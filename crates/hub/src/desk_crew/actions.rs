@@ -454,9 +454,11 @@ const OUTWARD_WORDS: &[&str] = &[
 
 /// Words that undo the outward word they come just before: "make no
 /// production changes", "don't push", "hold off on merging". Two cancel
-/// ("don't stop deploying" still deploys). Matched whole, apostrophes
-/// dropped; "no" only where it can't be an answer (see [`negation_at`]).
-const NEGATIONS: &[&str] = &["no", "not", "dont", "never", "without", "avoid", "stop"];
+/// ("don't stop deploying", "you can't not deploy" still deploy). Matched
+/// whole, apostrophes dropped.
+const NEGATIONS: &[&str] = &[
+    "no", "not", "dont", "never", "without", "avoid", "stop", "cant", "cannot",
+];
 
 /// Words that may stand between a negation and the word it undoes ("no
 /// more pushes", "don't do any deploys"). Any other word, an outward one
@@ -470,6 +472,12 @@ const BETWEEN: &[&str] = &[
 /// one at most and right before it: "no force-push", "no prod deploys".
 const MODIFIERS: &[&str] = &["force", "prod", "production"];
 
+/// The words a negation is honoured after, besides the start of its clause
+/// and `BETWEEN`'s "do" and "make": "please don't push", "we never
+/// deploy". After any other ("a shame not to deploy", "yes or no the
+/// deploy") the word stays outward.
+const SAYERS: &[&str] = &["i", "we", "you", "please"];
+
 /// Words before which a reply is the person's, not something to send:
 /// "until the person replies".
 const UNTIL: &[&str] = &["until", "till", "unless"];
@@ -480,79 +488,94 @@ const REACH: usize = 4;
 /// A word of a text, as matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Word {
+    /// Its letters and digits, run together.
     text: String,
+    /// Its pieces, where something that is no letter split it ("de⠀ploy"):
+    /// each is matched too, so a symbol can't hide a word.
+    parts: Vec<String>,
     /// Joined to the word before by a hyphen ("non-stop"), so it is no
     /// negation of its own.
     hyphened: bool,
 }
 
-/// Whether `c` is invisible formatting (zero-width spaces and joiners,
-/// direction marks, soft hyphens, variation selectors, tags), which could
-/// split a word so it isn't matched.
-fn formatting(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
-        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
-        | '\u{FFA0}' | '\u{E0000}'..='\u{E007F}')
+/// Whether `c` is left out: invisible formatting (General Category Cf,
+/// zero-width spaces and joiners, direction marks, soft hyphens, tags),
+/// combining marks (Mn: "pu\u{301}sh"), and the blank letters that show
+/// as nothing (Hangul fillers, the blank Braille pattern).
+fn hidden(c: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    matches!(
+        c.general_category(),
+        GeneralCategory::Format | GeneralCategory::NonspacingMark
+    ) || matches!(
+        c,
+        '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
+    )
 }
 
-/// The Latin letter a lowercase Cyrillic or Greek look-alike stands for.
-fn unconfused(c: char) -> char {
-    match c {
-        'а' | 'α' => 'a',
-        'с' | 'ϲ' => 'c',
-        'ԁ' => 'd',
-        'е' | 'ε' => 'e',
-        'һ' => 'h',
-        'і' | 'ι' => 'i',
-        'ј' => 'j',
-        'κ' => 'k',
-        'ӏ' => 'l',
-        'о' | 'ο' => 'o',
-        'р' | 'ρ' => 'p',
-        'ԛ' => 'q',
-        'ѕ' => 's',
-        'τ' => 't',
-        'ν' => 'v',
-        'ԝ' => 'w',
-        'х' | 'χ' => 'x',
-        'у' => 'y',
-        c => c,
-    }
+/// The letters of `word` as matched: lowercased, then read past
+/// look-alikes by its UTS #39 confusables skeleton ("pսsh", "merɡe" are
+/// push and merge), with what isn't a letter or digit left out.
+fn letters(word: &str) -> String {
+    let lower = word.to_lowercase();
+    unicode_security::skeleton(&lower)
+        .filter(|c| !hidden(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
-/// The words of `text`, NFKC-normalised, lowercased, look-alikes read as
-/// the letters they look like; `None` where a clause ends (`.,;:!?`, a
-/// dash standing alone, a line break), so nothing reaches across one.
+/// The words of `text`: decomposed (NFKD), what is hidden left out, split
+/// only at ASCII whitespace and punctuation (and dashes), so a symbol joins
+/// the word it is in rather than splitting it; `None` where a clause ends
+/// (`.,;:!?()`, a dash standing alone, a line break), so nothing reaches
+/// across one.
 fn words(text: &str) -> Vec<Option<Word>> {
     use unicode_normalization::UnicodeNormalization;
     let chars: Vec<char> = text
-        .chars()
-        .filter(|c| !formatting(*c))
-        .nfkc()
-        .filter(|c| !formatting(*c) && !matches!(c, '\'' | '\u{2019}'))
-        .flat_map(char::to_lowercase)
-        .map(unconfused)
+        .nfkd()
+        .filter(|c| !hidden(*c) && !matches!(c, '\'' | '\u{2019}'))
         .collect();
     let mut out: Vec<Option<Word>> = Vec::new();
     let mut word = String::new();
     let mut hyphened = false;
     let mut joined = false;
+    let push = |out: &mut Vec<Option<Word>>, word: &mut String, hyphened: bool| {
+        if word.is_empty() {
+            return;
+        }
+        let raw = std::mem::take(word);
+        let parts: Vec<String> = raw
+            .split(|c: char| !c.is_alphanumeric())
+            .map(letters)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let text = letters(
+            &raw.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>(),
+        );
+        if !text.is_empty() {
+            out.push(Some(Word {
+                text,
+                parts,
+                hyphened,
+            }));
+        }
+    };
     for (i, &c) in chars.iter().enumerate() {
-        if c.is_alphanumeric() {
+        // Only ASCII spaces split (NFKD made most others one), so a line
+        // separator inside a word joins it.
+        let splits = c.is_ascii_whitespace()
+            || c.is_ascii_punctuation()
+            || matches!(c, '\u{2014}' | '\u{2013}');
+        if !splits {
             if word.is_empty() {
                 hyphened = joined;
             }
             word.push(c);
             continue;
         }
-        if !word.is_empty() {
-            out.push(Some(Word {
-                text: std::mem::take(&mut word),
-                hyphened,
-            }));
-        }
+        push(&mut out, &mut word, hyphened);
         let spaced = |j: Option<usize>| {
             j.and_then(|j| chars.get(j))
                 .is_none_or(|c| c.is_whitespace())
@@ -570,17 +593,57 @@ fn words(text: &str) -> Vec<Option<Word>> {
             out.push(None);
         }
     }
-    if !word.is_empty() {
-        out.push(Some(Word {
-            text: word,
-            hyphened,
-        }));
-    }
+    push(&mut out, &mut word, hyphened);
     out
 }
 
-fn outward_word(w: &str) -> bool {
-    OUTWARD_WORDS.contains(&w) || OUTWARD_STEMS.iter().any(|s| w.starts_with(s))
+/// The word lists, each read once as [`letters`] reads a text's words.
+struct Keys {
+    words: Vec<String>,
+    stems: Vec<String>,
+    lists: std::collections::HashMap<&'static str, String>,
+}
+
+static KEYS: std::sync::LazyLock<Keys> = std::sync::LazyLock::new(|| {
+    let keyed = |list: &[&str]| list.iter().map(|w| letters(w)).collect::<Vec<_>>();
+    let mut lists = std::collections::HashMap::new();
+    for list in [
+        NEGATIONS,
+        BETWEEN,
+        MODIFIERS,
+        SAYERS,
+        UNTIL,
+        REPLIES,
+        &["on", "off", "hold"],
+    ] {
+        for w in list {
+            lists.insert(*w, letters(w));
+        }
+    }
+    Keys {
+        words: keyed(OUTWARD_WORDS),
+        stems: keyed(OUTWARD_STEMS),
+        lists,
+    }
+});
+
+/// The words a reply is waited on by.
+const REPLIES: &[&str] = &["reply", "replies", "replied"];
+
+fn outward_text(w: &str) -> bool {
+    KEYS.words.iter().any(|k| k == w) || KEYS.stems.iter().any(|s| w.starts_with(s.as_str()))
+}
+
+/// Whether `word` reads as outward, whole or by any piece of it.
+fn outward_word(word: &Word) -> bool {
+    outward_text(&word.text) || word.parts.iter().any(|p| outward_text(p))
+}
+
+/// Whether `w` is one of `list` (all of whose words are in [`KEYS`]), as
+/// [`letters`] reads both.
+fn one_of(w: &str, list: &[&str]) -> bool {
+    list.iter()
+        .any(|l| KEYS.lists.get(l).is_some_and(|k| k == w))
 }
 
 fn text_at(ws: &[Option<Word>], j: usize) -> Option<&str> {
@@ -589,42 +652,49 @@ fn text_at(ws: &[Option<Word>], j: usize) -> Option<&str> {
 
 /// Whether the word at `i` is undone by negations just before it, in its
 /// clause: an odd number of them, with only `BETWEEN` words, other
-/// negations and one `MODIFIERS` word right before it between, and no
-/// other negation earlier in the clause ("no reason not to deploy"
-/// deploys).
+/// negations and one `MODIFIERS` word right before it between; and
+/// before them the start of the clause or one of `SAYERS`, with no other
+/// negation earlier in the clause ("no reason not to deploy" deploys).
 fn negated(ws: &[Option<Word>], i: usize) -> bool {
     let mut j = i;
-    if j > 0 && text_at(ws, j - 1).is_some_and(|w| MODIFIERS.contains(&w)) {
+    if j > 0 && text_at(ws, j - 1).is_some_and(|w| one_of(w, MODIFIERS)) {
         j -= 1;
     }
     let mut negations = 0;
     let mut seen = 0;
-    while j > 0 && seen < REACH {
+    // Where the negations' run starts: the clause's start, or the word
+    // before them, once found.
+    let mut opened = false;
+    loop {
+        if j == 0 || text_at(ws, j - 1).is_none() {
+            opened = true;
+            break;
+        }
+        if seen == REACH {
+            break;
+        }
         j -= 1;
-        let Some(w) = text_at(ws, j) else { break };
         seen += 1;
+        let w = text_at(ws, j).unwrap_or_default();
         if negation_at(ws, j) {
             negations += 1;
-            if w == "on" {
+            if one_of(w, &["on"]) {
                 j -= 2;
             }
-        } else if !BETWEEN.contains(&w) {
+        } else if !one_of(w, BETWEEN) {
+            opened = one_of(w, SAYERS);
             break;
         }
     }
-    // Another negation before, anywhere in the clause, may undo this one
-    // ("no reason not to"): then it counts, to be safe.
     let clause = ws[..i]
         .iter()
         .rposition(Option::is_none)
         .map_or(0, |b| b + 1);
-    negations % 2 == 1 && !(clause..j).any(|k| negation_at(ws, k))
+    opened && negations % 2 == 1 && !(clause..j).any(|k| negation_at(ws, k))
 }
 
 /// Whether a negation ends at `j`: one of `NEGATIONS` standing alone (not
-/// "non-stop"), or "hold off on". "No" only where it can't be an answer:
-/// first in its clause, before a `BETWEEN` word ("no more"), or after
-/// "make" ("make no production changes"), never in "yes or no deploy?".
+/// "non-stop"), or "hold off on".
 fn negation_at(ws: &[Option<Word>], j: usize) -> bool {
     let Some(w) = ws[j].as_ref() else {
         return false;
@@ -632,26 +702,22 @@ fn negation_at(ws: &[Option<Word>], j: usize) -> bool {
     if w.hyphened {
         return false;
     }
-    match w.text.as_str() {
-        "on" => j >= 2 && text_at(ws, j - 1) == Some("off") && text_at(ws, j - 2) == Some("hold"),
-        "no" => {
-            let before = j.checked_sub(1).and_then(|k| text_at(ws, k));
-            before.is_none_or(|b| b == "make")
-                || text_at(ws, j + 1).is_some_and(|n| BETWEEN.contains(&n))
-        }
-        w => NEGATIONS.contains(&w),
+    let is = |k: usize, word: &str| text_at(ws, k).is_some_and(|w| one_of(w, &[word]));
+    if is(j, "on") {
+        return j >= 2 && is(j - 1, "off") && is(j - 2, "hold");
     }
+    one_of(&w.text, NEGATIONS)
 }
 
 /// Whether the reply-word at `i` is a wait on someone's reply: an `UNTIL`
 /// a few words before it, in its clause ("until the person replies").
 fn awaited(ws: &[Option<Word>], i: usize) -> bool {
-    matches!(text_at(ws, i), Some("reply" | "replies" | "replied"))
+    text_at(ws, i).is_some_and(|w| one_of(w, REPLIES))
         && ws[i.saturating_sub(REACH)..i]
             .iter()
             .rev()
             .map_while(Option::as_ref)
-            .any(|w| UNTIL.contains(&w.text.as_str()))
+            .any(|w| one_of(&w.text, UNTIL))
 }
 
 /// Whether `text` names something that pushes, deploys, deletes or sends.
@@ -668,26 +734,20 @@ fn awaited(ws: &[Option<Word>], i: usize) -> bool {
 /// a reply waited on ("until the person replies").
 pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
     let mut ws = words(text);
-    let mut names: Vec<Vec<String>> = names
+    let mut names: Vec<Vec<Word>> = names
         .iter()
-        .map(|n| {
-            words(n)
-                .into_iter()
-                .flatten()
-                .map(|w| w.text)
-                .collect::<Vec<_>>()
-        })
+        .map(|n| words(n).into_iter().flatten().collect::<Vec<_>>())
         .filter(|n| n.first().is_some_and(|w| !outward_word(w)))
         .collect();
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
     for name in &names {
-        let inward = !name.iter().any(|w| outward_word(w));
+        let inward = !name.iter().any(outward_word);
         let mut i = 0;
         while i + name.len() <= ws.len() {
             let here = ws[i..i + name.len()]
                 .iter()
                 .zip(name)
-                .all(|(w, n)| w.as_ref().is_some_and(|w| &w.text == n));
+                .all(|(w, n)| w.as_ref().is_some_and(|w| w.text == n.text));
             // Addressed: first in the message, a clause ending after it.
             let addressed = i == 0 && ws.get(name.len()).is_some_and(Option::is_none);
             if here && (inward || addressed) {
@@ -698,7 +758,9 @@ pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
         }
     }
     (0..ws.len()).any(|i| {
-        text_at(&ws, i).is_some_and(|w| outward_word(w) && !negated(&ws, i) && !awaited(&ws, i))
+        ws[i]
+            .as_ref()
+            .is_some_and(|w| outward_word(w) && !negated(&ws, i) && !awaited(&ws, i))
     })
 }
 
@@ -2031,7 +2093,8 @@ mod tests {
             "No prod deploys",
             "No more force pushes",
             "Never force-push to main",
-            "Look into it without deleting anything",
+            "Please don't deploy",
+            "We never force-push",
             "Avoid publishing for now",
             "Stop deploying",
             "No more pushes today",
@@ -2066,6 +2129,13 @@ mod tests {
             "Do a non-stop deploy",
             "Yes or no deploy now?",
             "There are no deploys left to do",
+            "Look into it without deleting anything",
+            "It would be a shame not to deploy",
+            "It would be a mistake not to push",
+            "You can't not deploy now",
+            "You cannot not deploy now",
+            "Yes or no the deploy goes ahead",
+            "We should not deploy",
         ] {
             assert!(outward(said), "{said}");
         }
@@ -2077,6 +2147,7 @@ mod tests {
             "Acme Migration".to_string(),
             "Acme Web".to_string(),
             "The Release".to_string(),
+            "Please Deploy".to_string(),
             "Deploy".to_string(),
             "Release 4.2".to_string(),
             "Deploy the docs".to_string(),
@@ -2087,6 +2158,9 @@ mod tests {
         assert!(!outward_except(cufflink, &names), "{cufflink}");
         for said in [
             "Acme-Migration: still stuck?",
+            // The residual: a name with an outward word, addressed, is let
+            // go, as a bare "now" would be.
+            "Please Deploy: now",
             "ACME MIGRATION, how is it going?",
             "How is Acme Web doing?",
             "Acme Web: no production changes, please",
@@ -2123,6 +2197,16 @@ mod tests {
             "\u{FF24}\u{FF45}\u{FF50}\u{FF4C}\u{FF4F}\u{FF59} now",
             "m\u{0435}rge the PR",
             "\u{0441}ommit it",
+            "p\u{057D}sh it",
+            "p\u{03C5}sh it",
+            "mer\u{0261}e it",
+            "sh\u{0131}p it",
+            "pu\u{301}sh it",
+            "de\u{2800}ploy",
+            "pu\u{2028}sh it",
+            "No\u{2028}deploy",
+            "de\u{2063}ploy now",
+            "pr\u{030}d deploy",
         ] {
             assert!(outward(said), "{said:?}");
         }
