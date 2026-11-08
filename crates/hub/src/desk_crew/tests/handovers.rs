@@ -411,3 +411,169 @@ async fn an_agent_made_a_groups_boss_brings_nothing_it_learned_outside_the_group
     })
     .await;
 }
+
+/// The mock model answers slowly from now on: a turn of the agent is in
+/// flight for `delay`.
+async fn slowly(server: &wiremock::MockServer, delay: std::time::Duration) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "id": "c1", "object": "chat.completion", "model": "mock",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                }))
+                .set_delay(delay),
+        )
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A heartbeat turn (not one Desk's crew tracks) that spans a move: the
+/// move waits for it, and is refused while it runs past the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heartbeat_turn_that_spans_a_move_holds_the_move_until_it_ends() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (desk_boss, l1) = agent(dir.path(), "desk", "ok").await;
+        let (sarah, l2) = agent(dir.path(), "sarah", "ok").await;
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| {
+            l.create("acme", "Acme", &[], None)?
+                .create("atlas", "Atlas", &[], None)
+        })
+        .await
+        .unwrap();
+        write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+        write_config(
+            &sarah,
+            &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        );
+        let all = [&desk_boss, &sarah];
+        let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("two bosses", async || (d.bosses().len() == 2).then_some(())).await;
+        slowly(&l2, std::time::Duration::from_millis(1500)).await;
+        let heartbeat = {
+            let sarah = Arc::clone(&sarah);
+            tokio::spawn(async move {
+                sarah
+                    .process_message(
+                        "heartbeat",
+                        PERSON,
+                        "Check on things.",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        eventually("the heartbeat in flight", async || {
+            (crate::memory_fence::turns_in_flight(&sarah.workspace) > 0).then_some(())
+        })
+        .await;
+        let refused = crew.move_boss_to("sarah", Some("atlas"), false).await;
+        assert!(refused.unwrap_err().contains("middle of a turn"));
+        assert_eq!(d.scope_of_boss("sarah"), Some(Scope::Group("acme".into())));
+        let _ = heartbeat.await.unwrap();
+        assert_eq!(crate::memory_fence::turns_in_flight(&sarah.workspace), 0);
+        crew.move_boss_to("sarah", Some("atlas"), false)
+            .await
+            .unwrap();
+        drop((l1, l2));
+    })
+    .await;
+}
+
+/// A room turn, by its id or by an older Desk's slug, reaches only an
+/// agent the room's group lets in now.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_turn_by_id_or_slug_reaches_a_boss_only_inside_the_rooms_group() {
+    use workforce_common::channels::desk::DeskPlace;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (desk_boss, l1) = agent(dir.path(), "desk", "ok").await;
+        let (sarah, l2) = agent(dir.path(), "sarah", "ok").await;
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| {
+            l.create("acme", "Acme", &[], None)?
+                .create("atlas", "Atlas", &[], None)
+        })
+        .await
+        .unwrap();
+        write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+        write_config(
+            &sarah,
+            &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        );
+        let all = [&desk_boss, &sarah];
+        let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("two bosses", async || (d.bosses().len() == 2).then_some(())).await;
+        let room = d
+            .create_room(workforce_desk::rooms::NewRoom {
+                name: "Acme launch".into(),
+                members: vec![workforce_desk::rooms::Member {
+                    hub: workforce_desk::rooms::LOCAL_HUB.into(),
+                    agent: "sarah".into(),
+                }],
+                default_member: None,
+                group: Some("acme".into()),
+                share_with: vec![],
+            })
+            .await
+            .unwrap();
+        let by_id = DeskPlace::Room {
+            room: room.id,
+            name: room.name.clone(),
+            thread: None,
+        };
+        let by_slug = DeskPlace::LegacyRoom {
+            slug: room.slug.clone(),
+        };
+        let by_old_id = DeskPlace::LegacyRoom {
+            slug: room.id.to_string(),
+        };
+        for place in [&by_id, &by_slug, &by_old_id] {
+            assert!(super::super::room_turn_refused(&sarah, place)
+                .await
+                .is_none());
+        }
+        crew.move_boss_to("sarah", Some("atlas"), false)
+            .await
+            .unwrap();
+        eventually("Sarah oversees Atlas", async || {
+            (d.scope_of_boss("sarah") == Some(Scope::Group("atlas".into()))).then_some(())
+        })
+        .await;
+        for place in [&by_id, &by_slug, &by_old_id] {
+            assert!(
+                super::super::room_turn_refused(&sarah, place)
+                    .await
+                    .is_some(),
+                "{place:?}"
+            );
+        }
+        // A room no desk here keeps is its own Desk's to bound.
+        let elsewhere = DeskPlace::LegacyRoom {
+            slug: "someone-elses-room".into(),
+        };
+        assert!(super::super::room_turn_refused(&sarah, &elsewhere)
+            .await
+            .is_none());
+        drop((l1, l2));
+    })
+    .await;
+}

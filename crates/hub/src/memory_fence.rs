@@ -128,6 +128,49 @@ impl FenceSource for ConfigFence {
     }
 }
 
+/// The turns running now, by their agent's workspace: every admitted turn
+/// (a person's, a heartbeat's, a monitor's, a scheduled job's, a check-in),
+/// whatever surface started it. A boss is moved only once its count is 0.
+static IN_FLIGHT: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One turn of the agent of a workspace, counted while it lives.
+pub(crate) struct TurnInFlight(PathBuf);
+
+impl TurnInFlight {
+    pub(crate) fn begin(workspace: &Path) -> Self {
+        *IN_FLIGHT.lock().entry(workspace.to_path_buf()).or_default() += 1;
+        Self(workspace.to_path_buf())
+    }
+}
+
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        let mut all = IN_FLIGHT.lock();
+        if let Some(n) = all.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                all.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// How many turns the agent of `workspace` is running now.
+pub(crate) fn turns_in_flight(workspace: &Path) -> usize {
+    IN_FLIGHT.lock().get(workspace).copied().unwrap_or(0)
+}
+
+/// The fence a turn of `agent` starting now carries: the one it is inside
+/// already (a turn that runs another for the same agent), else its config's.
+pub(crate) fn fence_for_turn(agent: &AgentId, workspace: &Path) -> String {
+    workforce_agent::runner::CURRENT_MEMORY_FENCE
+        .try_with(|s| s.clone())
+        .ok()
+        .filter(|s| decode(s, agent).is_some())
+        .unwrap_or_else(|| turn_fence(agent, workspace))
+}
+
 /// The session metadata key a boss's conversations carry once it left the
 /// scope they were had in: the scope's tag.
 pub(crate) const LEFT_SCOPE: &str = workforce_common::session::LEFT_SCOPE_KEY;
@@ -306,6 +349,23 @@ mod tests {
             .scope(began.clone(), async { fence.fence() })
             .await;
         assert_eq!(seen, Fence::Boss("desk-group:g-acme".into()));
+        // A turn begun inside another of the same agent's keeps the outer
+        // one's fence; one begun fresh reads the config.
+        let inner = workforce_agent::runner::CURRENT_MEMORY_FENCE
+            .scope(began.clone(), async { fence_for_turn(&sarah, dir.path()) })
+            .await;
+        assert_eq!(inner, began);
+        assert_eq!(
+            fence_for_turn(&sarah, dir.path()),
+            encode(&sarah, &Fence::Boss("desk-group:g-atlas".into()))
+        );
+        // A turn counts while it lives.
+        {
+            let _one = TurnInFlight::begin(dir.path());
+            let _two = TurnInFlight::begin(dir.path());
+            assert_eq!(turns_in_flight(dir.path()), 2);
+        }
+        assert_eq!(turns_in_flight(dir.path()), 0);
         // Another agent's turn says nothing of this one's.
         let mias = encode(&AgentId::new("mia"), &Fence::Open);
         let seen = workforce_agent::runner::CURRENT_MEMORY_FENCE

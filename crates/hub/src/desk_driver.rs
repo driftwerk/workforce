@@ -793,6 +793,64 @@ pub async fn mount(
 
 #[cfg(test)]
 mod tests {
+
+    /// Moves (preview and commit) are the hub holder's alone: an
+    /// administrator's own sign-in passes, anyone else is refused, and the
+    /// gateway token alone is no one's.
+    #[tokio::test]
+    async fn only_the_person_who_holds_the_hub_is_let_make_a_move() {
+        use workforce_desk::Authorize as _;
+        use workforce_identity::store::IdentityStore;
+        use workforce_identity::types::{Identity, IdentityRole};
+        let fixture = crate::remote_mcp::testing::fixture(false);
+        let jwt = crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600)
+            .unwrap();
+        let token = |person: &Identity| {
+            fixture.identities.create(person).unwrap();
+            crate::jwt::generate_token_with_identity(
+                &jwt,
+                &person.display_name,
+                person.role,
+                Some(person.id.to_string()),
+            )
+            .unwrap()
+        };
+        let holder = Identity::new("Sam", IdentityRole::SystemAdmin);
+        let member = Identity::new("Mo", IdentityRole::Member);
+        let (holds, doesnt) = (token(&holder), token(&member));
+        let state = Arc::new(GatewayState {
+            jwt_config: Some(jwt.clone()),
+            ..Arc::try_unwrap(fixture.state)
+                .ok()
+                .expect("the fixture's only handle")
+        });
+        let gateway_token = state.auth_token.clone();
+        let auth = SystemAdmins(state);
+        let bearer = |t: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {t}").parse().unwrap(),
+            );
+            h
+        };
+        assert_eq!(
+            auth.authorize_holder(&bearer(&holds), None).await,
+            Ok(Some(holder.id.to_string()))
+        );
+        assert_eq!(
+            auth.authorize_holder(&bearer(&doesnt), None).await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert!(auth
+            .authorize_holder(&bearer(&gateway_token), None)
+            .await
+            .is_err());
+        assert_eq!(
+            auth.authorize_holder(&HeaderMap::new(), None).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
     #[test]
     fn only_the_hubs_own_token_itself_is_the_hub_token() {
         let with = |v: &str| {

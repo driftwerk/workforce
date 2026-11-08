@@ -3684,6 +3684,20 @@ impl Desk {
         crate::scope::allowed_member(room.group.as_deref(), &m, &layout, &bossed, &bosses)
     }
 
+    /// The room an older Desk names by its id or its slug, when this desk
+    /// keeps it.
+    pub async fn room_named(&self, name: &str) -> Option<Uuid> {
+        let name = name.trim().trim_start_matches('#');
+        if let Ok(id) = Uuid::parse_str(name) {
+            return Some(id);
+        }
+        let rooms = self.0.store.rooms().await.ok()?;
+        rooms
+            .iter()
+            .find(|r| r.slug == name || r.slug == slug_for(name))
+            .map(|r| r.id)
+    }
+
     pub async fn update_room(&self, id: Uuid, patch: RoomPatch) -> Result<Room, DeskError> {
         let mut room = self.room_of(id)?;
         let before = room.members.clone();

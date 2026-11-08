@@ -251,7 +251,11 @@ impl CrewHub {
         // Its turns end first, within a bound: what a turn does as the boss
         // of the scope it leaves is done before it is another's boss.
         let deadline = std::time::Instant::now() + self.timing.minute / 2;
-        while self.running.lock().values().any(|r| r.agent_id == agent) {
+        // Every turn of its: a person's, a heartbeat's, a monitor's, a
+        // scheduled job's, a check-in's.
+        while self.running.lock().values().any(|r| r.agent_id == agent)
+            || crate::memory_fence::turns_in_flight(&service.workspace) > 0
+        {
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "{} is in the middle of a turn; move them once it's done.",

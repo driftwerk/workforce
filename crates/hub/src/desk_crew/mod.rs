@@ -177,13 +177,17 @@ pub(crate) async fn room_turn_refused(
     service: &AgentService,
     place: &workforce_common::channels::desk::DeskPlace,
 ) -> Option<String> {
-    let workforce_common::channels::desk::DeskPlace::Room { room, .. } = place else {
-        return None;
-    };
+    use workforce_common::channels::desk::DeskPlace;
     let crew = for_service(service)?;
+    let room = match place {
+        DeskPlace::Room { room, .. } => *room,
+        // An older Desk names a room by its slug (or id): the same room.
+        DeskPlace::LegacyRoom { slug } => crew.desk.room_named(slug).await?,
+        _ => return None,
+    };
     match crew
         .desk
-        .agent_reaches_room(*room, service.agent_id.as_str())
+        .agent_reaches_room(room, service.agent_id.as_str())
         .await
     {
         true => None,

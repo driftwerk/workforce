@@ -1109,7 +1109,7 @@ async fn replace_layout(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|before| match &r.expected {
+        .change_layout_by_person(|before| match &r.expected {
             Some(expected) if expected != before => Err(DeskError::Conflict(
                 "The layout changed since it was read: read it again.".into(),
             )),
@@ -1212,7 +1212,7 @@ async fn put_member(
     guarded!(s, h, q);
     let before = body.map(|Json(b)| b.before).unwrap_or_default();
     s.desk
-        .change_layout(|l| l.put(&item, &id, before.as_deref()))
+        .change_layout_by_person(|l| l.put(&item, &id, before.as_deref()))
         .await
         .map(Json)
         .into_response()
@@ -1226,7 +1226,7 @@ async fn remove_member(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|l| match l.group_of(&item) {
+        .change_layout_by_person(|l| match l.group_of(&item) {
             Some(g) if g.id == id => l.remove(&item),
             _ => Err(DeskError::NotFound),
         })
@@ -1246,7 +1246,7 @@ struct Order {
 async fn order_ungrouped(State(s): S, h: HeaderMap, Query(q): Q, Json(o): Json<Order>) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|l| l.order_ungrouped(&o.items))
+        .change_layout_by_person(|l| l.order_ungrouped(&o.items))
         .await
         .map(Json)
         .into_response()
