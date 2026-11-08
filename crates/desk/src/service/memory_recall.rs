@@ -26,6 +26,8 @@ pub struct Recall {
     pub group: Option<Option<String>>,
     /// Only one session's; it can only narrow.
     pub session: Option<Uuid>,
+    /// Only these kinds of exchanges and notes; all when none.
+    pub kinds: Option<Vec<PassageKind>>,
     pub limit: usize,
     /// What `memory_reads.tool` says asked.
     pub tool: &'static str,
@@ -70,14 +72,15 @@ impl Desk {
             });
         }
         let wanted = limit * 3;
-        let (found, keyword_only, notice) = match self.indexed(&b, &r.q, wanted).await {
+        let kinds = r.kinds.as_deref();
+        let (found, keyword_only, notice) = match self.indexed(&b, &r.q, kinds, wanted).await {
             Some(mut found) => {
                 // What the index doesn't hold yet is found by its words.
                 let catching_up = self.0.store.index_backlog(Some(&b.groups)).await? > 0;
                 let unindexed = self
                     .0
                     .store
-                    .memory_keyword(&r.q, &b, true, wanted as i64)
+                    .memory_keyword(&r.q, &b, kinds, true, wanted as i64)
                     .await?;
                 for (id, words) in unindexed {
                     let e = found.entry(id).or_default();
@@ -93,7 +96,7 @@ impl Desk {
                 let found = self
                     .0
                     .store
-                    .memory_keyword(&r.q, &b, false, wanted as i64)
+                    .memory_keyword(&r.q, &b, kinds, false, wanted as i64)
                     .await?
                     .into_iter()
                     .collect();
@@ -130,7 +133,7 @@ impl Desk {
                     session: row.session,
                     project: row.project.clone(),
                     flagged: row.flagged,
-                    superseded: false,
+                    superseded: row.item.as_ref().is_some_and(|i| i.superseded),
                 };
                 (row, c)
             })
@@ -168,13 +171,19 @@ impl Desk {
 
     /// Each exchange the index finds in `b`'s collections, with its
     /// relevance; none while there is no index ready, or when it fails.
-    async fn indexed(&self, b: &Bound, q: &str, wanted: usize) -> Option<HashMap<Uuid, f32>> {
+    async fn indexed(
+        &self,
+        b: &Bound,
+        q: &str,
+        kinds: Option<&[PassageKind]>,
+        wanted: usize,
+    ) -> Option<HashMap<Uuid, f32>> {
         let index = self.memory_index_up()?;
         let query = IndexQuery {
             text: q.to_string(),
             sessions: b.sessions.clone(),
             projects: b.projects.clone(),
-            kinds: Some(vec![PassageKind::Exchange, PassageKind::Compaction]),
+            kinds: kinds.map(<[PassageKind]>::to_vec),
             limit: wanted,
         };
         let mut found = HashMap::new();
@@ -229,8 +238,18 @@ impl Desk {
     }
 }
 
-/// How a recalled exchange is weighed.
+/// How a recalled exchange or note is weighed: a note the person
+/// confirmed or wrote above any Desk's model wrote.
 fn kind_of(row: &RecallRow) -> HitKind {
+    use crate::memory::derive::{ItemKind, ItemState};
+    if let Some(item) = &row.item {
+        return match (item.confirmed, item.kind, item.state) {
+            (true, _, _) => HitKind::Confirmed,
+            (false, ItemKind::Decision, _) => HitKind::Decision,
+            (false, ItemKind::Todo, ItemState::Open) => HitKind::OpenTodo,
+            (false, ItemKind::Todo | ItemKind::Fact, _) => HitKind::Fact,
+        };
+    }
     if row.compaction {
         HitKind::Compaction
     } else if row.answer.trim().is_empty() && row.stepped {

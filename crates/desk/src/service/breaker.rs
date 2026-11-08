@@ -289,7 +289,7 @@ impl Desk {
 
     /// The timezone budgets are counted in: the hub's, else the crew's
     /// once it is there; none before either says.
-    fn budget_tz(&self) -> Option<chrono_tz::Tz> {
+    pub(super) fn budget_tz(&self) -> Option<chrono_tz::Tz> {
         let set = *self.0.budget_tz.lock();
         set.or_else(|| self.reader().map(|c| c.timezone()))
     }

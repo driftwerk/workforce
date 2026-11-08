@@ -33,6 +33,7 @@ pub fn desk_floor() -> workforce_desk::Floor {
         pricer: None,
         redactor: None,
         index: None,
+        deriver: None,
     }
 }
 

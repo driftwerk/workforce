@@ -426,31 +426,43 @@ impl Desk {
             let unwritten =
                 u64::try_from(self.0.store.index_unwritten(group.as_deref()).await?).unwrap_or(0);
             let mut held = 0u64;
-            let mut after = None;
-            loop {
-                let _work = self.0.index.work.lock().await;
-                let page = self
-                    .0
-                    .store
-                    .index_held_page(group.as_deref(), after, RECONCILE_PAGE)
-                    .await?;
-                let Some(last) = page.last() else { break };
-                after = Some(last.row.id);
-                let pairs: Vec<(String, String)> = page
-                    .iter()
-                    .flat_map(|p| passages_of(&p.row))
-                    .map(|p| (p.key, p.hash))
-                    .collect();
-                let differing = index.differing(&collection, &pairs).await?;
-                held += differing.held;
-                let refs: HashSet<Uuid> = differing
-                    .keys
-                    .iter()
-                    .filter_map(|k| ref_of_key(k))
-                    .collect();
-                if !refs.is_empty() {
-                    let refs: Vec<Uuid> = refs.into_iter().collect();
-                    again += self.0.store.index_requeue(&refs).await?;
+            // Exchanges, then notes, a page at a time.
+            for notes in [false, true] {
+                let mut after = None;
+                loop {
+                    let _work = self.0.index.work.lock().await;
+                    let page = match notes {
+                        false => {
+                            self.0
+                                .store
+                                .index_held_page(group.as_deref(), after, RECONCILE_PAGE)
+                                .await?
+                        }
+                        true => {
+                            self.0
+                                .store
+                                .index_held_items_page(group.as_deref(), after, RECONCILE_PAGE)
+                                .await?
+                        }
+                    };
+                    let Some(last) = page.last() else { break };
+                    after = Some(last.row.id);
+                    let pairs: Vec<(String, String)> = page
+                        .iter()
+                        .flat_map(|p| passages_of(&p.row))
+                        .map(|p| (p.key, p.hash))
+                        .collect();
+                    let differing = index.differing(&collection, &pairs).await?;
+                    held += differing.held;
+                    let refs: HashSet<Uuid> = differing
+                        .keys
+                        .iter()
+                        .filter_map(|k| ref_of_key(k))
+                        .collect();
+                    if !refs.is_empty() {
+                        let refs: Vec<Uuid> = refs.into_iter().collect();
+                        again += self.0.store.index_requeue(&refs).await?;
+                    }
                 }
             }
             // It holds more than Postgres says it should, even counting a

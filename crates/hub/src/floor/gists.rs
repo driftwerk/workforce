@@ -986,10 +986,41 @@ async fn answer_on(
     system: &str,
     user: &str,
 ) -> eyre::Result<String> {
-    answer_with(primary, others, admits, true, owner, system, user).await
+    answer_with(
+        primary,
+        others,
+        admits,
+        true,
+        owner,
+        system,
+        user,
+        Call::GIST,
+    )
+    .await
+    .map(|(text, _)| text)
 }
 
-/// [`answer_on`], `quiet` as [`written_on`] has it.
+/// What a call on the floor's model is for: how long its answer may be,
+/// and what its cost is booked as.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Call {
+    pub max_tokens: u32,
+    pub task: &'static str,
+    pub description: &'static str,
+}
+
+impl Call {
+    /// A gist or the floor's paragraph.
+    pub(crate) const GIST: Call = Call {
+        max_tokens: 400,
+        task: "floor_gist",
+        description: "floor:gist",
+    };
+}
+
+/// [`answer_on`], `quiet` as [`written_on`] has it, for `call`: the text,
+/// and the model that wrote it.
+#[allow(clippy::too_many_arguments)]
 async fn answer_with(
     primary: Arc<crate::serve::AgentService>,
     others: Vec<Arc<crate::serve::AgentService>>,
@@ -998,7 +1029,8 @@ async fn answer_with(
     owner: Option<&str>,
     system: &str,
     user: &str,
-) -> eyre::Result<String> {
+    call: Call,
+) -> eyre::Result<(String, String)> {
     use workforce_agent::llm::provider::with_reasoning_suppressed;
     use workforce_agent::llm::types::LlmMessage;
     use workforce_agent::runner::with_served_log;
@@ -1041,7 +1073,7 @@ async fn answer_with(
             &messages,
             &[],
             Some(&model),
-            Some(400),
+            Some(call.max_tokens),
             true,
         )));
         let ran = match (kind, person) {
@@ -1067,9 +1099,9 @@ async fn answer_with(
             }
         };
         primary.cost_tracker.record(CostEntry {
-            task_type: Some("floor_gist"),
+            task_type: Some(call.task),
             identity_id: identity.as_deref(),
-            description: Some("floor:gist"),
+            description: Some(call.description),
             served,
             ..CostEntry::new(
                 primary.agent_id.as_str(),
@@ -1078,7 +1110,10 @@ async fn answer_with(
                 Origin::Floor,
             )
         });
-        return Ok(response.all_text().unwrap_or_default());
+        return Ok((
+            response.all_text().unwrap_or_default(),
+            response.model.clone(),
+        ));
     }
     Err(failed.unwrap_or_else(|| {
         eyre::eyre!(
@@ -1087,15 +1122,18 @@ async fn answer_with(
     }))
 }
 
-#[async_trait]
-impl Model for HubModel {
-    async fn answer(
+impl HubModel {
+    /// The answer to `system` and `user` for `call`, on `subject`'s account
+    /// (none: the floor's own) for `owner`, as gists are written: the text,
+    /// and the model that wrote it.
+    pub(crate) async fn answer_for(
         &self,
         subject: Option<&Subject>,
         owner: Option<&str>,
         system: &str,
         user: &str,
-    ) -> eyre::Result<String> {
+        call: Call,
+    ) -> eyre::Result<(String, String)> {
         let registry = &self.state.registry;
         let service = match subject {
             Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
@@ -1108,7 +1146,32 @@ impl Model for HubModel {
             false => vec![],
         };
         let admits = |agent: &str, person: &str| registry.admits(agent, person);
-        answer_with(service, others, admits, self.fallback, owner, system, user).await
+        answer_with(
+            service,
+            others,
+            admits,
+            self.fallback,
+            owner,
+            system,
+            user,
+            call,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl Model for HubModel {
+    async fn answer(
+        &self,
+        subject: Option<&Subject>,
+        owner: Option<&str>,
+        system: &str,
+        user: &str,
+    ) -> eyre::Result<String> {
+        self.answer_for(subject, owner, system, user, Call::GIST)
+            .await
+            .map(|(text, _)| text)
     }
 
     fn goal(&self, subject: &Subject) -> Option<String> {

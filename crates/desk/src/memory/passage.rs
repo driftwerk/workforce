@@ -47,6 +47,10 @@ pub enum PassageKind {
     Exchange,
     /// An engine's own summary of what came before.
     Compaction,
+    /// Notes Desk keeps of a session.
+    Decision,
+    Fact,
+    Todo,
 }
 
 impl PassageKind {
@@ -54,6 +58,21 @@ impl PassageKind {
         match self {
             PassageKind::Exchange => "exchange",
             PassageKind::Compaction => "compaction",
+            PassageKind::Decision => "decision",
+            PassageKind::Fact => "fact",
+            PassageKind::Todo => "todo",
+        }
+    }
+
+    /// Every kind of a session's exchanges.
+    pub const EXCHANGES: [PassageKind; 2] = [PassageKind::Exchange, PassageKind::Compaction];
+
+    /// A note of `kind`'s passage kind.
+    pub fn of_item(kind: super::derive::ItemKind) -> Self {
+        match kind {
+            super::derive::ItemKind::Decision => PassageKind::Decision,
+            super::derive::ItemKind::Fact => PassageKind::Fact,
+            super::derive::ItemKind::Todo => PassageKind::Todo,
         }
     }
 }
@@ -80,7 +99,17 @@ pub struct Passage {
     pub hash: String,
 }
 
-/// An exchange as the index worker reads it from Postgres.
+/// A note as the index worker reads it: one passage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexItem {
+    pub kind: super::derive::ItemKind,
+    pub text: String,
+    /// Not replaced: a replaced note is kept, and recalled labelled.
+    pub valid: bool,
+}
+
+/// An exchange (or a note: `item`) as the index worker reads it from
+/// Postgres.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexRow {
     pub id: Uuid,
@@ -92,6 +121,9 @@ pub struct IndexRow {
     pub answer: String,
     pub steps: Vec<Step>,
     pub compaction: bool,
+    /// A note, not an exchange: its text and validity stand in for the
+    /// exchange's parts.
+    pub item: Option<IndexItem>,
 }
 
 /// The text one exchange is searched by: what was asked, what was
@@ -157,8 +189,30 @@ pub fn hash_of(text: &str) -> String {
     hex::encode(&Sha256::digest(text.as_bytes())[..8])
 }
 
-/// `row`'s passages, in order.
+/// `row`'s passages, in order: a note's one.
 pub fn passages_of(row: &IndexRow) -> Vec<Passage> {
+    if let Some(item) = &row.item {
+        let text: String = item.text.trim().chars().take(PASSAGE_MAX).collect();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        return vec![Passage {
+            key: passage_key(row.id, 0),
+            of: row.id,
+            n: 0,
+            kind: PassageKind::of_item(item.kind),
+            session: row.session,
+            project: row.project.clone(),
+            at: row.at,
+            valid: item.valid,
+            hash: hash_of(&format!(
+                "{}\u{1f}{text}\u{1f}{}",
+                item.kind.as_str(),
+                item.valid
+            )),
+            text,
+        }];
+    }
     let kind = match row.compaction {
         true => PassageKind::Compaction,
         false => PassageKind::Exchange,
@@ -300,6 +354,7 @@ mod tests {
                 failed: false,
             }],
             compaction: false,
+            item: None,
         };
         let ps = passages_of(&row);
         assert_eq!(ps.len(), 1);
@@ -322,6 +377,46 @@ mod tests {
             ..row
         };
         assert_eq!(passages_of(&summary)[0].kind, PassageKind::Compaction);
+    }
+
+    #[test]
+    fn a_note_is_one_passage_carrying_its_kind_and_whether_it_still_holds() {
+        let row = IndexRow {
+            id: Uuid::new_v4(),
+            session: Uuid::new_v4(),
+            group: None,
+            project: "/dev/acme-web".into(),
+            at: Utc::now(),
+            ask: String::new(),
+            answer: String::new(),
+            steps: Vec::new(),
+            compaction: false,
+            item: Some(IndexItem {
+                kind: crate::memory::derive::ItemKind::Decision,
+                text: "Keep the session token in an HttpOnly cookie.".into(),
+                valid: true,
+            }),
+        };
+        let ps = passages_of(&row);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(
+            (ps[0].kind, ps[0].valid, ps[0].text.as_str()),
+            (
+                PassageKind::Decision,
+                true,
+                "Keep the session token in an HttpOnly cookie."
+            )
+        );
+        let replaced = IndexRow {
+            item: Some(IndexItem {
+                valid: false,
+                ..row.item.clone().unwrap()
+            }),
+            ..row.clone()
+        };
+        let p = &passages_of(&replaced)[0];
+        assert!(!p.valid);
+        assert_ne!(p.hash, ps[0].hash, "a replaced note is written again");
     }
 
     #[test]
