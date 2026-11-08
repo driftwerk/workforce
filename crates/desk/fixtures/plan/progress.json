@@ -1,0 +1,250 @@
+{
+  "about": "Shared with Desk's crew/plan.ts: progress(tickets) for each case.",
+  "cases": [
+    {
+      "name": "no tickets",
+      "tickets": [],
+      "progress": {
+        "done": 0,
+        "doing": 0,
+        "review": 0,
+        "ready": 0,
+        "blocked": 0,
+        "waiting": 0,
+        "total": 0,
+        "next": []
+      }
+    },
+    {
+      "name": "a proposed plan: everything waits in Backlog",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "backlog",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "backlog",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        }
+      ],
+      "progress": {
+        "done": 0,
+        "doing": 0,
+        "review": 0,
+        "ready": 0,
+        "blocked": 0,
+        "waiting": 2,
+        "total": 2,
+        "next": []
+      }
+    },
+    {
+      "name": "running: ready tickets next in rank order, the rest waiting on their needs",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "done",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "doing",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "state": "todo",
+          "rank": 4096,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-4"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "state": "todo",
+          "rank": 5120,
+          "needs": [
+            "00000000-0000-4000-8000-000000000002"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-5"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "state": "review",
+          "rank": 6144,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-6"
+        }
+      ],
+      "progress": {
+        "done": 1,
+        "doing": 1,
+        "review": 1,
+        "ready": 2,
+        "blocked": 0,
+        "waiting": 1,
+        "total": 6,
+        "next": [
+          "ACM-3",
+          "ACM-4"
+        ]
+      }
+    },
+    {
+      "name": "a ticket being started or handed out counts as doing",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1",
+          "starting": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        }
+      ],
+      "progress": {
+        "done": 0,
+        "doing": 2,
+        "review": 0,
+        "ready": 1,
+        "blocked": 0,
+        "waiting": 0,
+        "total": 3,
+        "next": [
+          "ACM-3"
+        ]
+      }
+    },
+    {
+      "name": "a dropped need blocks; dropped tickets aren't counted",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "dropped",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "done",
+          "rank": 3072,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        }
+      ],
+      "progress": {
+        "done": 1,
+        "doing": 0,
+        "review": 0,
+        "ready": 0,
+        "blocked": 1,
+        "waiting": 0,
+        "total": 2,
+        "next": []
+      }
+    },
+    {
+      "name": "a board with no keys names its tickets by id",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web"
+        }
+      ],
+      "progress": {
+        "done": 0,
+        "doing": 0,
+        "review": 0,
+        "ready": 1,
+        "blocked": 0,
+        "waiting": 0,
+        "total": 1,
+        "next": [
+          "00000000-0000-4000-8000-000000000001"
+        ]
+      }
+    }
+  ]
+}

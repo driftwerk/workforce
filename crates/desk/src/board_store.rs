@@ -523,7 +523,10 @@ impl DeskStore {
     }
 }
 
-async fn insert_ticket_in<C: tokio_postgres::GenericClient>(client: &C, t: &Ticket) -> Result<()> {
+pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
+    client: &C,
+    t: &Ticket,
+) -> Result<()> {
     client
         .execute(
             &format!(
