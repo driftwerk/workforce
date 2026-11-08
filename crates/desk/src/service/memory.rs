@@ -150,6 +150,8 @@ pub struct MemoryLimits {
     pub derive_calls_per_day: u32,
     /// Calls made today to note decisions.
     pub derive_calls_today: i64,
+    /// Whose model writes the notes, as a session's notes say it.
+    pub provider: Option<String>,
 }
 
 /// One group's memory, for Settings → Memory and the group's menu.
@@ -517,6 +519,12 @@ impl Desk {
                 index_per_minute: m.index_per_minute,
                 derive_calls_per_day: m.derive_calls_per_day,
                 derive_calls_today: self.0.store.derive_calls(self.derive_day()).await?,
+                provider: self
+                    .0
+                    .derive
+                    .deriver
+                    .as_ref()
+                    .and_then(|d| d.written_by().provider),
             },
             totals: self.0.store.memory_totals().await?,
         })

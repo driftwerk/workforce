@@ -1009,6 +1009,7 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         assert_eq!(body["paused"], false);
         assert_eq!(body["limits"]["retainDays"], 90);
         assert_eq!(body["limits"]["deriveCallsPerDay"], 200);
+        assert_eq!(body["limits"]["provider"], "anthropic");
         assert_eq!(body["totals"][0]["exchanges"], 1);
         assert_eq!(
             body["groups"],
