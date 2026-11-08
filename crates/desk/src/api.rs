@@ -2336,8 +2336,13 @@ mod tests {
             assert_eq!(status, 201, "{made}");
             assert!(home.join("dagr/app").is_dir());
             for path in ["/etc/desk-made", "~/../x"] {
-                let (status, _) =
-                    call(&app, "POST", "/api/desk/folders", Some(json!({ "path": path }))).await;
+                let (status, _) = call(
+                    &app,
+                    "POST",
+                    "/api/desk/folders",
+                    Some(json!({ "path": path })),
+                )
+                .await;
                 assert!(status == 403 || status == 400, "{path}: {status}");
             }
             assert!(!dir.path().join("x").exists());

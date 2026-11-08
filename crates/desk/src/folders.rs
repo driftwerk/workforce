@@ -219,13 +219,19 @@ mod tests {
         assert_eq!(one, t.home.join("dagr").to_string_lossy());
         assert!(t.home.join("dagr").is_dir());
         let deep = t.home.join("src/new/app");
-        assert_eq!(make(&deep.to_string_lossy(), home).unwrap(), deep.to_string_lossy());
+        assert_eq!(
+            make(&deep.to_string_lossy(), home).unwrap(),
+            deep.to_string_lossy()
+        );
         assert!(deep.is_dir());
         // There already: its answer, nothing made.
         assert_eq!(make("~/dagr", home).unwrap(), one);
         // Never outside the home, nor through `..`, `.`, a link out, or `~user`.
         let out = t.outside.join("x");
-        assert_eq!(make(&out.to_string_lossy(), home), Err(FolderError::OutsideHome));
+        assert_eq!(
+            make(&out.to_string_lossy(), home),
+            Err(FolderError::OutsideHome)
+        );
         assert!(!out.exists());
         assert_eq!(make("~/../escape", home), Err(FolderError::BadName));
         assert_eq!(make("~/./a", home), Err(FolderError::BadName));
