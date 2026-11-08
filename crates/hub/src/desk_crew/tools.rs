@@ -33,7 +33,7 @@ pub const READ: [&str; 5] = [
     super::spend::NAME,
     super::board::NAME,
 ];
-pub const ACT: [&str; 16] = [
+pub const ACT: [&str; 17] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -50,6 +50,7 @@ pub const ACT: [&str; 16] = [
     "crew.release",
     super::plan::NAME,
     super::plan::UPDATE,
+    super::handover::NAME,
 ];
 
 pub struct CrewTool {
@@ -430,6 +431,7 @@ impl Tool for CrewTool {
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
+            super::handover::NAME => super::handover::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
@@ -464,6 +466,7 @@ impl Tool for CrewTool {
             super::board::NAME => super::board::schema(),
             super::plan::NAME => super::plan::schema(),
             super::plan::UPDATE => super::plan::update_schema(),
+            super::handover::NAME => super::handover::schema(),
             "crew.activity" => json!({ "type": "object", "properties": {
                 "subject_id": { "type": "string", "description": "An agent or session id" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -597,6 +600,8 @@ impl Tool for CrewTool {
             self.read(&crew, &bound, &input).await
         } else if [super::plan::NAME, super::plan::UPDATE].contains(&self.name) {
             crew.plan_tool(self.name, &bound, &input).await
+        } else if self.name == super::handover::NAME {
+            crew.handover_tool(&bound, &input).await
         } else {
             self.act(&crew, &bound, &input).await
         };

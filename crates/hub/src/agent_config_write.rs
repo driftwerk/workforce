@@ -169,6 +169,79 @@ pub(crate) fn oversight_off(body: &str) -> Option<String> {
     Some(doc.to_string())
 }
 
+/// `body` with its `[oversight]` on and over `group` (none: everything
+/// ungrouped), everything else as it was. `None` when it doesn't parse or
+/// has no `[oversight]` table.
+pub(crate) fn oversight_of_group(body: &str, group: Option<&str>) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = body.parse().ok()?;
+    match doc.get_mut("oversight")? {
+        toml_edit::Item::Table(t) => {
+            t.insert("enabled", toml_edit::value(true));
+            match group {
+                Some(g) => {
+                    t.insert("group", toml_edit::value(g));
+                }
+                None => {
+                    t.remove("group");
+                }
+            }
+        }
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => {
+            t.insert("enabled", true.into());
+            match group {
+                Some(g) => {
+                    t.insert("group", g.into());
+                }
+                None => {
+                    t.remove("group");
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(doc.to_string())
+}
+
+/// Before `service`'s config goes from `before` to `body`: when it stops
+/// being the boss of a scope (moved to another, or switched off), what it
+/// remembered with no scope's tag is tagged with the scope it leaves, so
+/// nothing it learned there goes along (boss-gaps W8). A store that can't
+/// refuses the change.
+async fn keep_memory_to_scope(
+    service: &AgentService,
+    before: Option<&str>,
+    body: &str,
+) -> Result<(), Refused> {
+    use workforce_memory::group_tagged::{Fence, GROUP_TAG_PREFIX};
+    let fence = |b: Option<&str>| {
+        b.and_then(|b| workforce_common::settings::AgentWorkspaceConfig::parse(b).ok())
+            .and_then(|c| c.oversight().ok())
+            .map_or(Fence::Open, |o| crate::memory_fence::fence_of(&o))
+    };
+    let Fence::Boss(left) = fence(before) else {
+        return Ok(());
+    };
+    if fence(Some(body)) == Fence::Boss(left.clone()) {
+        return Ok(());
+    }
+    let Some(store) = service.memory_store.as_ref() else {
+        return Ok(());
+    };
+    match store
+        .add_tag(&service.agent_id, &left, GROUP_TAG_PREFIX)
+        .await
+    {
+        Ok(tagged) => {
+            tracing::info!(agent_id = %service.agent_id, scope = %left, tagged = tagged.len(), "A boss's memory is kept to the scope it leaves");
+            Ok(())
+        }
+        Err(e) => Err(Refused::Io(format!(
+            "what {} remembered couldn't be kept to the group it leaves, so its settings weren't changed: {e:#}",
+            service.agent_id
+        ))),
+    }
+}
+
 /// The group `body` names in `[oversight] group`, switched on or not.
 fn named_in(body: &str) -> Option<String> {
     let doc: toml::Table = toml::from_str(body).ok()?;
@@ -448,7 +521,9 @@ async fn save_one(
         }
         crate::workspace_admission::admit_workspace(service, body).map_err(Refused::Unloadable)
     };
-    admit(read(&path)?.as_deref())?;
+    let current = read(&path)?;
+    admit(current.as_deref())?;
+    keep_memory_to_scope(service, current.as_deref(), body).await?;
 
     tokio::fs::create_dir_all(&service.workspace)
         .await

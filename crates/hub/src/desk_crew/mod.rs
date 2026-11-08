@@ -31,6 +31,7 @@ mod actions;
 mod board;
 mod deliver;
 mod extras;
+mod handover;
 mod line;
 mod observe;
 mod plan;
@@ -46,6 +47,7 @@ mod work;
 pub(crate) mod tests;
 
 pub(crate) use extras::mentions_for;
+pub use handover::{handover_channel, HANDOVER};
 pub use observe::Observed;
 pub use plan::{plan_channel, PLAN};
 
@@ -649,6 +651,18 @@ impl Crew for CrewHub {
             self.desk.unbound_group(group).await;
         }
         Ok(())
+    }
+
+    async fn ask_handover(&self, h: &workforce_desk::moves::Handover, facts: &str) {
+        self.ask_handover_turn(h, facts).await;
+    }
+
+    async fn deliver_handover(&self, h: &workforce_desk::moves::Handover) -> Result<(), String> {
+        self.deliver_handover_turn(h).await
+    }
+
+    async fn move_boss(&self, agent: &str, to: Option<&str>, replace: bool) -> Result<(), String> {
+        self.move_boss_to(agent, to, replace).await
     }
 
     /// The main overseer: over everything ungrouped.
