@@ -1708,6 +1708,8 @@ impl Desk {
                 since: m.at,
                 place: crate::floor::Place::Session,
                 answer: crate::floor::Answer::Reply,
+                group: None,
+                boss: None,
             })
             .collect()
     }

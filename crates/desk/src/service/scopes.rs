@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 
 use crate::crew::{Event, Party, PartyKind};
+use crate::floor::{self, BossView, FloorView, Who};
 use crate::scope::{self, Scope, Seen};
 
 use super::{local_agent_item, session_item, Desk, Layout};
@@ -52,31 +53,68 @@ const OPENED: &str = "desk.groups.opened";
 
 impl Scopes {
     fn party_group(&self, p: &Party) -> Option<String> {
+        self.group_by(p.kind, &p.id)
+    }
+
+    /// The group what `kind` and `id` name is in now.
+    fn group_by(&self, kind: PartyKind, id: &str) -> Option<String> {
         let boss = || {
             self.bosses
                 .iter()
                 .flatten()
-                .find(|b| b.agent == p.id)
+                .find(|b| b.agent == id)
                 .map(|b| b.scope.group().map(str::to_string))
         };
-        match p.kind {
-            PartyKind::Session => {
-                p.id.parse()
-                    .ok()
-                    .and_then(|id| self.members.get(&session_item(id)).cloned())
-            }
+        match kind {
+            PartyKind::Session => id
+                .parse()
+                .ok()
+                .and_then(|id| self.members.get(&session_item(id)).cloned()),
             // A boss's own doing is its scope's, wherever its agent sits; an
             // agent of another hub is known as `hub/agent`.
             PartyKind::Agent => boss().unwrap_or_else(|| {
-                let item = match p.id.contains('/') {
-                    true => format!("agent:{}", p.id),
-                    false => local_agent_item(&p.id),
+                let item = match id.contains('/') {
+                    true => format!("agent:{id}"),
+                    false => local_agent_item(id),
                 };
                 self.members.get(&item).cloned()
             }),
             PartyKind::Manager => boss().flatten(),
             PartyKind::You | PartyKind::Desk => None,
         }
+    }
+
+    /// The group a Floor item about `who` is in now: its session's or
+    /// agent's, a boss's own work its scope's, and a group's budget held by
+    /// the breaker that group's.
+    fn floor_group(&self, who: &Who) -> Option<String> {
+        match who.kind {
+            PartyKind::Desk => who
+                .id
+                .strip_prefix("pool:group:")
+                .filter(|g| self.groups.contains_key(*g))
+                .map(str::to_string),
+            kind => self.group_by(kind, &who.id),
+        }
+    }
+
+    /// The groups closed to everyone but the person: named for a boss, with
+    /// no boss overseeing them now, and still in the sidebar.
+    fn sealed(&self) -> Vec<String> {
+        let bossing: HashSet<&str> = self
+            .bosses
+            .iter()
+            .flatten()
+            .filter_map(|b| b.scope.group())
+            .collect();
+        let mut sealed: Vec<String> = self
+            .bounded
+            .iter()
+            .filter(|g| !bossing.contains(g.as_str()) && self.groups.contains_key(*g))
+            .cloned()
+            .collect();
+        sealed.sort();
+        sealed
     }
 
     fn bossed(&self) -> HashSet<String> {
@@ -193,21 +231,48 @@ impl Desk {
     /// The groups closed to everyone but the person: named for a boss, with
     /// no boss overseeing them now (its config is off, or doesn't load).
     pub fn sealed(&self) -> Vec<String> {
+        self.0.scopes.lock().sealed()
+    }
+
+    /// `view` with each need and piece of work stamped with the group it is
+    /// in now and that group's own boss, and the sealed groups said: for
+    /// the person, who sees across groups.
+    pub fn stamp_floor(&self, view: &mut FloorView) {
         let s = self.0.scopes.lock();
-        let bossing: HashSet<&str> = s
+        let bossing: HashMap<&str, &str> = s
             .bosses
             .iter()
             .flatten()
-            .filter_map(|b| b.scope.group())
+            .filter_map(|b| Some((b.scope.group()?, b.agent.as_str())))
             .collect();
-        let mut sealed: Vec<String> = s
-            .bounded
-            .iter()
-            .filter(|g| !bossing.contains(g.as_str()) && s.groups.contains_key(*g))
-            .cloned()
-            .collect();
-        sealed.sort();
-        sealed
+        floor::stamp(
+            view,
+            |who| s.floor_group(who),
+            |group| bossing.get(group).map(|a| a.to_string()),
+        );
+        view.sealed = s.sealed();
+    }
+
+    /// The overseers there are, as the Floor heads their sections: whether
+    /// each is in a turn on `view`, what holds it, and its group's budget.
+    pub async fn floor_bosses(&self, view: &FloorView) -> Vec<BossView> {
+        let bosses = self.bosses();
+        if bosses.is_empty() {
+            return Vec::new();
+        }
+        let spend = self.group_standings().await;
+        bosses
+            .into_iter()
+            .map(|b| BossView {
+                state: floor::boss_state(view, &b.agent),
+                paused: self.agent_held(&b.agent),
+                spend: b.scope.group().and_then(|g| spend.get(g).cloned()),
+                scope: b.scope,
+                agent: b.agent,
+                name: b.name,
+                level: b.level,
+            })
+            .collect()
     }
 
     /// The person took the boss off `group`: the main overseer sees it from

@@ -507,6 +507,8 @@ mod tests {
             since: Utc::now() - Duration::minutes(5),
             place: Place::Dm,
             answer: Answer::Reply,
+            group: None,
+            boss: None,
         }
     }
 

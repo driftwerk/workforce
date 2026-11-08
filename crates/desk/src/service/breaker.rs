@@ -434,6 +434,8 @@ impl Desk {
                     answer: Answer::Decide {
                         at: DecideRef::Breaker { subject },
                     },
+                    group: None,
+                    boss: None,
                 })
             })
             .collect()
@@ -1252,6 +1254,37 @@ impl Desk {
             breakers: self.breakers(),
             rules: self.rules(),
         })
+    }
+
+    /// Each group's own budget, the furthest along, by group id: none
+    /// counted when no group has one, and none when they can't be counted
+    /// now (Desk doesn't know the timezone yet, or the ledger can't be read).
+    pub async fn group_standings(&self) -> HashMap<String, Standing> {
+        let any = self
+            .budget_list()
+            .iter()
+            .any(|b| b.scope == BudgetScope::Desk && b.group.is_some());
+        if !any {
+            return HashMap::new();
+        }
+        let view = match self.budgets_view().await {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::debug!(error = %e, "the groups' budgets can't be counted now");
+                return HashMap::new();
+            }
+        };
+        let mut by: HashMap<String, Vec<Standing>> = HashMap::new();
+        for v in view.budgets {
+            if let (BudgetScope::Desk, Some(group), Some(standing)) =
+                (&v.budget.scope, v.budget.group, v.standing)
+            {
+                by.entry(group).or_default().push(standing);
+            }
+        }
+        by.into_iter()
+            .filter_map(|(g, s)| Some((g, budget::tightest(s)?)))
+            .collect()
     }
 
     fn check_new(&self, b: &Budget) -> Result<(), DeskError> {

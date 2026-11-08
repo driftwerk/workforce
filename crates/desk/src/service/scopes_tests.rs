@@ -605,3 +605,237 @@ async fn a_group_closed_for_a_write_that_didnt_happen_is_forgotten_across_a_rest
     })
     .await;
 }
+
+/// A Floor of what `whos` are doing: one need and one turn running each.
+fn floor_of(whos: &[crate::floor::Who]) -> crate::floor::FloorView {
+    use crate::floor::{Answer, FloorView, More, Need, NeedKind, Place, Work};
+    let now = Utc::now();
+    FloorView {
+        as_of: now,
+        needs: whos
+            .iter()
+            .map(|who| Need {
+                id: format!("need:{}", who.id),
+                kind: NeedKind::Question,
+                who: who.clone(),
+                ask: "Go on?".into(),
+                why: None,
+                options: None,
+                chose: None,
+                since: now,
+                place: Place::Elsewhere,
+                answer: Answer::Reply,
+                group: None,
+                boss: None,
+            })
+            .collect(),
+        went_ahead: vec![],
+        working: whos
+            .iter()
+            .map(|who| Work {
+                who: who.clone(),
+                what: "working".into(),
+                place: Place::Elsewhere,
+                since: now,
+                heard_at: now,
+                ended_at: None,
+                outcome: None,
+                background: None,
+                gist: None,
+                group: None,
+                boss: None,
+            })
+            .collect(),
+        done: vec![],
+        lanes: vec![],
+        counts: Default::default(),
+        more: More::default(),
+        summary: None,
+        bosses: vec![],
+        sealed: vec![],
+    }
+}
+
+fn who(kind: crate::crew::PartyKind, id: &str) -> crate::floor::Who {
+    crate::floor::Who {
+        kind,
+        id: id.into(),
+        name: id.into(),
+        engine: None,
+    }
+}
+
+/// Each need's and each turn's group and boss, by who it is.
+fn placed(v: &crate::floor::FloorView) -> Vec<(String, Option<String>, Option<String>)> {
+    let needs = v
+        .needs
+        .iter()
+        .map(|n| (n.who.id.clone(), n.group.clone(), n.boss.clone()));
+    let work: Vec<_> = v
+        .working
+        .iter()
+        .map(|w| (w.who.id.clone(), w.group.clone(), w.boss.clone()))
+        .collect();
+    let needs: Vec<_> = needs.collect();
+    assert_eq!(needs, work, "a need and its work are placed alike");
+    needs
+}
+
+#[tokio::test]
+async fn the_floor_shows_each_item_in_its_group_now_with_that_groups_own_boss() {
+    use crate::crew::PartyKind;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        d.change_layout(|l| l.put(&session_item(s.id), "acme", None))
+            .await
+            .unwrap();
+        let whos = [
+            who(PartyKind::Session, &s.id.to_string()),
+            who(PartyKind::Agent, "scout"),
+            // A boss's own work is its scope's, wherever its agent sits.
+            who(PartyKind::Agent, "sarah"),
+            who(PartyKind::Agent, "infra-bot"),
+            who(PartyKind::Agent, "blog-bot"),
+            // Acme's budget, held by the breaker.
+            who(PartyKind::Desk, "pool:group:acme"),
+            who(PartyKind::Desk, "pool:desk"),
+        ];
+        let mut v = floor_of(&whos);
+        d.stamp_floor(&mut v);
+        let in_acme = || (Some("acme".to_string()), Some("sarah".to_string()));
+        let at = |(g, b): (Option<String>, Option<String>), id: &str| (id.to_string(), g, b);
+        assert_eq!(
+            placed(&v),
+            [
+                at(in_acme(), &s.id.to_string()),
+                at(in_acme(), "scout"),
+                at(in_acme(), "sarah"),
+                // A group with no boss of its own: its group, no boss.
+                at((Some("infra".into()), None), "infra-bot"),
+                // Ungrouped: neither.
+                at((None, None), "blog-bot"),
+                at(in_acme(), "pool:group:acme"),
+                at((None, None), "pool:desk"),
+            ]
+        );
+        assert!(v.sealed.is_empty());
+
+        // Moved to Atlas, the session shows in Atlas with Mia.
+        d.change_layout(|l| l.put(&session_item(s.id), "atlas", None))
+            .await
+            .unwrap();
+        let mut v = floor_of(&whos[..1]);
+        d.stamp_floor(&mut v);
+        assert_eq!(
+            placed(&v),
+            [at(
+                (Some("atlas".into()), Some("mia".into())),
+                &s.id.to_string()
+            )]
+        );
+
+        // The bosses head their sections: Sarah in a turn, the others idle,
+        // with no budget to stand against.
+        let mut v = floor_of(&whos);
+        d.stamp_floor(&mut v);
+        let bosses = d.floor_bosses(&v).await;
+        let heads: Vec<_> = bosses
+            .iter()
+            .map(|b| {
+                (
+                    b.agent.as_str(),
+                    b.scope.clone(),
+                    b.state,
+                    b.spend.is_some(),
+                )
+            })
+            .collect();
+        use crate::floor::BossState::{Idle, Working};
+        assert_eq!(
+            heads,
+            [
+                ("desk", Scope::Ungrouped, Idle, false),
+                ("sarah", acme(), Working, false),
+                ("mia", Scope::Group("atlas".into()), Idle, false),
+            ]
+        );
+        assert!(bosses.iter().all(|b| b.paused.is_none()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sealed_groups_items_carry_their_group_and_no_boss_and_the_floor_says_it_is_sealed() {
+    use crate::crew::PartyKind;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        // Sarah's config doesn't load: no boss oversees Acme now, but one is
+        // named for it.
+        d.set_bosses(vec![bosses().remove(0)]);
+        d.bound_groups(["acme".to_string()]).await;
+        let mut v = floor_of(&[
+            who(PartyKind::Agent, "scout"),
+            who(PartyKind::Agent, "infra-bot"),
+        ]);
+        d.stamp_floor(&mut v);
+        assert_eq!(
+            placed(&v),
+            [
+                ("scout".to_string(), Some("acme".to_string()), None),
+                ("infra-bot".to_string(), Some("infra".to_string()), None),
+            ]
+        );
+        assert_eq!(v.sealed, ["acme"], "Acme is no one's, not the main boss's");
+        let bosses = d.floor_bosses(&v).await;
+        assert_eq!(
+            bosses.iter().map(|b| b.agent.as_str()).collect::<Vec<_>>(),
+            ["desk"]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_groups_boss_has_its_groups_budget_standing_on_the_floor() {
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        d.count_budgets_in(chrono_tz::UTC);
+        d.put_budget(
+            NewBudget {
+                scope: BudgetScope::Desk,
+                group: Some("acme".into()),
+                period: Period::Day,
+                unit: Unit::Usd,
+                amount: 40.0,
+                warn_at: None,
+                on_exceed: None,
+            },
+            crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
+        let v = floor_of(&[]);
+        let bosses = d.floor_bosses(&v).await;
+        let spend = |agent: &str| {
+            bosses
+                .iter()
+                .find(|b| b.agent == agent)
+                .unwrap()
+                .spend
+                .as_ref()
+                .map(|s| s.of)
+        };
+        assert_eq!(spend("sarah"), Some(40.0));
+        assert_eq!(spend("mia"), None, "Atlas has no budget of its own");
+        assert_eq!(spend("desk"), None, "the main boss's section has none");
+    })
+    .await;
+}

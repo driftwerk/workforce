@@ -708,6 +708,8 @@ fn desk_memory_need(id: &str, ask: &str, since: DateTime<Utc>) -> Need {
         since,
         place: Place::Elsewhere,
         answer: Answer::Reply,
+        group: None,
+        boss: None,
     }
 }
 

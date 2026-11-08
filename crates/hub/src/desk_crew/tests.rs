@@ -1998,6 +1998,94 @@ mod floor {
         .await;
     }
 
+    /// The Floor read by the person who holds the Desk is by their sidebar:
+    /// each of the hub's own items in its group now, with that group's
+    /// boss, and the bosses there are. Anyone else's has neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_floor_is_by_group_for_the_person_who_holds_the_desk_alone() {
+        use workforce_desk::floor::{FloorView, Gists, Who, Work};
+        use workforce_desk::scope::Scope as Overseen;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            with_test_pool(PgFloorStore::build_pool, |floor_pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let installed = Installed::open(PgFloorStore::with_pool(floor_pool).await.unwrap());
+                let d = desk_with(
+                    pool,
+                    dir.path(),
+                    workforce_desk::Floor {
+                        turns: Some(Arc::clone(&installed.log)),
+                        plans: None,
+                        pricer: None,
+                        redactor: None,
+                        index: None,
+                    },
+                )
+                .await;
+                let sources = Sources::new(installed, {
+                    let d = d.clone();
+                    Arc::new(move || Some(d.clone()))
+                });
+                let s = new_session(&d, dir.path(), "acme-api").await;
+                d.change_layout(|l| {
+                    l.create("acme", "Acme", &[workforce_desk::session_item(s.id)], None)
+                })
+                .await
+                .unwrap();
+                d.set_bosses(vec![workforce_desk::Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: Overseen::Group("acme".into()),
+                    level: "act".into(),
+                }]);
+                let now = chrono::Utc::now();
+                let view = || {
+                    let mut v: FloorView =
+                        workforce_desk::floor::view(&[], vec![], &Gists::new(), now, now);
+                    v.working.push(Work {
+                        who: Who {
+                            kind: PartyKind::Session,
+                            id: s.id.to_string(),
+                            name: "acme-api".into(),
+                            engine: None,
+                        },
+                        what: "Fixing the checkout.".into(),
+                        place: Place::Session,
+                        since: now,
+                        heard_at: now,
+                        ended_at: None,
+                        outcome: None,
+                        background: None,
+                        gist: None,
+                        group: None,
+                        boss: None,
+                    });
+                    v
+                };
+                let mut mine = view();
+                crate::desk_floor::by_group(&sources, &me(true), &mut mine).await;
+                assert_eq!(
+                    (
+                        mine.working[0].group.as_deref(),
+                        mine.working[0].boss.as_deref()
+                    ),
+                    (Some("acme"), Some("sarah"))
+                );
+                assert_eq!(
+                    mine.bosses
+                        .iter()
+                        .map(|b| b.agent.as_str())
+                        .collect::<Vec<_>>(),
+                    ["sarah"]
+                );
+                let mut theirs = view();
+                crate::desk_floor::by_group(&sources, &me(false), &mut theirs).await;
+                assert_eq!(theirs, view(), "not theirs to see by group");
+            })
+            .await;
+        })
+        .await;
+    }
+
     /// A boss never lets a breaker go: no crew tool answers a need, and
     /// none is about the breaker.
     #[test]

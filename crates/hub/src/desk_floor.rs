@@ -330,6 +330,8 @@ fn routed_need(row: &PendingApproval, detail: &str, place: Place, name: String) 
                 request_id: row.request_id.clone(),
             },
         },
+        group: None,
+        boss: None,
     }
 }
 
@@ -432,6 +434,8 @@ pub(crate) fn config_need(
                 hash: elsewhere.hash.clone(),
             },
         },
+        group: None,
+        boss: None,
     }
 }
 
@@ -498,6 +502,19 @@ fn line_went_ahead(sources: &Sources, caller: &FloorCaller) -> Vec<floor::WentAh
         Some(desk) if caller.personal => desk.line_went_ahead_list(),
         _ => Vec::new(),
     }
+}
+
+/// `view` by the person's sidebar, for the person who holds the hub's Desk:
+/// each item stamped with the group it is in now and that group's boss, the
+/// bosses, and the sealed groups. Only this hub's own sessions and agents
+/// are stamped: another hub's and a machine's are Desk's to place by their
+/// keys in its layout.
+pub(crate) async fn by_group(sources: &Sources, caller: &FloorCaller, view: &mut floor::FloorView) {
+    let Some(desk) = (sources.desk)().filter(|_| caller.personal) else {
+        return;
+    };
+    desk.stamp_floor(view);
+    view.bosses = desk.floor_bosses(view).await;
 }
 
 /// What still needs the person: what their turns wait on and ask, the
@@ -627,6 +644,7 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
         });
         let mut view = floor::view(&turns, needs, &gists, day, now);
         view.went_ahead = line_went_ahead(&sources, &caller);
+        by_group(&sources, &caller, &mut view).await;
         let happening = floor::happening(&view, now);
         view.summary = sources.floor.gists.summary(&scope, happening, now).await;
         eyre::Ok(view)
