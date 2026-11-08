@@ -129,7 +129,7 @@ async fn start(
 
 /// Waits until `check` holds, poking the worker meanwhile.
 async fn until(d: &Desk, what: &str, mut check: impl AsyncFnMut() -> bool) {
-    for _ in 0..400 {
+    for _ in 0..600 {
         if check().await {
             return;
         }
@@ -618,7 +618,7 @@ async fn start_indexed(
 
 /// Waits until `check` holds, poking both workers meanwhile.
 async fn until_indexed(d: &Desk, what: &str, mut check: impl AsyncFnMut() -> bool) {
-    for _ in 0..400 {
+    for _ in 0..600 {
         if check().await {
             return;
         }
@@ -738,8 +738,8 @@ async fn notes_reach_the_index_and_recall_ranked_above_exchanges_and_go_when_for
         );
         assert_eq!(index.refs(UNGROUPED_COLLECTION).len(), 3);
 
-        // A replaced note is written again, no longer valid, and recalled
-        // labelled below its replacement.
+        // A replaced note leaves the index (Postgres keeps it), and only its
+        // replacement is recalled.
         let client = store.pool().get().await.unwrap();
         client
             .execute(
@@ -757,21 +757,33 @@ async fn notes_reach_the_index_and_recall_ranked_above_exchanges_and_go_when_for
         })
         .to_string()));
         d.derive_now(s).await.unwrap();
-        until_indexed(&d, "the replaced note is written again", async || {
-            index
-                .all()
-                .iter()
-                .any(|p| p.of == decision && !p.valid)
+        until_indexed(&d, "the replaced note goes and its replacement is written", async || {
+            let refs = index.refs(UNGROUPED_COLLECTION);
+            !refs.contains(&decision) && refs.len() == 4
         })
         .await;
-        until_indexed(&d, "its replacement is written", async || {
-            index.refs(UNGROUPED_COLLECTION).len() == 5
-        })
-        .await;
+        assert!(index.all().iter().all(|p| p.valid));
         let found = search("HttpOnly cookie", Some(vec![PassageKind::Decision])).await;
-        assert_eq!(found.hits.len(), 2);
+        assert_eq!(found.hits.len(), 1);
         assert!(!found.hits[0].hit.superseded);
-        assert!(found.hits[1].hit.superseded, "shown, labelled, below");
+        assert!(found.hits[0].hit.answer.contains("server-side"));
+        assert_eq!(
+            q::<i64>(&store, "SELECT COUNT(*) FROM memory_items WHERE id = $1 AND valid_to IS NOT NULL", &[&decision]).await,
+            1,
+            "Postgres keeps what was replaced"
+        );
+        // A restart's reconcile doesn't write it again.
+        cancel.cancel();
+        let (d, cancel) = start_indexed(&pool, dir.path(), &deriver, &index).await;
+        until_indexed(&d, "reconciled again", async || {
+            d.memory_index_status().await.unwrap().reconciled.is_some()
+        })
+        .await;
+        for _ in 0..8 {
+            d.memory_index_poke();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!index.refs(UNGROUPED_COLLECTION).contains(&decision));
 
         // Dropped: its passage goes.
         d.change_memory_item(todo, &ItemChange::Drop).await.unwrap();

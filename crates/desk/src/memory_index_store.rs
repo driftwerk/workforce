@@ -54,7 +54,8 @@ fn row_columns() -> String {
 }
 
 /// A note's passage's version: its kind, its text and whether it still
-/// holds, kept apart.
+/// holds, kept apart. Only notes still held are in the index: one replaced
+/// is purged from it, and stays in Postgres for the panel.
 const ITEM_VERSION: &str = "md5(kind || chr(31) || text || chr(31) || (valid_to IS NULL)::text)";
 
 /// [`ITEM_VERSION`] of the row `prefix` names (`m.`).
@@ -165,7 +166,7 @@ impl DeskStore {
                 .query(
                     &format!(
                         "SELECT {} FROM memory_items \
-                         WHERE indexed_at IS NULL AND index_tries < $2 \
+                         WHERE indexed_at IS NULL AND valid_to IS NULL AND index_tries < $2 \
                          ORDER BY written_at, id LIMIT $1",
                         item_columns()
                     ),
@@ -215,7 +216,7 @@ impl DeskStore {
                        AND {BELONGS} AND index_tries < $4 \
                        AND ($1 OR group_id = ANY($2) OR ($3 AND group_id IS NULL))) \
                      + (SELECT COUNT(*) FROM memory_items WHERE indexed_at IS NULL \
-                       AND index_tries < $4 \
+                       AND valid_to IS NULL AND index_tries < $4 \
                        AND ($1 OR group_id = ANY($2) OR ($3 AND group_id IS NULL)))"
                 ),
                 &[&any, &named, &ungrouped, &INDEX_TRIES],
@@ -230,7 +231,8 @@ impl DeskStore {
         let sql = format!(
             "SELECT (SELECT COUNT(*) FROM memory_exchanges WHERE {g} AND indexed_at IS NULL \
                AND {BELONGS}) \
-             + (SELECT COUNT(*) FROM memory_items WHERE {g} AND indexed_at IS NULL)",
+             + (SELECT COUNT(*) FROM memory_items WHERE {g} AND indexed_at IS NULL \
+               AND valid_to IS NULL)",
             g = group_is(group, 1)
         );
         let row = match group {
@@ -246,7 +248,8 @@ impl DeskStore {
         let sql = format!(
             "SELECT EXISTS (SELECT 1 FROM memory_exchanges WHERE {g} AND indexed_at IS NOT NULL \
                AND {BELONGS}) \
-             OR EXISTS (SELECT 1 FROM memory_items WHERE {g} AND indexed_at IS NOT NULL)",
+             OR EXISTS (SELECT 1 FROM memory_items WHERE {g} AND indexed_at IS NOT NULL \
+               AND valid_to IS NULL)",
             g = group_is(group, 1)
         );
         let row = match group {
@@ -299,7 +302,8 @@ impl DeskStore {
             group_is(group, 1)
         );
         let notes = format!(
-            "UPDATE memory_items SET indexed_at = NULL WHERE {} AND indexed_at IS NOT NULL",
+            "UPDATE memory_items SET indexed_at = NULL WHERE {} AND indexed_at IS NOT NULL \
+             AND valid_to IS NULL",
             group_is(group, 1)
         );
         Ok(match group {
@@ -343,7 +347,7 @@ impl DeskStore {
         let notes = client
             .execute(
                 "UPDATE memory_items SET index_tries = 0 \
-                 WHERE indexed_at IS NULL AND index_tries >= $1",
+                 WHERE indexed_at IS NULL AND valid_to IS NULL AND index_tries >= $1",
                 &[&INDEX_TRIES],
             )
             .await?;
@@ -369,7 +373,7 @@ impl DeskStore {
                     "SELECT (SELECT COUNT(*) FROM memory_exchanges \
                        WHERE indexed_at IS NULL AND {BELONGS} AND index_tries >= $1) \
                      + (SELECT COUNT(*) FROM memory_items \
-                       WHERE indexed_at IS NULL AND index_tries >= $1)"
+                       WHERE indexed_at IS NULL AND valid_to IS NULL AND index_tries >= $1)"
                 ),
                 &[&INDEX_TRIES],
             )
@@ -382,7 +386,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let notes = client
             .execute(
-                "UPDATE memory_items SET indexed_at = NULL WHERE id = ANY($1)",
+                "UPDATE memory_items SET indexed_at = NULL WHERE id = ANY($1) AND valid_to IS NULL",
                 &[&ids],
             )
             .await?;
@@ -431,7 +435,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let sql = format!(
             "SELECT {} FROM memory_items \
-             WHERE {} AND indexed_at IS NOT NULL \
+             WHERE {} AND indexed_at IS NOT NULL AND valid_to IS NULL \
                AND ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2",
             item_columns(),
             group_is(group, 3)
@@ -453,7 +457,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let sql = format!(
             "SELECT id FROM memory_exchanges WHERE id = ANY($1) AND {g} AND {BELONGS} \
-             UNION SELECT id FROM memory_items WHERE id = ANY($1) AND {g}",
+             UNION SELECT id FROM memory_items WHERE id = ANY($1) AND {g} AND valid_to IS NULL",
             g = group_is(group, 2)
         );
         let rows = match group {
@@ -808,7 +812,7 @@ impl DeskStore {
                         "SELECT id, ts_rank_cd(to_tsvector('simple', text), query, 32), valid_from \
                          FROM memory_items, websearch_to_tsquery('simple', $1) query \
                          WHERE to_tsvector('simple', text) @@ query AND kind = ANY($8) \
-                           AND (NOT $2 OR indexed_at IS NULL) AND {} \
+                           AND valid_to IS NULL AND (NOT $2 OR indexed_at IS NULL) AND {} \
                          ORDER BY 2 DESC, valid_from DESC LIMIT $3",
                         bound_sql(4)
                     ),

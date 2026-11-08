@@ -423,14 +423,24 @@ impl DeskStore {
                 continue;
             };
             // A note the person changed meanwhile stays as they left it.
-            tx.execute(
-                "UPDATE memory_items SET valid_to = $3, superseded_by = $4, indexed_at = NULL \
-                 WHERE id = $1 AND session = $2 AND valid_to IS NULL AND NOT confirmed \
-                   AND by <> 'person'",
-                &[&s.id, &session, &s.valid_to, by],
-            )
-            .await
-            .context("replacing a note")?;
+            let replaced = tx
+                .execute(
+                    "UPDATE memory_items SET valid_to = $3, superseded_by = $4 \
+                     WHERE id = $1 AND session = $2 AND valid_to IS NULL AND NOT confirmed \
+                       AND by <> 'person'",
+                    &[&s.id, &session, &s.valid_to, by],
+                )
+                .await
+                .context("replacing a note")?;
+            // What it replaced leaves the search index; Postgres keeps it.
+            if replaced > 0 {
+                crate::memory_store::queue_purge(
+                    &tx,
+                    a.group,
+                    &crate::memory::passage::Purge::Refs { refs: vec![s.id] },
+                )
+                .await?;
+            }
         }
         for c in &a.applied.close {
             tx.execute(
@@ -561,17 +571,17 @@ impl DeskStore {
             &[&id],
         )
         .await?;
-        let held = tx
+        let Some(held) = tx
             .query_opt(
-                "SELECT 1 FROM memory_items WHERE id = $1 AND valid_to IS NULL FOR UPDATE",
+                "SELECT group_id FROM memory_items WHERE id = $1 AND valid_to IS NULL FOR UPDATE",
                 &[&id],
             )
             .await?
-            .is_some();
-        if !held {
+        else {
             tx.rollback().await?;
             return Ok(None);
-        }
+        };
+        let group: Option<String> = held.try_get(0)?;
         let new = Uuid::new_v4();
         tx.execute(
             "INSERT INTO memory_items (id, session, group_id, project, kind, text, state, \
@@ -584,9 +594,14 @@ impl DeskStore {
         .await
         .context("correcting a note")?;
         tx.execute(
-            "UPDATE memory_items SET valid_to = now(), superseded_by = $2, indexed_at = NULL \
-             WHERE id = $1",
+            "UPDATE memory_items SET valid_to = now(), superseded_by = $2 WHERE id = $1",
             &[&id, &new],
+        )
+        .await?;
+        crate::memory_store::queue_purge(
+            &tx,
+            group.as_deref(),
+            &crate::memory::passage::Purge::Refs { refs: vec![id] },
         )
         .await?;
         tx.commit().await?;
