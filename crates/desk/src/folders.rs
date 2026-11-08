@@ -45,6 +45,8 @@ pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError>
     use std::path::Component;
     let home = home
         .and_then(|h| h.canonicalize().ok())
+        // A home that is the whole disk is no home to make folders in.
+        .filter(|h| h.parent().is_some())
         .ok_or(FolderError::NoHome)?;
     let r = requested.trim();
     // As typed: a path drops a `.` inside it as it is read.
@@ -97,7 +99,12 @@ pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError>
             Err(_) => return Err(FolderError::NotMade),
         }
     }
-    Ok(made.to_string_lossy().into_owned())
+    // What was made, as the disk has it now, is still inside the home.
+    let real = made.canonicalize().map_err(|_| FolderError::NotMade)?;
+    if !real.starts_with(&home) {
+        return Err(FolderError::OutsideHome);
+    }
+    Ok(real.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -247,6 +254,12 @@ mod tests {
         // Too deep at once.
         assert_eq!(make("~/1/2/3/4/5/6/7/8/9", home), Err(FolderError::BadName));
         assert_eq!(make("~/x", None), Err(FolderError::NoHome));
+        // A home that resolves to `/`: nothing is made anywhere.
+        assert_eq!(
+            make("/tmp/desk-made-x", Some(Path::new("/"))),
+            Err(FolderError::NoHome)
+        );
+        assert!(!Path::new("/tmp/desk-made-x").exists());
     }
 
     fn names(l: &Listing) -> Vec<&str> {

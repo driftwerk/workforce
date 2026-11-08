@@ -1006,6 +1006,7 @@ async fn folders(State(s): S, h: HeaderMap, Query(q): Query<FolderParams>) -> Re
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MakeFolder {
     path: String,
 }
@@ -2346,6 +2347,16 @@ mod tests {
                 assert!(status == 403 || status == 400, "{path}: {status}");
             }
             assert!(!dir.path().join("x").exists());
+            // Only the path: anything else said is refused.
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/folders",
+                Some(json!({"path": "~/other", "mode": "777"})),
+            )
+            .await;
+            assert!((400..500).contains(&status), "{status}");
+            assert!(!home.join("other").exists());
         })
         .await;
     }
