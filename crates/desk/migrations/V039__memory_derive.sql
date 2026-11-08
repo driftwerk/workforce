@@ -12,3 +12,14 @@ CREATE TABLE memory_derive_days (
     day   DATE PRIMARY KEY,
     calls INT  NOT NULL DEFAULT 0
 );
+
+-- How far each session's exchanges in each group were read for notes: a
+-- group whose sessions aren't read yet holds only its own place, so the
+-- session's later work elsewhere is still noted. `group_key` is the
+-- group's id, or '' for ungrouped work.
+CREATE TABLE memory_derive_reads (
+    session    UUID NOT NULL,
+    group_key  TEXT NOT NULL,
+    derived_to INT  NOT NULL DEFAULT 0,
+    PRIMARY KEY (session, group_key)
+);

@@ -10,14 +10,16 @@ use uuid::Uuid;
 
 use crate::memory::passage::{IndexRow, PassageKind, Purge};
 use crate::memory::reach::Bound;
+use crate::memory_derive_store::ITEMS_LOCKED;
 use crate::memory_store::queue_purge_of;
 use crate::store::DeskStore;
 
 /// Session memory's tables, as their data is measured.
-const MEMORY_TABLES: [&str; 7] = [
+const MEMORY_TABLES: [&str; 8] = [
     "memory_exchanges",
     "memory_items",
     "memory_derive",
+    "memory_derive_reads",
     "memory_reads",
     "memory_forgotten",
     "memory_purges",
@@ -267,9 +269,10 @@ impl DeskStore {
         let notes = client
             .execute(
                 &format!(
-                    "UPDATE memory_items m SET indexed_at = now(), index_tries = 0 \
-                     FROM unnest($1::uuid[], $2::text[]) AS v(id, version) \
-                     WHERE m.id = v.id AND {} = v.version",
+                    "WITH l AS ({ITEMS_LOCKED}) \
+                     UPDATE memory_items m SET indexed_at = now(), index_tries = 0 \
+                     FROM l JOIN unnest($1::uuid[], $2::text[]) AS v(id, version) ON v.id = l.id \
+                     WHERE m.id = l.id AND m.valid_to IS NULL AND {} = v.version",
                     item_version_of("m.")
                 ),
                 &[&ids, &versions],
@@ -302,8 +305,9 @@ impl DeskStore {
             group_is(group, 1)
         );
         let notes = format!(
-            "UPDATE memory_items SET indexed_at = NULL WHERE {} AND indexed_at IS NOT NULL \
-             AND valid_to IS NULL",
+            "UPDATE memory_items SET indexed_at = NULL WHERE id IN ( \
+               SELECT id FROM memory_items WHERE {} AND indexed_at IS NOT NULL \
+               AND valid_to IS NULL ORDER BY id FOR UPDATE)",
             group_is(group, 1)
         );
         Ok(match group {
@@ -329,8 +333,10 @@ impl DeskStore {
         rows.extend(
             client
                 .query(
-                    "UPDATE memory_items SET index_tries = index_tries + 1 \
-                     WHERE id = ANY($1) RETURNING id, index_tries",
+                    &format!(
+                        "UPDATE memory_items SET index_tries = index_tries + 1 \
+                         WHERE id IN ({ITEMS_LOCKED}) RETURNING id, index_tries"
+                    ),
                     &[&ids],
                 )
                 .await?,
@@ -346,8 +352,10 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let notes = client
             .execute(
-                "UPDATE memory_items SET index_tries = 0 \
-                 WHERE indexed_at IS NULL AND valid_to IS NULL AND index_tries >= $1",
+                "UPDATE memory_items SET index_tries = 0 WHERE id IN ( \
+                   SELECT id FROM memory_items \
+                   WHERE indexed_at IS NULL AND valid_to IS NULL AND index_tries >= $1 \
+                   ORDER BY id FOR UPDATE)",
                 &[&INDEX_TRIES],
             )
             .await?;
@@ -386,7 +394,10 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let notes = client
             .execute(
-                "UPDATE memory_items SET indexed_at = NULL WHERE id = ANY($1) AND valid_to IS NULL",
+                &format!(
+                    "UPDATE memory_items SET indexed_at = NULL \
+                     WHERE id IN ({ITEMS_LOCKED}) AND valid_to IS NULL"
+                ),
                 &[&ids],
             )
             .await?;
@@ -607,8 +618,9 @@ impl DeskStore {
             )
             .await?
             + tx.execute(
-                "UPDATE memory_items SET indexed_at = NULL, index_tries = 0 \
-                     WHERE indexed_at IS NOT NULL OR index_tries > 0",
+                "UPDATE memory_items SET indexed_at = NULL, index_tries = 0 WHERE id IN ( \
+                       SELECT id FROM memory_items WHERE indexed_at IS NOT NULL OR index_tries > 0 \
+                       ORDER BY id FOR UPDATE)",
                 &[],
             )
             .await?;

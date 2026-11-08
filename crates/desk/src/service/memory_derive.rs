@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError, UNGROUPED};
 use crate::memory::derive::{self, Deriver, Input, InputExchange, ItemKind, ItemState};
-use crate::memory_derive_store::{Apply, Claim, ItemRow, Unread};
+use crate::memory_derive_store::{model_name, Apply, Claim, ItemRow, Unread, UnreadGroup};
 
 /// How long a claim holds while its model call runs: past it, a hub that
 /// stopped mid-call finds the session due again.
@@ -127,6 +127,13 @@ pub struct Notes {
     pub why: Option<String>,
     /// Exchanges not yet read for notes.
     pub unread: i64,
+    /// Whose model writes the notes: the provider the floor's cheap model
+    /// runs on, under the hub's own account (`anthropic`, `codex`, ...).
+    pub provider: Option<String>,
+    /// The floor may write on another provider when that one can't
+    /// (`[floor] fallback_providers`); never for a Desk session today, whose
+    /// call has no person's login in scope.
+    pub fallback_providers: bool,
 }
 
 /// What the person does to a note.
@@ -236,33 +243,50 @@ impl Desk {
         let Some(claim) = self.0.store.derive_claim(LEASE.as_secs_f64()).await? else {
             return Ok(Did::Idle);
         };
+        // Each group is read on its own: the first whose sessions may be
+        // read, so one that may not holds only its own place.
+        let mut chosen: Option<UnreadGroup> = None;
+        let mut others = false;
+        for g in self.0.store.derive_unread_groups(claim.session).await? {
+            let facts = self
+                .0
+                .store
+                .derive_facts(claim.session, g.group.as_deref())
+                .await?;
+            if facts.paused || facts.session_off {
+                // Nothing of the session is sent; what it said waits.
+                self.0.store.derive_release(&claim, None).await?;
+                return Ok(Did::Work);
+            }
+            match (facts.group_on, chosen.is_some()) {
+                (true, false) => chosen = Some(g),
+                (true, true) => others = true,
+                (false, _) => {}
+            }
+        }
+        let Some(read) = chosen else {
+            // Nothing closed to read, or only in groups not read yet: due
+            // again as a turn ends, or the person lets them be read.
+            self.0.store.derive_release(&claim, None).await?;
+            return Ok(Did::Work);
+        };
+        let group = read.group.clone();
         let unread = self
             .0
             .store
             .derive_unread(
                 claim.session,
-                claim.derived_to,
+                group.as_deref(),
+                read.from,
                 i64::try_from(derive::BATCH).unwrap_or(12) + 1,
             )
             .await?;
-        let (rows, backlog) = batch(&unread);
+        let (rows, more) = batch(&unread);
+        let backlog = more || others;
         let Some(last) = rows.last() else {
-            // Nothing closed to read yet: due again as its turn ends.
             self.0.store.derive_release(&claim, None).await?;
             return Ok(Did::Work);
         };
-        let group = rows[0].group.clone();
-        let facts = self
-            .0
-            .store
-            .derive_facts(claim.session, group.as_deref())
-            .await?;
-        if facts.paused || facts.session_off || !facts.group_on {
-            // Nothing is sent; what it said waits, read once the person
-            // lets it be.
-            self.0.store.derive_release(&claim, None).await?;
-            return Ok(Did::Work);
-        }
         let input = Input {
             purpose: None,
             items: Vec::new(),
@@ -284,7 +308,7 @@ impl Desk {
         if input.exchanges.is_empty() {
             self.derive_write(
                 &claim,
-                last.seq,
+                (read.from, last.seq),
                 backlog,
                 group.as_deref(),
                 "",
@@ -320,13 +344,19 @@ impl Desk {
                 &derive::prompt(&input, &nonce),
             ),
         )
-        .await
-        .unwrap_or_else(|_| Err(eyre::eyre!("the model took too long")));
+        .await;
         let answered = match asked {
-            Ok(a) => a,
-            Err(e) => {
-                // No model took it: the day's count is given back.
-                self.0.store.derive_untake_call(day).await?;
+            Ok(Ok(a)) => a,
+            failed => {
+                let e = match failed {
+                    Ok(Err(e)) => {
+                        // No model took it: the day's count is given back.
+                        self.0.store.derive_untake_call(day).await?;
+                        e
+                    }
+                    // One that took too long may have been spent: it counts.
+                    _ => eyre::eyre!("the model took too long"),
+                };
                 let gave_up = claim.tries + 1 >= TRIES;
                 tracing::info!(session = %claim.session, error = format!("{e:#}"), gave_up, "couldn't note decisions from a session");
                 self.0
@@ -355,19 +385,25 @@ impl Desk {
                     retry_after(claim.tries),
                     gave_up,
                     DERIVE_FAILED,
-                    gave_up.then_some(last.seq),
+                    gave_up.then_some((group.as_deref(), last.seq)),
                 )
                 .await?;
             return Ok(Did::Work);
         };
-        let applied = derive::validate(&out, &input);
+        let mut applied = derive::validate(&out, &input);
+        // What the model wrote is kept as safely as what it read.
+        if let Some(r) = &self.0.ledger.redactor {
+            for a in &mut applied.add {
+                a.text = r.stored(&a.text).text.into_owned();
+            }
+        }
         if applied.dropped > 0 {
             tracing::info!(session = %claim.session, dropped = applied.dropped, kept = applied.add.len(), "dropped notes the record doesn't bear out");
         }
-        let by = format!("model:{}", answered.model);
+        let by = format!("model:{}", model_name(&answered.model));
         self.derive_write(
             &claim,
-            last.seq,
+            (read.from, last.seq),
             backlog,
             group.as_deref(),
             &by,
@@ -383,7 +419,7 @@ impl Desk {
     async fn derive_write(
         &self,
         claim: &Claim,
-        to: i32,
+        (from, to): (i32, i32),
         backlog: bool,
         group: Option<&str>,
         by: &str,
@@ -409,6 +445,7 @@ impl Desk {
             .store
             .derive_apply(&Apply {
                 claim,
+                from,
                 to,
                 backlog,
                 group,
@@ -448,7 +485,22 @@ impl Desk {
     ) -> Result<Notes, DeskError> {
         let items = self.0.store.session_items(id).await?;
         let queued = self.0.store.derive_queued(id).await?;
+        // Said of the group the next reading is stamped with; with nothing
+        // waiting, of the one it is in.
+        let group = match &queued.next_group {
+            Some(next) => next.as_deref(),
+            None => group,
+        };
+        let by = self
+            .0
+            .derive
+            .deriver
+            .as_ref()
+            .map(|d| d.written_by())
+            .unwrap_or_default();
         let mut notes = Notes {
+            provider: by.provider,
+            fallback_providers: by.fallback,
             decisions: Vec::new(),
             facts: Vec::new(),
             todos: Vec::new(),
@@ -533,13 +585,21 @@ impl Desk {
                 let Some(text) = derive::note_text(text) else {
                     return Err(DeskError::Invalid("Say what the note should say.".into()));
                 };
+                // Kept and searched as everything Desk remembers is: with
+                // every secret in it hidden, or not at all.
+                let Some(redactor) = &self.0.ledger.redactor else {
+                    return Err(DeskError::Invalid(crate::memory::NO_REDACTOR.into()));
+                };
+                let text = redactor.stored(&text).text.into_owned();
                 match self.0.store.correct_item(id, &text).await? {
                     Some(new) => new,
                     None => return Err(gone()),
                 }
             }
             ItemChange::Drop => {
-                self.0.store.drop_item(id).await?;
+                if !self.0.store.drop_item(id).await? {
+                    return Err(DeskError::NotFound);
+                }
                 self.memory_noted(item.session);
                 return Ok(None);
             }

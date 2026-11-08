@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 use workforce_common::secret_marker::{parse_markers_spanned, NAMED_LABEL};
-use workforce_desk::memory::derive::{Answered, Deriver};
+use workforce_desk::memory::derive::{Answered, Deriver, WrittenBy};
 use workforce_desk::memory::{Redacted, Redactor};
 
 /// A marker the grammar doesn't parse (a torn or hand-made one) is still a
@@ -202,8 +202,10 @@ impl Redactor for HubRedactor {
 }
 
 /// Who notes decisions, facts and to-dos from Desk's sessions: the floor's
-/// cheap model, as a session's gist is written (on the session's account
-/// where it has one, else the floor's), and the purpose its gist says.
+/// cheap model on the hub's own provider account, as a Desk session's gist
+/// is written (the host agent's plan; `[floor] fallback_providers` never
+/// applies, as a Desk session's call has no person's login in scope), never
+/// the session's own engine account; and the purpose its gist says.
 pub(crate) struct HubDeriver {
     pub model: crate::floor::gists::HubModel,
 }
@@ -236,6 +238,22 @@ impl Deriver for HubDeriver {
             )
             .await?;
         Ok(Answered { text, model })
+    }
+
+    fn written_by(&self) -> WrittenBy {
+        let provider = self.model.state.registry.host().and_then(|service| {
+            let key = service.tier_key.read().clone();
+            workforce_agent::llm::provider::ProviderKind::from_str_loose(&key)
+                .map(|k| k.canonical_name().to_string())
+                .or_else(|| (!key.is_empty()).then_some(key))
+        });
+        WrittenBy {
+            provider,
+            // `[floor] fallback_providers` draws only on a person's own
+            // login, and a Desk session's call has none in scope: it is
+            // never written on another provider.
+            fallback: false,
+        }
     }
 
     async fn purpose(&self, session: uuid::Uuid) -> Option<String> {
