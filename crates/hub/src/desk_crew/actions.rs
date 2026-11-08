@@ -482,7 +482,10 @@ fn words(text: &str) -> Vec<Option<String>> {
         if !word.is_empty() {
             out.push(Some(std::mem::take(&mut word)));
         }
-        let spaced = |j: Option<usize>| j.and_then(|j| chars.get(j)).is_none_or(|c| c.is_whitespace());
+        let spaced = |j: Option<usize>| {
+            j.and_then(|j| chars.get(j))
+                .is_none_or(|c| c.is_whitespace())
+        };
         let ends = match c {
             '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '\n' | '\u{2014}' | '\u{2013}' => true,
             '-' => spaced(i.checked_sub(1)) || spaced(Some(i + 1)),
@@ -504,7 +507,8 @@ fn outward_word(w: &str) -> bool {
 
 /// Whether the word at `i` is undone by negations just before it, in its
 /// clause: an odd number of them, with only `BETWEEN` words, outward
-/// words and other negations between.
+/// words and other negations between, and no other negation earlier in the
+/// clause ("no reason not to deploy" deploys).
 fn negated(ws: &[Option<String>], i: usize) -> bool {
     let mut negations = 0;
     let mut j = i;
@@ -513,20 +517,33 @@ fn negated(ws: &[Option<String>], i: usize) -> bool {
         j -= 1;
         let Some(w) = ws[j].as_deref() else { break };
         seen += 1;
-        let hold_off_on = w == "on"
-            && j >= 2
-            && ws[j - 1].as_deref() == Some("off")
-            && ws[j - 2].as_deref() == Some("hold");
-        if hold_off_on {
+        if negation_at(ws, j) {
             negations += 1;
-            j -= 2;
-        } else if NEGATIONS.contains(&w) {
-            negations += 1;
+            if w == "on" {
+                j -= 2;
+            }
         } else if !BETWEEN.contains(&w) && !outward_word(w) {
             break;
         }
     }
-    negations % 2 == 1
+    // Another negation before, anywhere in the clause, may undo this one
+    // ("no reason not to"): then it counts, to be safe.
+    let clause = ws[..i]
+        .iter()
+        .rposition(Option::is_none)
+        .map_or(0, |b| b + 1);
+    negations % 2 == 1 && !(clause..j).any(|k| negation_at(ws, k))
+}
+
+/// Whether a negation ends at `j`: one of `NEGATIONS`, or "hold off on".
+fn negation_at(ws: &[Option<String>], j: usize) -> bool {
+    match ws[j].as_deref() {
+        Some("on") => {
+            j >= 2 && ws[j - 1].as_deref() == Some("off") && ws[j - 2].as_deref() == Some("hold")
+        }
+        Some(w) => NEGATIONS.contains(&w),
+        None => false,
+    }
 }
 
 /// Whether the reply-word at `i` is a wait on someone's reply: an `UNTIL`
@@ -545,8 +562,8 @@ fn awaited(ws: &[Option<String>], i: usize) -> bool {
 /// push only in what came before), so this only ever narrows what runs.
 ///
 /// What `names` call sessions and agents isn't read ("Acme Migration" is a
-/// name, not a migration), unless the name is all outward words (a session
-/// called "Deploy" can't hide "Deploy now"). An outward word is let go only
+/// name, not a migration), unless the name starts with an outward word: a
+/// session called "Release 4.2" can't hide "go ahead with Release 4.2". An outward word is let go only
 /// when clearly negated just before ("make no production changes") or a
 /// reply waited on ("until the person replies").
 pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
@@ -554,7 +571,7 @@ pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
     let mut names: Vec<Vec<String>> = names
         .iter()
         .map(|n| words(n).into_iter().flatten().collect::<Vec<_>>())
-        .filter(|n| !n.is_empty() && !n.iter().all(|w| outward_word(w)))
+        .filter(|n| n.first().is_some_and(|w| !outward_word(w)))
         .collect();
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
     for name in &names {
@@ -1916,6 +1933,9 @@ mod tests {
             "Deploy without asking",
             "Reply to the thread until it is answered",
             "Reply until the person replies",
+            "No reason not to deploy",
+            "No need to hold off on merging",
+            "Never let them stop deploying",
         ] {
             assert!(outward(said), "{said}");
         }
@@ -1923,7 +1943,12 @@ mod tests {
 
     #[test]
     fn what_sessions_are_called_is_not_outward() {
-        let names = ["Acme Migration".to_string(), "Deploy".to_string()];
+        let names = [
+            "Acme Migration".to_string(),
+            "Deploy".to_string(),
+            "Release 4.2".to_string(),
+            "Deploy the docs".to_string(),
+        ];
         let cufflink = "Acme Migration: please give me a plain-English status of where \
             things stand. Make no production changes until the person replies.";
         assert!(outward(cufflink), "it is outward, read without the names");
@@ -1943,6 +1968,8 @@ mod tests {
             "Acme Migration, merge the PR",
             "Acme Migration: delete the branch",
             "No Acme Migration deploys",
+            "Go ahead with Release 4.2",
+            "Deploy the docs now",
         ] {
             assert!(outward_except(said, &names), "{said}");
         }

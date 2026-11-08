@@ -2977,7 +2977,10 @@ async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
             );
         }
         assert!(
-            matches!(crew.gate(&nudge(deploy.id, "Deploy now"), &o), Gate::Suggest(_)),
+            matches!(
+                crew.gate(&nudge(deploy.id, "Deploy now"), &o),
+                Gate::Suggest(_)
+            ),
             "a name of outward words hides nothing"
         );
         // The question answered is read the same way.
