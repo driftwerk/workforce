@@ -2298,6 +2298,91 @@ mod tests {
         .await;
     }
 
+    /// A crew that notes, as it takes each group's boss off, whether the
+    /// group was still there; and refuses `g-stuck`'s.
+    struct Releasing {
+        desk: crate::Desk,
+        seen: parking_lot::Mutex<Vec<(String, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::crew::Crew for Releasing {
+        fn overseer(&self) -> Option<crate::crew::Overseer> {
+            None
+        }
+        fn agents(&self) -> Vec<crate::crew::CrewAgent> {
+            vec![]
+        }
+        fn midnight(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now()
+        }
+        async fn accept(&self, _: &crate::crew::Suggestion) -> Result<(), String> {
+            Ok(())
+        }
+        async fn release_group(&self, group: &str) -> Result<(), String> {
+            let there = self.desk.layout().groups.iter().any(|g| g.id == group);
+            self.seen.lock().push((group.to_string(), there));
+            if group == "g-stuck" {
+                return Err("Sarah still oversees this group: busy".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_takes_its_boss_off_first_and_keeps_it_when_that_fails() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let crew = std::sync::Arc::new(Releasing {
+                desk: desk.clone(),
+                seen: Default::default(),
+            });
+            let as_crew: std::sync::Arc<dyn crate::crew::Crew> = crew.clone();
+            desk.answer_lines_with(&as_crew);
+            let app = super::sessions_router(desk.clone(), allow_all());
+            call(
+                &app,
+                "POST",
+                "/api/desk/groups",
+                Some(json!({ "id": "g-acme", "name": "Acme" })),
+            )
+            .await;
+            call(
+                &app,
+                "POST",
+                "/api/desk/groups",
+                Some(json!({ "id": "g-stuck", "name": "Globex" })),
+            )
+            .await;
+
+            let (status, l) = call(&app, "DELETE", "/api/desk/groups/g-acme", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(l["groups"].as_array().unwrap().len(), 1);
+            let (status, body) = call(&app, "DELETE", "/api/desk/groups/g-stuck", None).await;
+            assert_eq!(status, 409);
+            assert_eq!(body["error"], "Sarah still oversees this group: busy");
+            assert!(
+                desk.layout().groups.iter().any(|g| g.id == "g-stuck"),
+                "kept"
+            );
+            assert_eq!(
+                *crew.seen.lock(),
+                [("g-acme".to_string(), true), ("g-stuck".to_string(), true)],
+                "each boss taken off while its group was still there"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn names_and_groups_through_the_routes() {
         with_test_pool(build_pool, |pool| async move {
