@@ -117,6 +117,11 @@ tokio::task_local! {
     /// session no longer says so: a sub-agent such a turn spawned runs in a
     /// session of its own. Unset for work a person started.
     pub static CURRENT_AUTOMATED_ORIGIN: String;
+    /// The memory fence a turn started under, as `<agent>\t<fence>`: what
+    /// it and the work it spawns (tool calls, passive extraction) remember
+    /// is tagged with the scope its agent oversaw when it began, even if the
+    /// agent is moved meanwhile (boss-gaps W8). Read by the hub's store.
+    pub static CURRENT_MEMORY_FENCE: String;
     /// Current Slack channel ID (e.g. "C123" or "D456") — set during agent runs
     /// so tools can resolve channel context without needing a scheduler.
     pub static CURRENT_CHANNEL_ID: String;
@@ -740,6 +745,9 @@ pub struct SessionContext {
     /// [`CURRENT_AUTOMATED_ORIGIN`], carried so a job the scheduler tool
     /// creates in the spawned tool task records the automation behind it.
     pub automated_origin: Option<String>,
+    /// [`CURRENT_MEMORY_FENCE`], carried so a write made in the spawned task
+    /// is tagged as the turn's.
+    pub memory_fence: Option<String>,
     /// Active gated-MCP-workspace env overrides (`workspace -> env`). Carried
     /// across the tool-exec `JoinSet::spawn` alongside the `CURRENT_*` locals so
     /// the MCP call guard and `mcp.workspace_*` tools — which run in that
@@ -818,6 +826,7 @@ impl SessionContext {
             workspace_id: task_local_value(&CURRENT_WORKSPACE_ID, false),
             voice_channel: task_local_value(&CURRENT_VOICE_CHANNEL, false),
             automated_origin: task_local_value(&CURRENT_AUTOMATED_ORIGIN, false),
+            memory_fence: task_local_value(&CURRENT_MEMORY_FENCE, false),
             active_mcp_envs: current_active_mcp_envs(),
             active_environment: current_active_environment(),
             active_skill_instances: current_active_skill_instances(),
@@ -856,8 +865,9 @@ impl SessionContext {
         let secret_policy = self.secret_policy;
         let served = self.served;
         let desk = self.desk;
-        let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 13] = [
+        let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 14] = [
             (&CURRENT_ARTIFACT_SCOPE, self.artifact_scope, false),
+            (&CURRENT_MEMORY_FENCE, self.memory_fence, false),
             (&CURRENT_AGENT_ID, self.agent_id, true),
             (&CURRENT_CHANNEL_ID, self.channel_id, true),
             (&CURRENT_THREAD_ID, self.thread_id, true),
@@ -952,7 +962,8 @@ impl SessionContext {
         let secret_policy = self.secret_policy;
         let served = self.served;
         let desk = self.desk;
-        let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 10] = [
+        let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 11] = [
+            (&CURRENT_MEMORY_FENCE, self.memory_fence),
             (&CURRENT_AGENT_ID, self.agent_id),
             (&CURRENT_CHANNEL_ID, self.channel_id),
             (&CURRENT_THREAD_ID, self.thread_id),
@@ -8454,6 +8465,7 @@ mod tests {
             // what made voice-requested reminders arrive in Slack.
             voice_channel: Some("voice-pe".into()),
             automated_origin: Some("heartbeat".into()),
+            memory_fence: Some("sarah\tdesk-group:acme".into()),
             // The MCP-workspace override must survive capture→scope→capture too:
             // tools run inside the JoinSet::spawn this propagation feeds, so if
             // it's dropped here the gate sees no `cmd: use` activation. The same
@@ -8511,6 +8523,7 @@ mod tests {
         let after = captured.lock().unwrap().clone();
         assert_eq!(after.artifact_scope, original.artifact_scope);
         assert_eq!(after.key, original.key);
+        assert_eq!(after.memory_fence, original.memory_fence);
         assert_eq!(after.id, original.id);
         assert_eq!(after.user_id, original.user_id);
         assert_eq!(after.channel_id, original.channel_id);

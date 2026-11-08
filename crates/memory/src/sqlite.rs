@@ -934,6 +934,47 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(())
     }
 
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Failed to lock database: {}", e))?;
+        let tx = conn.transaction()?;
+        let held: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, tags FROM memories WHERE owner = ?1")?;
+            let rows = stmt
+                .query_map(params![owner.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut tagged = Vec::new();
+        for (id, tags_json) in held {
+            // Tags that don't read are left as they are, never replaced.
+            let Ok(mut tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+                tracing::warn!(memory = %id, "a memory's tags don't read, so it isn't tagged");
+                continue;
+            };
+            if tags.iter().any(|t| t.starts_with(unless_prefix)) {
+                continue;
+            }
+            tags.push(tag.to_string());
+            tx.execute(
+                "UPDATE memories SET tags = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&tags)?, id],
+            )?;
+            tagged.push(MemoryId(id));
+        }
+        tx.commit()?;
+        Ok(tagged)
+    }
+
     async fn identity_memories(&self, owner: &AgentId, identity: &str) -> Result<Vec<MemoryId>> {
         let conn = self
             .conn
@@ -1522,6 +1563,50 @@ mod tests {
     #[tokio::test]
     async fn identity_memories_are_reassigned_and_purged_forgotten_ones_included() {
         crate::store::identity_operations_contract(&make_store()).await;
+    }
+
+    #[tokio::test]
+    async fn the_add_tag_contract_holds() {
+        crate::store::add_tag_contract(&make_store()).await;
+    }
+
+    #[tokio::test]
+    async fn a_memory_whose_tags_dont_read_is_left_as_it_is() {
+        let store = make_store();
+        let owner = AgentId::new("sarah");
+        let id = store
+            .remember(Memory::new(
+                "acme note",
+                MemoryLayer::Episodic,
+                owner.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET tags = 'not json' WHERE id = ?1",
+                params![id.0],
+            )
+            .unwrap();
+        assert!(store
+            .add_tag(&owner, "desk-group:acme", "desk-group:")
+            .await
+            .unwrap()
+            .is_empty());
+        let kept: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT tags FROM memories WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "not json");
     }
 
     // ─── Forget (Soft Delete) ────────────────────────────────────────────
