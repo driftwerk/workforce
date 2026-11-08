@@ -189,6 +189,26 @@ impl DeskStore {
             .collect()
     }
 
+    /// Withdraws what the boss `boss` said to any session that hasn't gone
+    /// in: it is held by Desk's breaker, so it never will.
+    pub async fn line_withdraw_from_boss(&self, boss: &str) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'withdrawn', updated_at = now() \
+                     WHERE sender ->> 'kind' = 'manager' AND sender ->> 'id' = $1 \
+                     AND recipient ->> 'kind' = 'session' \
+                     AND kind = 'tell' AND delivery IN ('queued', 'held') RETURNING {COLUMNS}"
+                ),
+                &[&boss],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Withdraws one row the overseer said to a session, while it waits in
     /// the queue: put back from a hand-off, it never goes in. The row as it
     /// now is, or `None` when it had moved on.

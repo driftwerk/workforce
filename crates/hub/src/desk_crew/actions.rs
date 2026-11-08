@@ -1636,6 +1636,19 @@ impl CrewHub {
                 let engine = self.engine_or_default(*engine, &o)?;
                 self.startable(engine, None)?;
                 self.slot_free(&boss, &o, &by)?;
+                // A plan's ticket starts nothing while the breaker holds
+                // the plan's new starts (its own budget, its group's or
+                // Desk's): only the person lets them go on.
+                if let Ok(Some(plan)) = d.store().plan_of_ticket(id).await {
+                    if let Ok(Some(p)) = d.store().plan(plan).await {
+                        if let Some((_, ask)) = d.plan_starts_held(p.group.as_deref(), p.id) {
+                            return Err(format!(
+                                "Desk's breaker holds this plan's new sessions: {ask} The person \
+                                 can say Continue on Desk's Floor."
+                            ));
+                        }
+                    }
+                }
                 let charged = ChargedTo {
                     group: self.boss_group(&service, &o),
                     boss,

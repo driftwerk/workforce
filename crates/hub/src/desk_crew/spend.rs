@@ -417,6 +417,7 @@ mod tests {
             Period::FiveHours => at("2026-10-31T07:00:00Z"),
             Period::Week => at("2026-10-26T00:00:00Z"),
             Period::Month => at("2026-10-01T00:00:00Z"),
+            Period::Total => at("1970-01-01T00:00:00Z"),
         };
         assert_eq!(
             since_of("today", start).unwrap(),

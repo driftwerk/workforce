@@ -894,6 +894,7 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
                     parallel: None,
                     engine: crate::engine::Engine::Claude,
                     group: Some("acme".into()),
+                    budget: None,
                 },
                 &Party::manager("sarah", "Sarah"),
                 &By::manager("sarah", "Sarah", "asked"),

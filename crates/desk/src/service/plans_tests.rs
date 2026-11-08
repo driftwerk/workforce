@@ -44,6 +44,7 @@ fn new_plan(dir: &Path, titles: &[(&str, &[usize])]) -> NewPlan {
         parallel: None,
         engine: Engine::Claude,
         group: None,
+        budget: None,
     }
 }
 
@@ -1117,7 +1118,7 @@ async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stay
             "{blocked}"
         );
         // Deny on the Floor turns it down.
-        let kept_plan = d.decide_plan(id, 2, false, &By::you()).await.unwrap();
+        let kept_plan = d.decide_plan(id, 2, false, None, &By::you()).await.unwrap();
         let plan = &kept_plan.summary.plan;
         assert_eq!((plan.revision, plan.approved_revision), (3, Some(3)));
         assert_eq!(kept_plan.tickets.len(), 1, "nothing was added");
@@ -1154,10 +1155,10 @@ async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stay
         .unwrap();
         // The Floor's Deny names the waiting revision: an older one is stale.
         assert!(matches!(
-            d.decide_plan(id, 3, false, &By::you()).await,
+            d.decide_plan(id, 3, false, None, &By::you()).await,
             Err(DeskError::Conflict(_))
         ));
-        let out = d.decide_plan(id, 4, false, &By::you()).await.unwrap();
+        let out = d.decide_plan(id, 4, false, None, &By::you()).await.unwrap();
         assert_eq!(out.summary.plan.approved_revision, Some(5));
         assert_eq!(out.tickets.len(), 1);
     })
@@ -1187,7 +1188,7 @@ async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_and_the_floor_co
         let needs = d.plan_needs();
         assert_eq!(needs.len(), 1);
         assert!(needs[0].ask.contains(why), "{}", needs[0].ask);
-        let back = d.decide_plan(id, 1, true, &By::you()).await.unwrap();
+        let back = d.decide_plan(id, 1, true, None, &By::you()).await.unwrap();
         assert!(back.summary.plan.runs());
         assert_eq!(back.summary.paused_why, None);
         assert!(d.plan_needs().is_empty());
@@ -1437,6 +1438,7 @@ async fn a_plan_is_on_the_floor_in_its_own_group_whoever_its_boss_is_now() {
             .propose_plan(
                 NewPlan {
                     group: Some("acme".into()),
+                    budget: None,
                     ..new_plan(
                         dir.path(),
                         &[("Add the cart API", &[]), ("Wire the form", &[0])],
@@ -1495,6 +1497,444 @@ async fn a_plan_is_on_the_floor_in_its_own_group_whoever_its_boss_is_now() {
             .await
             .unwrap();
         assert!(d.floor_plans().await.unwrap().is_empty());
+    })
+    .await;
+}
+
+/// `usd` spent by `session` now.
+async fn spent(d: &Desk, session: Uuid, usd: f64) {
+    spent_at(d, session, usd, chrono::Utc::now()).await;
+}
+
+/// `usd` spent by `session` at `at`.
+async fn spent_at(d: &Desk, session: Uuid, usd: f64, at: chrono::DateTime<chrono::Utc>) {
+    use crate::ledger::{Billing, Priced, Spend, Tokens};
+    use crate::ledger_store::Kept;
+    d.0.store
+        .ledger_write(
+            session,
+            Engine::Claude,
+            None,
+            &[Kept {
+                spend: Spend {
+                    key: Uuid::new_v4().to_string(),
+                    at,
+                    model: Some("claude-opus-5-5".into()),
+                    tokens: Tokens {
+                        input: 1000,
+                        ..Default::default()
+                    },
+                    usd: Some(usd),
+                    priced: Priced::Reported,
+                    billing: None,
+                },
+                billing: Billing::Plan,
+                account: None,
+            }],
+        )
+        .await
+        .unwrap();
+}
+
+fn capped(usd: f64) -> Option<Option<PlanBudget>> {
+    Some(Some(PlanBudget::usd(usd)))
+}
+
+/// A plan in Acme of `titles`, approved by the person capped at `usd`.
+async fn capped_plan(d: &Desk, dir: &Path, titles: &[(&str, &[usize])], usd: f64) -> PlanDetail {
+    d.change_layout(|l| l.create("g-acme", "Acme", &[], None))
+        .await
+        .unwrap();
+    let mut new = new_plan(dir, titles);
+    new.group = Some("g-acme".into());
+    let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
+    d.decide_plan(p.summary.plan.id, 1, true, capped(usd), &By::you())
+        .await
+        .unwrap()
+}
+
+/// What may start now in plan `id`, as the runner reads it, with `held`
+/// passed as its standing.
+async fn next(d: &Desk, id: Uuid) -> Vec<Start> {
+    let p = d.plan(id).await.unwrap().summary.plan;
+    let held = d.plan_starts_held(p.group.as_deref(), id).map(|(s, _)| s);
+    plan::next_starts(&p, &d.plan_tickets(id).await.unwrap(), 0, 4, held)
+}
+
+#[tokio::test]
+async fn a_plans_budget_is_set_on_approval_kept_in_its_revision_and_only_changed_there() {
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = capped_plan(&d, dir.path(), &[("a", &[])], 40.0).await;
+        let id = p.summary.plan.id;
+        // Capped as the person approved it: a revision of theirs first.
+        assert_eq!(
+            (p.summary.plan.revision, p.summary.plan.approved_revision),
+            (2, Some(2))
+        );
+        let r = &p.revisions[1];
+        assert_eq!(r.by.kind, PartyKind::You);
+        assert_eq!(r.snapshot.budget, Some(PlanBudget::usd(40.0)));
+        assert_eq!(r.summary, "Capped it at a total budget of $40");
+        assert_eq!(p.summary.budget, Some(PlanBudget::usd(40.0)));
+        let kept: Vec<_> = d
+            .budget_list()
+            .into_iter()
+            .filter(|b| b.scope == BudgetScope::Plan(id))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].group.as_deref(), kept[0].period, kept[0].amount),
+            (Some("g-acme"), Period::Total, 40.0)
+        );
+        // Not among the person's own budgets, and never set as one.
+        assert!(d.budgets_view().await.unwrap().budgets.is_empty());
+        let own = super::super::NewBudget {
+            scope: BudgetScope::Plan(id),
+            group: None,
+            period: Period::Total,
+            unit: Unit::Usd,
+            amount: 400.0,
+            warn_at: None,
+            on_exceed: None,
+        };
+        assert!(matches!(
+            d.put_budget(own, By::you()).await,
+            Err(DeskError::Invalid(_))
+        ));
+        let patch = super::super::BudgetPatch {
+            amount: Some(400.0),
+            ..Default::default()
+        };
+        assert!(d.patch_budget(kept[0].id, patch, By::you()).await.is_err());
+        assert!(d.delete_budget(kept[0].id, By::you()).await.is_err());
+
+        // The boss raising it waits for the person; lowering it applies.
+        let raise = PlanEdit {
+            budget: capped(60.0),
+            why: Some("The tests are slow.".into()),
+            ..Default::default()
+        };
+        let waits = d
+            .change_plan(id, raise, Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!((waits.change, waits.applied), (Some(Change::Scope), false));
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.budget,
+            Some(PlanBudget::usd(40.0))
+        );
+        let r = waits.plan.summary.plan.revision;
+        d.decide_plan(id, r, false, None, &By::you()).await.unwrap();
+        let lower = PlanEdit {
+            budget: capped(25.0),
+            why: Some("Less is enough.".into()),
+            ..Default::default()
+        };
+        let applies = d
+            .change_plan(id, lower, Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(
+            (applies.change, applies.applied),
+            (Some(Change::Minor), true)
+        );
+        let amounts: Vec<f64> = d
+            .budget_list()
+            .iter()
+            .filter(|b| b.scope == BudgetScope::Plan(id))
+            .map(|b| b.amount)
+            .collect();
+        assert_eq!(amounts, [25.0]);
+        // A budget only goes with an approval through the Floor's answer.
+        let now = d.plan(id).await.unwrap().summary.plan.revision;
+        assert!(d
+            .decide_plan(id, now, true, capped(90.0), &By::you())
+            .await
+            .is_err());
+        // Dropped, its budget goes.
+        d.drop_plan(id, OnDrop::Stop, &By::you()).await.unwrap();
+        assert!(!d
+            .budget_list()
+            .iter()
+            .any(|b| b.scope == BudgetScope::Plan(id)));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_when_over() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = capped_plan(&d, dir.path(), &[("a", &[]), ("b", &[]), ("c", &[])], 10.0).await;
+        let id = p.summary.plan.id;
+        let plan = p.summary.plan.clone();
+        let first = next(&d, id).await.remove(0);
+        let s = d
+            .plan_start(&plan, &first, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        // Its first calls, made before it was handed its ticket, count too;
+        // what it did an hour before isn't the plan's.
+        spent_at(
+            &d,
+            s.id,
+            0.5,
+            chrono::Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+        spent_at(
+            &d,
+            s.id,
+            30.0,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+        spent(&d, s.id, 8.0).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+
+        // At its warning: the standing the runner passes starts nothing.
+        let (status, ask) = d.plan_starts_held(Some("g-acme"), id).unwrap();
+        assert_eq!(status, workforce_core::budget::Status::Warn);
+        assert_eq!(
+            ask,
+            "The plan “Ship the new checkout” is at 85% of its total budget ($8.50 of $10). \
+             Sarah has stopped starting sessions."
+        );
+        assert!(next(&d, id).await.is_empty());
+        let second =
+            plan::next_starts(&plan, &d.plan_tickets(id).await.unwrap(), 1, 4, None).remove(0);
+        let refused = d
+            .plan_start(&plan, &second, &sarah(), &by_sarah())
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("breaker"), "{refused}");
+        // One Floor need, in the plan's group, that only the person answers.
+        let subject = super::super::plan_subject(id);
+        let needs: Vec<Need> = d
+            .breaker_needs()
+            .into_iter()
+            .filter(|n| n.id == format!("breaker:{subject}"))
+            .collect();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].group.as_deref(), Some("g-acme"));
+        assert_eq!(
+            needs[0].answer,
+            Answer::Decide {
+                at: DecideRef::Breaker {
+                    subject: subject.clone()
+                }
+            }
+        );
+        assert!(needs[0]
+            .why
+            .as_deref()
+            .unwrap()
+            .contains("until it is over"));
+        let detail = d.plan(id).await.unwrap();
+        assert_eq!(detail.summary.held.as_deref(), Some(ask.as_str()));
+        assert_eq!(detail.spend.as_ref().map(|s| s.used), Some(8.5));
+        assert_eq!(d.session_held(s.id), None, "its session was only told");
+        // Spent again at its warning, it is held once.
+        d.breaker_spend(None).await;
+        assert_eq!(d.breaker_needs().len(), 1);
+
+        // Continue: it starts again.
+        d.breaker_continue(&subject, By::you()).unwrap();
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None);
+        assert_eq!(next(&d, id).await.len(), 2);
+        let b = d
+            .plan_start(&plan, &second, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+
+        // Over: its starts stop again, and its sessions' breakers hold them
+        // from their next turns. Their tickets wait on the person.
+        spent(&d, b.id, 2.0).await;
+        d.breaker_spend(Some(vec![b.id])).await;
+        let (status, _) = d.plan_starts_held(Some("g-acme"), id).unwrap();
+        assert_eq!(status, workforce_core::budget::Status::Over);
+        assert!(next(&d, id).await.is_empty());
+        assert!(d.session_held(s.id).is_some(), "a sibling's spend counts");
+        assert!(d.session_held(b.id).is_some());
+        let held: Vec<bool> = d
+            .plan(id)
+            .await
+            .unwrap()
+            .tickets
+            .iter()
+            .map(|t| t.held.is_some())
+            .collect();
+        assert_eq!(held, [true, true, false]);
+
+        // Its ticket done, what its session does next isn't the plan's.
+        d.move_ticket(
+            first.ticket,
+            Move {
+                state: TicketState::Done,
+                before: None,
+                after: None,
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        spent(&d, s.id, 25.0).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert_eq!(d.plan(id).await.unwrap().spend.unwrap().used, 10.5);
+
+        // The person raising the cap lets go of what it held.
+        let raise = PlanEdit {
+            revision: Some(d.plan(id).await.unwrap().summary.plan.revision),
+            budget: capped(50.0),
+            ..Default::default()
+        };
+        d.change_plan(id, raise, Engine::Claude, false, &By::you())
+            .await
+            .unwrap();
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None);
+        assert_eq!(next(&d, id).await.len(), 1);
+    })
+    .await;
+}
+
+/// A session's spend with no ticket stamped goes to the plan whose ticket
+/// it was handed then, one window a hand-out: back five minutes only after
+/// a gap, never into what it worked on before, and to one plan at most.
+#[tokio::test]
+async fn ticketless_spend_goes_to_one_plan_by_each_hand_out() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let a = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a1", &[]), ("a2", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let b = d
+            .propose_plan(new_plan(dir.path(), &[("b", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let (pa, pb) = (a.summary.plan.id, b.summary.plan.id);
+        let (a1, a2) = (a.tickets[0].ticket.ticket.id, a.tickets[1].ticket.ticket.id);
+        let tb = b.tickets[0].ticket.ticket.id;
+        let s = Uuid::new_v4();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let m = |n: i64| t0 + chrono::Duration::minutes(n);
+        let c = d.0.store.pool().get().await.unwrap();
+        // A, then B straight after, then A again after a gap.
+        for (ticket, from, until) in [
+            (a1, m(0), Some(m(30))),
+            (tb, m(30), Some(m(60))),
+            (a2, m(90), None),
+        ] {
+            c.execute(
+                "INSERT INTO ticket_assignments (ticket, session, from_at, until_at) \
+                 VALUES ($1, $2, $3, $4)",
+                &[&ticket, &s, &from, &until],
+            )
+            .await
+            .unwrap();
+        }
+        for (at, usd) in [
+            (m(-30), 32.0), // long before: no plan's
+            (m(-2), 1.0),   // its first calls: A's
+            (m(29), 2.0),   // in A's first hand-out
+            (m(35), 4.0),   // in B's
+            (m(65), 8.0),   // in the gap: no plan's
+            (m(87), 16.0),  // before A's second, after the gap: A's
+        ] {
+            c.execute(
+                "INSERT INTO ledger (engine, key, session, at, input, usd, priced, billing) \
+                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'plan')",
+                &[&Uuid::new_v4().to_string(), &s, &at, &usd],
+            )
+            .await
+            .unwrap();
+        }
+        let used =
+            d.0.store
+                .ledger_used_by_plan(chrono::DateTime::UNIX_EPOCH, &[pa, pb])
+                .await
+                .unwrap();
+        assert_eq!(used.get(&pa).map(|u| u.usd), Some(19.0));
+        assert_eq!(used.get(&pb).map(|u| u.usd), Some(4.0), "no grace into A's");
+        // B's hand-out came straight after A's: what was just before it is
+        // A's alone, not both.
+        let total: f64 = used.values().map(|u| u.usd).sum();
+        assert_eq!(total, 23.0);
+    })
+    .await;
+}
+
+/// A change of a plan's cap never reads as let go before it is counted
+/// again; a tightening keeps the person's Continue, and only a loosening
+/// the person approves forgets it.
+#[tokio::test]
+async fn a_change_of_cap_keeps_the_hold_until_counted_and_only_a_loosening_forgets_continue() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = capped_plan(&d, dir.path(), &[("a", &[]), ("b", &[])], 10.0).await;
+        let id = p.summary.plan.id;
+        let first = next(&d, id).await.remove(0);
+        let s = d
+            .plan_start(&p.summary.plan, &first, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        spent(&d, s.id, 8.5).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        let subject = super::super::plan_subject(id);
+        d.breaker_continue(&subject, By::you()).unwrap();
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None);
+
+        // The boss lowers it, still at its warning: the Continue stands.
+        let lower = PlanEdit {
+            budget: capped(9.6),
+            why: Some("Less is enough.".into()),
+            ..Default::default()
+        };
+        let r = d
+            .change_plan(id, lower, Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert!(r.applied);
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None, "still let go");
+
+        // Over now; the person raises it, still over: held all along.
+        spent(&d, s.id, 2.0).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert!(d.plan_starts_held(Some("g-acme"), id).is_some());
+        let (_, mut events) = d.subscribe();
+        let raise = |amount: f64| PlanEdit {
+            budget: capped(amount),
+            ..Default::default()
+        };
+        d.change_plan(id, raise(10.2), Engine::Claude, false, &By::you())
+            .await
+            .unwrap();
+        assert!(d.plan_starts_held(Some("g-acme"), id).is_some());
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Breaker { breaker } = e {
+                assert!(
+                    breaker.subject != subject || breaker.level != crate::breaker::Level::Clear,
+                    "never let go while counted again"
+                );
+            }
+        }
+        // Raised to where it is at its warning again: the person's raise
+        // forgot the Continue, so it holds at the warning.
+        d.change_plan(id, raise(12.5), Engine::Claude, false, &By::you())
+            .await
+            .unwrap();
+        let (status, _) = d.plan_starts_held(Some("g-acme"), id).unwrap();
+        assert_eq!(status, workforce_core::budget::Status::Warn);
     })
     .await;
 }
