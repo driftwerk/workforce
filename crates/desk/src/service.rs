@@ -82,8 +82,12 @@ mod memory_index;
 #[cfg(test)]
 mod memory_index_tests;
 mod memory_recall;
+mod moves;
+#[cfg(test)]
+mod moves_tests;
 #[cfg(test)]
 mod rooms_tests;
+pub use moves::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 mod scopes;
 pub use scopes::Boss;
 #[cfg(test)]
@@ -104,7 +108,9 @@ pub use breaker::{
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};
-pub use memory::{MemoryHitView, MemorySearch, SessionMemory};
+pub use memory::{
+    GroupMemoryChange, MemoryHitView, MemorySearch, MemorySettingsChange, SessionMemory,
+};
 pub use memory_derive::ItemChange;
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
@@ -854,6 +860,9 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while a move is made: two previews of one item never both go
+    /// through, the second finding what it does changed.
+    move_write: tokio::sync::Mutex<()>,
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
@@ -1497,6 +1506,7 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
@@ -3654,6 +3664,42 @@ impl Desk {
         self.save_room(room).await
     }
 
+    /// Whether this hub's agent `agent` may be given a turn in room `id`:
+    /// one its group's boundary lets in now. A boss moved to another group
+    /// no longer hears its old group's rooms, whatever a Desk app sends. A
+    /// room this desk doesn't keep (another hub's Desk's) is that desk's to
+    /// bound; one that can't be read is refused.
+    pub async fn agent_reaches_room(&self, id: Uuid, agent: &str) -> bool {
+        let room = match self.0.store.room(id).await {
+            Ok(Some(room)) => room,
+            Ok(None) => return true,
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "a room couldn't be read, so its turn wasn't run");
+                return false;
+            }
+        };
+        let m = Member {
+            hub: crate::rooms::LOCAL_HUB.into(),
+            agent: agent.to_string(),
+        };
+        let (layout, bossed, bosses) = (self.layout(), self.bossed(), self.boss_members());
+        crate::scope::allowed_member(room.group.as_deref(), &m, &layout, &bossed, &bosses)
+    }
+
+    /// The room an older Desk names by its id or its slug, when this desk
+    /// keeps it.
+    pub async fn room_named(&self, name: &str) -> Option<Uuid> {
+        let name = name.trim().trim_start_matches('#');
+        if let Ok(id) = Uuid::parse_str(name) {
+            return Some(id);
+        }
+        let rooms = self.0.store.rooms().await.ok()?;
+        rooms
+            .iter()
+            .find(|r| r.slug == name || r.slug == slug_for(name))
+            .map(|r| r.id)
+    }
+
     pub async fn update_room(&self, id: Uuid, patch: RoomPatch) -> Result<Room, DeskError> {
         let mut room = self.room_of(id)?;
         let before = room.members.clone();
@@ -3675,6 +3721,18 @@ impl Desk {
             room.default_member = d;
         }
         if let Some(g) = patch.group {
+            // A room is its conversation: it never crosses to another
+            // boss's scope (boss-gaps W8).
+            let bossed = self.bossed();
+            if crate::scope::scope_of(room.group.as_deref(), &bossed)
+                != crate::scope::scope_of(g.as_deref(), &bossed)
+            {
+                return Err(DeskError::Conflict(
+                    "A room keeps its conversation, so it can't move to a group another boss \
+                     oversees. Start a new room there instead."
+                        .into(),
+                ));
+            }
             room.group = g;
         }
         room.updated_at = Utc::now();

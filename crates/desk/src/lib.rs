@@ -45,6 +45,9 @@ pub mod memory_derive_store;
 pub mod memory_index_store;
 pub mod memory_store;
 pub mod model;
+mod move_api;
+pub mod move_store;
+pub mod moves;
 pub mod overview;
 pub mod plan;
 mod plan_api;
@@ -94,6 +97,7 @@ pub use service::{
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
+pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;

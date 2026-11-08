@@ -260,6 +260,14 @@ impl MemoryStore for Switching {
     async fn update_tags(&self, id: &MemoryId, tags: Vec<String>) -> Result<()> {
         self.current().update_tags(id, tags).await
     }
+    async fn add_tag(
+        &self,
+        owner: &workforce_core::types::AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        self.current().add_tag(owner, tag, unless_prefix).await
+    }
     async fn adjust_importance(&self, id: &MemoryId, delta: f32) -> Result<f32> {
         self.current().adjust_importance(id, delta).await
     }

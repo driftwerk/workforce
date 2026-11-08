@@ -31,6 +31,7 @@ mod actions;
 mod board;
 mod deliver;
 mod extras;
+mod handover;
 mod line;
 mod observe;
 mod plan;
@@ -46,6 +47,7 @@ mod work;
 pub(crate) mod tests;
 
 pub(crate) use extras::mentions_for;
+pub use handover::{handover_channel, HANDOVER};
 pub use observe::Observed;
 pub use plan::{plan_channel, PLAN};
 
@@ -165,6 +167,34 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
         .iter()
         .filter_map(Weak::upgrade)
         .find(|c| Arc::ptr_eq(&c.state, state))
+}
+
+/// Why a Desk room turn for `service` mustn't run: the room is one whose
+/// group's boundary keeps it out now (a boss moved away from it, or an
+/// agent that left), whatever the Desk app sent. `None` off a room, or
+/// without a crew.
+pub(crate) async fn room_turn_refused(
+    service: &AgentService,
+    place: &workforce_common::channels::desk::DeskPlace,
+) -> Option<String> {
+    use workforce_common::channels::desk::DeskPlace;
+    let crew = for_service(service)?;
+    let room = match place {
+        DeskPlace::Room { room, .. } => *room,
+        // An older Desk names a room by its slug (or id): the same room.
+        DeskPlace::LegacyRoom { slug } => crew.desk.room_named(slug).await?,
+        _ => return None,
+    };
+    match crew
+        .desk
+        .agent_reaches_room(room, service.agent_id.as_str())
+        .await
+    {
+        true => None,
+        false => {
+            Some("This agent isn't in that room's group now, so it can't answer there.".into())
+        }
+    }
 }
 
 /// Tells `service`'s crew a config was saved, so a new overseer gets its
@@ -605,16 +635,24 @@ impl Crew for CrewHub {
     async fn release_group(&self, group: &str) -> Result<(), String> {
         // First agents the hub doesn't serve now whose config still names
         // it, so taking a served boss off below finds nothing else naming it.
+        // The hub's memory, through any agent's handle: tagging names its
+        // owner itself.
+        let memory = self.services().iter().find_map(|s| s.memory_store.clone());
         for u in crate::agent_config_write::unserved_beside(&self.services()) {
-            crate::agent_config_write::unname_unserved(&u, self.state.def_store.as_deref(), group)
-                .await
-                .map_err(|e| {
-                    if e.starts_with(&format!("{}'s", u.who())) {
-                        e
-                    } else {
-                        format!("{} still names this group for its boss: {e}", u.who())
-                    }
-                })?;
+            crate::agent_config_write::unname_unserved(
+                &u,
+                self.state.def_store.as_deref(),
+                memory.as_deref(),
+                group,
+            )
+            .await
+            .map_err(|e| {
+                if e.starts_with(&format!("{}'s", u.who())) {
+                    e
+                } else {
+                    format!("{} still names this group for its boss: {e}", u.who())
+                }
+            })?;
         }
         for s in self.services() {
             if named_group(&s.workspace).as_deref() != Some(group) {
@@ -649,6 +687,18 @@ impl Crew for CrewHub {
             self.desk.unbound_group(group).await;
         }
         Ok(())
+    }
+
+    async fn ask_handover(&self, h: &workforce_desk::moves::Handover, facts: &str) {
+        self.ask_handover_turn(h, facts).await;
+    }
+
+    async fn deliver_handover(&self, h: &workforce_desk::moves::Handover) -> Result<(), String> {
+        self.deliver_handover_turn(h).await
+    }
+
+    async fn move_boss(&self, agent: &str, to: Option<&str>, replace: bool) -> Result<(), String> {
+        self.move_boss_to(agent, to, replace).await
     }
 
     /// The main overseer: over everything ungrouped.

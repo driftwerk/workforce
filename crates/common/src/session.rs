@@ -551,6 +551,10 @@ pub struct ToolStats {
     pub total_duration_ms: u64,
 }
 
+/// The metadata key a session carries once its agent left the Desk group
+/// it was had in as that group's boss: the group's memory tag.
+pub const LEFT_SCOPE_KEY: &str = "desk_scope_left";
+
 /// A conversation session between a user and an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -934,6 +938,13 @@ impl Session {
         self.metadata
             .as_object_mut()
             .expect("metadata was just ensured to be an object")
+    }
+
+    /// Whether this session was had while its agent was the boss of a Desk
+    /// group it has left since (boss-gaps W8): that group's, never read
+    /// again in another's turns, digests, scans or task lists.
+    pub fn left_behind(&self) -> bool {
+        self.metadata.get(LEFT_SCOPE_KEY).is_some()
     }
 
     /// Whether this session has been sealed by a thread rollover. A sealed

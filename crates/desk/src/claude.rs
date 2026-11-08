@@ -88,6 +88,12 @@ pub fn hook_settings(hook_url: &str, approval_timeout_secs: u64) -> Value {
             json!([{ "hooks": [http_hook(hook_url, 10)] }]),
         );
     }
+    // Before a compaction the hub reads what the session said, so nothing
+    // is lost to the summary; it answers at once, and never holds it up.
+    hooks.insert(
+        "PreCompact".into(),
+        json!([{ "hooks": [http_hook(hook_url, 5)] }]),
+    );
     json!({ "hooks": hooks })
 }
 
@@ -581,6 +587,11 @@ pub(crate) mod tests {
             3600
         );
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
+        let compact = &s["hooks"]["PreCompact"][0]["hooks"][0];
+        assert_eq!(
+            (compact["type"].as_str(), compact["timeout"].as_u64()),
+            (Some("http"), Some(5))
+        );
     }
 
     #[test]

@@ -818,6 +818,7 @@ mod tests {
                 TurnOp::Background { .. } => "background",
                 TurnOp::Settle { .. } => "settle",
                 TurnOp::Forget { .. } => "forget",
+                TurnOp::ForgetGists { .. } => "forget gists",
             })
             .collect()
     }

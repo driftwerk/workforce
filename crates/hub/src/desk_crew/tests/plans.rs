@@ -803,7 +803,17 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             (s.len() == 1).then(|| s[0].id)
         })
         .await;
-        // Its first calls, before its ticket is linked or not, count.
+        // Handed its ticket (what its spend is counted by), it spends.
+        eventually("the first ticket handed to its session", async || {
+            d.plan(id)
+                .await
+                .unwrap()
+                .tickets
+                .iter()
+                .any(|t| t.ticket.ticket.session() == Some(first))
+                .then_some(())
+        })
+        .await;
         spent(&d, first, 8.5).await;
         let paused = eventually("the plan paused at its warning", async || {
             let p = d.plan(id).await.unwrap().summary;
@@ -915,6 +925,16 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
         assert_eq!(d.plan(id).await.unwrap().summary.plan.paused, None);
 
         // Over: it stops again, and the hold is said again only once.
+        eventually("the next ticket handed to its session", async || {
+            d.plan(id)
+                .await
+                .unwrap()
+                .tickets
+                .iter()
+                .any(|t| t.ticket.ticket.session() == Some(second))
+                .then_some(())
+        })
+        .await;
         spent(&d, second, 2.0).await;
         eventually("the plan paused over its budget", async || {
             let p = d.plan(id).await.unwrap().summary;

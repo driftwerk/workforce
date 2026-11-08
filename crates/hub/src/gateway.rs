@@ -2083,6 +2083,8 @@ async fn handle_ws(
     let anchored_session_id = initial_session_id.clone();
 
     let conn_agent = agent_id.clone();
+    #[cfg(feature = "postgres")]
+    let room_agent = resolved_id.to_string();
     // WELCOME.md is the agent's own directive for greeting a new session,
     // read by the turn loop; it is never client copy.
     let connected_msg = ServerMessage {
@@ -2278,6 +2280,24 @@ async fn handle_ws(
                                     continue;
                                 }
                             };
+                            // A room's turn reaches only an agent its group
+                            // lets in now (boss-gaps W8).
+                            #[cfg(feature = "postgres")]
+                            if let Some(turn) = desk_turn.as_ref() {
+                                let why = match state.registry.get(&room_agent) {
+                                    Some(service) => {
+                                        crate::desk_crew::room_turn_refused(&service, &turn.place)
+                                            .await
+                                    }
+                                    None => None,
+                                };
+                                if let Some(why) = why {
+                                    let session =
+                                        conn_session_recv.lock().await.clone().unwrap_or_default();
+                                    let _ = broadcast_tx.send(refused(session, why));
+                                    continue;
+                                }
+                            }
                             let raw_content = client_msg.content.unwrap_or_default();
                             // Channel is metadata for downstream tooling only —
                             // session lookup uses session_id, not channel.

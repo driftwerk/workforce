@@ -1781,6 +1781,8 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
 /// agents and Desk sessions log, and answering it in place.
 mod groups;
 
+mod handovers;
+
 mod plans;
 
 /// A boss still among the hub's agents whose config fails to read for a

@@ -311,6 +311,21 @@ impl MemoryStore for ShadowedMemory {
     async fn update_tags(&self, id: &MemoryId, tags: Vec<String>) -> Result<()> {
         self.noted(id, self.serving.update_tags(id, tags).await)
     }
+    /// Every memory tagged is noted for vellev's replica.
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let tagged = self.serving.add_tag(owner, tag, unless_prefix).await?;
+        if let Some(noter) = &self.noter {
+            if !tagged.is_empty() {
+                noter.note(Note::Many(tagged.clone()));
+            }
+        }
+        Ok(tagged)
+    }
     async fn adjust_importance(&self, id: &MemoryId, delta: f32) -> Result<f32> {
         self.noted(id, self.serving.adjust_importance(id, delta).await)
     }

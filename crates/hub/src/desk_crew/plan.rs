@@ -1003,7 +1003,7 @@ impl CrewHub {
     }
 
     /// Spends one of the hour's work turns of `service`, the boss.
-    fn spend_boss_turn(&self, service: &AgentService, o: &Oversight) -> bool {
+    pub(super) fn spend_boss_turn(&self, service: &AgentService, o: &Oversight) -> bool {
         let hour = self.timing.minute * 60;
         let mut runs = self.work.lock();
         let run = runs

@@ -20,7 +20,7 @@ use workforce_core::budget::{
 
 use super::{session_item, Desk, DeskError, Live};
 use crate::breaker::{self as pure, Level, Reason, Signal, Step, Whose};
-use crate::budget_store::Used;
+use crate::budget_store::{SessionSpend, Used};
 use crate::crew::{By, Event, Kind, Party, PartyKind};
 use crate::engine::Engine;
 use crate::floor::{Answer, DecideRef, Need, NeedKind, Place, Who};
@@ -208,21 +208,16 @@ pub struct BudgetPatch {
 }
 
 /// What the sessions of `pool` spent, of each session's `spent`: every
-/// session on Desk (one since forgotten too), or a group's members now.
-/// The breaker and Settings count a total by this one rule.
-fn sessions_used(
-    pool: &Pool,
-    spent: Option<&HashMap<Uuid, Used>>,
-    groups: &HashMap<Uuid, Option<String>>,
-) -> Used {
+/// session on Desk (one since forgotten too), or what was spent in a group,
+/// by the group each ledger row was stamped with. A session moved in
+/// brings none of its past, and takes none of it away. The breaker and
+/// Settings count a total by this one rule.
+fn sessions_used(pool: &Pool, spent: Option<&HashMap<Uuid, SessionSpend>>) -> Used {
     let mut total = Used::default();
-    for (id, u) in spent.into_iter().flatten() {
-        let counts = match pool {
-            Pool::Desk => true,
-            Pool::Group(g) => groups.get(id).and_then(|x| x.as_deref()) == Some(g.as_str()),
-        };
-        if counts {
-            total.add(*u);
+    for s in spent.into_iter().flat_map(HashMap::values) {
+        match pool {
+            Pool::Desk => total.add(s.all),
+            Pool::Group(g) => total.add(s.groups.get(g).copied().unwrap_or_default()),
         }
     }
     total
@@ -1046,7 +1041,7 @@ impl Desk {
                         let spent = used
                             .get(&b.period)
                             .and_then(|m| m.get(&id))
-                            .copied()
+                            .map(|s| s.toward(b))
                             .unwrap_or_default();
                         standing(b, spent.of(b.unit))
                     }
@@ -1080,7 +1075,7 @@ impl Desk {
             let standings: Vec<Standing> = budget::pools(&budgets, &pool)
                 .into_iter()
                 .map(|b| {
-                    let mut total = sessions_used(&pool, used.get(&b.period), &groups);
+                    let mut total = sessions_used(&pool, used.get(&b.period));
                     total.add(self.agents_used(&pool, b.period, &agents));
                     standing(b, total.of(b.unit))
                 })
@@ -1321,7 +1316,7 @@ impl Desk {
         budgets: &[Budget],
         now: DateTime<Utc>,
         tz: chrono_tz::Tz,
-    ) -> Option<HashMap<Period, HashMap<Uuid, Used>>> {
+    ) -> Option<HashMap<Period, HashMap<Uuid, SessionSpend>>> {
         let mut periods: Vec<Period> = budgets.iter().map(|b| b.period).collect();
         periods.sort();
         periods.dedup();
@@ -1548,7 +1543,7 @@ impl Desk {
                 let spent = |id: &Uuid| {
                     of_period
                         .and_then(|m| m.get(id))
-                        .copied()
+                        .map(|s| s.toward(b))
                         .unwrap_or_default()
                 };
                 let agent_spent = |id: &str| {
@@ -1564,7 +1559,7 @@ impl Desk {
                     }
                     BudgetScope::Desk => {
                         let pool = b.group.clone().map_or(Pool::Desk, Pool::Group);
-                        let mut total = sessions_used(&pool, of_period, &groups);
+                        let mut total = sessions_used(&pool, of_period);
                         total.add(self.agents_used(&pool, b.period, &agents));
                         Some(budget::standing_of(b, total.of(b.unit), from, to))
                     }
@@ -1702,25 +1697,13 @@ impl Desk {
             return HashMap::new();
         };
         let agents = self.agents_by_period(&budgets, now, tz).await;
-        let groups: HashMap<Uuid, Option<String>> = {
-            let st = self.0.state.lock();
-            st.records
-                .keys()
-                .map(|id| {
-                    (
-                        *id,
-                        st.layout.group_of(&session_item(*id)).map(|g| g.id.clone()),
-                    )
-                })
-                .collect()
-        };
         let mut by: HashMap<String, Vec<Standing>> = HashMap::new();
         for b in &budgets {
             let Some(group) = b.group.clone() else {
                 continue;
             };
             let pool = Pool::Group(group.clone());
-            let mut total = sessions_used(&pool, used.get(&b.period), &groups);
+            let mut total = sessions_used(&pool, used.get(&b.period));
             total.add(self.agents_used(&pool, b.period, &agents));
             let (from, to) = (
                 budget::window_start(b.period, now, tz),

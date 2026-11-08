@@ -283,9 +283,10 @@ impl Desk {
     /// where they were written.
     pub(super) async fn moved_across(&self, id: Uuid, from: Option<&str>, to: Option<&str>) {
         let bossed = self.bossed();
-        if crate::scope::scope_of(from, &bossed) == crate::scope::scope_of(to, &bossed)
-            || self.0.scopes.lock().placing.contains(&id)
-        {
+        if crate::scope::scope_of(from, &bossed) == crate::scope::scope_of(to, &bossed) || {
+            let s = self.0.scopes.lock();
+            s.placing.contains(&id) || s.moving.contains(&id)
+        } {
             return;
         }
         let was = self.seen_by(&crate::scope::scope_of(from, &bossed));
@@ -416,7 +417,7 @@ impl Desk {
 
     /// Records `m` in Activity and tells every window, and what its
     /// sessions' threads are unread by.
-    fn line_announce(&self, m: &LineMessage) {
+    pub(super) fn line_announce(&self, m: &LineMessage) {
         {
             let mut st = self.0.state.lock();
             for id in [m.from_session(), m.to_session()].into_iter().flatten() {
@@ -1331,7 +1332,7 @@ impl Desk {
     }
 
     /// Delivers what waits for `id`, soon.
-    fn line_pump_later(&self, id: Uuid) {
+    pub(super) fn line_pump_later(&self, id: Uuid) {
         let desk = self.clone();
         tokio::spawn(async move { desk.line_pump(id).await });
     }

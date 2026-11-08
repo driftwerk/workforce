@@ -158,6 +158,8 @@ kinds! {
     PlanPaused => "plan_paused",
     PlanDropped => "plan_dropped",
     PlanDone => "plan_done",
+    Moved => "moved",
+    HandedOver => "handed_over",
 }
 
 /// One thing that happened on the crew.
@@ -680,6 +682,33 @@ pub trait Crew: Send + Sync {
     /// What went wrong, in plain words.
     async fn release_group(&self, _group: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Asks the boss an item leaves to draft handover note `h` for the
+    /// boss it goes to, in one `[Desk handover]` turn of its own, before
+    /// `h.asked_until`; `facts` is Desk's note from the facts, which stands
+    /// if it doesn't. Nothing where there's no crew.
+    async fn ask_handover(&self, _h: &crate::moves::Handover, _facts: &str) {}
+
+    /// Delivers handover note `h`, as the person sent it, to its new boss:
+    /// one `[Desk handover]` prompt, text only. What went wrong, in plain
+    /// words.
+    async fn deliver_handover(&self, _h: &crate::moves::Handover) -> Result<(), String> {
+        Err("There is no boss here to hand it to.".into())
+    }
+
+    /// Moves the boss `agent` to oversee `to` (none: everything ungrouped):
+    /// what it remembered is first kept to the scope it leaves, then its
+    /// `[oversight] group` is written; `replace` lets it take over a scope
+    /// that has a boss, which is switched off. What went wrong, in plain
+    /// words.
+    async fn move_boss(
+        &self,
+        _agent: &str,
+        _to: Option<&str>,
+        _replace: bool,
+    ) -> Result<(), String> {
+        Err("Desk can't move a boss on this hub.".into())
     }
 
     /// `assign`, as `by`: the overseer handing out a ticket is the overseer

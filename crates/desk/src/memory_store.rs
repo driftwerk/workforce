@@ -131,6 +131,19 @@ pub struct MemoryCounts {
     pub past_cap: i64,
 }
 
+/// What session memory holds of one group's sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupTotals {
+    /// None: ungrouped sessions'.
+    pub group: Option<String>,
+    pub sessions: i64,
+    pub exchanges: i64,
+    pub secrets_hidden: i64,
+    /// Notes still held.
+    pub notes: i64,
+}
+
 fn count(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
@@ -222,33 +235,37 @@ impl DeskStore {
                 )
                 .await?
                 .try_get(0)?;
+            // Each exchange is the group's its session was in when it began,
+            // so one read after a move stays where it was said.
+            let insert = format!(
+                "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, \
+                   folder, seq, at, ended, asker, ask, answer, steps, files, commands, \
+                   errors, compaction, redacted, flagged) \
+                 SELECT gen_random_uuid(), $1, $2, $3, {group}, $4, $5, $6, $7, $8, $9, \
+                   $10, $11, $12, $13, $14, $15, $16, $17, $18 \
+                 WHERE NOT EXISTS (SELECT 1 FROM memory_forgotten f \
+                   WHERE f.engine = $1 AND f.ref = 'key:' || $2) \
+                 ON CONFLICT (engine, key) DO UPDATE SET ended = EXCLUDED.ended, \
+                   ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
+                   files = EXCLUDED.files, commands = EXCLUDED.commands, \
+                   errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
+                   flagged = EXCLUDED.flagged, \
+                   indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                     memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                     EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
+                   index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                     memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                     EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
+                 WHERE memory_exchanges.session = EXCLUDED.session",
+                group = crate::store::group_at_sql("$3::uuid", "$7::timestamptz"),
+            );
             for (i, x) in w.closed.iter().chain(w.open).enumerate() {
                 let seq = base + i32::try_from(i).unwrap_or(i32::MAX - base) + 1;
                 let steps = serde_json::to_value(&x.steps)?;
                 let files: Vec<&str> = x.files.iter().map(String::as_str).collect();
                 let flagged: Vec<&str> = x.flagged.iter().map(String::as_str).collect();
                 tx.execute(
-                    "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, \
-                       folder, seq, at, ended, asker, ask, answer, steps, files, commands, \
-                       errors, compaction, redacted, flagged) \
-                     SELECT gen_random_uuid(), $1, $2, $3, ( \
-                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
-                       WHERE g.item = 'session:' || $3::uuid::text), $4, $5, $6, $7, $8, $9, \
-                       $10, $11, $12, $13, $14, $15, $16, $17, $18 \
-                     WHERE NOT EXISTS (SELECT 1 FROM memory_forgotten f \
-                       WHERE f.engine = $1 AND f.ref = 'key:' || $2) \
-                     ON CONFLICT (engine, key) DO UPDATE SET ended = EXCLUDED.ended, \
-                       ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
-                       files = EXCLUDED.files, commands = EXCLUDED.commands, \
-                       errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
-                       flagged = EXCLUDED.flagged, \
-                       indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
-                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
-                         EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
-                       index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
-                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
-                         EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
-                     WHERE memory_exchanges.session = EXCLUDED.session",
+                    insert.as_str(),
                     &[
                         &w.engine.as_str(),
                         &x.key,
@@ -414,16 +431,124 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Sets a session's own memory switch.
-    pub async fn set_session_memory(&self, session: Uuid, on: bool) -> Result<()> {
+    /// Merges `fields` into the object setting `key`, in one statement: two
+    /// changes at once each keep the other's fields. What it now is.
+    pub async fn merge_setting(
+        &self,
+        key: &str,
+        fields: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
         let client = self.pool().get().await?;
-        client
+        let fields = Value::Object(fields.clone());
+        Ok(client
+            .query_one(
+                "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) \
+                 ON CONFLICT (key) DO UPDATE SET value = CASE \
+                   WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value || $2 \
+                   ELSE $2 END, updated_at = now() \
+                 RETURNING value",
+                &[&key, &fields],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    /// Sets a session's own memory switch; false when there is no such
+    /// session.
+    pub async fn set_session_memory(&self, session: Uuid, on: bool) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
             .execute(
                 "UPDATE sessions SET memory = $2 WHERE id = $1",
                 &[&session, &if on { "on" } else { "off" }],
             )
-            .await?;
-        Ok(())
+            .await?
+            > 0)
+    }
+
+    /// A session's own memory switch: on unless the person turned it off;
+    /// none when there is no such session.
+    pub async fn session_memory_on(&self, session: Uuid) -> Result<Option<bool>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt("SELECT memory FROM sessions WHERE id = $1", &[&session])
+            .await?
+            .map(|r| r.try_get::<_, String>(0))
+            .transpose()?
+            .map(|m| m != "off"))
+    }
+
+    /// When Desk last kept something of `session`'s conversation.
+    pub async fn memory_last_kept(&self, session: Uuid) -> Result<Option<DateTime<Utc>>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT updated_at FROM memory_sessions WHERE session = $1",
+                &[&session],
+            )
+            .await?
+            .map(|r| r.try_get(0))
+            .transpose()?)
+    }
+
+    /// Every `memory.*` setting the person has made, by key.
+    pub async fn memory_settings(&self) -> Result<HashMap<String, Value>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT key, value FROM settings WHERE key LIKE 'memory.%'",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
+
+    /// What session memory holds, by group (none: ungrouped).
+    pub async fn memory_totals(&self) -> Result<Vec<GroupTotals>> {
+        let client = self.pool().get().await?;
+        let mut by: HashMap<Option<String>, GroupTotals> = HashMap::new();
+        for r in client
+            .query(
+                "SELECT group_id, COUNT(DISTINCT session), COUNT(*), \
+                   COALESCE(SUM(redacted), 0)::int8 \
+                 FROM memory_exchanges GROUP BY group_id",
+                &[],
+            )
+            .await?
+        {
+            let group: Option<String> = r.try_get(0)?;
+            by.insert(
+                group.clone(),
+                GroupTotals {
+                    group,
+                    sessions: r.try_get(1)?,
+                    exchanges: r.try_get(2)?,
+                    secrets_hidden: r.try_get(3)?,
+                    notes: 0,
+                },
+            );
+        }
+        for r in client
+            .query(
+                "SELECT group_id, COUNT(*) FROM memory_items \
+                 WHERE valid_to IS NULL GROUP BY group_id",
+                &[],
+            )
+            .await?
+        {
+            let group: Option<String> = r.try_get(0)?;
+            by.entry(group.clone())
+                .or_insert_with(|| GroupTotals {
+                    group,
+                    ..GroupTotals::default()
+                })
+                .notes = r.try_get(1)?;
+        }
+        let mut totals: Vec<GroupTotals> = by.into_values().collect();
+        totals.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(totals)
     }
 
     /// Deletes conversations that ended more than `retain_days` ago, and

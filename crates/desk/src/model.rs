@@ -340,6 +340,12 @@ pub enum DeskEvent {
         terminals: Vec<crate::service::TerminalView>,
         layout: crate::service::Layout,
     },
+    /// One of the person's settings changed (`memory.paused`,
+    /// `memory.group.<id>`, `memory.session.<id>` for a session's own
+    /// switch): read it again.
+    Setting {
+        key: String,
+    },
     /// The sidebar's groups changed; the whole layout as it now is.
     Layout {
         layout: crate::service::Layout,
@@ -417,6 +423,10 @@ pub enum DeskEvent {
     /// paused, dropped or done.
     Plan {
         plan: Box<crate::service::PlanSummary>,
+    },
+    /// A handover note's draft changed: its old boss wrote it.
+    Handover {
+        handover: Box<crate::moves::Handover>,
     },
     /// A board's ticket was made or changed.
     Ticket {

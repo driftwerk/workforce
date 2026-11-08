@@ -666,11 +666,7 @@ pub async fn scan_sessions_and_extract(
         .sessions
         .list_since(service.agent_id.as_str(), cutoff, 2000)?
         .into_iter()
-        .filter(|s| !crate::turn_extraction::leaves_no_memory(&s.channel))
-        // Shared (multi-human) sessions belong to no single user; consolidating
-        // them would widen one room's content into the agent's global memory,
-        // recalled for people who were never in the room.
-        .filter(|s| !s.is_shared_conversation())
+        .filter(consolidatable)
         .collect();
 
     if recent.is_empty() {
@@ -884,6 +880,17 @@ pub fn preseed_consolidation_cursor(workspace: &Path, since: DateTime<Utc>) -> R
     write_cursor(workspace, since)
 }
 
+/// Whether a session's talk may be consolidated into its agent's memory:
+/// one that leaves memory at all, of a single user (a shared room belongs to
+/// no one person, and consolidating it would widen one room's content into
+/// memory recalled for people never in it), and not one its agent had as
+/// the boss of a Desk group it has left since (that group's alone).
+fn consolidatable(s: &workforce_common::session::Session) -> bool {
+    !crate::turn_extraction::leaves_no_memory(&s.channel)
+        && !s.is_shared_conversation()
+        && !s.left_behind()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,6 +939,15 @@ mod tests {
             external_id: None,
             seq: None,
         }
+    }
+
+    #[test]
+    fn a_session_left_with_a_group_its_boss_left_is_never_consolidated() {
+        let mut left = workforce_common::session::Session::new("desk", "kings", "sarah");
+        assert!(consolidatable(&left));
+        left.metadata =
+            serde_json::json!({ workforce_common::session::LEFT_SCOPE_KEY: "desk-group:acme" });
+        assert!(!consolidatable(&left));
     }
 
     #[test]

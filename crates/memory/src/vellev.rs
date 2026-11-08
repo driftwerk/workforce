@@ -1406,6 +1406,55 @@ impl MemoryStore for VellevStore {
         Ok(counts)
     }
 
+    /// Every object of the owner's is read once; a memory held in several
+    /// objects has its tags set on each, as `update_tags` does.
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let mut by_memory: BTreeMap<String, (Vec<String>, Vec<ObjectId>)> = BTreeMap::new();
+        for object in self.every(eq("owner", owner.as_str())).await? {
+            let Some(memory) = object
+                .properties
+                .get("memoryId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let tags: Vec<String> = object
+                .properties
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let held = by_memory
+                .entry(memory)
+                .or_insert_with(|| (tags, Vec::new()));
+            held.1.push(object.id);
+        }
+        let mut tagged = Vec::new();
+        for (memory, (mut tags, objects)) in by_memory {
+            if tags.iter().any(|t| t.starts_with(unless_prefix)) {
+                continue;
+            }
+            tags.push(tag.to_string());
+            self.patch_all(&objects, props([("tags", json!(tags))]))
+                .await?;
+            tagged.push(MemoryId(memory));
+        }
+        if let Some(previous) = self.previous.get() {
+            previous.add_tag(owner, tag, unless_prefix).await?;
+        }
+        Ok(tagged)
+    }
+
     async fn reassign_identity(&self, owner: &AgentId, from: &str, to: &str) -> Result<usize> {
         let objects: Vec<ObjectId> = self
             .every(about(owner, from))
@@ -1888,6 +1937,14 @@ pub(crate) mod node_tests {
             return;
         };
         crate::store::identity_operations_contract(&node.store("Memories").await).await;
+    }
+
+    #[tokio::test]
+    async fn the_add_tag_contract_holds() {
+        let Some(node) = Node::fresh().await else {
+            return;
+        };
+        crate::store::add_tag_contract(&node.store("Memories").await).await;
     }
 
     #[tokio::test]

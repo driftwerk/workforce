@@ -158,6 +158,8 @@ pub fn select_visible_other_sessions<'a>(
         .filter(|s| s.owner == current_owner)
         .filter(|s| s.message_count() > 0)
         .filter(|s| s.updated_at > cutoff)
+        // A boss's talk in a group it has left stays with that group.
+        .filter(|s| !s.left_behind())
         .collect()
 }
 
@@ -4576,6 +4578,23 @@ pub mod tests {
     }
 
     // ── select_visible_other_sessions (DW-515) ─────────────────────────
+
+    #[test]
+    fn a_session_left_with_a_group_its_boss_left_is_never_another_sessions_context() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut left = Session::new("desk", "kings", "sarah");
+        left.add_user_message("acmecanary", None);
+        left.metadata =
+            serde_json::json!({ workforce_common::session::LEFT_SCOPE_KEY: "desk-group:acme" });
+        let mut kept = Session::new("slack:C1", "kings", "sarah");
+        kept.add_user_message("atlas", None);
+        let pool = vec![left, kept.clone()];
+        let visible = select_visible_other_sessions(&pool, "none", "kings", cutoff);
+        assert_eq!(
+            visible.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            [kept.id]
+        );
+    }
 
     fn make_session(owner: &str, age_minutes: i64, message_count: usize) -> Session {
         let mut s = Session::new("ios", owner, "atlas");

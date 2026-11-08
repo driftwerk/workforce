@@ -176,6 +176,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "handovers",
+        "drafted_by",
+        NotPersonal("the boss agent that drafted a handover note, or Desk, as a party"),
+    ),
+    (
+        "desk",
         "line_messages",
         "sender",
         NotPersonal("a session, the overseer agent, or `you`, the one person of the Desk"),
@@ -334,6 +340,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "gists",
         "subject",
         NotPersonal("the agent or Desk session a gist is of"),
+    ),
+    (
+        "hub",
+        "gists_forgotten",
+        "subject",
+        NotPersonal("the Desk session whose memory the person had forgotten"),
     ),
     ("hub", "summaries", "owner", By(C::Signals)),
     ("hub", "allows", "person", By(C::PermissionRules)),

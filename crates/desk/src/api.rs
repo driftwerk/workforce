@@ -41,6 +41,17 @@ pub trait Authorize: Send + Sync {
         query_token: Option<&str>,
     ) -> Result<Option<String>, StatusCode>;
 
+    /// As [`Self::authorize`], for what only the person who holds the hub
+    /// may do (making a move, as deciding a need): the hub refuses anyone
+    /// else. Its default is `authorize`'s answer.
+    async fn authorize_holder(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        self.authorize(headers, query_token).await
+    }
+
     /// Whether the request's bearer is the hub's own gateway token itself,
     /// compared in constant time: what an account's sign-in is handed to,
     /// and nothing else (not a system administrator's sign-in).
@@ -1098,7 +1109,7 @@ async fn replace_layout(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|before| match &r.expected {
+        .change_layout_by_person(|before| match &r.expected {
             Some(expected) if expected != before => Err(DeskError::Conflict(
                 "The layout changed since it was read: read it again.".into(),
             )),
@@ -1201,7 +1212,7 @@ async fn put_member(
     guarded!(s, h, q);
     let before = body.map(|Json(b)| b.before).unwrap_or_default();
     s.desk
-        .change_layout(|l| l.put(&item, &id, before.as_deref()))
+        .change_layout_by_person(|l| l.put(&item, &id, before.as_deref()))
         .await
         .map(Json)
         .into_response()
@@ -1215,7 +1226,7 @@ async fn remove_member(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|l| match l.group_of(&item) {
+        .change_layout_by_person(|l| match l.group_of(&item) {
             Some(g) if g.id == id => l.remove(&item),
             _ => Err(DeskError::NotFound),
         })
@@ -1235,7 +1246,7 @@ struct Order {
 async fn order_ungrouped(State(s): S, h: HeaderMap, Query(q): Q, Json(o): Json<Order>) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|l| l.order_ungrouped(&o.items))
+        .change_layout_by_person(|l| l.order_ungrouped(&o.items))
         .await
         .map(Json)
         .into_response()
@@ -1487,6 +1498,79 @@ async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uu
         .into_response()
 }
 
+/// The session's own Remember switch: `{"on": false}`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySwitch {
+    on: bool,
+}
+
+/// Turns one session's remembering on or off.
+async fn switch_memory(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Result<Json<MemorySwitch>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(switch) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    match s.desk.set_session_memory(id, switch.on).await {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(notice)) => Json(serde_json::json!({ "notice": notice })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The person's memory settings, the install's limits, and what is kept.
+async fn memory_settings(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk.memory_settings().await.map(Json).into_response()
+}
+
+/// Pauses or resumes remembering: `{"paused": true}`.
+async fn change_memory_settings(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    body: Result<Json<crate::service::MemorySettingsChange>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(change) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk
+        .change_memory_settings(&change)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// Changes one group's memory switches: `{"derive": true}`, `{"harvest":
+/// false}`, `{"handoffAsk": false}`.
+async fn change_group_memory(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    body: Result<Json<crate::service::GroupMemoryChange>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(change) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk
+        .change_group_memory(&id, &change)
+        .await
+        .map(Json)
+        .into_response()
+}
+
 /// Reads one session's new exchanges for decisions, facts and to-dos now,
 /// as its memory panel opens.
 async fn derive_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
@@ -1588,10 +1672,17 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
         .route(
             "/api/desk/sessions/{id}/memory",
-            get(session_memory).delete(forget_memory),
+            get(session_memory)
+                .delete(forget_memory)
+                .patch(switch_memory),
         )
         .route("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
         .route("/api/desk/memory/items/{id}", patch(change_memory_item))
+        .route(
+            "/api/desk/memory/settings",
+            get(memory_settings).patch(change_memory_settings),
+        )
+        .route("/api/desk/memory/groups/{id}", patch(change_group_memory))
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(
             "/api/desk/budgets/{id}",
@@ -1681,6 +1772,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             Arc::clone(&auth),
         ))
         .merge(crate::plan_api::api_routes(desk.clone(), Arc::clone(&auth)))
+        .merge(crate::move_api::api_routes(desk.clone(), Arc::clone(&auth)))
         .merge(crate::board_api::api_routes(desk, auth))
 }
 
