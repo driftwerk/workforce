@@ -42,6 +42,9 @@ pub const NO_DERIVER: &str = "Desk has no model to note decisions with on this c
 /// While memory is paused or off for the session.
 pub const DERIVE_MEMORY_OFF: &str =
     "Desk isn't noting decisions while it isn't remembering this session.";
+/// While remembering is paused for every session.
+pub const DERIVE_PAUSED_MEMORY: &str =
+    "Desk isn't noting decisions while remembering is paused for every session.";
 /// After it kept failing.
 pub const DERIVE_FAILED: &str =
     "Desk couldn't note decisions from this session lately; it tries again when the session says more.";
@@ -118,18 +121,45 @@ pub struct ReplacedView {
 /// The most replaced notes a session's panel lists.
 const REPLACED_MAX: i64 = 20;
 
-/// What the panel acts on of why Desk isn't noting, from what it says.
-fn reason_of(why: &str) -> Option<&'static str> {
-    [
-        (DERIVE_OFF, "desk_off"),
-        (NO_DERIVER, "no_model"),
-        (DERIVE_MEMORY_OFF, "memory_off"),
-        (DERIVE_GROUP_OFF, "group_off"),
-        (DERIVE_PAUSED, "day_cap"),
-        (DERIVE_FAILED, "failing"),
-    ]
-    .into_iter()
-    .find_map(|(said, reason)| (said == why).then_some(reason))
+/// Why Desk isn't noting a session's decisions, or what else to know:
+/// what the panel acts on, and what the person reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NotingWhy {
+    DeskOff,
+    NoModel,
+    /// The person paused remembering for every session.
+    Paused,
+    /// The person turned remembering off for this session.
+    SessionOff,
+    GroupOff,
+    DayCap,
+    Failing,
+}
+
+impl NotingWhy {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::DeskOff => "desk_off",
+            Self::NoModel => "no_model",
+            Self::Paused => "paused",
+            Self::SessionOff => "session_off",
+            Self::GroupOff => "group_off",
+            Self::DayCap => "day_cap",
+            Self::Failing => "failing",
+        }
+    }
+
+    pub(super) fn plain(self) -> &'static str {
+        match self {
+            Self::DeskOff => DERIVE_OFF,
+            Self::NoModel => NO_DERIVER,
+            Self::Paused => DERIVE_PAUSED_MEMORY,
+            Self::SessionOff => DERIVE_MEMORY_OFF,
+            Self::GroupOff => DERIVE_GROUP_OFF,
+            Self::DayCap => DERIVE_PAUSED,
+            Self::Failing => DERIVE_FAILED,
+        }
+    }
 }
 
 /// How many of each a session holds.
@@ -140,6 +170,9 @@ pub struct NoteCounts {
     pub facts: usize,
     pub todos: usize,
     pub open_todos: usize,
+    /// Every note Desk keeps of the session, those replaced and dropped
+    /// too: what forgetting it deletes.
+    pub kept: i64,
 }
 
 /// What Desk noted from a session, and whether it is noting.
@@ -154,8 +187,8 @@ pub struct Notes {
     /// Why it isn't, or what else to know, in plain words.
     pub why: Option<String>,
     /// The same, for the panel to act on: `desk_off`, `no_model`,
-    /// `memory_off`, `group_off` (the group's settings may let it),
-    /// `day_cap` or `failing`.
+    /// `paused` (every session), `session_off`, `group_off` (the group's
+    /// settings may let it), `day_cap` or `failing`.
     pub reason: Option<&'static str>,
     /// Notes another replaced lately, latest first: what they said, and
     /// when.
@@ -577,11 +610,12 @@ impl Desk {
                 .iter()
                 .filter(|t| t.state == ItemState::Open)
                 .count(),
+            kept: self.0.store.items_kept(id).await?,
         };
         let (noting, why) = self.noting(id, group, queued.failed.is_some()).await?;
         notes.noting = noting;
-        notes.reason = why.and_then(reason_of);
-        notes.why = why.map(str::to_string);
+        notes.reason = why.map(NotingWhy::code);
+        notes.why = why.map(|w| w.plain().to_string());
         Ok(notes)
     }
 
@@ -592,26 +626,29 @@ impl Desk {
         id: Uuid,
         group: Option<&str>,
         failed: bool,
-    ) -> Result<(Noting, Option<&'static str>), DeskError> {
+    ) -> Result<(Noting, Option<NotingWhy>), DeskError> {
         let m = &self.0.opts.memory;
         if !m.enabled || !m.derive {
-            return Ok((Noting::Off, Some(DERIVE_OFF)));
+            return Ok((Noting::Off, Some(NotingWhy::DeskOff)));
         }
         if self.0.derive.deriver.is_none() {
-            return Ok((Noting::Off, Some(NO_DERIVER)));
+            return Ok((Noting::Off, Some(NotingWhy::NoModel)));
         }
         let facts = self.0.store.derive_facts(id, group).await?;
-        if facts.paused || facts.session_off {
-            return Ok((Noting::Off, Some(DERIVE_MEMORY_OFF)));
+        if facts.paused {
+            return Ok((Noting::Off, Some(NotingWhy::Paused)));
+        }
+        if facts.session_off {
+            return Ok((Noting::Off, Some(NotingWhy::SessionOff)));
         }
         if !facts.group_on {
-            return Ok((Noting::Off, Some(DERIVE_GROUP_OFF)));
+            return Ok((Noting::Off, Some(NotingWhy::GroupOff)));
         }
         if self.0.store.derive_calls(self.derive_day()).await? >= i64::from(m.derive_calls_per_day)
         {
-            return Ok((Noting::Paused, Some(DERIVE_PAUSED)));
+            return Ok((Noting::Paused, Some(NotingWhy::DayCap)));
         }
-        Ok((Noting::On, failed.then_some(DERIVE_FAILED)))
+        Ok((Noting::On, failed.then_some(NotingWhy::Failing)))
     }
 
     /// The person's change to note `id`: confirmed, corrected (a note of

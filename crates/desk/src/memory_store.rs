@@ -427,6 +427,28 @@ impl DeskStore {
         Ok(())
     }
 
+    /// Merges `fields` into the object setting `key`, in one statement: two
+    /// changes at once each keep the other's fields. What it now is.
+    pub async fn merge_setting(
+        &self,
+        key: &str,
+        fields: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let client = self.pool().get().await?;
+        let fields = Value::Object(fields.clone());
+        Ok(client
+            .query_one(
+                "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) \
+                 ON CONFLICT (key) DO UPDATE SET value = CASE \
+                   WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value || $2 \
+                   ELSE $2 END, updated_at = now() \
+                 RETURNING value",
+                &[&key, &fields],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
     /// Sets a session's own memory switch; false when there is no such
     /// session.
     pub async fn set_session_memory(&self, session: Uuid, on: bool) -> Result<bool> {

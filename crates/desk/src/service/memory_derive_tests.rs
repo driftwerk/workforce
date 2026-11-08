@@ -964,10 +964,22 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         .await;
         assert_eq!(status, 200);
 
+        let (_, mut events) = d.subscribe();
+        let mut settings_told = || {
+            let mut keys = Vec::new();
+            while let Ok(e) = events.try_recv() {
+                if let crate::model::DeskEvent::Setting { key } = e {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+
         // Its own switch.
         let memory = d.session_memory(s).await.unwrap();
         assert!(memory.memory_on);
         assert!(!memory.no_record);
+        assert!(!memory.cleared);
         assert!(memory.last_read.is_some(), "it kept what was said");
         let uri = format!("/api/desk/sessions/{s}/memory");
         assert_eq!(
@@ -984,7 +996,8 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         );
         let memory = d.session_memory(s).await.unwrap();
         assert!(!memory.memory_on);
-        assert_eq!(memory.notes.reason, Some("memory_off"));
+        assert_eq!(memory.notes.reason, Some("session_off"));
+        assert_eq!(settings_told(), [format!("memory.session.{s}")]);
         assert_eq!(
             call(
                 app.clone(),
@@ -1010,6 +1023,7 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         assert_eq!(body["limits"]["retainDays"], 90);
         assert_eq!(body["limits"]["deriveCallsPerDay"], 200);
         assert_eq!(body["limits"]["provider"], "anthropic");
+        assert_eq!(body["limits"]["fallbackProviders"], false);
         assert_eq!(body["totals"][0]["exchanges"], 1);
         assert_eq!(
             body["groups"],
@@ -1025,6 +1039,16 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         .await;
         assert_eq!((status, &body["paused"]), (200, &json!(true)));
         assert_eq!(store.setting(PAUSED).await.unwrap(), Some(json!(true)));
+        assert_eq!(settings_told(), [PAUSED.to_string()]);
+        // The panel's light read: the pause, and its group's switches.
+        let memory = d.session_memory(s).await.unwrap();
+        assert!(memory.switches.paused);
+        assert!(memory.switches.group.is_none(), "it is in no group");
+        assert_eq!(
+            memory.notes.reason,
+            Some("paused"),
+            "the pause is its own reason"
+        );
         assert_eq!(
             call(
                 app.clone(),
@@ -1061,6 +1085,7 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
             store.setting(&group_key("g-acme")).await.unwrap(),
             Some(json!({"derive": true, "harvest": false, "handoff_ask": false}))
         );
+        assert_eq!(settings_told(), [group_key("g-acme"), group_key("g-acme")]);
         assert_eq!(
             call(
                 app.clone(),
@@ -1083,6 +1108,29 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
             .0,
             401
         );
+        cancel.cancel();
+
+        // Noting off for this Desk: a group can't be let.
+        let (d, cancel) = start(&pool, dir.path(), &deriver, |o| o.memory.derive = false).await;
+        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        call(
+            app.clone(),
+            "POST",
+            "/api/desk/groups",
+            Some(json!({"id": "g-globex", "name": "Globex"})),
+        )
+        .await;
+        let (status, body) = call(
+            app,
+            "PATCH",
+            "/api/desk/memory/groups/g-globex",
+            Some(json!({"derive": true})),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body
+            .to_string()
+            .contains("noting is turned off for this Desk"));
         cancel.cancel();
     })
     .await;
@@ -1114,6 +1162,10 @@ async fn a_replaced_note_is_listed_with_when_and_why_noting_is_off_is_said_as_a_
         let notes = d.session_memory(s).await.unwrap().notes;
         assert_eq!(notes.facts[0].text, "Sessions live in Postgres.");
         assert_eq!(notes.replaced.len(), 1);
+        assert_eq!(
+            notes.counts.kept, 2,
+            "the replaced one is kept, and forgotten, too"
+        );
         assert_eq!(
             (notes.replaced[0].id, notes.replaced[0].text.as_str()),
             (fact, "Sessions live in Redis.")

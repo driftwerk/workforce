@@ -647,6 +647,18 @@ impl DeskStore {
             .collect()
     }
 
+    /// How many notes of `session` are kept, whatever became of them.
+    pub async fn items_kept(&self, session: Uuid) -> Result<i64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_one(
+                "SELECT COUNT(*) FROM memory_items WHERE session = $1",
+                &[&session],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
     /// `session`'s notes another replaced, latest replaced first: at most
     /// `limit`.
     pub async fn replaced_items(&self, session: Uuid, limit: i64) -> Result<Vec<ItemRow>> {

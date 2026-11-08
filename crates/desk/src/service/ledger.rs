@@ -72,6 +72,10 @@ pub(super) struct LedgerRun {
     ending: Mutex<HashSet<Uuid>>,
     /// Each session's project, found once.
     projects: Mutex<HashMap<Uuid, String>>,
+    /// Held by every read of a session's records, and by a change to
+    /// memory's switches across the read it makes first and the switch
+    /// itself: no read runs between them with the switch as it was.
+    pub(super) reading: tokio::sync::Mutex<()>,
 }
 
 impl LedgerRun {
@@ -93,6 +97,7 @@ impl LedgerRun {
                 redactor,
                 ending: Mutex::default(),
                 projects: Mutex::default(),
+                reading: tokio::sync::Mutex::new(()),
             },
             Jobs {
                 jobs: rx,
@@ -511,6 +516,13 @@ impl Desk {
     /// Reads each of `id`'s records from its cursor to its end, for the
     /// ledger and, where it may be, for session memory.
     async fn read_spend(&self, id: Uuid) {
+        let _reading = self.0.ledger.reading.lock().await;
+        self.read_spend_held(id, None).await;
+    }
+
+    /// [`Self::read_spend`] with [`LedgerRun::reading`] already held; with
+    /// `forced`, every record is read so whatever the switches say now.
+    pub(super) async fn read_spend_held(&self, id: Uuid, forced: Option<Harvest>) {
         let Some(r) = self.session_record(id).await else {
             return;
         };
@@ -534,7 +546,10 @@ impl Desk {
         };
         self.0.ledger.projects.lock().insert(id, project.clone());
         let ending = self.0.ledger.ending.lock().remove(&id);
-        let modes = self.harvest_modes(&r, &records).await;
+        let modes = match forced {
+            Some(mode) => vec![mode; records.len()],
+            None => self.harvest_modes(&r, &records).await,
+        };
         for (path, mode) in records.iter().zip(modes) {
             if let Err(e) = self.read_record(&r, path, mode, ending, &project).await {
                 tracing::warn!(session = %id, error = %e, "couldn't read a session's record");
@@ -570,12 +585,20 @@ impl Desk {
                     let on = mode == Harvest::On;
                     let mut step = read_step(engine, &path, &cursor, on)?;
                     let mut next = std::mem::take(&mut step.cursor);
+                    let (mut open, mut closed) = (None, Vec::new());
                     if mode == Harvest::Skip {
                         // Never to be remembered: the harvest goes on with
-                        // the ledger.
+                        // the ledger. An exchange left open before is
+                        // closed where it was, never joined to what is said
+                        // after.
                         next.harvested_to = next.read_to;
+                        let mut h = Harvested::of(&next.harvest);
+                        if let Some(mut x) = h.open.take() {
+                            x.ended = Some(Utc::now());
+                            closed.push(x);
+                            next.harvest = h.value();
+                        }
                     }
-                    let (mut open, mut closed) = (None, Vec::new());
                     if let (Harvest::On, Some(redactor)) = (mode, redactor.as_deref()) {
                         let mut h = Harvested::of(&next.harvest);
                         let parts = std::mem::take(&mut step.parts);

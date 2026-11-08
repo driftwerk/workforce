@@ -97,6 +97,7 @@ impl PgFloorStore {
             }
             (TurnOp::Settle { owner, .. }, _) => Some(owner.clone()),
             (TurnOp::Forget { subjects }, _) => forget_subjects(&tx, subjects).await?,
+            (TurnOp::ForgetGists { subjects }, _) => forget_gists(&tx, subjects).await?,
             (_, Some(id)) => {
                 let row = tx
                     .query_opt(
@@ -607,6 +608,21 @@ async fn forget_subjects(
     let owners = db
         .query(
             "DELETE FROM turns WHERE subject = ANY($1) RETURNING owner",
+            &[&keys],
+        )
+        .await?;
+    Ok(owners.first().map(|row| row.get("owner")))
+}
+
+/// Deletes the subjects' gists alone; whose they were, if any.
+async fn forget_gists(
+    db: &impl GenericClient,
+    subjects: &[SubjectKey],
+) -> Result<Option<Option<String>>> {
+    let keys: Vec<&str> = subjects.iter().map(SubjectKey::as_str).collect();
+    let owners = db
+        .query(
+            "DELETE FROM gists WHERE subject = ANY($1) RETURNING owner",
             &[&keys],
         )
         .await?;
@@ -1404,6 +1420,61 @@ mod tests {
             assert_eq!(store.gist(Some("u3"), &scout).await.unwrap(), None);
             assert_eq!(store.prune(at("2026-10-30T00:00:00Z")).await.unwrap(), 2);
             assert!(store.gists(&personal).await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_what_desk_remembers_takes_a_sessions_gist_and_leaves_its_turns() {
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+            let session = |id| Turn {
+                owner: None,
+                subject: Subject::Session {
+                    id,
+                    engine: workforce_desk::model::Engine::Claude,
+                },
+                ..turn("x", None, "2026-10-29T11:00:00Z")
+            };
+            for t in [session(mine), session(other)] {
+                store.apply(&begin(&t, false)).await.unwrap();
+            }
+            let gist = Gist {
+                purpose: Some("Making sign-in safe.".into()),
+                purpose_at: None,
+                now: "Working.".into(),
+                now_at: at("2026-10-29T11:05:00Z"),
+                turn: Uuid::nil(),
+                by_model: true,
+            };
+            for id in [mine, other] {
+                store
+                    .put_gist(None, &SubjectKey::session(id), &gist)
+                    .await
+                    .unwrap();
+            }
+            let whose = store
+                .apply(&TurnOp::ForgetGists {
+                    subjects: vec![SubjectKey::session(mine)],
+                })
+                .await
+                .unwrap();
+            assert_eq!(whose, Some(None), "the personal floor is told");
+            let personal = Scope {
+                personal: true,
+                ..scope("u1")
+            };
+            let gists = store.gists(&personal).await.unwrap();
+            assert!(!gists.contains_key(&SubjectKey::session(mine)));
+            assert!(gists.contains_key(&SubjectKey::session(other)));
+            let turns = store
+                .relevant(&personal, at("2026-10-29T00:00:00Z"))
+                .await
+                .unwrap();
+            assert!(turns
+                .iter()
+                .any(|t| t.subject.key() == SubjectKey::session(mine)));
         })
         .await;
     }

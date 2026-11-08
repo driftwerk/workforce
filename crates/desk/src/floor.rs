@@ -319,6 +319,11 @@ pub enum TurnOp {
     Forget {
         subjects: Vec<SubjectKey>,
     },
+    /// The person had Desk forget what it remembers of the subjects: their
+    /// gists go, their turns stay.
+    ForgetGists {
+        subjects: Vec<SubjectKey>,
+    },
 }
 
 impl TurnOp {
@@ -335,7 +340,10 @@ impl TurnOp {
             | Self::Unwait { turn, .. }
             | Self::Background { turn, .. }
             | Self::End { turn, .. } => Some(*turn),
-            Self::Begin { .. } | Self::Settle { .. } | Self::Forget { .. } => None,
+            Self::Begin { .. }
+            | Self::Settle { .. }
+            | Self::Forget { .. }
+            | Self::ForgetGists { .. } => None,
         }
     }
 }
@@ -467,6 +475,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
         }
         TurnOp::Settle { .. } => {}
         TurnOp::Forget { subjects } => turns.retain(|t| !subjects.contains(&t.subject.key())),
+        TurnOp::ForgetGists { .. } => {}
     }
     turns
 }
