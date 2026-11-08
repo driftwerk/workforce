@@ -484,6 +484,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
                 t.task = None;
                 t.doing = None;
                 t.answer = None;
+                t.question = None;
             }
         }
     }

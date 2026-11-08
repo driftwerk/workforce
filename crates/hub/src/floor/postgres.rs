@@ -290,10 +290,15 @@ impl PgFloorStore {
         gist: &Gist,
     ) -> Result<()> {
         let conn = self.pool.get().await?;
+        // A gist of a turn begun before its subject was forgotten (a job
+        // already under way) is dropped.
         conn.execute(
             &format!(
                 "INSERT INTO gists (owner, subject, {GIST_COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 SELECT $1::text, $2::text, $3::text, $4::timestamptz, $5::text, \
+                   $6::timestamptz, $7::uuid, $8::bool \
+                 WHERE NOT EXISTS (SELECT 1 FROM gists_forgotten f WHERE f.subject = $2 \
+                   AND f.at >= coalesce((SELECT started_at FROM turns WHERE id = $7), $6)) \
                  ON CONFLICT ((coalesce(owner, '')), subject) DO UPDATE SET \
                      purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at, \
                      now_text = EXCLUDED.now_text, now_at = EXCLUDED.now_at, \
@@ -614,9 +619,10 @@ async fn forget_subjects(
     Ok(owners.first().map(|row| row.get("owner")))
 }
 
-/// Deletes the subjects' gists, and what their turns were asked, did and
-/// answered, so none is written from those again; the turns themselves
-/// stay. Whose they were, if any.
+/// Deletes the subjects' gists, and what their turns were asked, did,
+/// answered and asked back, so none is written from those again, and marks
+/// them forgotten now, so a gist already being written isn't kept; the
+/// turns themselves stay. Whose they were, if any.
 async fn forget_gists(
     db: &impl GenericClient,
     subjects: &[SubjectKey],
@@ -630,11 +636,17 @@ async fn forget_gists(
         .await?;
     let turns = db
         .query(
-            "UPDATE turns SET task = NULL, doing = NULL, answer = NULL \
+            "UPDATE turns SET task = NULL, doing = NULL, answer = NULL, question = NULL \
              WHERE subject = ANY($1) RETURNING owner",
             &[&keys],
         )
         .await?;
+    db.execute(
+        "INSERT INTO gists_forgotten (subject, at) SELECT unnest($1::text[]), now() \
+         ON CONFLICT (subject) DO UPDATE SET at = EXCLUDED.at",
+        &[&keys],
+    )
+    .await?;
     Ok(gists.first().or(turns.first()).map(|row| row.get("owner")))
 }
 
@@ -1444,9 +1456,14 @@ mod tests {
                     id,
                     engine: workforce_desk::model::Engine::Claude,
                 },
+                question: Some(workforce_desk::crew::ItemQuestion {
+                    text: "Use the secure cookie?".into(),
+                    options: None,
+                }),
                 ..turn("x", None, "2026-10-29T11:00:00Z")
             };
-            for t in [session(mine), session(other)] {
+            let old = session(mine);
+            for t in [old.clone(), session(other)] {
                 store.apply(&begin(&t, false)).await.unwrap();
             }
             let gist = Gist {
@@ -1505,6 +1522,43 @@ mod tests {
             let said = serde_json::to_string(&tile).unwrap();
             assert!(!said.contains("Making sign-in safe"), "{said}");
             assert!(!said.contains("Compare spend."), "{said}");
+
+            // A gist job under way before the forget writes nothing back.
+            let late = Gist {
+                turn: old.id,
+                now_at: chrono::Utc::now(),
+                ..gist.clone()
+            };
+            store
+                .put_gist(None, &SubjectKey::session(mine), &late)
+                .await
+                .unwrap();
+            assert!(!store
+                .gists(&personal)
+                .await
+                .unwrap()
+                .contains_key(&SubjectKey::session(mine)));
+            // A turn begun after it is written as ever.
+            let mut new = session(mine);
+            new.started_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+            new.heard_at = new.started_at;
+            store.apply(&begin(&new, false)).await.unwrap();
+            let fresh = Gist {
+                turn: new.id,
+                now_at: new.started_at,
+                purpose: Some("Tidying the cookie flags.".into()),
+                ..gist.clone()
+            };
+            store
+                .put_gist(None, &SubjectKey::session(mine), &fresh)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.gists(&personal).await.unwrap()[&SubjectKey::session(mine)]
+                    .purpose
+                    .as_deref(),
+                Some("Tidying the cookie flags.")
+            );
         })
         .await;
     }
