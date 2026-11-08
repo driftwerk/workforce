@@ -843,6 +843,12 @@ struct Inner {
     /// Whose scope each row is: members' groups and the bosses there are.
     /// Nothing is held under it, so events are stamped wherever noted.
     scopes: Mutex<scopes::Scopes>,
+    /// The groups' budgets as last counted for the Floor.
+    group_spend: Mutex<breaker::GroupSpend>,
+    /// Told when a count of the groups' budgets ends.
+    group_counted: Arc<tokio::sync::Notify>,
+    /// How many counts of the groups' budgets have begun.
+    group_counts: std::sync::atomic::AtomicUsize,
     /// The plans waiting on the person.
     boss_plans: Mutex<plans::Plans>,
     /// Held from reading a plan to writing it back: a plan is written
@@ -1486,6 +1492,9 @@ impl Desk {
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
             scopes: Mutex::default(),
+            group_spend: Mutex::default(),
+            group_counted: Arc::new(tokio::sync::Notify::new()),
+            group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),

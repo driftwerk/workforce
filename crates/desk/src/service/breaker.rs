@@ -209,6 +209,46 @@ fn sessions_used(
     total
 }
 
+/// The groups' budgets as last counted for the Floor.
+#[derive(Debug, Default)]
+pub(super) struct GroupSpend {
+    /// What was counted, and when.
+    kept: Option<(std::time::Instant, HashMap<String, Standing>)>,
+    /// Whether a count runs now.
+    counting: bool,
+    /// Bumped each time the budgets change: a count begun before is not kept.
+    generation: u64,
+}
+
+impl GroupSpend {
+    /// What was counted, when anything was.
+    #[cfg(test)]
+    pub(super) fn kept(&self) -> Option<&HashMap<String, Standing>> {
+        self.kept.as_ref().map(|(_, k)| k)
+    }
+}
+
+/// How long the Floor waits for the groups' budgets to be counted.
+pub(super) const SPEND_WAIT: Duration = Duration::from_millis(500);
+/// How long what was counted for the Floor is kept.
+const SPEND_KEPT: Duration = Duration::from_secs(5);
+/// How often a failing read of the agents' spend is warned about; the
+/// rest are said at debug.
+const SPEND_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// Warns that the agents' spend couldn't be read, at most once in
+/// [`SPEND_WARN_EVERY`]: it is read every minute and on every Floor read.
+fn warn_agents_spend(error: &str) {
+    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+    let mut last = LAST.lock();
+    if last.is_none_or(|at| at.elapsed() >= SPEND_WARN_EVERY) {
+        *last = Some(std::time::Instant::now());
+        tracing::warn!(error, "couldn't read agents' spend");
+    } else {
+        tracing::debug!(error, "couldn't read agents' spend");
+    }
+}
+
 /// A tool call's key: the same call hashes the same.
 fn key_of(label: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -275,16 +315,6 @@ impl Desk {
 
     fn rules(&self) -> Rules {
         self.0.breakers.lock().rules
-    }
-
-    /// The group an item is in now.
-    fn group_of_item(&self, item: &str) -> Option<String> {
-        self.0
-            .state
-            .lock()
-            .layout
-            .group_of(item)
-            .map(|g| g.id.clone())
     }
 
     /// What a subject is called now.
@@ -434,6 +464,8 @@ impl Desk {
                     answer: Answer::Decide {
                         at: DecideRef::Breaker { subject },
                     },
+                    group: None,
+                    boss: None,
                 })
             })
             .collect()
@@ -885,11 +917,7 @@ impl Desk {
         for (agent, u) in spent {
             let counts = match pool {
                 Pool::Desk => true,
-                Pool::Group(g) => {
-                    self.group_of_item(&super::local_agent_item(agent))
-                        .as_deref()
-                        == Some(g)
-                }
+                Pool::Group(g) => self.group_of_local_agent(agent).as_deref() == Some(g),
             };
             if counts {
                 total.add(*u);
@@ -921,10 +949,8 @@ impl Desk {
                 Ok(Ok(spent)) => {
                     out.insert(p, spent.into_iter().collect());
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = format!("{e:#}"), "couldn't read agents' spend")
-                }
-                Err(e) => tracing::warn!(error = %e, "couldn't read agents' spend"),
+                Ok(Err(e)) => warn_agents_spend(&format!("{e:#}")),
+                Err(e) => warn_agents_spend(&e.to_string()),
             }
         }
         out
@@ -939,7 +965,7 @@ impl Desk {
     /// The budgets that apply to the agent `id`: its own, else its group's
     /// default, else the ungrouped one.
     pub fn agent_budgets(&self, id: &str) -> Vec<Budget> {
-        let group = self.group_of_item(&super::local_agent_item(id));
+        let group = self.group_of_local_agent(id);
         let run = self.0.breakers.lock();
         budget::applying(
             &run.budgets,
@@ -1072,9 +1098,7 @@ impl Desk {
             return Ok(());
         };
         let group = match by.party.kind {
-            PartyKind::Agent | PartyKind::Manager => {
-                self.group_of_item(&super::local_agent_item(&by.party.id))
-            }
+            PartyKind::Agent | PartyKind::Manager => self.group_of_local_agent(&by.party.id),
             PartyKind::Session | PartyKind::You | PartyKind::Desk => None,
         };
         for pool in budget::pools_of(group.as_deref()) {
@@ -1268,6 +1292,132 @@ impl Desk {
         })
     }
 
+    /// Each group's own budget, the furthest along, by group id, as the
+    /// Floor heads a boss's section: none counted when no group has one,
+    /// and none when they can't be counted (Desk doesn't know the timezone
+    /// yet, or the ledger can't be read). What was counted is kept for
+    /// [`SPEND_KEPT`], or until the budgets change. One count runs at a
+    /// time: the read that starts it waits for it up to [`SPEND_WAIT`], and
+    /// a read while it runs takes what was counted last, so the Floor is
+    /// never held up by it. A count begun before the budgets changed is
+    /// not kept.
+    pub async fn group_standings(&self) -> HashMap<String, Standing> {
+        let (generation, last) = {
+            let mut g = self.0.group_spend.lock();
+            if let Some((at, kept)) = &g.kept {
+                if at.elapsed() < SPEND_KEPT {
+                    return kept.clone();
+                }
+            }
+            let last = g.kept.as_ref().map(|(_, k)| k.clone()).unwrap_or_default();
+            if g.counting {
+                return last;
+            }
+            g.counting = true;
+            (g.generation, last)
+        };
+        let done = std::sync::Arc::clone(&self.0.group_counted);
+        let waiting = done.notified();
+        let desk = self.clone();
+        tokio::spawn(async move {
+            /// The count is over however it ends.
+            struct Over(Desk);
+            impl Drop for Over {
+                fn drop(&mut self) {
+                    self.0 .0.group_spend.lock().counting = false;
+                    self.0 .0.group_counted.notify_waiters();
+                }
+            }
+            let over = Over(desk);
+            over.0
+                 .0
+                .group_counts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let counted = over.0.count_group_standings().await;
+            let mut g = over.0 .0.group_spend.lock();
+            if g.generation == generation {
+                g.kept = Some((std::time::Instant::now(), counted));
+            }
+        });
+        if tokio::time::timeout(SPEND_WAIT, waiting).await.is_err() {
+            tracing::debug!("the groups' budgets are taking long to count");
+            return last;
+        }
+        let g = self.0.group_spend.lock();
+        match &g.kept {
+            Some((_, kept)) if g.generation == generation => kept.clone(),
+            _ => last,
+        }
+    }
+
+    /// What the Floor counts for the groups' bosses is to be counted again:
+    /// the budgets changed. A count running now is not kept.
+    pub(super) fn group_spend_changed(&self) {
+        let mut g = self.0.group_spend.lock();
+        g.kept = None;
+        g.generation += 1;
+    }
+
+    /// How many counts of the groups' budgets have begun.
+    #[cfg(test)]
+    pub(super) fn group_counts(&self) -> usize {
+        self.0
+            .group_counts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn count_group_standings(&self) -> HashMap<String, Standing> {
+        let budgets: Vec<Budget> = self
+            .budget_list()
+            .into_iter()
+            .filter(|b| b.scope == BudgetScope::Desk && b.group.is_some())
+            .collect();
+        if budgets.is_empty() {
+            return HashMap::new();
+        }
+        let Some(tz) = self.budget_tz() else {
+            tracing::debug!("the groups' budgets can't be counted before Desk knows the timezone");
+            return HashMap::new();
+        };
+        let now = Utc::now();
+        // Only the periods the groups' own budgets use are read.
+        let Some(used) = self.used_by_period(&budgets, now, tz).await else {
+            return HashMap::new();
+        };
+        let agents = self.agents_by_period(&budgets, now, tz).await;
+        let groups: HashMap<Uuid, Option<String>> = {
+            let st = self.0.state.lock();
+            st.records
+                .keys()
+                .map(|id| {
+                    (
+                        *id,
+                        st.layout.group_of(&session_item(*id)).map(|g| g.id.clone()),
+                    )
+                })
+                .collect()
+        };
+        let mut by: HashMap<String, Vec<Standing>> = HashMap::new();
+        for b in &budgets {
+            let Some(group) = b.group.clone() else {
+                continue;
+            };
+            let pool = Pool::Group(group.clone());
+            let mut total = sessions_used(&pool, used.get(&b.period), &groups);
+            total.add(self.agents_used(&pool, b.period, &agents));
+            let (from, to) = (
+                budget::window_start(b.period, now, tz),
+                budget::window_end(b.period, now, tz),
+            );
+            by.entry(group)
+                .or_default()
+                .push(budget::standing_of(b, total.of(b.unit), from, to));
+        }
+        by.into_iter()
+            .filter_map(|(g, s)| Some((g, budget::tightest(s)?)))
+            .collect()
+    }
+
     fn check_new(&self, b: &Budget) -> Result<(), DeskError> {
         budget::check(b).map_err(DeskError::Invalid)?;
         if let Some(g) = &b.group {
@@ -1292,6 +1442,7 @@ impl Desk {
             }
         };
         self.0.breakers.lock().budgets = budgets.clone();
+        self.group_spend_changed();
         self.announce(DeskEvent::Budgets { budgets });
         self.note(by.event(Kind::Budgeted, None, text));
         self.breaker_spend(None).await;

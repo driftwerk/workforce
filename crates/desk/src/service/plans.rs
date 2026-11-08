@@ -386,6 +386,27 @@ impl Desk {
             .unwrap_or_default())
     }
 
+    /// The plans still open (proposed, running or paused), newest first,
+    /// as the Floor shows them in their groups' sections.
+    pub async fn floor_plans(&self) -> Result<Vec<crate::floor::PlanProgress>, DeskError> {
+        Ok(self
+            .plans(None, None)
+            .await?
+            .into_iter()
+            .filter(|s| !matches!(s.plan.state, PlanState::Done | PlanState::Dropped))
+            .map(|s| crate::floor::PlanProgress {
+                id: s.plan.id,
+                goal: s.plan.goal,
+                group: s.plan.group,
+                boss: s.plan.boss,
+                boss_name: s.boss_name,
+                state: s.plan.state,
+                paused_why: s.paused_why,
+                progress: s.progress,
+            })
+            .collect())
+    }
+
     /// The plans waiting on the person, as Floor needs: a plan to approve,
     /// or a change of scope to one.
     pub fn plan_needs(&self) -> Vec<Need> {
@@ -468,6 +489,9 @@ impl Desk {
                     revision: p.revision,
                 },
             },
+            // Its plan's group, whoever its boss is now.
+            group: p.group.clone(),
+            boss: None,
         };
         self.0.boss_plans.lock().awaiting.insert(p.id, need);
     }

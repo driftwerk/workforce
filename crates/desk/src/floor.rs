@@ -545,6 +545,16 @@ pub struct Need {
     pub since: DateTime<Utc>,
     pub place: Place,
     pub answer: Answer,
+    /// The sidebar group it is in now, stamped from the layout when the
+    /// view is read; none when ungrouped, or where the hub doesn't hold
+    /// the person's sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// That group's own boss (its agent id), when it has one: none for an
+    /// ungrouped item and one of a group with no boss of its own, which
+    /// are the main boss's, and one of a sealed group, which is no one's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boss: Option<String>,
 }
 
 /// A question to the person its session went ahead without, waiting
@@ -577,6 +587,16 @@ pub struct Work {
     pub background: Option<Background>,
     /// What its agent or session is for and doing, in plain words.
     pub gist: Option<Said>,
+    /// The sidebar group it is in now, stamped from the layout when the
+    /// view is read; none when ungrouped, or where the hub doesn't hold
+    /// the person's sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// That group's own boss (its agent id), when it has one: none for an
+    /// ungrouped item and one of a group with no boss of its own, which
+    /// are the main boss's, and one of a sealed group, which is no one's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boss: Option<String>,
 }
 
 impl Work {
@@ -639,6 +659,64 @@ pub struct FloorView {
     pub more: More,
     /// The floor in one paragraph, when one has been written.
     pub summary: Option<Paragraph>,
+    /// The overseers there are, each with its scope, for the person who
+    /// holds the hub's Desk: none elsewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bosses: Vec<BossView>,
+    /// The groups closed to everyone but the person: named for a boss that
+    /// isn't overseeing them now. Their items carry their group and no
+    /// boss, and are not the main boss's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed: Vec<String>,
+    /// The bosses' plans still open, each in its group, with where its
+    /// tickets stand: for the person who holds the hub's Desk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plans: Vec<PlanProgress>,
+}
+
+/// A plan as the Floor shows it in its group's section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanProgress {
+    pub id: Uuid,
+    pub goal: String,
+    /// Its group, as it was made; none is ungrouped.
+    pub group: Option<String>,
+    /// Its boss's agent id, and what the boss is called.
+    pub boss: String,
+    pub boss_name: String,
+    pub state: crate::plan::PlanState,
+    /// Why it is paused, in the person's words, while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_why: Option<String>,
+    pub progress: crate::plan::Progress,
+}
+
+/// Whether a boss is in a turn now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BossState {
+    Idle,
+    Working,
+}
+
+/// An overseer, as the Floor shows it at the head of its section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BossView {
+    pub scope: crate::scope::Scope,
+    pub agent: String,
+    pub name: String,
+    /// `watch`, `suggest` or `act`.
+    pub level: String,
+    pub state: BossState,
+    /// What holds its turns, in plain words, while something does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
+    /// Its group's budget, the furthest along: none for the main boss, and
+    /// for a group with no budget of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<workforce_core::budget::Standing>,
 }
 
 /// Each subject's gist, as kept.
@@ -707,6 +785,8 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
                 since: w.from,
                 place: t.place.clone(),
                 answer: w.answer.clone(),
+                group: None,
+                boss: None,
             })
     });
     let questions = turns.iter().filter(|t| t.asking()).filter_map(|t| {
@@ -722,6 +802,8 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
             since: t.ended_at.unwrap_or(t.started_at),
             place: t.place.clone(),
             answer: Answer::Reply,
+            group: None,
+            boss: None,
         })
     });
     longest_waiting(waits.chain(questions).collect())
@@ -787,6 +869,8 @@ fn work(t: &Turn, what: Option<&String>, gist: Said) -> Work {
         outcome: t.outcome,
         background: t.background(),
         gist: Some(gist),
+        group: None,
+        boss: None,
     }
 }
 
@@ -958,6 +1042,53 @@ pub fn view(
         counts,
         more,
         summary: None,
+        bosses: Vec::new(),
+        sealed: Vec::new(),
+        plans: Vec::new(),
+    }
+}
+
+/// `view` with every need and every piece of work stamped with the group
+/// its agent or session is in now (`group_of`), and that group's own boss
+/// (`boss_of`, by group id), so the Floor shows where each is after a move.
+pub fn stamp(
+    view: &mut FloorView,
+    group_of: impl Fn(&Who) -> Option<String>,
+    boss_of: impl Fn(&str) -> Option<String>,
+) {
+    let place = |who: &Who| {
+        let group = group_of(who);
+        let boss = group.as_deref().and_then(&boss_of);
+        (group, boss)
+    };
+    for n in &mut view.needs {
+        (n.group, n.boss) = match &n.answer {
+            // A plan is its own group's, as it was made, wherever its boss
+            // is now: the group it carries, with that group's boss now.
+            Answer::Decide {
+                at: DecideRef::Plan { .. },
+            } => {
+                let group = n.group.take();
+                let boss = group.as_deref().and_then(&boss_of);
+                (group, boss)
+            }
+            _ => place(&n.who),
+        };
+    }
+    for w in view.working.iter_mut().chain(view.done.iter_mut()) {
+        (w.group, w.boss) = place(&w.who);
+    }
+}
+
+/// Whether the boss `agent` is in a turn on `view` now.
+pub fn boss_state(view: &FloorView, agent: &str) -> BossState {
+    let working = view
+        .working
+        .iter()
+        .any(|w| matches!(w.who.kind, PartyKind::Agent | PartyKind::Manager) && w.who.id == agent);
+    match working {
+        true => BossState::Working,
+        false => BossState::Idle,
     }
 }
 
@@ -1537,6 +1668,8 @@ mod tests {
             since: at("2026-10-29T16:30:00Z"),
             place: Place::Session,
             answer: decide(),
+            group: None,
+            boss: None,
         };
         let nil = Uuid::nil().to_string();
         assert_eq!(
@@ -1584,6 +1717,8 @@ mod tests {
                 now: "Running the tests again.".into(),
                 at: at("2026-10-29T16:02:00Z"),
             }),
+            group: None,
+            boss: None,
         };
         assert_eq!(
             serde_json::to_value(work).unwrap(),
@@ -1599,6 +1734,175 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// A floor with one need and one piece of work each for Scout (an
+    /// agent) and a session.
+    fn floor_of_two() -> FloorView {
+        let scout = turn(agent("scout", "dm"), Some("u1"), "2026-10-29T08:00:00Z");
+        let mut session = turn(
+            Subject::Session {
+                id: Uuid::nil(),
+                engine: Engine::Claude,
+            },
+            Some("u1"),
+            "2026-10-29T08:01:00Z",
+        );
+        session
+            .waits
+            .push(wait("a", "2026-10-29T08:02:00Z", None, decide()));
+        let finished = ended(
+            turn(agent("scout", "dm"), Some("u1"), "2026-10-29T07:00:00Z"),
+            "2026-10-29T07:30:00Z",
+            Outcome::Finished,
+        );
+        let turns = [scout, session, finished];
+        let now = at("2026-10-29T09:00:00Z");
+        view(
+            &turns,
+            open_needs(&turns),
+            &Gists::new(),
+            at("2026-10-29T00:00:00Z"),
+            now,
+        )
+    }
+
+    #[test]
+    fn each_item_is_stamped_with_its_group_now_and_that_groups_own_boss() {
+        let mut v = floor_of_two();
+        let nil = Uuid::nil().to_string();
+        let group_of = |who: &Who| match (who.kind, who.id.as_str()) {
+            (PartyKind::Agent, "scout") => Some("acme".to_string()),
+            (PartyKind::Session, id) if id == nil => Some("infra".to_string()),
+            _ => None,
+        };
+        let boss_of = |g: &str| (g == "acme").then(|| "sarah".to_string());
+        stamp(&mut v, group_of, boss_of);
+        let work = |kind| v.working.iter().find(|w| w.who.kind == kind).unwrap();
+        let scout = work(PartyKind::Agent);
+        assert_eq!(
+            (scout.group.as_deref(), scout.boss.as_deref()),
+            (Some("acme"), Some("sarah"))
+        );
+        // A group with no boss of its own carries its group and no boss.
+        let session = work(PartyKind::Session);
+        assert_eq!(
+            (session.group.as_deref(), session.boss.as_deref()),
+            (Some("infra"), None)
+        );
+        assert_eq!(
+            (v.needs[0].group.as_deref(), v.needs[0].boss.as_deref()),
+            (Some("infra"), None)
+        );
+        // What finished is stamped as what runs.
+        assert_eq!(v.done.len(), 1);
+        assert_eq!(
+            (v.done[0].group.as_deref(), v.done[0].boss.as_deref()),
+            (Some("acme"), Some("sarah"))
+        );
+
+        // Stamped again after a move, it says where each is now; ungrouped
+        // carries neither.
+        stamp(&mut v, |_| None, boss_of);
+        assert!(v
+            .working
+            .iter()
+            .chain(&v.done)
+            .all(|w| w.group.is_none() && w.boss.is_none()));
+        assert!(v
+            .needs
+            .iter()
+            .all(|n| n.group.is_none() && n.boss.is_none()));
+        assert_eq!(boss_state(&v, "scout"), BossState::Working);
+        assert_eq!(boss_state(&v, "sarah"), BossState::Idle);
+    }
+
+    #[test]
+    fn a_floor_by_group_is_the_old_shape_with_more_and_an_older_desk_reads_it() {
+        let plain = floor_of_two();
+        let before = serde_json::to_value(&plain).unwrap();
+        for key in ["bosses", "sealed", "plans"] {
+            assert!(before.get(key).is_none(), "no groups: today's shape");
+        }
+        assert!(before["needs"][0].get("group").is_none());
+
+        let mut v = plain.clone();
+        stamp(&mut v, |_| Some("acme".into()), |_| Some("sarah".into()));
+        v.sealed = vec!["globex".into()];
+        v.bosses = vec![BossView {
+            scope: crate::scope::Scope::Group("acme".into()),
+            agent: "sarah".into(),
+            name: "Sarah".into(),
+            level: "act".into(),
+            state: BossState::Idle,
+            paused: None,
+            spend: None,
+        }];
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["needs"][0]["group"], "acme");
+        assert_eq!(json["working"][0]["boss"], "sarah");
+        assert_eq!(
+            json["bosses"][0],
+            json!({
+                "scope": {"kind": "group", "group": "acme"}, "agent": "sarah",
+                "name": "Sarah", "level": "act", "state": "idle"
+            })
+        );
+        assert_eq!(json["sealed"], json!(["globex"]));
+
+        // An older Desk's types, with none of the new fields, read it.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
+        struct OldNeed {
+            id: String,
+            kind: NeedKind,
+            who: Who,
+            ask: String,
+            since: DateTime<Utc>,
+            place: Place,
+            answer: Answer,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct OldWork {
+            who: Who,
+            what: String,
+            place: Place,
+            since: DateTime<Utc>,
+            heard_at: DateTime<Utc>,
+            ended_at: Option<DateTime<Utc>>,
+            outcome: Option<Outcome>,
+            background: Option<Background>,
+            gist: Option<Said>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
+        struct OldView {
+            as_of: DateTime<Utc>,
+            needs: Vec<OldNeed>,
+            working: Vec<serde_json::Value>,
+            done: Vec<serde_json::Value>,
+            lanes: Vec<Lane>,
+            counts: Counts,
+            more: More,
+            summary: Option<Paragraph>,
+        }
+        let old: OldView = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(old.needs.len(), v.needs.len());
+        // The new fields are the only ones an older Work didn't know.
+        let mut work = json["working"][0].clone();
+        assert!(serde_json::from_value::<OldWork>(work.clone()).is_err());
+        let w = work.as_object_mut().unwrap();
+        w.remove("group");
+        w.remove("boss");
+        serde_json::from_value::<OldWork>(work).unwrap();
+
+        // And this Desk reads what an older hub sends.
+        let back: FloorView = serde_json::from_value(before).unwrap();
+        assert_eq!(back, plain);
     }
 
     #[test]

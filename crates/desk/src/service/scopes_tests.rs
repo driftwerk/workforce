@@ -605,3 +605,412 @@ async fn a_group_closed_for_a_write_that_didnt_happen_is_forgotten_across_a_rest
     })
     .await;
 }
+
+/// A Floor of what `whos` are doing: one need and one turn running each.
+fn floor_of(whos: &[crate::floor::Who]) -> crate::floor::FloorView {
+    use crate::floor::{Answer, FloorView, More, Need, NeedKind, Place, Work};
+    let now = Utc::now();
+    FloorView {
+        as_of: now,
+        needs: whos
+            .iter()
+            .map(|who| Need {
+                id: format!("need:{}", who.id),
+                kind: NeedKind::Question,
+                who: who.clone(),
+                ask: "Go on?".into(),
+                why: None,
+                options: None,
+                chose: None,
+                since: now,
+                place: Place::Elsewhere,
+                answer: Answer::Reply,
+                group: None,
+                boss: None,
+            })
+            .collect(),
+        went_ahead: vec![],
+        working: whos
+            .iter()
+            .map(|who| Work {
+                who: who.clone(),
+                what: "working".into(),
+                place: Place::Elsewhere,
+                since: now,
+                heard_at: now,
+                ended_at: None,
+                outcome: None,
+                background: None,
+                gist: None,
+                group: None,
+                boss: None,
+            })
+            .collect(),
+        done: vec![],
+        lanes: vec![],
+        counts: Default::default(),
+        more: More::default(),
+        summary: None,
+        bosses: vec![],
+        sealed: vec![],
+        plans: vec![],
+    }
+}
+
+fn who(kind: crate::crew::PartyKind, id: &str) -> crate::floor::Who {
+    crate::floor::Who {
+        kind,
+        id: id.into(),
+        name: id.into(),
+        engine: None,
+    }
+}
+
+/// Each need's and each turn's group and boss, by who it is.
+fn placed(v: &crate::floor::FloorView) -> Vec<(String, Option<String>, Option<String>)> {
+    let needs = v
+        .needs
+        .iter()
+        .map(|n| (n.who.id.clone(), n.group.clone(), n.boss.clone()));
+    let work: Vec<_> = v
+        .working
+        .iter()
+        .map(|w| (w.who.id.clone(), w.group.clone(), w.boss.clone()))
+        .collect();
+    let needs: Vec<_> = needs.collect();
+    assert_eq!(needs, work, "a need and its work are placed alike");
+    needs
+}
+
+#[tokio::test]
+async fn the_floor_shows_each_item_in_its_group_now_with_that_groups_own_boss() {
+    use crate::crew::PartyKind;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        d.change_layout(|l| l.put(&session_item(s.id), "acme", None))
+            .await
+            .unwrap();
+        let whos = [
+            who(PartyKind::Session, &s.id.to_string()),
+            who(PartyKind::Agent, "scout"),
+            // A boss's own work is its scope's, wherever its agent sits.
+            who(PartyKind::Agent, "sarah"),
+            who(PartyKind::Agent, "infra-bot"),
+            who(PartyKind::Agent, "blog-bot"),
+            // Acme's budget, held by the breaker.
+            who(PartyKind::Desk, "pool:group:acme"),
+            who(PartyKind::Desk, "pool:desk"),
+        ];
+        let mut v = floor_of(&whos);
+        d.stamp_floor(&mut v);
+        let in_acme = || (Some("acme".to_string()), Some("sarah".to_string()));
+        let at = |(g, b): (Option<String>, Option<String>), id: &str| (id.to_string(), g, b);
+        assert_eq!(
+            placed(&v),
+            [
+                at(in_acme(), &s.id.to_string()),
+                at(in_acme(), "scout"),
+                at(in_acme(), "sarah"),
+                // A group with no boss of its own: its group, no boss.
+                at((Some("infra".into()), None), "infra-bot"),
+                // Ungrouped: neither.
+                at((None, None), "blog-bot"),
+                at(in_acme(), "pool:group:acme"),
+                at((None, None), "pool:desk"),
+            ]
+        );
+        assert!(v.sealed.is_empty());
+
+        // An id with a hub in it is no agent of this hub's: Desk places it.
+        let mut v = floor_of(&[who(PartyKind::Agent, "acme-hub/zed")]);
+        d.stamp_floor(&mut v);
+        assert_eq!(placed(&v), [("acme-hub/zed".to_string(), None, None)]);
+
+        // Moved to Atlas, the session shows in Atlas with Mia.
+        d.change_layout(|l| l.put(&session_item(s.id), "atlas", None))
+            .await
+            .unwrap();
+        let mut v = floor_of(&whos[..1]);
+        d.stamp_floor(&mut v);
+        assert_eq!(
+            placed(&v),
+            [at(
+                (Some("atlas".into()), Some("mia".into())),
+                &s.id.to_string()
+            )]
+        );
+
+        // The bosses head their sections: Sarah in a turn, the others idle,
+        // with no budget to stand against.
+        let mut v = floor_of(&whos);
+        d.stamp_floor(&mut v);
+        let bosses = d.floor_bosses(&v).await;
+        let heads: Vec<_> = bosses
+            .iter()
+            .map(|b| {
+                (
+                    b.agent.as_str(),
+                    b.scope.clone(),
+                    b.state,
+                    b.spend.is_some(),
+                )
+            })
+            .collect();
+        use crate::floor::BossState::{Idle, Working};
+        assert_eq!(
+            heads,
+            [
+                ("desk", Scope::Ungrouped, Idle, false),
+                ("sarah", acme(), Working, false),
+                ("mia", Scope::Group("atlas".into()), Idle, false),
+            ]
+        );
+        assert!(bosses.iter().all(|b| b.paused.is_none()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sealed_groups_items_carry_their_group_and_no_boss_and_the_floor_says_it_is_sealed() {
+    use crate::crew::PartyKind;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        // Sarah's config doesn't load: no boss oversees Acme now, but one is
+        // named for it.
+        d.set_bosses(vec![bosses().remove(0)]);
+        d.bound_groups(["acme".to_string()]).await;
+        let mut v = floor_of(&[
+            who(PartyKind::Agent, "scout"),
+            who(PartyKind::Agent, "infra-bot"),
+        ]);
+        d.stamp_floor(&mut v);
+        assert_eq!(
+            placed(&v),
+            [
+                ("scout".to_string(), Some("acme".to_string()), None),
+                ("infra-bot".to_string(), Some("infra".to_string()), None),
+            ]
+        );
+        assert_eq!(v.sealed, ["acme"], "Acme is no one's, not the main boss's");
+        let bosses = d.floor_bosses(&v).await;
+        assert_eq!(
+            bosses.iter().map(|b| b.agent.as_str()).collect::<Vec<_>>(),
+            ["desk"]
+        );
+    })
+    .await;
+}
+
+/// What each local agent spent, as the hub's telemetry says it: after
+/// `wait`, or failing.
+struct Spent {
+    wait: Duration,
+    spent: Option<Vec<(&'static str, f64)>>,
+}
+
+impl AgentSpend for Spent {
+    fn spent(
+        &self,
+        _: chrono::DateTime<Utc>,
+        _: chrono::DateTime<Utc>,
+    ) -> eyre::Result<Vec<(String, crate::budget_store::Used)>> {
+        std::thread::sleep(self.wait);
+        let spent = self
+            .spent
+            .clone()
+            .ok_or_else(|| eyre::eyre!("telemetry is down"))?;
+        Ok(spent
+            .into_iter()
+            .map(|(a, usd)| (a.to_string(), crate::budget_store::Used { tokens: 0, usd }))
+            .collect())
+    }
+}
+
+/// A day budget of $40 for Acme, set by the person.
+async fn acme_budget(d: &Desk) {
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    d.put_budget(
+        NewBudget {
+            scope: BudgetScope::Desk,
+            group: Some("acme".into()),
+            period: Period::Day,
+            unit: Unit::Usd,
+            amount: 40.0,
+            warn_at: None,
+            on_exceed: None,
+        },
+        crate::crew::By::you(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Each boss's spend standing on the Floor: what it used of what.
+async fn spends(d: &Desk) -> Vec<(String, Option<(f64, f64)>)> {
+    d.floor_bosses(&floor_of(&[]))
+        .await
+        .into_iter()
+        .map(|b| (b.agent, b.spend.map(|s| (s.used, s.of))))
+        .collect()
+}
+
+fn spend_of(all: &[(String, Option<(f64, f64)>)], agent: &str) -> Option<(f64, f64)> {
+    all.iter().find(|(a, _)| a == agent).unwrap().1
+}
+
+#[tokio::test]
+async fn a_groups_boss_has_its_groups_budget_standing_on_the_floor_its_own_spend_counted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        d.count_budgets_in(chrono_tz::UTC);
+        // Sarah sits in no group, but her own turns are Acme's, as the Floor
+        // shows them; Scout is in Acme; Mia's are Atlas's.
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: Some(vec![("sarah", 3.0), ("scout", 2.0), ("mia", 7.0)]),
+        }));
+        acme_budget(&d).await;
+        let all = spends(&d).await;
+        assert_eq!(spend_of(&all, "sarah"), Some((5.0, 40.0)));
+        assert_eq!(
+            spend_of(&all, "mia"),
+            None,
+            "Atlas has no budget of its own"
+        );
+        assert_eq!(
+            spend_of(&all, "desk"),
+            None,
+            "the main boss's section has none"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_floor_has_no_spend_it_cant_count_and_waits_for_none() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let store_pool = pool.clone();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        acme_budget(&d).await;
+
+        // Desk doesn't know the timezone yet: no day to count.
+        *d.0.budget_tz.lock() = None;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+
+        // The telemetry fails: the sessions' ledger still counts.
+        d.count_budgets_in(chrono_tz::UTC);
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: None,
+        }));
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 40.0)));
+
+        // Counting is slow: the Floor doesn't wait for it, and says none.
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::from_secs(3),
+            spent: Some(vec![]),
+        }));
+        let begun = std::time::Instant::now();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+        assert!(
+            begun.elapsed() < super::breaker::SPEND_WAIT * 3,
+            "{:?}",
+            begun.elapsed()
+        );
+        // A read while that count runs doesn't wait for it, nor start one.
+        let counts = d.group_counts();
+        let begun = std::time::Instant::now();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+        assert!(begun.elapsed() < super::breaker::SPEND_WAIT);
+        assert_eq!(d.group_counts(), counts);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // The ledger can't be read: none.
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: Some(vec![]),
+        }));
+        store_pool
+            .get()
+            .await
+            .unwrap()
+            .batch_execute("ALTER TABLE ledger RENAME TO ledger_gone")
+            .await
+            .unwrap();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+    })
+    .await;
+}
+
+/// A day budget of `amount` for Acme, set by the person.
+async fn acme_budget_of(d: &Desk, amount: f64) {
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    d.put_budget(
+        NewBudget {
+            scope: BudgetScope::Desk,
+            group: Some("acme".into()),
+            period: Period::Day,
+            unit: Unit::Usd,
+            amount,
+            warn_at: None,
+            on_exceed: None,
+        },
+        crate::crew::By::you(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reads_at_once_start_one_count_and_a_count_begun_before_the_budgets_changed_isnt_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        acme_budget_of(&d, 40.0).await;
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::from_secs(1),
+            spent: Some(vec![]),
+        }));
+        d.group_spend_changed();
+        let before = d.group_counts();
+
+        // Eight Floor reads at once under slow telemetry: one count.
+        let reads = futures::future::join_all((0..8).map(|_| spends(&d))).await;
+        assert!(reads.iter().all(|r| spend_of(r, "sarah").is_none()));
+        assert_eq!(d.group_counts() - before, 1);
+        // Once it ends, what it counted is kept.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 40.0)));
+        assert_eq!(d.group_counts() - before, 1);
+
+        // A count runs; the budget changes meanwhile; what it counted is
+        // not kept, and the next read counts the new budget.
+        d.group_spend_changed();
+        let _ = spends(&d).await;
+        assert_eq!(d.group_counts() - before, 2);
+        acme_budget_of(&d, 50.0).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            d.0.group_spend.lock().kept().is_none(),
+            "a count begun before the change isn't kept"
+        );
+        let _ = spends(&d).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 50.0)));
+        assert_eq!(d.group_counts() - before, 3);
+    })
+    .await;
+}
