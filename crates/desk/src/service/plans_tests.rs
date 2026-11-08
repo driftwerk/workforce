@@ -1677,12 +1677,20 @@ async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_whe
             .plan_start(&plan, &first, &sarah(), &by_sarah())
             .await
             .unwrap();
-        // Its first calls, made before it was handed its ticket, count too.
+        // Its first calls, made before it was handed its ticket, count too;
+        // what it did an hour before isn't the plan's.
         spent_at(
             &d,
             s.id,
             0.5,
             chrono::Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+        spent_at(
+            &d,
+            s.id,
+            30.0,
+            chrono::Utc::now() - chrono::Duration::hours(1),
         )
         .await;
         spent(&d, s.id, 8.0).await;
@@ -1761,6 +1769,22 @@ async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_whe
             .map(|t| t.held.is_some())
             .collect();
         assert_eq!(held, [true, true, false]);
+
+        // Its ticket done, what its session does next isn't the plan's.
+        d.move_ticket(
+            first.ticket,
+            Move {
+                state: TicketState::Done,
+                before: None,
+                after: None,
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        spent(&d, s.id, 25.0).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert_eq!(d.plan(id).await.unwrap().spend.unwrap().used, 10.5);
 
         // The person raising the cap lets go of what it held.
         let raise = PlanEdit {

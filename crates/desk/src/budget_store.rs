@@ -11,6 +11,10 @@ use workforce_core::budget::{Budget, BudgetScope, OnExceed, Period, Unit};
 use crate::breaker;
 use crate::store::DeskStore;
 
+/// How long before a session is handed a plan's ticket what it spends with
+/// no ticket stamped still counts toward the plan: its first calls.
+pub const PLAN_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// What a set of sessions spent from a moment on: every token, and the
 /// dollars of the calls that have a price.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -194,9 +198,11 @@ impl DeskStore {
     }
 
     /// What each of `plans` spent from `from` on: every ledger row stamped
-    /// with one of its tickets, and the rows of a session that worked on
-    /// one of them that no ticket was stamped on (its first calls can come
-    /// before it is handed its ticket).
+    /// with one of its tickets, and the rows no ticket was stamped on of a
+    /// session that worked on one of them, made while it did or in the
+    /// [`PLAN_GRACE`] before it was handed its first (its first calls can
+    /// come before it is handed its ticket). What the session did before or
+    /// after is not the plan's.
     pub async fn ledger_used_by_plan(
         &self,
         from: DateTime<Utc>,
@@ -209,9 +215,11 @@ impl DeskStore {
         let rows = client
             .query(
                 "WITH ours AS (SELECT id, plan FROM tickets WHERE plan = ANY($2)), \
-                   worked AS (SELECT DISTINCT ON (a.session) a.session, o.plan \
+                   worked AS (SELECT a.session, o.plan, \
+                       MIN(a.from_at) - make_interval(secs => $3) AS since, \
+                       MAX(COALESCE(a.until_at, 'infinity'::timestamptz)) AS until \
                      FROM ticket_assignments a JOIN ours o ON o.id = a.ticket \
-                     ORDER BY a.session, a.from_at) \
+                     GROUP BY a.session, o.plan) \
                  SELECT plan, SUM(tokens)::int8, COALESCE(SUM(usd), 0)::float8 FROM ( \
                    SELECT o.plan, l.input + l.output + l.cache_read + l.cache_write AS tokens, \
                      l.usd FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
@@ -219,8 +227,9 @@ impl DeskStore {
                    SELECT w.plan, l.input + l.output + l.cache_read + l.cache_write, l.usd \
                      FROM ledger l JOIN worked w ON w.session = l.session \
                      WHERE l.ticket IS NULL AND l.at >= $1 \
+                       AND l.at >= w.since AND l.at < w.until \
                  ) spent GROUP BY plan",
-                &[&from, &plans],
+                &[&from, &plans, &(PLAN_GRACE.as_secs() as f64)],
             )
             .await
             .context("summing the ledger for plans' budgets")?;
@@ -237,8 +246,8 @@ impl DeskStore {
             .collect()
     }
 
-    /// The plan each session works for, of `plans`: the one whose ticket it
-    /// has now, else the one it had last.
+    /// The plan each session works for now, of `plans`: the one whose
+    /// ticket it has. One whose ticket is done is no longer the plan's.
     pub async fn plan_sessions(&self, plans: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
         if plans.is_empty() {
             return Ok(HashMap::new());
@@ -248,8 +257,8 @@ impl DeskStore {
             .query(
                 "SELECT DISTINCT ON (a.session) a.session, t.plan \
                  FROM ticket_assignments a JOIN tickets t ON t.id = a.ticket \
-                 WHERE t.plan = ANY($1) \
-                 ORDER BY a.session, (a.until_at IS NULL) DESC, a.from_at DESC",
+                 WHERE t.plan = ANY($1) AND a.until_at IS NULL \
+                 ORDER BY a.session, a.from_at DESC",
                 &[&plans],
             )
             .await
