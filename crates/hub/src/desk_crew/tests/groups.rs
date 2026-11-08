@@ -1228,3 +1228,63 @@ async fn releasing_a_group_takes_it_off_an_unserved_agents_config() {
     })
     .await;
 }
+
+/// Only agents' folders beside the served ones are walked, and each is known
+/// by its folder's name, as the served agents' folders are named after
+/// their ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn unserved_folders_are_agents_only_and_known_by_their_ids() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        let beside = ws.parent().unwrap();
+        std::fs::create_dir_all(beside.join("notes")).unwrap();
+        std::fs::write(beside.join("notes").join("config.toml"), "not [ toml").unwrap();
+        std::fs::create_dir_all(beside.join("empty")).unwrap();
+        let services = c.crew.state.registry.all_services();
+        for s in &services {
+            if s.workspace.parent() == Some(beside) {
+                assert_eq!(
+                    s.workspace.file_name().unwrap().to_string_lossy(),
+                    s.agent_id.as_str(),
+                    "a served agent's folder is named after its id"
+                );
+            }
+        }
+        let found = crate::agent_config_write::unserved_beside(&services);
+        assert_eq!(
+            found,
+            [crate::agent_config_write::Unserved {
+                workspace: ws.clone(),
+                id: Some("ghost".into()),
+            }]
+        );
+    })
+    .await;
+}
+
+/// A group whose unserved agent's config can't be switched off isn't
+/// deleted, and says which agent's settings to fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_refused_names_the_agent_whose_settings_to_fix() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        let path = ws.join("config.toml");
+        workforce_common::config_files::guard(&path).unwrap();
+        std::fs::write(
+            &path,
+            "[oversight]\nenabled = false\ngroup = \"infra\"\n# by hand\n",
+        )
+        .unwrap();
+        let why = c.d.release_group("infra").await.unwrap_err();
+        assert!(
+            why.starts_with("ghost still names this group for its boss: "),
+            "{why}"
+        );
+        assert_eq!(names(&ws).as_deref(), Some("infra"));
+    })
+    .await;
+}
