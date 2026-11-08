@@ -95,6 +95,29 @@ impl Authorize for SystemAdmins {
         }
     }
 
+    /// Only the person who holds the hub, as the floor's decide route reads
+    /// them ([`crate::desk_floor::holds_the_hub`]): an administrator's own
+    /// sign-in or the device the Desk app paired with it, never another
+    /// administrator's device or the gateway token alone.
+    async fn authorize_holder(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        let caller = resolve_caller_context(&self.0, headers, query_token).await;
+        if crate::desk_floor::holds_the_hub(
+            self.0.identity_store.as_ref(),
+            true,
+            caller.identity_id.as_deref(),
+        ) {
+            return Ok(caller.identity_id);
+        }
+        match caller {
+            c if c.identity_id.is_some() || c.device_id.is_some() => Err(StatusCode::FORBIDDEN),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
     fn is_hub_token(&self, headers: &HeaderMap) -> bool {
         bearer_is(headers, &self.0.auth_token)
     }

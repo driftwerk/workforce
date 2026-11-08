@@ -408,8 +408,26 @@ impl DeskStore {
     /// Replaces the layout, in one transaction. Boards in a group it no
     /// longer has become ungrouped: which ones.
     pub async fn put_layout(&self, layout: &Layout) -> Result<Vec<Uuid>> {
+        self.put_layout_with(layout, true).await
+    }
+
+    /// [`Self::put_layout`]; with `moves`, each session whose group it
+    /// changes is kept as moved then. Desk's first push of its layout moves
+    /// nothing: it says where sessions already were.
+    pub async fn put_layout_with(&self, layout: &Layout, moves: bool) -> Result<Vec<Uuid>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
+        // Where each session was, to say which moved.
+        let before: Vec<(String, Option<String>)> = tx
+            .query(
+                "SELECT item, NULLIF(group_id, 'ungrouped') FROM group_members \
+                 WHERE item LIKE 'session:%' FOR UPDATE",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect::<Result<_, tokio_postgres::Error>>()?;
         tx.execute("DELETE FROM groups", &[]).await?;
         let now = Utc::now();
         let ungrouped = Group {
@@ -440,6 +458,19 @@ impl DeskStore {
                 "INSERT INTO group_ids_used (id, first_used) VALUES ($1, now()) \
                  ON CONFLICT DO NOTHING",
                 &[&g.id],
+            )
+            .await?;
+        }
+        // Each session whose group changed: what is read about it later,
+        // but happened before, keeps the group it happened in.
+        let (items, froms, tos) = moved_sessions(&before, layout);
+        if moves && !items.is_empty() {
+            tx.execute(
+                // The database's clock: the one the rows it stamps are
+                // compared with as they are written.
+                "INSERT INTO group_moves (item, from_group, to_group, at) \
+                 SELECT i, f, t, now() FROM UNNEST($1::text[], $2::text[], $3::text[]) AS m(i, f, t)",
+                &[&items, &froms, &tos],
             )
             .await?;
         }
@@ -496,6 +527,40 @@ impl DeskStore {
             .await?;
         Ok(row.get(0))
     }
+}
+
+/// The sessions whose group `after` changes from `before` (each item and
+/// its group, none for ungrouped): their keys, and where each was and is.
+#[allow(clippy::type_complexity)]
+fn moved_sessions(
+    before: &[(String, Option<String>)],
+    after: &Layout,
+) -> (Vec<String>, Vec<Option<String>>, Vec<Option<String>>) {
+    let was: std::collections::HashMap<&str, Option<&str>> = before
+        .iter()
+        .map(|(i, g)| (i.as_str(), g.as_deref()))
+        .collect();
+    let now: std::collections::HashMap<&str, &str> = after
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter().map(move |i| (i.as_str(), g.id.as_str())))
+        .filter(|(i, _)| i.starts_with("session:"))
+        .collect();
+    let mut keys: Vec<&str> = was.keys().chain(now.keys()).copied().collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = (Vec::new(), Vec::new(), Vec::new());
+    for k in keys {
+        let from = was.get(k).copied().flatten();
+        let to = now.get(k).copied();
+        // New to the sidebar and ungrouped: nothing moved.
+        if from != to && (from.is_some() || to.is_some()) {
+            out.0.push(k.to_string());
+            out.1.push(from.map(str::to_string));
+            out.2.push(to.map(str::to_string));
+        }
+    }
+    out
 }
 
 /// What Desk pushes the first time it meets a hub: its local layout and
@@ -578,7 +643,7 @@ impl Desk {
                 "a group was called {used:?} before; each group needs an id of its own"
             )));
         }
-        let ungrouped = self.0.store.put_layout(&after).await?;
+        let ungrouped = self.0.store.put_layout_with(&after, fresh_ids).await?;
         self.0.state.lock().layout = after.clone();
         self.scopes_follow(&after);
         self.boards_ungrouped(&ungrouped).await;

@@ -41,6 +41,17 @@ pub trait Authorize: Send + Sync {
         query_token: Option<&str>,
     ) -> Result<Option<String>, StatusCode>;
 
+    /// As [`Self::authorize`], for what only the person who holds the hub
+    /// may do (making a move, as deciding a need): the hub refuses anyone
+    /// else. Its default is `authorize`'s answer.
+    async fn authorize_holder(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        self.authorize(headers, query_token).await
+    }
+
     /// Whether the request's bearer is the hub's own gateway token itself,
     /// compared in constant time: what an account's sign-in is handed to,
     /// and nothing else (not a system administrator's sign-in).
@@ -1761,6 +1772,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             Arc::clone(&auth),
         ))
         .merge(crate::plan_api::api_routes(desk.clone(), Arc::clone(&auth)))
+        .merge(crate::move_api::api_routes(desk.clone(), Arc::clone(&auth)))
         .merge(crate::board_api::api_routes(desk, auth))
 }
 

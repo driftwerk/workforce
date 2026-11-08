@@ -1106,6 +1106,27 @@ impl Desk {
         self.plan_saved(&p).await
     }
 
+    /// Plan `id` passes to the boss `to`: its boss moved to another scope.
+    /// A running plan pauses until the person has read its handover note,
+    /// so nothing runs unsupervised meanwhile.
+    pub async fn pass_plan(&self, id: Uuid, to: &Party, by: &By) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let mut p = self.plan_of(id).await?;
+        p.boss = to.id.clone();
+        if p.state == PlanState::Running {
+            p.state = PlanState::Paused;
+            p.paused = Some(Paused::NoBoss);
+        }
+        p.updated_at = crew::now();
+        self.plan_note(
+            &p,
+            by,
+            Kind::HandedOver,
+            format!("passed the plan to {}", to.name),
+        );
+        self.plan_saved(&p).await
+    }
+
     /// Resumes plan `id`, paused for `why`: a pause for another reason
     /// stays.
     pub async fn resume_plan(

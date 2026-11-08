@@ -98,7 +98,7 @@ impl Desk {
     /// What the boss `id` is called: as the hub's roster says now, which
     /// outlives a restart, else as it was when it took a session on. Never
     /// its id: one with no name of its own is [`crate::crew::UNNAMED_BOSS`].
-    fn boss_name(&self, id: &str) -> String {
+    pub(super) fn boss_name(&self, id: &str) -> String {
         let named = |n: &str| !n.trim().is_empty() && n != id;
         let crew = self
             .0

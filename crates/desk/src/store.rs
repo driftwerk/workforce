@@ -274,6 +274,29 @@ pub(crate) async fn forget_in(
         .await?)
 }
 
+/// The group session `session` (a SQL expression of a uuid) was in at
+/// `at` (a SQL timestamp), for a row about it written now: where the first
+/// move after `at` took it from, else the group it is in now. A row read
+/// after a move about what happened before stays the old group's. Null is
+/// ungrouped.
+///
+/// Moves are timed by the database's clock; `at` is the engine's record of
+/// the call, made on this computer, which the hub runs on too. A clock that
+/// disagrees by more than the gap between a call and a move puts a call
+/// made just before the move in the group it moved to, or one made just
+/// after in the group it left: within that skew only, never more.
+pub(crate) fn group_at_sql(session: &str, at: &str) -> String {
+    format!(
+        "(CASE WHEN EXISTS (SELECT 1 FROM group_moves gm \
+           WHERE gm.item = 'session:' || ({session})::text AND gm.at > {at}) \
+         THEN (SELECT gm.from_group FROM group_moves gm \
+           WHERE gm.item = 'session:' || ({session})::text AND gm.at > {at} \
+           ORDER BY gm.at LIMIT 1) \
+         ELSE (SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
+           WHERE g.item = 'session:' || ({session})::text) END)"
+    )
+}
+
 pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
     Ok(SessionRecord {
         id: row.try_get("id")?,

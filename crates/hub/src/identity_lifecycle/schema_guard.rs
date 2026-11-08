@@ -176,6 +176,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "handovers",
+        "drafted_by",
+        NotPersonal("the boss agent that drafted a handover note, or Desk, as a party"),
+    ),
+    (
+        "desk",
         "line_messages",
         "sender",
         NotPersonal("a session, the overseer agent, or `you`, the one person of the Desk"),

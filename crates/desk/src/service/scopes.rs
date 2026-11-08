@@ -45,7 +45,14 @@ pub(crate) struct Scopes {
     opened: HashMap<String, DateTime<Utc>>,
     /// Sessions being put in their group as they start: not a move.
     pub(crate) placing: HashSet<uuid::Uuid>,
+    /// Sessions a confirmed move is moving: it does what the move does,
+    /// not what a drag would.
+    pub(crate) moving: HashSet<uuid::Uuid>,
 }
+
+/// The detail key an event names its group by when it is noted of one
+/// scope on purpose: a string, or null for ungrouped.
+pub(crate) const IN_GROUP: &str = "inGroup";
 
 /// Where the boundaries are kept across restarts.
 const BOUNDED: &str = "desk.groups.bounded";
@@ -440,6 +447,11 @@ impl Desk {
         // group's, whoever they name.
         let of_plan = e.detail.as_ref().is_some_and(|d| d.get("plan").is_some());
         if e.ticket.is_some() || of_plan {
+            return;
+        }
+        // An event said of one scope on purpose (a move is noted in both).
+        if let Some(g) = e.detail.as_ref().and_then(|d| d.get(IN_GROUP)) {
+            e.group = g.as_str().map(str::to_string);
             return;
         }
         let s = self.0.scopes.lock();
