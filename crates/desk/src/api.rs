@@ -1422,8 +1422,7 @@ struct MemoryParams {
     /// A group's id, or `ungrouped`.
     group: Option<String>,
     session: Option<Uuid>,
-    /// `exchanges` or `all`; decisions, todos and facts are noted once Desk
-    /// writes them, and none are kept yet.
+    /// `decisions`, `todos`, `facts`, `exchanges` or `all`.
     kind: Option<String>,
     limit: Option<i64>,
 }
@@ -1441,16 +1440,20 @@ async fn memory_search(
         Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
     };
     let run = async {
-        let exchanges = match p.kind.as_deref().unwrap_or("all") {
-            "all" | "exchanges" => true,
-            "decisions" | "todos" | "facts" => false,
+        use crate::memory::passage::PassageKind;
+        let kinds = match p.kind.as_deref().unwrap_or("all") {
+            "all" => None,
+            "exchanges" => Some(PassageKind::EXCHANGES.to_vec()),
+            "decisions" => Some(vec![PassageKind::Decision]),
+            "todos" => Some(vec![PassageKind::Todo]),
+            "facts" => Some(vec![PassageKind::Fact]),
             _ => {
                 return Err(DeskError::Invalid(
                     "kind is decisions, todos, facts, exchanges or all".into(),
                 ))
             }
         };
-        let mut found = s
+        let found = s
             .desk
             .memory_search(&crate::memory_store::MemoryQuery {
                 q: p.q,
@@ -1458,12 +1461,10 @@ async fn memory_search(
                     .group
                     .map(|g| Some(g).filter(|g| g != crate::service::UNGROUPED)),
                 session: p.session,
+                kinds,
                 limit: p.limit.unwrap_or(20),
             })
             .await?;
-        if !exchanges {
-            found.hits.clear();
-        }
         Ok(found)
     };
     run.await.map(Json).into_response()

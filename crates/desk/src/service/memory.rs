@@ -249,6 +249,7 @@ impl Desk {
                     q: q.q.clone(),
                     group: q.group.clone(),
                     session: q.session,
+                    kinds: q.kinds.clone(),
                     limit: usize::try_from(q.limit.clamp(1, SEARCH_MAX)).unwrap_or(1),
                     tool: "search",
                     ..Default::default()
@@ -259,6 +260,14 @@ impl Desk {
             .hits
             .into_iter()
             .map(|(r, _)| MemoryHit {
+                kind: match (&r.item, r.compaction) {
+                    (Some(i), _) => i.kind.as_str(),
+                    (None, true) => "compaction",
+                    (None, false) => "exchange",
+                },
+                noted_by_desk: r.item.as_ref().is_some_and(|i| i.noted),
+                confirmed: r.item.as_ref().is_some_and(|i| i.confirmed),
+                superseded: r.item.as_ref().is_some_and(|i| i.superseded),
                 session: r.session,
                 group: r.group,
                 project: r.project,

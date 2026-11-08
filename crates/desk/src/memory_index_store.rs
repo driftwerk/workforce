@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use eyre::{Context, Result};
 use uuid::Uuid;
 
-use crate::memory::passage::{IndexRow, Purge};
+use crate::memory::passage::{IndexRow, PassageKind, Purge};
 use crate::memory::reach::Bound;
 use crate::memory_store::queue_purge_of;
 use crate::store::DeskStore;
@@ -51,6 +51,59 @@ pub const INDEX_TRIES: i32 = 5;
 /// The columns an [`IndexRow`] is read from, then its text's version.
 fn row_columns() -> String {
     format!("id, session, group_id, project, at, ask, answer, steps, compaction, {VERSION}")
+}
+
+/// A note's passage's version: its kind, its text and whether it still
+/// holds, kept apart.
+const ITEM_VERSION: &str = "md5(kind || chr(31) || text || chr(31) || (valid_to IS NULL)::text)";
+
+/// [`ITEM_VERSION`] of the row `prefix` names (`m.`).
+fn item_version_of(prefix: &str) -> String {
+    format!(
+        "md5({prefix}kind || chr(31) || {prefix}text || chr(31) || ({prefix}valid_to IS NULL)::text)"
+    )
+}
+
+/// The columns a note's [`IndexRow`] is read from, then its version.
+fn item_columns() -> String {
+    format!(
+        "id, session, group_id, project, valid_from, kind, text, valid_to IS NULL, {ITEM_VERSION}"
+    )
+}
+
+fn item_pending_of(r: &tokio_postgres::Row) -> Result<Option<Pending>> {
+    let Some(kind) = crate::memory::derive::ItemKind::parse(r.try_get(5)?) else {
+        return Ok(None);
+    };
+    Ok(Some(Pending {
+        row: IndexRow {
+            id: r.try_get(0)?,
+            session: r.try_get(1)?,
+            group: r.try_get(2)?,
+            project: r.try_get(3)?,
+            at: r.try_get(4)?,
+            ask: String::new(),
+            answer: String::new(),
+            steps: Vec::new(),
+            compaction: false,
+            item: Some(crate::memory::passage::IndexItem {
+                kind,
+                text: r.try_get(6)?,
+                valid: r.try_get(7)?,
+            }),
+        },
+        version: r.try_get(8)?,
+    }))
+}
+
+fn items_of(rows: &[tokio_postgres::Row]) -> Result<Vec<Pending>> {
+    Ok(rows
+        .iter()
+        .map(item_pending_of)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// `group_id` is `group`, as SQL the indexes serve: `$n` when it is a group.
@@ -96,30 +149,51 @@ fn pending_of(r: &tokio_postgres::Row) -> Result<Pending> {
             answer: r.try_get(6)?,
             steps: serde_json::from_value(r.try_get(7)?).unwrap_or_default(),
             compaction: r.try_get(8)?,
+            item: None,
         },
         version: r.try_get(9)?,
     })
 }
 
 impl DeskStore {
-    /// The oldest `limit` closed exchanges not yet in the index.
+    /// The oldest `limit` notes and closed exchanges not yet in the index:
+    /// notes first, as they are few and stand for many exchanges.
     pub async fn index_pending(&self, limit: i64) -> Result<Vec<Pending>> {
         let client = self.pool().get().await?;
-        client
-            .query(
-                &format!(
-                    "SELECT {} FROM memory_exchanges \
-                     WHERE indexed_at IS NULL AND {BELONGS} AND index_tries < $2 \
-                     ORDER BY at, id LIMIT $1",
-                    row_columns()
-                ),
-                &[&limit, &INDEX_TRIES],
-            )
-            .await
-            .context("reading the index's outbox")?
-            .iter()
-            .map(pending_of)
-            .collect()
+        let mut pending = items_of(
+            &client
+                .query(
+                    &format!(
+                        "SELECT {} FROM memory_items \
+                         WHERE indexed_at IS NULL AND index_tries < $2 \
+                         ORDER BY written_at, id LIMIT $1",
+                        item_columns()
+                    ),
+                    &[&limit, &INDEX_TRIES],
+                )
+                .await
+                .context("reading the index's outbox of notes")?,
+        )?;
+        let left = limit - i64::try_from(pending.len()).unwrap_or(limit);
+        if left > 0 {
+            for r in client
+                .query(
+                    &format!(
+                        "SELECT {} FROM memory_exchanges \
+                         WHERE indexed_at IS NULL AND {BELONGS} AND index_tries < $2 \
+                         ORDER BY at, id LIMIT $1",
+                        row_columns()
+                    ),
+                    &[&left, &INDEX_TRIES],
+                )
+                .await
+                .context("reading the index's outbox")?
+                .iter()
+            {
+                pending.push(pending_of(r)?);
+            }
+        }
+        Ok(pending)
     }
 
     /// How many closed exchanges aren't in the index yet, of `groups` when
@@ -137,8 +211,12 @@ impl DeskStore {
         Ok(client
             .query_one(
                 &format!(
-                    "SELECT COUNT(*) FROM memory_exchanges WHERE indexed_at IS NULL AND {BELONGS} \
-                     AND index_tries < $4 AND ($1 OR group_id = ANY($2) OR ($3 AND group_id IS NULL))"
+                    "SELECT (SELECT COUNT(*) FROM memory_exchanges WHERE indexed_at IS NULL \
+                       AND {BELONGS} AND index_tries < $4 \
+                       AND ($1 OR group_id = ANY($2) OR ($3 AND group_id IS NULL))) \
+                     + (SELECT COUNT(*) FROM memory_items WHERE indexed_at IS NULL \
+                       AND index_tries < $4 \
+                       AND ($1 OR group_id = ANY($2) OR ($3 AND group_id IS NULL)))"
                 ),
                 &[&any, &named, &ungrouped, &INDEX_TRIES],
             )
@@ -150,8 +228,10 @@ impl DeskStore {
     pub async fn index_unwritten(&self, group: Option<&str>) -> Result<i64> {
         let client = self.pool().get().await?;
         let sql = format!(
-            "SELECT COUNT(*) FROM memory_exchanges WHERE {} AND indexed_at IS NULL AND {BELONGS}",
-            group_is(group, 1)
+            "SELECT (SELECT COUNT(*) FROM memory_exchanges WHERE {g} AND indexed_at IS NULL \
+               AND {BELONGS}) \
+             + (SELECT COUNT(*) FROM memory_items WHERE {g} AND indexed_at IS NULL)",
+            g = group_is(group, 1)
         );
         let row = match group {
             Some(g) => client.query_one(&sql, &[&g]).await?,
@@ -164,8 +244,10 @@ impl DeskStore {
     pub async fn index_holds_any(&self, group: Option<&str>) -> Result<bool> {
         let client = self.pool().get().await?;
         let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM memory_exchanges WHERE {} AND indexed_at IS NOT NULL AND {BELONGS})",
-            group_is(group, 1)
+            "SELECT EXISTS (SELECT 1 FROM memory_exchanges WHERE {g} AND indexed_at IS NOT NULL \
+               AND {BELONGS}) \
+             OR EXISTS (SELECT 1 FROM memory_items WHERE {g} AND indexed_at IS NOT NULL)",
+            g = group_is(group, 1)
         );
         let row = match group {
             Some(g) => client.query_one(&sql, &[&g]).await?,
@@ -179,19 +261,31 @@ impl DeskStore {
     pub async fn index_written(&self, written: &[(Uuid, String)]) -> Result<u64> {
         let client = self.pool().get().await?;
         let (ids, versions): (Vec<Uuid>, Vec<String>) = written.iter().cloned().unzip();
-        Ok(client
+        let notes = client
             .execute(
                 &format!(
-                    "WITH l AS ({LOCKED_IDS}) \
+                    "UPDATE memory_items m SET indexed_at = now(), index_tries = 0 \
+                     FROM unnest($1::uuid[], $2::text[]) AS v(id, version) \
+                     WHERE m.id = v.id AND {} = v.version",
+                    item_version_of("m.")
+                ),
+                &[&ids, &versions],
+            )
+            .await?;
+        Ok(notes
+            + client
+                .execute(
+                    &format!(
+                        "WITH l AS ({LOCKED_IDS}) \
                      UPDATE memory_exchanges m SET indexed_at = now(), index_tries = 0 \
                      FROM l JOIN unnest($1::uuid[], $2::text[]) AS v(id, version) ON v.id = l.id \
                      WHERE m.id = l.id AND m.{BELONGS} \
                        AND {} = v.version",
-                    version_of("m.")
-                ),
-                &[&ids, &versions],
-            )
-            .await?)
+                        version_of("m.")
+                    ),
+                    &[&ids, &versions],
+                )
+                .await?)
     }
 
     /// Queues every exchange of `group` (`None`: ungrouped) to be written
@@ -204,9 +298,13 @@ impl DeskStore {
                ORDER BY id FOR UPDATE)",
             group_is(group, 1)
         );
+        let notes = format!(
+            "UPDATE memory_items SET indexed_at = NULL WHERE {} AND indexed_at IS NOT NULL",
+            group_is(group, 1)
+        );
         Ok(match group {
-            Some(g) => client.execute(&sql, &[&g]).await?,
-            None => client.execute(&sql, &[]).await?,
+            Some(g) => client.execute(&sql, &[&g]).await? + client.execute(&notes, &[&g]).await?,
+            None => client.execute(&sql, &[]).await? + client.execute(&notes, &[]).await?,
         })
     }
 
@@ -215,7 +313,7 @@ impl DeskStore {
     /// the index is rebuilt. Which were set aside now.
     pub async fn index_tried(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
         let client = self.pool().get().await?;
-        client
+        let mut rows = client
             .query(
                 &format!(
                     "UPDATE memory_exchanges SET index_tries = index_tries + 1 \
@@ -223,8 +321,17 @@ impl DeskStore {
                 ),
                 &[&ids],
             )
-            .await?
-            .iter()
+            .await?;
+        rows.extend(
+            client
+                .query(
+                    "UPDATE memory_items SET index_tries = index_tries + 1 \
+                     WHERE id = ANY($1) RETURNING id, index_tries",
+                    &[&ids],
+                )
+                .await?,
+        );
+        rows.iter()
             .filter(|r| r.get::<_, i32>(1) >= INDEX_TRIES)
             .map(|r| Ok(r.try_get(0)?))
             .collect()
@@ -233,16 +340,24 @@ impl DeskStore {
     /// Gives every exchange set aside its tries again. How many.
     pub async fn index_retry_set_aside(&self) -> Result<u64> {
         let client = self.pool().get().await?;
-        Ok(client
+        let notes = client
             .execute(
-                &format!(
-                    "UPDATE memory_exchanges SET index_tries = 0 WHERE id IN ( \
-                       SELECT id FROM memory_exchanges WHERE indexed_at IS NULL AND {BELONGS} \
-                       AND index_tries >= $1 ORDER BY id FOR UPDATE)"
-                ),
+                "UPDATE memory_items SET index_tries = 0 \
+                 WHERE indexed_at IS NULL AND index_tries >= $1",
                 &[&INDEX_TRIES],
             )
-            .await?)
+            .await?;
+        Ok(notes
+            + client
+                .execute(
+                    &format!(
+                        "UPDATE memory_exchanges SET index_tries = 0 WHERE id IN ( \
+                       SELECT id FROM memory_exchanges WHERE indexed_at IS NULL AND {BELONGS} \
+                       AND index_tries >= $1 ORDER BY id FOR UPDATE)"
+                    ),
+                    &[&INDEX_TRIES],
+                )
+                .await?)
     }
 
     /// How many exchanges are set aside, failing on their own.
@@ -251,8 +366,10 @@ impl DeskStore {
         Ok(client
             .query_one(
                 &format!(
-                    "SELECT COUNT(*) FROM memory_exchanges \
-                     WHERE indexed_at IS NULL AND {BELONGS} AND index_tries >= $1"
+                    "SELECT (SELECT COUNT(*) FROM memory_exchanges \
+                       WHERE indexed_at IS NULL AND {BELONGS} AND index_tries >= $1) \
+                     + (SELECT COUNT(*) FROM memory_items \
+                       WHERE indexed_at IS NULL AND index_tries >= $1)"
                 ),
                 &[&INDEX_TRIES],
             )
@@ -263,14 +380,21 @@ impl DeskStore {
     /// Queues `ids` to be written to the index again.
     pub async fn index_requeue(&self, ids: &[Uuid]) -> Result<u64> {
         let client = self.pool().get().await?;
-        Ok(client
+        let notes = client
             .execute(
-                &format!(
-                    "UPDATE memory_exchanges SET indexed_at = NULL WHERE id IN ({LOCKED_IDS})"
-                ),
+                "UPDATE memory_items SET indexed_at = NULL WHERE id = ANY($1)",
                 &[&ids],
             )
-            .await?)
+            .await?;
+        Ok(notes
+            + client
+                .execute(
+                    &format!(
+                        "UPDATE memory_exchanges SET indexed_at = NULL WHERE id IN ({LOCKED_IDS})"
+                    ),
+                    &[&ids],
+                )
+                .await?)
     }
 
     /// A page of `group`'s exchanges Postgres says the index holds, by id
@@ -296,7 +420,31 @@ impl DeskStore {
         rows.iter().map(pending_of).collect()
     }
 
-    /// Which of `ids` are exchanges the index should hold, in `group`.
+    /// A page of `group`'s notes Postgres says the index holds, by id
+    /// after `after`.
+    pub async fn index_held_items_page(
+        &self,
+        group: Option<&str>,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<Pending>> {
+        let client = self.pool().get().await?;
+        let sql = format!(
+            "SELECT {} FROM memory_items \
+             WHERE {} AND indexed_at IS NOT NULL \
+               AND ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2",
+            item_columns(),
+            group_is(group, 3)
+        );
+        let rows = match group {
+            Some(g) => client.query(&sql, &[&after, &limit, &g]).await?,
+            None => client.query(&sql, &[&after, &limit]).await?,
+        };
+        items_of(&rows)
+    }
+
+    /// Which of `ids` are exchanges or notes the index should hold, in
+    /// `group`.
     pub async fn index_belonging(
         &self,
         group: Option<&str>,
@@ -304,8 +452,9 @@ impl DeskStore {
     ) -> Result<HashSet<Uuid>> {
         let client = self.pool().get().await?;
         let sql = format!(
-            "SELECT id FROM memory_exchanges WHERE id = ANY($1) AND {} AND {BELONGS}",
-            group_is(group, 2)
+            "SELECT id FROM memory_exchanges WHERE id = ANY($1) AND {g} AND {BELONGS} \
+             UNION SELECT id FROM memory_items WHERE id = ANY($1) AND {g}",
+            g = group_is(group, 2)
         );
         let rows = match group {
             Some(g) => client.query(&sql, &[&ids, &g]).await?,
@@ -452,6 +601,12 @@ impl DeskStore {
                    ORDER BY id FOR UPDATE)",
                 &[],
             )
+            .await?
+            + tx.execute(
+                "UPDATE memory_items SET indexed_at = NULL, index_tries = 0 \
+                     WHERE indexed_at IS NOT NULL OR index_tries > 0",
+                &[],
+            )
             .await?;
         tx.commit().await?;
         Ok(queued)
@@ -497,6 +652,22 @@ pub struct RecallRow {
     /// It has tool steps.
     pub stepped: bool,
     pub flagged: bool,
+    /// A note, not an exchange: `answer` holds its text, and `at` since
+    /// when it is so.
+    pub item: Option<RecallItem>,
+}
+
+/// What a recalled note is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallItem {
+    pub kind: crate::memory::derive::ItemKind,
+    pub state: crate::memory::derive::ItemState,
+    /// The person confirmed or wrote it.
+    pub confirmed: bool,
+    /// Desk's model wrote it.
+    pub noted: bool,
+    /// Another note replaced it.
+    pub superseded: bool,
 }
 
 /// [`Bound`]'s parts as SQL parameters: the groups named, whether
@@ -521,10 +692,10 @@ fn bound_sql(first: usize) -> String {
 }
 
 impl DeskStore {
-    /// The exchanges `ids` names that still exist.
+    /// The exchanges and notes `ids` names that still exist.
     pub async fn recall_rows(&self, ids: &[Uuid]) -> Result<Vec<RecallRow>> {
         let client = self.pool().get().await?;
-        client
+        let mut rows = client
             .query(
                 "SELECT id, session, group_id, project, at, asker, ask, answer, compaction, \
                    jsonb_array_length(steps) > 0, cardinality(flagged) > 0 \
@@ -547,41 +718,113 @@ impl DeskStore {
                     compaction: r.try_get(8)?,
                     stepped: r.try_get(9)?,
                     flagged: r.try_get(10)?,
+                    item: None,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        for r in client
+            .query(
+                "SELECT id, session, group_id, project, valid_from, text, kind, state, \
+                   confirmed OR by = 'person', by <> 'person', valid_to IS NOT NULL \
+                 FROM memory_items WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await
+            .context("reading recalled notes")?
+        {
+            let Some(kind) = crate::memory::derive::ItemKind::parse(r.try_get(6)?) else {
+                continue;
+            };
+            rows.push(RecallRow {
+                id: r.try_get(0)?,
+                session: r.try_get(1)?,
+                group: r.try_get(2)?,
+                project: r.try_get(3)?,
+                at: r.try_get(4)?,
+                asker: crate::memory::record::Asker::Desk,
+                ask: String::new(),
+                answer: r.try_get(5)?,
+                compaction: false,
+                stepped: false,
+                flagged: false,
+                item: Some(RecallItem {
+                    kind,
+                    state: crate::memory::derive::ItemState::parse(r.try_get(7)?)
+                        .unwrap_or(crate::memory::derive::ItemState::Held),
+                    confirmed: r.try_get(8)?,
+                    noted: r.try_get(9)?,
+                    superseded: r.try_get(10)?,
+                }),
+            });
+        }
+        Ok(rows)
     }
 
-    /// The exchanges within `bound` whose words match `q`, best first, each
-    /// with its rank from 0 to 1: every one, or (`unindexed`) only those
-    /// the search index doesn't hold yet, or ever will (past the cap).
+    /// The exchanges and notes within `bound` whose words match `q`, of
+    /// `kinds` (all when none), best first, each with its rank from 0 to 1:
+    /// every one, or (`unindexed`) only those the search index doesn't hold
+    /// yet, or ever will (past the cap).
     pub async fn memory_keyword(
         &self,
         q: &str,
         bound: &Bound,
+        kinds: Option<&[PassageKind]>,
         unindexed: bool,
         limit: i64,
     ) -> Result<Vec<(Uuid, f32)>> {
         let client = self.pool().get().await?;
         let (named, ungrouped, sessions, projects) = bound_params(bound);
-        client
-            .query(
-                &format!(
-                    "SELECT id, ts_rank_cd(tsv, query, 32) FROM memory_exchanges, \
-                       websearch_to_tsquery('simple', $1) query \
-                     WHERE tsv @@ query AND (NOT $2 OR indexed_at IS NULL OR past_cap) AND {} \
-                     ORDER BY ts_rank_cd(tsv, query, 32) DESC, at DESC LIMIT $3",
-                    bound_sql(4)
-                ),
-                &[
-                    &q, &unindexed, &limit, &named, &ungrouped, &sessions, &projects,
-                ],
-            )
-            .await
-            .context("searching session memory by keyword")?
-            .iter()
-            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
-            .collect()
+        let exchanges = kinds.is_none_or(|k| PassageKind::EXCHANGES.iter().any(|e| k.contains(e)));
+        let notes: Vec<&str> = [PassageKind::Decision, PassageKind::Fact, PassageKind::Todo]
+            .into_iter()
+            .filter(|n| kinds.is_none_or(|k| k.contains(n)))
+            .map(PassageKind::as_str)
+            .collect();
+        let mut found: Vec<(Uuid, f32, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        if exchanges {
+            for r in client
+                .query(
+                    &format!(
+                        "SELECT id, ts_rank_cd(tsv, query, 32), at FROM memory_exchanges, \
+                           websearch_to_tsquery('simple', $1) query \
+                         WHERE tsv @@ query AND (NOT $2 OR indexed_at IS NULL OR past_cap) AND {} \
+                         ORDER BY ts_rank_cd(tsv, query, 32) DESC, at DESC LIMIT $3",
+                        bound_sql(4)
+                    ),
+                    &[
+                        &q, &unindexed, &limit, &named, &ungrouped, &sessions, &projects,
+                    ],
+                )
+                .await
+                .context("searching session memory by keyword")?
+            {
+                found.push((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?));
+            }
+        }
+        if !notes.is_empty() {
+            for r in client
+                .query(
+                    &format!(
+                        "SELECT id, ts_rank_cd(to_tsvector('simple', text), query, 32), valid_from \
+                         FROM memory_items, websearch_to_tsquery('simple', $1) query \
+                         WHERE to_tsvector('simple', text) @@ query AND kind = ANY($8) \
+                           AND (NOT $2 OR indexed_at IS NULL) AND {} \
+                         ORDER BY 2 DESC, valid_from DESC LIMIT $3",
+                        bound_sql(4)
+                    ),
+                    &[
+                        &q, &unindexed, &limit, &named, &ungrouped, &sessions, &projects, &notes,
+                    ],
+                )
+                .await
+                .context("searching session memory's notes by keyword")?
+            {
+                found.push((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?));
+            }
+        }
+        found.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
+        found.truncate(usize::try_from(limit).unwrap_or(0));
+        Ok(found.into_iter().map(|(id, rank, _)| (id, rank)).collect())
     }
 
     /// Keeps who read what: `hits` found by `reader` with `tool`.

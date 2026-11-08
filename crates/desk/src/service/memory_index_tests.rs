@@ -880,6 +880,7 @@ async fn a_session_never_recalls_another_groups_memory_whatever_it_asks() {
                             reach,
                             group,
                             session,
+                            kinds: None,
                             limit: 10,
                             tool: "recall",
                         },

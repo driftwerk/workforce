@@ -424,7 +424,7 @@ impl DeskStore {
             };
             // A note the person changed meanwhile stays as they left it.
             tx.execute(
-                "UPDATE memory_items SET valid_to = $3, superseded_by = $4 \
+                "UPDATE memory_items SET valid_to = $3, superseded_by = $4, indexed_at = NULL \
                  WHERE id = $1 AND session = $2 AND valid_to IS NULL AND NOT confirmed \
                    AND by <> 'person'",
                 &[&s.id, &session, &s.valid_to, by],
@@ -576,7 +576,8 @@ impl DeskStore {
         .await
         .context("correcting a note")?;
         tx.execute(
-            "UPDATE memory_items SET valid_to = now(), superseded_by = $2 WHERE id = $1",
+            "UPDATE memory_items SET valid_to = now(), superseded_by = $2, indexed_at = NULL \
+             WHERE id = $1",
             &[&id, &new],
         )
         .await?;
@@ -584,13 +585,30 @@ impl DeskStore {
         Ok(Some(new))
     }
 
-    /// The person drops note `id`: it goes. Whether there was one.
+    /// The person drops note `id`: it goes, and its passage is queued to
+    /// go from the search index. Whether there was one.
     pub async fn drop_item(&self, id: Uuid) -> Result<bool> {
-        let client = self.pool().get().await?;
-        Ok(client
-            .execute("DELETE FROM memory_items WHERE id = $1", &[&id])
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let Some(row) = tx
+            .query_opt(
+                "DELETE FROM memory_items WHERE id = $1 RETURNING group_id",
+                &[&id],
+            )
             .await?
-            > 0)
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let group: Option<String> = row.try_get(0)?;
+        crate::memory_store::queue_purge(
+            &tx,
+            group.as_deref(),
+            &crate::memory::passage::Purge::Refs { refs: vec![id] },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
