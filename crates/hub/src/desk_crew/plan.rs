@@ -160,6 +160,7 @@ pub fn update_schema() -> Value {
 fn plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        e @ workforce_desk::DeskError::CrossesBoss => e.to_string(),
         workforce_desk::DeskError::NotFound => "There's no such plan.".into(),
         workforce_desk::DeskError::Internal(e) => {
             tracing::warn!(error = %e, "a plan change failed");

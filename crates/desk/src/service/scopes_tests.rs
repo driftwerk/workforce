@@ -9,7 +9,6 @@ use chrono::Utc;
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
-use super::groups::CROSSES_A_BOSS;
 use super::tests::desk;
 use super::*;
 use crate::crew::{Event, Kind, Party};
@@ -1029,15 +1028,11 @@ async fn the_sidebars_routes_never_take_a_session_to_another_boss() {
         d.change_layout(|l| l.put(&item, "acme", None))
             .await
             .unwrap();
-        let crosses = |r: Result<Layout, DeskError>| {
-            matches!(r, Err(DeskError::Conflict(why)) if why == CROSSES_A_BOSS)
-        };
+        let crosses = |r: Result<Layout, DeskError>| matches!(r, Err(DeskError::CrossesBoss));
         // Into Atlas (Mia's), into Infra and out to Ungrouped (both the main
         // boss's): each crosses from Sarah, so each is refused.
         for to in ["atlas", "infra", UNGROUPED] {
-            let r = d
-                .change_layout_by_person(|l| l.put(&item, to, None))
-                .await;
+            let r = d.change_layout_by_person(|l| l.put(&item, to, None)).await;
             assert!(crosses(r), "put into {to}");
         }
         let r = d.change_layout_by_person(|l| l.remove(&item)).await;
@@ -1070,6 +1065,46 @@ async fn the_sidebars_routes_never_take_a_session_to_another_boss() {
         assert_eq!(
             d.layout().group_of(&item).map(|g| g.id.clone()),
             Some("infra".into())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_forced_import_never_takes_a_session_to_another_boss() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        let item = session_item(s.id);
+        d.change_layout(|l| l.put(&item, "acme", None))
+            .await
+            .unwrap();
+        let forced = |layout: Layout| Import {
+            layout,
+            session_names: Default::default(),
+            force: true,
+        };
+        // Desk's own copy, with the session in Atlas: refused, nothing moves.
+        let elsewhere = d.layout().put(&item, "atlas", None).unwrap();
+        let r = d.import_layout(forced(elsewhere)).await;
+        assert!(matches!(r, Err(DeskError::CrossesBoss)), "{r:?}");
+        assert_eq!(
+            d.layout().group_of(&item).map(|g| g.id.clone()),
+            Some("acme".into())
+        );
+        // Within Acme it is taken as before: a group renamed.
+        let renamed = d.layout().edit("acme", Some("Acme Ltd"), None).unwrap();
+        let done = d.import_layout(forced(renamed)).await.unwrap();
+        assert!(done.imported);
+        assert_eq!(
+            d.layout()
+                .groups
+                .iter()
+                .find(|g| g.id == "acme")
+                .map(|g| g.name.clone()),
+            Some("Acme Ltd".into())
         );
     })
     .await;

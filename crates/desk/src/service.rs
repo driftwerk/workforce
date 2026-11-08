@@ -173,6 +173,15 @@ pub enum DeskError {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    /// A change only a move may make: the sidebar's own routes would put a
+    /// session in another boss's part of Desk. Answered as a 409 with its
+    /// own `code`, so a client asks the person rather than reading the
+    /// layout again and retrying.
+    #[error(
+        "That would put a session in a group another boss oversees. Move it with the Move \
+         dialog, which shows what moves and lets you write the new boss's note."
+    )]
+    CrossesBoss,
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]

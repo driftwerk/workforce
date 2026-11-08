@@ -589,10 +589,6 @@ pub struct Imported {
     pub session_names: BTreeMap<String, String>,
 }
 
-/// What the sidebar's routes say of a change only a move may make.
-pub const CROSSES_A_BOSS: &str = "That would put a session in a group another boss oversees. \
-     Move it with the Move dialog, which shows what moves and lets you write the new boss's note.";
-
 impl Desk {
     /// The sidebar's groups as the hub has them.
     pub fn layout(&self) -> Layout {
@@ -646,7 +642,7 @@ impl Desk {
             let from = before.group_of(&item).map(|g| g.id.as_str());
             let to = after.group_of(&item).map(|g| g.id.as_str());
             if from != to && scope_of(from, &bossed) != scope_of(to, &bossed) {
-                return Err(DeskError::Conflict(CROSSES_A_BOSS.into()));
+                return Err(DeskError::CrossesBoss);
             }
         }
         Ok(())
@@ -768,7 +764,23 @@ impl Desk {
             .without_sessions(|id| !known.contains(&id));
         let imported = fresh || import.force;
         if imported {
-            self.change_layout_as(|_| Ok(layout), false).await?;
+            // Forced over a layout the hub already keeps, it is the person's
+            // change like any other: one at a time with moves, and never
+            // taking a session to another boss.
+            let _one = match fresh {
+                true => None,
+                false => Some(self.0.move_write.lock().await),
+            };
+            self.change_layout_as(
+                |before| {
+                    if !fresh {
+                        self.stays_in_scope(before, &layout)?;
+                    }
+                    Ok(layout)
+                },
+                false,
+            )
+            .await?;
             for (id, name) in import.session_names {
                 let Ok(id) = Uuid::parse_str(&id) else {
                     continue;
