@@ -548,6 +548,8 @@ fn options(config: &WorkforceConfig) -> Options {
             index_per_minute: desk.memory.index_per_minute,
             session_reach: workforce_desk::memory::reach::Reach::parse(&desk.memory.session_reach)
                 .unwrap_or(workforce_desk::memory::reach::Reach::Project),
+            derive: desk.memory.derive != "off",
+            derive_calls_per_day: desk.memory.derive_calls_per_day,
         },
     }
 }
@@ -693,6 +695,12 @@ pub async fn mount(
         redactor: Some(Arc::new(crate::desk_memory::HubRedactor)),
         index: crate::desk_memory_index::VellevDeskIndex::installed(config)
             .map(|i| i as Arc<dyn workforce_desk::memory::index::MemoryIndex>),
+        deriver: Some(Arc::new(crate::desk_memory::HubDeriver {
+            model: crate::floor::gists::HubModel {
+                state: Arc::clone(state),
+                fallback: config.floor.fallback_providers,
+            },
+        })),
         ..crate::floor::desk_floor()
     };
     let desk = Desk::start(store, options(config), floor, cancel)

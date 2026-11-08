@@ -14,10 +14,11 @@ use crate::memory_store::queue_purge_of;
 use crate::store::DeskStore;
 
 /// Session memory's tables, as their data is measured.
-const MEMORY_TABLES: [&str; 7] = [
+const MEMORY_TABLES: [&str; 8] = [
     "memory_exchanges",
     "memory_items",
     "memory_derive",
+    "memory_derive_reads",
     "memory_reads",
     "memory_forgotten",
     "memory_purges",

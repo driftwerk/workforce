@@ -257,6 +257,13 @@ impl DeskStore {
                 .await
                 .context("keeping an exchange")?;
             }
+            // Exchanges that closed are to be read for notes: due as the
+            // turn ends, at most every ten minutes.
+            if !w.closed.is_empty() {
+                tx.execute(&crate::memory_derive_store::arm_sql(), &[&w.session])
+                    .await
+                    .context("queueing a session to note decisions from")?;
+            }
         }
         // A session forgotten meanwhile keeps no cursor: its harvest's state
         // holds what it said.
@@ -630,10 +637,24 @@ pub(crate) async fn forget_memory_in(
         &[&ids],
     )
     .await?;
+    // Then their derivation queue, as writing what was noted locks it
+    // before their notes.
+    tx.execute(
+        "SELECT 1 FROM memory_derive WHERE session = ANY($1) ORDER BY session FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
     // Their exchanges are locked in id order, as every write of many
     // exchanges locks them.
     tx.execute(
         "SELECT 1 FROM memory_exchanges WHERE session = ANY($1) ORDER BY id FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
+    // And their notes, in id order, as every write of many notes locks
+    // them.
+    tx.execute(
+        "SELECT 1 FROM memory_items WHERE session = ANY($1) ORDER BY id FOR UPDATE",
         &[&ids],
     )
     .await?;
@@ -693,6 +714,7 @@ pub(crate) async fn forget_memory_in(
         "memory_exchanges",
         "memory_items",
         "memory_derive",
+        "memory_derive_reads",
         "memory_sessions",
     ] {
         tx.execute(
