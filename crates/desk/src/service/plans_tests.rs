@@ -1800,3 +1800,141 @@ async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_whe
     })
     .await;
 }
+
+/// A session's spend with no ticket stamped goes to the plan whose ticket
+/// it was handed then, one window a hand-out: back five minutes only after
+/// a gap, never into what it worked on before, and to one plan at most.
+#[tokio::test]
+async fn ticketless_spend_goes_to_one_plan_by_each_hand_out() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let a = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a1", &[]), ("a2", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let b = d
+            .propose_plan(new_plan(dir.path(), &[("b", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let (pa, pb) = (a.summary.plan.id, b.summary.plan.id);
+        let (a1, a2) = (a.tickets[0].ticket.ticket.id, a.tickets[1].ticket.ticket.id);
+        let tb = b.tickets[0].ticket.ticket.id;
+        let s = Uuid::new_v4();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let m = |n: i64| t0 + chrono::Duration::minutes(n);
+        let c = d.0.store.pool().get().await.unwrap();
+        // A, then B straight after, then A again after a gap.
+        for (ticket, from, until) in [
+            (a1, m(0), Some(m(30))),
+            (tb, m(30), Some(m(60))),
+            (a2, m(90), None),
+        ] {
+            c.execute(
+                "INSERT INTO ticket_assignments (ticket, session, from_at, until_at) \
+                 VALUES ($1, $2, $3, $4)",
+                &[&ticket, &s, &from, &until],
+            )
+            .await
+            .unwrap();
+        }
+        for (at, usd) in [
+            (m(-30), 32.0), // long before: no plan's
+            (m(-2), 1.0),   // its first calls: A's
+            (m(29), 2.0),   // in A's first hand-out
+            (m(35), 4.0),   // in B's
+            (m(65), 8.0),   // in the gap: no plan's
+            (m(87), 16.0),  // before A's second, after the gap: A's
+        ] {
+            c.execute(
+                "INSERT INTO ledger (engine, key, session, at, input, usd, priced, billing) \
+                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'plan')",
+                &[&Uuid::new_v4().to_string(), &s, &at, &usd],
+            )
+            .await
+            .unwrap();
+        }
+        let used =
+            d.0.store
+                .ledger_used_by_plan(chrono::DateTime::UNIX_EPOCH, &[pa, pb])
+                .await
+                .unwrap();
+        assert_eq!(used.get(&pa).map(|u| u.usd), Some(19.0));
+        assert_eq!(used.get(&pb).map(|u| u.usd), Some(4.0), "no grace into A's");
+        // B's hand-out came straight after A's: what was just before it is
+        // A's alone, not both.
+        let total: f64 = used.values().map(|u| u.usd).sum();
+        assert_eq!(total, 23.0);
+    })
+    .await;
+}
+
+/// A change of a plan's cap never reads as let go before it is counted
+/// again; a tightening keeps the person's Continue, and only a loosening
+/// the person approves forgets it.
+#[tokio::test]
+async fn a_change_of_cap_keeps_the_hold_until_counted_and_only_a_loosening_forgets_continue() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = capped_plan(&d, dir.path(), &[("a", &[]), ("b", &[])], 10.0).await;
+        let id = p.summary.plan.id;
+        let first = next(&d, id).await.remove(0);
+        let s = d
+            .plan_start(&p.summary.plan, &first, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        spent(&d, s.id, 8.5).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        let subject = super::super::plan_subject(id);
+        d.breaker_continue(&subject, By::you()).unwrap();
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None);
+
+        // The boss lowers it, still at its warning: the Continue stands.
+        let lower = PlanEdit {
+            budget: capped(9.6),
+            why: Some("Less is enough.".into()),
+            ..Default::default()
+        };
+        let r = d
+            .change_plan(id, lower, Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert!(r.applied);
+        assert_eq!(d.plan_starts_held(Some("g-acme"), id), None, "still let go");
+
+        // Over now; the person raises it, still over: held all along.
+        spent(&d, s.id, 2.0).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert!(d.plan_starts_held(Some("g-acme"), id).is_some());
+        let (_, mut events) = d.subscribe();
+        let raise = |amount: f64| PlanEdit {
+            budget: capped(amount),
+            ..Default::default()
+        };
+        d.change_plan(id, raise(10.2), Engine::Claude, false, &By::you())
+            .await
+            .unwrap();
+        assert!(d.plan_starts_held(Some("g-acme"), id).is_some());
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Breaker { breaker } = e {
+                assert!(
+                    breaker.subject != subject || breaker.level != crate::breaker::Level::Clear,
+                    "never let go while counted again"
+                );
+            }
+        }
+        // Raised to where it is at its warning again: the person's raise
+        // forgot the Continue, so it holds at the warning.
+        d.change_plan(id, raise(12.5), Engine::Claude, false, &By::you())
+            .await
+            .unwrap();
+        let (status, _) = d.plan_starts_held(Some("g-acme"), id).unwrap();
+        assert_eq!(status, workforce_core::budget::Status::Warn);
+    })
+    .await;
+}

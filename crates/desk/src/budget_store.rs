@@ -199,10 +199,12 @@ impl DeskStore {
 
     /// What each of `plans` spent from `from` on: every ledger row stamped
     /// with one of its tickets, and the rows no ticket was stamped on of a
-    /// session that worked on one of them, made while it did or in the
-    /// [`PLAN_GRACE`] before it was handed its first (its first calls can
-    /// come before it is handed its ticket). What the session did before or
-    /// after is not the plan's.
+    /// session while it was handed one of them. Each hand-out is a window of
+    /// its own: from its start (or [`PLAN_GRACE`] before, when the session
+    /// had nothing just before it, for its first calls, but never back into
+    /// what it worked on before) until it ended. A row is the plan's of at
+    /// most one window, the latest begun; what the session did outside them
+    /// is not a plan's.
     pub async fn ledger_used_by_plan(
         &self,
         from: DateTime<Utc>,
@@ -215,19 +217,27 @@ impl DeskStore {
         let rows = client
             .query(
                 "WITH ours AS (SELECT id, plan FROM tickets WHERE plan = ANY($2)), \
-                   worked AS (SELECT a.session, o.plan, \
-                       MIN(a.from_at) - make_interval(secs => $3) AS since, \
-                       MAX(COALESCE(a.until_at, 'infinity'::timestamptz)) AS until \
-                     FROM ticket_assignments a JOIN ours o ON o.id = a.ticket \
-                     GROUP BY a.session, o.plan) \
+                   spans AS (SELECT a.session, a.ticket, a.from_at, a.until_at, \
+                       LAG(COALESCE(a.until_at, 'infinity'::timestamptz)) \
+                         OVER (PARTITION BY a.session ORDER BY a.from_at) AS before \
+                     FROM ticket_assignments a WHERE a.session IN ( \
+                       SELECT b.session FROM ticket_assignments b JOIN ours o ON o.id = b.ticket)), \
+                   windows AS (SELECT s.session, o.plan, s.from_at, \
+                       LEAST(s.from_at, GREATEST(s.from_at - make_interval(secs => $3), \
+                         COALESCE(s.before, '-infinity'::timestamptz))) AS since, \
+                       COALESCE(s.until_at, 'infinity'::timestamptz) AS until \
+                     FROM spans s JOIN ours o ON o.id = s.ticket), \
+                   untagged AS (SELECT DISTINCT ON (l.engine, l.key) w.plan, \
+                       l.input + l.output + l.cache_read + l.cache_write AS tokens, l.usd \
+                     FROM ledger l JOIN windows w ON w.session = l.session \
+                       AND l.at >= w.since AND l.at < w.until \
+                     WHERE l.ticket IS NULL AND l.at >= $1 \
+                     ORDER BY l.engine, l.key, w.from_at DESC) \
                  SELECT plan, SUM(tokens)::int8, COALESCE(SUM(usd), 0)::float8 FROM ( \
                    SELECT o.plan, l.input + l.output + l.cache_read + l.cache_write AS tokens, \
                      l.usd FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
                    UNION ALL \
-                   SELECT w.plan, l.input + l.output + l.cache_read + l.cache_write, l.usd \
-                     FROM ledger l JOIN worked w ON w.session = l.session \
-                     WHERE l.ticket IS NULL AND l.at >= $1 \
-                       AND l.at >= w.since AND l.at < w.until \
+                   SELECT plan, tokens, usd FROM untagged \
                  ) spent GROUP BY plan",
                 &[&from, &plans, &(PLAN_GRACE.as_secs() as f64)],
             )

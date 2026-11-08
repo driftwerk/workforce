@@ -500,20 +500,14 @@ impl CrewHub {
     /// Continue, or the hold's period ended. Its boss can't: no crew tool
     /// lets a hold go.
     async fn lift_hold(&self, p: &Plan) {
-        let lifted = match p.paused {
-            Some(plan::Paused::BossHeld) => self.desk.agent_held(&p.boss).is_none(),
-            Some(plan::Paused::Budget) => self
-                .desk
-                .plan_starts_held(p.group.as_deref(), p.id)
-                .is_none(),
-            _ => false,
-        };
-        if !lifted {
+        if !matches!(
+            p.paused,
+            Some(plan::Paused::BossHeld | plan::Paused::Budget)
+        ) {
             return;
         }
         let by = By::desk("What held it is over.");
-        let why = [plan::Paused::BossHeld, plan::Paused::Budget];
-        if let Err(e) = self.desk.resume_plan(p.id, &why, &by).await {
+        if let Err(e) = self.desk.resume_if_lifted(p.id, &by).await {
             tracing::info!(plan = %p.id, error = %e, "a plan Desk paused wasn't resumed");
         }
     }

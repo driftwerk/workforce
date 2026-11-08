@@ -185,6 +185,18 @@ fn minutes(seen: &VecDeque<Seen>, now: DateTime<Utc>) -> i64 {
         .map_or(0, |s| (now - s.at).num_minutes().max(1))
 }
 
+/// "your day budget" (`whose` "your"), or for a budget a plan's sessions
+/// share "your plan's total budget, shared by the plan's sessions".
+fn whose_budget(whose: &str, standing: &Standing) -> String {
+    match standing.shared {
+        true => format!(
+            "{whose} plan's {} budget, shared by the plan's sessions",
+            standing.period.words()
+        ),
+        false => format!("{whose} {} budget", standing.period.words()),
+    }
+}
+
 /// What the session is told when it trips for `reason`.
 fn steer_text(detail: &Detail, over: Option<OnExceed>) -> String {
     match (detail, over) {
@@ -197,22 +209,22 @@ fn steer_text(detail: &Detail, over: Option<OnExceed>) -> String {
              Stop, say what you've learned, and ask the person before trying it again."
         ),
         (Detail::Budget { standing }, None) => format!(
-            "Desk's breaker: you have used {} of your {} budget ({}). Keep to what's needed and \
-             wrap up soon.",
+            "Desk's breaker: you have used {} of {} ({}). Keep to what's needed and wrap up \
+             soon.",
             standing.percent(),
-            standing.period.words(),
+            whose_budget("your", standing),
             standing.amounts()
         ),
         (Detail::Budget { standing }, Some(OnExceed::Pause)) => format!(
-            "Desk's breaker: you are over your {} budget ({}). Finish the step you're on and end \
-             your turn: Desk pauses you after it until the person says to go on.",
-            standing.period.words(),
+            "Desk's breaker: you are over {} ({}). Finish the step you're on and end your turn: \
+             Desk pauses you after it until the person says to go on.",
+            whose_budget("your", standing),
             standing.amounts()
         ),
         (Detail::Budget { standing }, Some(OnExceed::Warn)) => format!(
-            "Desk's breaker: you are over your {} budget ({}). The person asked only to be told; \
-             keep to what's needed.",
-            standing.period.words(),
+            "Desk's breaker: you are over {} ({}). The person asked only to be told; keep to \
+             what's needed.",
+            whose_budget("your", standing),
             standing.amounts()
         ),
     }
@@ -520,9 +532,9 @@ pub fn need_text_for(
             };
             (
                 format!(
-                    "{name} is at {} of its {} budget ({}). {paused}",
+                    "{name} is at {} of {} ({}). {paused}",
                     standing.percent(),
-                    standing.period.words(),
+                    whose_budget("its", standing),
                     standing.amounts()
                 ),
                 why,
@@ -598,6 +610,7 @@ mod tests {
             on_exceed,
             from: at(-600),
             to: at(840),
+            shared: false,
         }
     }
 
@@ -716,6 +729,34 @@ mod tests {
         assert!(steps.contains(&Step::Hold {
             reason: Reason::Budget(id)
         }));
+    }
+
+    #[test]
+    fn a_plans_budget_is_said_to_be_shared_by_its_sessions() {
+        let id = Uuid::new_v4();
+        let shared = Standing {
+            shared: true,
+            period: Period::Total,
+            ..standing(id, 9.1, Status::Warn, OnExceed::Pause)
+        };
+        let (s, steps) = run(State::default(), [(0, Signal::Spend(vec![shared.clone()]))]);
+        assert!(
+            matches!(&steps[..], [Step::Steer { text, .. }]
+            if text.contains("82% of your plan's total budget, shared by the plan's sessions ($9.10 of $11)")),
+            "{steps:?}"
+        );
+        let over = Standing {
+            used: 11.5,
+            status: Status::Over,
+            ..shared
+        };
+        let (s, _) = run(s, [(1, Signal::Spend(vec![over]))]);
+        let (ask, _) = need_text("acme-api", Whose::Session, &s.level).unwrap();
+        assert_eq!(
+            ask,
+            "acme-api is at 104% of its plan's total budget, shared by the plan's sessions \
+             ($11.50 of $11). Desk paused it after its turn."
+        );
     }
 
     #[test]

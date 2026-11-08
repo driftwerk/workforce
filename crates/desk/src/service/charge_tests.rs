@@ -907,3 +907,54 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
     })
     .await;
 }
+
+/// A boss Desk's breaker holds (over its own budget) takes no turns, and
+/// what it queued for its sessions is withdrawn: it never goes in.
+#[tokio::test]
+async fn a_held_bosss_queued_messages_are_withdrawn() {
+    use workforce_core::budget::{OnExceed, Period, Standing, Status, Unit};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        d.person_drove(s.id);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let queued = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", s.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let over = Standing {
+            budget: Uuid::new_v4(),
+            period: Period::Day,
+            unit: Unit::Usd,
+            used: 12.0,
+            of: 11.0,
+            status: Status::Over,
+            on_exceed: OnExceed::Pause,
+            from: now - chrono::Duration::hours(1),
+            to: now + chrono::Duration::hours(10),
+            shared: false,
+        };
+        d.agent_stand("sarah", "Sarah", vec![over], false);
+        assert!(d.agent_held("sarah").is_some());
+        let mut withdrawn = false;
+        for _ in 0..50 {
+            let thread = d.line_thread(s.id, None, None).await.unwrap();
+            if thread
+                .iter()
+                .any(|m| m.id == queued.id && m.delivery == Delivery::Withdrawn)
+            {
+                withdrawn = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(withdrawn, "what it queued is withdrawn");
+    })
+    .await;
+}

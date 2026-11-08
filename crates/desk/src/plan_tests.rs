@@ -828,3 +828,28 @@ fn a_draft_keeps_the_limit_of_what_it_changes_and_an_old_snapshot_reads_with_non
     )
     .contains("uns at most 1 at once"));
 }
+
+/// Past its limit (a held session let go on again), the runner starts
+/// nothing until enough of them stop working.
+#[test]
+fn over_the_limit_nothing_starts_until_it_drains() {
+    let p = plan(PlanState::Running);
+    let mut tickets = Vec::new();
+    for i in 0..3 {
+        tickets.push(PlanTicket {
+            id: u(i),
+            key: None,
+            state: TicketState::Todo,
+            rank: i as f64,
+            needs: vec![],
+            engine: Some(Engine::Claude),
+            folder: Some("/work/acme-web".into()),
+            view: None,
+            assigned: false,
+            starting: false,
+        });
+    }
+    assert!(next_starts(&p, &tickets, 5, 4, None).is_empty());
+    assert!(next_starts(&p, &tickets, 4, 4, None).is_empty());
+    assert_eq!(next_starts(&p, &tickets, 3, 4, None).len(), 1);
+}

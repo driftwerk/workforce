@@ -675,6 +675,13 @@ impl Desk {
                         l.breaker.hold_after = Some(l.breaker.turns);
                     }
                 }
+                // A boss held takes no turns, and what it queued for its
+                // sessions never goes in.
+                if let BreakerOf::Agent(id) = held {
+                    let desk = self.clone();
+                    let id = id.clone();
+                    tokio::spawn(async move { desk.withdraw_boss(&id).await });
+                }
                 let ask = self.breaker_view(subject, state).and_then(|v| v.ask);
                 let text = match held {
                     BreakerOf::Pool(_) | BreakerOf::Plan(_) => {
@@ -703,6 +710,22 @@ impl Desk {
                     }
                 }
             }
+        }
+    }
+
+    /// What the boss `boss` said to its sessions that hasn't gone in is
+    /// withdrawn: Desk's breaker holds it.
+    async fn withdraw_boss(&self, boss: &str) {
+        match self.0.store.line_withdraw_from_boss(boss).await {
+            Ok(rows) => {
+                for m in rows {
+                    let _ = self.0.events.send(DeskEvent::Line {
+                        message: Box::new(m),
+                        removed: false,
+                    });
+                }
+            }
+            Err(e) => tracing::warn!(boss, error = %e, "couldn't withdraw a held boss's messages"),
         }
     }
 
@@ -1013,16 +1036,20 @@ impl Desk {
             };
             let standings: Vec<Standing> = budget::applying(&budgets, &subject)
                 .into_iter()
-                .map(|b| {
-                    let spent = match b.scope {
-                        BudgetScope::Plan(p) => plan_spent(p, b.period),
-                        _ => used
+                .map(|b| match b.scope {
+                    // Shared by the plan's sessions: said so.
+                    BudgetScope::Plan(p) => Standing {
+                        shared: true,
+                        ..standing(b, plan_spent(p, b.period).of(b.unit))
+                    },
+                    _ => {
+                        let spent = used
                             .get(&b.period)
                             .and_then(|m| m.get(&id))
                             .copied()
-                            .unwrap_or_default(),
-                    };
-                    standing(b, spent.of(b.unit))
+                            .unwrap_or_default();
+                        standing(b, spent.of(b.unit))
+                    }
                 })
                 .collect();
             let known = self
@@ -1348,13 +1375,15 @@ impl Desk {
             .chain([plan_subject(plan)])
             .find_map(|subject| {
                 let state = self.held(&subject)?;
-                let status = match &state.level {
-                    Level::Held {
-                        detail: pure::Detail::Budget { standing },
-                        ..
-                    } => standing.status,
-                    _ => Status::Over,
+                // A pool's or a plan's holds only for a budget.
+                let Level::Held {
+                    detail: pure::Detail::Budget { standing },
+                    ..
+                } = &state.level
+                else {
+                    return None;
                 };
+                let status = standing.status;
                 let ask = self
                     .breaker_view(&subject, &state)
                     .and_then(|v| v.ask)
@@ -1850,9 +1879,12 @@ impl Desk {
     }
 
     /// Keeps plan `p`'s budget as `want` says, as the revision the person
-    /// approved has it: set, changed or taken off. A change lets go of what
-    /// its breaker held, which is then counted again against the budget as
-    /// it is now.
+    /// approved has it: set, changed or taken off. A budget counted the same
+    /// way keeps its id, so what the person let go on stays let go. One the
+    /// person loosened (raised, taken off, counted another way) is counted
+    /// at once, and its breaker becomes what that count says, in one step:
+    /// it never reads as let go before the new count is in. A tightening
+    /// keeps the hold and the person's Continue, and is counted as usual.
     pub(super) async fn keep_plan_budget(
         &self,
         p: &crate::plan::Plan,
@@ -1873,22 +1905,22 @@ impl Desk {
             .into_iter()
             .filter(|b| b.scope == scope)
             .collect();
-        let same = |b: &Budget, w: &crate::plan::PlanBudget| {
-            b.period == w.period
-                && b.unit == w.unit
-                && b.amount == w.amount
-                && b.warn_at == w.warn_at
-                && b.on_exceed == w.on_exceed
-                && b.group == p.group
+        let as_planned = |b: &Budget| crate::plan::PlanBudget {
+            amount: b.amount,
+            unit: b.unit,
+            period: b.period,
+            warn_at: b.warn_at,
+            on_exceed: b.on_exceed,
         };
         match want {
-            Some(w) if had.len() == 1 && same(&had[0], w) => return Ok(()),
+            Some(w) if had.len() == 1 && as_planned(&had[0]) == *w && had[0].group == p.group => {
+                return Ok(())
+            }
             None if had.is_empty() => return Ok(()),
             _ => {}
         }
-        for b in &had {
-            self.0.store.delete_budget(b.id).await?;
-        }
+        let loosened = by.party.kind == PartyKind::You
+            && had.first().is_some_and(|b| as_planned(b).loosened_by(want));
         let text = match want {
             Some(w) => {
                 let b = Budget {
@@ -1903,31 +1935,101 @@ impl Desk {
                     updated_at: Utc::now(),
                 };
                 budget::check(&b).map_err(DeskError::Invalid)?;
-                let kept = self.0.store.put_budget(&b).await?;
+                // Counted the same way: the same budget, changed.
+                let kept = match had.as_slice() {
+                    [one] if one.period == w.period && one.unit == w.unit => {
+                        let b = Budget { id: one.id, ..b };
+                        self.0
+                            .store
+                            .update_budget(&b)
+                            .await?
+                            .ok_or(DeskError::NotFound)?
+                    }
+                    _ => {
+                        for old in &had {
+                            self.0.store.delete_budget(old.id).await?;
+                        }
+                        self.0.store.put_budget(&b).await?
+                    }
+                };
                 format!(
                     "set {} for {}",
                     budget_words(&kept),
                     self.scope_words(&kept)
                 )
             }
-            None => format!(
-                "took the budget off {}",
-                self.scope_words(&Budget {
-                    id: Uuid::nil(),
-                    scope,
-                    group: None,
-                    period: Period::Total,
-                    unit: Unit::Usd,
-                    amount: 1.0,
-                    warn_at: WARN_AT,
-                    on_exceed: OnExceed::Pause,
-                    updated_at: Utc::now(),
-                })
-            ),
+            None => {
+                for old in &had {
+                    self.0.store.delete_budget(old.id).await?;
+                }
+                format!(
+                    "took the budget off {}",
+                    self.scope_words(&Budget {
+                        id: Uuid::nil(),
+                        scope,
+                        group: None,
+                        period: Period::Total,
+                        unit: Unit::Usd,
+                        amount: 1.0,
+                        warn_at: WARN_AT,
+                        on_exceed: OnExceed::Pause,
+                        updated_at: Utc::now(),
+                    })
+                )
+            }
         };
-        self.breaker_forget(&plan_subject(p.id));
+        let budgets = self.0.store.budgets().await?;
+        self.0.breakers.lock().budgets = budgets.clone();
+        if loosened {
+            self.recount_plan(p.id, &budgets).await;
+        }
         self.budgets_changed(by, text).await;
         Ok(())
+    }
+
+    /// Plan `id`'s breaker, counted afresh against `budgets` now: what it
+    /// held and was let go is forgotten, and what the count says holds.
+    /// Left as it is when it can't be counted.
+    async fn recount_plan(&self, id: Uuid, budgets: &[Budget]) {
+        let mut standings = Vec::new();
+        for b in budgets.iter().filter(|b| b.scope == BudgetScope::Plan(id)) {
+            match self.plan_standing(id, b).await {
+                Some(st) => standings.push(st),
+                None => return,
+            }
+        }
+        let (fresh, _) =
+            pure::pool_step(pure::State::default(), Signal::Spend(standings), Utc::now());
+        self.breaker_replace(&plan_subject(id), fresh);
+    }
+
+    /// Puts `state` as `subject`'s breaker in one step, kept and announced.
+    fn breaker_replace(&self, subject: &str, state: pure::State) {
+        let before = {
+            let mut run = self.0.breakers.lock();
+            match state == pure::State::default() {
+                true => run.states.remove(subject),
+                false => run.states.insert(subject.to_string(), state.clone()),
+            }
+        };
+        if before.as_ref() == Some(&state) || (before.is_none() && state == pure::State::default())
+        {
+            return;
+        }
+        let store = std::sync::Arc::clone(&self.0.store);
+        let (key, kept) = (subject.to_string(), state.clone());
+        tokio::spawn(async move {
+            if let Err(e) = store.put_breaker(&key, &kept).await {
+                tracing::warn!(subject = %key, error = format!("{e:#}"), "couldn't keep a breaker");
+            }
+        });
+        if before.map(|b| b.level) != Some(state.level.clone()) {
+            if let Some(view) = self.breaker_view(subject, &state) {
+                self.announce(DeskEvent::Breaker {
+                    breaker: Box::new(view),
+                });
+            }
+        }
     }
 
     /// Forgets `subject`'s breaker: what it held, warned and was let go.

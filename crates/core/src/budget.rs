@@ -338,6 +338,10 @@ pub struct Standing {
     pub from: DateTime<Utc>,
     /// Where its period ends.
     pub to: DateTime<Utc>,
+    /// Counted over many sessions together (a plan's), not the subject's
+    /// own spend alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 impl Standing {
@@ -411,6 +415,7 @@ pub fn standing_of(b: &Budget, used: f64, from: DateTime<Utc>, to: DateTime<Utc>
         on_exceed: b.on_exceed,
         from,
         to,
+        shared: false,
     }
 }
 

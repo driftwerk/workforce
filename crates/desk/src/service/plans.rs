@@ -1229,7 +1229,40 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        let mut p = self.plan_of(id).await?;
+        let p = self.plan_of(id).await?;
+        self.resume_read(p, why, by).await
+    }
+
+    /// Resumes plan `id` if Desk paused it because its boss was held or the
+    /// breaker held its new starts, and that is over now: read again with
+    /// the plan's writes held, so a hold come back meanwhile keeps it
+    /// paused. `None` when it stays paused.
+    pub async fn resume_if_lifted(
+        &self,
+        id: Uuid,
+        by: &By,
+    ) -> Result<Option<PlanDetail>, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let p = self.plan_of(id).await?;
+        let lifted = match p.paused {
+            Some(Paused::BossHeld) => self.agent_held(&p.boss).is_none(),
+            Some(Paused::Budget) => self.plan_starts_held(p.group.as_deref(), p.id).is_none(),
+            _ => false,
+        };
+        if !lifted {
+            return Ok(None);
+        }
+        self.resume_read(p, &[Paused::BossHeld, Paused::Budget], by)
+            .await
+            .map(Some)
+    }
+
+    async fn resume_read(
+        &self,
+        mut p: Plan,
+        why: &[Paused],
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
         let Some(was) = p.paused.filter(|w| why.contains(w)) else {
             return match p.paused {
                 Some(other) => Err(DeskError::Conflict(format!(

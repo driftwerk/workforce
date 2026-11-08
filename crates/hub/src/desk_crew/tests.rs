@@ -2964,6 +2964,7 @@ async fn a_held_bosss_sessions_questions_go_straight_to_the_person() {
             on_exceed: OnExceed::Pause,
             from: now - chrono::Duration::hours(1),
             to: now + chrono::Duration::hours(10),
+            shared: false,
         };
         d.agent_stand("desk", "Desk", vec![over], false);
         let s = new_session(&d, dir.path(), "acme-web").await;

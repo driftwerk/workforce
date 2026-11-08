@@ -792,7 +792,7 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
         d.count_budgets_in(chrono_tz::UTC);
-        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         eventually("the plan tools", async || {
             overseer.tools.has("crew.plan").then_some(())
         })
@@ -826,6 +826,31 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             .filter(|n| n.id == format!("breaker:{subject}"))
             .collect();
         assert_eq!(needs.len(), 1, "one need");
+        // Nor does a hand-out of one of its tickets to a new session.
+        let waiting = d
+            .plan(id)
+            .await
+            .unwrap()
+            .tickets
+            .into_iter()
+            .find(|t| t.ticket.ticket.state == TicketState::Todo)
+            .unwrap();
+        let handout = Action::AssignTicket {
+            ticket: waiting.ticket.key.clone().unwrap(),
+            id: Some(waiting.ticket.ticket.id),
+            text: String::new(),
+            to: super::super::actions::Handout::NewSession {
+                folder: dir.path().to_string_lossy().into_owned(),
+                engine: Some(Engine::Claude),
+            },
+            planned: true,
+        };
+        let refused = crew
+            .perform(&handout, By::manager("desk", "Desk", "Start the next."))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("breaker"), "{refused}");
+        assert_eq!(started(&d).len(), 1);
         // The first session finishes its turn, freeing its slot: nothing
         // starts while the plan is held.
         let key = d.view(first).unwrap().name;
@@ -935,6 +960,7 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
             on_exceed: OnExceed::Pause,
             from: now - chrono::Duration::hours(1),
             to: now + chrono::Duration::hours(10),
+            shared: false,
         };
         d.agent_stand("desk", "Desk", vec![over], false);
         assert!(d.agent_held("desk").is_some());
