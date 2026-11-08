@@ -277,3 +277,137 @@ async fn a_handover_is_drafted_only_by_its_old_boss_and_only_the_persons_note_re
     })
     .await;
 }
+
+/// A boss's turn that spans a move: the move waits for it within a bound
+/// and is refused past it, and what the turn remembers after is still the
+/// scope it began in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_spans_a_move_keeps_its_scope_and_the_move_waits_for_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (desk_boss, l1) = agent(dir.path(), "desk", "ok").await;
+        let (sarah, l2) = agent(dir.path(), "sarah", "ok").await;
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| {
+            l.create("acme", "Acme", &[], None)?
+                .create("atlas", "Atlas", &[], None)
+        })
+        .await
+        .unwrap();
+        write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+        write_config(
+            &sarah,
+            &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        );
+        let all = [&desk_boss, &sarah];
+        let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("two bosses", async || (d.bosses().len() == 2).then_some(())).await;
+
+        // A turn of Sarah's begins as Acme's boss.
+        let began = crate::memory_fence::turn_fence(&sarah.agent_id, &sarah.workspace);
+        let now = chrono::Utc::now();
+        crew.running.lock().insert(
+            "turn-1".into(),
+            super::super::Running {
+                agent_id: "sarah".into(),
+                task: None,
+                detail: None,
+                since: now,
+                last_activity: now,
+            },
+        );
+        let refused = crew.move_boss_to("sarah", Some("atlas"), false).await;
+        assert!(refused.unwrap_err().contains("middle of a turn"));
+        assert_eq!(d.scope_of_boss("sarah"), Some(Scope::Group("acme".into())));
+        // It ends while the move waits: the move goes on.
+        let ending = {
+            let crew = Arc::clone(&crew);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                crew.running.lock().remove("turn-1");
+            })
+        };
+        crew.move_boss_to("sarah", Some("atlas"), false)
+            .await
+            .unwrap();
+        ending.await.unwrap();
+        eventually("Sarah oversees Atlas", async || {
+            (d.scope_of_boss("sarah") == Some(Scope::Group("atlas".into()))).then_some(())
+        })
+        .await;
+        // Its passive extraction, run after the move, is still Acme's.
+        let store = sarah.memory_store.clone().unwrap();
+        let mut m = Memory::new(
+            "acmecanary from the turn",
+            MemoryLayer::Episodic,
+            sarah.agent_id.clone(),
+        );
+        m.identity_id = Some(PERSON.into());
+        let id = workforce_agent::runner::CURRENT_MEMORY_FENCE
+            .scope(began, store.remember(m))
+            .await
+            .unwrap();
+        let listed = store.list(filter()).await.unwrap();
+        assert!(
+            listed.iter().all(|m| m.id != id),
+            "an Acme memory never reaches her in Atlas"
+        );
+        drop((l1, l2));
+    })
+    .await;
+}
+
+/// An agent made a boss keeps what it learned outside the group out of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_made_a_groups_boss_brings_nothing_it_learned_outside_the_group() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (desk_boss, l1) = agent(dir.path(), "desk", "ok").await;
+        let (sarah, l2) = agent(dir.path(), "sarah", "ok").await;
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| l.create("acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+        write_config(&sarah, "");
+        let all = [&desk_boss, &sarah];
+        let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the main boss", async || {
+            (!d.bosses().is_empty()).then_some(())
+        })
+        .await;
+        let store = sarah.memory_store.clone().unwrap();
+        let mut m = Memory::new(
+            "globexcanary learned ungrouped",
+            MemoryLayer::Semantic,
+            sarah.agent_id.clone(),
+        );
+        m.identity_id = Some(PERSON.into());
+        store.remember(m).await.unwrap();
+        assert_eq!(recalled(&sarah, "globexcanary").await.len(), 1);
+        let current = std::fs::read_to_string(
+            sarah
+                .workspace
+                .join(workforce_common::config_files::WORKSPACE_CONFIG),
+        )
+        .unwrap();
+        crate::agent_config_write::save(
+            &sarah,
+            "sarah",
+            None,
+            &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+            workforce_orchestrator::workflow_store::EditContext::new("oversight", None),
+            |now| now == Some(current.as_str()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            recalled(&sarah, "globexcanary").await.is_empty(),
+            "kept with everything ungrouped, out of Acme"
+        );
+        drop((l1, l2));
+    })
+    .await;
+}

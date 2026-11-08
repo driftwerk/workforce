@@ -202,62 +202,89 @@ pub(crate) fn oversight_of_group(body: &str, group: Option<&str>) -> Option<Stri
     Some(doc.to_string())
 }
 
-/// Before `service`'s config goes from `before` to `body`: when it stops
-/// being the boss of a scope (moved to another, or switched off), what it
-/// remembered with no scope's tag is tagged with the scope it leaves, so
-/// nothing it learned there goes along (boss-gaps W8). A store that can't
-/// refuses the change.
+/// The memory fence `body` gives its agent (no file: none).
+fn fence_in(body: Option<&str>) -> workforce_memory::group_tagged::Fence {
+    use workforce_memory::group_tagged::Fence;
+    body.and_then(|b| workforce_common::settings::AgentWorkspaceConfig::parse(b).ok())
+        .and_then(|c| c.oversight().ok())
+        .map_or(Fence::Open, |o| crate::memory_fence::fence_of(&o))
+}
+
+/// The tag of the scope the agent `service`, not a boss, sits in now: its
+/// sidebar group's when that group is a boundary, else everything
+/// ungrouped's.
+fn prior_scope_tag(service: &AgentService) -> String {
+    #[cfg(feature = "postgres")]
+    if let Some(crew) = crate::desk_crew::for_service(service) {
+        let group = crew.desk().group_of_agent(service.agent_id.as_str());
+        let scope = crew.desk().scope_of_group(group.as_deref());
+        return workforce_memory::group_tagged::group_tag(scope.group());
+    }
+    let _ = service;
+    workforce_memory::group_tagged::group_tag(None)
+}
+
+/// Before `service`'s config goes from `before` to `body`, what it
+/// remembered with no scope's tag is tagged with the scope it was learned
+/// in (boss-gaps W8), so nothing goes along into the next one:
+/// - a boss that stops overseeing its scope (moved, switched off,
+///   replaced): with that scope;
+/// - an agent that becomes a boss: with the scope it sat in until now, its
+///   sidebar group's (or everything ungrouped's), so what it learned there
+///   reaches a new group's boss only when that is the group it sat in.
+///
+/// A store that can't refuses the change. The scope it leaves, when it
+/// leaves one: its conversations are left there once the file is written.
 async fn keep_memory_to_scope(
     service: &AgentService,
     before: Option<&str>,
     body: &str,
-) -> Result<(), Refused> {
+) -> Result<Option<String>, Refused> {
     use workforce_memory::group_tagged::{Fence, GROUP_TAG_PREFIX};
-    let fence = |b: Option<&str>| {
-        b.and_then(|b| workforce_common::settings::AgentWorkspaceConfig::parse(b).ok())
-            .and_then(|c| c.oversight().ok())
-            .map_or(Fence::Open, |o| crate::memory_fence::fence_of(&o))
-    };
-    let Fence::Boss(left) = fence(before) else {
-        return Ok(());
-    };
-    if fence(Some(body)) == Fence::Boss(left.clone()) {
-        return Ok(());
+    let (was, now) = (fence_in(before), fence_in(Some(body)));
+    if was == now {
+        return Ok(None);
     }
-    let Some(store) = service.memory_store.as_ref() else {
-        return crate::memory_fence::leave_sessions(
+    let (tag, left) = match &was {
+        Fence::Boss(left) => (left.clone(), Some(left.clone())),
+        Fence::Open | Fence::Unknown => (prior_scope_tag(service), None),
+    };
+    if was != Fence::Open || matches!(now, Fence::Boss(_)) {
+        if let Some(store) = service.memory_store.as_ref() {
+            let tagged = store
+                .add_tag(&service.agent_id, &tag, GROUP_TAG_PREFIX)
+                .await
+                .map_err(|e| {
+                    Refused::Io(format!(
+                        "what {} remembered couldn't be kept to the group it was learned in, so its settings weren't changed: {e:#}",
+                        service.agent_id
+                    ))
+                })?;
+            tracing::info!(agent_id = %service.agent_id, scope = %tag, tagged = tagged.len(), "An agent's memory is kept to the scope it was learned in");
+        }
+    }
+    Ok(left)
+}
+
+/// After the write that took `service` off the scope `left`: its
+/// conversations there are left there ([`crate::memory_fence::leave_sessions`]).
+/// Once written, a failure can't undo the write: it is tried once more and
+/// then logged loudly.
+fn leave_conversations(service: &AgentService, left: &str) {
+    for attempt in 0..2 {
+        match crate::memory_fence::leave_sessions(
             service.sessions.as_ref(),
             service.agent_id.as_str(),
-            &left,
-        )
-        .map(drop)
-        .map_err(|e| Refused::Io(format!("{e:#}")));
-    };
-    match store
-        .add_tag(&service.agent_id, &left, GROUP_TAG_PREFIX)
-        .await
-    {
-        Ok(tagged) => {
-            tracing::info!(agent_id = %service.agent_id, scope = %left, tagged = tagged.len(), "A boss's memory is kept to the scope it leaves");
-            // Its conversations too: none is carried on, digested or
-            // searched in the next scope.
-            crate::memory_fence::leave_sessions(
-                service.sessions.as_ref(),
-                service.agent_id.as_str(),
-                &left,
-            )
-            .map(drop)
-            .map_err(|e| {
-                Refused::Io(format!(
-                    "{}'s conversations couldn't be left with the group it leaves, so its settings weren't changed: {e:#}",
-                    service.agent_id
-                ))
-            })
+            left,
+        ) {
+            Ok(_) => return,
+            Err(e) if attempt == 0 => {
+                tracing::warn!(agent_id = %service.agent_id, error = %format!("{e:#}"), "a boss's conversations weren't left with its old group; trying again");
+            }
+            Err(e) => {
+                tracing::error!(agent_id = %service.agent_id, scope = %left, error = %format!("{e:#}"), "a boss's conversations couldn't be left with the group it left");
+            }
         }
-        Err(e) => Err(Refused::Io(format!(
-            "what {} remembered couldn't be kept to the group it leaves, so its settings weren't changed: {e:#}",
-            service.agent_id
-        ))),
     }
 }
 
@@ -331,7 +358,7 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
     // group, would keep it closed to everyone: its name goes too.
     if let workforce_common::oversight::Scope::Group(g) = &mine {
         for u in unserved_beside(&registry.all_services()) {
-            if let Err(e) = unname_unserved(&u, store, g).await {
+            if let Err(e) = unname_unserved(&u, store, keep.memory_store.as_deref(), g).await {
                 tracing::warn!(workspace = %u.workspace.display(), error = %e, "Could not take a group off an agent's config");
             }
         }
@@ -472,6 +499,7 @@ fn unchanged_since(path: &Path, seen: &str) -> Result<(), String> {
 pub(crate) async fn unname_unserved(
     u: &Unserved,
     store: Option<&WorkflowStore>,
+    memory: Option<&dyn workforce_memory::store::MemoryStore>,
     group: &str,
 ) -> Result<bool, String> {
     use workforce_common::settings::AgentWorkspaceConfig;
@@ -490,6 +518,31 @@ pub(crate) async fn unname_unserved(
         )
     })?;
     AgentWorkspaceConfig::locked(&u.workspace, || unchanged_since(&path, &current))?;
+    // What it remembered as that group's boss stays the group's.
+    if let (workforce_memory::group_tagged::Fence::Boss(tag), Some(memory)) =
+        (fence_in(Some(&current)), memory)
+    {
+        match &u.id {
+            Some(id) => {
+                memory
+                    .add_tag(
+                        &workforce_core::types::AgentId::new(id.as_str()),
+                        &tag,
+                        workforce_memory::group_tagged::GROUP_TAG_PREFIX,
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "{}'s memory couldn't be kept to the group, so its settings weren't changed: {e:#}",
+                            u.who()
+                        )
+                    })?;
+            }
+            None => {
+                tracing::warn!(workspace = %u.workspace.display(), "No agent id for this workspace: its memory can't be tagged with the group it leaves")
+            }
+        }
+    }
     match &u.id {
         Some(id) => {
             record_revision(
@@ -542,7 +595,7 @@ async fn save_one(
     };
     let current = read(&path)?;
     admit(current.as_deref())?;
-    keep_memory_to_scope(service, current.as_deref(), body).await?;
+    let left = keep_memory_to_scope(service, current.as_deref(), body).await?;
 
     tokio::fs::create_dir_all(&service.workspace)
         .await
@@ -566,6 +619,10 @@ async fn save_one(
         Ok(findings)
     })?;
     tracing::info!(agent_id = %service.agent_id, via = edit.edited_via, "Agent config.toml saved");
+    // Only now it is written: a refused write leaves them as they were.
+    if let Some(left) = &left {
+        leave_conversations(service, left);
+    }
 
     let restart_required = service.reload_config().await.unwrap_or_else(|e| {
         tracing::warn!(agent_id = %service.agent_id, error = %e, "Config hot-reload failed after save");
@@ -970,16 +1027,48 @@ mod tests {
 
     const NAMES_ACME: &str = "[oversight]\nenabled = false\ngroup = \"g-acme\"\nlevel = \"act\"\n";
 
+    /// A boss the hub doesn't serve, taken off its group, keeps what it
+    /// remembered there to the group.
+    #[tokio::test]
+    async fn an_unserved_boss_taken_off_its_group_keeps_its_memory_to_it() {
+        use workforce_memory::store::MemoryStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let u = unserved(
+            dir.path(),
+            Some("ghost"),
+            "[oversight]\nenabled = true\ngroup = \"g-acme\"\n",
+        );
+        let memory = workforce_memory::in_memory::InMemoryStore::new();
+        let mut m = workforce_memory::types::Memory::new(
+            "acmecanary",
+            workforce_memory::types::MemoryLayer::Episodic,
+            workforce_core::types::AgentId::new("ghost"),
+        );
+        m.identity_id = Some("u".into());
+        let id = memory.remember(m).await.unwrap();
+        assert_eq!(
+            unname_unserved(&u, None, Some(&memory), "g-acme").await,
+            Ok(true)
+        );
+        assert_eq!(
+            memory.get(&id).await.unwrap().unwrap().tags,
+            ["desk-group:g-acme"]
+        );
+    }
+
     #[tokio::test]
     async fn an_unserved_agents_group_is_taken_off_as_a_revision_under_its_id() {
         with_store(|store| async move {
             let dir = tempfile::tempdir().unwrap();
             let u = unserved(dir.path(), Some("ghost"), NAMES_ACME);
             assert_eq!(
-                unname_unserved(&u, Some(&store), "g-other").await,
+                unname_unserved(&u, Some(&store), None, "g-other").await,
                 Ok(false)
             );
-            assert_eq!(unname_unserved(&u, Some(&store), "g-acme").await, Ok(true));
+            assert_eq!(
+                unname_unserved(&u, Some(&store), None, "g-acme").await,
+                Ok(true)
+            );
             let now =
                 std::fs::read_to_string(u.workspace.join(config_files::WORKSPACE_CONFIG)).unwrap();
             assert_eq!(named_in(&now), None);
@@ -1003,7 +1092,7 @@ mod tests {
             // it waits on the person.
             config_files::guard(&path).unwrap();
             std::fs::write(&path, format!("{NAMES_ACME}# edited by hand\n")).unwrap();
-            let refused = unname_unserved(&u, Some(&store), "g-acme")
+            let refused = unname_unserved(&u, Some(&store), None, "g-acme")
                 .await
                 .unwrap_err();
             assert!(refused.contains("changed outside the hub"), "{refused}");
@@ -1025,7 +1114,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let u = unserved(dir.path(), None, NAMES_ACME);
             assert_eq!(u.who(), "ghost");
-            assert_eq!(unname_unserved(&u, Some(&store), "g-acme").await, Ok(true));
+            assert_eq!(
+                unname_unserved(&u, Some(&store), None, "g-acme").await,
+                Ok(true)
+            );
             assert!(store
                 .list_revisions(KIND_AGENT_CONFIG, "ghost", None)
                 .await

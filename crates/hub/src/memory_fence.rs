@@ -130,12 +130,12 @@ impl FenceSource for ConfigFence {
 
 /// The session metadata key a boss's conversations carry once it left the
 /// scope they were had in: the scope's tag.
-pub(crate) const LEFT_SCOPE: &str = "desk_scope_left";
+pub(crate) const LEFT_SCOPE: &str = workforce_common::session::LEFT_SCOPE_KEY;
 
 /// Whether `s` was had while its agent was the boss of a scope it has left
 /// since: never read again, nor recalled in a digest.
 pub(crate) fn left_behind(s: &workforce_common::session::Session) -> bool {
-    s.metadata.get(LEFT_SCOPE).is_some()
+    s.left_behind()
 }
 
 /// Every conversation of `sessions`' agent is left with the scope `tag` it
@@ -152,18 +152,13 @@ pub(crate) fn leave_sessions(
         if shell.agent_id != agent_id || left_behind(&shell) {
             continue;
         }
-        let Some(mut s) = sessions.get(&shell.id)? else {
-            continue;
-        };
-        if let Some(meta) = s.metadata.as_object_mut() {
-            meta.insert(LEFT_SCOPE.into(), serde_json::json!(tag));
-        } else {
-            s.metadata = serde_json::json!({ LEFT_SCOPE: tag });
-        }
-        let open = !s.is_sealed();
-        sessions.save(&s)?;
-        if open {
-            sessions.start_fresh(&s.channel, &s.owner, agent_id)?;
+        // Only the mark is written: a turn's own save of the session never
+        // races a whole-session save of ours.
+        let mut mark = serde_json::Map::new();
+        mark.insert(LEFT_SCOPE.into(), serde_json::json!(tag));
+        sessions.merge_metadata(&shell.id, mark, &[])?;
+        if !shell.is_sealed() {
+            sessions.start_fresh(&shell.channel, &shell.owner, agent_id)?;
         }
         marked += 1;
     }

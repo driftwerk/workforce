@@ -169,6 +169,30 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
         .find(|c| Arc::ptr_eq(&c.state, state))
 }
 
+/// Why a Desk room turn for `service` mustn't run: the room is one whose
+/// group's boundary keeps it out now (a boss moved away from it, or an
+/// agent that left), whatever the Desk app sent. `None` off a room, or
+/// without a crew.
+pub(crate) async fn room_turn_refused(
+    service: &AgentService,
+    place: &workforce_common::channels::desk::DeskPlace,
+) -> Option<String> {
+    let workforce_common::channels::desk::DeskPlace::Room { room, .. } = place else {
+        return None;
+    };
+    let crew = for_service(service)?;
+    match crew
+        .desk
+        .agent_reaches_room(*room, service.agent_id.as_str())
+        .await
+    {
+        true => None,
+        false => {
+            Some("This agent isn't in that room's group now, so it can't answer there.".into())
+        }
+    }
+}
+
 /// Tells `service`'s crew a config was saved, so a new overseer gets its
 /// tools and summaries at once, and Desk knows its scope as it is now.
 pub(crate) fn config_saved(service: &AgentService) {
@@ -607,16 +631,24 @@ impl Crew for CrewHub {
     async fn release_group(&self, group: &str) -> Result<(), String> {
         // First agents the hub doesn't serve now whose config still names
         // it, so taking a served boss off below finds nothing else naming it.
+        // The hub's memory, through any agent's handle: tagging names its
+        // owner itself.
+        let memory = self.services().iter().find_map(|s| s.memory_store.clone());
         for u in crate::agent_config_write::unserved_beside(&self.services()) {
-            crate::agent_config_write::unname_unserved(&u, self.state.def_store.as_deref(), group)
-                .await
-                .map_err(|e| {
-                    if e.starts_with(&format!("{}'s", u.who())) {
-                        e
-                    } else {
-                        format!("{} still names this group for its boss: {e}", u.who())
-                    }
-                })?;
+            crate::agent_config_write::unname_unserved(
+                &u,
+                self.state.def_store.as_deref(),
+                memory.as_deref(),
+                group,
+            )
+            .await
+            .map_err(|e| {
+                if e.starts_with(&format!("{}'s", u.who())) {
+                    e
+                } else {
+                    format!("{} still names this group for its boss: {e}", u.who())
+                }
+            })?;
         }
         for s in self.services() {
             if named_group(&s.workspace).as_deref() != Some(group) {

@@ -1006,6 +1006,10 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
             "{:?}",
             r.members
         );
+        // Nor is she let into it whatever a Desk app sends; a room this
+        // desk doesn't keep is another's to bound.
+        assert!(!d.agent_reaches_room(room.id, "sarah").await);
+        assert!(d.agent_reaches_room(Uuid::new_v4(), "sarah").await);
     })
     .await;
 }

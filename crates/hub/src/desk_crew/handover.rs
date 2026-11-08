@@ -156,6 +156,12 @@ impl CrewHub {
         if o.level == Level::Watch {
             return;
         }
+        // Drafting is paced as a boss's work turns are: a flood of previews
+        // never runs it more than its hour allows; Desk's note stands.
+        if !self.spend_boss_turn(&service, &o) {
+            tracing::info!(handover = %h.id, "the boss is out of work turns this hour; Desk's note stands");
+            return;
+        }
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
@@ -241,6 +247,18 @@ impl CrewHub {
                     name_of(&there)
                 ));
             }
+        }
+        // Its turns end first, within a bound: what a turn does as the boss
+        // of the scope it leaves is done before it is another's boss.
+        let deadline = std::time::Instant::now() + self.timing.minute / 2;
+        while self.running.lock().values().any(|r| r.agent_id == agent) {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} is in the middle of a turn; move them once it's done.",
+                    name_of(&service)
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let path = service
             .workspace
