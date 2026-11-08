@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::{session_item, Desk, DeskError, UNGROUPED};
@@ -14,7 +16,9 @@ use crate::engine::Engine;
 use crate::ledger_store::Cursor;
 use crate::memory::record::Harvested;
 use crate::memory::{harvestable, Skip, Subject, Switches};
-use crate::memory_store::{KeptExchange, MemoryCounts, MemoryHit, MemoryQuery};
+use crate::memory_store::{
+    group_key, GroupTotals, KeptExchange, MemoryCounts, MemoryHit, MemoryQuery, PAUSED,
+};
 use crate::model::SessionRecord;
 
 /// How often conversations past their keeping are swept.
@@ -78,6 +82,97 @@ pub struct SessionMemory {
     /// Its decisions, facts and to-dos still held, and whether Desk is
     /// noting them.
     pub notes: super::memory_derive::Notes,
+    /// The session's own Remember switch; off once Desk no longer has it.
+    pub memory_on: bool,
+    /// Its engine keeps no record Desk can read: it remembers only what
+    /// it's for.
+    pub no_record: bool,
+    /// When Desk last kept something it said.
+    pub last_read: Option<DateTime<Utc>>,
+}
+
+/// A group's memory switches (`memory.group.<id>`), as the person set them
+/// or as they stand unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemory {
+    /// Its sessions' conversations are remembered.
+    pub harvest: bool,
+    /// Desk's model may read them to note decisions, facts and to-dos.
+    pub derive: bool,
+    /// Desk asks before handing its work to another engine.
+    pub handoff_ask: bool,
+    /// The person decided whether Desk's model may read them (asked once).
+    pub derive_decided: bool,
+}
+
+impl GroupMemory {
+    /// As `value` (the stored setting, snake_case) says, else the defaults:
+    /// remembered, not read by the model until the person lets it, asked
+    /// before a handoff.
+    fn of(value: Option<&Value>) -> Self {
+        let flag = |k: &str| value.and_then(|v| v.get(k)).and_then(Value::as_bool);
+        Self {
+            harvest: flag("harvest").unwrap_or(true),
+            derive: flag("derive").unwrap_or(false),
+            handoff_ask: flag("handoff_ask").unwrap_or(true),
+            derive_decided: flag("derive").is_some(),
+        }
+    }
+}
+
+/// The person's change to a group's switches: what it names changes.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupMemoryChange {
+    pub harvest: Option<bool>,
+    pub derive: Option<bool>,
+    pub handoff_ask: Option<bool>,
+}
+
+/// The person's change to memory's own switches.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemorySettingsChange {
+    pub paused: Option<bool>,
+}
+
+/// What the install's `[desk.memory]` sets, for Settings → Memory to show.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryLimits {
+    pub enabled: bool,
+    pub derive: bool,
+    pub backfill_days: u32,
+    pub retain_days: u32,
+    pub max_disk_mb: u64,
+    pub index_per_minute: u32,
+    pub derive_calls_per_day: u32,
+    /// Calls made today to note decisions.
+    pub derive_calls_today: i64,
+}
+
+/// One group's memory, for Settings → Memory and the group's menu.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemoryView {
+    pub id: String,
+    /// As the sidebar calls it.
+    pub name: String,
+    #[serde(flatten)]
+    pub switches: GroupMemory,
+}
+
+/// The person's memory settings, the install's limits, and what is kept.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySettings {
+    pub paused: bool,
+    /// Every group Desk has, with its switches.
+    pub groups: Vec<GroupMemoryView>,
+    pub limits: MemoryLimits,
+    /// What is kept, by group (`group` none: ungrouped sessions').
+    pub totals: Vec<GroupTotals>,
 }
 
 /// What the panel says of a session past its cap.
@@ -349,6 +444,9 @@ impl Desk {
                 counts,
                 remembering: false,
                 why: Some(crate::memory::CLEARED.into()),
+                memory_on: false,
+                no_record: false,
+                last_read: self.0.store.memory_last_kept(id).await?,
             });
         };
         let (exchanges, counts) = self.0.store.session_memory(id, LIST_MAX).await?;
@@ -375,7 +473,99 @@ impl Desk {
             counts,
             remembering: why.is_none(),
             why,
+            memory_on: self.0.store.session_memory_on(id).await?.unwrap_or(true),
+            no_record: !matches!(r.engine, Engine::Claude | Engine::Codex),
+            last_read: self.0.store.memory_last_kept(id).await?,
         })
+    }
+
+    /// Turns session `id`'s own Remember switch on or off. Off, nothing it
+    /// says meanwhile is ever kept; what it remembered already stays until
+    /// it is forgotten.
+    pub async fn set_session_memory(&self, id: Uuid, on: bool) -> Result<(), DeskError> {
+        if !self.0.store.set_session_memory(id, on).await? {
+            return Err(DeskError::NotFound);
+        }
+        self.derive_poke();
+        Ok(())
+    }
+
+    /// The person's memory settings, the install's limits, and what is
+    /// kept.
+    pub async fn memory_settings(&self) -> Result<MemorySettings, DeskError> {
+        let set = self.0.store.memory_settings().await?;
+        let mut groups: Vec<GroupMemoryView> = self
+            .group_names()
+            .into_iter()
+            .map(|(id, name)| GroupMemoryView {
+                switches: GroupMemory::of(set.get(&group_key(&id))),
+                id,
+                name,
+            })
+            .collect();
+        groups.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        let m = &self.0.opts.memory;
+        Ok(MemorySettings {
+            paused: set.get(PAUSED).and_then(Value::as_bool).unwrap_or(false),
+            groups,
+            limits: MemoryLimits {
+                enabled: m.enabled,
+                derive: m.derive,
+                backfill_days: m.backfill_days,
+                retain_days: m.retain_days,
+                max_disk_mb: m.max_disk_mb,
+                index_per_minute: m.index_per_minute,
+                derive_calls_per_day: m.derive_calls_per_day,
+                derive_calls_today: self.0.store.derive_calls(self.derive_day()).await?,
+            },
+            totals: self.0.store.memory_totals().await?,
+        })
+    }
+
+    /// The person pauses or resumes remembering for every session. Paused,
+    /// nothing said meanwhile is ever kept.
+    pub async fn change_memory_settings(
+        &self,
+        change: &MemorySettingsChange,
+    ) -> Result<MemorySettings, DeskError> {
+        if let Some(paused) = change.paused {
+            self.0
+                .store
+                .put_setting(PAUSED, &serde_json::json!(paused))
+                .await?;
+            self.derive_poke();
+        }
+        self.memory_settings().await
+    }
+
+    /// The person changes group `id`'s memory switches: what the change
+    /// names, the rest kept.
+    pub async fn change_group_memory(
+        &self,
+        id: &str,
+        change: &GroupMemoryChange,
+    ) -> Result<GroupMemory, DeskError> {
+        if self.group_name(id).is_none() {
+            return Err(DeskError::NotFound);
+        }
+        let key = group_key(id);
+        let mut value = match self.0.store.setting(&key).await? {
+            Some(Value::Object(o)) => o,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in [
+            ("harvest", change.harvest),
+            ("derive", change.derive),
+            ("handoff_ask", change.handoff_ask),
+        ] {
+            if let Some(v) = v {
+                value.insert(k.into(), Value::Bool(v));
+            }
+        }
+        let value = Value::Object(value);
+        self.0.store.put_setting(&key, &value).await?;
+        self.derive_poke();
+        Ok(GroupMemory::of(Some(&value)))
     }
 
     /// Forgets what Desk remembers of session `id`, whether or not Desk

@@ -647,6 +647,25 @@ impl DeskStore {
             .collect()
     }
 
+    /// `session`'s notes another replaced, latest replaced first: at most
+    /// `limit`.
+    pub async fn replaced_items(&self, session: Uuid, limit: i64) -> Result<Vec<ItemRow>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {ITEM_COLUMNS} FROM memory_items i \
+                     WHERE i.session = $1 AND i.superseded_by IS NOT NULL \
+                     ORDER BY i.valid_to DESC, i.id LIMIT $2"
+                ),
+                &[&session, &limit],
+            )
+            .await?
+            .iter()
+            .map(item_of)
+            .collect()
+    }
+
     /// The note `id`.
     pub async fn memory_item(&self, id: Uuid) -> Result<Option<ItemRow>> {
         let client = self.pool().get().await?;

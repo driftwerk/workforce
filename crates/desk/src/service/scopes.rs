@@ -344,6 +344,17 @@ impl Desk {
         self.0.scopes.lock().groups.get(id).cloned()
     }
 
+    /// Every sidebar group's id and name.
+    pub fn group_names(&self) -> Vec<(String, String)> {
+        self.0
+            .scopes
+            .lock()
+            .groups
+            .iter()
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect()
+    }
+
     /// Stamps `e` with the group it is about now: its subject's, or with
     /// none its actor's. A ticket's event carries its board's group already.
     pub(super) fn stamp(&self, e: &mut Event) {

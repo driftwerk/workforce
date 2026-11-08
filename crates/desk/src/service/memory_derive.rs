@@ -104,6 +104,34 @@ impl From<&ItemRow> for NoteView {
     }
 }
 
+/// A note another replaced, as the person reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacedView {
+    pub id: Uuid,
+    pub kind: ItemKind,
+    pub text: String,
+    /// When it was replaced.
+    pub replaced_at: DateTime<Utc>,
+}
+
+/// The most replaced notes a session's panel lists.
+const REPLACED_MAX: i64 = 20;
+
+/// What the panel acts on of why Desk isn't noting, from what it says.
+fn reason_of(why: &str) -> Option<&'static str> {
+    [
+        (DERIVE_OFF, "desk_off"),
+        (NO_DERIVER, "no_model"),
+        (DERIVE_MEMORY_OFF, "memory_off"),
+        (DERIVE_GROUP_OFF, "group_off"),
+        (DERIVE_PAUSED, "day_cap"),
+        (DERIVE_FAILED, "failing"),
+    ]
+    .into_iter()
+    .find_map(|(said, reason)| (said == why).then_some(reason))
+}
+
 /// How many of each a session holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +153,13 @@ pub struct Notes {
     pub noting: Noting,
     /// Why it isn't, or what else to know, in plain words.
     pub why: Option<String>,
+    /// The same, for the panel to act on: `desk_off`, `no_model`,
+    /// `memory_off`, `group_off` (the group's settings may let it),
+    /// `day_cap` or `failing`.
+    pub reason: Option<&'static str>,
+    /// Notes another replaced lately, latest first: what they said, and
+    /// when.
+    pub replaced: Vec<ReplacedView>,
     /// Exchanges not yet read for notes.
     pub unread: i64,
     /// Whose model writes the notes: the provider the floor's cheap model
@@ -182,7 +217,7 @@ impl Desk {
     }
 
     /// The day calls are counted on: today in the person's time.
-    fn derive_day(&self) -> NaiveDate {
+    pub(super) fn derive_day(&self) -> NaiveDate {
         let now = Utc::now();
         match self.budget_tz() {
             Some(tz) => now.with_timezone(&tz).date_naive(),
@@ -507,6 +542,22 @@ impl Desk {
             counts: NoteCounts::default(),
             noting: Noting::On,
             why: None,
+            reason: None,
+            replaced: self
+                .0
+                .store
+                .replaced_items(id, REPLACED_MAX)
+                .await?
+                .iter()
+                .filter_map(|r| {
+                    Some(ReplacedView {
+                        id: r.id,
+                        kind: r.kind,
+                        text: r.text.clone(),
+                        replaced_at: r.valid_to?,
+                    })
+                })
+                .collect(),
             unread: queued.unread,
         };
         for r in &items {
@@ -529,6 +580,7 @@ impl Desk {
         };
         let (noting, why) = self.noting(id, group, queued.failed.is_some()).await?;
         notes.noting = noting;
+        notes.reason = why.and_then(reason_of);
         notes.why = why.map(str::to_string);
         Ok(notes)
     }

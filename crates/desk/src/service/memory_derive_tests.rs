@@ -913,3 +913,220 @@ async fn notes_reach_the_index_and_recall_ranked_above_exchanges_and_go_when_for
     })
     .await;
 }
+
+/// One request to `app`: its status and JSON body.
+async fn call(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        req = req.header("content-type", "application/json");
+    }
+    let res = app
+        .oneshot(
+            req.body(match body {
+                Some(b) => axum::body::Body::from(b.to_string()),
+                None => axum::body::Body::empty(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+#[tokio::test]
+async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let s = session(&store, "acme-web").await;
+        said(&store, s, "a-1", "Fix the cookie flag.", 10).await;
+        let deriver = Arc::new(FakeDeriver::answering(std::iter::empty::<String>()));
+        let (d, cancel) = start(&pool, dir.path(), &deriver, |o| o.memory.retain_days = 90).await;
+        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let denied = crate::api::sessions_router(d.clone(), crate::testing::deny_all());
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/api/desk/groups",
+            Some(json!({"id": "g-acme", "name": "Acme"})),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Its own switch.
+        let memory = d.session_memory(s).await.unwrap();
+        assert!(memory.memory_on);
+        assert!(!memory.no_record);
+        assert!(memory.last_read.is_some(), "it kept what was said");
+        let uri = format!("/api/desk/sessions/{s}/memory");
+        assert_eq!(
+            call(denied.clone(), "PATCH", &uri, Some(json!({"on": false})))
+                .await
+                .0,
+            401
+        );
+        assert_eq!(
+            call(app.clone(), "PATCH", &uri, Some(json!({"on": false})))
+                .await
+                .0,
+            204
+        );
+        let memory = d.session_memory(s).await.unwrap();
+        assert!(!memory.memory_on);
+        assert_eq!(memory.notes.reason, Some("memory_off"));
+        assert_eq!(
+            call(
+                app.clone(),
+                "PATCH",
+                &format!("/api/desk/sessions/{}/memory", Uuid::new_v4()),
+                Some(json!({"on": true}))
+            )
+            .await
+            .0,
+            404
+        );
+
+        // The pause, the limits and what is kept.
+        assert_eq!(
+            call(denied.clone(), "GET", "/api/desk/memory/settings", None)
+                .await
+                .0,
+            401
+        );
+        let (status, body) = call(app.clone(), "GET", "/api/desk/memory/settings", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["paused"], false);
+        assert_eq!(body["limits"]["retainDays"], 90);
+        assert_eq!(body["limits"]["deriveCallsPerDay"], 200);
+        assert_eq!(body["totals"][0]["exchanges"], 1);
+        assert_eq!(
+            body["groups"],
+            json!([{"id": "g-acme", "name": "Acme", "harvest": true, "derive": false,
+                    "handoffAsk": true, "deriveDecided": false}])
+        );
+        let (status, body) = call(
+            app.clone(),
+            "PATCH",
+            "/api/desk/memory/settings",
+            Some(json!({"paused": true})),
+        )
+        .await;
+        assert_eq!((status, &body["paused"]), (200, &json!(true)));
+        assert_eq!(store.setting(PAUSED).await.unwrap(), Some(json!(true)));
+        assert_eq!(
+            call(
+                app.clone(),
+                "PATCH",
+                "/api/desk/memory/settings",
+                Some(json!({"pasued": true}))
+            )
+            .await
+            .0,
+            400
+        );
+
+        // A group's: what the change names, the rest kept.
+        let (status, body) = call(
+            app.clone(),
+            "PATCH",
+            "/api/desk/memory/groups/g-acme",
+            Some(json!({"derive": true})),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            (&body["derive"], &body["deriveDecided"]),
+            (&json!(true), &json!(true))
+        );
+        call(
+            app.clone(),
+            "PATCH",
+            "/api/desk/memory/groups/g-acme",
+            Some(json!({"harvest": false, "handoffAsk": false})),
+        )
+        .await;
+        assert_eq!(
+            store.setting(&group_key("g-acme")).await.unwrap(),
+            Some(json!({"derive": true, "harvest": false, "handoff_ask": false}))
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "PATCH",
+                "/api/desk/memory/groups/g-globex",
+                Some(json!({"derive": true}))
+            )
+            .await
+            .0,
+            404
+        );
+        assert_eq!(
+            call(
+                denied,
+                "PATCH",
+                "/api/desk/memory/groups/g-acme",
+                Some(json!({"derive": false}))
+            )
+            .await
+            .0,
+            401
+        );
+        cancel.cancel();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_replaced_note_is_listed_with_when_and_why_noting_is_off_is_said_as_a_reason() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let s = session(&store, "acme-web").await;
+        said(&store, s, "a-1", "Fix the cookie flag.", 10).await;
+        let deriver = Arc::new(FakeDeriver::answering([json!({"add": [
+            {"kind": "fact", "text": "Sessions live in Redis.", "sources": ["x1"]},
+        ]})
+        .to_string()]));
+        let (d, cancel) = start(&pool, dir.path(), &deriver, |_| {}).await;
+        until(&d, "noted", async || derived_to(&store, s).await == 1).await;
+        let fact = d.session_memory(s).await.unwrap().notes.facts[0].id;
+        d.change_memory_item(
+            fact,
+            &ItemChange::Correct {
+                text: "Sessions live in Postgres.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let notes = d.session_memory(s).await.unwrap().notes;
+        assert_eq!(notes.facts[0].text, "Sessions live in Postgres.");
+        assert_eq!(notes.replaced.len(), 1);
+        assert_eq!(
+            (notes.replaced[0].id, notes.replaced[0].text.as_str()),
+            (fact, "Sessions live in Redis.")
+        );
+        assert_eq!(notes.reason, None);
+        cancel.cancel();
+
+        let (d, cancel) = start(&pool, dir.path(), &deriver, |o| o.memory.derive = false).await;
+        let notes = d.session_memory(s).await.unwrap().notes;
+        assert_eq!(
+            (notes.reason, notes.why.as_deref()),
+            (Some("desk_off"), Some(DERIVE_OFF))
+        );
+        cancel.cancel();
+    })
+    .await;
+}
