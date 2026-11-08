@@ -595,24 +595,16 @@ impl Crew for CrewHub {
     async fn release_group(&self, group: &str) -> Result<(), String> {
         // First agents the hub doesn't serve now whose config still names
         // it, so taking a served boss off below finds nothing else naming it.
-        let served: Vec<std::path::PathBuf> = self
-            .services()
-            .iter()
-            .map(|s| s.workspace.clone())
-            .collect();
-        for workspace in crate::agent_config_write::unserved_beside(&served) {
-            crate::agent_config_write::unname_unserved(
-                &workspace,
-                self.state.def_store.as_deref(),
-                group,
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "{} still names this group: {e}",
-                    workspace.file_name().unwrap_or_default().to_string_lossy()
-                )
-            })?;
+        for u in crate::agent_config_write::unserved_beside(&self.services()) {
+            crate::agent_config_write::unname_unserved(&u, self.state.def_store.as_deref(), group)
+                .await
+                .map_err(|e| {
+                    if e.starts_with(&format!("{}'s", u.who())) {
+                        e
+                    } else {
+                        format!("{} still names this group for its boss: {e}", u.who())
+                    }
+                })?;
         }
         for s in self.services() {
             if named_group(&s.workspace).as_deref() != Some(group) {
