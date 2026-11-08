@@ -28,7 +28,7 @@ deadpool-postgres = { workspace = true, optional = true }
 refinery = { workspace = true, optional = true }
 # TLS for `sslmode = "require"` (e.g. an RDS Proxy endpoint). Pure-Rust via
 # rustls + ring; only built with the `postgres` feature.
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 # tokio closes each pool's idle connections (`postgres`). The rest are
@@ -37,7 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # `[dev-dependencies] workforce-postgres = { features = ["test-support"] }`.
 tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
-postgresql_embedded = { version = "0.20", default-features = false, features = ["bundled", "tokio", "theseus", "rustls"], optional = true }
+postgresql_embedded = { version = "0.22", default-features = false, features = ["bundled", "tokio", "theseus", "rustls"], optional = true }
 chrono = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
 

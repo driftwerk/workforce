@@ -9,13 +9,13 @@ description = "AES-256-GCM sealing under an Argon2id master key that wraps per-e
 [dependencies]
 # `zeroize` on both so the expanded AES key schedule is wiped on drop, not
 # just the raw key bytes this crate holds itself.
-aes = { version = "0.8", features = ["zeroize"] }
+aes = { version = "0.9", features = ["zeroize"] }
 aes-gcm = { workspace = true, features = ["zeroize"] }
 argon2 = { workspace = true }
-hkdf = "0.12"
-hmac = "0.12"
+hkdf = "0.13"
+hmac = "0.13"
 rand = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zeroize = "1"
