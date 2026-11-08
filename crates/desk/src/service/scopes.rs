@@ -94,6 +94,9 @@ impl Scopes {
                 .strip_prefix("pool:group:")
                 .filter(|g| self.groups.contains_key(*g))
                 .map(str::to_string),
+            // The hub's own agents have no `hub/` in their ids: one that
+            // does is no agent of this hub, and is placed by Desk.
+            PartyKind::Agent | PartyKind::Manager if who.id.contains('/') => None,
             kind => self.group_by(kind, &who.id),
         }
     }
@@ -265,7 +268,7 @@ impl Desk {
             .into_iter()
             .map(|b| BossView {
                 state: floor::boss_state(view, &b.agent),
-                paused: self.agent_held(&b.agent),
+                paused: self.agent_held(&b.agent).filter(|why| !why.is_empty()),
                 spend: b.scope.group().and_then(|g| spend.get(g).cloned()),
                 scope: b.scope,
                 agent: b.agent,
@@ -338,6 +341,16 @@ impl Desk {
     /// it sits; another agent's sidebar group's.
     pub fn group_of_agent(&self, id: &str) -> Option<String> {
         self.0.scopes.lock().party_group(&Party::agent(id, id))
+    }
+
+    /// The group one of this hub's agents counts in, by the scope rule: a
+    /// boss's its scope's, wherever it sits; another's its sidebar group's.
+    /// None for an id with a `hub/` in it, which is no agent of this hub.
+    pub(crate) fn group_of_local_agent(&self, id: &str) -> Option<String> {
+        if id.contains('/') {
+            return None;
+        }
+        self.0.scopes.lock().group_by(PartyKind::Agent, id)
     }
 
     /// The boss of `scope`, when it has one.

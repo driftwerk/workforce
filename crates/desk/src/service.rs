@@ -830,6 +830,13 @@ struct Inner {
     /// Whose scope each row is: members' groups and the bosses there are.
     /// Nothing is held under it, so events are stamped wherever noted.
     scopes: Mutex<scopes::Scopes>,
+    /// The groups' budgets as last counted for the Floor, and when.
+    group_spend: Mutex<
+        Option<(
+            std::time::Instant,
+            HashMap<String, workforce_core::budget::Standing>,
+        )>,
+    >,
 }
 
 #[derive(Clone)]
@@ -1464,6 +1471,7 @@ impl Desk {
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
             scopes: Mutex::default(),
+            group_spend: Mutex::new(None),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;

@@ -723,6 +723,11 @@ async fn the_floor_shows_each_item_in_its_group_now_with_that_groups_own_boss() 
         );
         assert!(v.sealed.is_empty());
 
+        // An id with a hub in it is no agent of this hub's: Desk places it.
+        let mut v = floor_of(&[who(PartyKind::Agent, "acme-hub/zed")]);
+        d.stamp_floor(&mut v);
+        assert_eq!(placed(&v), [("acme-hub/zed".to_string(), None, None)]);
+
         // Moved to Atlas, the session shows in Atlas with Mia.
         d.change_layout(|l| l.put(&session_item(s.id), "atlas", None))
             .await
@@ -800,42 +805,147 @@ async fn a_sealed_groups_items_carry_their_group_and_no_boss_and_the_floor_says_
     .await;
 }
 
-#[tokio::test]
-async fn a_groups_boss_has_its_groups_budget_standing_on_the_floor() {
+/// What each local agent spent, as the hub's telemetry says it: after
+/// `wait`, or failing.
+struct Spent {
+    wait: Duration,
+    spent: Option<Vec<(&'static str, f64)>>,
+}
+
+impl AgentSpend for Spent {
+    fn spent(
+        &self,
+        _: chrono::DateTime<Utc>,
+        _: chrono::DateTime<Utc>,
+    ) -> eyre::Result<Vec<(String, crate::budget_store::Used)>> {
+        std::thread::sleep(self.wait);
+        let spent = self
+            .spent
+            .clone()
+            .ok_or_else(|| eyre::eyre!("telemetry is down"))?;
+        Ok(spent
+            .into_iter()
+            .map(|(a, usd)| (a.to_string(), crate::budget_store::Used { tokens: 0, usd }))
+            .collect())
+    }
+}
+
+/// A day budget of $40 for Acme, set by the person.
+async fn acme_budget(d: &Desk) {
     use workforce_core::budget::{BudgetScope, Period, Unit};
+    d.put_budget(
+        NewBudget {
+            scope: BudgetScope::Desk,
+            group: Some("acme".into()),
+            period: Period::Day,
+            unit: Unit::Usd,
+            amount: 40.0,
+            warn_at: None,
+            on_exceed: None,
+        },
+        crate::crew::By::you(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Each boss's spend standing on the Floor: what it used of what.
+async fn spends(d: &Desk) -> Vec<(String, Option<(f64, f64)>)> {
+    d.floor_bosses(&floor_of(&[]))
+        .await
+        .into_iter()
+        .map(|b| (b.agent, b.spend.map(|s| (s.used, s.of))))
+        .collect()
+}
+
+fn spend_of(all: &[(String, Option<(f64, f64)>)], agent: &str) -> Option<(f64, f64)> {
+    all.iter().find(|(a, _)| a == agent).unwrap().1
+}
+
+#[tokio::test]
+async fn a_groups_boss_has_its_groups_budget_standing_on_the_floor_its_own_spend_counted() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         groups(&d).await;
         d.count_budgets_in(chrono_tz::UTC);
-        d.put_budget(
-            NewBudget {
-                scope: BudgetScope::Desk,
-                group: Some("acme".into()),
-                period: Period::Day,
-                unit: Unit::Usd,
-                amount: 40.0,
-                warn_at: None,
-                on_exceed: None,
-            },
-            crate::crew::By::you(),
-        )
-        .await
-        .unwrap();
-        let v = floor_of(&[]);
-        let bosses = d.floor_bosses(&v).await;
-        let spend = |agent: &str| {
-            bosses
-                .iter()
-                .find(|b| b.agent == agent)
-                .unwrap()
-                .spend
-                .as_ref()
-                .map(|s| s.of)
-        };
-        assert_eq!(spend("sarah"), Some(40.0));
-        assert_eq!(spend("mia"), None, "Atlas has no budget of its own");
-        assert_eq!(spend("desk"), None, "the main boss's section has none");
+        // Sarah sits in no group, but her own turns are Acme's, as the Floor
+        // shows them; Scout is in Acme; Mia's are Atlas's.
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: Some(vec![("sarah", 3.0), ("scout", 2.0), ("mia", 7.0)]),
+        }));
+        acme_budget(&d).await;
+        let all = spends(&d).await;
+        assert_eq!(spend_of(&all, "sarah"), Some((5.0, 40.0)));
+        assert_eq!(
+            spend_of(&all, "mia"),
+            None,
+            "Atlas has no budget of its own"
+        );
+        assert_eq!(
+            spend_of(&all, "desk"),
+            None,
+            "the main boss's section has none"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_floor_has_no_spend_it_cant_count_and_waits_for_none() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let store_pool = pool.clone();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        acme_budget(&d).await;
+
+        // Desk doesn't know the timezone yet: no day to count.
+        *d.0.budget_tz.lock() = None;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+
+        // The telemetry fails: the sessions' ledger still counts.
+        d.count_budgets_in(chrono_tz::UTC);
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: None,
+        }));
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 40.0)));
+
+        // Counting is slow: the Floor doesn't wait for it, and says none.
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::from_secs(3),
+            spent: Some(vec![]),
+        }));
+        let begun = std::time::Instant::now();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+        assert!(
+            begun.elapsed() < super::breaker::SPEND_WAIT * 3,
+            "{:?}",
+            begun.elapsed()
+        );
+        // Kept a moment, so the next read doesn't start another count.
+        let begun = std::time::Instant::now();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+        assert!(begun.elapsed() < super::breaker::SPEND_WAIT);
+
+        // The ledger can't be read: none.
+        d.group_spend_changed();
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::ZERO,
+            spent: Some(vec![]),
+        }));
+        store_pool
+            .get()
+            .await
+            .unwrap()
+            .batch_execute("ALTER TABLE ledger RENAME TO ledger_gone")
+            .await
+            .unwrap();
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
     })
     .await;
 }

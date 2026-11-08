@@ -1713,7 +1713,12 @@ mod tests {
         session
             .waits
             .push(wait("a", "2026-10-29T08:02:00Z", None, decide()));
-        let turns = [scout, session];
+        let finished = ended(
+            turn(agent("scout", "dm"), Some("u1"), "2026-10-29T07:00:00Z"),
+            "2026-10-29T07:30:00Z",
+            Outcome::Finished,
+        );
+        let turns = [scout, session, finished];
         let now = at("2026-10-29T09:00:00Z");
         view(
             &turns,
@@ -1750,6 +1755,12 @@ mod tests {
         assert_eq!(
             (v.needs[0].group.as_deref(), v.needs[0].boss.as_deref()),
             (Some("infra"), None)
+        );
+        // What finished is stamped as what runs.
+        assert_eq!(v.done.len(), 1);
+        assert_eq!(
+            (v.done[0].group.as_deref(), v.done[0].boss.as_deref()),
+            (Some("acme"), Some("sarah"))
         );
 
         // Stamped again after a move, it says where each is now; ungrouped
