@@ -1781,6 +1781,8 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
 /// agents and Desk sessions log, and answering it in place.
 mod groups;
 
+mod plans;
+
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them
 /// go once that has lasted.
@@ -4395,7 +4397,7 @@ mod board {
                 let input = json!({"ticket": key, "state": state, "reason": "Back on."});
                 async move {
                     let mut a = Action::parse("crew.move_ticket", &input).unwrap();
-                    crew.resolve_ticket(&mut a, None).await.unwrap();
+                    crew.resolve_ticket(&mut a, None, None).await.unwrap();
                     a
                 }
             };

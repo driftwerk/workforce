@@ -160,6 +160,10 @@ pub enum DecideRef {
     /// (`session:<id>`, `agent:<id>`, `pool:desk`, `pool:group:<id>`):
     /// Allow is Continue, Deny is Keep paused. Only the person answers it.
     Breaker { subject: String },
+    /// A boss's plan, or a change to it, as of `revision`: Allow is
+    /// Approve and run, Deny keeps it as it is for the person to open.
+    /// Only the person answers it.
+    Plan { plan: Uuid, revision: i32 },
 }
 
 /// A stretch of a turn that waited on the person: one per ask.

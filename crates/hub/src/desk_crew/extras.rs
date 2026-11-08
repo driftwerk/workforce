@@ -69,7 +69,7 @@ impl CrewHub {
         Extras {
             approvals,
             suggestions,
-            questions: Vec::new(),
+            ..Default::default()
         }
     }
 

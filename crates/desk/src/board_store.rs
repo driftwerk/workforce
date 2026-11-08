@@ -310,6 +310,22 @@ impl DeskStore {
         self.tickets_where("board = $1", &[&board]).await
     }
 
+    /// Every ticket that is in a plan.
+    pub async fn planned_tickets(&self) -> Result<std::collections::HashSet<Uuid>> {
+        let client = self.pool().get().await?;
+        client
+            .query("SELECT id FROM tickets WHERE plan IS NOT NULL", &[])
+            .await?
+            .iter()
+            .map(|r| Ok(r.try_get(0)?))
+            .collect()
+    }
+
+    /// The tickets of the plan `id`.
+    pub async fn plan_tickets(&self, id: Uuid) -> Result<Vec<Ticket>> {
+        self.tickets_where("plan = $1", &[&id]).await
+    }
+
     /// The tickets assigned to the session `id`.
     pub async fn session_tickets(&self, id: Uuid) -> Result<Vec<Ticket>> {
         self.tickets_where(
@@ -523,7 +539,10 @@ impl DeskStore {
     }
 }
 
-async fn insert_ticket_in<C: tokio_postgres::GenericClient>(client: &C, t: &Ticket) -> Result<()> {
+pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
+    client: &C,
+    t: &Ticket,
+) -> Result<()> {
     client
         .execute(
             &format!(

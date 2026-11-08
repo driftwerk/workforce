@@ -46,6 +46,9 @@ pub mod memory_index_store;
 pub mod memory_store;
 pub mod model;
 pub mod overview;
+pub mod plan;
+mod plan_api;
+pub mod plan_store;
 mod procs;
 pub mod providers;
 mod pty;
@@ -87,6 +90,9 @@ pub use service::{
 pub use service::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
     TicketQuery, TicketView,
+};
+pub use service::{
+    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

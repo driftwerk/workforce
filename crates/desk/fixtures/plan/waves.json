@@ -1,0 +1,250 @@
+{
+  "about": "Shared with Desk's crew/plan.ts: waves(tickets) for each case.",
+  "cases": [
+    {
+      "name": "no tickets",
+      "tickets": [],
+      "waves": []
+    },
+    {
+      "name": "independent tickets are one wave, in rank order",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        }
+      ],
+      "waves": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          "00000000-0000-4000-8000-000000000002",
+          "00000000-0000-4000-8000-000000000003"
+        ]
+      ]
+    },
+    {
+      "name": "a chain is one wave per ticket",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [
+            "00000000-0000-4000-8000-000000000002"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        }
+      ],
+      "waves": [
+        [
+          "00000000-0000-4000-8000-000000000001"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000002"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000003"
+        ]
+      ]
+    },
+    {
+      "name": "a diamond: two in the middle, one last",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "done",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "doing",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "state": "todo",
+          "rank": 4096,
+          "needs": [
+            "00000000-0000-4000-8000-000000000002",
+            "00000000-0000-4000-8000-000000000003"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-4"
+        }
+      ],
+      "waves": [
+        [
+          "00000000-0000-4000-8000-000000000001"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000002",
+          "00000000-0000-4000-8000-000000000003"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000004"
+        ]
+      ]
+    },
+    {
+      "name": "a need outside the plan holds nothing back in the waves",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [
+            "00000000-0000-4000-8000-000000000099"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        }
+      ],
+      "waves": [
+        [
+          "00000000-0000-4000-8000-000000000001"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000002"
+        ]
+      ]
+    },
+    {
+      "name": "tickets that need each other in a loop come last, together",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [
+            "00000000-0000-4000-8000-000000000003"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "todo",
+          "rank": 3072,
+          "needs": [
+            "00000000-0000-4000-8000-000000000002"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "state": "todo",
+          "rank": 4096,
+          "needs": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-4"
+        }
+      ],
+      "waves": [
+        [
+          "00000000-0000-4000-8000-000000000001"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000004"
+        ],
+        [
+          "00000000-0000-4000-8000-000000000002",
+          "00000000-0000-4000-8000-000000000003"
+        ]
+      ]
+    }
+  ]
+}

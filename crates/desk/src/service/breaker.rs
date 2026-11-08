@@ -1058,6 +1058,20 @@ impl Desk {
 
     // ── Starts and prompts by others ────────────────────────────────────
 
+    /// What Desk's breaker asks while it holds new starts in `group`'s
+    /// pools (Desk's and the group's), when it does.
+    pub fn starts_held(&self, group: Option<&str>) -> Option<String> {
+        budget::pools_of(group).into_iter().find_map(|pool| {
+            let subject = pool_subject(&pool);
+            let state = self.held(&subject)?;
+            Some(
+                self.breaker_view(&subject, &state)
+                    .and_then(|v| v.ask)
+                    .unwrap_or_default(),
+            )
+        })
+    }
+
     /// Why a start by `by` is refused while a pool it counts toward holds
     /// new starts. The person's own starts are never refused.
     pub(super) fn breaker_refuses_start(&self, by: Option<&By>) -> Result<(), DeskError> {

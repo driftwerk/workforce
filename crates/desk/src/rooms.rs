@@ -511,6 +511,7 @@ fn delivered(kind: DeliveryKind) -> &'static str {
         DeliveryKind::Reminder => "sent a reminder",
         DeliveryKind::Approval => "asks you to approve",
         DeliveryKind::Question => "gave you a session's question",
+        DeliveryKind::Plan => "sent you a plan",
         DeliveryKind::Job => "sent a job's answer",
         DeliveryKind::Workflow => "sent a workflow's update",
         DeliveryKind::CheckIn => "checked in",

@@ -465,6 +465,21 @@ impl Desk {
         self.put_charge(c, Wheel::Boss).await.map(drop)
     }
 
+    /// Makes `id`, a session about to start, `boss`'s in `st`, under the
+    /// same lock its record goes in with: no one ever sees it there and
+    /// unrun, so a boss that takes on every session never takes this one
+    /// on as it starts. One that fails to start is forgotten with it.
+    pub(super) fn reserve_charge(
+        st: &mut super::State,
+        id: Uuid,
+        boss: &Party,
+        group: Option<&str>,
+    ) {
+        st.charges.names.insert(boss.id.clone(), boss.name.clone());
+        let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
+        st.charges.rows.insert(id, c);
+    }
+
     /// Forgets `id`'s charge: it never ran. Desk is told it is let go, as
     /// for any charge that ends, so none is left showing.
     pub(super) fn charge_forget(&self, id: Uuid) {

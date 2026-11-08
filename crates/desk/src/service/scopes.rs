@@ -425,7 +425,10 @@ impl Desk {
     /// Stamps `e` with the group it is about now: its subject's, or with
     /// none its actor's. A ticket's event carries its board's group already.
     pub(super) fn stamp(&self, e: &mut Event) {
-        if e.ticket.is_some() {
+        // A ticket's events are its board's group's, and a plan's its own
+        // group's, whoever they name.
+        let of_plan = e.detail.as_ref().is_some_and(|d| d.get("plan").is_some());
+        if e.ticket.is_some() || of_plan {
             return;
         }
         let s = self.0.scopes.lock();

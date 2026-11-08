@@ -423,6 +423,8 @@ pub enum DeliveryKind {
     /// A question a session asked on Desk's line that the overseer gave
     /// the person: it waits on them.
     Question,
+    /// A boss's plan for the person to approve, or a change to one.
+    Plan,
     /// One a newer hub or Desk names, read by one that doesn't know it.
     #[serde(other)]
     Other,

@@ -477,6 +477,15 @@ fn breaker_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
     }
 }
 
+/// The bosses' plans, and changes to them, waiting on the person who holds
+/// the Desk: only they approve one.
+fn plan_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.plan_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// Desk Memory nearly or quite out of room, for the person who holds the
 /// Desk: only they free room or raise the limit.
 fn memory_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
@@ -534,6 +543,7 @@ fn needs_of(
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
             .chain(breaker_needs(sources, caller))
+            .chain(plan_needs(sources, caller))
             .chain(line_needs(sources, caller))
             .chain(memory_needs(sources, caller))
             .collect(),
@@ -830,6 +840,32 @@ pub(crate) async fn answer(
                 Err(e) => Err(e.into()),
             }
         }
+        DecideRef::Plan { plan, revision } => {
+            // The person's alone: a boss proposes, never approves.
+            if !caller.personal {
+                return Ok(Err(Unanswered::NotYours));
+            }
+            let Some(desk) = (sources.desk)() else {
+                return Ok(Err(Unanswered::Unknown));
+            };
+            // Allow approves (or continues a plan paused for a ticket that
+            // keeps failing to start); Deny turns down a change of a running
+            // plan, and leaves one never approved as proposed for Desk to open.
+            let allow = match choice {
+                Choice::Allow => true,
+                Choice::Deny => false,
+                Choice::AllowForSession | Choice::Cancel => return Ok(Err(Unanswered::NotOffered)),
+            };
+            match desk.decide_plan(*plan, *revision, allow, &By::you()).await {
+                Ok(_) => Ok(Ok(())),
+                Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
+                // A newer revision came, or it ended: it is asked again as
+                // it is now.
+                Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
+                Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
+                Err(e) => Err(e.into()),
+            }
+        }
         DecideRef::Config { agent_id, hash } => {
             use crate::agent_config_write::{keep_saved, use_changed, Refused};
             if !caller.personal {
@@ -870,7 +906,14 @@ async fn decide(
         Err(refused) => return refused,
     };
     match answer(&r.state, &sources, &caller, &body.at, body.choice).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        // A plan's card reads the plan as it is now.
+        Ok(Ok(())) => match (&body.at, (sources.desk)()) {
+            (DecideRef::Plan { plan, .. }, Some(desk)) => match desk.plan(*plan).await {
+                Ok(detail) => Json(detail).into_response(),
+                Err(e) => failed(e.into()),
+            },
+            _ => StatusCode::NO_CONTENT.into_response(),
+        },
         Ok(Err(Unanswered::AlreadyAnswered)) => refusal(StatusCode::CONFLICT, "already_answered"),
         Ok(Err(Unanswered::NotYours)) => refusal(StatusCode::FORBIDDEN, "not_yours"),
         Ok(Err(Unanswered::Unknown)) => refusal(StatusCode::NOT_FOUND, "unknown"),
