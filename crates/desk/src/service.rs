@@ -73,6 +73,10 @@ pub use plans::{Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, Pla
 #[cfg(test)]
 mod lifecycle_tests;
 mod memory;
+mod memory_index;
+#[cfg(test)]
+mod memory_index_tests;
+mod memory_recall;
 #[cfg(test)]
 mod rooms_tests;
 mod scopes;
@@ -712,6 +716,9 @@ pub struct Floor {
     /// Hides secrets in what session memory keeps: the hub's patterns.
     /// Without one, nothing is harvested.
     pub redactor: Option<Arc<dyn crate::memory::Redactor>>,
+    /// Session memory's search index: the hub's vellev node. Without one,
+    /// what Desk remembers is searched by keyword only.
+    pub index: Option<Arc<dyn crate::memory::index::MemoryIndex>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -795,6 +802,8 @@ struct Inner {
     /// when a read of an engine serves them all.
     restoring_since: Mutex<Option<std::time::Instant>>,
     ledger: ledger::LedgerRun,
+    /// Session memory's search index and its worker.
+    index: memory_index::IndexRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -1118,7 +1127,19 @@ async fn prune_layout(
     layout: Layout,
     records: &HashMap<Uuid, SessionRecord>,
 ) -> (Layout, Vec<Uuid>) {
-    let pruned = layout.without_sessions(|id| !records.contains_key(&id));
+    // A closed session is still the registry's: it keeps its group, which
+    // what is harvested of it and its ledger rows are stamped with.
+    let closed: HashSet<Uuid> = match store.every_session().await {
+        Ok(all) => all.into_iter().map(|r| r.id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't read the closed sessions; the sidebar's layout is left as it is"
+            );
+            return (layout, vec![]);
+        }
+    };
+    let pruned = layout.without_sessions(|id| !records.contains_key(&id) && !closed.contains(&id));
     if pruned == layout {
         return (layout, vec![]);
     }
@@ -1437,6 +1458,7 @@ impl Desk {
                 .collect(),
             restoring_since: Mutex::new(restoring_since),
             ledger,
+            index: memory_index::IndexRun::new(floor.index.clone()),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
@@ -1458,6 +1480,7 @@ impl Desk {
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
+        tokio::spawn(desk.clone().index_loop());
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
@@ -3053,9 +3076,14 @@ impl Desk {
     /// the floor, and takes it out of the sidebar's layout. Its engine's
     /// transcript is the engine's, and stays.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
-        self.forget_as(id, None, crate::memory_store::Memory::Forget, |_, _| Ok(()))
+        let forgot = self
+            .forget_as(id, None, crate::memory_store::Memory::Forget, |_, _| Ok(()))
             .await
-            .map(drop)
+            .map(drop);
+        if forgot.is_ok() {
+            self.memory_forgotten();
+        }
+        forgot
     }
 
     /// [`Self::forget`], once `may` agrees under the lock it is forgotten
@@ -6617,6 +6645,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -6776,6 +6805,7 @@ mod tests {
                     plans: Some(readings.clone()),
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -6903,6 +6933,7 @@ mod tests {
                 plans: None,
                 pricer: None,
                 redactor: None,
+                index: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -7016,6 +7047,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -7139,6 +7171,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -7453,6 +7486,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8236,6 +8270,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8297,6 +8332,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8363,6 +8399,7 @@ mod tests {
                 plans: None,
                 pricer: None,
                 redactor: None,
+                index: None,
             },
             CancellationToken::new(),
         )

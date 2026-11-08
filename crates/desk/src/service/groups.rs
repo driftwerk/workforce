@@ -133,7 +133,15 @@ impl Layout {
 
     /// Checked and tidied: names trimmed, ids unique, every member valid
     /// and in one place only (its first).
-    pub fn checked(mut self) -> Result<Self, DeskError> {
+    pub fn checked(self) -> Result<Self, DeskError> {
+        self.checked_except(&HashSet::new())
+    }
+
+    /// As [`Self::checked`], with `uncounted` (closed sessions' keys: they
+    /// keep their group, so what was kept of them stays stamped with it)
+    /// left out of the most members a layout may have, so the person can
+    /// always change their groups.
+    pub fn checked_except(mut self, uncounted: &HashSet<String>) -> Result<Self, DeskError> {
         if self.groups.len() > MAX_GROUPS {
             return Err(bad(format!("at most {MAX_GROUPS} groups")));
         }
@@ -149,10 +157,15 @@ impl Layout {
             }
             g.name = check_name(&g.name)?;
             g.items.retain(|k| seen.insert(k.clone()));
-            count += g.items.len();
+            count += g.items.iter().filter(|k| !uncounted.contains(*k)).count();
         }
         self.ungrouped.items.retain(|k| seen.insert(k.clone()));
-        count += self.ungrouped.items.len();
+        count += self
+            .ungrouped
+            .items
+            .iter()
+            .filter(|k| !uncounted.contains(*k))
+            .count();
         if count > MAX_ITEMS {
             return Err(bad(format!("at most {MAX_ITEMS} members")));
         }
@@ -422,6 +435,14 @@ impl DeskStore {
                 .await?;
             }
         }
+        for g in &layout.groups {
+            tx.execute(
+                "INSERT INTO group_ids_used (id, first_used) VALUES ($1, now()) \
+                 ON CONFLICT DO NOTHING",
+                &[&g.id],
+            )
+            .await?;
+        }
         let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
         let ungrouped = tx
             .query(
@@ -435,6 +456,31 @@ impl DeskStore {
             .collect::<Result<Vec<Uuid>, _>>()?;
         tx.commit().await.context("saving the sidebar's groups")?;
         Ok(ungrouped)
+    }
+
+    /// Which of `ids` a group has had before.
+    pub async fn group_ids_used(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool().get().await?;
+        Ok(client
+            .query("SELECT id FROM group_ids_used WHERE id = ANY($1)", &[&ids])
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// The sessions that are closed.
+    pub async fn closed_sessions(&self) -> Result<Vec<Uuid>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query("SELECT id FROM sessions WHERE state = 'closed'", &[])
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
     }
 
     /// Whether the person has named or grouped anything yet.
@@ -497,11 +543,40 @@ impl Desk {
         &self,
         f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
     ) -> Result<Layout, DeskError> {
+        self.change_layout_as(f, true).await
+    }
+
+    /// As [`Self::change_layout`]; with `fresh_ids`, a group new to the
+    /// layout may not take an id a group had before. Only Desk's own first
+    /// push of its layout may bring back ids it already had.
+    async fn change_layout_as(
+        &self,
+        f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
+        fresh_ids: bool,
+    ) -> Result<Layout, DeskError> {
         let _one = self.0.layout_write.lock().await;
         let before = self.layout();
-        let after = f(&before)?.checked()?;
+        let closed = self.closed_items().await?;
+        let after = f(&before)?.checked_except(&closed)?;
         if after == before {
             return Ok(after);
+        }
+        // A group id is never used twice: rows stamped with a deleted
+        // group must never become another group's.
+        let new: Vec<String> = after
+            .groups
+            .iter()
+            .filter(|g| !before.groups.iter().any(|b| b.id == g.id))
+            .map(|g| g.id.clone())
+            .collect();
+        let used = match fresh_ids {
+            true => self.0.store.group_ids_used(&new).await?,
+            false => Vec::new(),
+        };
+        if let Some(used) = used.into_iter().next() {
+            return Err(DeskError::Conflict(format!(
+                "a group was called {used:?} before; each group needs an id of its own"
+            )));
         }
         let ungrouped = self.0.store.put_layout(&after).await?;
         self.0.state.lock().layout = after.clone();
@@ -529,6 +604,18 @@ impl Desk {
             Box::pin(self.moved_across(id, from.as_deref(), to.as_deref())).await;
         }
         Ok(after)
+    }
+
+    /// The sidebar keys of the sessions that are closed.
+    async fn closed_items(&self) -> Result<HashSet<String>, DeskError> {
+        Ok(self
+            .0
+            .store
+            .closed_sessions()
+            .await?
+            .into_iter()
+            .map(session_item)
+            .collect())
     }
 
     /// Takes a forgotten session out of the layout. Its record is already
@@ -559,15 +646,23 @@ impl Desk {
     /// nothing.
     pub async fn import_layout(&self, import: Import) -> Result<Imported, DeskError> {
         let fresh = self.0.store.layout_is_empty().await?;
-        // Desk's own copy can still name sessions the hub has forgotten.
-        let known: HashSet<Uuid> = self.0.state.lock().records.keys().copied().collect();
+        // Desk's own copy can still name sessions the hub has forgotten. A
+        // closed one is still the registry's, and keeps its group.
+        let known: HashSet<Uuid> = self
+            .0
+            .store
+            .every_session()
+            .await?
+            .iter()
+            .map(|r| r.id)
+            .collect();
         let layout = import
             .layout
-            .checked()?
+            .checked_except(&self.closed_items().await?)?
             .without_sessions(|id| !known.contains(&id));
         let imported = fresh || import.force;
         if imported {
-            self.change_layout(|_| Ok(layout)).await?;
+            self.change_layout_as(|_| Ok(layout), false).await?;
             for (id, name) in import.session_names {
                 let Ok(id) = Uuid::parse_str(&id) else {
                     continue;
@@ -790,6 +885,20 @@ mod tests {
     }
 
     #[test]
+    fn closed_sessions_dont_count_toward_the_most_members() {
+        let items: Vec<String> = (0..MAX_ITEMS as u128 + 10).map(s).collect();
+        let full = Layout::default().create("g", "Acme", &items, None).unwrap();
+        assert!(full.clone().checked().is_err());
+        let closed: HashSet<String> = items[..20].iter().cloned().collect();
+        let kept = full.checked_except(&closed).unwrap();
+        assert_eq!(
+            kept.groups[0].items.len(),
+            items.len(),
+            "closed ones keep their group"
+        );
+    }
+
+    #[test]
     fn a_layout_is_tidied_and_checked() {
         let l = Layout {
             groups: vec![
@@ -954,8 +1063,17 @@ mod tests {
                 assert!(heard_layout && heard_group, "changes go out live");
 
                 // Kept: a restarted hub has them.
+                // Once the name is written: it is kept a moment after it is said.
+                let kept = DeskStore::from_pool(pool.clone());
+                for _ in 0..200 {
+                    let named = kept.get(id).await.unwrap().and_then(|r| r.display_name);
+                    if named.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 let again = Desk::start(
-                    DeskStore::from_pool(pool),
+                    DeskStore::from_pool(pool.clone()),
                     crate::testing::options(dir.path()),
                     Default::default(),
                     tokio_util::sync::CancellationToken::new(),

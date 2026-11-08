@@ -166,6 +166,47 @@ impl Desk {
         added
     }
 
+    /// Takes the boss off `group` through the hub's crew, before the group
+    /// is deleted; nothing to do where there's no crew.
+    pub async fn release_group(&self, group: &str) -> Result<(), String> {
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        match crew {
+            Some(c) => c.release_group(group).await,
+            None => Ok(()),
+        }
+    }
+
+    /// `group` was closed for a boss whose config was then not written, and
+    /// no config names it: it is as it was, open, its past too.
+    pub fn forget_bound(&self, group: &str) {
+        self.0.scopes.lock().bounded.remove(group);
+    }
+
+    /// The groups closed to everyone but the person: named for a boss, with
+    /// no boss overseeing them now (its config is off, or doesn't load).
+    pub fn sealed(&self) -> Vec<String> {
+        let s = self.0.scopes.lock();
+        let bossing: HashSet<&str> = s
+            .bosses
+            .iter()
+            .flatten()
+            .filter_map(|b| b.scope.group())
+            .collect();
+        let mut sealed: Vec<String> = s
+            .bounded
+            .iter()
+            .filter(|g| !bossing.contains(g.as_str()) && s.groups.contains_key(*g))
+            .cloned()
+            .collect();
+        sealed.sort();
+        sealed
+    }
+
     /// The person took the boss off `group`: the main overseer sees it from
     /// now on, never what it held before.
     pub async fn unbound_group(&self, group: &str) {

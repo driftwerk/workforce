@@ -222,6 +222,34 @@ pub(crate) async fn oversight_saved(service: &AgentService, before: Option<&str>
     }
 }
 
+/// Closes the group `body` makes `service` the boss of, before it is
+/// written, when it wasn't closed: that group, to be opened again by
+/// [`not_closed`] if the write doesn't happen.
+pub(crate) fn closing(service: &AgentService, body: &str) -> Option<String> {
+    let crew = for_service(service)?;
+    match crate::agent_config_write::overseen(body)? {
+        Scope::Group(g) if crew.desk.bound_groups_now([g.clone()]) => Some(g),
+        _ => None,
+    }
+}
+
+/// The write [`closing`] closed `group` for didn't happen: opened again,
+/// past and all, unless a config names it.
+pub(crate) fn not_closed(service: &AgentService, group: &str) {
+    if let Some(crew) = for_service(service) {
+        if !crew.named_on_disk(None).iter().any(|g| g == group) {
+            crew.desk.forget_bound(group);
+        }
+    }
+}
+
+/// Keeps a group [`closing`] closed, now its boss's config is written.
+pub(crate) async fn keep_closed(service: &AgentService) {
+    if let Some(crew) = for_service(service) {
+        crew.desk.keep_boundaries().await;
+    }
+}
+
 /// Whether the overseer `caller`, when it is one, may change or delete the
 /// agent `target`: only an agent of its own scope that oversees nothing.
 pub(crate) fn boss_may_change(caller: &str, target: &str) -> Result<(), String> {
@@ -570,6 +598,42 @@ impl CrewHub {
 
 #[async_trait]
 impl Crew for CrewHub {
+    /// Every agent whose config names `group` for a boss is switched off
+    /// and names it no more, through the same write as any change (history,
+    /// admission, hot reload), so the group opens to the main overseer from
+    /// now on: before it is deleted.
+    async fn release_group(&self, group: &str) -> Result<(), String> {
+        for s in self.services() {
+            if named_group(&s.workspace).as_deref() != Some(group) {
+                continue;
+            }
+            let path = s
+                .workspace
+                .join(workforce_common::config_files::WORKSPACE_CONFIG);
+            let Ok(Some(current)) = workforce_common::config_files::read(&path) else {
+                continue;
+            };
+            let Some(off) = crate::agent_config_write::oversight_off(&current) else {
+                return Err(format!(
+                    "{}'s settings file has a mistake in it, so it still oversees this group.",
+                    name_of(&s)
+                ));
+            };
+            let id = s.agent_id.as_str().to_string();
+            crate::agent_config_write::save(
+                &s,
+                &id,
+                self.state.def_store.as_deref(),
+                &off,
+                workforce_orchestrator::workflow_store::EditContext::new("oversight", None),
+                |now| now == Some(current.as_str()),
+            )
+            .await
+            .map_err(|e| format!("{} still oversees this group: {e}", name_of(&s)))?;
+        }
+        Ok(())
+    }
+
     /// The main overseer: over everything ungrouped.
     fn overseer(&self) -> Option<Overseer> {
         let (service, o) = self.overseer_for(&Scope::Ungrouped)?;

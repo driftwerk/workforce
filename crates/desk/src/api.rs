@@ -1158,6 +1158,10 @@ async fn update_group(
 
 async fn delete_group(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
     guarded!(s, h, q);
+    // Its boss is taken off first, so the group is no one's when it goes.
+    if let Err(why) = s.desk.release_group(&id).await {
+        return DeskError::Conflict(why).into_response();
+    }
     s.desk
         .change_layout(|l| l.delete(&id))
         .await
@@ -1482,6 +1486,23 @@ async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uu
         .into_response()
 }
 
+/// Starts Desk Memory's search index again from what Desk keeps: the
+/// person's alone.
+async fn rebuild_memory_index(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .rebuild_memory_index()
+        .await
+        .map(|queued| Json(serde_json::json!({ "queued": queued })))
+        .into_response()
+}
+
+/// How Desk Memory's search index stands.
+async fn memory_index_status(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk.memory_index_status().await.map(Json).into_response()
+}
+
 /// The sessions' and rooms' routes and the events socket alone.
 pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -1529,6 +1550,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
         .route("/api/desk/memory/search", get(memory_search))
+        .route("/api/desk/memory/index", get(memory_index_status))
+        .route("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
         .route(
             "/api/desk/sessions/{id}/memory",
             get(session_memory).delete(forget_memory),
