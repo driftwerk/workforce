@@ -125,6 +125,26 @@ pub struct Changed {
     pub summary: String,
 }
 
+/// Why a plan's ticket didn't start.
+#[derive(Debug, thiserror::Error)]
+pub enum StartRefused {
+    /// Nothing is wrong with the ticket: it moved, its plan was paused or
+    /// ended, it is starting already, or Desk's breaker holds new starts.
+    /// It is read again as it is.
+    #[error("{0}")]
+    Skipped(String),
+    /// Its session couldn't start: a folder or an account gone, or
+    /// anything else that keeps it from starting until someone acts.
+    #[error("{0}")]
+    Failed(DeskError),
+}
+
+impl From<DeskError> for StartRefused {
+    fn from(e: DeskError) -> Self {
+        Self::Failed(e)
+    }
+}
+
 /// What dropping a plan does with the sessions working on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1305,16 +1325,16 @@ impl Desk {
         start: &Start,
         boss: &Party,
         by: &By,
-    ) -> Result<SessionView, DeskError> {
+    ) -> Result<SessionView, StartRefused> {
         let _one = self.0.plan_starting.lock().await;
         if let Some(ask) = self.starts_held(p.group.as_deref()) {
-            return Err(DeskError::Conflict(format!(
+            return Err(StartRefused::Skipped(format!(
                 "Desk's breaker holds new sessions: {ask} The person can say Continue on Desk's Floor."
             )));
         }
         let mut t = self.ticket_of(start.ticket).await?;
         if t.state != TicketState::Todo || t.assignee.is_some() {
-            return Err(DeskError::Conflict(
+            return Err(StartRefused::Skipped(
                 "That ticket isn't waiting to start any more.".into(),
             ));
         }
@@ -1326,7 +1346,7 @@ impl Desk {
             .map_err(internal)?
             .is_some()
         {
-            return Err(DeskError::Conflict(
+            return Err(StartRefused::Skipped(
                 "That ticket is starting already.".into(),
             ));
         }
@@ -1339,16 +1359,17 @@ impl Desk {
             .begin_start(&mut t, p.id, rank, session, at)
             .await
             .map_err(|e| match e {
-                BeginStart::Stale => DeskError::Conflict(
+                BeginStart::Stale => StartRefused::Skipped(
                     "That ticket changed as it was started; it is read again.".into(),
                 ),
-                BeginStart::NotRunning => DeskError::Conflict(
+                BeginStart::NotRunning => StartRefused::Skipped(
                     "That plan was paused or ended as its ticket was started.".into(),
                 ),
-                BeginStart::Other(e) => DeskError::Internal(e),
+                BeginStart::Other(e) => StartRefused::Failed(DeskError::Internal(e)),
             })?;
-        self.plan_launch(p, t, session, &runs, start.worktree, boss, by)
-            .await
+        Ok(self
+            .plan_launch(p, t, session, &runs, start.worktree, boss, by)
+            .await?)
     }
 
     /// Finishes the start `s` that a stop cut off: its session is known (it

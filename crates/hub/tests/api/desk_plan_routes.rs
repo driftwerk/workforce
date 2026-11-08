@@ -50,10 +50,6 @@ async fn a_hub_without_desk_serves_no_plan_routes() {
         (reqwest::Method::GET, "/api/desk/plans".to_string()),
         (reqwest::Method::GET, format!("/api/desk/plans/{id}")),
         (reqwest::Method::PATCH, format!("/api/desk/plans/{id}")),
-        (
-            reqwest::Method::POST,
-            format!("/api/desk/plans/{id}/approve"),
-        ),
         (reqwest::Method::POST, format!("/api/desk/plans/{id}/pause")),
         (
             reqwest::Method::POST,
@@ -217,8 +213,14 @@ async fn a_bosss_plan_is_approved_from_the_floor_by_the_person_alone_as_of_the_r
                 decide(addr, &theirs, &at, "allow").await,
                 (403, json!({"error": "not_yours"}))
             );
-            // Deny leaves it as proposed, for the person to open.
-            assert_eq!(decide(addr, &mine, &at, "deny").await.0, 204);
+            // The hub's own token is no one: it never decides a plan.
+            let gateway_token = gateway.state.auth_token.clone();
+            assert_eq!(decide(addr, &gateway_token, &at, "allow").await.0, 401);
+            // Deny leaves it as proposed, for the person to open; the card
+            // reads the plan as it is now.
+            let (status, denied) = decide(addr, &mine, &at, "deny").await;
+            assert_eq!(status, 200, "{denied}");
+            assert_eq!(denied["state"], "proposed");
             assert_eq!(
                 d.plan(id).await.unwrap().summary.plan.state,
                 PlanState::Proposed
@@ -243,11 +245,67 @@ async fn a_bosss_plan_is_approved_from_the_floor_by_the_person_alone_as_of_the_r
                 (409, json!({"error": "already_answered"}))
             );
             let now = json!({ "kind": "plan", "plan": id, "revision": 2 });
-            assert_eq!(decide(addr, &mine, &now, "allow").await.0, 204);
-            let ran = d.plan(id).await.unwrap();
-            assert_eq!(ran.summary.plan.state, PlanState::Running);
-            assert_eq!(ran.summary.plan.approved_revision, Some(2));
+            let (status, ran) = decide(addr, &mine, &now, "allow").await;
+            assert_eq!(status, 200, "{ran}");
+            assert_eq!(ran["state"], "running");
+            assert_eq!(ran["approvedRevision"], 2);
+            assert!(ran["tickets"].is_array() && ran["revisions"].is_array());
             assert!(!has(&floor(mine.clone()).await), "nothing waits on them");
+
+            // Sarah adds a ticket: it waits on the person, who turns it
+            // down by naming that revision.
+            let detail = d.plan(id).await.unwrap();
+            let mut tickets: Vec<DraftTicket> = detail
+                .tickets
+                .iter()
+                .map(|t| DraftTicket {
+                    id: Some(t.ticket.ticket.id),
+                    title: t.ticket.ticket.title.clone(),
+                    folder: dir.path().to_string_lossy().into_owned(),
+                    ..Default::default()
+                })
+                .collect();
+            tickets.push(DraftTicket {
+                title: "Update the docs".into(),
+                folder: dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            });
+            let waits = d
+                .change_plan(
+                    id,
+                    PlanEdit {
+                        revision: Some(2),
+                        tickets: Some(tickets),
+                        ..Default::default()
+                    },
+                    Engine::Claude,
+                    false,
+                    &by_sarah,
+                )
+                .await
+                .unwrap();
+            assert!(!waits.applied);
+            assert!(has(&floor(mine.clone()).await));
+            let change = json!({ "kind": "plan", "plan": id, "revision": 3 });
+            assert_eq!(
+                decide(addr, &theirs, &change, "deny").await,
+                (403, json!({"error": "not_yours"}))
+            );
+            let (status, kept) = decide(addr, &mine, &change, "deny").await;
+            assert_eq!(status, 200, "{kept}");
+            assert_eq!(kept["revision"], 4);
+            assert_eq!(kept["approvedRevision"], 4);
+            assert_eq!(
+                kept["tickets"].as_array().unwrap().len(),
+                1,
+                "nothing added"
+            );
+            assert!(!has(&floor(mine.clone()).await));
+            // Answered: the same again is already answered.
+            assert_eq!(
+                decide(addr, &mine, &change, "deny").await,
+                (409, json!({"error": "already_answered"}))
+            );
         })
         .await;
     })

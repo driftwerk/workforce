@@ -1,6 +1,8 @@
 //! Plans over HTTP, for the person: the list, one in full, their edit,
-//! approving, pausing, resuming and dropping. A boss proposes and changes
-//! plans with its crew tools, never here.
+//! pausing, resuming and dropping. Approving a plan, or turning down a
+//! change to one, is the hub holder's alone, through the Floor's
+//! `POST /api/desk/needs/decide` (`DecideRef::Plan`). A boss proposes and
+//! changes plans with its crew tools, never here.
 
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use uuid::Uuid;
 use crate::api::Authorize;
 use crate::crew::By;
 use crate::plan::{Paused, PlanState};
-use crate::service::{Desk, DeskError, OnDrop, PlanEdit};
+use crate::service::{Desk, OnDrop, PlanEdit};
 
 struct Api {
     desk: Desk,
@@ -42,20 +44,6 @@ macro_rules! guarded {
 
 fn bad(why: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": why }))).into_response()
-}
-
-/// Only the person who holds the hub, signed in as themselves, approves
-/// or turns down a plan, as on the Floor: never the hub's own token.
-async fn holder(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
-    match s.auth.authorize(h, q.token.as_deref()).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "only the person who holds the hub decides a plan" })),
-        )
-            .into_response()),
-        Err(status) => Err((status, Json(json!({ "error": "not allowed" }))).into_response()),
-    }
 }
 
 #[derive(Deserialize)]
@@ -120,56 +108,6 @@ async fn edit(
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct Approve {
-    revision: i32,
-    /// A cap on the plan's own spend, which comes with plan budgets.
-    #[serde(default)]
-    budget: Option<Value>,
-}
-
-/// **Approve and run**, as of the revision the person read.
-async fn approve(
-    State(s): S,
-    h: HeaderMap,
-    Query(q): Q,
-    Path(id): Path<Uuid>,
-    Json(b): Json<Approve>,
-) -> Response {
-    if let Err(refused) = holder(&s, &h, &q).await {
-        return refused;
-    }
-    if b.budget.is_some_and(|v| !v.is_null()) {
-        return DeskError::Invalid(
-            "A plan can't have a budget of its own yet; set its group's budget instead.".into(),
-        )
-        .into_response();
-    }
-    s.desk
-        .approve_plan(id, b.revision, &By::you())
-        .await
-        .map(Json)
-        .into_response()
-}
-
-/// The person turns down the boss's change waiting on them, revision
-/// `rev`: the plan stays on its approved revision, and the boss is told.
-async fn reject(
-    State(s): S,
-    h: HeaderMap,
-    Query(q): Q,
-    Path((id, rev)): Path<(Uuid, i32)>,
-) -> Response {
-    if let Err(refused) = holder(&s, &h, &q).await {
-        return refused;
-    }
-    s.desk
-        .reject_plan(id, rev, &By::you())
-        .await
-        .map(Json)
-        .into_response()
-}
-
 async fn pause(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
     s.desk
@@ -219,8 +157,6 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/plans", get(list))
         .route("/api/desk/plans/{id}", get(read).patch(edit))
-        .route("/api/desk/plans/{id}/approve", post(approve))
-        .route("/api/desk/plans/{id}/changes/{rev}/reject", post(reject))
         .route("/api/desk/plans/{id}/pause", post(pause))
         .route("/api/desk/plans/{id}/resume", post(resume))
         .route("/api/desk/plans/{id}/drop", post(drop_plan))

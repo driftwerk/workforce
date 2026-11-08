@@ -69,7 +69,9 @@ mod breaker_tests;
 mod codex_asks_tests;
 mod ledger;
 mod plans;
-pub use plans::{Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView};
+pub use plans::{
+    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
+};
 #[cfg(test)]
 mod lifecycle_tests;
 mod memory;

@@ -888,7 +888,14 @@ async fn decide(
         Err(refused) => return refused,
     };
     match answer(&r.state, &sources, &caller, &body.at, body.choice).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        // A plan's card reads the plan as it is now.
+        Ok(Ok(())) => match (&body.at, (sources.desk)()) {
+            (DecideRef::Plan { plan, .. }, Some(desk)) => match desk.plan(*plan).await {
+                Ok(detail) => Json(detail).into_response(),
+                Err(e) => failed(e.into()),
+            },
+            _ => StatusCode::NO_CONTENT.into_response(),
+        },
         Ok(Err(Unanswered::AlreadyAnswered)) => refusal(StatusCode::CONFLICT, "already_answered"),
         Ok(Err(Unanswered::NotYours)) => refusal(StatusCode::FORBIDDEN, "not_yours"),
         Ok(Err(Unanswered::Unknown)) => refusal(StatusCode::NOT_FOUND, "unknown"),

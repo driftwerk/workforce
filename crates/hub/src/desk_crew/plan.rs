@@ -49,14 +49,31 @@ pub const UPDATE: &str = "crew.plan_update";
 pub const FAILS_BEFORE_PAUSE: u32 = 5;
 
 /// A plan's ticket that failed to start: how often, why last, and when it
-/// is tried next. Forgotten once it starts or its plan changes.
+/// is tried next. Forgotten once it starts, where it runs changes, or its
+/// plan's scope does (an edit within it, as a reorder, isn't enough).
 #[derive(Debug, Clone)]
 pub(crate) struct Failed {
     plan: Uuid,
-    revision: i32,
+    /// Where it ran: its engine, folder and view, as they were.
+    runs: (
+        Option<Engine>,
+        Option<String>,
+        Option<workforce_desk::model::View>,
+    ),
+    /// The plan's newest change of scope then.
+    scope: i32,
     count: u32,
     next: Instant,
     why: String,
+}
+
+impl Failed {
+    /// Whether its failures still count for `t`, its plan's newest change of
+    /// scope being `scope`: nothing about where it runs, or the plan's
+    /// scope, changed since.
+    fn still(&self, scope: i32, t: &PlanTicket) -> bool {
+        self.scope == scope && self.runs == (t.engine, t.folder.clone(), t.view)
+    }
 }
 
 /// How long what happens to a plan is gathered into one turn.
@@ -491,9 +508,16 @@ impl CrewHub {
                 // A ticket that failed to start waits longer each time, and
                 // is tried afresh once the plan changes.
                 let mut rows = tickets.clone();
+                let scope = self.last_scope(p.id).await;
                 {
                     let mut failed = self.plan_failed.lock();
-                    failed.retain(|_, f| f.revision == p.revision || f.plan != p.id);
+                    failed.retain(|id, f| {
+                        f.plan != p.id
+                            || tickets
+                                .iter()
+                                .find(|t| t.id == *id)
+                                .is_some_and(|t| f.still(scope, t))
+                    });
                     for t in &mut rows {
                         if failed.get(&t.id).is_some_and(|f| Instant::now() < f.next) {
                             t.starting = true;
@@ -508,16 +532,15 @@ impl CrewHub {
                             self.plan_failed.lock().remove(&s.ticket);
                         }
                         // Read again next pass: a race, the breaker, a pause.
-                        Err(e @ workforce_desk::DeskError::Conflict(_)) => {
+                        Err(e @ workforce_desk::StartRefused::Skipped(_)) => {
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start now");
                         }
-                        Err(e) => {
+                        Err(workforce_desk::StartRefused::Failed(e)) => {
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start");
-                            let key = tickets
-                                .iter()
-                                .find(|t| t.id == s.ticket)
-                                .map_or_else(|| "A ticket".to_string(), PlanTicket::name);
-                            self.start_failed(&p, s.ticket, &key, &plain(e)).await;
+                            let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
+                                continue;
+                            };
+                            self.start_failed(&p, t, scope, &plain(e)).await;
                         }
                     }
                 }
@@ -530,16 +553,32 @@ impl CrewHub {
         }
     }
 
+    /// The newest revision of plan `id` that changed its scope.
+    async fn last_scope(&self, id: Uuid) -> i32 {
+        self.desk
+            .store()
+            .revisions(id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.change == plan::Change::Scope)
+            .map(|r| r.revision)
+            .max()
+            .unwrap_or(1)
+    }
+
     /// `ticket` of `p` failed to start, saying `why`. Its boss is told once
     /// for each thing that keeps it from starting; it is tried again after
     /// a wait that doubles each time; after [`FAILS_BEFORE_PAUSE`] tries the
     /// plan pauses, and the person reads why on the Floor.
-    async fn start_failed(&self, p: &Plan, ticket: Uuid, key: &str, why: &str) {
+    async fn start_failed(&self, p: &Plan, t: &PlanTicket, scope: i32, why: &str) {
+        let (ticket, key) = (t.id, t.name());
         let (count, tell) = {
             let mut failed = self.plan_failed.lock();
             let f = failed.entry(ticket).or_insert_with(|| Failed {
                 plan: p.id,
-                revision: p.revision,
+                runs: (t.engine, t.folder.clone(), t.view),
+                scope,
                 count: 0,
                 next: Instant::now(),
                 why: String::new(),
@@ -1028,6 +1067,39 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_count_on_until_where_it_runs_or_the_plans_scope_changes() {
+        let t = PlanTicket {
+            id: Uuid::new_v4(),
+            key: Some("ACM-3".into()),
+            state: TicketState::Todo,
+            rank: 1.0,
+            needs: vec![],
+            engine: Some(Engine::Claude),
+            folder: Some("/work/acme-web".into()),
+            view: None,
+            assigned: false,
+            starting: false,
+        };
+        let f = Failed {
+            plan: Uuid::new_v4(),
+            runs: (t.engine, t.folder.clone(), t.view),
+            scope: 3,
+            count: 4,
+            next: Instant::now(),
+            why: "gone".into(),
+        };
+        // A reorder or a title is no change for it.
+        assert!(f.still(3, &t));
+        assert!(!f.still(5, &t), "a change of scope");
+        let mut moved = t.clone();
+        moved.folder = Some("/work/acme-api".into());
+        assert!(!f.still(3, &moved), "where it runs");
+        let mut other = t.clone();
+        other.engine = Some(Engine::Codex);
+        assert!(!f.still(3, &other));
+    }
 
     #[test]
     fn a_plan_has_a_channel_of_its_own_that_is_no_desk_room() {

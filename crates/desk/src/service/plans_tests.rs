@@ -134,7 +134,7 @@ async fn a_proposed_plan_waits_in_backlog_for_the_persons_approval() {
         };
         assert!(matches!(
             d.plan_start(plan, &start, &sarah(), &by_sarah()).await,
-            Err(DeskError::Conflict(_))
+            Err(StartRefused::Skipped(_))
         ));
     })
     .await;
@@ -756,7 +756,7 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
         for (method, uri) in [
             ("GET", "/api/desk/plans".to_string()),
             ("GET", format!("/api/desk/plans/{id}")),
-            ("POST", format!("/api/desk/plans/{id}/approve")),
+            ("POST", format!("/api/desk/plans/{id}/pause")),
         ] {
             assert_eq!(
                 call(&closed, method, &uri, Some(json!({"revision": 1})))
@@ -766,16 +766,21 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
                 "{method} {uri}"
             );
         }
-        // The hub's own token reads and edits, but never approves.
+        // Approving and turning down are the Floor's decide route's, the
+        // hub holder's alone: there are no routes for them here.
         let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
-        let (status, said) = call(
-            &hub,
-            "POST",
-            &format!("/api/desk/plans/{id}/approve"),
-            Some(json!({ "revision": 1 })),
-        )
-        .await;
-        assert_eq!(status, 403, "{said}");
+        for uri in [
+            format!("/api/desk/plans/{id}/approve"),
+            format!("/api/desk/plans/{id}/changes/1/reject"),
+        ] {
+            assert_eq!(
+                call(&hub, "POST", &uri, Some(json!({ "revision": 1 })))
+                    .await
+                    .0,
+                404,
+                "{uri}"
+            );
+        }
         let app = crate::plan_api::api_routes(d.clone(), crate::testing::identified("sam"));
         let (status, list) = call(&app, "GET", "/api/desk/plans?state=proposed", None).await;
         assert_eq!(status, 200);
@@ -832,39 +837,8 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
                 .contains("look at revision 2"),
             "{stale}"
         );
-        let approve = |rev: i32| json!({ "revision": rev });
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                &format!("/api/desk/plans/{id}/approve"),
-                Some(approve(1))
-            )
-            .await
-            .0,
-            409
-        );
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                &format!("/api/desk/plans/{id}/approve"),
-                Some(json!({ "revision": 2, "budget": { "usd": 40 } }))
-            )
-            .await
-            .0,
-            400,
-            "no plan budget yet"
-        );
-        let (status, ran) = call(
-            &app,
-            "POST",
-            &format!("/api/desk/plans/{id}/approve"),
-            Some(approve(2)),
-        )
-        .await;
-        assert_eq!(status, 200, "{ran}");
-        assert_eq!(ran["state"], "running");
+        let ran = d.approve_plan(id, 2, &By::you()).await.unwrap();
+        assert_eq!(ran.summary.plan.state, PlanState::Running);
         let (status, paused) =
             call(&app, "POST", &format!("/api/desk/plans/{id}/pause"), None).await;
         assert_eq!((status, paused["paused"].as_str()), (200, Some("person")));
@@ -1158,7 +1132,7 @@ async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stay
         // Nothing waits now: no change to turn down.
         assert!(d.reject_plan(id, 3, &By::you()).await.is_err());
 
-        // The route does the same, the hub holder alone.
+        // Again, by revision.
         let mut again = kept(&kept_plan);
         again.push(DraftTicket {
             title: "c".into(),
@@ -1178,25 +1152,14 @@ async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stay
         )
         .await
         .unwrap();
-        let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
-        let uri = format!("/api/desk/plans/{id}/changes/4/reject");
-        assert_eq!(call(&hub, "POST", &uri, None).await.0, 403);
-        let app = crate::plan_api::api_routes(d.clone(), crate::testing::identified("sam"));
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                &format!("/api/desk/plans/{id}/changes/3/reject"),
-                None
-            )
-            .await
-            .0,
-            409,
-            "a stale revision"
-        );
-        let (status, out) = call(&app, "POST", &uri, None).await;
-        assert_eq!(status, 200, "{out}");
-        assert_eq!(out["approvedRevision"], 5);
+        // The Floor's Deny names the waiting revision: an older one is stale.
+        assert!(matches!(
+            d.decide_plan(id, 3, false, &By::you()).await,
+            Err(DeskError::Conflict(_))
+        ));
+        let out = d.decide_plan(id, 4, false, &By::you()).await.unwrap();
+        assert_eq!(out.summary.plan.approved_revision, Some(5));
+        assert_eq!(out.tickets.len(), 1);
     })
     .await;
 }
@@ -1324,6 +1287,64 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
             .unwrap_err();
         assert!(refused.to_string().contains("breaker"), "{refused}");
         assert_eq!(d.list().len(), 1, "only the person's");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_start_that_cant_happen_now_is_skipped_and_one_whose_session_cant_start_failed() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let folder = tempfile::tempdir().unwrap();
+        let p = d
+            .propose_plan(
+                new_plan(folder.path(), &[("a", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let read = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let start = plan::next_starts(
+            &read.summary.plan,
+            &d.plan_tickets(id).await.unwrap(),
+            0,
+            4,
+            None,
+        )
+        .remove(0);
+        drop(folder);
+        // Its folder is gone: that keeps failing until someone acts.
+        let failed = d
+            .plan_start(&read.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap_err();
+        assert!(matches!(failed, StartRefused::Failed(_)), "{failed}");
+        assert_eq!(
+            d.ticket(start.ticket).await.unwrap().ticket.state,
+            TicketState::Todo,
+            "back in To do"
+        );
+        assert!(d.0.store.starting().await.unwrap().is_empty());
+        // Moved by the person: nothing wrong with it, it is only read again.
+        d.move_ticket(
+            start.ticket,
+            Move {
+                state: TicketState::Backlog,
+                before: None,
+                after: None,
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            d.plan_start(&read.summary.plan, &start, &sarah(), &by_sarah())
+                .await,
+            Err(StartRefused::Skipped(_))
+        ));
     })
     .await;
 }
