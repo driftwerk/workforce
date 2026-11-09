@@ -2189,6 +2189,55 @@ async fn an_account_whose_usage_matches_the_sign_in_is_linked_until_it_doesnt_an
 }
 
 #[tokio::test]
+async fn the_person_taking_a_sign_in_over_wins_whatever_write_of_it_is_still_pending() {
+    use crate::identity::{Identity, Link, LinkedBy};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let identity = Identity {
+            key: "the-sign-in".into(),
+            email: Some("me@example.com".into()),
+        };
+        let link = |by| Link {
+            identity: identity.clone(),
+            by,
+            at: chrono::Utc::now(),
+        };
+        let store = &d.0.store;
+        // Work's link by usage is kept, and its removal is still pending.
+        store
+            .put_account_link(work, Some(&link(LinkedBy::Usage)))
+            .await
+            .unwrap();
+        // The person takes the sign-in over: it is theirs, work's row gone.
+        store
+            .put_account_link(personal, Some(&link(LinkedBy::Manual)))
+            .await
+            .unwrap();
+        // The pending removal, then a late write by usage, change nothing.
+        store.put_account_link(work, None).await.unwrap();
+        store
+            .put_account_link(work, Some(&link(LinkedBy::Usage)))
+            .await
+            .unwrap();
+        let kept = store.account_links().await.unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[&personal].by, LinkedBy::Manual);
+        // Usage doesn't turn the person's own link on its account into its own.
+        store
+            .put_account_link(personal, Some(&link(LinkedBy::Usage)))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.account_links().await.unwrap()[&personal].by,
+            LinkedBy::Manual
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_reading_of_another_account_never_ends_one_being_full_and_a_move_off_is_asked_back_once()
 {
     use crate::engine_accounts::AccountNeed;
