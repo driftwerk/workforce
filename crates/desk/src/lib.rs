@@ -31,6 +31,7 @@ mod first_run;
 pub mod floor;
 pub mod folders;
 pub mod gist;
+pub mod handoff;
 pub mod holder;
 pub mod identity;
 pub mod leader;
