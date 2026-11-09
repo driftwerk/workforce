@@ -17,7 +17,8 @@ use crate::store::DeskStore;
 pub struct LineageWrite<'a> {
     pub session: Uuid,
     pub link: &'a Link,
-    pub account: Option<&'a str>,
+    /// The engine account it runs on, by id.
+    pub account: Option<Uuid>,
     pub brief: Option<&'a str>,
     pub included: &'a Included,
 }
@@ -26,7 +27,7 @@ pub struct LineageWrite<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeptLineage {
     pub link: Link,
-    pub account: Option<String>,
+    pub account: Option<Uuid>,
     pub brief: Option<String>,
 }
 
@@ -141,7 +142,7 @@ impl DeskStore {
                 self.put_lineage(&LineageWrite {
                     session,
                     link: &k.link,
-                    account: k.account.as_deref(),
+                    account: k.account,
                     brief: k.brief.as_deref(),
                     included: &k.link.included,
                 })
@@ -194,13 +195,16 @@ impl DeskStore {
         Ok(back)
     }
 
-    /// The brief `session` was given, and the group it was given in; none
-    /// when it was given none (or it was forgotten).
-    pub async fn lineage_brief(&self, session: Uuid) -> Result<Option<(String, Option<String>)>> {
+    /// The brief `session` was given (none once forgotten), and the group
+    /// it was given in; none when it was handed no work.
+    pub async fn lineage_brief(
+        &self,
+        session: Uuid,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
         let client = self.pool().get().await?;
         client
             .query_opt(
-                "SELECT brief, group_id FROM work_lineage WHERE session = $1 AND brief IS NOT NULL",
+                "SELECT brief, group_id FROM work_lineage WHERE session = $1",
                 &[&session],
             )
             .await?
