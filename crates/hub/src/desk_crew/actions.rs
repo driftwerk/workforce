@@ -133,6 +133,16 @@ pub(crate) enum Action {
     Release {
         session: Uuid,
     },
+    /// Continue a session's work in a session of another engine, with a
+    /// brief of it: only ever suggested, as the brief goes to that
+    /// engine's vendor.
+    Handoff {
+        session: Uuid,
+        engine: Engine,
+        /// The account it runs on: none, the engine's default; `Some(None)`,
+        /// the CLI's own sign-in.
+        account: Option<Option<Uuid>>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -161,6 +171,8 @@ struct Input {
     #[serde(default)]
     options: Vec<String>,
     draft: Option<String>,
+    /// A handoff's account: an account's id, or `own`.
+    account: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -340,6 +352,20 @@ impl Action {
             "crew.release" => Self::Release {
                 session: session()?,
             },
+            "crew.handoff" => Self::Handoff {
+                session: session()?,
+                engine: i
+                    .engine
+                    .ok_or("Say which engine to continue in: claude or codex.")?,
+                account: match blank_none(i.account).as_deref() {
+                    None => None,
+                    Some("own") => Some(None),
+                    Some(a) => Some(Some(a.parse().map_err(|_| {
+                        "That isn’t an account id; leave account out for the engine's default."
+                            .to_string()
+                    })?)),
+                },
+            },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -405,7 +431,8 @@ impl Action {
             | Self::Interrupt { .. }
             | Self::Escalate { .. }
             | Self::TakeOn { .. }
-            | Self::Release { .. } => "",
+            | Self::Release { .. }
+            | Self::Handoff { .. } => "",
         })
     }
 }
@@ -803,6 +830,16 @@ pub(crate) enum Gate {
 impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        // Continuing a session in another engine sends its brief to that
+        // engine's vendor: the person's call, every time.
+        if let Action::Handoff { .. } = action {
+            return match o.level {
+                Level::Watch => Gate::Refuse,
+                Level::Suggest | Level::Act => Gate::Suggest(
+                    "continuing a session in another engine is the person's call, as its brief goes to that engine's vendor".into(),
+                ),
+            };
+        }
         // Asking the person is always allowed, and so is letting a session
         // go: the person runs it then, as before it was taken on.
         if let Action::Escalate { .. } | Action::Release { .. } = action {
@@ -928,6 +965,7 @@ impl CrewHub {
             Action::Deny { .. } | Action::Stop { .. } => false,
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => true,
+            Action::Handoff { .. } => false,
         };
         if allowed {
             Gate::Run
@@ -983,7 +1021,8 @@ impl CrewHub {
             | Action::Stop { session: s }
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
-            | Action::Restart { session: s, .. } => Some(*s),
+            | Action::Restart { session: s, .. }
+            | Action::Handoff { session: s, .. } => Some(*s),
             _ => None,
         }
     }
@@ -1123,7 +1162,10 @@ impl CrewHub {
             | Action::Interrupt { .. }
             | Action::Escalate { .. }
             | Action::TakeOn { .. }
-            | Action::Release { .. } => true,
+            | Action::Release { .. }
+            // The session it starts waits on its approvals, as any Desk
+            // starts; and it is only ever suggested.
+            | Action::Handoff { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -1192,7 +1234,10 @@ impl CrewHub {
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
             | Action::TakeOn { session: s }
-            | Action::Release { session: s } => self.desk.view(*s).ok().map(|v| Party::session(&v)),
+            | Action::Release { session: s }
+            | Action::Handoff { session: s, .. } => {
+                self.desk.view(*s).ok().map(|v| Party::session(&v))
+            }
         }
     }
 
@@ -1293,6 +1338,14 @@ impl CrewHub {
             Action::Release { session } => {
                 format!("Let {} go: you run it", self.session_name(*session))
             }
+            Action::Handoff {
+                session, engine, ..
+            } => format!(
+                "Continue {} in {}? {}",
+                self.session_name(*session),
+                engine.title(),
+                workforce_desk::handoff::egress(*engine)
+            ),
         }
     }
 
@@ -1490,6 +1543,41 @@ impl CrewHub {
             Action::Release { session } => {
                 let c = d.release(*session, &by).await.map_err(charge_plain)?;
                 Ok(format!("let {} go", self.session_name(c.session)))
+            }
+            Action::Handoff {
+                session,
+                engine,
+                account,
+            } => {
+                // The person, saying yes to the suggestion that named who
+                // receives the brief: no one else hands work on.
+                if by.party.kind != crew::PartyKind::You {
+                    return Err("Only the person continues a session in another engine.".into());
+                }
+                let name = self.session_name(*session);
+                let done = d
+                    .handoff(
+                        *session,
+                        &workforce_desk::handoff::Ask {
+                            engine: Some(*engine),
+                            account: *account,
+                            egress_confirmed: true,
+                            ..Default::default()
+                        },
+                        by,
+                    )
+                    .await
+                    // Desk's refusals are said whole, as its dialog says them.
+                    .map_err(|e| match e {
+                        workforce_desk::DeskError::Conflict(why)
+                        | workforce_desk::DeskError::Invalid(why) => why,
+                        e => plain(e),
+                    })?;
+                Ok(format!(
+                    "continued {name} in {} as {}",
+                    engine.title(),
+                    done.session.label()
+                ))
             }
         }
     }
