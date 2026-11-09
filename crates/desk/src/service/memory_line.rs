@@ -13,9 +13,17 @@
 //! while memory is paused still searches what was kept within its reach.
 //! Forgetting is what takes rows out of reach.
 //!
-//! On a machine's engine (`[desk] agents = false`) both are refused: the
-//! groups that bound a session's reach are kept by the Desk that drives
-//! it, not there, until groups are granted to machines.
+//! On a hub that may be a machine's both are refused: the groups that
+//! bound a session's reach are kept by the Desk that drives it, not there,
+//! until groups are granted to machines. It fails closed: only a hub
+//! Desk's helper wrote `[desk] machine = false` for, with nothing else of a
+//! machine's about it (`agents = false`, `restore = "auto"`), is the
+//! person's own computer (`MemoryOptions::machine`, set by the hub).
+//!
+//! A `recall_read` refused (a ref outside its reach, unknown, or malformed)
+//! is logged and kept in `memory_reads` as a read with no hits, as a
+//! search that found nothing is; a reach it can't name is refused before
+//! anything is searched, and logged.
 //!
 //! Every answer reaches the model wrapped as untrusted content
 //! ([`crate::memory::render`]); nothing of what was recalled is outside
@@ -56,13 +64,12 @@ fn reach_word(r: Reach) -> &'static str {
 
 /// `text` cut to `max` characters, ending with "…" when it was cut.
 fn excerpt(text: &str, max: usize) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match text.chars().count() > max {
         true => format!(
             "{}…",
             text.chars().take(max.saturating_sub(1)).collect::<String>()
         ),
-        false => text,
+        false => text.to_string(),
     }
 }
 
@@ -193,8 +200,6 @@ impl Desk {
         limit: usize,
     ) -> Result<Value, String> {
         let reader = self.session_reader(caller).await?;
-        let setting = self.session_reach().await;
-        let used = reach.map_or(setting, |a| a.min(setting));
         let found = self
             .memory_recall(
                 &reader,
@@ -209,6 +214,9 @@ impl Desk {
             )
             .await
             .map_err(|e| self.line_memory_failed(caller, e))?;
+        // The most it may cover, as this recall read it.
+        let setting = found.session_reach;
+        let used = reach.map_or(setting, |a| a.min(setting));
         let mut notes: Vec<String> = Vec::new();
         if reach.is_some_and(|a| a > setting) {
             notes.push(format!(
@@ -253,26 +261,58 @@ impl Desk {
     }
 
     /// `recall_read`, for the session `caller`: the exchange or the note
-    /// `reference` names, when it is within the session's reach.
+    /// `reference` names, when it is within the session's reach. A ref
+    /// refused is kept as a read of nothing, and logged.
     pub(super) async fn recall_read_call(
         &self,
         caller: Uuid,
         reference: String,
     ) -> Result<Value, String> {
         let reader = self.session_reader(caller).await?;
+        match self.recall_read_in(caller, &reader, &reference).await {
+            Ok(read) => Ok(read),
+            Err(Some(said)) => Err(said),
+            Err(None) => {
+                tracing::info!(
+                    session = %caller,
+                    reference = %reference,
+                    "a session asked to read a ref outside its reach, or none; refused"
+                );
+                if let Err(e) = self
+                    .0
+                    .store
+                    .memory_read(&reader.label(), "recall_read", Some(&reference), &[], None)
+                    .await
+                {
+                    tracing::warn!(session = %caller, error = format!("{e:#}"), "couldn't keep a refused read of session memory");
+                }
+                Err(not_yours(&reference))
+            }
+        }
+    }
+
+    /// What `recall_read` reads for `reader`; `Err(None)` when the ref is
+    /// none it may read.
+    async fn recall_read_in(
+        &self,
+        caller: Uuid,
+        reader: &Reader,
+        reference: &str,
+    ) -> Result<Value, Option<String>> {
+        let reference = reference.to_string();
         let known = self
             .0
             .store
             .memory_groups()
             .await
-            .map_err(|e| self.line_memory_failed(caller, e.into()))?;
-        let b = bound(&reader, self.session_reach().await, None, &known);
+            .map_err(|e| Some(self.line_memory_failed(caller, e.into())))?;
+        let b = bound(reader, self.session_reach().await, None, &known);
         let Some((is_item, id)) = parse_reference(&reference) else {
-            return Err(not_yours(&reference));
+            return Err(None);
         };
         let sees = |group: Option<&str>, session: Uuid, project: &str, at| {
             may_see(
-                &reader,
+                reader,
                 &b,
                 &Row {
                     group,
@@ -282,7 +322,7 @@ impl Desk {
                 },
             )
         };
-        let failed = |e: eyre::Report| self.line_memory_failed(caller, e.into());
+        let failed = |e: eyre::Report| Some(self.line_memory_failed(caller, e.into()));
         // What is shown, first the one asked for: each a row's facts, its
         // kind, flags and text.
         struct Shown {
@@ -306,7 +346,7 @@ impl Desk {
                 .await
                 .map_err(failed)?
                 .filter(|i| sees(i.group.as_deref(), i.session, &i.project, i.valid_from))
-                .ok_or_else(|| not_yours(&reference))?;
+                .ok_or(None)?;
             let mut text = item.text.clone();
             if !item.source_kept {
                 text.push_str("\n(The conversation it came from is no longer kept.)");
@@ -355,7 +395,7 @@ impl Desk {
                 .await
                 .map_err(failed)?
                 .filter(|x| sees(x.group.as_deref(), x.session, &x.project, x.exchange.at))
-                .ok_or_else(|| not_yours(&reference))?;
+                .ok_or(None)?;
             shown.push(Shown {
                 id: x.id,
                 reference: reference.clone(),
@@ -378,7 +418,7 @@ impl Desk {
         let names = self
             .hit_names(&sessions)
             .await
-            .map_err(|e| self.line_memory_failed(caller, e))?;
+            .map_err(|e| Some(self.line_memory_failed(caller, e)))?;
         let ids: Vec<Uuid> = shown.iter().map(|s| s.id).collect();
         let group = one_group(shown.iter().map(|s| s.group.as_deref()));
         self.0
@@ -494,6 +534,6 @@ mod tests {
         let cut = excerpt(&long, EXCERPT);
         assert_eq!(cut.chars().count(), EXCERPT);
         assert!(cut.ends_with('…'));
-        assert_eq!(excerpt("a\n  b", EXCERPT), "a b");
+        assert_eq!(excerpt("a\n  b", EXCERPT), "a\n  b", "as it was said");
     }
 }

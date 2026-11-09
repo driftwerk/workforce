@@ -40,6 +40,8 @@ pub struct Recalled {
     /// Only keywords were matched: there is no search index ready.
     pub keyword_only: bool,
     pub notice: Option<&'static str>,
+    /// The most a session's recall covers, as this one read it.
+    pub session_reach: Reach,
 }
 
 /// The setting key of the person's narrower session reach.
@@ -57,7 +59,8 @@ impl Desk {
         }
         let limit = r.limit.max(1);
         let known = self.0.store.memory_groups().await?;
-        let b = bound(reader, self.session_reach().await, r.reach, &known)
+        let session_reach = self.session_reach().await;
+        let b = bound(reader, session_reach, r.reach, &known)
             .narrowed(r.group.as_ref().map(|g| g.as_deref()), r.session);
         if b.is_empty() {
             tracing::info!(
@@ -69,6 +72,7 @@ impl Desk {
                 hits: Vec::new(),
                 keyword_only: self.memory_index_up().is_none(),
                 notice: None,
+                session_reach,
             });
         }
         let wanted = limit * 3;
@@ -166,6 +170,7 @@ impl Desk {
             hits,
             keyword_only,
             notice,
+            session_reach,
         })
     }
 

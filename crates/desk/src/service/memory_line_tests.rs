@@ -546,3 +546,41 @@ async fn a_machines_sessions_recall_nothing_until_groups_are_granted() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_refused_read_is_kept_as_a_read_of_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, store, w, _index, _cancel) = world(&pool, dir.path(), Reach::Project, false).await;
+        let globex = format!("x-{}", exchanges(&store, w.globex).await[0]);
+        for r in [globex.clone(), "x-nonsense".to_string()] {
+            d.line_call(w.web, "recall_read", &json!({ "ref": r }), None)
+                .await
+                .unwrap_err();
+        }
+        let client = store.pool().get().await.unwrap();
+        let reads: Vec<(String, Option<String>, Vec<Uuid>, Option<String>)> = client
+            .query(
+                "SELECT tool, query, hits, group_id FROM memory_reads WHERE reader = $1 ORDER BY at",
+                &[&format!("session:{}", w.web)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                ("recall_read".to_string(), Some(globex), vec![], None),
+                (
+                    "recall_read".to_string(),
+                    Some("x-nonsense".to_string()),
+                    vec![],
+                    None
+                ),
+            ]
+        );
+    })
+    .await;
+}

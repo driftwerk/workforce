@@ -45,10 +45,11 @@ pub struct MemoryOptions {
     pub derive: bool,
     /// The most calls it makes a day.
     pub derive_calls_per_day: u32,
-    /// Whether this is a machine's engine (a hub that serves no agents,
-    /// driven by Desk on another computer). Its sessions' groups live in
-    /// that Desk's sidebar, not here, so here every one looks ungrouped:
-    /// sessions' recall is refused until groups are granted to machines.
+    /// Whether this hub may be a machine's (driven by Desk on another
+    /// computer): true unless the hub was told it is the person's own
+    /// computer. A machine's sessions' groups live in that Desk's sidebar,
+    /// not here, so here every one looks ungrouped: sessions' recall is
+    /// refused until groups are granted to machines.
     pub machine: bool,
 }
 

@@ -896,7 +896,13 @@ impl Desk {
         input: &Value,
         step: Option<Duration>,
     ) -> Result<Value, String> {
-        let call = line::call_of(name, input)?;
+        let call = line::call_of(name, input).inspect_err(|e| {
+            // A recall asked of what it can't name is refused before anything
+            // is searched: kept in the log, as a refused read is.
+            if name.starts_with("recall") {
+                tracing::info!(session = %caller, tool = name, refused = %e, "a session's recall was refused as asked");
+            }
+        })?;
         let sessions = self.line_sessions();
         let say = |e: LineError| match e {
             LineError::Refused(r) => r.to_string(),
