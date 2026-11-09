@@ -1673,6 +1673,9 @@ struct HandoffParams {
     back: bool,
     #[serde(default)]
     goal_only: bool,
+    /// Have Desk note what it hasn't of the session first (a model call):
+    /// the dialog's preview asks it with `derive=1`, a prefetch doesn't.
+    derive: Option<String>,
 }
 
 impl HandoffParams {
@@ -1721,15 +1724,18 @@ async fn handoff_preview(
     p: Result<Query<HandoffParams>, QueryRejection>,
 ) -> Response {
     guarded!(s, h, q);
-    let ask = match p
-        .map_err(|e| DeskError::Invalid(e.body_text()))
-        .and_then(|Query(p)| p.ask())
-    {
-        Ok(ask) => ask,
-        Err(e) => return e.into_response(),
-    };
+    let (ask, derive) =
+        match p
+            .map_err(|e| DeskError::Invalid(e.body_text()))
+            .and_then(|Query(p)| {
+                let derive = matches!(p.derive.as_deref(), Some("1" | "true" | "yes"));
+                p.ask().map(|a| (a, derive))
+            }) {
+            Ok(asked) => asked,
+            Err(e) => return e.into_response(),
+        };
     s.desk
-        .handoff_preview(id, &ask)
+        .handoff_preview(id, &ask, derive)
         .await
         .map(Json)
         .into_response()
