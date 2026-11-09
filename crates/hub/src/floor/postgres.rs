@@ -303,6 +303,8 @@ impl PgFloorStore {
                    AND f.at >= coalesce((SELECT started_at FROM turns WHERE id = $7), $6)) \
                  ON CONFLICT ((coalesce(owner, '')), subject) DO UPDATE SET \
                      purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at, \
+                     purpose_from = CASE WHEN gists.purpose IS NOT DISTINCT FROM EXCLUDED.purpose \
+                       THEN gists.purpose_from END, \
                      now_text = EXCLUDED.now_text, now_at = EXCLUDED.now_at, \
                      turn = EXCLUDED.turn, by_model = EXCLUDED.by_model \
                  WHERE gists.now_at <= EXCLUDED.now_at"
@@ -653,7 +655,10 @@ async fn forget_gists(
 }
 
 /// `to` continues `from`'s work: its gist starts with `from`'s purpose,
-/// unless it has one of its own already. Whose gist it wrote, if any.
+/// unless it has one of its own already, and says where that came from (the
+/// session it was first carried from, through every hand on). Only the
+/// purpose: what `from` was doing is its own, and `to`'s turns say its own.
+/// Whose gist it wrote, if any.
 async fn carry_purpose(
     db: &impl GenericClient,
     from: &SubjectKey,
@@ -661,21 +666,25 @@ async fn carry_purpose(
 ) -> Result<Option<Option<String>>> {
     let rows = db
         .query(
-            "INSERT INTO gists (owner, subject, purpose, purpose_at, now_text, now_at, turn, by_model) \
-             SELECT owner, $2, purpose, purpose_at, now_text, now_at, turn, false FROM gists \
+            "INSERT INTO gists (owner, subject, purpose, purpose_at, purpose_from, \
+               now_text, now_at, turn, by_model) \
+             SELECT owner, $2, purpose, purpose_at, coalesce(purpose_from, $1), \
+               '', to_timestamp(0), $3::uuid, false FROM gists \
              WHERE subject = $1 AND purpose IS NOT NULL \
              ON CONFLICT ((coalesce(owner, '')), subject) DO UPDATE SET \
-                 purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at \
+                 purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at, \
+                 purpose_from = EXCLUDED.purpose_from \
              WHERE gists.purpose IS NULL RETURNING owner",
-            &[&from.as_str(), &to.as_str()],
+            &[&from.as_str(), &to.as_str(), &Uuid::nil()],
         )
         .await?;
     Ok(rows.first().map(|row| row.get("owner")))
 }
 
-/// `from` is being forgotten: the purpose each of `to` was given from it
-/// goes, where it is still the one given (the same words, written when
-/// `from`'s was), not one it wrote since. Whose gists it changed, if any.
+/// `from` is being forgotten: the purpose each of `to` was carried from it
+/// goes, through every hand on, but never one `to` wrote itself, nor one
+/// carried from elsewhere. A gist that held only that goes whole. Whose
+/// gists it changed, if any.
 async fn forget_carried(
     db: &impl GenericClient,
     from: &SubjectKey,
@@ -684,15 +693,16 @@ async fn forget_carried(
     let to: Vec<&str> = to.iter().map(SubjectKey::as_str).collect();
     let rows = db
         .query(
-            "UPDATE gists t SET purpose = NULL, purpose_at = NULL FROM gists s \
-             WHERE s.subject = $1 AND t.subject = ANY($2) \
-               AND coalesce(t.owner, '') = coalesce(s.owner, '') \
-               AND t.purpose IS NOT DISTINCT FROM s.purpose \
-               AND t.purpose_at IS NOT DISTINCT FROM s.purpose_at \
-             RETURNING t.owner",
+            "UPDATE gists SET purpose = NULL, purpose_at = NULL, purpose_from = NULL \
+             WHERE subject = ANY($2) AND purpose_from = $1 RETURNING owner",
             &[&from.as_str(), &to],
         )
         .await?;
+    db.execute(
+        "DELETE FROM gists WHERE subject = ANY($1) AND purpose IS NULL AND now_text = '' AND turn = $2",
+        &[&to, &Uuid::nil()],
+    )
+    .await?;
     Ok(rows.first().map(|row| row.get("owner")))
 }
 
@@ -1527,6 +1537,11 @@ mod tests {
             let carried = store.gist(None, &to).await.unwrap().unwrap();
             assert_eq!(carried.purpose.as_deref(), Some("Making sign-in safe."));
             assert!(!carried.by_model);
+            assert_eq!(carried.now, "", "what the source was doing is its own");
+            assert!(
+                carried.now_at < at("2026-10-29T00:00:00Z"),
+                "and never its tile's now"
+            );
             store
                 .apply(&TurnOp::CarryPurpose {
                     from: from.clone(),
@@ -1563,7 +1578,11 @@ mod tests {
                 .await
                 .unwrap();
             for k in [&to, &next] {
-                assert_eq!(store.gist(None, k).await.unwrap().unwrap().purpose, None);
+                assert_eq!(
+                    store.gist(None, k).await.unwrap(),
+                    None,
+                    "nothing carried is left"
+                );
             }
             assert_eq!(
                 store
@@ -1575,6 +1594,71 @@ mod tests {
                     .as_deref(),
                 Some("Its own purpose."),
             );
+            // Handed back to a session with a purpose of its own: forgetting
+            // the one in between never takes it.
+            let (a, b) = (
+                SubjectKey::session(Uuid::new_v4()),
+                SubjectKey::session(Uuid::new_v4()),
+            );
+            store
+                .put_gist(None, &a, &gist("A's own purpose."))
+                .await
+                .unwrap();
+            for (f, t) in [(&a, &b), (&b, &a)] {
+                store
+                    .apply(&TurnOp::CarryPurpose {
+                        from: f.clone(),
+                        to: t.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            store
+                .apply(&TurnOp::ForgetCarried {
+                    from: b.clone(),
+                    to: vec![a.clone()],
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .gist(None, &a)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .purpose
+                    .as_deref(),
+                Some("A's own purpose."),
+                "the first session's own purpose stays"
+            );
+            // A target that has written its own now keeps it, and loses only
+            // the purpose it was given.
+            let c = SubjectKey::session(Uuid::new_v4());
+            store
+                .apply(&TurnOp::CarryPurpose {
+                    from: a.clone(),
+                    to: c.clone(),
+                })
+                .await
+                .unwrap();
+            let mine = Gist {
+                purpose: Some("A's own purpose.".into()),
+                now: "Running the tests in Codex.".into(),
+                now_at: at("2026-10-29T12:00:00Z"),
+                turn: Uuid::new_v4(),
+                ..gist("")
+            };
+            store.put_gist(None, &c, &mine).await.unwrap();
+            store
+                .apply(&TurnOp::ForgetCarried {
+                    from: a.clone(),
+                    to: vec![c.clone()],
+                })
+                .await
+                .unwrap();
+            let left = store.gist(None, &c).await.unwrap().unwrap();
+            assert_eq!(left.purpose, None);
+            assert_eq!(left.now, "Running the tests in Codex.");
             // Nothing to carry: nothing written.
             let none = SubjectKey::session(Uuid::new_v4());
             let whose = store
