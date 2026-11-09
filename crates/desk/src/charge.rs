@@ -229,6 +229,97 @@ pub fn wheel(
     }
 }
 
+// ── Where a boss acts fully ─────────────────────────────────────────────
+
+/// A repository as a remote's address names it: its host, when said, and
+/// its `owner/name`, lowercased, without `.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoName {
+    pub host: Option<String>,
+    pub path: String,
+}
+
+/// `text` (`git@github.com:acme/acme-web.git`, `https://github.com/acme/
+/// acme-web`, `ssh://git@host:22/acme/acme-web.git`, `acme/acme-web`) as
+/// the repository it names; `None` when it names none.
+pub fn repo_name(text: &str) -> Option<RepoName> {
+    let t = text.trim();
+    if t.is_empty() || t.starts_with('/') || t.starts_with('~') || t.starts_with('.') {
+        return None;
+    }
+    let (host, path) = if let Some((_, rest)) = t.split_once("://") {
+        // scheme://[user@]host[:port]/path
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?.split(':').next()?;
+        (Some(host), path)
+    } else if let Some((left, path)) = t.split_once(':') {
+        // [user@]host:path
+        (Some(left.rsplit('@').next()?), path)
+    } else {
+        let parts: Vec<&str> = t.split('/').collect();
+        match parts.as_slice() {
+            [owner, name] => (None, &t[..owner.len() + 1 + name.len()]),
+            [host, _, _] if host.contains('.') => (Some(*host), &t[host.len() + 1..]),
+            _ => return None,
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).to_lowercase();
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return None;
+    }
+    Some(RepoName {
+        host: host.filter(|h| !h.is_empty()).map(str::to_lowercase),
+        path,
+    })
+}
+
+/// Whether the repository a session works in is one of `named` (as
+/// `[oversight.full] repos` writes them): by its `origin` remote's address
+/// (`owner/name`, or the whole address), or by a local checkout's path,
+/// which must be its main checkout or the worktree itself (`checkouts`,
+/// real). A path named is read as `real` resolves it, `~` the home.
+pub fn repo_named(
+    origin: Option<&str>,
+    checkouts: &[PathBuf],
+    named: &[String],
+    home: &Path,
+    real: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> bool {
+    let origin = origin.and_then(repo_name);
+    let checkouts: Vec<PathBuf> = checkouts.iter().map(|c| boss::fold(c)).collect();
+    named.iter().any(|n| {
+        let n = n.trim();
+        let path = if n == "~" {
+            Some(home.to_path_buf())
+        } else if let Some(rest) = n.strip_prefix("~/") {
+            Some(home.join(rest))
+        } else if n.starts_with('/') {
+            Some(PathBuf::from(n))
+        } else {
+            None
+        };
+        if let Some(p) = path {
+            return real(&p).is_some_and(|p| checkouts.contains(&boss::fold(&p)));
+        }
+        match (repo_name(n), &origin) {
+            (Some(want), Some(have)) => {
+                want.path == have.path
+                    && want
+                        .host
+                        .as_ref()
+                        .is_none_or(|h| have.host.as_ref() == Some(h))
+            }
+            _ => false,
+        }
+    })
+}
+
 // ── What a boss answers for ─────────────────────────────────────────────
 
 /// Where a boss's answers for its sessions are judged: the person's home,
@@ -282,6 +373,8 @@ pub struct Facts {
     pub branch: Option<String>,
     /// The repository's default branch, when it says (`origin/HEAD`).
     pub default_branch: Option<String>,
+    /// The boss acts fully in this repository: what ships is its to allow.
+    pub ships: bool,
     pub what: What,
 }
 
@@ -327,7 +420,7 @@ fn under(pattern: &str) -> &str {
 
 /// The folder a session works in: its cwd, or the worktree under
 /// `.worktrees/` that holds it.
-fn own_folder(cwd: &Path) -> PathBuf {
+pub(crate) fn own_folder(cwd: &Path) -> PathBuf {
     let parts: Vec<Component<'_>> = cwd.components().collect();
     match parts
         .iter()
@@ -380,6 +473,7 @@ pub fn facts_of(
         cwd,
         branch: None,
         default_branch: None,
+        ships: false,
         what,
     }
 }
@@ -487,6 +581,7 @@ pub fn answerable(
                 real,
                 branch: facts.branch.as_deref(),
                 default_branch: facts.default_branch.as_deref(),
+                ships: facts.ships,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
@@ -735,6 +830,70 @@ mod tests {
         c.wheel = Wheel::PersonPinned;
         c.wheel_since = Some(ago(600));
         assert_eq!(wheel(&c, None, HOLD, now), Wheel::PersonPinned);
+    }
+
+    #[test]
+    fn a_repository_is_named_by_its_origin_or_its_checkout() {
+        let gh = |p: &str| RepoName {
+            host: Some("github.com".into()),
+            path: p.into(),
+        };
+        for (text, want) in [
+            (
+                "git@github.com:acme/acme-web.git",
+                Some(gh("acme/acme-web")),
+            ),
+            (
+                "https://github.com/Acme/Acme-Web",
+                Some(gh("acme/acme-web")),
+            ),
+            (
+                "ssh://git@github.com:22/acme/acme-web.git",
+                Some(gh("acme/acme-web")),
+            ),
+            ("github.com/acme/acme-web", Some(gh("acme/acme-web"))),
+            (
+                "acme/acme-web",
+                Some(RepoName {
+                    host: None,
+                    path: "acme/acme-web".into(),
+                }),
+            ),
+            ("acme-web", None),
+            ("~/dev/acme-web", None),
+            ("https://github.com/acme", None),
+        ] {
+            assert_eq!(repo_name(text), want, "{text}");
+        }
+        let home = Path::new("/Users/sam");
+        let real = |p: &Path| Some(p.to_path_buf());
+        let origin = Some("git@github.com:acme/acme-web.git");
+        let main = [PathBuf::from("/Users/sam/dev/acme-web")];
+        let named = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for yes in [
+            named(&["acme/acme-web"]),
+            named(&["globex/globex-api", "ACME/acme-web"]),
+            named(&["https://github.com/acme/acme-web.git"]),
+            named(&["~/dev/acme-web"]),
+            named(&["/Users/sam/dev/acme-web"]),
+        ] {
+            assert!(repo_named(origin, &main, &yes, home, &real), "{yes:?}");
+        }
+        for no in [
+            named(&[]),
+            named(&["globex/globex-api"]),
+            named(&["acme/acme-web-fork"]),
+            named(&["gitlab.com/acme/acme-web"]),
+            named(&["~/dev"]),
+            named(&["/Users/sam/dev/acme-web/src"]),
+            named(&["acme-web"]),
+        ] {
+            assert!(!repo_named(origin, &main, &no, home, &real), "{no:?}");
+        }
+        assert!(
+            !repo_named(None, &[], &named(&["acme/acme-web"]), home, &real),
+            "no origin, no checkout: not named"
+        );
     }
 
     #[test]

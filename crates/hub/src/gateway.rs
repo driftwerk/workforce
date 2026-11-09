@@ -14912,13 +14912,13 @@ mod vault_admin_tests {
         assert_eq!(plain(&body), "Saving the change failed; try again.");
 
         let (status, body) = said(Refused::Unloadable(ConfigRefusal::Said(
-            "How much the overseer does on its own must be watch, suggest or act.".into(),
+            "How much the overseer does on its own must be watch, suggest, act or full.".into(),
         )));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             plain(&body),
             "That change couldn’t be saved. How much the overseer does on its own must be \
-             watch, suggest or act."
+             watch, suggest, act or full."
         );
         assert!(body.get("findings").is_none(), "{body}");
 

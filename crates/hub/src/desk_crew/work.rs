@@ -323,7 +323,7 @@ impl CrewHub {
         }
         for (service, o) in &overseers {
             // Watching only, it runs nothing.
-            if o.level != Level::Act || o.work.take_on != TakeOn::All {
+            if !o.level.acts() || o.work.take_on != TakeOn::All {
                 continue;
             }
             let boss = party(service);

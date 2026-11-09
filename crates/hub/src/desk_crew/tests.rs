@@ -496,7 +496,7 @@ async fn one_agent_oversees_and_has_the_tools_its_level_allows() {
         .unwrap_err();
         assert_eq!(
             refused.to_string(),
-            "the agent would not load that: How much the overseer does on its own must be watch, suggest or act."
+            "the agent would not load that: How much the overseer does on its own must be watch, suggest, act or full."
         );
     })
     .await;
@@ -1784,6 +1784,8 @@ mod groups;
 mod handovers;
 
 mod plans;
+
+mod act_fully;
 
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them

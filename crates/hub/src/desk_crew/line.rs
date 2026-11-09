@@ -408,7 +408,8 @@ impl CrewHub {
                     };
                     match self.gate(&action, &o) {
                         Gate::Run => {
-                            if let Err(e) = self.perform(&action, by.clone()).await {
+                            let by = self.by_at_level(by.clone(), &o);
+                            if let Err(e) = self.perform(&action, by).await {
                                 tracing::info!(error = %e, "the overseer's reply didn't answer");
                             }
                         }
@@ -473,6 +474,21 @@ impl CrewHub {
                 format!("- message {} ({kind}): {}", m.id, m.full_text())
             })
             .collect();
+        // Acting fully in its repository, shipping is the overseer's too.
+        let (level, outward) = match self.ships_in(session, o) {
+            true => (
+                Level::Full,
+                "deletes, spends, sends to people, changes scope or touches secrets (merging, pushing to the \
+                 default branch, tagging, promoting and deploying this repository are yours at Act fully)",
+            ),
+            false => (
+                match o.level {
+                    Level::Full => Level::Act,
+                    l => l,
+                },
+                "pushes, deletes, deploys, spends, sends to people or changes scope",
+            ),
+        };
         if !ended.is_empty() {
             let said = match lines.is_empty() {
                 true => String::new(),
@@ -484,21 +500,20 @@ impl CrewHub {
                 ),
             };
             return format!(
-                "{}\n{about}{said}\n\nAlways give the person anything that pushes, deletes, deploys, spends, \
-                 sends to people or changes scope. {}",
+                "{}\n{about}{said}\n\nAlways give the person anything that {outward}. {}",
                 self.work_intro(session, ended, o),
-                Self::level_line(o.level),
+                Self::level_line(level),
             );
         }
         format!(
             "{LINE} A session on Desk's line (session_id {session}) wrote to you, its overseer:\n{about}\n\n{}\n\n\
              For each question: answer it with crew.nudge (session_id, reply_to = the message id, message), \
              or give it to the person with crew.escalate (message_id, reason, options, draft) — always for \
-             anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever \
+             anything that {outward}, and whenever \
              you are unsure. A reply with no tool call is taken as your answer to a single question. \
              Messages that only tell you something need no answer. {}",
             reported(&lines.join("\n"), "the session"),
-            Self::level_line(o.level),
+            Self::level_line(level),
         )
     }
 
@@ -507,6 +522,7 @@ impl CrewHub {
             Level::Watch => "You only watch.",
             Level::Suggest => "You suggest: an answer you give becomes a draft the person sends.",
             Level::Act => "You may answer within what the person allowed; anything else becomes a draft for them.",
+            Level::Full => "You act fully: within what the person allowed, and in the repositories they named also on merging, pushing to the default branch, tagging, promoting and deploying. Anything else becomes a draft for them. Never secrets, registries, force pushes, remote deletes or your own limits.",
         }
     }
 

@@ -38,6 +38,10 @@ pub(crate) struct Charges {
     /// How long the person's input holds each boss's sessions, by agent
     /// id, as its settings say; [`charge::HOLD`] for one not said.
     holds: HashMap<String, chrono::Duration>,
+    /// The repositories each boss acting fully may ship in, by agent id:
+    /// only those whose Act fully is in force (named repositories, a
+    /// budget not yet spent), as the hub says.
+    full: HashMap<String, Vec<String>>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -134,6 +138,43 @@ impl Desk {
         self.0.state.lock().charges.holds = holds;
     }
 
+    /// The repositories each boss acting fully may ship in, by its agent
+    /// id, as the hub reads their settings and spend: a boss left out
+    /// doesn't act fully anywhere.
+    pub fn set_full_repos(&self, full: HashMap<String, Vec<String>>) {
+        self.0.state.lock().charges.full = full;
+    }
+
+    /// The repositories `boss` acts fully in now; none when it doesn't.
+    fn full_repos(&self, boss: &str) -> Vec<String> {
+        self.0
+            .state
+            .lock()
+            .charges
+            .full
+            .get(boss)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether `boss` acts fully in the repository session `id` works in:
+    /// its own folder's, named in `[oversight.full] repos`.
+    pub fn acts_fully_in(&self, id: Uuid, boss: &str) -> bool {
+        let named = self.full_repos(boss);
+        if named.is_empty() {
+            return false;
+        }
+        let Ok(view) = self.view(id) else {
+            return false;
+        };
+        let home = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone());
+        let Some(home) = home else {
+            return false;
+        };
+        let own = charge::own_folder(std::path::Path::new(&view.cwd));
+        repo_of_own(&own).is_some_and(|r| r.named(&named, &home))
+    }
+
     /// How long the person's input holds a session `boss` runs, as the hub
     /// last said.
     pub fn hold_for(&self, boss: &str) -> chrono::Duration {
@@ -224,9 +265,15 @@ impl Desk {
         *self.0.boss_bounds.lock() = Some(bounds);
     }
 
-    /// Whether the boss running `id` may answer its open request
-    /// `approval` itself; why not, in the person's words, when it may not.
-    pub fn boss_answerable(&self, id: Uuid, approval: Uuid) -> Result<(), charge::Irreversible> {
+    /// Whether `boss` may answer `id`'s open request `approval` itself; why
+    /// not, in the person's words, when it may not. Where it acts fully,
+    /// what ships is its to allow too.
+    pub fn boss_answerable(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        boss: &str,
+    ) -> Result<(), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
         let Some(bounds) = self.0.boss_bounds.lock().clone() else {
             return no("Desk can't judge requests for a boss yet");
@@ -259,6 +306,9 @@ impl Desk {
                     &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
                 )
                 .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+                let named = self.full_repos(boss);
+                facts.ships = !named.is_empty()
+                    && repo_of_own(&facts.own).is_some_and(|r| r.named(&named, &bounds.home));
             }
         }
         charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
@@ -334,7 +384,7 @@ impl Desk {
         match decision {
             Decision::Deny | Decision::Cancel => Ok(()),
             Decision::Allow => self
-                .boss_answerable(id, approval)
+                .boss_answerable(id, approval, &boss.party.id)
                 .map_err(|why| DeskError::Conflict(format!("{why}: it's the person's to allow"))),
             Decision::AllowForSession | Decision::Terminal => Err(DeskError::Invalid(
                 "only the person answers for the rest of a session".into(),
@@ -767,6 +817,59 @@ fn quiet_for(hold: chrono::Duration) -> String {
         1 => "1 quiet minute".into(),
         n => format!("{n} quiet minutes"),
     }
+}
+
+/// The repository a session's own folder is: its `origin`'s address and
+/// its checkouts (the folder itself and, for a worktree, the main one).
+struct OwnRepo {
+    origin: Option<String>,
+    checkouts: Vec<std::path::PathBuf>,
+}
+
+impl OwnRepo {
+    fn named(&self, named: &[String], home: &std::path::Path) -> bool {
+        charge::repo_named(
+            self.origin.as_deref(),
+            &self.checkouts,
+            named,
+            home,
+            &crate::computer::boss::resolve_real,
+        )
+    }
+}
+
+/// The repository whose top is `own`, a session's own folder; `None` when
+/// it is no repository's top (a nested folder, no repository at all).
+fn repo_of_own(own: &std::path::Path) -> Option<OwnRepo> {
+    use crate::computer::boss::resolve_real;
+    let own_real = resolve_real(own)?;
+    let top = git_line(own, &["rev-parse", "--show-toplevel"])
+        .and_then(|t| resolve_real(std::path::Path::new(&t)))?;
+    if top != own_real {
+        return None;
+    }
+    let mut checkouts = vec![top];
+    // A worktree's main checkout holds the repository it shares.
+    if let Some(common) = git_line(
+        own,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        let common = std::path::PathBuf::from(common);
+        if let Some(main) = common
+            .file_name()
+            .filter(|n| *n == ".git")
+            .and_then(|_| common.parent())
+            .and_then(resolve_real)
+        {
+            if !checkouts.contains(&main) {
+                checkouts.push(main);
+            }
+        }
+    }
+    Some(OwnRepo {
+        origin: git_line(own, &["remote", "get-url", "origin"]),
+        checkouts,
+    })
 }
 
 /// One line git prints in `dir`, or `None` when it can't say.
