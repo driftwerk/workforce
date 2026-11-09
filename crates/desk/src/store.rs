@@ -346,11 +346,13 @@ impl MigrationRun for Embedded {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, SubsecRound, Utc};
     use workforce_postgres::test_support::with_test_pool;
 
     pub(crate) fn record_fixture(name: &str) -> SessionRecord {
-        let now = Utc::now();
+        // To the microsecond: Postgres keeps no finer, so a nanosecond
+        // stamp reads back unequal to itself.
+        let now = Utc::now().trunc_subsecs(6);
         SessionRecord {
             id: Uuid::new_v4(),
             engine: Engine::Claude,
