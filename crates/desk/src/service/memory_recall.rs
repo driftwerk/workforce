@@ -40,6 +40,8 @@ pub struct Recalled {
     /// Only keywords were matched: there is no search index ready.
     pub keyword_only: bool,
     pub notice: Option<&'static str>,
+    /// The most a session's recall covers, as this one read it.
+    pub session_reach: Reach,
 }
 
 /// The setting key of the person's narrower session reach.
@@ -57,7 +59,8 @@ impl Desk {
         }
         let limit = r.limit.max(1);
         let known = self.0.store.memory_groups().await?;
-        let b = bound(reader, self.session_reach().await, r.reach, &known)
+        let session_reach = self.session_reach().await;
+        let b = bound(reader, session_reach, r.reach, &known)
             .narrowed(r.group.as_ref().map(|g| g.as_deref()), r.session);
         if b.is_empty() {
             tracing::info!(
@@ -69,6 +72,7 @@ impl Desk {
                 hits: Vec::new(),
                 keyword_only: self.memory_index_up().is_none(),
                 notice: None,
+                session_reach,
             });
         }
         let wanted = limit * 3;
@@ -152,12 +156,20 @@ impl Desk {
             .collect();
         let hit_ids: Vec<Uuid> = hits.iter().map(|(r, _)| r.id).collect();
         let group = one_group(hits.iter().map(|(r, _)| r.group.as_deref()));
+        // Kept as everything Desk remembers is: with every secret in it
+        // hidden, or not at all.
+        let query = self
+            .0
+            .ledger
+            .redactor
+            .as_ref()
+            .map(|redactor| redactor.stored(&r.q).text.into_owned());
         self.0
             .store
             .memory_read(
                 &reader.label(),
                 r.tool,
-                Some(&r.q),
+                query.as_deref(),
                 &hit_ids,
                 group.as_deref(),
             )
@@ -166,6 +178,7 @@ impl Desk {
             hits,
             keyword_only,
             notice,
+            session_reach,
         })
     }
 
@@ -224,7 +237,7 @@ impl Desk {
 
     /// The most a session's recall covers: the install's, or the person's
     /// narrower setting.
-    async fn session_reach(&self) -> Reach {
+    pub(super) async fn session_reach(&self) -> Reach {
         let install = self.0.opts.memory.session_reach;
         let person = self
             .0

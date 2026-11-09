@@ -573,8 +573,20 @@ fn options(config: &WorkforceConfig) -> Options {
                 .unwrap_or(workforce_desk::memory::reach::Reach::Project),
             derive: desk.memory.derive != "off",
             derive_calls_per_day: desk.memory.derive_calls_per_day,
+            machine: may_be_machine(desk),
         },
     }
+}
+
+/// Whether this hub might be a machine's: unless Desk's helper said it is
+/// the person's own computer (`[desk] machine = false`), and nothing else
+/// says it is a machine's (`agents = false`, `restore = "auto"`, as the
+/// helper writes a machine's), it is taken to be one. Fails closed: a
+/// config written before `machine` was, or edited by hand, is a machine's.
+fn may_be_machine(desk: &workforce_common::settings::DeskConfig) -> bool {
+    desk.machine != Some(false)
+        || !desk.agents
+        || desk.restore == workforce_common::settings::DeskRestore::Auto
 }
 
 /// Where `[desk.accounts]` says the person's engine accounts' sign-ins are
@@ -793,6 +805,29 @@ pub async fn mount(
 
 #[cfg(test)]
 mod tests {
+
+    /// A session may recall only on a hub Desk said is the person's own
+    /// computer, and nothing else marks a machine's.
+    #[test]
+    fn only_a_hub_desk_says_is_this_computer_is_no_machine() {
+        let parse = |toml: &str| {
+            toml::from_str::<workforce_common::settings::WorkforceConfig>(toml)
+                .unwrap()
+                .desk
+        };
+        let cases = [
+            ("[desk]\nenabled = true\nmachine = false\n", false),
+            // Written before `machine` was, or by hand: unknown.
+            ("[desk]\nenabled = true\n", true),
+            ("[desk]\nenabled = true\nmachine = true\n", true),
+            // A machine's, as the helper writes it, whatever `machine` says.
+            ("[desk]\nmachine = false\nagents = false\n", true),
+            ("[desk]\nmachine = false\nrestore = \"auto\"\n", true),
+        ];
+        for (toml, machine) in cases {
+            assert_eq!(super::may_be_machine(&parse(toml)), machine, "{toml}");
+        }
+    }
 
     /// Moves (preview and commit) are the hub holder's alone: an
     /// administrator's own sign-in passes, anyone else is refused, and the

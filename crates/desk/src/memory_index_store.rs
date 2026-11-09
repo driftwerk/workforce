@@ -686,6 +686,18 @@ pub struct RecallItem {
     pub superseded: bool,
 }
 
+/// One exchange in full, as `recall_read` gives it, with the facts its
+/// last check needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullExchange {
+    pub id: Uuid,
+    pub session: Uuid,
+    pub group: Option<String>,
+    pub project: String,
+    pub flagged: bool,
+    pub exchange: crate::memory_store::KeptExchange,
+}
+
 /// [`Bound`]'s parts as SQL parameters: the groups named, whether
 /// ungrouped is among them, and the sessions and projects it keeps to.
 fn bound_params(b: &Bound) -> (Vec<String>, bool, Option<Vec<Uuid>>, Option<Vec<String>>) {
@@ -774,6 +786,44 @@ impl DeskStore {
             });
         }
         Ok(rows)
+    }
+
+    /// The exchange `id` in full, as kept.
+    pub async fn memory_exchange(&self, id: Uuid) -> Result<Option<FullExchange>> {
+        let client = self.pool().get().await?;
+        let Some(r) = client
+            .query_opt(
+                "SELECT id, session, group_id, project, cardinality(flagged) > 0, seq, at, ended, \
+                   asker, ask, answer, steps, files, commands, errors, compaction, redacted \
+                 FROM memory_exchanges WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .context("reading a recalled exchange")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(FullExchange {
+            id: r.try_get(0)?,
+            session: r.try_get(1)?,
+            group: r.try_get(2)?,
+            project: r.try_get(3)?,
+            flagged: r.try_get(4)?,
+            exchange: crate::memory_store::KeptExchange {
+                seq: r.try_get(5)?,
+                at: r.try_get(6)?,
+                ended: r.try_get(7)?,
+                asker: crate::memory::record::Asker::parse(r.try_get(8)?)?,
+                ask: r.try_get(9)?,
+                answer: r.try_get(10)?,
+                steps: serde_json::from_value(r.try_get(11)?).unwrap_or_default(),
+                files: r.try_get(12)?,
+                commands: r.try_get(13)?,
+                errors: r.try_get(14)?,
+                compaction: r.try_get(15)?,
+                redacted: r.try_get(16)?,
+            },
+        }))
     }
 
     /// The exchanges and notes within `bound` whose words match `q`, of

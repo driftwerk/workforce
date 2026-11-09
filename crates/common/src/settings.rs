@@ -748,6 +748,13 @@ pub struct DeskConfig {
     /// left from before are forgotten when it starts. Default: on.
     #[serde(default = "default_true")]
     pub agents: bool,
+    /// Whether this hub is a machine's (`true`) or the person's own
+    /// computer's (`false`), as Desk's helper writes it on every start.
+    /// Unset means unknown, and whatever might be a machine's is refused:
+    /// a machine keeps none of its sessions' groups (the Desk driving it
+    /// does), so a session's recall there would cross clients.
+    #[serde(default)]
+    pub machine: Option<bool>,
     /// Agents this hub served before and serves no more, whose chat
     /// sessions and Floor rows it forgets, once each, when it starts with
     /// `agents` off: a machine's old Desk agent (`["desk"]`). Never any other
@@ -959,6 +966,7 @@ impl Default for DeskConfig {
             github_client_id: None,
             accounts: DeskAccounts::default(),
             agents: true,
+            machine: None,
             forget_agents: Vec::new(),
             memory: DeskMemoryConfig::default(),
         }
@@ -11691,6 +11699,7 @@ default = true
 # approval_timeout_secs = 3600 # Then the terminal asks instead
 # adopt_interval_secs = 5      # Look for sessions in other terminals (0 = off)
 # agents = true                # false: run Desk's sessions only, no agents (a machine's)
+# machine = false              # written by Desk: true on a machine, false on this computer
 
 # Heartbeat — periodic agent check-ins.
 # [heartbeat]

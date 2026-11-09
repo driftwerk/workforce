@@ -689,6 +689,20 @@ impl Desk {
         }
     }
 
+    /// The project `r`'s harvest stamps on what it keeps of it: its
+    /// repository's main folder, found once.
+    pub(super) async fn project_of(&self, r: &SessionRecord) -> String {
+        if let Some(known) = self.0.ledger.projects.lock().get(&r.id).cloned() {
+            return known;
+        }
+        let cwd = r.cwd.clone();
+        let project = tokio::task::spawn_blocking(move || crate::worktree::git_project(&cwd))
+            .await
+            .unwrap_or_else(|_| r.cwd.clone());
+        self.0.ledger.projects.lock().insert(r.id, project.clone());
+        project
+    }
+
     /// The ledger summed as `q` asks, in the person's timezone.
     pub async fn spend(&self, q: &SpendQuery) -> Result<SpendView, DeskError> {
         let tz = self.timezone();

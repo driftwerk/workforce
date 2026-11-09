@@ -81,6 +81,9 @@ mod memory_derive_tests;
 mod memory_index;
 #[cfg(test)]
 mod memory_index_tests;
+mod memory_line;
+#[cfg(test)]
+mod memory_line_tests;
 mod memory_recall;
 mod moves;
 #[cfg(test)]
