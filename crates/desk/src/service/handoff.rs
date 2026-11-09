@@ -470,10 +470,12 @@ impl Desk {
                     .map(|x| x.ask.clone());
             }
         }
-        let (purpose, now) = match (&self.0.derive.deriver, since) {
+        let (purpose, now) = match (&self.0.derive.deriver, since, content) {
             // A hand back's source began as its brief: its purpose is the
-            // work's, which the session resumed already knows.
-            (Some(d), None) => d.gist(r.id).await,
+            // work's, which the session resumed already knows. Only the
+            // goal goes with nothing but the goal: the gist is read from
+            // the conversation that can't be handed over.
+            (Some(d), None, Content::Brief) => d.gist(r.id).await,
             _ => (None, None),
         };
         let (purpose, now, goal) = (
@@ -484,25 +486,23 @@ impl Desk {
                 Some(_) => None,
             },
         );
-        let (branch, head, dirty) = crate::worktree::state_of(Path::new(&r.cwd)).await;
-        let git = GitState {
-            branch: self.redacted(branch.as_deref()),
-            head,
-            dirty: dirty
-                .iter()
-                .filter_map(|d| self.redacted(Some(d)))
-                .collect(),
-            new_worktree: place == Place::NewWorktree,
+        let git = match content {
+            Content::Brief => {
+                let (branch, head, dirty) = crate::worktree::state_of(Path::new(&r.cwd)).await;
+                GitState {
+                    branch: self.redacted(branch.as_deref()),
+                    head,
+                    dirty: dirty
+                        .iter()
+                        .filter_map(|d| self.redacted(Some(d)))
+                        .collect(),
+                    new_worktree: place == Place::NewWorktree,
+                }
+            }
+            Content::GoalOnly => GitState::default(),
         };
-        let account = r.account.and_then(|a| {
-            self.accounts()
-                .into_iter()
-                .find(|v| v.id == a)
-                .map(|v| v.name)
-        });
         let source = SourceInfo {
             engine: r.engine,
-            account,
             name: named(r).to_string(),
             folder: r.cwd.clone(),
         };
@@ -563,6 +563,16 @@ impl Desk {
         }
     }
 
+    /// Whether Desk would note more of `id` than it has, without asking
+    /// it to.
+    async fn notes_unwritten(&self, id: Uuid, group: Option<&str>) -> Result<bool, DeskError> {
+        if !self.notes_allowed(id, group).await? {
+            return Ok(false);
+        }
+        let q = self.0.store.derive_queued(id).await?;
+        Ok(q.unread > 0 && q.failed.is_none())
+    }
+
     /// Whether `group`'s switches ask the person before each handoff.
     async fn asks_each_time(&self, group: Option<&str>) -> Result<bool, DeskError> {
         let Some(g) = group else {
@@ -619,14 +629,21 @@ impl Desk {
     }
 
     /// What a handoff of `id` as `ask` asks would give: its brief and what
-    /// the person reads of it. Desk notes what it hasn't of the source
-    /// first, waiting a while for it.
-    pub async fn handoff_preview(&self, id: Uuid, ask: &Ask) -> Result<HandoffPreview, DeskError> {
+    /// the person reads of it. With `derive`, Desk notes what it hasn't of
+    /// the source first, waiting a while for it: only when the person asks
+    /// for the preview, never for a prefetch, which spends no model call.
+    pub async fn handoff_preview(
+        &self,
+        id: Uuid,
+        ask: &Ask,
+        derive: bool,
+    ) -> Result<HandoffPreview, DeskError> {
         let c = self.handoff_checked(id, ask).await?;
         let group = c.facts.source_group.as_deref();
-        let notes_pending = match c.content {
-            Content::Brief => self.notes_now(id, group).await?,
-            Content::GoalOnly => false,
+        let notes_pending = match (c.content, derive) {
+            (Content::Brief, true) => self.notes_now(id, group).await?,
+            (Content::Brief, false) => self.notes_unwritten(id, group).await?,
+            (Content::GoalOnly, _) => false,
         };
         let (b, budget) = self
             .write_brief(
@@ -700,12 +717,7 @@ impl Desk {
             )));
         }
         let notes_pending = match c.content {
-            Content::Brief => self
-                .0
-                .store
-                .derive_queued(id)
-                .await
-                .is_ok_and(|q| q.unread > 0 && q.failed.is_none()),
+            Content::Brief => self.notes_unwritten(id, group.as_deref()).await?,
             Content::GoalOnly => false,
         };
         let (b, _) = self
@@ -716,7 +728,7 @@ impl Desk {
                 c.content,
                 c.ask.place,
                 c.since,
-                notes_pending && self.notes_allowed(id, group.as_deref()).await?,
+                notes_pending,
                 &nonce(),
             )
             .await?;
@@ -801,16 +813,14 @@ impl Desk {
             }
         };
         let id = Uuid::new_v4();
-        let account = self
-            .account_for(c.target, c.ask.account)?
-            .and_then(|a| self.accounts().into_iter().find(|v| v.id == a))
-            .map(|v| v.name);
+        let account = self.account_for(c.target, c.ask.account)?;
+        self.still_in_group(c, &[r.id])?;
         self.0
             .store
             .put_lineage(&LineageWrite {
                 session: id,
                 link,
-                account: account.as_deref(),
+                account,
                 brief: Some(brief),
                 included: &link.included,
             })
@@ -848,6 +858,21 @@ impl Desk {
         }
     }
 
+    /// Refuses when any of `sessions` left the group `c` was checked in
+    /// since: read again just before the lineage is written, so a move
+    /// made meanwhile never takes a brief across groups.
+    fn still_in_group(&self, c: &Checked, sessions: &[Uuid]) -> Result<(), DeskError> {
+        let moved = sessions.iter().any(|s| {
+            self.group_of_member(&session_item(*s))
+                .filter(|g| g != UNGROUPED)
+                != c.facts.source_group
+        });
+        match moved {
+            true => Err(DeskError::Conflict(rules::Refusal::CrossGroup.to_string())),
+            false => Ok(()),
+        }
+    }
+
     /// Resumes `back`, the session `c`'s work came from, with what happened
     /// since: its lineage and brief kept first, put back if it doesn't
     /// resume.
@@ -861,16 +886,13 @@ impl Desk {
         by: &By,
     ) -> Result<SessionView, DeskError> {
         let was: Option<KeptLineage> = self.0.store.lineage_row(back.id).await?;
-        let account = back
-            .account
-            .and_then(|a| self.accounts().into_iter().find(|v| v.id == a))
-            .map(|v| v.name);
+        self.still_in_group(c, &[c.r.id, back.id])?;
         self.0
             .store
             .put_lineage(&LineageWrite {
                 session: back.id,
                 link,
-                account: account.as_deref(),
+                account: back.account,
                 brief: Some(brief),
                 included: &link.included,
             })
@@ -1095,6 +1117,9 @@ impl Desk {
                 "brief": null,
                 "note": "No work was handed to you from another session, so Desk holds no brief for you. Use recall to look for earlier work.",
             }));
+        };
+        let Some(text) = text else {
+            return Ok(json!({ "brief": null, "note": "The brief for this work was forgotten." }));
         };
         if &given_in != group {
             tracing::info!(session = %caller, "a session asked for a brief given in another group; refused");

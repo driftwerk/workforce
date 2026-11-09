@@ -186,6 +186,7 @@ async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: boo
         super::Floor {
             redactor: Some(Arc::new(Plain) as Arc<dyn crate::memory::Redactor>),
             turns: Some(Arc::clone(&logged) as Arc<dyn crate::floor::TurnLog>),
+            deriver: Some(deriver() as Arc<dyn crate::memory::derive::Deriver>),
             ..Default::default()
         },
         cancel.clone(),
@@ -208,6 +209,13 @@ async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: boo
         logged,
         _cancel: cancel,
     }
+}
+
+/// Desk's model, as the gists know each session's purpose.
+fn deriver() -> Arc<crate::memory::derive::fake::FakeDeriver> {
+    let d = crate::memory::derive::fake::FakeDeriver::default();
+    *d.purpose.lock() = Some("Making sign-in safe against a race.".into());
+    Arc::new(d)
 }
 
 fn to(engine: Engine) -> Ask {
@@ -273,7 +281,7 @@ async fn a_globex_note_never_reaches_an_acme_brief_and_the_brief_says_what_it_le
         .await;
 
         let p =
-            w.d.handoff_preview(w.acme, &to(Engine::Codex))
+            w.d.handoff_preview(w.acme, &to(Engine::Codex), false)
                 .await
                 .unwrap();
         for never in ["Globex", "globex-only", "print the vault"] {
@@ -312,14 +320,14 @@ async fn a_globex_note_never_reaches_an_acme_brief_and_the_brief_says_what_it_le
         assert_eq!(p.brief.matches(MARKER).count(), 2);
         // Each preview's wrapping is its own.
         let again =
-            w.d.handoff_preview(w.acme, &to(Engine::Codex))
+            w.d.handoff_preview(w.acme, &to(Engine::Codex), false)
                 .await
                 .unwrap();
         assert_ne!(p.brief, again.brief);
 
         // Globex's session's brief holds Globex's, and nothing of Acme's.
         let theirs =
-            w.d.handoff_preview(w.globex, &to(Engine::Codex))
+            w.d.handoff_preview(w.globex, &to(Engine::Codex), false)
                 .await
                 .unwrap();
         assert!(theirs
@@ -343,7 +351,7 @@ async fn on_a_machines_engine_nothing_is_handed_on() {
                 ..Ask::default()
             },
         ] {
-            let e = w.d.handoff_preview(w.acme, &ask).await.unwrap_err();
+            let e = w.d.handoff_preview(w.acme, &ask, false).await.unwrap_err();
             assert_eq!(
                 e.to_string(),
                 "Continuing on a machine comes with group grants."
@@ -484,7 +492,7 @@ async fn work_is_handed_back_to_the_session_it_came_from_with_only_what_is_new()
         // The preview on the target offers to hand it back.
         let p = w
             .d
-            .handoff_preview(codex, &Ask { back: true, ..Ask::default() })
+            .handoff_preview(codex, &Ask { back: true, ..Ask::default() }, false)
             .await
             .unwrap();
         assert_eq!(p.engine, Engine::Claude);
@@ -546,6 +554,7 @@ async fn forgetting_a_session_forgets_the_briefs_written_from_it() {
                 .await
                 .unwrap();
         assert!(read["brief"].is_null(), "{read}");
+        assert_eq!(read["note"], "The brief for this work was forgotten.");
         let client = w.store.pool().get().await.unwrap();
         let kept: i64 = client
             .query_one(
@@ -753,6 +762,63 @@ async fn forgetting_the_session_a_work_went_to_gives_it_back() {
         };
         let again = w.d.handoff(w.acme, &ask, By::you()).await.unwrap();
         assert_eq!(w.d.lineage().head(w.acme), again.session.id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_only_the_goal_nothing_but_the_goal_goes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        w.store.set_session_memory(w.acme, false).await.unwrap();
+        let e =
+            w.d.handoff_preview(w.acme, &to(Engine::Codex), false)
+                .await
+                .unwrap_err();
+        assert!(e.to_string().contains("only the goal"), "{e}");
+        let full =
+            w.d.handoff_preview(w.globex, &to(Engine::Codex), false)
+                .await
+                .unwrap();
+        assert!(
+            full.brief.contains("Making sign-in safe"),
+            "a full brief has the purpose"
+        );
+        let ask = Ask {
+            goal_only: true,
+            ..to(Engine::Codex)
+        };
+        let p = w.d.handoff_preview(w.acme, &ask, false).await.unwrap();
+        let open = p.brief.find("<<<EXTERNAL_UNTRUSTED_CONTENT_").unwrap();
+        let start = open + p.brief[open..].find(">>>\n").unwrap() + 4;
+        let end = p.brief.find("<<</EXTERNAL_UNTRUSTED_CONTENT_").unwrap();
+        assert_eq!(
+            &p.brief[start..end],
+            "## Goal\nThe session's goal: fix the auth race\n",
+            "nothing of the session but its goal"
+        );
+        for never in [
+            "Making sign-in safe",
+            "Fix the login race",
+            "HttpOnly",
+            "cargo test",
+        ] {
+            assert!(!p.brief.contains(never), "{never} went");
+        }
+        let i = p.included;
+        assert!(i.goal);
+        assert_eq!(
+            (
+                i.decisions,
+                i.todos,
+                i.facts,
+                i.exchanges,
+                i.of_exchanges,
+                i.files
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
     })
     .await;
 }
