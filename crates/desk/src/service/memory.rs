@@ -788,16 +788,21 @@ impl Desk {
     /// Forgets what Desk remembers of session `id`, whether or not Desk
     /// still has the session: its exchanges and notes go, and its
     /// conversation, records and exchanges are never harvested again.
-    pub async fn forget_memory(&self, id: Uuid) -> Result<(), DeskError> {
+    /// What the person should know of it: where its work was handed on to,
+    /// whose own conversations may still hold what they read.
+    pub async fn forget_memory(&self, id: Uuid) -> Result<Option<String>, DeskError> {
         match self.0.store.forget_memory(id).await? {
             true => {
+                // What it handed on goes first, while its gist is there to
+                // tell it by.
+                let notice = self.carried_forgotten(id);
                 // Its gist goes too; its turns are the Floor's.
                 self.log_turns(vec![crate::floor::TurnOp::ForgetGists {
                     subjects: vec![crate::floor::SubjectKey::session(id)],
                 }]);
                 self.memory_index_poke();
                 self.measure_memory().await;
-                Ok(())
+                Ok(notice)
             }
             false => Err(DeskError::NotFound),
         }

@@ -169,6 +169,38 @@ impl Desk {
         self.0.handoff.lineage.lock().forget(id);
     }
 
+    /// Session `id` is being forgotten: what its work was handed on with
+    /// goes from the Floor's gists of every session it reached, down the
+    /// chain, unless one wrote its own since. What the person should know:
+    /// those sessions' own conversations may still hold what they read.
+    pub(super) fn carried_forgotten(&self, id: Uuid) -> Option<String> {
+        let reached = self.0.handoff.lineage.lock().carried_from(id);
+        if reached.is_empty() {
+            return None;
+        }
+        self.log_turns(vec![TurnOp::ForgetCarried {
+            from: SubjectKey::session(id),
+            to: reached.iter().copied().map(SubjectKey::session).collect(),
+        }]);
+        let names: Vec<String> = reached
+            .iter()
+            .map(|s| {
+                self.record(*s).map_or_else(
+                    |_| "a session since forgotten".into(),
+                    |r| named(&r).to_string(),
+                )
+            })
+            .collect();
+        let one = names.len() == 1;
+        Some(format!(
+            "Its work was handed on to {}. Desk forgets what it gave {}, but {} own conversation may still hold what {} read.",
+            names.join(", "),
+            if one { "it" } else { "them" },
+            if one { "its" } else { "their" },
+            if one { "it" } else { "they" },
+        ))
+    }
+
     /// Handoff's lineage as it is now.
     pub(super) fn lineage(&self) -> Lineage {
         self.0.handoff.lineage.lock().clone()

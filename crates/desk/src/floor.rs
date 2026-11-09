@@ -336,6 +336,12 @@ pub enum TurnOp {
         from: SubjectKey,
         to: SubjectKey,
     },
+    /// `from` is being forgotten: the purpose `to` were given from it goes,
+    /// in those that haven't written their own since.
+    ForgetCarried {
+        from: SubjectKey,
+        to: Vec<SubjectKey>,
+    },
 }
 
 impl TurnOp {
@@ -356,7 +362,8 @@ impl TurnOp {
             | Self::Settle { .. }
             | Self::Forget { .. }
             | Self::ForgetGists { .. }
-            | Self::CarryPurpose { .. } => None,
+            | Self::CarryPurpose { .. }
+            | Self::ForgetCarried { .. } => None,
         }
     }
 }
@@ -486,7 +493,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
                 t.end(*at, *outcome, answer.clone(), question.clone());
             }
         }
-        TurnOp::Settle { .. } | TurnOp::CarryPurpose { .. } => {}
+        TurnOp::Settle { .. } | TurnOp::CarryPurpose { .. } | TurnOp::ForgetCarried { .. } => {}
         TurnOp::Forget { subjects } => turns.retain(|t| !subjects.contains(&t.subject.key())),
         TurnOp::ForgetGists { subjects } => {
             for t in turns

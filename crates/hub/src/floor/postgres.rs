@@ -99,6 +99,7 @@ impl PgFloorStore {
             (TurnOp::Forget { subjects }, _) => forget_subjects(&tx, subjects).await?,
             (TurnOp::ForgetGists { subjects }, _) => forget_gists(&tx, subjects).await?,
             (TurnOp::CarryPurpose { from, to }, _) => carry_purpose(&tx, from, to).await?,
+            (TurnOp::ForgetCarried { from, to }, _) => forget_carried(&tx, from, to).await?,
             (_, Some(id)) => {
                 let row = tx
                     .query_opt(
@@ -667,6 +668,29 @@ async fn carry_purpose(
                  purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at \
              WHERE gists.purpose IS NULL RETURNING owner",
             &[&from.as_str(), &to.as_str()],
+        )
+        .await?;
+    Ok(rows.first().map(|row| row.get("owner")))
+}
+
+/// `from` is being forgotten: the purpose each of `to` was given from it
+/// goes, where it is still the one given (the same words, written when
+/// `from`'s was), not one it wrote since. Whose gists it changed, if any.
+async fn forget_carried(
+    db: &impl GenericClient,
+    from: &SubjectKey,
+    to: &[SubjectKey],
+) -> Result<Option<Option<String>>> {
+    let to: Vec<&str> = to.iter().map(SubjectKey::as_str).collect();
+    let rows = db
+        .query(
+            "UPDATE gists t SET purpose = NULL, purpose_at = NULL FROM gists s \
+             WHERE s.subject = $1 AND t.subject = ANY($2) \
+               AND coalesce(t.owner, '') = coalesce(s.owner, '') \
+               AND t.purpose IS NOT DISTINCT FROM s.purpose \
+               AND t.purpose_at IS NOT DISTINCT FROM s.purpose_at \
+             RETURNING t.owner",
+            &[&from.as_str(), &to],
         )
         .await?;
     Ok(rows.first().map(|row| row.get("owner")))
@@ -1520,6 +1544,36 @@ mod tests {
                     .as_deref(),
                 Some("Its own purpose."),
                 "a purpose of its own is kept"
+            );
+            // Forgotten, what it gave goes, down the chain, unless one
+            // wrote its own since.
+            let (next, wrote) = (SubjectKey::session(Uuid::new_v4()), own.clone());
+            store
+                .apply(&TurnOp::CarryPurpose {
+                    from: to.clone(),
+                    to: next.clone(),
+                })
+                .await
+                .unwrap();
+            store
+                .apply(&TurnOp::ForgetCarried {
+                    from: from.clone(),
+                    to: vec![to.clone(), next.clone(), wrote.clone()],
+                })
+                .await
+                .unwrap();
+            for k in [&to, &next] {
+                assert_eq!(store.gist(None, k).await.unwrap().unwrap().purpose, None);
+            }
+            assert_eq!(
+                store
+                    .gist(None, &wrote)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .purpose
+                    .as_deref(),
+                Some("Its own purpose."),
             );
             // Nothing to carry: nothing written.
             let none = SubjectKey::session(Uuid::new_v4());
