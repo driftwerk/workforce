@@ -732,14 +732,36 @@ impl Desk {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        // A work is named as it goes on now.
-        if q.by == SpendBy::Work {
-            let heads: HashSet<Uuid> = ids
+        // A work is shown as the session it goes on in now, unless that is
+        // outside what is asked of (another group's): then as its latest
+        // session inside it, never one outside.
+        let in_cells: HashSet<Uuid> = ids.iter().copied().collect();
+        let inside = |s: Uuid| match &q.filter.seen {
+            None => true,
+            Some(seen) => seen.sees(
+                self.group_of_member(&super::session_item(s))
+                    .filter(|g| g != super::UNGROUPED)
+                    .as_deref(),
+            ),
+        };
+        let shown = |work: Uuid| -> Uuid {
+            let head = lineage.head(work);
+            if inside(head) {
+                return head;
+            }
+            let sessions = lineage.sessions(work);
+            sessions
                 .iter()
-                .map(|id| lineage.head(lineage.work_of(*id)))
-                .collect();
+                .rev()
+                .find(|s| inside(**s) && in_cells.contains(s))
+                .or_else(|| sessions.iter().rev().find(|s| in_cells.contains(s)))
+                .copied()
+                .unwrap_or(work)
+        };
+        if q.by == SpendBy::Work {
+            let shows: HashSet<Uuid> = ids.iter().map(|id| shown(lineage.work_of(*id))).collect();
             ids.extend(
-                heads
+                shows
                     .into_iter()
                     .filter(|h| !ids.contains(h))
                     .collect::<Vec<_>>(),
@@ -768,11 +790,11 @@ impl Desk {
             return Ok(self.spend_by_group(&cells, q, &labels).await);
         }
         if q.by == SpendBy::Work {
-            let cells = ledger::by_work(&cells, |id| lineage.work_of(id));
+            let cells = ledger::by_work(&cells, |id| shown(lineage.work_of(id)));
             return Ok(ledger::fold(
                 &cells,
                 q.by,
-                |work| labels.get(&lineage.head(work)).cloned(),
+                |shown| labels.get(&shown).cloned(),
                 q.limit,
                 q.from,
                 q.to,

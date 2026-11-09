@@ -548,7 +548,22 @@ async fn forgetting_a_session_forgets_the_briefs_written_from_it() {
                 .unwrap()
                 .session
                 .id;
-        w.d.forget_memory(w.acme).await.unwrap();
+        let notice = w.d.forget_memory(w.acme).await.unwrap().unwrap();
+        assert!(
+            notice.contains("handed on to acme-api")
+                && notice.contains("own conversation may still hold what it read"),
+            "{notice}"
+        );
+        // The purpose it gave the target's gist goes too.
+        assert!(
+            super::tests::logs(&w.logged, |ops| ops.iter().any(|op| matches!(
+                op,
+                crate::floor::TurnOp::ForgetCarried { from, to }
+                    if *from == crate::floor::SubjectKey::session(w.acme)
+                        && *to == vec![crate::floor::SubjectKey::session(target)]
+            )))
+            .await
+        );
         let read =
             w.d.line_call(target, "brief", &json!({}), None)
                 .await
@@ -689,24 +704,50 @@ async fn the_work_follows_to_the_session_it_continues_in() {
         // Its budget too.
         let scopes: Vec<BudgetScope> = w.d.budget_list().into_iter().map(|b| b.scope).collect();
         assert_eq!(scopes, vec![BudgetScope::Session(target)]);
-        // Its spend is the work's.
-        let spent = w
-            .d
-            .spend(&super::SpendQuery {
-                by: crate::ledger::SpendBy::Work,
-                from: "2026-01-01T00:00:00Z".parse().unwrap(),
-                to: chrono::Utc::now(),
-                limit: 10,
-                filter: crate::ledger_store::Filter {
-                    session: Some(target),
-                    ..Default::default()
-                },
-            })
+        // Its spend is the work's, shown as where it goes on now…
+        w.d.update(
+            target,
+            crate::model::SessionPatch {
+                display_name: Some(Some("acme-api on codex".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let by_work = |seen: Option<crate::scope::Seen>| {
+            let d = w.d.clone();
+            async move {
+                d.spend(&super::SpendQuery {
+                    by: crate::ledger::SpendBy::Work,
+                    from: "2026-01-01T00:00:00Z".parse().unwrap(),
+                    to: chrono::Utc::now(),
+                    limit: 10,
+                    filter: crate::ledger_store::Filter {
+                        session: Some(target),
+                        seen,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let spent = by_work(None).await;
+        assert_eq!(spent.rows.len(), 1, "{spent:?}");
+        assert_eq!(spent.rows[0].session, Some(target));
+        assert_eq!(spent.rows[0].label, "acme-api on codex");
+        assert!(spent.rows[0].totals.calls > 0);
+        // …but within a group filter only ever as one of its sessions
+        // inside it: never one since moved to another client's group.
+        w.d.change_layout(|l| l.put(&super::session_item(target), GLOBEX, None))
             .await
             .unwrap();
-        assert_eq!(spent.rows.len(), 1, "{spent:?}");
-        assert_eq!(spent.rows[0].session, Some(w.acme), "the work's own");
-        assert!(spent.rows[0].totals.calls > 0);
+        let globex = w.d.seen_by(&crate::scope::Scope::Group(GLOBEX.into()));
+        assert!(by_work(Some(globex)).await.rows.is_empty());
+        let acme = w.d.seen_by(&crate::scope::Scope::Group(ACME.into()));
+        let mine = by_work(Some(acme)).await;
+        assert_eq!(mine.rows.len(), 1);
+        assert_eq!(mine.rows[0].session, Some(w.acme), "not the one now in Globex");
+        assert_eq!(mine.rows[0].label, "acme-api");
         // Reading the target reads the session it left.
         let now = chrono::Utc::now();
         w.d.put_reads(
