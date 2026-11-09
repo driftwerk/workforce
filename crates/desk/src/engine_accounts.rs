@@ -1551,30 +1551,75 @@ impl crate::store::DeskStore {
     }
 
     /// Keeps `account` known as `link`, or (none) as no identity.
+    ///
+    /// One account per identity, decided here and not by the order writes
+    /// arrive in (some are queued in the background): the person's link
+    /// takes its identity over from any other account, in one transaction;
+    /// one made by usage never takes it from another account, nor
+    /// replaces the person's own link on this one.
     pub async fn put_account_link(
         &self,
         account: Uuid,
         link: Option<&crate::identity::Link>,
     ) -> Result<()> {
-        let client = self.pool().get().await?;
-        match link {
-            Some(l) => client
-                .execute(
-                    "INSERT INTO engine_account_identities (account, identity, email, linked_by, linked_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (account) DO UPDATE SET identity = $2, email = $3, linked_by = $4, linked_at = $5",
-                    &[&account, &l.identity.key, &l.identity.email, &l.by.as_str(), &l.at],
-                )
-                .await
-                .context("keeping an account's identity")?,
-            None => client
+        let mut client = self.pool().get().await?;
+        let Some(l) = link else {
+            client
                 .execute(
                     "DELETE FROM engine_account_identities WHERE account = $1",
                     &[&account],
                 )
                 .await
-                .context("forgetting an account's identity")?,
+                .context("forgetting an account's identity")?;
+            return Ok(());
         };
+        let manual = l.by == crate::identity::LinkedBy::Manual;
+        let tx = client
+            .transaction()
+            .await
+            .context("keeping an account's identity")?;
+        // Writes of one identity go one at a time.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            &[&l.identity.key],
+        )
+        .await
+        .context("keeping an account's identity")?;
+        if manual {
+            tx.execute(
+                "DELETE FROM engine_account_identities WHERE identity = $1 AND account <> $2",
+                &[&l.identity.key, &account],
+            )
+            .await
+            .context("keeping an account's identity")?;
+        } else {
+            let held = tx
+                .query_opt(
+                    "SELECT 1 FROM engine_account_identities WHERE identity = $1 AND account <> $2",
+                    &[&l.identity.key, &account],
+                )
+                .await
+                .context("keeping an account's identity")?;
+            if held.is_some() {
+                return Ok(());
+            }
+        }
+        let guard = if manual {
+            ""
+        } else {
+            " WHERE engine_account_identities.linked_by <> 'manual'"
+        };
+        tx.execute(
+            &format!(
+                "INSERT INTO engine_account_identities (account, identity, email, linked_by, linked_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (account) DO UPDATE SET identity = $2, email = $3, linked_by = $4, linked_at = $5{guard}"
+            ),
+            &[&account, &l.identity.key, &l.identity.email, &l.by.as_str(), &l.at],
+        )
+        .await
+        .context("keeping an account's identity")?;
+        tx.commit().await.context("keeping an account's identity")?;
         Ok(())
     }
 }
