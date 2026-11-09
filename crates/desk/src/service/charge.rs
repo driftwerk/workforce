@@ -7,7 +7,8 @@
 //! While the person has the wheel the boss's messages to the session wait
 //! on its line ([`crate::line::Wait::PersonDriving`]); who has it is read
 //! from the person's last input each time it is asked, so a hold starts the
-//! moment they type. A loop of its own writes each change of hands down and
+//! moment they type, and ends the hold after their last input
+//! ([`charge::HOLD`], or what its boss's settings say). A loop of its own writes each change of hands down and
 //! lets what waited go once the wheel is back.
 
 use std::collections::HashMap;
@@ -34,6 +35,9 @@ pub(crate) struct Charges {
     driven: HashMap<Uuid, DateTime<Utc>>,
     /// What each boss that took a session on is called, by agent id.
     names: HashMap<String, String>,
+    /// How long the person's input holds each boss's sessions, by agent
+    /// id, as its settings say; [`charge::HOLD`] for one not said.
+    holds: HashMap<String, chrono::Duration>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -51,6 +55,9 @@ pub struct ChargeView {
     pub how: How,
     pub wheel: Wheel,
     pub wheel_since: Option<DateTime<Utc>>,
+    /// How long the person's last input keeps the wheel theirs (unpinned),
+    /// in minutes, as its boss's settings say.
+    pub hold_minutes: i64,
     pub since: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
 }
@@ -64,7 +71,7 @@ const SETTLE_EVERY: Duration = Duration::from_secs(5);
 impl Desk {
     /// Reads the charges as kept; whether they were. What the person
     /// typed before a restart isn't known after it, so a wheel of theirs
-    /// counts its quiet from now.
+    /// counts its hold from now.
     pub(super) async fn charge_load(&self) -> bool {
         match self.0.store.charges().await {
             Ok(rows) => {
@@ -120,6 +127,24 @@ impl Desk {
         crew::shown_name(id, st.charges.names.get(id).map(String::as_str), true)
     }
 
+    /// How long the person's input holds the sessions of each boss, by its
+    /// agent id, as the hub reads their settings: a boss left out holds
+    /// for [`charge::HOLD`].
+    pub fn set_holds(&self, holds: HashMap<String, chrono::Duration>) {
+        self.0.state.lock().charges.holds = holds;
+    }
+
+    /// How long the person's input holds a session `boss` runs, as the hub
+    /// last said.
+    pub fn hold_for(&self, boss: &str) -> chrono::Duration {
+        Self::hold_of(&self.0.state.lock(), boss)
+    }
+
+    /// How long the person's input holds a session `boss` runs.
+    fn hold_of(st: &super::State, boss: &str) -> chrono::Duration {
+        st.charges.holds.get(boss).copied().unwrap_or(charge::HOLD)
+    }
+
     /// The person gave `id` a prompt or wrote to it: they take its wheel.
     pub(super) fn person_drove(&self, id: Uuid) {
         self.0.state.lock().charges.driven.insert(id, Utc::now());
@@ -134,12 +159,12 @@ impl Desk {
 
     /// `c`'s wheel now, as `st` reads.
     fn wheel_now(st: &super::State, c: &Charge) -> Wheel {
-        let state = st
-            .records
-            .get(&c.session)
-            .map_or(SessionState::Closed, |r| r.state);
-        let since = st.state_since.get(&c.session).copied();
-        charge::wheel(c, Self::last_input(st, c.session), state, since, Utc::now())
+        charge::wheel(
+            c,
+            Self::last_input(st, c.session),
+            Self::hold_of(st, &c.boss),
+            Utc::now(),
+        )
     }
 
     fn charge_view(&self, c: &Charge, wheel: Wheel) -> ChargeView {
@@ -151,6 +176,7 @@ impl Desk {
             how: c.how,
             wheel,
             wheel_since: c.wheel_since,
+            hold_minutes: self.hold_for(&c.boss).num_minutes(),
             since: c.since,
             released_at: c.released_at,
         }
@@ -629,9 +655,10 @@ impl Desk {
     }
 
     /// Writes down each change of hands since last looked: the person took
-    /// a wheel by their input, or it came back after they went quiet.
+    /// a wheel by their input, or it came back once their hold was up.
     async fn charge_settle(&self) {
-        let changed: Vec<(Charge, Wheel, Option<DateTime<Utc>>)> = {
+        type Changed = (Charge, Wheel, Option<DateTime<Utc>>, chrono::Duration);
+        let changed: Vec<Changed> = {
             let st = self.0.state.lock();
             st.charges
                 .rows
@@ -640,12 +667,18 @@ impl Desk {
                 .filter_map(|c| {
                     let now = Self::wheel_now(&st, c);
                     let was = c.wheel;
-                    (now != was && was != Wheel::PersonPinned)
-                        .then(|| (c.clone(), now, Self::last_input(&st, c.session)))
+                    (now != was && was != Wheel::PersonPinned).then(|| {
+                        (
+                            c.clone(),
+                            now,
+                            Self::last_input(&st, c.session),
+                            Self::hold_of(&st, &c.boss),
+                        )
+                    })
                 })
                 .collect()
         };
-        for (mut c, now, input) in changed {
+        for (mut c, now, input, hold) in changed {
             let Ok(view) = self.view(c.session) else {
                 continue;
             };
@@ -672,11 +705,7 @@ impl Desk {
                             Kind::HandedBack,
                             boss,
                             Some(Party::session(&view)),
-                            format!(
-                                "has {} back after {} quiet minutes",
-                                view.label(),
-                                charge::QUIET.num_minutes()
-                            ),
+                            format!("has {} back after {}", view.label(), quiet_for(hold)),
                         ));
                     }
                     done
@@ -727,6 +756,16 @@ impl Desk {
                 },
             }
         }
+    }
+}
+
+/// How long the person was quiet before a wheel came back, in words:
+/// "2 quiet minutes", "1 quiet minute", "30 quiet seconds".
+fn quiet_for(hold: chrono::Duration) -> String {
+    match hold.num_minutes() {
+        0 => format!("{} quiet seconds", hold.num_seconds().max(1)),
+        1 => "1 quiet minute".into(),
+        n => format!("{n} quiet minutes"),
     }
 }
 

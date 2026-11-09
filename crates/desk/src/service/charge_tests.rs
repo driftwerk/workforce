@@ -164,6 +164,80 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
     .await;
 }
 
+/// The person holds a session only while they are active in it: an ask
+/// 30 seconds after their last input waits for them, one 3 minutes after
+/// is the boss's, and a boss's own hold, as its settings say, counts.
+#[tokio::test]
+async fn the_persons_hold_lasts_two_minutes_after_their_last_input_unless_the_boss_says() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        let typed = |ago: chrono::Duration| {
+            d.0.state
+                .lock()
+                .charges
+                .driven
+                .insert(s.id, Utc::now() - ago);
+        };
+        let by = By::manager("sarah", "Sarah", "Answering it.");
+        // Taken on an hour ago, so the input below is since.
+        d.0.state.lock().charges.rows.get_mut(&s.id).unwrap().since =
+            Utc::now() - chrono::Duration::hours(1);
+
+        typed(chrono::Duration::seconds(30));
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Person), "still typing");
+        assert!(d.boss_holds(s.id, Some(&by)).is_err());
+        typed(chrono::Duration::minutes(3));
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss), "stopped typing");
+        assert!(d.boss_holds(s.id, Some(&by)).is_ok());
+
+        // Sarah's settings hold for 5 minutes.
+        d.set_holds([("sarah".to_string(), chrono::Duration::minutes(5))].into());
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Person));
+        typed(chrono::Duration::minutes(6));
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss));
+        d.set_holds(Default::default());
+
+        // Written down as it changes hands, in honest words.
+        typed(chrono::Duration::seconds(30));
+        d.charge_settle().await;
+        assert_eq!(d.charge_of(s.id).unwrap().wheel, Wheel::Person);
+        {
+            let mut st = d.0.state.lock();
+            let c = st.charges.rows.get_mut(&s.id).unwrap();
+            c.wheel_since = Some(Utc::now() - chrono::Duration::minutes(3));
+        }
+        typed(chrono::Duration::minutes(3));
+        d.charge_settle().await;
+        assert_eq!(d.charge_of(s.id).unwrap().wheel, Wheel::Boss);
+        for _ in 0..200 {
+            let texts: Vec<String> = d
+                .activity(crew::Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .map(|e| e.text.clone())
+                .collect();
+            if texts.iter().any(|t| t.starts_with("is driving"))
+                && texts
+                    .iter()
+                    .any(|t| t.ends_with("back after 2 quiet minutes"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("driving and getting it back after 2 quiet minutes aren't in Activity");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
     with_test_pool(build_pool, |pool| async move {
