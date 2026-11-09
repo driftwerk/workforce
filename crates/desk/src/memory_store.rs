@@ -855,6 +855,14 @@ pub(crate) async fn forget_memory_in(
         &[&ids],
     )
     .await?;
+    // The briefs handed to them, and those written from them: a brief holds
+    // what its source said. Their lineage stays, numbers only.
+    tx.execute(
+        "UPDATE work_lineage SET brief = NULL WHERE session = ANY($1) OR from_session = ANY($1)",
+        &[&ids],
+    )
+    .await
+    .context("forgetting briefs")?;
     for table in [
         "memory_exchanges",
         "memory_items",

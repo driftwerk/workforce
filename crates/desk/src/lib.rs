@@ -41,6 +41,7 @@ pub mod limit;
 pub mod line;
 mod line_api;
 pub mod line_store;
+pub mod lineage_store;
 pub mod local;
 pub mod memory;
 pub mod memory_derive_store;
