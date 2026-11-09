@@ -554,3 +554,41 @@ async fn forgetting_a_session_forgets_the_briefs_written_from_it() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn forgetting_the_session_a_work_went_to_gives_it_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let ask = Ask {
+            egress_confirmed: true,
+            ..to(Engine::Codex)
+        };
+        let target =
+            w.d.handoff(w.acme, &ask, By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        assert_eq!(w.d.lineage().head(w.acme), target);
+        w.d.forget(target).await.unwrap();
+        let l = w.d.lineage();
+        assert_eq!(l.head(w.acme), w.acme);
+        assert!(!l.handed_off(w.acme));
+        let client = w.store.pool().get().await.unwrap();
+        let handed: Option<Uuid> = client
+            .query_one("SELECT handed_to FROM sessions WHERE id = $1", &[&w.acme])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(handed, None);
+        // It can be handed on again, here to the same engine afresh.
+        let ask = Ask {
+            egress_confirmed: true,
+            ..to(Engine::Claude)
+        };
+        let again = w.d.handoff(w.acme, &ask, By::you()).await.unwrap();
+        assert_eq!(w.d.lineage().head(w.acme), again.session.id);
+    })
+    .await;
+}

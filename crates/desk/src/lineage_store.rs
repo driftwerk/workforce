@@ -172,6 +172,28 @@ impl DeskStore {
         Ok(())
     }
 
+    /// `session` is forgotten: no work goes on in it any more, and it holds
+    /// none. The sessions whose work went on in it are where it is again.
+    pub async fn forget_lineage(&self, session: Uuid) -> Result<Vec<Uuid>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let back: Vec<Uuid> = tx
+            .query(
+                "UPDATE sessions SET handed_to = NULL WHERE handed_to = $1 RETURNING id",
+                &[&session],
+            )
+            .await
+            .context("taking work back from a forgotten session")?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        tx.execute("DELETE FROM work_lineage WHERE session = $1", &[&session])
+            .await
+            .context("forgetting a session's lineage")?;
+        tx.commit().await?;
+        Ok(back)
+    }
+
     /// The brief `session` was given, and the group it was given in; none
     /// when it was given none (or it was forgotten).
     pub async fn lineage_brief(&self, session: Uuid) -> Result<Option<(String, Option<String>)>> {

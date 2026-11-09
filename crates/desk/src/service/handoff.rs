@@ -158,6 +158,15 @@ impl Desk {
         }
     }
 
+    /// Session `id` is being forgotten: its work goes back to the sessions
+    /// it came from, which can be handed on again, and it holds none.
+    pub(super) async fn lineage_forgotten(&self, id: Uuid) {
+        if let Err(e) = self.0.store.forget_lineage(id).await {
+            tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't take work back from a forgotten session");
+        }
+        self.0.handoff.lineage.lock().forget(id);
+    }
+
     /// Handoff's lineage as it is now.
     pub(super) fn lineage(&self) -> Lineage {
         self.0.handoff.lineage.lock().clone()

@@ -300,6 +300,14 @@ impl Lineage {
         self.handed_to.contains_key(&session)
     }
 
+    /// `session` was forgotten: it holds no work, and the sessions whose
+    /// work went on in it are where it is again.
+    pub fn forget(&mut self, session: Uuid) {
+        self.links.remove(&session);
+        self.handed_to.remove(&session);
+        self.handed_to.retain(|_, to| *to != session);
+    }
+
     /// Notes that `to` was handed `from`'s work with `link`, and, when it
     /// was handed back, that `to`'s goes on no further.
     pub fn hand_on(&mut self, from: Uuid, to: Uuid, link: Link) {
@@ -618,6 +626,11 @@ mod tests {
         assert_eq!(l.sessions(c), vec![a, b, c]);
         assert_eq!(l.sessions(other), vec![other]);
         assert_eq!(l.head(b), c);
+        // Its last session forgotten, the work is where it was before.
+        l.forget(c);
+        assert_eq!(l.head(a), a);
+        assert!(!l.handed_off(a));
+        assert_eq!(l.sessions(a), vec![a, b]);
     }
 
     #[test]

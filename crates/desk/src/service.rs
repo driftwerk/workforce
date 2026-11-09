@@ -3268,6 +3268,7 @@ impl Desk {
         drop(live);
         self.line_forgotten(&gone).await;
         self.board_forgotten(id).await;
+        self.lineage_forgotten(id).await;
         let (done, written) = oneshot::channel();
         let _ = self.0.persist.send(Persist::Forget {
             ids: vec![id],
