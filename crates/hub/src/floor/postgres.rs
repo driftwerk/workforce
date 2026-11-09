@@ -98,6 +98,7 @@ impl PgFloorStore {
             (TurnOp::Settle { owner, .. }, _) => Some(owner.clone()),
             (TurnOp::Forget { subjects }, _) => forget_subjects(&tx, subjects).await?,
             (TurnOp::ForgetGists { subjects }, _) => forget_gists(&tx, subjects).await?,
+            (TurnOp::CarryPurpose { from, to }, _) => carry_purpose(&tx, from, to).await?,
             (_, Some(id)) => {
                 let row = tx
                     .query_opt(
@@ -648,6 +649,27 @@ async fn forget_gists(
     )
     .await?;
     Ok(gists.first().or(turns.first()).map(|row| row.get("owner")))
+}
+
+/// `to` continues `from`'s work: its gist starts with `from`'s purpose,
+/// unless it has one of its own already. Whose gist it wrote, if any.
+async fn carry_purpose(
+    db: &impl GenericClient,
+    from: &SubjectKey,
+    to: &SubjectKey,
+) -> Result<Option<Option<String>>> {
+    let rows = db
+        .query(
+            "INSERT INTO gists (owner, subject, purpose, purpose_at, now_text, now_at, turn, by_model) \
+             SELECT owner, $2, purpose, purpose_at, now_text, now_at, turn, false FROM gists \
+             WHERE subject = $1 AND purpose IS NOT NULL \
+             ON CONFLICT ((coalesce(owner, '')), subject) DO UPDATE SET \
+                 purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at \
+             WHERE gists.purpose IS NULL RETURNING owner",
+            &[&from.as_str(), &to.as_str()],
+        )
+        .await?;
+    Ok(rows.first().map(|row| row.get("owner")))
 }
 
 /// Holds, to the end of the transaction, the questions of the owner and
@@ -1441,6 +1463,75 @@ mod tests {
             assert_eq!(store.gist(Some("u3"), &scout).await.unwrap(), None);
             assert_eq!(store.prune(at("2026-10-30T00:00:00Z")).await.unwrap(), 2);
             assert!(store.gists(&personal).await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_handed_work_starts_with_its_purpose_and_keeps_its_own() {
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            let (from, to, own) = (
+                SubjectKey::session(Uuid::new_v4()),
+                SubjectKey::session(Uuid::new_v4()),
+                SubjectKey::session(Uuid::new_v4()),
+            );
+            let gist = |purpose: &str| Gist {
+                purpose: Some(purpose.into()),
+                purpose_at: Some(at("2026-10-29T11:00:00Z")),
+                now: "Tidying the cookie settings.".into(),
+                now_at: at("2026-10-29T11:05:00Z"),
+                turn: Uuid::nil(),
+                by_model: true,
+            };
+            store
+                .put_gist(None, &from, &gist("Making sign-in safe."))
+                .await
+                .unwrap();
+            store
+                .put_gist(None, &own, &gist("Its own purpose."))
+                .await
+                .unwrap();
+            let whose = store
+                .apply(&TurnOp::CarryPurpose {
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(whose, Some(None), "the personal floor is told");
+            let carried = store.gist(None, &to).await.unwrap().unwrap();
+            assert_eq!(carried.purpose.as_deref(), Some("Making sign-in safe."));
+            assert!(!carried.by_model);
+            store
+                .apply(&TurnOp::CarryPurpose {
+                    from: from.clone(),
+                    to: own.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .gist(None, &own)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .purpose
+                    .as_deref(),
+                Some("Its own purpose."),
+                "a purpose of its own is kept"
+            );
+            // Nothing to carry: nothing written.
+            let none = SubjectKey::session(Uuid::new_v4());
+            let whose = store
+                .apply(&TurnOp::CarryPurpose {
+                    from: SubjectKey::session(Uuid::new_v4()),
+                    to: none.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(whose, None);
+            assert_eq!(store.gist(None, &none).await.unwrap(), None);
         })
         .await;
     }

@@ -819,6 +819,7 @@ mod tests {
                 TurnOp::Settle { .. } => "settle",
                 TurnOp::Forget { .. } => "forget",
                 TurnOp::ForgetGists { .. } => "forget gists",
+                TurnOp::CarryPurpose { .. } => "carry purpose",
             })
             .collect()
     }

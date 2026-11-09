@@ -329,6 +329,13 @@ pub enum TurnOp {
     ForgetGists {
         subjects: Vec<SubjectKey>,
     },
+    /// `to` continues `from`'s work (a handoff): its gist starts with
+    /// `from`'s purpose, so the floor doesn't learn the work again. One it
+    /// has already is kept.
+    CarryPurpose {
+        from: SubjectKey,
+        to: SubjectKey,
+    },
 }
 
 impl TurnOp {
@@ -348,7 +355,8 @@ impl TurnOp {
             Self::Begin { .. }
             | Self::Settle { .. }
             | Self::Forget { .. }
-            | Self::ForgetGists { .. } => None,
+            | Self::ForgetGists { .. }
+            | Self::CarryPurpose { .. } => None,
         }
     }
 }
@@ -478,7 +486,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
                 t.end(*at, *outcome, answer.clone(), question.clone());
             }
         }
-        TurnOp::Settle { .. } => {}
+        TurnOp::Settle { .. } | TurnOp::CarryPurpose { .. } => {}
         TurnOp::Forget { subjects } => turns.retain(|t| !subjects.contains(&t.subject.key())),
         TurnOp::ForgetGists { subjects } => {
             for t in turns
@@ -617,6 +625,21 @@ pub struct Work {
     /// are the main boss's, and one of a sealed group, which is no one's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boss: Option<String>,
+    /// The session's work was handed to it from another: where from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued: Option<Continued>,
+}
+
+/// Where the work a session's tile shows came from: "Continued from
+/// Claude Code at 10:42".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Continued {
+    /// The session it was handed from.
+    pub from: Uuid,
+    /// That session's engine, when Desk still has it.
+    pub engine: Option<Engine>,
+    pub at: DateTime<Utc>,
 }
 
 impl Work {
@@ -891,6 +914,7 @@ fn work(t: &Turn, what: Option<&String>, gist: Said) -> Work {
         gist: Some(gist),
         group: None,
         boss: None,
+        continued: None,
     }
 }
 
@@ -1108,6 +1132,42 @@ pub fn stamp(
     }
 }
 
+/// `view` with each piece of work on one tile: the sessions whose work
+/// went on in another (`handed`) are folded under the one it continues in,
+/// shown neither working nor done, and a session handed work says where
+/// from (`from`, by session). `day` is the person's, which the counts are
+/// of.
+pub fn fold_work(
+    view: &mut FloorView,
+    handed: &HashSet<Uuid>,
+    from: &HashMap<Uuid, Continued>,
+    day: DateTime<Utc>,
+) {
+    let session = |w: &Work| match w.who.kind {
+        PartyKind::Session => w.who.id.parse::<Uuid>().ok(),
+        _ => None,
+    };
+    let folded = |w: &Work| session(w).is_some_and(|s| handed.contains(&s));
+    let working = view.working.len();
+    view.working.retain(|w| !folded(w));
+    let today = view
+        .done
+        .iter()
+        .filter(|w| folded(w) && w.ended_at.is_some_and(|at| at >= day))
+        .count();
+    view.done.retain(|w| !folded(w));
+    view.counts.working = view
+        .counts
+        .working
+        .saturating_sub(working - view.working.len());
+    view.counts.done_today = view.counts.done_today.saturating_sub(today);
+    for w in view.working.iter_mut().chain(view.done.iter_mut()) {
+        if let Some(c) = session(w).and_then(|s| from.get(&s)) {
+            w.continued = Some(c.clone());
+        }
+    }
+}
+
 /// Whether the boss `agent` is in a turn on `view` now.
 pub fn boss_state(view: &FloorView, agent: &str) -> BossState {
     let working = view
@@ -1234,6 +1294,57 @@ mod tests {
                 approval_id: Uuid::nil(),
             },
         }
+    }
+
+    #[test]
+    fn a_work_handed_on_is_one_tile_saying_where_it_came_from() {
+        let (claude, codex, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let session = |id, engine| Subject::Session { id, engine };
+        let turns = vec![
+            ended(
+                turn(
+                    session(claude, Engine::Claude),
+                    None,
+                    "2026-10-29T09:00:00Z",
+                ),
+                "2026-10-29T10:00:00Z",
+                Outcome::Finished,
+            ),
+            turn(session(codex, Engine::Codex), None, "2026-10-29T10:42:00Z"),
+            turn(session(other, Engine::Claude), None, "2026-10-29T10:50:00Z"),
+        ];
+        let (day, now) = (at("2026-10-29T00:00:00Z"), at("2026-10-29T11:00:00Z"));
+        let mut v = view(&turns, vec![], &Gists::new(), day, now);
+        assert_eq!((v.counts.working, v.counts.done_today), (2, 1));
+        let continued = Continued {
+            from: claude,
+            engine: Some(Engine::Claude),
+            at: at("2026-10-29T10:42:00Z"),
+        };
+        fold_work(
+            &mut v,
+            &[claude].into(),
+            &[(codex, continued.clone())].into(),
+            day,
+        );
+        assert!(v.done.is_empty(), "the handed-off session isn't shown done");
+        assert_eq!((v.counts.working, v.counts.done_today), (2, 0));
+        let tile = v
+            .working
+            .iter()
+            .find(|w| w.who.id == codex.to_string())
+            .unwrap();
+        assert_eq!(tile.continued.as_ref(), Some(&continued));
+        let plain = v
+            .working
+            .iter()
+            .find(|w| w.who.id == other.to_string())
+            .unwrap();
+        assert_eq!(plain.continued, None);
+        assert_eq!(
+            serde_json::to_value(tile).unwrap()["continued"]["engine"],
+            json!("claude")
+        );
     }
 
     #[test]
@@ -1747,6 +1858,7 @@ mod tests {
             }),
             group: None,
             boss: None,
+            continued: None,
         };
         assert_eq!(
             serde_json::to_value(work).unwrap(),

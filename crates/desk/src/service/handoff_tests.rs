@@ -140,6 +140,8 @@ struct World {
     /// Acme's session, and Globex's.
     acme: Uuid,
     globex: Uuid,
+    /// What the Floor's log was sent.
+    logged: Arc<super::tests::Logged>,
     _cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -177,11 +179,13 @@ async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: boo
         .with_program(Engine::Codex, fake_cli(dir, "codex"));
     opts.memory.machine = machine;
     let cancel = tokio_util::sync::CancellationToken::new();
+    let logged = Arc::new(super::tests::Logged::default());
     let d = Desk::start(
         DeskStore::from_pool(pool.clone()),
         opts,
         super::Floor {
             redactor: Some(Arc::new(Plain) as Arc<dyn crate::memory::Redactor>),
+            turns: Some(Arc::clone(&logged) as Arc<dyn crate::floor::TurnLog>),
             ..Default::default()
         },
         cancel.clone(),
@@ -201,6 +205,7 @@ async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: boo
         store,
         acme: records[0].id,
         globex: records[1].id,
+        logged,
         _cancel: cancel,
     }
 }
@@ -551,6 +556,165 @@ async fn forgetting_a_session_forgets_the_briefs_written_from_it() {
             .unwrap()
             .get(0);
         assert_eq!(kept, 1, "its lineage stays, without the brief");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_work_follows_to_the_session_it_continues_in() {
+    use crate::board::TicketState;
+    use crate::line::{Send, Target, When};
+    use crate::reads::{Mark, ReadPlace, ReadPoint, ReadPut};
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        // Stopped, not ended: what is sent to it waits until it runs.
+        w.store
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .execute("UPDATE sessions SET state = 'stopped' WHERE id = $1", &[&w.acme])
+            .await
+            .unwrap();
+        w.d.load(w.acme).await.unwrap();
+        let source = w.d.view(w.acme).unwrap();
+        // What waits for it, its ticket in review, and its own budget.
+        let held = w
+            .d
+            .line_send(
+                super::Sender::Person,
+                Send::Tell {
+                    to: Target::Session(w.acme),
+                    text: "Check the logout path too.".into(),
+                    when: When::Queue,
+                },
+            )
+            .await
+            .unwrap();
+        let board = w
+            .d
+            .create_board(super::NewBoard {
+                name: "Acme".into(),
+                group: Some(ACME.into()),
+                prefix: Some("ACM".into()),
+            })
+            .await
+            .unwrap();
+        let t = w
+            .d
+            .create_ticket(
+                super::NewTicket {
+                    board: board.id,
+                    title: "Fix the sign-in race".into(),
+                    body: String::new(),
+                    state: Some(TicketState::Review),
+                    needs: vec![],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        {
+            let client = w.store.pool().get().await.unwrap();
+            client
+                .execute(
+                    "UPDATE tickets SET assignee = $1 WHERE id = $2",
+                    &[&serde_json::to_value(crate::crew::Party::session(&source)).unwrap(), &t.ticket.id],
+                )
+                .await
+                .unwrap();
+        }
+        w.d.put_budget(
+            super::NewBudget {
+                scope: BudgetScope::Session(w.acme),
+                group: None,
+                period: Period::Day,
+                unit: Unit::Usd,
+                amount: 5.0,
+                warn_at: None,
+                on_exceed: None,
+            },
+            By::you(),
+        )
+        .await
+        .unwrap();
+
+        let ask = Ask {
+            egress_confirmed: true,
+            ..to(Engine::Codex)
+        };
+        let done = w.d.handoff(w.acme, &ask, By::you()).await.unwrap();
+        let target = done.session.id;
+        assert!(done.notes.iter().any(|n| n.contains("Its budget moved")), "{:?}", done.notes);
+
+        // Its purpose starts the target's gist.
+        assert!(
+            super::tests::logs(&w.logged, |ops| ops.iter().any(|op| matches!(
+                op,
+                crate::floor::TurnOp::CarryPurpose { from, to }
+                    if *from == crate::floor::SubjectKey::session(w.acme)
+                        && *to == crate::floor::SubjectKey::session(target)
+            )))
+            .await
+        );
+        // What waited for it waits for the target, and its thread says so.
+        let inbox = w.store.line_inbox(&target.to_string()).await.unwrap();
+        assert!(inbox.iter().any(|m| m.id == held.id), "{inbox:?}");
+        let client = w.store.pool().get().await.unwrap();
+        let noted: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM line_messages WHERE recipient ->> 'id' = $1 AND delivery = 'noted'",
+                &[&w.acme.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(noted, 1);
+        // Its ticket is the target's, where it stood.
+        let tickets = w.store.session_tickets(target).await.unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].state, TicketState::Review);
+        assert!(w.store.session_tickets(w.acme).await.unwrap().is_empty());
+        // Its budget too.
+        let scopes: Vec<BudgetScope> = w.d.budget_list().into_iter().map(|b| b.scope).collect();
+        assert_eq!(scopes, vec![BudgetScope::Session(target)]);
+        // Its spend is the work's.
+        let spent = w
+            .d
+            .spend(&super::SpendQuery {
+                by: crate::ledger::SpendBy::Work,
+                from: "2026-01-01T00:00:00Z".parse().unwrap(),
+                to: chrono::Utc::now(),
+                limit: 10,
+                filter: crate::ledger_store::Filter {
+                    session: Some(target),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(spent.rows.len(), 1, "{spent:?}");
+        assert_eq!(spent.rows[0].session, Some(w.acme), "the work's own");
+        assert!(spent.rows[0].totals.calls > 0);
+        // Reading the target reads the session it left.
+        let now = chrono::Utc::now();
+        w.d.put_reads(
+            "you",
+            &[ReadPut {
+                place: ReadPlace::Session(target),
+                point: ReadPoint { at: now, message: None },
+                mark: Mark::Advance,
+            }],
+        )
+        .await
+        .unwrap();
+        let reads = w.d.reads("you").await.unwrap();
+        assert!(reads.iter().any(|r| r.place == ReadPlace::Session(w.acme)), "{reads:?}");
+        // Its peers list the work once.
+        let peers = w.d.line_call(target, "peers", &json!({}), None).await.unwrap();
+        assert!(!peers.to_string().contains(&w.acme.to_string()), "{peers}");
     })
     .await;
 }

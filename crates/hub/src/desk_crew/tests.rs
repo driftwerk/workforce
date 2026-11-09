@@ -2071,6 +2071,7 @@ mod floor {
                         gist: None,
                         group: None,
                         boss: None,
+                        continued: None,
                     });
                     v
                 };

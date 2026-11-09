@@ -1733,7 +1733,7 @@ impl Desk {
         Ok(())
     }
 
-    async fn budgets_changed(&self, by: &By, text: String) {
+    pub(super) async fn budgets_changed(&self, by: &By, text: String) {
         let budgets = match self.0.store.budgets().await {
             Ok(b) => b,
             Err(e) => {
