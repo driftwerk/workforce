@@ -125,7 +125,7 @@ impl GroupMemory {
     /// As `value` (the stored setting, snake_case) says, else the defaults:
     /// remembered, not read by the model until the person lets it, asked
     /// before a handoff.
-    fn of(value: Option<&Value>) -> Self {
+    pub(super) fn of(value: Option<&Value>) -> Self {
         let flag = |k: &str| value.and_then(|v| v.get(k)).and_then(Value::as_bool);
         Self {
             harvest: flag("harvest").unwrap_or(true),

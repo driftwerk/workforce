@@ -43,6 +43,32 @@ pub fn slug(branch: &str) -> String {
 /// Creates `<repo>/.worktrees/<slug>` on `branch` (new from HEAD, or the
 /// existing branch) and returns its path.
 pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
+    create_from(cwd, branch, None).await
+}
+
+/// Creates `<repo>/.worktrees/<slug>` on a new `branch` from `start` (a
+/// commit), as a handoff to a new worktree does: from the source's HEAD,
+/// whatever the main checkout's is. Refused when `branch` exists.
+pub async fn create_at(cwd: &Path, branch: &str, start: &str) -> Result<PathBuf> {
+    create_from(cwd, branch, Some(start)).await
+}
+
+/// Where a folder's repository stands: its branch, its HEAD, and what is
+/// uncommitted (`git status --porcelain`). Nothing when it isn't one.
+pub async fn state_of(cwd: &Path) -> (Option<String>, Option<String>, Vec<String>) {
+    let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await.ok();
+    let head = git(cwd, &["rev-parse", "--short=12", "HEAD"]).await.ok();
+    let dirty = match head {
+        Some(_) => git(cwd, &["status", "--porcelain"])
+            .await
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    (branch.filter(|b| b != "HEAD"), head, dirty)
+}
+
+async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<PathBuf> {
     let name = slug(branch);
     if name.is_empty() {
         eyre::bail!("branch name {branch:?} has no usable characters");
@@ -65,10 +91,17 @@ pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
     )
     .await
     .is_ok();
-    if exists {
-        git(&root, &["worktree", "add", &path_arg, branch]).await?;
-    } else {
-        git(&root, &["worktree", "add", "-b", branch, &path_arg]).await?;
+    match (exists, start) {
+        (true, Some(_)) => eyre::bail!("a branch called {branch} already exists"),
+        (true, None) => {
+            git(&root, &["worktree", "add", &path_arg, branch]).await?;
+        }
+        (false, None) => {
+            git(&root, &["worktree", "add", "-b", branch, &path_arg]).await?;
+        }
+        (false, Some(start)) => {
+            git(&root, &["worktree", "add", "-b", branch, &path_arg, start]).await?;
+        }
     }
     Ok(path)
 }

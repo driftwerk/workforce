@@ -31,6 +31,7 @@ mod first_run;
 pub mod floor;
 pub mod folders;
 pub mod gist;
+pub mod handoff;
 pub mod holder;
 pub mod identity;
 pub mod leader;
@@ -40,6 +41,7 @@ pub mod limit;
 pub mod line;
 mod line_api;
 pub mod line_store;
+pub mod lineage_store;
 pub mod local;
 pub mod memory;
 pub mod memory_derive_store;
@@ -99,6 +101,7 @@ pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
+pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;

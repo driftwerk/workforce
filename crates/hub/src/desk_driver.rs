@@ -574,6 +574,7 @@ fn options(config: &WorkforceConfig) -> Options {
             derive: desk.memory.derive != "off",
             derive_calls_per_day: desk.memory.derive_calls_per_day,
             machine: may_be_machine(desk),
+            brief_max_tokens: desk.memory.brief_max_tokens,
         },
     }
 }

@@ -4,6 +4,7 @@
 //! shapes and rules here are pure; the desk's I/O shell reads, stores and
 //! searches.
 
+pub mod brief;
 pub mod derive;
 pub mod harvest;
 pub mod index;
@@ -51,6 +52,9 @@ pub struct MemoryOptions {
     /// not here, so here every one looks ungrouped: sessions' recall is
     /// refused until groups are granted to machines.
     pub machine: bool,
+    /// The most tokens a handoff's brief may take, whatever the target's
+    /// window.
+    pub brief_max_tokens: u32,
 }
 
 impl Default for MemoryOptions {
@@ -66,6 +70,7 @@ impl Default for MemoryOptions {
             derive: true,
             derive_calls_per_day: 200,
             machine: false,
+            brief_max_tokens: 20_000,
         }
     }
 }
@@ -79,6 +84,9 @@ pub const NO_REDACTOR: &str =
     "Desk can't hide secrets in conversations here, so it isn't remembering them.";
 /// What a session on a machine's engine reads when it asks to recall.
 pub const MACHINE_RECALL: &str = "Memory search on machines comes with group grants.";
+/// What the person reads when a handoff would start or leave a session on
+/// a machine's engine.
+pub const MACHINE_HANDOFF: &str = "Continuing on a machine comes with group grants.";
 /// What the person reads when the install turned session memory off.
 pub const DISABLED: &str = "Remembering conversations is turned off for this Desk.";
 /// What the person reads of a session Desk no longer has.

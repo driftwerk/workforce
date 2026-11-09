@@ -154,6 +154,23 @@ pub enum Steer {
     None,
 }
 
+/// How a new session of an engine takes its first prompt: what a handoff
+/// gives it to start on (a short prompt naming Desk's `brief` tool, never
+/// the brief itself, which would show in `ps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "via", content = "flag")]
+pub enum FirstPrompt {
+    /// On its command line: positional when the flag is empty, else after
+    /// the flag (`-i` for Gemini CLI).
+    Arg(&'static str),
+    /// As the content of its first `session/prompt` (ACP agents).
+    Acp,
+    /// Typed into its terminal at its first idle.
+    Paste,
+    /// None it takes.
+    None,
+}
+
 /// The first Claude Code that runs hooks modules (mods), which Desk's line
 /// tools and deliveries are: "Create a mod", code.claude.com/docs.
 pub const LINE_CLAUDE: Version = Version {
@@ -184,6 +201,11 @@ pub struct Caps {
     pub line: Deliver,
     /// How the person's **Send now** reaches a working turn.
     pub steer: Steer,
+    /// Its context window in tokens, when known: what a handoff's brief is
+    /// sized against.
+    pub window: Option<u32>,
+    /// How a new session takes its first prompt.
+    pub first_prompt: FirstPrompt,
     /// What the person reads beside it, in the new session dialog and on
     /// its card.
     pub notes: Vec<&'static str>,
@@ -203,6 +225,8 @@ impl Caps {
             accounts: crate::engine_accounts::AccountsVia::None,
             line: Deliver::None,
             steer: Steer::None,
+            window: None,
+            first_prompt: FirstPrompt::None,
             notes: Vec::new(),
         }
     }
@@ -257,6 +281,9 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             accounts: crate::engine_accounts::AccountsVia::Token,
             line: Deliver::Submit,
             steer: Steer::Paste,
+            // The plan's cap, whatever the model's own window.
+            window: Some(200_000),
+            first_prompt: FirstPrompt::Arg(""),
             notes: Vec::new(),
         },
         // Codex's TUI asks its approvals; Desk, subscribed to its thread,
@@ -272,6 +299,9 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             accounts: crate::engine_accounts::AccountsVia::None,
             line: Deliver::Paste,
             steer: Steer::TurnSteer,
+            // Its models' `model_context_window` as Codex documents it.
+            window: Some(272_000),
+            first_prompt: FirstPrompt::Arg(""),
             notes: vec![
                 "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
             ],
@@ -282,6 +312,32 @@ pub fn caps(engine: Engine, view: View) -> Caps {
         | Engine::Cursor
         | Engine::Devin
         | Engine::Custom => Caps::none(),
+    }
+}
+
+/// The window a handoff sizes its brief against when an engine's is
+/// unknown: an ACP agent's, else a custom command's.
+pub fn window_or_default(engine: Engine, caps: &Caps) -> u32 {
+    caps.window.unwrap_or(match engine {
+        Engine::Gemini => 1_000_000,
+        Engine::Copilot | Engine::OpenCode => 128_000,
+        Engine::Cursor | Engine::Devin => 64_000,
+        Engine::Claude | Engine::Codex | Engine::Custom => 32_000,
+    })
+}
+
+/// Who receives what a session of `engine` is given: the vendor its
+/// model runs at, as a handoff's dialog names it. None for a custom
+/// command, which could be anything.
+pub fn vendor_of(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Claude => Some("Anthropic"),
+        Engine::Codex => Some("OpenAI"),
+        Engine::Gemini => Some("Google"),
+        Engine::Copilot => Some("GitHub"),
+        Engine::Cursor => Some("Cursor"),
+        Engine::Devin => Some("Cognition"),
+        Engine::OpenCode | Engine::Custom => None,
     }
 }
 

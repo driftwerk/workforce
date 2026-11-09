@@ -4,7 +4,7 @@
 //! Its reader is built here from the line's caller and the registry's
 //! record, never from the tool's input: its group (as the harvest stamps
 //! it), its project (its repository's main folder, as the harvest stamps
-//! it) and its work (itself until handoff gives sessions a lineage). What
+//! it) and its work (the sessions handoff made one lineage of it). What
 //! it asks can only narrow that, and the person's `memory.session_reach`
 //! can only narrow the install's.
 //!
@@ -196,8 +196,8 @@ impl Desk {
             id: caller,
             group,
             project,
-            // Its lineage, once handoff gives it one; until then, itself.
-            work: vec![caller],
+            // Its lineage: every session of its work, itself among them.
+            work: self.work_sessions(caller),
         })
     }
 

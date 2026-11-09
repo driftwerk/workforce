@@ -978,6 +978,7 @@ impl Desk {
                 limit,
             } => self.recall_call(caller, query, reach, kinds, limit).await,
             Call::RecallRead { reference } => self.recall_read_call(caller, reference).await,
+            Call::Brief => self.brief_call(caller).await,
             Call::Inbox => {
                 let taken = self.line_take_inbox(caller).await.map_err(say)?;
                 Ok(json!({ "messages": taken }))

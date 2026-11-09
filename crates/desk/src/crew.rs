@@ -160,6 +160,7 @@ kinds! {
     PlanDone => "plan_done",
     Moved => "moved",
     HandedOver => "handed_over",
+    HandedOff => "handed_off",
 }
 
 /// One thing that happened on the crew.
