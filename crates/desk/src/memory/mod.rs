@@ -45,6 +45,11 @@ pub struct MemoryOptions {
     pub derive: bool,
     /// The most calls it makes a day.
     pub derive_calls_per_day: u32,
+    /// Whether this is a machine's engine (a hub that serves no agents,
+    /// driven by Desk on another computer). Its sessions' groups live in
+    /// that Desk's sidebar, not here, so here every one looks ungrouped:
+    /// sessions' recall is refused until groups are granted to machines.
+    pub machine: bool,
 }
 
 impl Default for MemoryOptions {
@@ -59,6 +64,7 @@ impl Default for MemoryOptions {
             session_reach: reach::Reach::Project,
             derive: true,
             derive_calls_per_day: 200,
+            machine: false,
         }
     }
 }
@@ -70,6 +76,8 @@ pub const NO_RECORD: &str =
 /// What the person reads when the hub can't hide secrets.
 pub const NO_REDACTOR: &str =
     "Desk can't hide secrets in conversations here, so it isn't remembering them.";
+/// What a session on a machine's engine reads when it asks to recall.
+pub const MACHINE_RECALL: &str = "Memory search on machines comes with group grants.";
 /// What the person reads when the install turned session memory off.
 pub const DISABLED: &str = "Remembering conversations is turned off for this Desk.";
 /// What the person reads of a session Desk no longer has.

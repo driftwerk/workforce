@@ -224,7 +224,7 @@ impl Desk {
 
     /// The most a session's recall covers: the install's, or the person's
     /// narrower setting.
-    async fn session_reach(&self) -> Reach {
+    pub(super) async fn session_reach(&self) -> Reach {
         let install = self.0.opts.memory.session_reach;
         let person = self
             .0

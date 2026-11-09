@@ -573,6 +573,8 @@ fn options(config: &WorkforceConfig) -> Options {
                 .unwrap_or(workforce_desk::memory::reach::Reach::Project),
             derive: desk.memory.derive != "off",
             derive_calls_per_day: desk.memory.derive_calls_per_day,
+            // A machine's hub serves no agents of its own.
+            machine: !desk.agents,
         },
     }
 }

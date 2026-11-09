@@ -965,6 +965,13 @@ impl Desk {
                 Ok(json!({ "id": a.id }))
             }
             Call::Ticket(call) => self.ticket_call(caller, call).await,
+            Call::Recall {
+                query,
+                reach,
+                kinds,
+                limit,
+            } => self.recall_call(caller, query, reach, kinds, limit).await,
+            Call::RecallRead { reference } => self.recall_read_call(caller, reference).await,
             Call::Inbox => {
                 let taken = self.line_take_inbox(caller).await.map_err(say)?;
                 Ok(json!({ "messages": taken }))
