@@ -706,17 +706,45 @@ impl Desk {
     /// The ledger summed as `q` asks, in the person's timezone.
     pub async fn spend(&self, q: &SpendQuery) -> Result<SpendView, DeskError> {
         let tz = self.timezone();
-        let cells = self
+        let lineage = self.lineage();
+        // By work, one session asked about stands for its whole work.
+        let (filter, work) = match (q.by, q.filter.session) {
+            (SpendBy::Work, Some(s)) => (
+                crate::ledger_store::Filter {
+                    session: None,
+                    ..q.filter.clone()
+                },
+                Some(lineage.sessions(s).into_iter().collect::<HashSet<Uuid>>()),
+            ),
+            _ => (q.filter.clone(), None),
+        };
+        let mut cells = self
             .0
             .store
-            .ledger_cells(q.from, q.to, tz.name(), &q.filter)
+            .ledger_cells(q.from, q.to, tz.name(), &filter)
             .await?;
-        let ids: Vec<Uuid> = cells
+        if let Some(work) = &work {
+            cells.retain(|c| work.contains(&c.session));
+        }
+        let mut ids: Vec<Uuid> = cells
             .iter()
             .map(|c| c.session)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // A work is named as it goes on now.
+        if q.by == SpendBy::Work {
+            let heads: HashSet<Uuid> = ids
+                .iter()
+                .map(|id| lineage.head(lineage.work_of(*id)))
+                .collect();
+            ids.extend(
+                heads
+                    .into_iter()
+                    .filter(|h| !ids.contains(h))
+                    .collect::<Vec<_>>(),
+            );
+        }
         let mut labels: HashMap<Uuid, Label> = HashMap::new();
         let missing: Vec<Uuid> = {
             let st = self.0.state.lock();
@@ -738,6 +766,17 @@ impl Desk {
         }
         if q.by == SpendBy::Group {
             return Ok(self.spend_by_group(&cells, q, &labels).await);
+        }
+        if q.by == SpendBy::Work {
+            let cells = ledger::by_work(&cells, |id| lineage.work_of(id));
+            return Ok(ledger::fold(
+                &cells,
+                q.by,
+                |work| labels.get(&lineage.head(work)).cloned(),
+                q.limit,
+                q.from,
+                q.to,
+            ));
         }
         Ok(ledger::fold(
             &cells,

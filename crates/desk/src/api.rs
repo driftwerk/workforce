@@ -283,7 +283,9 @@ async fn spend(
         let (from, to) = p.window(&s.desk)?;
         let by =
             crate::ledger::SpendBy::parse(p.by.as_deref().unwrap_or("session")).map_err(|_| {
-                DeskError::Invalid("by is session, project, day, engine, account or group".into())
+                DeskError::Invalid(
+                    "by is session, project, day, engine, account, group or work".into(),
+                )
             })?;
         s.desk
             .spend(&crate::service::SpendQuery {
