@@ -831,24 +831,71 @@ async fn sweep_orphan_deep_memories(
     forget_orphan_memories(&referenced, DEEP_EXPERTISE_TAG, memory).await
 }
 
-/// Upper bound on rows the orphan sweep scans per run. Every backend caps an
-/// unset `MemoryFilter::limit` at a small page (Weaviate 10, SQLite/InMemory
-/// 100), which silently reduced the sweep to a no-op: each self-learning run
-/// minted a fresh orphan per re-recorded node while the sweep saw only the
-/// first page — 337 stale `deep_expertise` bodies on driftwerk-prod by
-/// 2026-07-05. 10k matches Weaviate's default QUERY_MAXIMUM_RESULTS, far
-/// above any real tag population (hundreds).
-const ORPHAN_SWEEP_SCAN_LIMIT: usize = 10_000;
+/// Rows the orphan sweep asks for in one read. Every backend caps an unset
+/// `MemoryFilter::limit` at a small page (Weaviate 10, SQLite/InMemory 100),
+/// which once reduced the sweep to a no-op (337 stale `deep_expertise` bodies
+/// on one deployment by 2026-07-05); and one big explicit limit does not
+/// work either: the group fence asks its store for three times the limit
+/// plus 20, and Weaviate refuses any read above `QUERY_MAXIMUM_RESULTS`
+/// (10000 by default), so a limit of 10000 became 30020 and the sweep failed
+/// on 2026-11-09. A page of 2000 asks for 6020 at most, well under it.
+const ORPHAN_SWEEP_PAGE: usize = 2_000;
+
+/// A window of creation times the sweep reads; `None` is open on that side.
+type Window = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// The filter the orphan sweep scans with: every `tag`-tagged memory across
-/// agents, up to [`ORPHAN_SWEEP_SCAN_LIMIT`].
-fn orphan_sweep_filter(tag: &str) -> MemoryFilter {
+/// agents created within `window`, at most `page` of them.
+fn orphan_sweep_filter(tag: &str, window: Window, page: usize) -> MemoryFilter {
     MemoryFilter {
         tags: Some(vec![tag.to_string()]),
         system_unscoped: true,
-        limit: Some(ORPHAN_SWEEP_SCAN_LIMIT),
+        limit: Some(page),
+        created_after: window.0,
+        created_before: window.1,
         ..Default::default()
     }
+}
+
+/// Every `tag`-tagged memory across agents, read `page` at a time. Weaviate
+/// cannot walk a filtered read with its id cursor, and offset plus limit is
+/// capped too, so the creation times are cut into windows instead: a window
+/// that comes back full is halved and both halves read, until each comes
+/// back short (so is whole) or cannot be halved. Windows share their edges,
+/// as the bounds are inclusive, and a memory read twice is kept once.
+async fn scan_tagged(
+    memory: &dyn MemoryStore,
+    tag: &str,
+    page: usize,
+) -> eyre::Result<Vec<workforce_memory::types::Memory>> {
+    let floor = DateTime::<Utc>::from_timestamp(946_684_800, 0).unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let ceiling = Utc::now() + chrono::Duration::days(1);
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    let mut pending: Vec<Window> = vec![(None, None)];
+    while let Some(window) = pending.pop() {
+        let rows = memory.list(orphan_sweep_filter(tag, window, page)).await?;
+        let lo = window.0.unwrap_or(floor);
+        let hi = window.1.unwrap_or(ceiling);
+        if rows.len() >= page {
+            if (hi - lo).num_milliseconds() > 1 {
+                let mid = lo + (hi - lo) / 2;
+                pending.push((window.0, Some(mid)));
+                pending.push((Some(mid), window.1));
+                continue;
+            }
+            warn!(
+                tag,
+                page, "Orphan sweep: a full page of memories share one creation time; some may be skipped"
+            );
+        }
+        for mem in rows {
+            if seen.insert(mem.id.0.clone()) {
+                found.push(mem);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Scan every `tag`-tagged memory across agents and forget those whose id is not
@@ -859,9 +906,17 @@ async fn forget_orphan_memories(
     tag: &str,
     memory: &dyn MemoryStore,
 ) -> eyre::Result<usize> {
-    let filter = orphan_sweep_filter(tag);
+    forget_orphans_paged(referenced, tag, memory, ORPHAN_SWEEP_PAGE).await
+}
+
+async fn forget_orphans_paged(
+    referenced: &HashSet<String>,
+    tag: &str,
+    memory: &dyn MemoryStore,
+    page: usize,
+) -> eyre::Result<usize> {
     let mut forgotten = 0;
-    for mem in memory.list(filter).await? {
+    for mem in scan_tagged(memory, tag, page).await? {
         if referenced.contains(&mem.id.0) {
             continue;
         }
@@ -1280,10 +1335,59 @@ mod tests {
 
     #[test]
     fn orphan_sweep_filter_sets_an_explicit_scan_limit() {
-        let filter = orphan_sweep_filter(DEEP_EXPERTISE_TAG);
-        assert_eq!(filter.limit, Some(ORPHAN_SWEEP_SCAN_LIMIT));
+        let filter = orphan_sweep_filter(DEEP_EXPERTISE_TAG, (None, None), ORPHAN_SWEEP_PAGE);
+        assert_eq!(filter.limit, Some(ORPHAN_SWEEP_PAGE));
+        // The group fence asks for 3x + 20; Weaviate refuses above 10000.
+        const { assert!(ORPHAN_SWEEP_PAGE * 3 + 20 < 10_000) };
         assert!(filter.system_unscoped);
         assert_eq!(filter.tags, Some(vec![DEEP_EXPERTISE_TAG.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn the_sweep_sees_every_memory_across_more_than_one_page() {
+        use workforce_core::types::AgentId;
+        use workforce_memory::in_memory::InMemoryStore;
+        use workforce_memory::types::{Memory, MemoryLayer, MemorySource, Visibility};
+
+        let memory = InMemoryStore::new();
+        let base = Utc::now() - chrono::Duration::days(30);
+        let mut referenced = HashSet::new();
+        let mut orphans = Vec::new();
+        for i in 0..23 {
+            let mut m = Memory::new(
+                format!("m{i}"),
+                MemoryLayer::Organisation,
+                AgentId("a".into()),
+            );
+            m.visibility = Visibility::Global;
+            m.source = MemorySource::Curated;
+            m.tags = vec![SELF_LEARNED_TAG.to_string()];
+            // Uneven spacing, so the halving meets crowded and empty windows.
+            m.created_at = base + chrono::Duration::hours((i * i) as i64);
+            let id = memory.remember(m).await.unwrap();
+            if i % 3 == 0 {
+                referenced.insert(id.0);
+            } else {
+                orphans.push(id);
+            }
+        }
+        // A page of 4 is far below the 23 rows.
+        let seen = scan_tagged(&memory, SELF_LEARNED_TAG, 4).await.unwrap();
+        assert_eq!(seen.len(), 23);
+        let forgotten = forget_orphans_paged(&referenced, SELF_LEARNED_TAG, &memory, 4)
+            .await
+            .unwrap();
+        assert_eq!(forgotten, orphans.len());
+        for id in &orphans {
+            assert!(memory.get(id).await.unwrap().is_none_or(|m| m.deleted));
+        }
+        for id in &referenced {
+            assert!(memory
+                .get(&MemoryId(id.clone()))
+                .await
+                .unwrap()
+                .is_some_and(|m| !m.deleted));
+        }
     }
 
     // Exercise the real schedule decision (not a copy) via the extracted

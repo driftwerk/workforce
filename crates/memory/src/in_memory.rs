@@ -311,6 +311,15 @@ fn apply_filter(memory: &Memory, filter: &MemoryFilter) -> bool {
             return false;
         }
     }
+    if filter
+        .created_after
+        .is_some_and(|at| memory.created_at < at)
+        || filter
+            .created_before
+            .is_some_and(|at| memory.created_at > at)
+    {
+        return false;
+    }
     if !passes_excluded_tags(memory, &filter.excluded_tags) {
         return false;
     }
