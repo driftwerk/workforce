@@ -140,6 +140,27 @@ impl DeskStore {
         row.as_ref().map(budget_of).transpose()
     }
 
+    /// Moves the session `from`'s own budgets to `to`, whose work it now
+    /// is; one `to` has already for the same period and unit stays, and
+    /// `from`'s is left. The budgets moved.
+    pub async fn move_session_budgets(&self, from: Uuid, to: Uuid) -> Result<Vec<Budget>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "UPDATE budgets b SET scope = 'session:' || $2::text, updated_at = now() \
+                 WHERE b.scope = 'session:' || $1::text AND NOT EXISTS ( \
+                   SELECT 1 FROM budgets o WHERE o.scope = 'session:' || $2::text \
+                   AND o.period = b.period AND o.unit = b.unit \
+                   AND COALESCE(o.group_id, '') = COALESCE(b.group_id, '')) \
+                 RETURNING id, scope, group_id, period, unit, amount, warn_at, on_exceed, \
+                   updated_at",
+                &[&from.to_string(), &to.to_string()],
+            )
+            .await
+            .context("moving a session's budgets to where its work went")?;
+        rows.iter().map(budget_of).collect()
+    }
+
     /// Removes the budget `id`; whether there was one.
     pub async fn delete_budget(&self, id: Uuid) -> Result<bool> {
         let client = self.pool().get().await?;

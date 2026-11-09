@@ -670,6 +670,11 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
         let mut view = floor::view(&turns, needs, &gists, day, now);
         view.went_ahead = line_went_ahead(&sources, &caller);
         by_group(&sources, &caller, &mut view).await;
+        // One tile per piece of work: what was handed on is folded under
+        // the session it went on in.
+        if let Some(desk) = (sources.desk)().filter(|_| caller.personal) {
+            desk.fold_floor(&mut view, day);
+        }
         let happening = floor::happening(&view, now);
         view.summary = sources.floor.gists.summary(&scope, happening, now).await;
         eyre::Ok(view)

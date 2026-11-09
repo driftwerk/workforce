@@ -210,7 +210,7 @@ impl Desk {
 
     /// The group a line message is its session's: its sender's when that
     /// is a session, else its recipient's.
-    fn line_group(&self, m: &LineMessage) -> Option<String> {
+    pub(super) fn line_group(&self, m: &LineMessage) -> Option<String> {
         m.from_session()
             .or_else(|| m.to_session())
             .and_then(|id| self.group_of_member(&super::session_item(id)))
@@ -988,9 +988,13 @@ impl Desk {
                     .iter()
                     .find(|s| s.id == caller)
                     .ok_or_else(|| "Desk doesn't know this session.".to_string())?;
+                // A work is listed once: the session it went on in, not
+                // those it left.
+                let lineage = self.lineage();
                 let peers: Vec<Value> =
                     line::peers(me, &sessions, self.line_reach(), &self.bossed())
                         .into_iter()
+                        .filter(|s| !lineage.handed_off(s.id))
                         .map(|s| {
                             json!({
                                 "id": s.id,

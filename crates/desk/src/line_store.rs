@@ -229,6 +229,26 @@ impl DeskStore {
             .transpose()
     }
 
+    /// Gives what waits for the session `from` (queued, or held while it
+    /// isn't running) to `to`, whose work it now is. The rows as they now
+    /// are; what Desk's plugin already took stays.
+    pub async fn line_readdress(&self, from: &str, to: &Party) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "UPDATE line_messages SET recipient = $2, updated_at = now() \
+                     WHERE recipient ->> 'kind' = 'session' AND recipient ->> 'id' = $1 \
+                     AND delivery IN ('queued', 'held') RETURNING {COLUMNS}"
+                ),
+                &[&from, &serde_json::to_value(to)?],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Everything waiting to go to a session, by session: what the pump
     /// starts from after a restart.
     pub async fn line_waiting(&self) -> Result<Vec<LineMessage>> {

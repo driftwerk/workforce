@@ -81,7 +81,34 @@ fn stronger(a: Option<SessionUnread>, b: Option<SessionUnread>) -> Option<Sessio
     }
 }
 
+/// `unread` with each piece of work counted once: what a session whose
+/// work went on in another leaves unread is its `head`'s, the more pressing
+/// of the two, as of the later.
+pub fn fold_unread(unread: Vec<SessionUnread>, head: impl Fn(Uuid) -> Uuid) -> Vec<SessionUnread> {
+    let mut by: Vec<SessionUnread> = Vec::new();
+    for u in unread {
+        let id = head(u.id);
+        let u = SessionUnread { id, ..u };
+        match by.iter_mut().find(|b| b.id == id) {
+            Some(b) => *b = stronger(Some(b.clone()), Some(u)).unwrap_or_else(|| b.clone()),
+            None => by.push(u),
+        }
+    }
+    by.sort_by(|a, b| b.since.cmp(&a.since));
+    by
+}
+
 impl Desk {
+    /// The sessions whose work went on in `head` (and on to it again),
+    /// each read when it is: one piece of work is read at once.
+    fn folded_into(&self, head: Uuid) -> Vec<Uuid> {
+        let l = self.lineage();
+        l.sessions(head)
+            .into_iter()
+            .filter(|s| *s != head && l.handed_off(*s) && l.head(*s) == head)
+            .collect()
+    }
+
     /// What is unread on this Desk for `owner`.
     pub async fn unread(&self, crew: &dyn Crew, owner: &str) -> Result<UnreadSummary, DeskError> {
         let store = &self.0.store;
@@ -145,7 +172,7 @@ impl Desk {
         floor: DateTime<Utc>,
     ) -> Vec<SessionUnread> {
         let st = self.0.state.lock();
-        let mut unread: Vec<SessionUnread> = st
+        let unread: Vec<SessionUnread> = st
             .records
             .values()
             .filter_map(|r| {
@@ -161,8 +188,11 @@ impl Desk {
                 stronger(state, line)
             })
             .collect();
-        unread.sort_by(|a, b| b.since.cmp(&a.since));
-        unread
+        drop(st);
+        // One piece of work is one entry: its sessions' unread folded into
+        // the one it goes on in.
+        let l = self.lineage();
+        fold_unread(unread, |id| l.head(id))
     }
 
     /// When the overseer's latest brief was written, while there is one.
@@ -196,7 +226,7 @@ impl Desk {
         // A point is never later than now: one from a clock running ahead
         // would count everything until then as read.
         let now = Utc::now();
-        let puts: Vec<ReadPut> = puts
+        let mut puts: Vec<ReadPut> = puts
             .iter()
             .cloned()
             .map(|mut p| {
@@ -204,6 +234,21 @@ impl Desk {
                 p
             })
             .collect();
+        // Reading the session a work goes on in reads the ones it left.
+        let folded: Vec<ReadPut> = puts
+            .iter()
+            .filter_map(|p| match p.place {
+                ReadPlace::Session(id) => Some((id, p)),
+                _ => None,
+            })
+            .flat_map(|(id, p)| {
+                self.folded_into(id).into_iter().map(|s| ReadPut {
+                    place: ReadPlace::Session(s),
+                    ..p.clone()
+                })
+            })
+            .collect();
+        puts.extend(folded);
         let changed = self.0.store.put_reads(owner, &puts).await?;
         self.announce_reads(&changed);
         Ok(changed)
@@ -231,15 +276,15 @@ impl Desk {
                 .into_iter()
                 .map(|r| (r.place, r.point))
                 .collect();
-            others.extend(self.sessions_unread(&points, floor).into_iter().map(|s| {
-                advance(
-                    ReadPlace::Session(s.id),
-                    ReadPoint {
-                        at: s.since,
-                        message: None,
-                    },
-                )
-            }));
+            for s in self.sessions_unread(&points, floor) {
+                let point = ReadPoint {
+                    at: s.since,
+                    message: None,
+                };
+                for id in std::iter::once(s.id).chain(self.folded_into(s.id)) {
+                    others.push(advance(ReadPlace::Session(id), point.clone()));
+                }
+            }
             if let Some(newest) = self.0.store.newest_activity().await? {
                 others.push(advance(ReadPlace::Activity, newest));
             }
@@ -294,6 +339,33 @@ pub(crate) mod tests {
             .unwrap()
             .to_utc()
             + chrono::Duration::seconds(s)
+    }
+
+    #[test]
+    fn a_work_handed_on_is_unread_once_as_its_more_pressing() {
+        let (claude, codex, other) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let u = |id, s, urgency| SessionUnread {
+            id,
+            since: at(s),
+            urgency,
+        };
+        let folded = fold_unread(
+            vec![
+                u(claude, 5, Urgency::ForYou),
+                u(codex, 9, Urgency::New),
+                u(other, 7, Urgency::New),
+            ],
+            |id| if id == claude { codex } else { id },
+        );
+        assert_eq!(
+            folded,
+            vec![u(codex, 9, Urgency::ForYou), u(other, 7, Urgency::New)]
+        );
+        // The source alone unread: it shows as the work's.
+        assert_eq!(
+            fold_unread(vec![u(claude, 5, Urgency::New)], |_| codex),
+            vec![u(codex, 5, Urgency::New)]
+        );
     }
 
     #[test]

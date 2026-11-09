@@ -99,7 +99,8 @@ impl CrewHub {
             | Action::Resume { session, .. }
             | Action::Restart { session, .. }
             | Action::TakeOn { session }
-            | Action::Release { session } => self.session_seen(*session, seen),
+            | Action::Release { session }
+            | Action::Handoff { session, .. } => self.session_seen(*session, seen),
             Action::Assign { agent, .. } => self.agent_seen(agent, seen).map(drop),
             Action::AssignTicket { to, .. } => match to {
                 Handout::Session(s) => self.session_seen(*s, seen),

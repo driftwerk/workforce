@@ -12,7 +12,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! ```
 //!
@@ -127,6 +127,10 @@ pub struct Act {
     pub message_terminal_sessions: bool,
     /// Answering what sessions ask it on Desk's line.
     pub answer_sessions: bool,
+    /// Suggesting a session continue in another engine (`crew.handoff`):
+    /// only ever a suggestion, since its brief goes to that engine's
+    /// vendor; off, it isn't even suggested.
+    pub hand_off: bool,
 }
 
 /// Which sessions the overseer takes on.
@@ -232,6 +236,7 @@ impl Default for Oversight {
                 message_agents: false,
                 message_terminal_sessions: false,
                 answer_sessions: true,
+                hand_off: false,
             },
             work: Work {
                 prefer_sessions: true,
@@ -507,6 +512,12 @@ impl Oversight {
                     d.act.answer_sessions,
                     "answering sessions' questions without asking",
                 )?,
+                hand_off: switch(
+                    act,
+                    "hand_off",
+                    d.act.hand_off,
+                    "suggesting a session continue in another engine",
+                )?,
             },
             work: Work {
                 prefer_sessions: switch(
@@ -679,6 +690,22 @@ mod tests {
             );
             assert!(!e.contains("message_"), "{source} → {e} names the key");
         }
+    }
+
+    /// Suggesting a session continue in another engine is off until the
+    /// person switches it on.
+    #[test]
+    fn handing_off_is_off_until_switched_on() {
+        let d = parse("[oversight]\nenabled = true\nlevel = \"act\"\n").unwrap();
+        assert!(!d.act.hand_off);
+        let on = parse("[oversight]\n[oversight.act]\nhand_off = true\n").unwrap();
+        assert!(on.act.hand_off);
+        let e = parse("[oversight]\nact = { hand_off = \"yes\" }\n").unwrap_err();
+        assert!(
+            e.contains("suggesting a session continue in another engine")
+                && e.contains("true or false"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -646,6 +646,7 @@ fn floor_of(whos: &[crate::floor::Who]) -> crate::floor::FloorView {
                 gist: None,
                 group: None,
                 boss: None,
+                continued: None,
             })
             .collect(),
         done: vec![],

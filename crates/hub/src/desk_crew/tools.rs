@@ -33,7 +33,7 @@ pub const READ: [&str; 5] = [
     super::spend::NAME,
     super::board::NAME,
 ];
-pub const ACT: [&str; 17] = [
+pub const ACT: [&str; 18] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -51,6 +51,7 @@ pub const ACT: [&str; 17] = [
     super::plan::NAME,
     super::plan::UPDATE,
     super::handover::NAME,
+    "crew.handoff",
 ];
 
 pub struct CrewTool {
@@ -371,6 +372,11 @@ impl CrewTool {
         // Nothing outside its scope is looked into, before anything is said
         // of it or the gate weighs it.
         crew.in_scope(&action, &b.seen).await?;
+        // Handing work to another engine is suggested only where the
+        // person switched it on.
+        if matches!(action, Action::Handoff { .. }) && !b.oversight.act.hand_off {
+            return Err("The person hasn't let you suggest continuing sessions in another engine; tell them what you would suggest instead.".into());
+        }
         // A ticket is read before the gate looks at what is said of it, and
         // a suggestion keeps its id and its key, so it is that ticket that
         // is shown and acted on. One on another scope's board is refused
@@ -448,6 +454,7 @@ impl Tool for CrewTool {
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it, and your messages wait until they hand it back.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
+            "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
             _ => "",
         }
     }
@@ -510,6 +517,14 @@ impl Tool for CrewTool {
                     "prompt": { "type": "string" }
                 })),
                 &["session_id"],
+            ),
+            "crew.handoff" => act(
+                props(json!({
+                    "session_id": session_schema(),
+                    "engine": { "type": "string", "enum": ["claude", "codex"], "description": "The engine to continue in" },
+                    "account": { "type": "string", "description": "Optional: an account's id from crew.overview, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
+                })),
+                &["session_id", "engine"],
             ),
             "crew.start_session" => {
                 let engines = self

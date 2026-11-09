@@ -371,6 +371,9 @@ text_enum!(SpendBy {
     Engine => "engine",
     Account => "account",
     Group => "group",
+    // One row per piece of work: a session and every session it was
+    // handed on to, across engines.
+    Work => "work",
 });
 
 /// The ledger summed by everything a view groups by: what the store
@@ -473,6 +476,18 @@ pub const UNKNOWN_ACCOUNT: &str = "Account not known";
 /// What Desk calls the spend of what is in no group.
 pub const UNGROUPED_SPEND: &str = "Ungrouped";
 
+/// `cells` with each session's calls counted as its work's: what
+/// [`SpendBy::Work`] folds.
+pub fn by_work(cells: &[Cell], work_of: impl Fn(Uuid) -> Uuid) -> Vec<Cell> {
+    cells
+        .iter()
+        .map(|c| Cell {
+            session: work_of(c.session),
+            ..c.clone()
+        })
+        .collect()
+}
+
 /// `cells` grouped `by`, the costliest first (by day: the latest first),
 /// at most `limit` rows. `label` names a session, if Desk still has it.
 pub fn fold(
@@ -567,6 +582,20 @@ pub fn fold(
                     },
                 )
             }
+            // Each cell's session is its work's own (the caller folds them),
+            // named as its work goes on now.
+            SpendBy::Work => (
+                c.session.to_string(),
+                SpendRow {
+                    key: c.session.to_string(),
+                    label: l.as_ref().map_or(FORGOTTEN.into(), |l| l.name.clone()),
+                    session: Some(c.session),
+                    engine: None,
+                    folder: l.as_ref().map(|l| l.cwd.clone()),
+                    totals: Totals::default(),
+                    agents: None,
+                },
+            ),
             // Named by the caller, who knows the groups: here by id.
             SpendBy::Group => {
                 let key = c.group.clone().unwrap_or_default();
@@ -860,6 +889,37 @@ mod tests {
         assert_eq!(accounts.rows[0].label, "allan@example.com");
         let engines = fold(&cells, SpendBy::Engine, label, 10, from, to);
         assert_eq!(engines.rows[0].label, "Claude Code");
+    }
+
+    #[test]
+    fn a_work_handed_across_engines_is_one_row() {
+        let (claude, codex, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut handed = cell(codex, "gpt-5.5", 2.6, 0);
+        handed.engine = Engine::Codex;
+        let cells = [
+            cell(claude, "claude-opus-5-5", 1.5, 0),
+            handed,
+            cell(other, "claude-opus-5-5", 3.0, 0),
+        ];
+        let work = by_work(&cells, |s| if s == codex { claude } else { s });
+        let label = |id: Uuid| {
+            (id == claude).then(|| Label {
+                name: "acme-api".into(),
+                cwd: "/dev/acme-api".into(),
+            })
+        };
+        let (from, to) = (at("2026-10-31T00:00:00Z"), at("2026-10-31T12:00:00Z"));
+        let v = fold(&work, SpendBy::Work, label, 10, from, to);
+        assert_eq!(v.rows.len(), 2);
+        let acme = v.rows.iter().find(|r| r.session == Some(claude)).unwrap();
+        assert!(
+            (acme.totals.usd - 4.1).abs() < 1e-9,
+            "across Claude Code and Codex"
+        );
+        assert_eq!(acme.totals.calls, 6);
+        assert_eq!(acme.label, "acme-api");
+        assert_eq!(acme.engine, None);
+        assert!((v.total.usd - 7.1).abs() < 1e-9);
     }
 
     #[test]

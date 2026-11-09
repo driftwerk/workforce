@@ -3266,6 +3266,8 @@ impl Desk {
             live.end();
         }
         drop(live);
+        // Before its gist goes with it, what it handed on goes too.
+        self.carried_forgotten(id);
         self.line_forgotten(&gone).await;
         self.board_forgotten(id).await;
         self.lineage_forgotten(id).await;

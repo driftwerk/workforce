@@ -706,17 +706,67 @@ impl Desk {
     /// The ledger summed as `q` asks, in the person's timezone.
     pub async fn spend(&self, q: &SpendQuery) -> Result<SpendView, DeskError> {
         let tz = self.timezone();
-        let cells = self
+        let lineage = self.lineage();
+        // By work, one session asked about stands for its whole work.
+        let (filter, work) = match (q.by, q.filter.session) {
+            (SpendBy::Work, Some(s)) => (
+                crate::ledger_store::Filter {
+                    session: None,
+                    ..q.filter.clone()
+                },
+                Some(lineage.sessions(s).into_iter().collect::<HashSet<Uuid>>()),
+            ),
+            _ => (q.filter.clone(), None),
+        };
+        let mut cells = self
             .0
             .store
-            .ledger_cells(q.from, q.to, tz.name(), &q.filter)
+            .ledger_cells(q.from, q.to, tz.name(), &filter)
             .await?;
-        let ids: Vec<Uuid> = cells
+        if let Some(work) = &work {
+            cells.retain(|c| work.contains(&c.session));
+        }
+        let mut ids: Vec<Uuid> = cells
             .iter()
             .map(|c| c.session)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // A work is shown as the session it goes on in now, unless that is
+        // outside what is asked of (another group's): then as its latest
+        // session inside it, never one outside.
+        let in_cells: HashSet<Uuid> = ids.iter().copied().collect();
+        let inside = |s: Uuid| match &q.filter.seen {
+            None => true,
+            Some(seen) => seen.sees(
+                self.group_of_member(&super::session_item(s))
+                    .filter(|g| g != super::UNGROUPED)
+                    .as_deref(),
+            ),
+        };
+        let shown = |work: Uuid| -> Uuid {
+            let head = lineage.head(work);
+            if inside(head) {
+                return head;
+            }
+            let sessions = lineage.sessions(work);
+            sessions
+                .iter()
+                .rev()
+                .find(|s| inside(**s) && in_cells.contains(s))
+                .or_else(|| sessions.iter().rev().find(|s| in_cells.contains(s)))
+                .copied()
+                .unwrap_or(work)
+        };
+        if q.by == SpendBy::Work {
+            let shows: HashSet<Uuid> = ids.iter().map(|id| shown(lineage.work_of(*id))).collect();
+            ids.extend(
+                shows
+                    .into_iter()
+                    .filter(|h| !ids.contains(h))
+                    .collect::<Vec<_>>(),
+            );
+        }
         let mut labels: HashMap<Uuid, Label> = HashMap::new();
         let missing: Vec<Uuid> = {
             let st = self.0.state.lock();
@@ -738,6 +788,17 @@ impl Desk {
         }
         if q.by == SpendBy::Group {
             return Ok(self.spend_by_group(&cells, q, &labels).await);
+        }
+        if q.by == SpendBy::Work {
+            let cells = ledger::by_work(&cells, |id| shown(lineage.work_of(id)));
+            return Ok(ledger::fold(
+                &cells,
+                q.by,
+                |shown| labels.get(&shown).cloned(),
+                q.limit,
+                q.from,
+                q.to,
+            ));
         }
         Ok(ledger::fold(
             &cells,

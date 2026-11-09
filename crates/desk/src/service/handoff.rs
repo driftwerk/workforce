@@ -26,7 +26,9 @@ use uuid::Uuid;
 use super::{session_item, Desk, DeskError, UNGROUPED};
 use crate::crew::{By, Kind, Party};
 use crate::engine::{self, Deliver, Engine, View};
+use crate::floor::{SubjectKey, TurnOp};
 use crate::handoff::{self as rules, After, Ask, Back, Content, Facts, Lineage, Link, Place};
+use crate::line::{Delivery, LineKind, LineMessage};
 use crate::lineage_store::{KeptLineage, LineageWrite};
 use crate::memory::brief::{
     self, BriefExchange, BriefInput, BriefItem, GitState, Included, SourceInfo,
@@ -167,6 +169,38 @@ impl Desk {
         self.0.handoff.lineage.lock().forget(id);
     }
 
+    /// Session `id` is being forgotten: what its work was handed on with
+    /// goes from the Floor's gists of every session it reached, down the
+    /// chain, unless one wrote its own since. What the person should know:
+    /// those sessions' own conversations may still hold what they read.
+    pub(super) fn carried_forgotten(&self, id: Uuid) -> Option<String> {
+        let reached = self.0.handoff.lineage.lock().carried_from(id);
+        if reached.is_empty() {
+            return None;
+        }
+        self.log_turns(vec![TurnOp::ForgetCarried {
+            from: SubjectKey::session(id),
+            to: reached.iter().copied().map(SubjectKey::session).collect(),
+        }]);
+        let names: Vec<String> = reached
+            .iter()
+            .map(|s| {
+                self.record(*s).map_or_else(
+                    |_| "a session since forgotten".into(),
+                    |r| named(&r).to_string(),
+                )
+            })
+            .collect();
+        let one = names.len() == 1;
+        Some(format!(
+            "Its work was handed on to {}. Desk forgets what it gave {}, but {} own conversation may still hold what {} read.",
+            names.join(", "),
+            if one { "it" } else { "them" },
+            if one { "its" } else { "their" },
+            if one { "it" } else { "they" },
+        ))
+    }
+
     /// Handoff's lineage as it is now.
     pub(super) fn lineage(&self) -> Lineage {
         self.0.handoff.lineage.lock().clone()
@@ -232,6 +266,31 @@ impl Desk {
             handed_to,
             sessions: l.sessions(id),
         }
+    }
+
+    /// `view` with each piece of work on one tile ([`crate::floor::fold_work`]):
+    /// a session whose work went on in another is folded under it, and the
+    /// one it went on in says where from. For the person's Floor, whose
+    /// `day` it is.
+    pub fn fold_floor(&self, view: &mut crate::floor::FloorView, day: DateTime<Utc>) {
+        let l = self.lineage();
+        let handed: std::collections::HashSet<Uuid> = l.handed_to.keys().copied().collect();
+        let from = l
+            .links
+            .iter()
+            .filter(|(s, _)| !l.handed_off(**s))
+            .map(|(s, link)| {
+                (
+                    *s,
+                    crate::floor::Continued {
+                        from: link.from,
+                        engine: self.record(link.from).ok().map(|r| r.engine),
+                        at: link.at,
+                    },
+                )
+            })
+            .collect();
+        crate::floor::fold_work(view, &handed, &from, day);
     }
 
     /// The facts a handoff of `r` as `ask` asks is checked against, and
@@ -743,7 +802,7 @@ impl Desk {
                 ),
             },
         ));
-        let mut notes = Vec::new();
+        let mut notes = self.work_follows(&source, &view, &by).await;
         notes.extend(self.source_after(id, c.ask.source.unwrap_or(After::Keep), &by));
         if !tools {
             self.paste_brief(view.id, b.text.clone());
@@ -880,6 +939,134 @@ impl Desk {
                 Err(e)
             }
         }
+    }
+
+    /// What follows the work from `from` to `to`: its purpose on the
+    /// Floor, what waits on its line, its ticket and its own budgets. What
+    /// the person should know of what didn't.
+    async fn work_follows(&self, from: &SessionView, to: &SessionView, by: &By) -> Vec<String> {
+        let mut notes = Vec::new();
+        self.log_turns(vec![TurnOp::CarryPurpose {
+            from: SubjectKey::session(from.id),
+            to: SubjectKey::session(to.id),
+        }]);
+        // Its line: what waits for it goes to where its work is.
+        match self
+            .0
+            .store
+            .line_readdress(&from.id.to_string(), &Party::session(to))
+            .await
+        {
+            Ok(moved) if !moved.is_empty() => {
+                for m in &moved {
+                    self.line_announce(m);
+                }
+                let mut note = LineMessage::new(
+                    Party::desk(),
+                    Party::session(from),
+                    LineKind::Tell,
+                    format!(
+                        "This work continues in {} ({}), so the {} waiting here went to it.",
+                        to.label(),
+                        to.engine.title(),
+                        match moved.len() {
+                            1 => "message".to_string(),
+                            n => format!("{n} messages"),
+                        }
+                    ),
+                    0,
+                );
+                note.delivery = Delivery::Noted;
+                note.group = self.line_group(&note);
+                match self.0.store.put_line(&note).await {
+                    Ok(()) => self.line_announce(&note),
+                    Err(e) => tracing::warn!(
+                        error = format!("{e:#}"),
+                        "couldn't note on a thread where its messages went"
+                    ),
+                }
+                self.line_went_live(to.id);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(session = %from.id, error = format!("{e:#}"), "a handed-off session's messages stayed with it");
+                notes.push("Messages waiting for it couldn't be moved; they stay with it.".into());
+            }
+        }
+        // Its ticket: the work's, so its holder is where the work is.
+        match self.0.store.session_tickets(from.id).await {
+            Ok(tickets) => {
+                for t in tickets {
+                    if let Err(e) = self.ticket_follows(t, to, by).await {
+                        tracing::info!(session = %from.id, error = %e, "a ticket didn't follow its work");
+                        notes.push(format!("Its ticket stayed with it ({e})."));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session = %from.id, error = format!("{e:#}"), "couldn't read a handed-off session's tickets");
+                notes.push("Its ticket couldn't be read, so it stays with it.".into());
+            }
+        }
+        // Its own budget: the work's, wherever it runs.
+        match self.0.store.move_session_budgets(from.id, to.id).await {
+            Ok(moved) if !moved.is_empty() => {
+                let text = format!(
+                    "moved {}'s budget to {}, where its work continues",
+                    from.label(),
+                    to.label()
+                );
+                self.budgets_changed(by, text).await;
+                notes.push(format!("Its budget moved to {} with the work.", to.label()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(session = %from.id, error = format!("{e:#}"), "a handed-off session's budget stayed with it");
+                notes.push("Its budget couldn't be moved; it stays with it.".into());
+            }
+        }
+        notes
+    }
+
+    /// `t`, assigned to the session a work left, is `to`'s: where it stands
+    /// on the board stays.
+    async fn ticket_follows(
+        &self,
+        mut t: crate::board::Ticket,
+        to: &SessionView,
+        by: &By,
+    ) -> Result<(), DeskError> {
+        let party = Party::session(to);
+        let link = crate::board::Link::Session { session: to.id };
+        for _ in 0..3 {
+            t.assignee = Some(party.clone());
+            t.updated_at = Utc::now();
+            match self.save_ticket(&mut t).await {
+                Ok(()) => {
+                    self.0
+                        .store
+                        .put_link(t.id, &link, t.updated_at)
+                        .await
+                        .map_err(DeskError::Internal)?;
+                    if !t.links.contains(&link) {
+                        t.links.push(link.clone());
+                    }
+                    let key = self.key_of(&t).await?;
+                    let text = format!("{key} follows its work to {}", to.label());
+                    self.ticket_changed(t, by, Kind::TicketAssigned, Some(party), text)
+                        .await?;
+                    return Ok(());
+                }
+                Err(DeskError::Conflict(_)) => {
+                    t = match self.0.store.ticket(t.id).await {
+                        Ok(Some(now)) => now,
+                        _ => return Ok(()),
+                    };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(DeskError::Conflict("it kept changing meanwhile".into()))
     }
 
     /// What becomes of the session the work left, as `after` says; what

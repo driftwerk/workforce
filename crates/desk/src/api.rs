@@ -283,7 +283,9 @@ async fn spend(
         let (from, to) = p.window(&s.desk)?;
         let by =
             crate::ledger::SpendBy::parse(p.by.as_deref().unwrap_or("session")).map_err(|_| {
-                DeskError::Invalid("by is session, project, day, engine, account or group".into())
+                DeskError::Invalid(
+                    "by is session, project, day, engine, account, group or work".into(),
+                )
             })?;
         s.desk
             .spend(&crate::service::SpendQuery {
@@ -1529,11 +1531,11 @@ async fn session_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
 /// has it.
 async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
-    s.desk
-        .forget_memory(id)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .into_response()
+    match s.desk.forget_memory(id).await {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(notice)) => Json(serde_json::json!({ "notice": notice })).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// The session's own Remember switch: `{"on": false}`.

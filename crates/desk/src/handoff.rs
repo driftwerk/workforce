@@ -300,6 +300,28 @@ impl Lineage {
         self.handed_to.contains_key(&session)
     }
 
+    /// Every session `session`'s work was handed on to, and on from those,
+    /// in the order they were handed it: whose gists may carry its
+    /// purpose.
+    pub fn carried_from(&self, session: Uuid) -> Vec<Uuid> {
+        let mut reached = vec![session];
+        let mut by: Vec<(&Uuid, &Link)> = self.links.iter().collect();
+        by.sort_by_key(|(s, l)| (l.at, **s));
+        loop {
+            let more: Vec<Uuid> = by
+                .iter()
+                .filter(|(s, l)| reached.contains(&l.from) && !reached.contains(s))
+                .map(|(s, _)| **s)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            reached.extend(more);
+        }
+        reached.remove(0);
+        reached
+    }
+
     /// `session` was forgotten: it holds no work, and the sessions whose
     /// work went on in it are where it is again.
     pub fn forget(&mut self, session: Uuid) {
@@ -626,6 +648,9 @@ mod tests {
         assert_eq!(l.sessions(c), vec![a, b, c]);
         assert_eq!(l.sessions(other), vec![other]);
         assert_eq!(l.head(b), c);
+        assert_eq!(l.carried_from(a), vec![b, c], "all the way down");
+        assert_eq!(l.carried_from(b), vec![a, c], "handed back to, and on");
+        assert!(l.carried_from(other).is_empty());
         // Its last session forgotten, the work is where it was before.
         l.forget(c);
         assert_eq!(l.head(a), a);

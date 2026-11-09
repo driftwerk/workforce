@@ -2071,6 +2071,7 @@ mod floor {
                         gist: None,
                         group: None,
                         boss: None,
+                        continued: None,
                     });
                     v
                 };
@@ -2633,6 +2634,77 @@ async fn the_overseer_interrupts_a_tracked_session_once_let_and_never_stops_it()
             (v.state, v.live),
             (workforce_desk::model::SessionState::Done, true)
         );
+    })
+    .await;
+}
+
+/// `crew.handoff` is only ever a suggestion naming who receives the brief,
+/// and only once the person switched it on; saying yes hands the work on
+/// as the person, through the same checks as Desk's own dialog.
+#[tokio::test(flavor = "multi_thread")]
+async fn continuing_a_session_in_another_engine_is_only_suggested_once_switched_on() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(&overseer, "[oversight]\nenabled = true\nlevel = \"act\"\n");
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.handoff").then_some(())
+        })
+        .await;
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        let ask = json!({"session_id": s.id.to_string(), "engine": "codex",
+            "reason": "Claude Code's plan is nearly spent."});
+
+        // Off by default: not even suggested.
+        let off = tool("crew.handoff").execute(ask.clone()).await.unwrap();
+        assert!(!off.success, "{off:?}");
+        assert!(
+            off.error.as_deref().is_some_and(|e| e.contains("hasn't let you suggest")),
+            "{off:?}"
+        );
+        assert!(d.store().suggestions(10).await.unwrap().is_empty());
+
+        // Switched on, even at act: a suggestion that says who gets the brief.
+        std::thread::sleep(Duration::from_millis(1100));
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_off = true\nhand_out_work = true\n",
+        );
+        let suggested = tool("crew.handoff").execute(ask).await.unwrap();
+        assert_eq!(
+            suggested.output["suggested"],
+            "Continue acme-api in Codex? The brief goes to OpenAI, through Codex.",
+            "{suggested:?}"
+        );
+        assert_eq!(d.list().len(), 1, "nothing started");
+
+        // Said yes to, it goes through Desk's checks as the person's: here
+        // Desk can't hide secrets, so nothing is handed over.
+        let g = d
+            .store()
+            .suggestions(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.text.starts_with("Continue acme-api"))
+            .unwrap();
+        let refused = crew.accept(&g).await.unwrap_err();
+        assert_eq!(refused, workforce_desk::memory::NO_REDACTOR);
+        assert_eq!(d.list().len(), 1);
+        let plain = super::actions::Action::Handoff {
+            session: s.id,
+            engine: Engine::Codex,
+            account: None,
+        };
+        let not_yours = crew
+            .perform(&plain, workforce_desk::crew::By::manager("desk", "Desk", "why"))
+            .await
+            .unwrap_err();
+        assert!(not_yours.contains("Only the person"), "{not_yours}");
     })
     .await;
 }
