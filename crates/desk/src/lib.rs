@@ -101,6 +101,7 @@ pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
+pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;

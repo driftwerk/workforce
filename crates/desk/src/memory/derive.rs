@@ -499,6 +499,12 @@ pub trait Deriver: Send + Sync {
     /// written.
     async fn purpose(&self, session: Uuid) -> Option<String>;
 
+    /// What session `session` is for and where it is now, as its gist
+    /// says: what a handoff's brief starts from.
+    async fn gist(&self, session: Uuid) -> (Option<String>, Option<String>) {
+        (self.purpose(session).await, None)
+    }
+
     /// Whose model it is.
     fn written_by(&self) -> WrittenBy {
         WrittenBy::default()

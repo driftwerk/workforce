@@ -56,6 +56,10 @@ pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
 mod groups;
+mod handoff;
+#[cfg(test)]
+mod handoff_tests;
+pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
 mod lifecycle;
 mod line;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
@@ -840,6 +844,8 @@ struct Inner {
     index: memory_index::IndexRun,
     /// Session memory's notes and their worker.
     derive: memory_derive::DeriveRun,
+    /// Handoff's lineage, and its preview's wait.
+    handoff: handoff::HandoffRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -1508,6 +1514,7 @@ impl Desk {
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
             derive: memory_derive::DeriveRun::new(floor.deriver.clone()),
+            handoff: Default::default(),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
@@ -1530,6 +1537,7 @@ impl Desk {
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
+        desk.lineage_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());

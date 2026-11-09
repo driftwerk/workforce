@@ -1659,6 +1659,108 @@ async fn memory_index_status(State(s): S, h: HeaderMap, Query(q): Q) -> Response
     s.desk.memory_index_status().await.map(Json).into_response()
 }
 
+/// What a handoff's preview asks: the engine, the account (`own`: the
+/// CLI's own sign-in; absent, the engine's default), the place
+/// (`same_folder` or `new_worktree`), and whether it hands back or gives
+/// only the goal.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandoffParams {
+    engine: Option<String>,
+    account: Option<String>,
+    place: Option<String>,
+    #[serde(default)]
+    back: bool,
+    #[serde(default)]
+    goal_only: bool,
+}
+
+impl HandoffParams {
+    fn ask(self) -> Result<crate::handoff::Ask, DeskError> {
+        let engine = match self.engine.as_deref() {
+            None | Some("") => None,
+            Some(e) => Some(
+                crate::engine::Engine::parse(e)
+                    .map_err(|_| DeskError::Invalid(format!("there's no engine called {e:?}")))?,
+            ),
+        };
+        let account = match self.account.as_deref() {
+            None | Some("") => None,
+            Some("own") => Some(None),
+            Some(a) => Some(Some(a.parse::<Uuid>().map_err(|_| {
+                DeskError::Invalid("account is an account's id, or own".into())
+            })?)),
+        };
+        let place = match self.place.as_deref() {
+            None | Some("same_folder") => crate::handoff::Place::SameFolder,
+            Some("new_worktree") => crate::handoff::Place::NewWorktree,
+            Some(_) => {
+                return Err(DeskError::Invalid(
+                    "place is same_folder or new_worktree".into(),
+                ))
+            }
+        };
+        Ok(crate::handoff::Ask {
+            engine,
+            account,
+            place,
+            back: self.back,
+            goal_only: self.goal_only,
+            ..Default::default()
+        })
+    }
+}
+
+/// What continuing a session in another engine would give it: the brief,
+/// what it holds and leaves out, its size, and who receives it.
+async fn handoff_preview(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    p: Result<Query<HandoffParams>, QueryRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let ask = match p
+        .map_err(|e| DeskError::Invalid(e.body_text()))
+        .and_then(|Query(p)| p.ask())
+    {
+        Ok(ask) => ask,
+        Err(e) => return e.into_response(),
+    };
+    s.desk
+        .handoff_preview(id, &ask)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// Continues a session in another engine, or hands its work back.
+async fn handoff(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Result<Json<crate::handoff::Ask>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(ask) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk
+        .handoff(id, &ask, By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// A session's place in its work: where it came from and went.
+async fn session_lineage(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.session_lineage(id).await).into_response()
+}
+
 /// The sessions' and rooms' routes and the events socket alone.
 pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -1715,6 +1817,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
                 .patch(switch_memory),
         )
         .route("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
+        .route(
+            "/api/desk/sessions/{id}/handoff",
+            get(handoff_preview).post(handoff),
+        )
+        .route("/api/desk/sessions/{id}/lineage", get(session_lineage))
         .route("/api/desk/memory/items/{id}", patch(change_memory_item))
         .route(
             "/api/desk/memory/settings",

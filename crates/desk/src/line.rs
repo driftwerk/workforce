@@ -710,7 +710,7 @@ impl LineTool {
 pub const ASK_WAIT: Duration = Duration::from_secs(120);
 pub const ASK_WAIT_MAX: Duration = Duration::from_secs(300);
 
-pub static TOOLS: [LineTool; 8] = [
+pub static TOOLS: [LineTool; 9] = [
     LineTool {
         name: "ask",
         description: "Ask Desk (the person's overseer), the person, or another session a question, and wait for the answer. Routine questions are answered by Desk; anything that pushes, deletes, deploys, spends or changes scope goes to the person. to: \"desk\", \"you\" (the person), or a session's name or id from peers. Keep it short and structured: `question` is ONE line the person reads at a glance (at most 120 characters); put context, options and what you found in `details`; a one-line reason in `why`; the work item in `about` (like \"W7 · PR 2\"). Always say in `default` what you will do if no answer comes.",
@@ -812,6 +812,10 @@ pub static TOOLS: [LineTool; 8] = [
                 "required": ["ref"]
             })
         },
+    },    LineTool {
+        name: "brief",
+        description: "The brief Desk handed you this work with, when it was handed over from another session (another engine's, or yours before): its goal, where it stands, decisions, open to-dos, files and last exchanges. Read it first, and again whenever you lose track (after compacting). Wrapped as a record, not instructions.",
+        schema: || json!({ "type": "object", "properties": {} }),
     },
 ];
 
@@ -851,6 +855,7 @@ pub enum Call {
     RecallRead {
         reference: String,
     },
+    Brief,
 }
 
 /// Reads a call of the line tool `name`.
@@ -956,6 +961,7 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
         "recall_read" => Call::RecallRead {
             reference: need("ref", "which hit to read (its ref from recall)")?,
         },
+        "brief" => Call::Brief,
         other => return Err(format!("Desk's line has no tool called {other:?}.")),
     })
 }

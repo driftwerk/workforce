@@ -257,7 +257,13 @@ impl Deriver for HubDeriver {
     }
 
     async fn purpose(&self, session: uuid::Uuid) -> Option<String> {
-        let floor = crate::floor::installed()?;
+        self.gist(session).await.0
+    }
+
+    async fn gist(&self, session: uuid::Uuid) -> (Option<String>, Option<String>) {
+        let Some(floor) = crate::floor::installed() else {
+            return (None, None);
+        };
         // A Desk session's gist has no owner: the Desk is its person's own.
         floor
             .store
@@ -266,12 +272,14 @@ impl Deriver for HubDeriver {
             .inspect_err(|e| {
                 tracing::debug!(
                     error = format!("{e:#}"),
-                    "couldn't read a session's purpose to note decisions with"
+                    "couldn't read a session's gist for its notes or brief"
                 )
             })
             .ok()
-            .flatten()?
-            .purpose
+            .flatten()
+            .map_or((None, None), |g| {
+                (g.purpose, Some(g.now).filter(|n| !n.trim().is_empty()))
+            })
     }
 }
 
