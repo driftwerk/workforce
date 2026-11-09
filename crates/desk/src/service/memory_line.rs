@@ -51,6 +51,29 @@ fn not_yours(reference: &str) -> String {
     format!("Nothing you may read has the ref {reference:?}; use a ref recall gave you.")
 }
 
+/// What a ref that doesn't parse is kept, logged and answered as.
+const MALFORMED: &str = "<malformed>";
+
+/// How many refused reads of one session are kept in `memory_reads` an
+/// hour; past it they are only logged.
+pub const REFUSALS_KEPT_PER_HOUR: u32 = 30;
+
+/// Each session's refused reads kept this hour: since when, and how many.
+static REFUSALS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<Uuid, (std::time::Instant, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether `session`'s refused read at `now` is kept, within its hour's
+/// [`REFUSALS_KEPT_PER_HOUR`].
+fn refusal_kept(session: Uuid, now: std::time::Instant) -> bool {
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let mut kept = REFUSALS.lock();
+    kept.retain(|_, (since, _)| now.saturating_duration_since(*since) < HOUR);
+    let (_, n) = kept.entry(session).or_insert((now, 0));
+    *n += 1;
+    *n <= REFUSALS_KEPT_PER_HOUR
+}
+
 const UNREACHABLE: &str = "Desk can't be reached right now; carry on without it.";
 
 /// How `recall`'s answer names a reach.
@@ -269,22 +292,33 @@ impl Desk {
         reference: String,
     ) -> Result<Value, String> {
         let reader = self.session_reader(caller).await?;
+        // The ref as it parsed, never the caller's own text: that is a
+        // model's, of any length, and may hold anything.
+        let reference = match parse_reference(&reference) {
+            Some((true, id)) => format!("i-{id}"),
+            Some((false, id)) => format!("x-{id}"),
+            None => MALFORMED.to_string(),
+        };
         match self.recall_read_in(caller, &reader, &reference).await {
             Ok(read) => Ok(read),
             Err(Some(said)) => Err(said),
             Err(None) => {
+                let kept = refusal_kept(caller, std::time::Instant::now());
                 tracing::info!(
                     session = %caller,
                     reference = %reference,
+                    kept,
                     "a session asked to read a ref outside its reach, or none; refused"
                 );
-                if let Err(e) = self
-                    .0
-                    .store
-                    .memory_read(&reader.label(), "recall_read", Some(&reference), &[], None)
-                    .await
-                {
-                    tracing::warn!(session = %caller, error = format!("{e:#}"), "couldn't keep a refused read of session memory");
+                if kept {
+                    if let Err(e) = self
+                        .0
+                        .store
+                        .memory_read(&reader.label(), "recall_read", Some(&reference), &[], None)
+                        .await
+                    {
+                        tracing::warn!(session = %caller, error = format!("{e:#}"), "couldn't keep a refused read of session memory");
+                    }
                 }
                 Err(not_yours(&reference))
             }
@@ -526,6 +560,19 @@ mod tests {
         for bad in ["", "x-", "x-nope", &format!("y-{id}"), &id.to_string(), "é"] {
             assert_eq!(parse_reference(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_sessions_refusals_are_kept_up_to_its_hours_cap() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let now = std::time::Instant::now();
+        let kept = (0..REFUSALS_KEPT_PER_HOUR + 5)
+            .filter(|_| refusal_kept(a, now))
+            .count();
+        assert_eq!(kept, REFUSALS_KEPT_PER_HOUR as usize);
+        assert!(refusal_kept(b, now), "another session's own");
+        let later = now + std::time::Duration::from_secs(60 * 60 + 1);
+        assert!(refusal_kept(a, later), "a new hour");
     }
 
     #[test]

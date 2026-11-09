@@ -156,12 +156,20 @@ impl Desk {
             .collect();
         let hit_ids: Vec<Uuid> = hits.iter().map(|(r, _)| r.id).collect();
         let group = one_group(hits.iter().map(|(r, _)| r.group.as_deref()));
+        // Kept as everything Desk remembers is: with every secret in it
+        // hidden, or not at all.
+        let query = self
+            .0
+            .ledger
+            .redactor
+            .as_ref()
+            .map(|redactor| redactor.stored(&r.q).text.into_owned());
         self.0
             .store
             .memory_read(
                 &reader.label(),
                 r.tool,
-                Some(&r.q),
+                query.as_deref(),
                 &hit_ids,
                 group.as_deref(),
             )
