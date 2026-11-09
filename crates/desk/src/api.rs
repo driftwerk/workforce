@@ -76,11 +76,21 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+/// The `code` of a 409 that only a move may get past (`DeskError::CrossesBoss`).
+pub const CROSSES_BOSS: &str = "crosses_boss";
+
 impl IntoResponse for DeskError {
     fn into_response(self) -> Response {
         let status = match &self {
             DeskError::NotFound => StatusCode::NOT_FOUND,
             DeskError::Conflict(_) => StatusCode::CONFLICT,
+            DeskError::CrossesBoss => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": self.to_string(), "code": CROSSES_BOSS })),
+                )
+                    .into_response()
+            }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "desk request failed");
@@ -1168,7 +1178,7 @@ async fn create_group(State(s): S, h: HeaderMap, Query(q): Q, Json(g): Json<NewG
     guarded!(s, h, q);
     let id = g.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     s.desk
-        .change_layout(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
+        .change_layout_by_person(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
         .await
         .map(Json)
         .into_response()
@@ -2104,6 +2114,30 @@ mod tests {
         seen
     }
 
+    #[tokio::test]
+    async fn a_change_only_a_move_may_make_says_so_by_its_code() {
+        use super::{DeskError, IntoResponse, StatusCode, CROSSES_BOSS};
+        let res = DeskError::CrossesBoss.into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], CROSSES_BOSS);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Move it with the Move dialog"));
+        // Any other conflict has no code: read again and retry.
+        let res =
+            DeskError::Conflict("The layout changed since it was read: read it again.".into())
+                .into_response();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("code").is_none());
+    }
     #[tokio::test]
     async fn two_viewers_one_types_the_other_mirrors_until_it_claims() {
         with_test_pool(build_pool, |pool| async move {

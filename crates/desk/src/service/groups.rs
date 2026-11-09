@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError};
 use crate::model::{DeskEvent, GroupRef, SessionPatch, SessionView};
+use crate::scope::scope_of;
 use crate::store::DeskStore;
 
 /// The fixed group of whatever is in no other; always last.
@@ -614,12 +615,37 @@ impl Desk {
     /// [`Self::change_layout`] as the person asks it from the sidebar: one at
     /// a time with confirmed moves, so a drag never lands in the middle of
     /// one.
+    ///
+    /// A change that would take one of this hub's sessions from one boss's
+    /// part of Desk to another's is refused (409): only a move made through
+    /// the move routes crosses, with its preview and its handover note.
     pub async fn change_layout_by_person(
         &self,
         f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
     ) -> Result<Layout, DeskError> {
         let _one = self.0.move_write.lock().await;
-        self.change_layout(f).await
+        self.change_layout(|before| {
+            let after = f(before)?;
+            self.stays_in_scope(before, &after)?;
+            Ok(after)
+        })
+        .await
+    }
+
+    /// `Err` (409) when `after` puts one of this hub's sessions in another
+    /// boss's part of Desk than `before` has it in.
+    fn stays_in_scope(&self, before: &Layout, after: &Layout) -> Result<(), DeskError> {
+        let bossed = self.bossed();
+        let ids: Vec<Uuid> = self.0.state.lock().records.keys().copied().collect();
+        for id in ids {
+            let item = session_item(id);
+            let from = before.group_of(&item).map(|g| g.id.as_str());
+            let to = after.group_of(&item).map(|g| g.id.as_str());
+            if from != to && scope_of(from, &bossed) != scope_of(to, &bossed) {
+                return Err(DeskError::CrossesBoss);
+            }
+        }
+        Ok(())
     }
 
     /// As [`Self::change_layout`]; with `fresh_ids`, a group new to the
@@ -738,7 +764,23 @@ impl Desk {
             .without_sessions(|id| !known.contains(&id));
         let imported = fresh || import.force;
         if imported {
-            self.change_layout_as(|_| Ok(layout), false).await?;
+            // Forced over a layout the hub already keeps, it is the person's
+            // change like any other: one at a time with moves, and never
+            // taking a session to another boss.
+            let _one = match fresh {
+                true => None,
+                false => Some(self.0.move_write.lock().await),
+            };
+            self.change_layout_as(
+                |before| {
+                    if !fresh {
+                        self.stays_in_scope(before, &layout)?;
+                    }
+                    Ok(layout)
+                },
+                false,
+            )
+            .await?;
             for (id, name) in import.session_names {
                 let Ok(id) = Uuid::parse_str(&id) else {
                     continue;
