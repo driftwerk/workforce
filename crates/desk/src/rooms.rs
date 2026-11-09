@@ -1045,10 +1045,17 @@ impl DeskStore {
 pub(crate) mod tests {
     use super::*;
     use crate::store::build_pool;
+    use chrono::SubsecRound;
     use workforce_postgres::test_support::with_test_pool;
 
+    /// Now, to the microsecond: Postgres keeps no finer, so a fixture
+    /// stamped with nanoseconds reads back unequal to itself.
+    pub(crate) fn now_micros() -> DateTime<Utc> {
+        Utc::now().trunc_subsecs(6)
+    }
+
     pub(crate) fn room_fixture(name: &str) -> Room {
-        let now = Utc::now();
+        let now = now_micros();
         let id = Uuid::new_v4();
         Room {
             id,
@@ -1672,10 +1679,10 @@ pub(crate) mod tests {
     #[test]
     fn a_message_for_a_thread_that_has_gone_goes_to_the_timeline() {
         let r = room_fixture("release");
-        let root = msg(&r, YOU, "ship it?", Utc::now());
-        let mut reply = msg(&r, YOU, "yes", Utc::now());
+        let root = msg(&r, YOU, "ship it?", now_micros());
+        let mut reply = msg(&r, YOU, "yes", now_micros());
         reply.thread_id = Some(root.id);
-        let elsewhere = msg(&room_fixture("other"), YOU, "hi", Utc::now());
+        let elsewhere = msg(&room_fixture("other"), YOU, "hi", now_micros());
         assert_eq!(place_in_timeline(r.id, None, None), None);
         assert_eq!(
             place_in_timeline(r.id, Some(root.id), Some(&root)),
@@ -1821,7 +1828,7 @@ pub(crate) mod tests {
             assert!(store.slug_taken("release", None).await.unwrap());
             assert!(!store.slug_taken("release", Some(r.id)).await.unwrap());
 
-            let t0 = Utc::now();
+            let t0 = now_micros();
             let ask = msg(&r, YOU, "what is left before we cut 0.9?", t0);
             store.add_message(&ask).await.unwrap();
             for (i, a) in ["dw/allan", "local/scout"].iter().enumerate() {
