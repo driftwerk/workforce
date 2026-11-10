@@ -421,6 +421,55 @@ mod tests {
         .await;
     }
 
+    /// A Desk boss link's `desk_link` copies across with its token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copies_desk_boss_links() {
+        use crate::remote_mcp_token::{DeskLink, TokenScope};
+        use chrono::DurationRound as _;
+        with_test_pool(PostgresIdentityStore::build_pool, |pool| async move {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let source = SqliteIdentityStore::new(tmp.path()).unwrap();
+            let owner = Identity::new("Sam", IdentityRole::Member);
+            source.create(&owner).unwrap();
+            let now = Utc::now()
+                .duration_trunc(chrono::Duration::microseconds(1))
+                .unwrap();
+            let link = DeskLink {
+                link_id: uuid::Uuid::new_v4(),
+                agent_id: "allan".into(),
+                group_key: "d-1/g-acme".into(),
+                group_name: "Acme".into(),
+                engine_id: "devbox".into(),
+                engine_name: "devbox".into(),
+                engine_public_key: "ed25519:key".into(),
+            };
+            let boss = RemoteMcpToken {
+                id: uuid::Uuid::new_v4(),
+                identity_id: owner.id,
+                label: "allan bosses Acme on devbox".into(),
+                token_hash: crate::remote_mcp_token::mint_as(TokenScope::DeskBoss).hash,
+                scopes: vec!["desk_boss".into(), "device:d1".into()],
+                created_at: now,
+                expires_at: now + chrono::Duration::days(30),
+                last_used_at: None,
+                revoked_at: None,
+                desk_link: Some(link.clone()),
+            };
+            source.create_token(&boss).unwrap();
+            drop(source);
+
+            let report = migrate_sqlite_to_postgres_with_pool(tmp.path(), pool.clone())
+                .await
+                .expect("copy a source with a boss link");
+            assert_eq!(report.remote_mcp_tokens, 1);
+            let dest = PostgresIdentityStore::with_pool(pool).await.unwrap();
+            let got = dest.get_token_by_hash(&boss.token_hash).unwrap().unwrap();
+            assert_eq!(got.desk_link, Some(link));
+            assert_eq!(got.scope(), Some(TokenScope::DeskBoss));
+        })
+        .await;
+    }
+
     /// A source file an older release last wrote still has `token_prefix`; the
     /// keys copy across and the prefix does not.
     #[tokio::test(flavor = "multi_thread")]

@@ -1176,6 +1176,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_desk_boss_link_round_trips() {
+        use crate::remote_mcp_token::{DeskLink, TokenScope};
+        with_embedded_pg(|store| async move {
+            let owner = Identity::new("Sam", IdentityRole::Member);
+            store.create(&owner).unwrap();
+            let now = Utc::now()
+                .duration_trunc(chrono::Duration::microseconds(1))
+                .unwrap();
+            let link = DeskLink {
+                link_id: Uuid::new_v4(),
+                agent_id: "allan".into(),
+                group_key: "d-1/g-acme".into(),
+                group_name: "Acme".into(),
+                engine_id: "devbox".into(),
+                engine_name: "devbox".into(),
+                engine_public_key: "ed25519:key".into(),
+            };
+            let boss = RemoteMcpToken {
+                id: Uuid::new_v4(),
+                identity_id: owner.id,
+                label: "allan bosses Acme on devbox".into(),
+                token_hash: crate::remote_mcp_token::mint_as(TokenScope::DeskBoss).hash,
+                scopes: vec!["desk_boss".into(), "device:d1".into()],
+                created_at: now,
+                expires_at: now + chrono::Duration::days(30),
+                last_used_at: None,
+                revoked_at: None,
+                desk_link: Some(link.clone()),
+            };
+            let plain = RemoteMcpToken {
+                id: Uuid::new_v4(),
+                token_hash: crate::remote_mcp_token::mint().hash,
+                scopes: vec!["remote_mcp".into()],
+                desk_link: None,
+                ..boss.clone()
+            };
+            store.create_token(&boss).unwrap();
+            store.create_token(&plain).unwrap();
+            let got = store.get_token_by_hash(&boss.token_hash).unwrap().unwrap();
+            assert_eq!(got, boss);
+            assert_eq!(got.scope(), Some(TokenScope::DeskBoss));
+            let got = store.get_token_by_hash(&plain.token_hash).unwrap().unwrap();
+            assert_eq!(got.desk_link, None);
+            assert_eq!(got.scope(), Some(TokenScope::RemoteMcp));
+            let listed = store.list_tokens_for_identity(owner.id).unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().any(|t| t.desk_link == Some(link.clone())));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn parity_remote_mcp_tokens() {
         with_embedded_pg(|store| async move {
             let owner = Identity::new("Alice", IdentityRole::Member);
