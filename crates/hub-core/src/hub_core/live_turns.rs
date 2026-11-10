@@ -1091,6 +1091,7 @@ mod tests {
             message: None,
             spoken: false,
             voice: None,
+            members: Vec::new(),
         };
         DeskTurnContext::new(
             turn,

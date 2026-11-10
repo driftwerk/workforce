@@ -85,6 +85,11 @@ pub async fn ensure_channel_read_access(
     if task_local(&CURRENT_CHANNEL_ID).as_deref() == Some(channel) {
         return Ok(());
     }
+    // Desk reads only the room the turn is in, from what that turn carried
+    // (`DeskSurface::room_here`): the requester's own conversation.
+    if surface.platform() == workforce_common::channels::desk::DESK_PLATFORM {
+        return Ok(());
+    }
     // No requesting human in scope (CLI / scheduled / system run) — operator-
     // trusted, no user to protect. A human turn always has CURRENT_USER_ID set,
     // so this never relaxes the gate for an actual user.

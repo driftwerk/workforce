@@ -9,6 +9,7 @@ mod deliver;
 #[cfg(feature = "postgres")]
 pub(crate) mod link;
 mod retarget;
+pub(crate) mod room_view;
 mod surface;
 
 use workforce_common::channels::desk::DeskTurn;
@@ -154,6 +155,7 @@ mod tests {
             message: None,
             spoken: false,
             voice: None,
+            members: Vec::new(),
         }
     }
 
