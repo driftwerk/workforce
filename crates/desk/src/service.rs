@@ -3444,12 +3444,14 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        // The boss of a session it runs, checked in `decide`.
+        // The boss of a session it runs, checked in `decide`; an unbound
+        // boss answers Codex too, wherever it asks.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
-                && self
-                    .charge_of(id)
-                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
         };
         let by = by
             .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))

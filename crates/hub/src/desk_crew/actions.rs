@@ -476,6 +476,12 @@ pub(crate) enum Gate {
 impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        // Unbound, every crew action runs: Desk answers what it asks for
+        // itself (`boss_decides`), and only the hold while the person types
+        // into a session it runs waits, as a courtesy.
+        if o.level != Level::Watch && self.unbound(o) {
+            return self.unbound_gate(action, o);
+        }
         // Continuing a session in another engine sends its brief to that
         // engine's vendor: the person's call, every time.
         if let Action::Handoff { .. } = action {
@@ -632,6 +638,34 @@ impl CrewHub {
         } else {
             Gate::Suggest("the person hasn't let you do that without asking".into())
         }
+    }
+
+    /// [`Self::gate`] for an unbound overseer: everything runs, but what
+    /// it does to a session it runs waits while the person is driving it
+    /// (a plain message waits on its line as before).
+    fn unbound_gate(&self, action: &Action, o: &Oversight) -> Gate {
+        let charged = Self::session_of(action).filter(|s| self.overseer_runs(*s, &o.scope));
+        if let Some(session) = charged {
+            let driving = self.desk.wheel_of(session).is_some_and(|w| w.person());
+            if driving && !matches!(action, Action::Nudge { reply_to: None, .. }) {
+                let name = self.session_name(session);
+                return Gate::Suggest(
+                    format!(
+                        "the person is driving {name}, so I've held this for them as a suggestion"
+                    )
+                    .into(),
+                );
+            }
+        }
+        Gate::Run
+    }
+
+    /// Whether `by` is an overseer that is unbound now.
+    pub(crate) fn by_unbound(&self, by: &By) -> bool {
+        by.party.kind == crew::PartyKind::Manager
+            && self
+                .overseer_named(&by.party.id)
+                .is_some_and(|(s, o)| self.unbound_given(&s, &o))
     }
 
     /// The hard limit what `action` says, or the question it answers,
@@ -1186,7 +1220,7 @@ impl CrewHub {
             } => {
                 // The person, saying yes to the suggestion that named who
                 // receives the brief: no one else hands work on.
-                if by.party.kind != crew::PartyKind::You {
+                if by.party.kind != crew::PartyKind::You && !self.by_unbound(&by) {
                     return Err("Only the person continues a session in another engine.".into());
                 }
                 let name = self.session_name(*session);

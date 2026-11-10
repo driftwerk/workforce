@@ -325,6 +325,22 @@ impl CrewHub {
             self.plan_lines(&p)
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
+        // Unbound, it approves its own plan, and Desk starts it.
+        if self.unbound_given(&b.service, &b.oversight) {
+            let by = self.by_at_level(
+                self.by_boss(&b.service, "It approved its own plan."),
+                &b.oversight,
+            );
+            let approved = self
+                .desk
+                .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
+                .await
+                .map_err(plain)?;
+            return Ok(json!({
+                "proposed": plan_out(&approved),
+                "note": "You are unbound, so it is approved and Desk starts its ready tickets; the person sees it as a plan card in your DM and on the Floor.",
+            }));
+        }
         Ok(json!({
             "proposed": plan_out(&p),
             "note": "The person sees it as a plan card in your DM and on the Floor, and approves or edits it there. Nothing of it runs until they approve it; say so briefly.",
@@ -397,6 +413,28 @@ impl CrewHub {
                 false => format!("{name} proposes a change to the plan: {}", changed.summary),
             };
             self.post_plan(&b.service, p, &text).await;
+        }
+        // Unbound, a change waiting on the person is its own to approve.
+        if !changed.applied && self.unbound_given(&b.service, o) {
+            let by = self.by_at_level(
+                self.by_boss(&b.service, "It approved its own change to the plan."),
+                o,
+            );
+            let approved = self
+                .desk
+                .approve_plan(
+                    changed.plan.summary.plan.id,
+                    changed.plan.summary.plan.revision,
+                    &by,
+                )
+                .await
+                .map_err(plain)?;
+            return Ok(json!({
+                "plan": plan_out(&approved),
+                "change": changed.change.map(|c| c.as_str()),
+                "applied": true,
+                "note": "You are unbound, so it applies now.",
+            }));
         }
         Ok(json!({
             "plan": plan_out(&changed.plan),

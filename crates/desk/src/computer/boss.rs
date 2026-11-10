@@ -84,6 +84,9 @@ pub struct Here<'a> {
     /// The workflows the person listed for Act fully to run
     /// (`[oversight.full] workflows`), by their file names exactly.
     pub workflows: &'a [String],
+    /// Any workflow may run, not only those listed (`[oversight.full]
+    /// anywhere`).
+    pub any_workflow: bool,
     /// `HEAD` is the commit `origin`'s default branch is at, as `origin`
     /// itself says now: a tag made now tags what the default branch has.
     pub at_tip: bool,
@@ -2462,7 +2465,9 @@ fn workflow_run(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
         }
     }
     match g.operands.as_slice() {
-        [w] if !w.glob && walk.here.workflows.contains(&w.text) => Ok(()),
+        [w] if !w.glob && (walk.here.any_workflow || walk.here.workflows.contains(&w.text)) => {
+            Ok(())
+        }
         [_] => no(
             "runs a workflow the person hasn't listed for Act fully; that's the person's to allow",
         ),
@@ -3020,6 +3025,7 @@ pub(crate) mod tests {
             follow_tags: false,
             hooks: false,
             workflows: &[],
+            any_workflow: false,
             at_tip: false,
             unpushed: true,
             branches: &[],
@@ -3706,6 +3712,7 @@ pub(crate) mod tests {
             follow_tags: false,
             hooks: false,
             workflows: &[],
+            any_workflow: false,
             at_tip: false,
             unpushed: true,
             branches: &[],

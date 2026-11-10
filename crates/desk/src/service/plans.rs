@@ -1111,7 +1111,9 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        if by.party.kind != PartyKind::You {
+        // An unbound boss approves its own plans: the person let it.
+        let unbound = by.party.kind == PartyKind::Manager && self.full_of(&by.party.id).unbound;
+        if by.party.kind != PartyKind::You && !unbound {
             return Err(DeskError::Invalid(
                 "Only the person approves a plan.".into(),
             ));

@@ -106,7 +106,8 @@ fn is_watchable(tool: &str, params: &Value) -> bool {
 pub(crate) const CREW_WATCH: &str = "No extra watch is needed for Desk's sessions: Desk already \
      wakes you for every session you oversee when it waits on a question or an approval, goes \
      quiet, finishes a turn or fails (how soon is the person's `[oversight.wake]`), and the \
-     sessions in your charge at each turn's end. Just say what you'll do when it next wakes you; \
+     sessions in your charge at each turn's end; unbound, it also sweeps them all every two \
+     minutes. Just say what you'll do when it next wakes you; \
      `watch` only polls read-only status tools.";
 
 /// "Keep an eye on X" tool.
