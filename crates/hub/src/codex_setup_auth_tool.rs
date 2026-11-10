@@ -163,6 +163,13 @@ impl Tool for CodexSetupAuthTool {
                 AUTH_VAULT_KEY.to_string(),
             ),
         };
+        // Only what an agent may read is a source: never a Desk link.
+        if workforce_common::vault_scope::is_desk_link(&source) {
+            return Ok(ToolResult::failure(
+                crate::vault_policy::AgentReadDenial::DeskLink.to_string(),
+                elapsed(),
+            ));
+        }
         let Some(auth_json) = reader.resolve(&source) else {
             return Ok(ToolResult::failure(
                 format!(
@@ -407,6 +414,24 @@ mod tests {
         assert_eq!(result.output["path"], own.as_str());
         assert_eq!(vault.get(&own).as_deref(), Some(login().as_str()));
         assert_eq!(reloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_desk_link_is_never_a_source() {
+        let (vault, _dir) = temp_vault();
+        vault
+            .set(&per_user_key(BOB, "desk/hubs/atlas/remote_mcp"), &login())
+            .unwrap();
+        let (tool, _) = tool(Arc::clone(&vault));
+        let result = as_user(
+            BOB,
+            tool.execute(serde_json::json!({ "vault_path": "desk/hubs/atlas/remote_mcp" })),
+        )
+        .await
+        .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Desk link"));
+        assert!(vault.get(&per_user_key(BOB, AUTH_VAULT_KEY)).is_none());
     }
 
     #[tokio::test]

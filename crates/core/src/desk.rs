@@ -684,6 +684,32 @@ pub struct TurnEnd {
     pub reply_id: Option<String>,
 }
 
+/// The Jira tools a Desk board's sync may call on a hub, and nothing else:
+/// no raw API, no delete, no reassigning. A token a paired device minted
+/// reaches exactly these, the Linear ones, `help` and `identity.whoami`.
+pub const BOARD_SYNC_JIRA_TOOLS: &[&str] = &[
+    "jira.search",
+    "jira.get_issue",
+    "jira.create_issue",
+    "jira.update_issue",
+    "jira.list_transitions",
+    "jira.transition_issue",
+    "jira.add_comment",
+];
+
+/// The Linear tools a Desk board's sync may call on a hub.
+pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
+    "linear.issue_list",
+    "linear.issue_get",
+    "linear.issue_search",
+    "linear.issue_create",
+    "linear.issue_update",
+    "linear.issue_link",
+    "linear.comment_add",
+    "linear.states_list",
+    "linear.teams_list",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

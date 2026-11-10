@@ -39,6 +39,9 @@ pub struct PairingToolContext {
     pub identity_store: IdentityStoreHandle,
     /// Whether the person this turn runs for is an active System Admin.
     pub is_admin: IsAdminFn,
+    /// Remote MCP tokens, late-bound: a revoked device's minted tokens are
+    /// revoked with it.
+    pub remote_mcp_tokens: crate::serve::RemoteMcpTokensHandle,
 }
 
 impl PairingToolContext {
@@ -452,6 +455,12 @@ impl Tool for PairingRevokeTool {
             .await
         {
             Ok(()) => {
+                if let Some(tokens) = self.ctx.remote_mcp_tokens.read().clone() {
+                    crate::remote_mcp::tokens::revoke_device_tokens(
+                        tokens.as_ref(),
+                        &params.device_id,
+                    );
+                }
                 info!(device_id = %params.device_id, "Device revoked via pairing.revoke tool");
                 Ok(ToolResult::success(
                     serde_json::json!({
@@ -618,6 +627,11 @@ mod tests {
                 } else {
                     crate::authz::never_admin()
                 },
+                remote_mcp_tokens: Arc::new(parking_lot::RwLock::new(Some(
+                    workforce_identity::store::IdentityAndTeamStore::as_remote_mcp_token_store(
+                        Arc::clone(&store),
+                    ),
+                ))),
             },
             store,
         }
@@ -894,5 +908,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output["devices"][0]["revoked"], true);
+    }
+
+    /// Revoking a device revokes the remote MCP tokens it minted.
+    #[tokio::test]
+    async fn revoking_a_device_revokes_its_minted_tokens() {
+        use workforce_identity::remote_mcp_token::RemoteMcpToken;
+        let f = fixture(true);
+        let req = f
+            .ctx
+            .device_pairing
+            .initiate("desk", vec![], None, None, None, None)
+            .unwrap();
+        let (device, _token) = f.ctx.device_pairing.approve(&req.code, "test").unwrap();
+        let who = person(&f, "sam@acme.example");
+        let tokens = f.ctx.remote_mcp_tokens.read().clone().unwrap();
+        let now = chrono::Utc::now();
+        tokens
+            .create_token(&RemoteMcpToken {
+                id: uuid::Uuid::new_v4(),
+                identity_id: who.id,
+                label: "Desk on desk".into(),
+                token_hash: "h".into(),
+                scopes: vec!["remote_mcp".into(), format!("device:{}", device.id)],
+                created_at: now,
+                expires_at: now + chrono::Duration::days(90),
+                last_used_at: None,
+                revoked_at: None,
+            })
+            .unwrap();
+        PairingRevokeTool::new(f.ctx.clone())
+            .execute(serde_json::json!({ "device_id": device.id }))
+            .await
+            .unwrap();
+        assert!(tokens.list_tokens_for_identity(who.id).unwrap().is_empty());
     }
 }

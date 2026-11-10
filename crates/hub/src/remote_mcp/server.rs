@@ -268,16 +268,23 @@ async fn serve(
     }
 }
 
-/// What a token a paired device minted may call: what Desk's board sync
-/// needs, within what the hub exposes anyway. Never `agent.*` (a delegated
-/// turn runs with the person's own role), `approval.*`, `vault.*` or the
-/// rest.
-pub const DEVICE_SURFACE: &[&str] = &["jira.*", "linear.*", "help", "identity.whoami"];
+/// What a token a paired device minted may call besides the board sync's
+/// own Jira and Linear tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
+/// by exact name, within what the hub exposes anyway. Never `agent.*` (a
+/// delegated turn runs with the person's own role), `approval.*`, `vault.*`,
+/// `jira.api`, a delete, an assign or a bulk change.
+pub const DEVICE_SURFACE_EXTRA: &[&str] = &["help", "identity.whoami"];
 
-/// `surface` narrowed to [`DEVICE_SURFACE`].
+/// `surface` narrowed to the device surface, by exact names only.
 fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
-    let patterns: Vec<String> = DEVICE_SURFACE.iter().map(|p| p.to_string()).collect();
-    build_mcp_registry(surface, &patterns)
+    let narrowed = ToolRegistry::empty_like(surface);
+    workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+        .iter()
+        .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        .chain(DEVICE_SURFACE_EXTRA)
+        .filter_map(|name| surface.get(name))
+        .for_each(|tool| narrowed.register(tool));
+    narrowed
 }
 
 /// `gates` for a token a paired device minted: scored as a member whatever
@@ -988,7 +995,12 @@ mod tests {
     fn a_device_minted_token_sees_only_the_sync_tools() {
         let source = registry(&[
             "jira.search",
+            "jira.api",
+            "jira.delete_issue",
+            "jira.assign_issue",
             "linear.issue_list",
+            "linear.issue_bulk_update",
+            "linear.document_delete",
             "vault.get",
             "workflow",
             "help",

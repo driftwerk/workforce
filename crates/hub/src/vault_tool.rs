@@ -918,6 +918,7 @@ impl Tool for VaultMyCredentialsTool {
                     .list_at_tier(prefix.as_deref(), tier)
                     .into_iter()
                     .filter(|(p, _)| !p.starts_with("wasm-skills/"))
+                    .filter(|(p, _)| !crate::vault_policy::is_desk_link(p))
                     .map(|(path, entry)| render_entry(path, entry, self.owner_resolver.as_ref()))
                     .collect();
                 (tier.label().to_string(), serde_json::Value::Array(entries))
@@ -2462,6 +2463,26 @@ mod tests {
         assert_eq!(per_user[0]["path"], "skills/jira/api_token");
         let any_alice = res.output.to_string().contains("alice");
         assert!(!any_alice, "Bob's view leaked Alice's per-user entries");
+    }
+
+    #[tokio::test]
+    async fn vault_my_credentials_never_names_a_desk_link() {
+        let agent = new_vault();
+        let global = new_vault();
+        global
+            .set("users/alice/desk/hubs/atlas/remote_mcp", "token")
+            .unwrap();
+        global.set("users/alice/skills/jira/email", "e").unwrap();
+        let store = layered_store(agent, global);
+        let tool = VaultMyCredentialsTool::new(store, no_owner_resolver());
+        let res = CURRENT_USER_ID
+            .scope("alice".to_string(), async {
+                tool.execute(serde_json::json!({})).await.unwrap()
+            })
+            .await;
+        let out = res.output.to_string();
+        assert!(out.contains("skills/jira/email"));
+        assert!(!out.contains("desk/hubs"), "{out}");
     }
 
     #[tokio::test]

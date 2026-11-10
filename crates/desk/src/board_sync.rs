@@ -21,26 +21,8 @@ use crate::crew::{Party, PartyKind};
 
 /// The tools a board's sync may call, and nothing else: no raw API, no
 /// delete, no reassigning.
-pub const JIRA_TOOLS: &[&str] = &[
-    "jira.search",
-    "jira.get_issue",
-    "jira.create_issue",
-    "jira.update_issue",
-    "jira.list_transitions",
-    "jira.transition_issue",
-    "jira.add_comment",
-];
-pub const LINEAR_TOOLS: &[&str] = &[
-    "linear.issue_list",
-    "linear.issue_get",
-    "linear.issue_search",
-    "linear.issue_create",
-    "linear.issue_update",
-    "linear.issue_link",
-    "linear.comment_add",
-    "linear.states_list",
-    "linear.teams_list",
-];
+pub const JIRA_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS;
+pub const LINEAR_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS;
 
 /// The tools `system`'s sync needs a hub to offer.
 pub fn tools_of(system: System) -> &'static [&'static str] {
