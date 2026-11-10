@@ -333,6 +333,7 @@ async fn every_category_answers_whom_it_holds_things_for() {
             expires_at: Utc::now() + Duration::days(1),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         })
         .unwrap();
     let permissions: Arc<dyn workforce_permissions::store::PermissionStore> =

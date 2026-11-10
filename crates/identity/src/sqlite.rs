@@ -83,7 +83,8 @@ impl SqliteIdentityStore {
                 created_at      TEXT NOT NULL,
                 expires_at      TEXT NOT NULL,
                 last_used_at    TEXT,
-                revoked_at      TEXT
+                revoked_at      TEXT,
+                desk_link       TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_remote_mcp_tokens_identity
@@ -109,6 +110,27 @@ impl SqliteIdentityStore {
         )
         .wrap_err("Failed to initialize identity schema")?;
         Self::drop_legacy_token_prefix(conn)?;
+        Self::add_desk_link_column(conn)?;
+        Ok(())
+    }
+
+    /// A database written before Desk boss links has no `desk_link` column.
+    /// Added, empty, on the next start; every existing key stays a remote
+    /// MCP key.
+    fn add_desk_link_column(conn: &Connection) -> Result<()> {
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('remote_mcp_tokens') \
+                 WHERE name = 'desk_link'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .wrap_err("Failed to inspect remote_mcp_tokens")?
+            > 0;
+        if !has_column {
+            conn.execute_batch("ALTER TABLE remote_mcp_tokens ADD COLUMN desk_link TEXT;")
+                .wrap_err("Failed to add remote_mcp_tokens.desk_link")?;
+        }
         Ok(())
     }
 
@@ -406,14 +428,15 @@ impl TeamStore for SqliteIdentityStore {
 }
 
 const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, scopes, \
-                                        created_at, expires_at, last_used_at, revoked_at";
+                                        created_at, expires_at, last_used_at, revoked_at, \
+                                        desk_link";
 
 impl RemoteMcpTokenStore for SqliteIdentityStore {
     fn create_token(&self, token: &RemoteMcpToken) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO remote_mcp_tokens (id, identity_id, label, token_hash, scopes, created_at, expires_at, last_used_at, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO remote_mcp_tokens (id, identity_id, label, token_hash, scopes, created_at, expires_at, last_used_at, revoked_at, desk_link)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 token.id.to_string(),
                 token.identity_id.to_string(),
@@ -424,6 +447,11 @@ impl RemoteMcpTokenStore for SqliteIdentityStore {
                 token.expires_at.to_rfc3339(),
                 token.last_used_at.map(|t| t.to_rfc3339()),
                 token.revoked_at.map(|t| t.to_rfc3339()),
+                token
+                    .desk_link
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ],
         )
         .wrap_err("Failed to create remote MCP token")?;
@@ -676,6 +704,9 @@ pub(crate) fn parse_remote_mcp_token_row(
     let expires_at: String = row.get("expires_at")?;
     let last_used_at: Option<String> = row.get("last_used_at")?;
     let revoked_at: Option<String> = row.get("revoked_at")?;
+    // Absent from a source an older release wrote; unreadable is no link,
+    // which a Desk boss token can't do without, so it fails closed.
+    let desk_link: Option<String> = row.get("desk_link").ok().flatten();
     Ok(RemoteMcpToken {
         id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
         identity_id: Uuid::parse_str(&identity_id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -686,6 +717,7 @@ pub(crate) fn parse_remote_mcp_token_row(
         expires_at: parse_rfc3339(&expires_at),
         last_used_at: last_used_at.as_deref().map(parse_rfc3339),
         revoked_at: revoked_at.as_deref().map(parse_rfc3339),
+        desk_link: desk_link.and_then(|l| serde_json::from_str(&l).ok()),
     })
 }
 
@@ -1189,7 +1221,62 @@ mod tests {
             expires_at: created_at + chrono::Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         }
+    }
+
+    #[test]
+    fn a_desk_boss_link_round_trips_and_an_old_database_gains_the_column() {
+        use crate::remote_mcp_token::{DeskLink, TokenScope};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE remote_mcp_tokens (
+                    id TEXT PRIMARY KEY, identity_id TEXT NOT NULL, label TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                    last_used_at TEXT, revoked_at TEXT);",
+            )
+            .unwrap();
+        }
+        let store = SqliteIdentityStore::new(&path).unwrap();
+        let now = Utc::now();
+        let plain = token_for(Uuid::new_v4(), now, "laptop");
+        store.create_token(&plain).unwrap();
+        let link = DeskLink {
+            link_id: Uuid::new_v4(),
+            agent_id: "allan".into(),
+            group_key: "d-1/g-acme".into(),
+            desk_group_key: "d-1/g-acme".into(),
+            group_name: "Acme".into(),
+            engine_id: "devbox".into(),
+            engine_name: "devbox".into(),
+            engine_public_key: "ed25519:key".into(),
+        };
+        let boss = RemoteMcpToken {
+            token_hash: crate::remote_mcp_token::mint_as(TokenScope::DeskBoss).hash,
+            scopes: vec!["desk_boss".into(), "device:d1".into()],
+            desk_link: Some(link.clone()),
+            ..token_for(plain.identity_id, now, "Allan bosses Acme on devbox")
+        };
+        store.create_token(&boss).unwrap();
+        drop(store);
+        let store = SqliteIdentityStore::new(&path).unwrap();
+        let got = store.get_token_by_hash(&boss.token_hash).unwrap().unwrap();
+        assert_eq!(got.desk_link, Some(link));
+        assert_eq!(got.scope(), Some(TokenScope::DeskBoss));
+        let got = store.get_token_by_hash(&plain.token_hash).unwrap().unwrap();
+        assert_eq!(got.desk_link, None);
+        assert_eq!(got.scope(), Some(TokenScope::RemoteMcp));
+        assert_eq!(
+            store
+                .list_tokens_for_identity(plain.identity_id)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

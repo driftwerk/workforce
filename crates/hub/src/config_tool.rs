@@ -204,8 +204,9 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
 }
 
 /// Refuse the settings only a human changes: the agent's environments decide
-/// which instances it may reach, and `[oversight]` what it oversees and may
-/// do there, so it never edits them itself.
+/// which instances it may reach, `[oversight]` what it oversees and may do
+/// there, and `[desk_boss]` whether a Desk may make it a boss, so it never
+/// edits them itself.
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
         Some(&"oversight") => Err(
@@ -214,6 +215,11 @@ fn human_only(path: &[&str]) -> Result<(), String> {
         Some(&"environments") => Err(
             "environments are human-only: a person changes them with `cmd: env …` or in the \
              agent's settings"
+                .to_string(),
+        ),
+        Some(&"desk_boss") => Err(
+            "desk_boss is human-only: an admin decides whether this agent takes boss work \
+             from Desk"
                 .to_string(),
         ),
         _ => Ok(()),
@@ -438,6 +444,9 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             "oversight.full.repos",
             "oversight.full.budget_usd_per_day",
             "oversight.wake.hold_minutes",
+            // Whether it may be made a Desk group's boss.
+            "desk_boss",
+            "desk_boss.accept",
         ] {
             assert!(
                 human_only(&key_path(key).unwrap()).is_err(),

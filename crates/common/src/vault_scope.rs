@@ -131,6 +131,21 @@ mod tests {
 /// marker, ever resolves one.
 pub const DESK_LINK_PREFIXES: [&str; 2] = ["desk/hubs", "desk/links"];
 
+/// Where an engine keeps each Desk boss link's token, as
+/// `desk/links/bosses/<link id>`: under [`DESK_LINK_PREFIXES`], so no agent
+/// tool and no secret marker ever reaches one.
+pub const DESK_BOSS_LINKS: &str = "desk/links/bosses";
+
+/// Where an engine keeps the private half of its Ed25519 key, the one its
+/// boss links' uplinks prove: also under [`DESK_LINK_PREFIXES`]. It never
+/// leaves the engine.
+pub const DESK_ENGINE_KEY: &str = "desk/links/engine-key";
+
+/// The reserved path of the boss link `link_id`'s token on an engine.
+pub fn desk_boss_link_path(link_id: &str) -> String {
+    format!("{DESK_BOSS_LINKS}/{link_id}")
+}
+
 /// Whether the vault path `path` (shared, or per-user under `users/<uid>/`)
 /// is a Desk link, matched without regard to case, doubled or trailing
 /// slashes, so no spelling of it slips by.
@@ -152,7 +167,22 @@ pub fn is_desk_link(path: &str) -> bool {
 
 #[cfg(test)]
 mod desk_link_tests {
-    use super::is_desk_link;
+    use super::{desk_boss_link_path, is_desk_link, DESK_ENGINE_KEY};
+
+    #[test]
+    fn an_engines_boss_links_and_key_are_desk_links() {
+        let link = desk_boss_link_path("6f1c");
+        assert_eq!(link, "desk/links/bosses/6f1c");
+        for p in [
+            link.clone(),
+            format!("users/sam/{link}"),
+            DESK_ENGINE_KEY.to_string(),
+            format!("users/sam/{DESK_ENGINE_KEY}"),
+            DESK_ENGINE_KEY.to_uppercase(),
+        ] {
+            assert!(is_desk_link(&p), "{p}");
+        }
+    }
 
     #[test]
     fn a_desk_link_is_known_however_it_is_spelled() {

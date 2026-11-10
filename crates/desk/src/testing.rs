@@ -99,6 +99,7 @@ pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
         account_keys: None,
         line_reach: crate::line::Reach::Group,
         memory: Default::default(),
+        bosses: Default::default(),
     }
 }
 
