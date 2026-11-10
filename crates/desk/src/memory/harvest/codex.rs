@@ -50,11 +50,11 @@ pub fn codex_part(v: &Value, state: &mut CodexParts) -> Vec<Part> {
         v.get("type").and_then(Value::as_str),
         p.get("type").and_then(Value::as_str),
     ) {
-        (Some("turn_context"), _) | (Some("event_msg"), Some("task_started")) => {
+        (Some("turn_context"), _) | (Some("event_msg"), Some("task_started" | "turn_started")) => {
             state.turn(text("turn_id"));
             Vec::new()
         }
-        (Some("event_msg"), Some("task_complete" | "turn_aborted")) => {
+        (Some("event_msg"), Some("task_complete" | "turn_complete" | "turn_aborted")) => {
             at.map(|at| Part::End { at }).into_iter().collect()
         }
         (Some("compacted"), _) => match (at, text("message")) {

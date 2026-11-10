@@ -760,7 +760,9 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
                                 .any(|x| x == "waitingOnApproval" || x == "waitingOnUserInput")
                         }),
                 },
-                "idle" => CodexEvent::Idle,
+                // A turn that failed (a usage limit, a lost sign-in) ends
+                // in `systemError`, never `idle` (verified on CLI 0.166).
+                "idle" | "systemError" => CodexEvent::Idle,
                 _ => return None,
             };
             seen(s("/threadId"), event)
@@ -893,6 +895,9 @@ pub struct Follower {
     home: Option<PathBuf>,
     /// The thread's turn running now, which a steer must name.
     turn: Option<String>,
+    /// Whether the thread's status said its last turn ended: a turn's
+    /// `turn/completed` says so only when its status didn't.
+    settled: bool,
     /// The line's messages said into its turns, oldest first, until Codex
     /// answers each (`turn/steer` answers in order).
     steering: std::collections::VecDeque<Uuid>,
@@ -908,6 +913,7 @@ impl Follower {
             open: HashMap::new(),
             home,
             turn: None,
+            settled: false,
             steering: std::collections::VecDeque::new(),
         }
     }
@@ -1018,14 +1024,36 @@ impl Follower {
                 }
                 let ours = params.get("threadId").and_then(Value::as_str).is_some()
                     && params.get("threadId").and_then(Value::as_str) == self.thread.as_deref();
+                // A turn's end, when its status never said it: the turn
+                // is over whatever became of the thread. Said once, which
+                // ever of the two comes first.
+                let mut ended = None;
+                let mut said_already = false;
                 match method {
                     "turn/started" if ours => {
                         self.turn = params
                             .pointer("/turn/id")
                             .and_then(Value::as_str)
                             .map(str::to_string);
+                        self.settled = false;
                     }
-                    "turn/completed" if ours => self.turn = None,
+                    "turn/completed" if ours => {
+                        self.turn = None;
+                        if !std::mem::replace(&mut self.settled, true) {
+                            ended = self.thread.clone().map(|thread| Seen {
+                                thread,
+                                event: CodexEvent::Idle,
+                            });
+                        }
+                    }
+                    "thread/status/changed" if ours => {
+                        let end = matches!(
+                            params.pointer("/status/type").and_then(Value::as_str),
+                            Some("idle" | "systemError")
+                        );
+                        said_already = end && self.settled;
+                        self.settled = end;
+                    }
                     _ => {}
                 }
                 if method == "serverRequest/resolved" {
@@ -1042,7 +1070,7 @@ impl Follower {
                         });
                     return (seen.into_iter().collect(), None);
                 }
-                let seen = interpret(method, &params);
+                let seen = interpret(method, &params).filter(|_| !said_already);
                 if let Some(Seen {
                     thread,
                     event: CodexEvent::Thread { .. },
@@ -1056,7 +1084,7 @@ impl Follower {
                     }
                     _ => None,
                 };
-                (seen.into_iter().collect(), send)
+                (seen.into_iter().chain(ended).collect(), send)
             }
             (None, None) => (Vec::new(), None),
         }
@@ -1387,6 +1415,85 @@ pub(crate) mod tests {
         );
         assert_eq!(done("aborted", rm.clone()), None);
         assert_eq!(done("inProgress", rm), None);
+    }
+
+    /// What a follower makes of a turn Codex 0.166 recorded (against a
+    /// stand-in model): the session's own events, the turn's ends among them.
+    fn replayed(recording: &str) -> Vec<CodexEvent> {
+        let mut f = Follower::new(None, None);
+        recording
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .flat_map(|v| f.heard(&v).0)
+            .filter(|s| s.thread == "t1")
+            .map(|s| s.event)
+            .filter(|e| matches!(e, CodexEvent::Working { .. } | CodexEvent::Idle))
+            .collect()
+    }
+
+    #[test]
+    fn every_recorded_turn_ends_once_however_it_ended() {
+        let working = CodexEvent::Working { waiting: false };
+        for (how, recording) in [
+            (
+                "finished",
+                include_str!("../fixtures/codex/app-server-0.166-ok.jsonl"),
+            ),
+            (
+                "interrupted",
+                include_str!("../fixtures/codex/app-server-0.166-interrupted.jsonl"),
+            ),
+            // A usage limit: `systemError`, never `idle`.
+            (
+                "failed",
+                include_str!("../fixtures/codex/app-server-0.166-failed.jsonl"),
+            ),
+        ] {
+            assert_eq!(
+                replayed(recording),
+                [working.clone(), CodexEvent::Idle],
+                "{how}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turns_completion_ends_it_when_its_status_never_does() {
+        let mut f = Follower::new(Some("t1".into()), None);
+        let heard = |f: &mut Follower, v: Value| -> Vec<CodexEvent> {
+            f.heard(&v).0.into_iter().map(|s| s.event).collect()
+        };
+        let status = |kind: &str| json!({"method": "thread/status/changed", "params": {"threadId": "t1", "status": {"type": kind, "activeFlags": []}}});
+        let started =
+            json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u1"}}});
+        let completed = json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u1", "status": "failed"}}});
+        heard(&mut f, status("active"));
+        heard(&mut f, started.clone());
+        // No status at all: the completion is its end.
+        assert_eq!(heard(&mut f, completed.clone()), [CodexEvent::Idle]);
+        // And a status after it isn't a second one.
+        assert_eq!(heard(&mut f, status("idle")), []);
+        // The next turn ends at its status, and its completion says no more.
+        assert_eq!(
+            heard(&mut f, status("active")),
+            [CodexEvent::Working { waiting: false }]
+        );
+        heard(&mut f, started);
+        assert_eq!(heard(&mut f, status("systemError")), [CodexEvent::Idle]);
+        assert_eq!(heard(&mut f, completed.clone()), []);
+        // Another thread's completion is not this session's.
+        let other =
+            json!({"method": "turn/completed", "params": {"threadId": "t2", "turn": {"id": "x"}}});
+        assert_eq!(heard(&mut f, other), []);
+        // A sub-agent's thread that failed ends as well.
+        assert_eq!(
+            interpret(
+                "thread/status/changed",
+                &json!({"threadId": "child", "status": {"type": "systemError"}})
+            )
+            .map(|s| s.event),
+            Some(CodexEvent::Idle)
+        );
     }
 
     #[test]

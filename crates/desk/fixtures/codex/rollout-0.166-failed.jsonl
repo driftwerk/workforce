@@ -1,0 +1,11 @@
+{"type": "session_meta", "payload": {"id": "t1", "cwd": "/work/app", "timestamp": "2026-11-10T16:47:47.699Z"}}
+{"type": "event_msg", "payload": {"type": "task_started", "turn_id": "u1", "root_turn_id": "u1", "turn_attribution": {"turn_id": "u1", "turn_trigger": null, "parent_turn_id": null, "root_turn_id": "u1"}}}
+{"type": "response_item", "payload": {}}
+{"type": "response_item", "payload": {}}
+{"type": "world_state", "payload": {}}
+{"type": "turn_context", "payload": {}}
+{"type": "event_msg", "payload": {"type": "thread_settings_applied"}}
+{"type": "response_item", "payload": {}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "u1"}}
+{"type": "event_msg", "payload": {"type": "token_count"}}
+{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "u1", "root_turn_id": "u1", "last_agent_message": null, "error": {"message": "You\u2019ve hit your usage limit. Try again later.", "codex_error_info": "usage_limit_exceeded"}}}

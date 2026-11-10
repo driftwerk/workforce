@@ -1,0 +1,14 @@
+{"type": "session_meta", "payload": {"id": "t1", "cwd": "/work/app", "timestamp": "2026-11-10T16:47:43.633Z"}}
+{"type": "event_msg", "payload": {"type": "task_started", "turn_id": "u1", "root_turn_id": "u1", "turn_attribution": {"turn_id": "u1", "turn_trigger": null, "parent_turn_id": null, "root_turn_id": "u1"}}}
+{"type": "response_item", "payload": {}}
+{"type": "response_item", "payload": {}}
+{"type": "world_state", "payload": {}}
+{"type": "turn_context", "payload": {}}
+{"type": "event_msg", "payload": {"type": "thread_settings_applied"}}
+{"type": "response_item", "payload": {}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "u1"}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "u1"}}
+{"type": "response_item", "payload": {}}
+{"type": "token_usage_record", "payload": {}}
+{"type": "event_msg", "payload": {"type": "token_count"}}
+{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "u1", "root_turn_id": "u1", "last_agent_message": "Fixed: the test passes now."}}
