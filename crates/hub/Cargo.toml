@@ -54,9 +54,6 @@ serde_json = "1"
 toml = { workspace = true }
 toml_edit = { workspace = true }
 # The overseer reads what it says past look-alike and hidden letters.
-unicode-normalization = { workspace = true }
-unicode-properties = { workspace = true }
-unicode-security = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 tower-http = { version = "0.6", features = ["cors"] }
