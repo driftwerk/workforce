@@ -251,7 +251,10 @@ mod tests {
         ] {
             let refused = tool.execute(input.clone()).await.unwrap();
             assert!(!refused.success, "{input}");
-            assert!(refused.error.unwrap_or_default().contains("human-only"), "{input}");
+            assert!(
+                refused.error.unwrap_or_default().contains("human-only"),
+                "{input}"
+            );
         }
         let policy =
             ConnectorToolAccess::policy(service.workspace.clone(), Arc::clone(&service.tools));
