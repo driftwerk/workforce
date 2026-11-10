@@ -198,6 +198,36 @@ pub(crate) fn register_jira(
     }
 }
 
+/// A fake Linear with one team, ATL.
+struct FakeLinearTool(&'static str);
+
+pub(crate) const ATL_ID: &str = "8a7b6c5d-0000-4000-8000-000000000001";
+
+#[async_trait::async_trait]
+impl Tool for FakeLinearTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "a fake Linear tool"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    async fn execute(&self, _input: Value) -> eyre::Result<ToolResult> {
+        Ok(ToolResult::success(
+            match self.0 {
+                "linear.teams_list" => json!({ "teams": [
+                    { "id": ATL_ID, "key": "ATL", "name": "Atlas" },
+                    { "id": "99999999-0000-4000-8000-000000000009", "key": "GLX", "name": "Globex" },
+                ]}),
+                _ => json!({ "issues": [] }),
+            },
+            0,
+        ))
+    }
+}
+
 /// A remote hub: its remote MCP served on a local port, exposing `allow`,
 /// with the fake Jira's tools. Its address, and a member's token there.
 pub(crate) struct RemoteHub {
@@ -216,6 +246,9 @@ pub(crate) async fn remote_hub(
     let jira: Shared = Arc::default();
     let service = fx.state.registry.default_agent().unwrap();
     register_jira(&service.tools, &jira, except);
+    for name in workforce_desk::board_sync::LINEAR_TOOLS {
+        service.tools.register(Arc::new(FakeLinearTool(name)));
+    }
     let state = Arc::try_unwrap(fx.state)
         .ok()
         .expect("the fixture's only handle");
@@ -428,6 +461,26 @@ async fn a_hub_s_token_is_tried_then_kept_in_the_vault_only() {
             .get(&token_key(&local.person.id.to_string(), "globex"))
             .is_none());
         assert!(local.sync.desk.sync_hub("globex").await.unwrap().is_none());
+        // A new address with the old token is refused, and nothing changes.
+        let (status, _) = local
+            .send(
+                "PUT",
+                "/api/desk/sync-hubs/atlas",
+                json!({ "name": "Atlas", "url": "https://elsewhere.example" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            local
+                .sync
+                .desk
+                .sync_hub("atlas")
+                .await
+                .unwrap()
+                .unwrap()
+                .url,
+            remote.url
+        );
         // Forgetting the hub removes its token.
         let (status, _) = local
             .send("DELETE", "/api/desk/sync-hubs/atlas", json!(null))
@@ -655,6 +708,35 @@ async fn a_board_pauses_when_its_hub_is_forgotten() {
         assert_eq!(status, StatusCode::CONFLICT, "{said}");
         assert!(said["error"].as_str().unwrap().contains("Atlas has Jira"));
         let _ = Uuid::nil();
+    })
+    .await;
+}
+
+/// A Linear link names its team by key and id, and the two must be one
+/// team on the hub: another team's id under this key is refused.
+#[tokio::test]
+async fn a_linear_link_must_name_one_team_by_key_and_id() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*", "linear.*"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Atlas web").await;
+        let body = |id: &str| {
+            json!({
+                "system": "linear", "target": "ATL", "targetId": id,
+                "via": { "kind": "hub", "hub": "atlas" },
+                "filter": { "kind": "label", "value": "web" }, "states": {},
+            })
+        };
+        let uri = format!("/api/desk/boards/{}/link", b.id);
+        let (status, said) = local
+            .send("PUT", &uri, body("99999999-0000-4000-8000-000000000009"))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+        let (status, said) = local.send("PUT", &uri, body(ATL_ID)).await;
+        assert_eq!(status, StatusCode::OK, "{said}");
     })
     .await;
 }

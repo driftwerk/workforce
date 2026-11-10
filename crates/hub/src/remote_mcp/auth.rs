@@ -109,7 +109,7 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
     }
     let as_member = match minted_by_device(&token.scopes) {
         Some(device) => {
-            device_still_paired(state, device, identity.id)?;
+            device_still_paired(state, device, &token)?;
             true
         }
         None => false,
@@ -143,33 +143,42 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
 }
 
 /// Whether the device that minted a token is still paired to the token's
-/// person, checked on every request: unpairing or reassigning the device, by
-/// any route, ends its tokens at once. Fails closed when it can't be told.
+/// person, as the same pairing that minted it, checked on every request:
+/// unpairing, expiring or reassigning the device, by any route, ends its
+/// tokens at once, and a device paired again (a new pairing under the same
+/// id) never revives a token minted before it. A token found dead is
+/// revoked on the spot, so it leaves the listing and the cap too. Fails
+/// closed when it can't be told.
 fn device_still_paired(
     state: &GatewayState,
     device: &str,
-    person: uuid::Uuid,
+    token: &RemoteMcpToken,
 ) -> Result<(), AuthError> {
     let pairing = state
         .device_pairing
         .as_ref()
         .ok_or(AuthError::Unauthenticated)?;
-    let paired = pairing
-        .device(device)
-        .map_err(|e| {
-            warn!(error = %e, "device lookup for a device-minted remote MCP token failed — failing closed");
-            AuthError::Unavailable
-        })?
-        .filter(|d| !d.revoked && d.expires_at.is_none_or(|at| at > Utc::now()))
-        .is_some();
+    let now = Utc::now();
+    let found = pairing.device(device).map_err(|e| {
+        warn!(error = %e, "device lookup for a device-minted remote MCP token failed — failing closed");
+        AuthError::Unavailable
+    })?;
+    let paired = found.as_ref().is_some_and(|d| {
+        !d.revoked && d.expires_at.is_none_or(|at| at > now) && d.created_at <= token.created_at
+    });
     let holder = state
         .identity_store
         .as_ref()
         .and_then(|store| crate::device_link::identity_for_device(store.as_ref(), device));
-    match paired && holder.as_deref() == Some(person.to_string().as_str()) {
-        true => Ok(()),
-        false => Err(AuthError::Unauthenticated),
+    if paired && holder.as_deref() == Some(token.identity_id.to_string().as_str()) {
+        return Ok(());
     }
+    if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
+        if let Err(e) = tokens.revoke_token(token.id, None, now) {
+            warn!(error = %e, token = %token.id, "a dead device token wasn't revoked");
+        }
+    }
+    Err(AuthError::Unauthenticated)
 }
 
 /// Whether a token with `scopes` may use the whole remote surface: it must
@@ -393,6 +402,52 @@ mod tests {
             authenticate(&fx.state, &bearer(&borrowed)).err(),
             Some(AuthError::Unauthenticated)
         );
+    }
+
+    /// A device paired again under the same id never revives a token it
+    /// minted before; a dead token is revoked where it is found.
+    #[test]
+    fn a_re_paired_device_never_revives_an_older_token() {
+        use crate::remote_mcp::testing::{fixture_with_devices, pair_device};
+        let (fx, devices) = fixture_with_devices(true);
+        let mut who = active(&fx, IdentityRole::Member);
+        let (mut device, _) = pair_device(&fx, &devices, &mut who, "Mac");
+        let token = device_token(&fx, &who, &device.id);
+        assert!(authenticate(&fx.state, &bearer(&token)).is_ok());
+        // Revoked, then paired again: the same id, a newer pairing.
+        device.revoked = false;
+        device.created_at = Utc::now() + Duration::seconds(5);
+        workforce_pairing::PairingStore::revoke_device(devices.as_ref(), &device.id).unwrap();
+        workforce_pairing::PairingStore::register_device(devices.as_ref(), &device).unwrap();
+        assert_eq!(
+            authenticate(&fx.state, &bearer(&token)).err(),
+            Some(AuthError::Unauthenticated)
+        );
+        assert!(
+            fx.tokens
+                .list_tokens_for_identity(who.id)
+                .unwrap()
+                .is_empty(),
+            "the dead token was revoked"
+        );
+    }
+
+    /// An expired device's tokens die with it, and are revoked.
+    #[test]
+    fn an_expired_device_s_tokens_are_revoked() {
+        use crate::remote_mcp::testing::{fixture_with_devices, pair_device};
+        let (fx, devices) = fixture_with_devices(true);
+        let mut who = active(&fx, IdentityRole::Member);
+        let (mut device, _) = pair_device(&fx, &devices, &mut who, "Mac");
+        let token = device_token(&fx, &who, &device.id);
+        device.expires_at = Some(Utc::now() - Duration::seconds(1));
+        workforce_pairing::PairingStore::register_device(devices.as_ref(), &device).unwrap();
+        assert!(authenticate(&fx.state, &bearer(&token)).is_err());
+        assert!(fx
+            .tokens
+            .list_tokens_for_identity(who.id)
+            .unwrap()
+            .is_empty());
     }
 
     /// An admin's device mints a member's token: its principal is a member.

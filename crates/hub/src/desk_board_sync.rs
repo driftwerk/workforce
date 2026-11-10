@@ -50,6 +50,10 @@ use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 use crate::vault::Vault;
 
+/// The longest the link dialog waits on one hub when asking which offers a
+/// system.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The longest a call to a hub may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -346,13 +350,18 @@ impl BoardSync {
     /// board then syncs through it rather than with this computer's own
     /// keys. A hub that can't be reached now is passed over.
     pub async fn hub_offering(&self, system: System, person: &str) -> Option<String> {
-        for h in self.desk.sync_hubs().await.ok()? {
+        let hubs = self.desk.sync_hubs().await.ok()?;
+        let probes = hubs.into_iter().map(|h| async move {
             let via = Via::Hub { hub: h.id.clone() };
-            if self.offered(system, &via, person).await.is_ok() {
-                return Some(h.name);
-            }
-        }
-        None
+            let offered =
+                tokio::time::timeout(PROBE_TIMEOUT, self.offered(system, &via, person)).await;
+            matches!(offered, Ok(Ok(_))).then_some(h.name)
+        });
+        futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .next()
     }
 
     /// The name a board's hub goes by, for what the board says.
@@ -536,6 +545,24 @@ async fn put_hub(
         },
         None => None,
     };
+    // A token goes only to the address it was given for: a hub that moves
+    // needs a token checked at its new address.
+    let before = match r.sync.desk.sync_hub(&hub).await {
+        Ok(h) => h,
+        Err(e) => return e.into_response(),
+    };
+    let moved = before
+        .as_ref()
+        .is_some_and(|h| h.url != url.as_str().trim_end_matches('/'));
+    if moved && token.is_none() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "{} has a new address: paste a token made there.",
+                body.name.trim()
+            ),
+        );
+    }
     // A new token is tried before it is kept: one the hub refuses is never
     // kept.
     let offers = match &token {
@@ -866,6 +893,33 @@ async fn link_board(
             Json(json!({ "error": paused_words(&hub, link.system, &p), "paused": p })),
         )
             .into_response();
+    }
+    // A Linear team is named by its key and its id: the two must be one team
+    // on that hub, so a link never syncs a team other than the one named.
+    if link.system == System::Linear {
+        let remote = match r.sync.offered(link.system, &link.via, &person).await {
+            Ok(remote) => remote,
+            Err(p) => {
+                return refusal(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &paused_words(&hub, link.system, &p),
+                )
+            }
+        };
+        let teams = match sync::call(&*remote, link.system, "linear.teams_list", json!({})).await {
+            Ok(t) => teams_of(&t),
+            Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+        };
+        let named = teams.as_array().into_iter().flatten().any(|t| {
+            t["id"].as_str() == link.target_id.as_deref()
+                && t["key"].as_str() == Some(link.target.as_str())
+        });
+        if !named {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                &format!("{hub} has no Linear team {} with that id.", link.target),
+            );
+        }
     }
     match r.sync.desk.link_board(id, link, &person).await {
         Ok(b) => Json(b).into_response(),

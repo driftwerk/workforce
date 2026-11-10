@@ -414,7 +414,13 @@ impl Consent {
         if path.is_empty() || path.split('/').any(|segment| segment == "..") {
             return Ok(None);
         }
-        Ok(self.vault()?.get(&user_path(&self.uid, path)))
+        let full = user_path(&self.uid, path);
+        // What an agent's vault tools may not read is no skill's value
+        // either: a Desk link, a database or an endpoint credential.
+        if crate::vault_policy::agent_can_read(&full, Some(&self.uid)).is_err() {
+            return Ok(None);
+        }
+        Ok(self.vault()?.get(&full))
     }
 
     /// Approve `credential` for `skill` and provision it: `provided` is
@@ -1720,6 +1726,12 @@ description = "ping"
         assert_eq!(bob.user_secret("../alice/api_token").unwrap(), None);
         assert_eq!(bob.user_secret("").unwrap(), None);
         assert_eq!(bob.user_secret("missing").unwrap(), None);
+        // A Desk link's token is never a skill's value.
+        h.vault
+            .set("users/bob/desk/hubs/atlas/remote_mcp", "wfr-like-token")
+            .unwrap();
+        assert_eq!(bob.user_secret("desk/hubs/atlas/remote_mcp").unwrap(), None);
+        assert_eq!(bob.user_secret("Desk/Hubs/atlas/remote_mcp").unwrap(), None);
     }
 
     #[test]
