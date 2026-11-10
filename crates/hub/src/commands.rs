@@ -120,9 +120,11 @@ pub enum Command {
     /// `/skills` — the agent's skills and whether each is ready, as
     /// `system.list_skills` reads them.
     Skills,
-    /// `/<word>` naming no command: answered at once, never passed to the
-    /// model. Only a lone, command-shaped word ([`unknown_command`]).
-    Unknown { name: String },
+    /// `/<word>` that is a near miss of a command (`/stauts`): answered at
+    /// once with the command it is near, never passed to the model, and never
+    /// echoing what was typed. Any other unknown word goes to the agent
+    /// ([`unknown_command`]).
+    Unknown { near: &'static str },
 }
 
 /// One command as `/help` and Desk's `/` menu list it.
@@ -242,8 +244,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     info("help", "", &["h", "?"], "Show this help"),
 ];
 
-/// The playbook directives and the Claude Code chat words: commands of their
-/// own that are read elsewhere (or reach the agent), never an unknown one.
+/// The playbook directives, the Claude Code chat words and a stop: read
+/// elsewhere (or by the agent), never an unknown command.
 const READ_ELSEWHERE: &[&str] = &[
     "continue",
     "exit",
@@ -252,23 +254,107 @@ const READ_ELSEWHERE: &[&str] = &[
     "cc-rebase",
     "cx",
     "cx-rebase",
+    "stop",
 ];
 
-/// A message that is a lone command-shaped word naming no command: `/clear2`,
-/// `cmd: frobnicate`. A path (`/etc/hosts`), prose after a prefix (`cmd: what
-/// is happening`), or a word read elsewhere is not one, and goes on as before.
+/// Every word [`parse_command`] reads as a command, three letters or more:
+/// what an unknown word may be a near miss of.
+const KNOWN: &[&str] = &[
+    "new",
+    "reset",
+    "clear",
+    "status",
+    "progress",
+    "sitrep",
+    "update",
+    "compact",
+    "context",
+    "ctx",
+    "help",
+    "model",
+    "health",
+    "wake",
+    "heartbeat",
+    "config",
+    "save-config",
+    "select-agent",
+    "tools",
+    "secret",
+    "endpoint",
+    "endpoints",
+    "skill",
+    "skills",
+    "workflow",
+    "playbook",
+    "playbooks",
+    "monitor",
+    "monitors",
+    "use",
+    "mcp",
+    "remote-mcp",
+    "env",
+];
+
+/// The edits (insert, delete, substitute, swap two neighbours) from `a` to `b`.
+fn edits(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// The command `word` is a near miss of: one edit for a short word, two for
+/// a longer one.
+fn near_miss(word: &str) -> Option<&'static str> {
+    let allowed = if word.chars().count() <= 5 { 1 } else { 2 };
+    KNOWN
+        .iter()
+        .map(|known| (edits(word, known), *known))
+        .filter(|(d, _)| *d <= allowed)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, known)| known)
+}
+
+/// A message that is a lone word a near miss of a command (`/stauts`,
+/// `cmd: helo`). Anything else — a path (`/tmp`, `/etc/hosts`), prose after a
+/// prefix, an unknown word near no command, a word read elsewhere — is not
+/// one, and goes to the agent as before.
 fn unknown_command(word: &str, args: Option<&str>) -> Option<Command> {
     let name = word.strip_prefix('/')?;
-    let shaped = name.len() <= 32
-        && name.starts_with(|c: char| c.is_ascii_lowercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-    (shaped && args.is_none_or(str::is_empty) && !READ_ELSEWHERE.contains(&name)).then(|| {
-        Command::Unknown {
-            name: name.to_string(),
-        }
-    })
+    if args.is_some_and(|a| !a.is_empty()) || READ_ELSEWHERE.contains(&name) {
+        return None;
+    }
+    near_miss(name).map(|near| Command::Unknown { near })
+}
+
+/// The command `message` runs, given whether it carries files: a near miss
+/// with files is no unknown command, and goes to the agent with them.
+pub fn command_of(message: &str, with_files: bool) -> Option<Command> {
+    parse_command(message).filter(|c| !(with_files && matches!(c, Command::Unknown { .. })))
+}
+
+/// Whether `message` is a command that runs on its raw text, untokenised
+/// and never joining a live turn: any but an unknown one, which goes on like
+/// a message.
+pub fn runs_raw(message: &str) -> bool {
+    parse_command(message).is_some_and(|c| !matches!(c, Command::Unknown { .. }))
 }
 
 /// Result of executing a command.
@@ -472,7 +558,7 @@ pub fn parse_command(message: &str) -> Option<Command> {
     match cmd.as_str() {
         "/new" | "/n" => Some(Command::New { model: args }),
         "/reset" | "/r" | "/clear" => Some(Command::Reset),
-        "/status" | "/s" => Some(Command::Status),
+        "/status" | "/s" | "/progress" | "/sitrep" | "/update" | "/wtf" => Some(Command::Status),
         "/compact" | "/gc" => Some(Command::Compact),
         "/context" | "/ctx" => Some(Command::Context),
         "/help" | "/h" | "/?" => Some(Command::Help),
@@ -699,8 +785,9 @@ pub async fn execute_command(
         }
         Command::Env { args } => execute_env(service, channel, user, args.as_deref()).await,
         Command::Skills => execute_skills(service),
-        Command::Unknown { name } => CommandResult::info(format!(
-            "Unknown command `/{name}`. Type `/help` for what this agent understands."
+        Command::Unknown { near } => CommandResult::info(format!(
+            "Unknown command. Did you mean `/{near}`? Type `/help` for what this agent \
+             understands."
         )),
     }
 }
@@ -2821,11 +2908,10 @@ mod tests {
         assert_eq!(parse_command("cmd: s"), Some(Command::Status));
         // A lone unknown word is answered as one; prose after the prefix
         // still goes to the agent.
+        assert_eq!(parse_command("cmd: not-a-command"), None);
         assert_eq!(
-            parse_command("cmd: not-a-command"),
-            Some(Command::Unknown {
-                name: "not-a-command".into()
-            })
+            parse_command("cmd: stauts"),
+            Some(Command::Unknown { near: "status" })
         );
         assert_eq!(parse_command("cmd: what is happening"), None);
         // Bare prefixes are not commands.
@@ -3001,19 +3087,56 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_unknown_word_is_an_unknown_command() {
-        for (text, name) in [
-            ("/unknown", "unknown"),
-            ("/Frobnicate", "frobnicate"),
-            ("cmd: clear2", "clear2"),
-            ("  /re_index  ", "re_index"),
+    fn a_lone_near_miss_of_a_command_is_answered_with_that_command() {
+        for (text, near) in [
+            ("/stauts", "status"),
+            ("/Statsu", "status"),
+            ("cmd: clear2", "clear"),
+            ("  /helo  ", "help"),
+            ("/heartbeet", "heartbeat"),
         ] {
             assert_eq!(
                 parse_command(text),
-                Some(Command::Unknown { name: name.into() }),
+                Some(Command::Unknown { near }),
                 "{text}"
             );
         }
+        assert!(
+            !runs_raw("/stauts"),
+            "an unknown word is tokenised like a message"
+        );
+        assert!(runs_raw("/status") && runs_raw("cmd: secret a b"));
+        assert!(!runs_raw("hello"));
+        assert_eq!(
+            command_of("/stauts", true),
+            None,
+            "with files it goes to the agent"
+        );
+        assert_eq!(command_of("/status", true), Some(Command::Status));
+    }
+
+    #[test]
+    fn a_word_near_no_command_reaches_the_agent() {
+        for text in [
+            "/tmp",
+            "/data",
+            "/app",
+            "/workspace",
+            "/unknown",
+            "/frobnicate",
+            "/re_index",
+        ] {
+            assert_eq!(parse_command(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn asking_how_it_is_going_is_status_and_stop_is_read_elsewhere() {
+        for text in ["/progress", "cmd: sitrep", "/update", "/wtf"] {
+            assert_eq!(parse_command(text), Some(Command::Status), "{text}");
+        }
+        assert_eq!(parse_command("/stop"), None);
+        assert_eq!(parse_command("cmd: stop"), None);
     }
 
     #[test]

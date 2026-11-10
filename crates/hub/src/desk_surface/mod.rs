@@ -99,10 +99,12 @@ pub(crate) fn turn_end(
         .ok()
         .flatten()
         .is_some_and(|session| session.messages.iter().any(|m| m.id == desk.reply_id));
-    let command = ran.is_some_and(|text| crate::commands::parse_command(text).is_some());
+    // A command saves no answer: a near miss sent with files went to the
+    // agent, which did.
+    let command = !saved && ran.is_some_and(|text| crate::commands::parse_command(text).is_some());
     workforce_common::channels::desk::TurnEnd {
         turn_ref: desk.turn_ref.clone(),
-        reply_id: (saved && !command).then(|| desk.reply_id.clone()),
+        reply_id: saved.then(|| desk.reply_id.clone()),
         command,
     }
 }

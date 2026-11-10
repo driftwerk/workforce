@@ -1511,6 +1511,25 @@ const DESK_ONLY_FRAMES: &[&str] = &[
     crate::broadcast::DESK_DELIVERED,
 ];
 
+/// Whether the person's message kept under client id `id` in `session_id`
+/// was asked already: its turn answered it, or is running it now. Kept but
+/// unanswered with nothing running, it is a question to take up again.
+fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
+    let Some(session) = service.sessions.get(session_id).ok().flatten() else {
+        return false;
+    };
+    let Some(at) = session.messages.iter().rposition(|m| {
+        m.role == workforce_common::session::MessageRole::User
+            && m.external_id.as_deref() == Some(id)
+    }) else {
+        return false;
+    };
+    service.live_turns.running(session_id)
+        || session.messages[at + 1..]
+            .iter()
+            .any(|m| m.role == workforce_common::session::MessageRole::Assistant)
+}
+
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
@@ -2656,6 +2675,30 @@ async fn handle_ws(
                             // turn instead, and the client queues it — as does
                             // one sent to queue, files or not, which a live
                             // turn never takes in.
+                            // The same DM message again (Desk's Retry sends it
+                            // under its own id): once its turn has answered it,
+                            // or while that turn runs, it is not asked twice. Its
+                            // turn just ends, and the Desk reads what was kept.
+                            if let Some(asked) = desk.as_ref().filter(|d| {
+                                matches!(d.turn.place, DeskPlace::Dm)
+                                    && d.turn.message.is_some_and(|id| {
+                                        asked_already(
+                                            &service,
+                                            &effective_session_id,
+                                            &id.to_string(),
+                                        )
+                                    })
+                            }) {
+                                let _ = broadcast_tx.send(BroadcastMessage::turn_end(
+                                    effective_session_id.clone(),
+                                    workforce_common::channels::desk::TurnEnd {
+                                        turn_ref: asked.turn_ref.clone(),
+                                        reply_id: None,
+                                        command: false,
+                                    },
+                                ));
+                                continue;
+                            }
                             let queued = client_msg.mode
                                 == Some(workforce_gateway_client::protocol::SendMode::Queue);
                             if !has_attachments || queued {
@@ -2683,11 +2726,16 @@ async fn handle_ws(
                                     continue;
                                 }
                                 if steered.applied() {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
-                                        effective_session_id.clone(),
-                                        "injected",
-                                        "Follow-up absorbed into active run".to_string(),
-                                    ));
+                                    // Named for the message's own turn, so its
+                                    // Desk knows that one got there.
+                                    let _ = broadcast_tx.send(
+                                        BroadcastMessage::new(
+                                            effective_session_id.clone(),
+                                            "injected",
+                                            "Follow-up absorbed into active run".to_string(),
+                                        )
+                                        .stamped(stamp.as_ref()),
+                                    );
                                     continue;
                                 }
                             }
@@ -4702,21 +4750,22 @@ async fn session_export(
 }
 
 /// The commands a person can type to an agent, as `/help` lists them: what
-/// a client's `/` menu offers. The same for every agent and every caller, so
-/// it asks only that a credential sent is good.
+/// a client's `/` menu offers, to a caller that may chat.
 async fn list_commands(
     headers: axum::http::HeaderMap,
     Query(query): Query<WsQuery>,
     State(state): State<Arc<GatewayState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let caller = resolve_caller_context(&state, &headers, query.token.as_deref()).await;
-    match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => Err(StatusCode::UNAUTHORIZED),
-        Some(AuthFailure::StoreError) => Err(StatusCode::SERVICE_UNAVAILABLE),
-        None => Ok(Json(
-            serde_json::json!({ "commands": crate::commands::COMMANDS }),
-        )),
-    }
+) -> Result<Json<serde_json::Value>, ScopeRejection> {
+    require_scope(
+        &state,
+        &headers,
+        query.token.as_deref(),
+        crate::jwt::SCOPE_CHAT,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "commands": crate::commands::COMMANDS }),
+    ))
 }
 
 /// List available agents.

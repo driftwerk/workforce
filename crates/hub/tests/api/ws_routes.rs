@@ -924,7 +924,11 @@ async fn a_command_ends_its_desk_turn_as_one_kept_nowhere() {
         ("/new", ""),
         ("/compact", ""),
         ("/model", "Current"),
-        ("/frobnicate", "Unknown command `/frobnicate`. Type `/help`"),
+        (
+            "/stauts",
+            "Unknown command. Did you mean `/status`? Type `/help`",
+        ),
+        ("/sitrep", "Model"),
     ]
     .into_iter()
     .enumerate()
@@ -981,4 +985,69 @@ async fn a_command_ends_its_desk_turn_as_one_kept_nowhere() {
         .await
         .unwrap();
     assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let anonymous = reqwest::get(format!("http://{addr}/api/commands"))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // A path-like word near no command is the agent's to read, kept as asked.
+    send(&mut desk, dm("/tmp", "ref-path")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let end = frames.last().unwrap();
+    assert!(
+        end.get("command").is_none() && end["id"].is_string(),
+        "{end}"
+    );
+}
+
+/// The same DM message sent again under its own id (Desk's Retry) is not
+/// asked twice once its turn answered it: the second turn just ends, and
+/// the model is not asked again.
+#[tokio::test]
+async fn a_dm_message_sent_again_under_its_id_is_asked_once() {
+    let data = tempfile::tempdir().unwrap();
+    let (_service, llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", _service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, _) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let id = uuid::Uuid::new_v4();
+    let dm = |turn: &str| {
+        json!({"type": "chat", "content": "deploy it", "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "message": id}})
+    };
+    send(&mut desk, dm("ref-1")).await;
+    let first = frames_until(&mut desk, "turn_end").await;
+    assert!(first.last().unwrap()["id"].is_string(), "{first:?}");
+    let asked = llm.received_requests().await.unwrap().len();
+    send(&mut desk, dm("ref-2")).await;
+    let again = frames_until(&mut desk, "turn_end").await;
+    assert_eq!(again.len(), 1, "only its end: {again:?}");
+    assert_eq!(again[0]["turn_ref"], "ref-2");
+    assert_eq!(llm.received_requests().await.unwrap().len(), asked);
+}
+
+/// A follow-up taken into the running turn is said to be, under its own
+/// turn's ref, so the Desk that sent it knows it got there.
+#[tokio::test]
+async fn a_follow_up_taken_into_the_running_turn_is_named_by_its_turn() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        crate::support::agent_on_slow_mock_llm(data.path(), std::time::Duration::from_secs(2))
+            .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, _) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let dm = |content: &str, turn: &str| {
+        json!({"type": "chat", "content": content, "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"},
+                        "message": uuid::Uuid::new_v4()}})
+    };
+    send(&mut desk, dm("deploy it", "ref-a")).await;
+    let typing = next_frame(&mut desk).await;
+    assert_eq!(typing["turn_ref"], "ref-a", "{typing}");
+    send(&mut desk, dm("and tag it", "ref-b")).await;
+    let frames = frames_until(&mut desk, "injected").await;
+    assert_eq!(frames.last().unwrap()["turn_ref"], "ref-b", "{frames:?}");
 }
