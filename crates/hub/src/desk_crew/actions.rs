@@ -13,6 +13,7 @@ use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
+use workforce_desk::mode::Mode;
 use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
@@ -143,6 +144,12 @@ pub(crate) enum Action {
         /// the CLI's own sign-in.
         account: Option<Option<Uuid>>,
     },
+    /// Change a session's permission mode ([`workforce_desk::mode`]): it
+    /// starts again in place, its conversation kept.
+    SetMode {
+        session: Uuid,
+        mode: Mode,
+    },
 }
 
 #[derive(Deserialize)]
@@ -173,6 +180,8 @@ struct Input {
     draft: Option<String>,
     /// A handoff's account: an account's id, or `own`.
     account: Option<String>,
+    /// A permission mode, as Claude Code spells it.
+    mode: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -366,6 +375,12 @@ impl Action {
                     })?)),
                 },
             },
+            "crew.set_mode" => Self::SetMode {
+                session: session()?,
+                mode: i.mode.as_deref().and_then(Mode::parse).ok_or(
+                    "Say which mode: default, acceptEdits, auto, plan or bypassPermissions.",
+                )?,
+            },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -432,7 +447,8 @@ impl Action {
             | Self::Escalate { .. }
             | Self::TakeOn { .. }
             | Self::Release { .. }
-            | Self::Handoff { .. } => "",
+            | Self::Handoff { .. }
+            | Self::SetMode { .. } => "",
         })
     }
 }
@@ -632,6 +648,20 @@ impl CrewHub {
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => true,
             Action::Handoff { .. } => false,
+            // At Act, only to a mode that still asks before it runs a
+            // command; any other is an unbound overseer's alone.
+            Action::SetMode { mode, .. } => {
+                if !mode.asks() {
+                    return Gate::Suggest(
+                        format!(
+                            "only an unbound overseer puts a session in {} mode",
+                            mode.title()
+                        )
+                        .into(),
+                    );
+                }
+                o.act.set_mode
+            }
         };
         if allowed {
             Gate::Run
@@ -701,7 +731,8 @@ impl CrewHub {
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
-            | Action::Handoff { session: s, .. } => Some(*s),
+            | Action::Handoff { session: s, .. }
+            | Action::SetMode { session: s, .. } => Some(*s),
             _ => None,
         }
     }
@@ -834,7 +865,9 @@ impl CrewHub {
             | Action::Release { .. }
             // The session it starts waits on its approvals, as any Desk
             // starts; and it is only ever suggested.
-            | Action::Handoff { .. } => true,
+            | Action::Handoff { .. }
+            // Below unbound, only to a mode that still asks.
+            | Action::SetMode { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -904,7 +937,8 @@ impl CrewHub {
             | Action::Restart { session: s, .. }
             | Action::TakeOn { session: s }
             | Action::Release { session: s }
-            | Action::Handoff { session: s, .. } => {
+            | Action::Handoff { session: s, .. }
+            | Action::SetMode { session: s, .. } => {
                 self.desk.view(*s).ok().map(|v| Party::session(&v))
             }
         }
@@ -1014,6 +1048,11 @@ impl CrewHub {
                 self.session_name(*session),
                 engine.title(),
                 workforce_desk::handoff::egress(*engine)
+            ),
+            Action::SetMode { session, mode } => format!(
+                "Put {} in {} mode",
+                self.session_name(*session),
+                mode.title()
             ),
         }
     }
@@ -1247,6 +1286,34 @@ impl CrewHub {
                     engine.title(),
                     done.session.label()
                 ))
+            }
+            Action::SetMode { session, mode } => {
+                let set = d.set_mode(*session, *mode, by).await.map_err(|e| match e {
+                    workforce_desk::DeskError::Conflict(why)
+                    | workforce_desk::DeskError::Invalid(why) => why,
+                    e => plain(e),
+                })?;
+                let name = set.view.label().to_string();
+                Ok(match (set.running, set.confirmed) {
+                    (false, _) => format!(
+                        "{name} isn't running; it starts in {} mode next time",
+                        mode.title()
+                    ),
+                    (true, Some(m)) if m == *mode => format!(
+                        "started {name} again in place in {} mode, its conversation kept; it says it runs in {} mode",
+                        mode.title(),
+                        m.title()
+                    ),
+                    (true, Some(m)) => format!(
+                        "started {name} again in place, but it says it runs in {} mode, not {}; check it before relying on it",
+                        m.title(),
+                        mode.title()
+                    ),
+                    (true, None) => format!(
+                        "started {name} again in place in {} mode, its conversation kept; it hasn't said its mode yet",
+                        mode.title()
+                    ),
+                })
             }
         }
     }

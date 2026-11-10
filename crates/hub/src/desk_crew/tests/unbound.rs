@@ -14,7 +14,7 @@ use workforce_desk::crew::{Event, Party};
 pub(super) const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
     act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
     interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
-    hand_off = true }\n\
+    hand_off = true, set_mode = true }\n\
     [oversight.full]\nanywhere = true\n";
 
 fn ask(url: &str, command: &str) -> tokio::task::JoinHandle<Value> {
@@ -263,6 +263,135 @@ async fn at_act_what_waits_waits_its_minutes_and_nothing_sweeps() {
                 .is_none_or(|c| !c.prompt.contains("Regular sweep")),
             "{latest:?}"
         );
+    })
+    .await;
+}
+
+/// The hook URL of `id`'s CLI started with `--permission-mode <mode>`.
+async fn started_in(dir: &Path, id: uuid::Uuid, mode: &str) -> String {
+    let wanted = format!("--permission-mode\n{mode}\n");
+    let marker = format!("/hook/{id}/");
+    for _ in 0..250 {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("args-") {
+                continue;
+            }
+            let args = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if let (true, Some(at)) = (args.contains(&wanted), args.find(&marker)) {
+                let start = args[..at].rfind("http://").unwrap();
+                let token: String = args[at + marker.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect();
+                return args[start..at + marker.len() + token.len()].to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{id} never started in {mode} mode");
+}
+
+/// Unbound, the overseer puts a session in auto mode and back: Desk
+/// starts it again in place in each, reads back the mode it says it runs
+/// in, and says each change in Activity.
+#[tokio::test(flavor = "multi_thread")]
+async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.set_mode").then_some(())
+        })
+        .await;
+        let s = new_session(&d, &base, "acme-web").await;
+        hook_url(&base, s.id).await;
+        let tool = overseer.tools.get("crew.set_mode").unwrap();
+        for (mode, title) in [("auto", "auto"), ("default", "manual")] {
+            // Claude Code says the mode it started in on its first hook.
+            let said = {
+                let base = base.clone();
+                let mode = mode.to_string();
+                tokio::spawn(async move {
+                    let url = started_in(&base, s.id, &mode).await;
+                    hook(
+                        &url,
+                        json!({"hook_event_name": "SessionStart", "session_id": "cli-1", "source": "resume", "permission_mode": mode}),
+                    )
+                    .await
+                })
+            };
+            let done = tool
+                .execute(json!({"session_id": s.id.to_string(), "mode": mode, "reason": "Routine test run."}))
+                .await
+                .unwrap();
+            said.await.unwrap();
+            let text = done.output["done"].as_str().unwrap_or_default().to_string();
+            assert!(
+                text.contains(&format!("in {title} mode, its conversation kept; it says it runs in {title} mode")),
+                "{done:?}"
+            );
+            assert_eq!(
+                d.mode_seen(s.id),
+                workforce_desk::mode::Mode::parse(mode)
+            );
+            eventually("the change in Activity", async || {
+                d.activity(Filter::All, None, 50)
+                    .await
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|e| {
+                        e.text.starts_with(&format!("put acme-web in {title} mode"))
+                            && e.reason.as_deref().is_some_and(|r| r.starts_with("Routine test run."))
+                    })
+                    .then_some(())
+            })
+            .await;
+        }
+    })
+    .await;
+}
+
+/// Below unbound a mode is the person's to change, but at Act with
+/// `set_mode` on, to one that still asks: never auto or bypass.
+#[tokio::test(flavor = "multi_thread")]
+async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_asks() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let (_, mut o) = crew.overseer_service().unwrap();
+        let set = |mode| Action::SetMode {
+            session: s.id,
+            mode,
+        };
+        use workforce_desk::mode::Mode;
+        for mode in Mode::ALL {
+            assert!(
+                matches!(crew.gate(&set(mode), &o), Gate::Suggest(_)),
+                "{mode:?}"
+            );
+        }
+        o.act.set_mode = true;
+        for mode in [Mode::Default, Mode::AcceptEdits, Mode::Plan] {
+            assert_eq!(crew.gate(&set(mode), &o), Gate::Run, "{mode:?}");
+        }
+        for mode in [Mode::Auto, Mode::BypassPermissions] {
+            assert!(
+                matches!(crew.gate(&set(mode), &o), Gate::Suggest(_)),
+                "{mode:?}"
+            );
+        }
+        o.level = workforce_common::oversight::Level::Suggest;
+        assert!(matches!(crew.gate(&set(Mode::Plan), &o), Gate::Suggest(_)));
     })
     .await;
 }

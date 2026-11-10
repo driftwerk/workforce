@@ -12,7 +12,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
@@ -176,6 +176,10 @@ pub struct Act {
     /// only ever a suggestion, since its brief goes to that engine's
     /// vendor; off, it isn't even suggested.
     pub hand_off: bool,
+    /// Changing a session's permission mode (`crew.set_mode`): at `act`,
+    /// to manual, accept edits or plan, never one that asks for less;
+    /// unbound, to any.
+    pub set_mode: bool,
 }
 
 /// `[oversight.full]`: where, and on what budget, Act fully ships.
@@ -327,6 +331,7 @@ impl Default for Oversight {
                 message_terminal_sessions: false,
                 answer_sessions: true,
                 hand_off: false,
+                set_mode: false,
             },
             work: Work {
                 prefer_sessions: true,
@@ -712,6 +717,12 @@ impl Oversight {
                     d.act.hand_off,
                     "suggesting a session continue in another engine",
                 )?,
+                set_mode: switch(
+                    act,
+                    "set_mode",
+                    d.act.set_mode,
+                    "changing a session's permission mode",
+                )?,
             },
             work: Work {
                 prefer_sessions: switch(
@@ -787,6 +798,7 @@ impl Oversight {
             && a.message_terminal_sessions
             && a.answer_sessions
             && a.hand_off
+            && a.set_mode
     }
 
     /// `[oversight]` as a config holds it: absent is the defaults (off).
@@ -1183,7 +1195,7 @@ mod tests {
     pub(crate) const UNBOUND: &str = "[oversight]\nlevel = \"full\"\n\
         act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
         interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
-        hand_off = true }\nfull = { anywhere = true }\n";
+        hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
 
     #[test]
     fn unbound_is_act_fully_anywhere_with_every_switch_on_and_never_remote() {
@@ -1203,6 +1215,7 @@ mod tests {
             "message_terminal_sessions",
             "answer_sessions",
             "hand_off",
+            "set_mode",
         ] {
             let one = UNBOUND.replace(&format!("{off} = true"), &format!("{off} = false"));
             assert!(!parse(&one).unwrap().unbound(true), "{off} off");
