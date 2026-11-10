@@ -313,16 +313,35 @@ pub fn repo_named(
             return real(&p).is_some_and(|p| checkouts.contains(&boss::fold(&p)));
         }
         match (repo_name(n), &origin) {
-            (Some(want), Some(have)) => {
-                want.path == have.path
-                    && want
-                        .host
-                        .as_ref()
-                        .is_none_or(|h| have.host.as_ref() == Some(h))
-            }
+            (Some(want), Some(have)) => same_repo(&want, have),
             _ => false,
         }
     })
+}
+
+/// The host a name without one means: GitHub's.
+pub const DEFAULT_HOST: &str = "github.com";
+
+/// Whether `want`, as the person named it, is the repository `have`: the
+/// same `owner/name`, on the host named, `github.com` when none is.
+fn same_repo(want: &RepoName, have: &RepoName) -> bool {
+    let host = |r: &RepoName| r.host.clone().unwrap_or_else(|| DEFAULT_HOST.into());
+    want.path == have.path && host(want) == host(have)
+}
+
+/// Whether every one of a repository's remote addresses (`remotes`, fetch
+/// and push, every remote) is the same repository as its `origin`: so
+/// whichever one `gh` resolves the repository to (its `gh-resolved`
+/// default, then upstream, github, origin), it is that one. None at all,
+/// or one that names no repository, isn't.
+pub fn remotes_one_repo(origin: Option<&str>, remotes: &[String]) -> bool {
+    let Some(origin) = origin.and_then(repo_name) else {
+        return false;
+    };
+    !remotes.is_empty()
+        && remotes
+            .iter()
+            .all(|r| repo_name(r).is_some_and(|r| same_repo(&r, &origin)))
 }
 
 // ── What a boss answers for ─────────────────────────────────────────────
@@ -380,6 +399,10 @@ pub struct Facts {
     pub default_branch: Option<String>,
     /// The boss acts fully in this repository: what ships is its to allow.
     pub ships: bool,
+    /// Every remote of the repository is the one named: `gh` ships too.
+    pub ships_gh: bool,
+    /// The repository says `push.followTags`.
+    pub follow_tags: bool,
     pub what: What,
 }
 
@@ -479,6 +502,8 @@ pub fn facts_of(
         branch: None,
         default_branch: None,
         ships: false,
+        ships_gh: false,
+        follow_tags: false,
         what,
     }
 }
@@ -559,6 +584,7 @@ pub fn answerable(
     facts: &Facts,
     bounds: &Bounds,
     real: &dyn Fn(&Path) -> Option<PathBuf>,
+    scripts: &dyn Fn(&boss::Script) -> Result<Vec<String>, String>,
 ) -> Result<(), Irreversible> {
     let no = |why: String| Err(Irreversible(why));
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
@@ -587,6 +613,9 @@ pub fn answerable(
                 branch: facts.branch.as_deref(),
                 default_branch: facts.default_branch.as_deref(),
                 ships: facts.ships,
+                ships_gh: facts.ships_gh,
+                follow_tags: facts.follow_tags,
+                scripts,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
@@ -892,6 +921,45 @@ mod tests {
         ] {
             assert!(repo_named(origin, &main, &yes, home, &real), "{yes:?}");
         }
+        // A name with no host is GitHub's: a lookalike elsewhere isn't it.
+        let gitlab = Some("git@gitlab.com:acme/acme-web.git");
+        assert!(!repo_named(
+            gitlab,
+            &[],
+            &named(&["acme/acme-web"]),
+            home,
+            &real
+        ));
+        assert!(repo_named(
+            gitlab,
+            &[],
+            &named(&["gitlab.com/acme/acme-web"]),
+            home,
+            &real
+        ));
+        // gh acts on the repository only where every remote is that one: a
+        // fork whose upstream is its parent isn't.
+        let fork = Some("git@github.com:acme/acme-web.git");
+        let urls = |u: &[&str]| u.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(remotes_one_repo(
+            fork,
+            &urls(&[
+                "git@github.com:acme/acme-web.git",
+                "https://github.com/acme/acme-web"
+            ])
+        ));
+        assert!(!remotes_one_repo(
+            fork,
+            &urls(&[
+                "git@github.com:acme/acme-web.git",
+                "git@github.com:globex/acme-web.git"
+            ])
+        ));
+        assert!(!remotes_one_repo(fork, &[]));
+        assert!(!remotes_one_repo(
+            None,
+            &urls(&["git@github.com:acme/acme-web.git"])
+        ));
         for no in [
             named(&[]),
             named(&["globex/globex-api"]),
@@ -997,7 +1065,8 @@ mod tests {
         let mut facts = facts_of(engine, p, s, Path::new("/Users/sam"), moved);
         facts.branch = Some("feat/date-picker".into());
         facts.default_branch = Some("main".into());
-        answerable(&facts, &bounds(), &real).map_err(|e| e.to_string())
+        answerable(&facts, &bounds(), &real, &crate::computer::boss::no_scripts)
+            .map_err(|e| e.to_string())
     }
 
     fn judged(engine: Engine, p: &PendingApproval, s: &SessionView) -> Result<(), String> {

@@ -329,11 +329,30 @@ impl Desk {
                 )
                 .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
                 let named = self.full_repos(boss);
-                facts.ships = !named.is_empty()
-                    && repo_of_own(&facts.own).is_some_and(|r| r.named(&named, &bounds.home));
+                if let Some(repo) = repo_of_own(&facts.own) {
+                    facts.follow_tags = repo.follow_tags;
+                    facts.ships = !named.is_empty() && repo.named(&named, &bounds.home);
+                    facts.ships_gh = facts.ships
+                        && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes);
+                }
             }
         }
-        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
+        // What ships through a script is read first, as the default branch
+        // has it.
+        let reader = crate::computer::scripts::Reader {
+            top: crate::computer::boss::resolve_real(&facts.own).unwrap_or_default(),
+            default_branch: facts.default_branch.clone(),
+        };
+        let scripts = |s: &crate::computer::boss::Script| match facts.ships {
+            true => reader.read(s),
+            false => crate::computer::boss::no_scripts(s),
+        };
+        charge::answerable(
+            &facts,
+            &bounds,
+            &crate::computer::boss::resolve_real,
+            &scripts,
+        )
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
@@ -846,6 +865,10 @@ fn quiet_for(hold: chrono::Duration) -> String {
 struct OwnRepo {
     origin: Option<String>,
     checkouts: Vec<std::path::PathBuf>,
+    /// Every remote's every address, fetch and push, as git uses them.
+    remotes: Vec<String>,
+    /// It says `push.followTags`.
+    follow_tags: bool,
 }
 
 impl OwnRepo {
@@ -888,11 +911,49 @@ fn repo_of_own(own: &std::path::Path) -> Option<OwnRepo> {
             }
         }
     }
+    let mut remotes: Vec<String> = git_lines(own, &["remote", "-v"])
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+    remotes.extend(
+        git_lines(
+            own,
+            &["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"],
+        )
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string)),
+    );
+    remotes.sort();
+    remotes.dedup();
     Some(OwnRepo {
         // Where a push to it goes: its push address, when it has one.
         origin: git_line(own, &["remote", "get-url", "--push", "origin"]),
         checkouts,
+        remotes,
+        follow_tags: git_line(own, &["config", "--bool", "--get", "push.followTags"])
+            .is_some_and(|v| v == "true"),
     })
+}
+
+/// Every line git prints in `dir`; none when it can't say.
+fn git_lines(dir: &std::path::Path, args: &[&str]) -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One line git prints in `dir`, or `None` when it can't say.

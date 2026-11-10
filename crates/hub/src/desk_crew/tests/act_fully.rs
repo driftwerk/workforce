@@ -18,16 +18,28 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Acme")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "Acme")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
         .output()
         .unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
 /// A checkout at `dir` on `feat/x`, its `origin` at `origin`, whose default
-/// branch is `main`.
+/// branch is `main`, holding a deploy script as `main` has it.
 fn repo(dir: &Path, origin: &str) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "-q", "-b", "feat/x"]);
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"scripts": {"deploy": "vite build && wrangler deploy", "release": "npm publish"}}"#,
+    )
+    .unwrap();
+    git(dir, &["add", "package.json"]);
+    git(dir, &["commit", "-q", "-m", "Scripts"]);
+    git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
     git(dir, &["remote", "add", "origin", origin]);
     git(
         dir,
@@ -135,6 +147,7 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         // The hard limits stay the person's, Act fully or not.
         for (command, why) in [
             ("cargo publish -p acme-core", "package registry"),
+            ("npm run release", "package registry"),
             ("source ~/.aws-creds && aws s3 ls", "secrets"),
             ("git push --force origin main", "can't be undone"),
             ("gh release delete v1.1.0 --yes", "on the remote"),
@@ -185,6 +198,28 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
             tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
             asked.await.unwrap();
         }
+
+        // A fork: origin is the named repository, upstream its parent. gh
+        // could resolve to either: merging is the person's, pushing to
+        // origin isn't.
+        git(&acme, &["remote", "add", "upstream", "git@github.com:globex/acme-web.git"]);
+        let asked = ask(&url, "gh pr merge 44 --squash");
+        let a = pending(s.id, "gh pr merge 44 --squash").await;
+        let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
+        assert!(held.output["suggested"].is_string(), "{held:?}");
+        assert!(held.output["note"].as_str().unwrap().contains("another repository"));
+        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+        asked.await.unwrap();
+        // With push.followTags set, a push sends tags: the person's.
+        git(&acme, &["config", "push.followTags", "true"]);
+        let asked = ask(&url, "git push origin HEAD:main");
+        let a = pending(s.id, "git push origin HEAD:main").await;
+        let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
+        assert!(held.output["note"].as_str().unwrap().contains("push.followTags"), "{held:?}");
+        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+        asked.await.unwrap();
+        git(&acme, &["config", "--unset", "push.followTags"]);
+        git(&acme, &["remote", "remove", "upstream"]);
 
         // A repository not named: shipping is a suggestion.
         let g = new_session(&d, &globex, "globex-api").await;
@@ -287,7 +322,7 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
     assert!(super::super::fully_given(&full, Some(24.99)).is_ok());
     assert!(super::super::fully_given(&full, Some(25.0))
         .unwrap_err()
-        .contains("daily budget of $25.00 is spent"));
+        .contains("daily budget of $25.00, for the Desk sessions' spend in this scope and the overseer's own model use, is spent"));
     assert!(super::super::fully_given(&full, None)
         .unwrap_err()
         .contains("today's spend is read"));

@@ -31,6 +31,13 @@
 //!   release, a workflow run, and the project's own deploy, release or
 //!   promote scripts. What no boss does at any level is
 //!   [`crate::never`]'s list, checked before anything here.
+//! - A script it ships through is read first ([`Here::scripts`]): its body
+//!   as on `origin`'s default branch, unchanged, every line checked against
+//!   [`crate::never`] and every script it calls followed the same way. One
+//!   that can't be read, or calls what can't be followed, is the person's.
+//! - `gh` acts on the repository its remotes say: it ships only when every
+//!   remote is the one named ([`Here::ships_gh`]).
+//! - With `push.followTags` set, a push also sends tags: the person's.
 //!
 //! It is there to stop a boss misjudging, not to contain a hostile
 //! session: an allowed in-folder edit followed by an allowed build runs
@@ -63,7 +70,35 @@ pub struct Here<'a> {
     /// The boss acts fully in this repository (`[oversight.full] repos`
     /// names it): what ships ([`PUBLISHES`]) is its to allow too.
     pub ships: bool,
+    /// Every remote of the repository (fetch and push) is the one named,
+    /// so whatever `gh` resolves the repository to, it is that one.
+    pub ships_gh: bool,
+    /// The repository says `push.followTags`: a push sends tags too.
+    pub follow_tags: bool,
+    /// A script's commands, as on `origin`'s default branch and unchanged
+    /// there, or why they can't be read: for what ships through one.
+    pub scripts: &'a dyn Fn(&Script) -> Result<Vec<String>, String>,
 }
+
+/// A script of the project's own a command runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Script {
+    /// `npm run <name>` (its `pre` and `post` scripts with it) from `dir`'s
+    /// `package.json`; `None`: `npm version`'s lifecycle scripts.
+    Package { dir: PathBuf, name: Option<String> },
+    /// `make <target>` in `dir`, its prerequisites' recipes first.
+    Make { dir: PathBuf, target: String },
+    /// A shell script, by its path.
+    Shell { path: PathBuf },
+}
+
+/// A script's commands are never read: for a boss that doesn't act fully.
+pub fn no_scripts(_: &Script) -> Result<Vec<String>, String> {
+    Err("Desk doesn't read scripts for a boss that doesn't act fully".into())
+}
+
+/// How deep scripts calling scripts are followed.
+const SCRIPT_DEPTH: usize = 4;
 
 pub const CANT_READ: &str = "Desk can't read this command";
 pub const PUBLISHES: &str = "pushes to the default branch, publishes or deploys";
@@ -596,6 +631,124 @@ struct Walk<'h, 'a> {
     moved: bool,
 }
 
+/// Where a command was found, as a boss reads it: `cwd`, where it runs.
+fn script_of(words: &[String], cwd: &Path) -> Result<Option<Script>, String> {
+    let follow = || Err("calls a script Desk can't follow".to_string());
+    let Some((first, args)) = words.split_first() else {
+        return Ok(None);
+    };
+    let prog = first.rsplit('/').next().unwrap_or(first);
+    let ops: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let elsewhere = args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-C" | "--prefix" | "--dir" | "-w" | "--workspace" | "--filter" | "-r" | "--recursive"
+        ) || a.starts_with("--prefix=")
+            || a.starts_with("--dir=")
+            || a.starts_with("--workspace=")
+            || a.starts_with("--filter=")
+    });
+    const BUILTINS: &[&str] = &[
+        "install",
+        "i",
+        "add",
+        "ci",
+        "remove",
+        "rm",
+        "uninstall",
+        "exec",
+        "dlx",
+        "x",
+        "why",
+        "list",
+        "ls",
+        "outdated",
+        "audit",
+        "init",
+        "create",
+        "link",
+        "unlink",
+        "update",
+        "up",
+        "upgrade",
+        "import",
+        "store",
+        "config",
+        "cache",
+        "info",
+        "view",
+        "pack",
+        "whoami",
+        "help",
+        "dedupe",
+        "prune",
+    ];
+    match prog {
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            if elsewhere || ops.first() == Some(&"workspace") {
+                return follow();
+            }
+            let name = match ops.as_slice() {
+                ["run" | "run-script", name, ..] => Some(name.to_string()),
+                ["run" | "run-script"] => return follow(),
+                ["version", ..] => None,
+                [s @ ("test" | "t" | "start" | "stop" | "restart"), ..] => Some(match *s {
+                    "t" => "test".into(),
+                    s => s.to_string(),
+                }),
+                [s, ..] if BUILTINS.contains(s) => return Ok(None),
+                [s, ..] if prog != "npm" => Some(s.to_string()),
+                _ => return Ok(None),
+            };
+            Ok(Some(Script::Package {
+                dir: cwd.to_path_buf(),
+                name,
+            }))
+        }
+        "make" | "gmake" => {
+            if args.iter().any(|a| {
+                a.starts_with("-C")
+                    || a.starts_with("-f")
+                    || a.starts_with("--directory")
+                    || a.starts_with("--file")
+                    || a.starts_with("--makefile")
+            }) {
+                return follow();
+            }
+            let targets: Vec<&&str> = ops.iter().filter(|t| !t.contains('=')).collect();
+            match targets.as_slice() {
+                [t] => Ok(Some(Script::Make {
+                    dir: cwd.to_path_buf(),
+                    target: t.to_string(),
+                })),
+                _ => follow(),
+            }
+        }
+        "sh" | "bash" | "zsh" | "dash" => match args.first() {
+            Some(a) if !a.starts_with('-') && a.ends_with(".sh") => {
+                Ok(Some(Script::Shell { path: cwd.join(a) }))
+            }
+            _ => follow(),
+        },
+        "just" | "task" | "node" | "deno" | "python" | "python3" | "ruby" | "perl" | "php"
+        | "npx" | "pnpx" | "bunx" | "eval" | "source" | "." | "xargs" => follow(),
+        _ if first.contains('/') => {
+            if first.ends_with(".sh") || !first.contains('.') {
+                Ok(Some(Script::Shell {
+                    path: cwd.join(first),
+                }))
+            } else {
+                follow()
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// A word that names a path, by how it is written.
 fn pathy(text: &str) -> bool {
     text.contains('/') || text.starts_with('~') || text.starts_with('.')
@@ -609,6 +762,25 @@ impl Walk<'_, '_> {
             true => Ok(()),
             false => no(PUBLISHES),
         }
+    }
+
+    /// What ships through `gh`: only where every remote is the one named.
+    fn ships_gh(&self) -> Judged {
+        self.ships()?;
+        match self.here.ships_gh {
+            true => Ok(()),
+            false => no("gh may act on another repository than the one named (its remotes don't all point at it); that's the person's to allow"),
+        }
+    }
+
+    /// What ships through a script of the project's own: the boss's only
+    /// where it acts fully, and only once the script is read in full.
+    fn ships_through(&self, script: Script) -> Judged {
+        self.ships()?;
+        let Some(cwd) = self.cwd.clone() else {
+            return no("Desk can't tell which script this runs");
+        };
+        read_script(self.here, &script, &cwd, 0)
     }
 
     fn resolve(&self, w: &Word) -> Option<PathBuf> {
@@ -839,7 +1011,7 @@ fn parse<'w>(
 /// Whether a name reads as deploying or publishing.
 fn outward_name(name: &str) -> bool {
     let n = name.to_lowercase();
-    ["deploy", "release", "publish", "ship", "prod"]
+    ["deploy", "release", "publish", "ship", "prod", "promot"]
         .iter()
         .any(|w| n.contains(w))
 }
@@ -1002,6 +1174,54 @@ fn reader(name: &str) -> Option<(Spec, &'static [&'static str])> {
         "hexdump" => (s("C", "n"), &[]),
         _ => return None,
     })
+}
+
+/// Whether `script`'s every command, as `here.scripts` reads them, keeps
+/// off [`crate::never`]'s list, and every script it calls does too: `cwd`
+/// is where it runs. A `cd`, a subshell or a script it can't follow is the
+/// person's.
+fn read_script(here: &Here<'_>, script: &Script, cwd: &Path, depth: usize) -> Judged {
+    let named = match script {
+        Script::Package { name: Some(n), .. } => format!("the {n} script"),
+        Script::Package { name: None, .. } => "the version scripts".to_string(),
+        Script::Make { target, .. } => format!("make {target}"),
+        Script::Shell { path } => path
+            .file_name()
+            .map_or("a script".into(), |n| n.to_string_lossy().into_owned()),
+    };
+    let within = |why: String| format!("{why} (in {named})");
+    if depth >= SCRIPT_DEPTH {
+        return no(within("calls scripts deeper than Desk follows".into()));
+    }
+    let lines = (here.scripts)(script).map_err(within)?;
+    let at = crate::never::Where {
+        cwd: Some(cwd),
+        own: here.own,
+        home: here.home,
+        scratch: here.scratch,
+    };
+    for line in &lines {
+        if line.contains("$(") || line.contains('`') {
+            return no(within(CANT_READ.into()));
+        }
+        if let Some(n) = crate::never::command(line, &at) {
+            return no(within(n.why().into()));
+        }
+        for words in crate::never::programs(line) {
+            if words.first().is_some_and(|w| w == "cd" || w == "pushd") {
+                return no(within(
+                    "moves where it runs; Desk can't follow what it calls".into(),
+                ));
+            }
+            if let Some(next) = script_of(&words, cwd).map_err(within)? {
+                if next == *script {
+                    continue;
+                }
+                read_script(here, &next, cwd, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `command`, run where `here` says, is the boss's to allow:
@@ -1360,10 +1580,13 @@ fn one(walk: &mut Walk<'_, '_>, cmd: &Cmd, next: Option<Join>) -> Judged {
         }
         _ if dir.is_some() => {
             // A script of the project's own, by its path.
-            if outward_name(name) {
-                walk.ships()?;
+            walk.own_code(program)?;
+            match outward_name(name) {
+                true => walk.ships_through(Script::Shell {
+                    path: walk.cwd.clone().unwrap_or_default().join(&program.text),
+                }),
+                false => Ok(()),
             }
-            walk.own_code(program)
         }
         "npx" | "bunx" => no("runs a package Desk can't read"),
         "docker" | "podman" | "kubectl" | "helm" | "terraform" | "tofu" | "pulumi" | "fly"
@@ -2019,6 +2242,7 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
             "verbose",
             "progress",
             "no-progress",
+            "no-follow-tags",
         ],
         ..Spec::default()
     };
@@ -2029,6 +2253,9 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
     let Some(branch) = here.branch else {
         return no("Desk can't tell which branch this pushes");
     };
+    if here.follow_tags && !rest.iter().any(|a| a.text == "--no-follow-tags") {
+        return no("sends tags too (push.followTags is set); that's the person's to allow");
+    }
     // What ships goes only to `origin`, the repository the person named.
     let ships_to = |remote: &str| match remote == "origin" {
         true => walk.ships(),
@@ -2109,7 +2336,7 @@ fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
             if words[..2] == ["pr", "merge"] && !merges_by_number(&words[2..]) {
                 return no(PUBLISHES);
             }
-            walk.ships()
+            walk.ships_gh()
         }
         ["release", "delete" | "delete-asset", ..] => no(crate::never::Never::DeleteRemote.why()),
         ["pr", "create", ..] => {
@@ -2378,8 +2605,9 @@ fn cargo(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
                 .unwrap_or(rest.len());
             let g = parse(&format!("cargo {}", sub.text), &common, &rest[..cut], false)?;
             for v in g.values(&["-p", "--package", "--bin", "--example", "--test", "--bench"]) {
+                // Its code isn't a script Desk reads: the person's.
                 if outward_name(&v.text) {
-                    walk.ships()?;
+                    return no(PUBLISHES);
                 }
             }
             for v in g.values(&["--target-dir"]) {
@@ -2458,8 +2686,13 @@ fn node_pm(walk: &Walk<'_, '_>, pm: &str, args: &[Word]) -> Judged {
         walk.own_code(v)?;
     }
     let ops: Vec<&str> = g.operands.iter().map(|o| o.text.as_str()).collect();
+    let elsewhere = g.values(&["-C", "--dir", "--prefix"]).next().is_some();
     let script = |name: Option<&&str>| match name {
-        Some(n) if outward_name(n) => walk.ships(),
+        Some(_) if elsewhere && name.is_some_and(|n| outward_name(n)) => no(PUBLISHES),
+        Some(n) if outward_name(n) => walk.ships_through(Script::Package {
+            dir: walk.cwd.clone().unwrap_or_default(),
+            name: Some(n.to_string()),
+        }),
         Some(_) => Ok(()),
         None => no(CANT_READ),
     };
@@ -2469,22 +2702,26 @@ fn node_pm(walk: &Walk<'_, '_>, pm: &str, args: &[Word]) -> Judged {
         ["install" | "i" | "add", ..] => {
             no("installs a package Desk can't read; that's the person's to allow")
         }
-        // `yarn workspace web <what>`: what it runs there.
+        // `yarn workspace web <what>`: what it runs there, which Desk
+        // doesn't follow for what ships.
         ["workspace", _, rest @ ..] if pm == "yarn" => match rest {
             ["npm", ..] => no(crate::never::Never::Registry.why()),
-            [what, ..] => script(Some(what)).and_then(|_| match *what {
-                "install" | "add" | "dlx" | "exec" => no("runs a package Desk can't read"),
-                "run" => script(rest.get(1)),
-                _ => Ok(()),
-            }),
+            [what, ..] if outward_name(what) => no(PUBLISHES),
+            ["run", name, ..] if outward_name(name) => no(PUBLISHES),
+            ["install" | "add" | "dlx" | "exec", ..] => no("runs a package Desk can't read"),
+            [_, ..] => Ok(()),
             [] => no(CANT_READ),
         },
         ["test" | "t" | "ls" | "list" | "outdated" | "why" | "lint" | "build" | "typecheck", ..] => {
             Ok(())
         }
         ["run" | "run-script", rest @ ..] => script(rest.first()),
-        // A version bump commits and tags.
-        ["version", ..] => walk.ships(),
+        // A version bump commits and tags, and runs its lifecycle scripts.
+        ["version", ..] if elsewhere => no(PUBLISHES),
+        ["version", ..] => walk.ships_through(Script::Package {
+            dir: walk.cwd.clone().unwrap_or_default(),
+            name: None,
+        }),
         ["publish" | "deprecate" | "unpublish", ..] => no(crate::never::Never::Registry.why()),
         ["npm", ..] if pm == "yarn" => no(crate::never::Never::Registry.why()),
         ["exec" | "x" | "dlx" | "create" | "init", ..] => no("runs a package Desk can't read"),
@@ -2509,11 +2746,14 @@ fn make(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
         ..Spec::default()
     };
     let g = parse("make", &spec, args, false)?;
+    let mut elsewhere = false;
     for v in g.values(&["-C", "--directory"]) {
         walk.own_code(v)?;
+        elsewhere = true;
     }
     for v in g.values(&["-f", "--file", "--makefile"]) {
         walk.own_code(v)?;
+        elsewhere = true;
     }
     if g.operands.is_empty() {
         return no("Desk can't tell what make runs by default");
@@ -2523,7 +2763,13 @@ fn make(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
             return no(format!("Desk can't tell what setting {} does", t.text));
         }
         if outward_name(&t.text) {
-            walk.ships()?;
+            if elsewhere {
+                return no(PUBLISHES);
+            }
+            walk.ships_through(Script::Make {
+                dir: walk.cwd.clone().unwrap_or_default(),
+                target: t.text.clone(),
+            })?;
         }
     }
     Ok(())
@@ -2664,10 +2910,17 @@ fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
         },
         t if t.starts_with('-') => no("runs code Desk can't read; that's the person's to allow"),
         t => {
-            if outward_name(t) {
-                walk.ships()?;
+            walk.own_code(first)?;
+            match outward_name(t) {
+                // A shell script is read; another language's isn't.
+                true if SHELLS.contains(&name) && t.ends_with(".sh") => {
+                    walk.ships_through(Script::Shell {
+                        path: walk.cwd.clone().unwrap_or_default().join(t),
+                    })
+                }
+                true => no(PUBLISHES),
+                false => Ok(()),
             }
-            walk.own_code(first)
         }
     }
 }
@@ -2731,6 +2984,9 @@ pub(crate) mod tests {
             branch: Some(branch),
             default_branch: Some("main"),
             ships: false,
+            ships_gh: false,
+            follow_tags: false,
+            scripts: &no_scripts,
         }
     }
 
@@ -2752,6 +3008,49 @@ pub(crate) mod tests {
 
     /// [`judged_on`], the boss acting fully in this repository.
     fn judged_fully(command: &str, branch: &str) -> Judged {
+        judged_fully_with(command, branch, &acme_scripts, |_| {})
+    }
+
+    /// The project's scripts, as on its default branch.
+    fn acme_scripts(s: &Script) -> Result<Vec<String>, String> {
+        let lines = |l: &[&str]| Ok(l.iter().map(|l| l.to_string()).collect());
+        match s {
+            Script::Package { name: Some(n), .. } => match n.as_str() {
+                "deploy" => lines(&["npm run build && wrangler deploy"]),
+                "build" => lines(&["vite build"]),
+                "release" => lines(&["npm publish"]),
+                "release:changesets" => lines(&["changeset publish"]),
+                "release:semantic" => lines(&["semantic-release --no-ci"]),
+                "release:nested" => lines(&["npm run ship-it"]),
+                "ship-it" => lines(&["cargo publish"]),
+                "promote" => lines(&["cd infra && ./promote.sh"]),
+                "deploy:sub" => lines(&["echo $(cat .env)"]),
+                n => Err(format!("its package.json has no {n} script")),
+            },
+            Script::Package { name: None, .. } => lines(&[]),
+            Script::Make { target, .. } => match target.as_str() {
+                "deploy" => lines(&["cargo build --release", "./scripts/deploy.sh staging"]),
+                "release" => lines(&["git tag v1.2.0", "git push --force origin main"]),
+                t => Err(format!("its Makefile has no {t} target")),
+            },
+            Script::Shell { path } => match path.file_name().and_then(|n| n.to_str()) {
+                Some("release.sh") => lines(&["git push origin v1.2.0"]),
+                Some("deploy.sh") => lines(&["fly deploy --app acme-web"]),
+                Some("promote-edited.sh") => Err(
+                    "its scripts/promote-edited.sh isn't as on origin/main; a script changed since is the person's to allow"
+                        .into(),
+                ),
+                _ => Err("Desk can't find the script it runs".into()),
+            },
+        }
+    }
+
+    fn judged_fully_with(
+        command: &str,
+        branch: &str,
+        scripts: &dyn Fn(&Script) -> Result<Vec<String>, String>,
+        tweak: impl FnOnce(&mut Here<'_>),
+    ) -> Judged {
         let home = Path::new("/Users/sam");
         let own = Path::new("/Users/sam/dev/acme-web");
         let scratch = [PathBuf::from("/tmp")];
@@ -2759,7 +3058,84 @@ pub(crate) mod tests {
         let real = fake_real;
         let mut here = here(home, own, &scratch, &withheld, &real, branch);
         here.ships = true;
+        here.ships_gh = true;
+        here.scripts = scripts;
+        tweak(&mut here);
         judge(command, &here)
+    }
+
+    #[test]
+    fn acting_fully_reads_the_scripts_it_ships_through_and_holds_what_they_cant_show() {
+        use crate::never::Never;
+        let held = |command: &str, why: &str| {
+            let got = judged_fully(command, "feat/date-picker").expect_err(command);
+            assert!(got.contains(why), "{command}: {got}");
+        };
+        held("npm run release", Never::Registry.why());
+        held("npm run release:changesets", Never::Registry.why());
+        held("npm run release:semantic", Never::Registry.why());
+        held("npm run release:nested", Never::Registry.why());
+        held("pnpm release", Never::Registry.why());
+        held("make release", Never::RewriteHistory.why());
+        held("./scripts/promote-edited.sh", "isn't as on origin/main");
+        held("npm run promote", "Desk can't follow");
+        held("npm run deploy:sub", CANT_READ);
+        held("npm run deploy:missing", "no deploy:missing script");
+        held("npm --prefix web run deploy", PUBLISHES);
+        held("make -C web deploy", PUBLISHES);
+        held("python scripts/deploy.py", PUBLISHES);
+        // Not acting fully, none is read: they are the person's.
+        assert_eq!(
+            judged_fully_with("npm run deploy", "feat/x", &acme_scripts, |h| h.ships =
+                false),
+            Err(PUBLISHES.into())
+        );
+        // A script that can't be read at all is the person's.
+        assert!(judged_fully_with("npm run deploy", "feat/x", &no_scripts, |_| {}).is_err());
+    }
+
+    #[test]
+    fn gh_ships_only_where_every_remote_is_the_named_repository_and_follow_tags_is_the_persons() {
+        // A fork: origin is the named repository, upstream its parent.
+        for command in [
+            "gh pr merge 42 --squash",
+            "gh release create v1.2.0",
+            "gh workflow run deploy.yml",
+        ] {
+            let got = judged_fully_with(command, "feat/x", &acme_scripts, |h| h.ships_gh = false)
+                .unwrap_err();
+            assert!(got.contains("another repository"), "{command}: {got}");
+        }
+        // git pushes to origin, which is named, still ship.
+        assert_eq!(
+            judged_fully_with("git push origin v1.2.0", "feat/x", &acme_scripts, |h| h
+                .ships_gh =
+                false),
+            Ok(())
+        );
+        // With push.followTags, a push sends tags too: the person's, at any
+        // level, unless it says not to.
+        for (command, ships) in [
+            ("git push origin feat/x", false),
+            ("git push origin main", true),
+            ("git push origin v1.2.0", true),
+        ] {
+            let got = judged_fully_with(command, "feat/x", &acme_scripts, |h| {
+                h.follow_tags = true;
+                h.ships = ships;
+            })
+            .unwrap_err();
+            assert!(got.contains("push.followTags"), "{command}: {got}");
+        }
+        assert_eq!(
+            judged_fully_with(
+                "git push --no-follow-tags origin main",
+                "feat/x",
+                &acme_scripts,
+                |h| h.follow_tags = true
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -3041,6 +3417,9 @@ pub(crate) mod tests {
             branch: Some("feat/x"),
             default_branch: Some("main"),
             ships: false,
+            ships_gh: false,
+            follow_tags: false,
+            scripts: &no_scripts,
         };
         let desk = format!(
             "cat '{}/library/application support/desk/x'",

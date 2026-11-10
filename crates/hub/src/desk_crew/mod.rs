@@ -117,9 +117,10 @@ pub struct CrewHub {
     sent: Mutex<Vec<DateTime<Utc>>>,
     /// Each agent's `[oversight]`, by the config.toml mtime it was read at.
     read: Mutex<HashMap<String, (Option<SystemTime>, Oversight)>>,
-    /// What each overseer acting fully has spent today in its scope, in
-    /// dollars, by agent, as last read: Act fully holds only under its
-    /// budget, and not before this is read.
+    /// What each overseer acting fully has spent today, in dollars, by
+    /// agent, as last read: its scope's Desk sessions and its own model
+    /// calls. Act fully holds only under its budget, and not before this is
+    /// read.
     spent_today: Mutex<HashMap<String, f64>>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
@@ -382,7 +383,7 @@ pub(crate) fn fully_given(
             "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
         ),
         Some(spent) if spent >= budget => Err(format!(
-            "Act fully's daily budget of ${budget:.2} is spent (${spent:.2} today), so it acts within Desk until tomorrow."
+            "Act fully's daily budget of ${budget:.2}, for the Desk sessions' spend in this scope and the overseer's own model use, is spent (${spent:.2} today), so it acts within Desk until tomorrow."
         )),
         Some(_) => Ok(full),
     }
@@ -598,8 +599,9 @@ impl CrewHub {
             })
     }
 
-    /// Reads what each overseer that chose Act fully has spent today in
-    /// its scope, for [`Self::fully`]. One that can't be read isn't in
+    /// Reads what each overseer that chose Act fully has spent today (its
+    /// scope's Desk sessions and its own model calls), for
+    /// [`Self::fully`]. One that can't be read isn't in
     /// force until it can be.
     pub(crate) async fn read_spent_today(&self, overseers: &[(Arc<AgentService>, Oversight)]) {
         let now = Utc::now();
@@ -623,7 +625,19 @@ impl CrewHub {
             };
             match self.desk.spend(&query).await {
                 Ok(view) => {
-                    spent.insert(s.agent_id.as_str().to_string(), view.total.usd);
+                    // Its own model calls count too, where the hub records
+                    // them.
+                    let own: f64 = s
+                        .telemetry_store
+                        .agent_use(from, now)
+                        .map(|rows| {
+                            rows.iter()
+                                .filter(|u| u.agent_id == s.agent_id.as_str())
+                                .map(|u| u.cost_usd)
+                                .sum()
+                        })
+                        .unwrap_or_default();
+                    spent.insert(s.agent_id.as_str().to_string(), view.total.usd + own);
                 }
                 Err(e) => tracing::warn!(
                     agent = s.agent_id.as_str(),

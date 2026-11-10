@@ -810,6 +810,17 @@ const PROGRAMS: &[&str] = &[
     "changeset",
 ];
 
+/// The commands of `command`, each from its program on (assignments and
+/// wrappers such as `sudo` and `env A=b` skipped), quotes taken off: what
+/// a script's line runs, for following the scripts it calls.
+pub(crate) fn programs(command: &str) -> Vec<Vec<String>> {
+    commands(command)
+        .iter()
+        .map(|w| from_program(w).to_vec())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
 /// The hard limit `command`, a shell command a session asks to run, runs
 /// into; `None` when it runs into none of them (which doesn't make it safe:
 /// [`crate::computer::boss::judge`] still decides).

@@ -6,6 +6,7 @@ pub(crate) mod api;
 pub mod asks;
 pub mod boss;
 pub mod policy;
+pub mod scripts;
 mod store;
 
 #[cfg(test)]
