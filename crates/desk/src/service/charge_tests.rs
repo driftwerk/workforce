@@ -238,6 +238,57 @@ async fn the_persons_hold_lasts_two_minutes_after_their_last_input_unless_the_bo
     .await;
 }
 
+/// Typing a draft in Desk's composer, unsent, keeps the session the
+/// person's as a keystroke in its terminal does: the typing route counts
+/// as their input, and an unknown session is refused.
+#[tokio::test]
+async fn a_draft_typed_in_the_composer_keeps_the_session_the_persons() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        d.0.state.lock().charges.rows.get_mut(&s.id).unwrap().since =
+            Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss));
+        let app = crate::charge_api::api_routes(d.clone(), Arc::new(crate::testing::Bearer));
+        let typing = |id: Uuid| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/desk/sessions/{id}/typing"))
+                .header("authorization", "Bearer hub-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let res = app.clone().oneshot(typing(s.id)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(d.wheel_of(s.id), Some(Wheel::Person), "a draft is input");
+        let by = By::manager("sarah", "Sarah", "Answering it.");
+        assert!(d.boss_holds(s.id, Some(&by)).is_err());
+        let res = app.clone().oneshot(typing(Uuid::new_v4())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let unauthorized = Request::builder()
+            .method("POST")
+            .uri(format!("/api/desk/sessions/{}/typing", s.id))
+            .body(Body::empty())
+            .unwrap();
+        assert!(!app
+            .oneshot(unauthorized)
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(charge::TYPING_EVERY < charge::HOLD.to_std().unwrap() / 4);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
     with_test_pool(build_pool, |pool| async move {

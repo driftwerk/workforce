@@ -77,6 +77,11 @@ impl Wheel {
 /// `[oversight.wake] hold_minutes` says otherwise.
 pub const HOLD: chrono::Duration = chrono::Duration::minutes(2);
 
+/// How often, at most, Desk's window says the person is typing in a
+/// session's composer (`POST /api/desk/sessions/{id}/typing`): well inside
+/// the shortest hold.
+pub const TYPING_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// One session's charge, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Charge {
