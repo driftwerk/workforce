@@ -876,9 +876,12 @@ impl CodingSessionTool {
                 ToolResult::success(result, elapsed())
             }
             _ => {
-                let reason = claude_code::classify_failure(&ran.result)
-                    .map(|f| f.human_reason())
-                    .unwrap_or_else(|| "Claude Code failed for an unknown reason.".to_string());
+                // Named by the engine that ran it, else the one picked.
+                let label = match &ran.result {
+                    Ok(r) if !r.engine.is_empty() => r.engine.clone(),
+                    _ => self.engine.label().to_string(),
+                };
+                let reason = crate::coding_engine::round_failure(&label, &ran.result);
                 ToolResult::failure(reason, elapsed())
             }
         }

@@ -9259,9 +9259,13 @@ impl ClaudeChatConfig {
         }
     }
 
-    /// The engine chain `/cc` uses, given the coding session's.
+    /// The engine chain `/cc` uses, given the coding session's: led by the
+    /// engine it sets, never by the agent's provider.
     pub fn effective_engine(&self, coding: &CodingEngineConfig) -> CodingEngineConfig {
-        self.engine.clone().unwrap_or_else(|| coding.clone())
+        self.engine.clone().unwrap_or_else(|| CodingEngineConfig {
+            kind: Some(coding.primary()),
+            ..coding.clone()
+        })
     }
 
     /// The engine chain a chat surface uses when its own config pins none:
@@ -9272,7 +9276,7 @@ impl ClaudeChatConfig {
         primary: CodingEngineKind,
     ) -> CodingEngineConfig {
         self.engine.clone().unwrap_or_else(|| CodingEngineConfig {
-            kind: primary,
+            kind: Some(primary),
             ..coding.clone()
         })
     }
@@ -9517,7 +9521,9 @@ pub struct CodingSessionConfig {
     #[serde(default)]
     pub effort: Option<String>,
     /// What runs a coding round and what it falls back to. Absent
-    /// `[coding_session.engine]` → Claude Code on the subscription, no fallback.
+    /// `[coding_session.engine]` (or its `kind`) → the CLI of the agent's
+    /// provider on its subscription (Codex for a ChatGPT plan, else Claude
+    /// Code), no fallback.
     #[serde(default)]
     pub engine: CodingEngineConfig,
     /// How Claude Code reaches Bedrock when an engine entry names
@@ -9776,8 +9782,11 @@ impl EngineEntry {
 /// `[coding_session.engine]` — the primary engine and its fallback chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodingEngineConfig {
-    #[serde(default)]
-    pub kind: CodingEngineKind,
+    /// The engine that leads. Unset, an agent's coding rounds follow its
+    /// provider (see [`Self::led_by`]): Codex for one on a ChatGPT plan,
+    /// Claude Code otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CodingEngineKind>,
     /// Tried in order when the primary cannot run or fails, each as
     /// `engine[:model]`; a model here overrides the round's own.
     #[serde(default)]
@@ -9792,7 +9801,7 @@ pub struct CodingEngineConfig {
 impl Default for CodingEngineConfig {
     fn default() -> Self {
         Self {
-            kind: CodingEngineKind::default(),
+            kind: None,
             fallback: Vec::new(),
             allow_metered: false,
             fallback_on: default_fallback_on(),
@@ -9801,10 +9810,28 @@ impl Default for CodingEngineConfig {
 }
 
 impl CodingEngineConfig {
-    /// The primary and every fallback engine, in chain order; a chain that
-    /// does not parse counts as the primary alone.
+    /// The engine that leads where nothing else picks one: the one set,
+    /// else Claude Code.
+    pub fn primary(&self) -> CodingEngineKind {
+        self.kind.unwrap_or_default()
+    }
+
+    /// The engine that leads for an agent whose provider's engine is
+    /// `provider`: the one set, else the provider's, else Claude Code.
+    pub fn led_by(&self, provider: Option<CodingEngineKind>) -> CodingEngineKind {
+        self.kind.or(provider).unwrap_or_default()
+    }
+
+    /// The engines that may lead, then every fallback, in chain order; a
+    /// chain that does not parse counts as its leaders alone. Unset, either
+    /// subscription CLI may lead, as the agent's provider has it.
     pub fn kinds(&self) -> Vec<CodingEngineKind> {
-        std::iter::once(self.kind)
+        let leaders = match self.kind {
+            Some(kind) => vec![kind],
+            None => vec![CodingEngineKind::ClaudeCode, CodingEngineKind::Codex],
+        };
+        leaders
+            .into_iter()
             .chain(
                 EngineEntry::parse_all(&self.fallback)
                     .unwrap_or_default()
@@ -11476,7 +11503,8 @@ impl WorkforceConfig {
                 "coding_session timeout_secs must be 0 (default) or at least {MIN_DRIVER_TIMEOUT_SECS}"
             ));
         }
-        let efforts = self.coding_session.engine.kind.efforts();
+        // Unset, Claude Code's efforts: Codex takes every one of them too.
+        let efforts = self.coding_session.engine.primary().efforts();
         if let Some(effort) = self
             .coding_session
             .effort
@@ -11508,9 +11536,9 @@ impl WorkforceConfig {
         let codex_chat_chain = EngineEntry::parse_all(&codex_chat_engine.fallback)
             .map_err(|e| eyre::eyre!("[codex_chat.engine] {e}"))?;
         let names_bedrock = [
-            (self.coding_session.engine.kind, chain),
-            (chat_engine.kind, chat_chain),
-            (codex_chat_engine.kind, codex_chat_chain),
+            (self.coding_session.engine.primary(), chain),
+            (chat_engine.primary(), chat_chain),
+            (codex_chat_engine.primary(), codex_chat_chain),
         ]
         .iter()
         .any(|(kind, entries)| kind.is_bedrock() || entries.iter().any(|e| e.kind.is_bedrock()));
@@ -12188,11 +12216,42 @@ oauth_system_prefix = ""
             .contains("whitespace"));
 
         let mut wf = WorkforceConfig::default();
-        wf.coding_session.engine.kind = CodingEngineKind::Codex;
+        wf.coding_session.engine.kind = Some(CodingEngineKind::Codex);
         wf.coding_session.effort = Some("xhigh".into());
         assert!(wf.validate().is_ok(), "xhigh is a Codex effort");
-        wf.coding_session.engine.kind = CodingEngineKind::ClaudeCode;
+        wf.coding_session.engine.kind = Some(CodingEngineKind::ClaudeCode);
         assert!(wf.validate().unwrap_err().to_string().contains("xhigh"));
+    }
+
+    #[test]
+    fn an_unset_coding_engine_follows_the_provider_and_a_set_one_wins() {
+        let unset: CodingEngineConfig = toml::from_str("").unwrap();
+        assert_eq!(unset.kind, None);
+        assert_eq!(unset.primary(), CodingEngineKind::ClaudeCode);
+        assert_eq!(
+            unset.led_by(Some(CodingEngineKind::Codex)),
+            CodingEngineKind::Codex
+        );
+        assert_eq!(unset.led_by(None), CodingEngineKind::ClaudeCode);
+        assert_eq!(
+            unset.kinds(),
+            [CodingEngineKind::ClaudeCode, CodingEngineKind::Codex]
+        );
+        assert!(unset.subscription_only());
+        let set: CodingEngineConfig = toml::from_str("kind = \"claude_code\"\n").unwrap();
+        assert_eq!(
+            set.led_by(Some(CodingEngineKind::Codex)),
+            CodingEngineKind::ClaudeCode
+        );
+        assert_eq!(set.kinds(), [CodingEngineKind::ClaudeCode]);
+        // Written back as it was read.
+        assert!(!toml::to_string(&unset).unwrap().contains("kind"));
+        // An effort Claude Code takes is fine unset; one only Codex takes isn't.
+        let mut wf = WorkforceConfig::default();
+        wf.coding_session.effort = Some("high".into());
+        assert!(wf.validate().is_ok());
+        wf.coding_session.effort = Some("xhigh".into());
+        assert!(wf.validate().is_err());
     }
 
     #[test]
@@ -12203,13 +12262,13 @@ oauth_system_prefix = ""
         };
         let inherit: ClaudeChatConfig = toml::from_str("").unwrap();
         let led = inherit.effective_engine_led_by(&coding, CodingEngineKind::Codex);
-        assert_eq!(led.kind, CodingEngineKind::Codex);
+        assert_eq!(led.kind, Some(CodingEngineKind::Codex));
         assert_eq!(led.fallback, coding.fallback);
         let own: ClaudeChatConfig = toml::from_str("[engine]\nkind = \"codex_api\"\n").unwrap();
         assert_eq!(
             own.effective_engine_led_by(&coding, CodingEngineKind::Codex)
                 .kind,
-            CodingEngineKind::CodexApi
+            Some(CodingEngineKind::CodexApi)
         );
         let wf: WorkforceConfig =
             toml::from_str("[codex_chat.engine]\nkind = \"codex\"\nfallback = [\"codex:\"]\n")
@@ -12238,7 +12297,14 @@ oauth_system_prefix = ""
             fallback: vec!["claude_code:opus".into()],
             ..Default::default()
         };
-        assert_eq!(inherit.effective_engine(&coding_engine), coding_engine);
+        assert_eq!(
+            inherit.effective_engine(&coding_engine),
+            CodingEngineConfig {
+                kind: Some(CodingEngineKind::ClaudeCode),
+                ..coding_engine.clone()
+            },
+            "/cc is Claude Code's, whatever the agent's provider"
+        );
         let own: ClaudeChatConfig =
             toml::from_str("[engine]\nfallback = [\"claude_code_bedrock:standard\"]\n").unwrap();
         assert_eq!(
@@ -12324,7 +12390,7 @@ oauth_system_prefix = ""
         assert!(engine.subscription_only());
         engine.fallback.push("openrouter:anthropic:cheap".into());
         assert!(!engine.subscription_only());
-        engine.kind = CodingEngineKind::Model;
+        engine.kind = Some(CodingEngineKind::Model);
         engine.fallback.clear();
         assert!(!engine.subscription_only());
 

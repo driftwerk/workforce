@@ -11,6 +11,7 @@ mod agent_loop;
 mod bedrock;
 mod claude_code;
 pub mod codex;
+mod failure;
 mod fallback;
 mod sandbox_tools;
 
@@ -30,7 +31,8 @@ use workforce_common::settings::{
     FallbackTrigger,
 };
 
-use workforce_common::subscription::SubscriptionKind;
+use workforce_agent::llm::provider::ProviderKind;
+use workforce_common::subscription::{SubscriptionKind, SubscriptionRoute};
 
 use crate::agent_turn::connect::no_login_notice;
 use crate::claude_code::{headline, is_cancelled, CliHealth};
@@ -45,6 +47,7 @@ pub use bedrock::{ClaudeCodeBedrockEngine, CredentialMinter, StsMinter};
 pub(crate) use claude_code::vision_model as claude_vision_model;
 pub use claude_code::ClaudeCodeEngine;
 pub use codex::{CodexAuth, CodexEngine, CodexPolicy};
+pub use failure::round_failure;
 pub use fallback::{attempt_of, handed_over, with_handed_over, FallbackEngine};
 pub use sandbox_tools::sandbox_tools;
 
@@ -529,7 +532,7 @@ impl Engines {
         primary: Option<CodingEngineKind>,
         fallback: Option<&[String]>,
     ) -> Result<Arc<dyn CodingEngine>> {
-        let primary = self.get(primary.unwrap_or(config.kind));
+        let primary = self.get(primary.unwrap_or_else(|| config.primary()));
         let entries = EngineEntry::parse_all(fallback.unwrap_or(&config.fallback))?;
         if entries.is_empty() {
             return Ok(primary);
@@ -542,6 +545,116 @@ impl Engines {
             config.allow_metered,
             config.fallback_on.clone(),
         )))
+    }
+
+    /// The engine an agent's coding rounds run on: the one `config` sets,
+    /// else its provider's ([`ProviderLed`]), each leading the same chain.
+    pub fn for_agent(
+        &self,
+        config: &CodingEngineConfig,
+        service: &Arc<AgentService>,
+    ) -> Result<Arc<dyn CodingEngine>> {
+        if config.kind.is_some() {
+            return self.configured(config, None, None);
+        }
+        Ok(Arc::new(ProviderLed {
+            service: Arc::downgrade(service),
+            claude: self.configured(config, Some(CodingEngineKind::ClaudeCode), None)?,
+            codex: self.configured(config, Some(CodingEngineKind::Codex), None)?,
+        }))
+    }
+}
+
+/// The engine of the provider `kind`: Codex for a ChatGPT plan (or the
+/// Codex CLI), Claude Code for anything else.
+pub fn engine_of_provider(kind: ProviderKind) -> CodingEngineKind {
+    match kind.subscription_route().map(SubscriptionRoute::kind) {
+        Some(SubscriptionKind::ChatGpt) => CodingEngineKind::Codex,
+        _ => CodingEngineKind::ClaudeCode,
+    }
+}
+
+/// The engine of the provider `service` runs its turns on now: its
+/// default model's route, else its primary provider's.
+pub fn provider_engine(service: &AgentService) -> CodingEngineKind {
+    let model = service.current_default_model.read().clone();
+    let kind = crate::subscription::routed_kind(&model).unwrap_or(*service.provider_kind.read());
+    engine_of_provider(kind)
+}
+
+/// Coding rounds led by the engine of the agent's provider, picked at each
+/// call so a provider changed by a reload is followed: an agent on a
+/// ChatGPT plan codes with Codex, one on a Claude plan with Claude Code.
+pub struct ProviderLed {
+    service: std::sync::Weak<AgentService>,
+    claude: Arc<dyn CodingEngine>,
+    codex: Arc<dyn CodingEngine>,
+}
+
+impl ProviderLed {
+    fn of(&self, kind: CodingEngineKind) -> &Arc<dyn CodingEngine> {
+        match kind {
+            CodingEngineKind::Codex => &self.codex,
+            _ => &self.claude,
+        }
+    }
+
+    /// The engine for `service`'s provider.
+    fn for_service(&self, service: &AgentService) -> &Arc<dyn CodingEngine> {
+        self.of(provider_engine(service))
+    }
+
+    /// The engine for the agent's provider now; Claude Code once the agent
+    /// is gone.
+    fn now(&self) -> &Arc<dyn CodingEngine> {
+        match self.service.upgrade() {
+            Some(service) => self.for_service(&service),
+            None => &self.claude,
+        }
+    }
+}
+
+#[async_trait]
+impl CodingEngine for ProviderLed {
+    fn label(&self) -> &'static str {
+        self.now().label()
+    }
+
+    fn metered(&self) -> bool {
+        self.now().metered()
+    }
+
+    fn preflight(&self, ctx: &RoundContext<'_>) -> Result<(), Refusal> {
+        self.for_service(ctx.service).preflight(ctx)
+    }
+
+    fn limit_reached(&self, text: &str) -> bool {
+        self.now().limit_reached(text)
+    }
+
+    fn model_choices(&self) -> ModelChoices {
+        self.now().model_choices()
+    }
+
+    fn model_for(&self, requested: Option<&str>, ctx: &RoundContext<'_>) -> Option<String> {
+        self.for_service(ctx.service).model_for(requested, ctx)
+    }
+
+    async fn cli_health(&self) -> Option<CliHealth> {
+        self.now().cli_health().await
+    }
+
+    async fn run(
+        &self,
+        sandbox: Arc<dyn CodingSandbox>,
+        round: &CodingRound,
+        ctx: &RoundContext<'_>,
+        cancel: Option<CancellationToken>,
+        progress: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<CliRoundResult> {
+        self.for_service(ctx.service)
+            .run(sandbox, round, ctx, cancel, progress)
+            .await
     }
 }
 
@@ -699,6 +812,113 @@ pub(crate) mod tests {
             None,
         );
         assert_eq!(cost_rows(&service).len(), 3);
+    }
+
+    /// An engine that says which it is and runs nothing.
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl CodingEngine for Named {
+        fn label(&self) -> &'static str {
+            self.0
+        }
+        fn preflight(&self, _: &RoundContext<'_>) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn model_choices(&self) -> ModelChoices {
+            ModelChoices {
+                models: vec![self.0.to_string()],
+                efforts: &[],
+                raw_id_prefixes: &[],
+            }
+        }
+        async fn run(
+            &self,
+            _: Arc<dyn CodingSandbox>,
+            _: &CodingRound,
+            _: &RoundContext<'_>,
+            _: Option<CancellationToken>,
+            _: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+        ) -> Result<CliRoundResult> {
+            Ok(CliRoundResult {
+                engine: self.0.to_string(),
+                ..CliRoundResult::default()
+            })
+        }
+    }
+
+    /// The engine a round `led` runs for `service` ran on.
+    async fn ran(led: &ProviderLed, service: &AgentService) -> String {
+        led.run(
+            Arc::new(claude_code::tests::StubSandbox),
+            &fable_round(),
+            &context(service),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .engine
+    }
+
+    fn on(service: &AgentService, provider: ProviderKind, model: &str) {
+        *service.provider_kind.write() = provider;
+        *service.current_default_model.write() = model.to_string();
+    }
+
+    #[test]
+    fn each_provider_codes_with_its_own_cli() {
+        for (provider, engine) in [
+            (ProviderKind::ChatGpt, CodingEngineKind::Codex),
+            (ProviderKind::Codex, CodingEngineKind::Codex),
+            (ProviderKind::ClaudeCode, CodingEngineKind::ClaudeCode),
+            (ProviderKind::Anthropic, CodingEngineKind::ClaudeCode),
+            (ProviderKind::Bedrock, CodingEngineKind::ClaudeCode),
+            (ProviderKind::OpenRouter, CodingEngineKind::ClaudeCode),
+        ] {
+            assert_eq!(engine_of_provider(provider), engine, "{provider:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agents_rounds_follow_its_provider_unless_an_engine_is_set() {
+        let service = service().await;
+        let led = ProviderLed {
+            service: Arc::downgrade(&service),
+            claude: Arc::new(Named(claude_code::LABEL)),
+            codex: Arc::new(Named(codex::LABEL)),
+        };
+        // A ChatGPT plan: Codex, its label, models and rounds.
+        on(&service, ProviderKind::ChatGpt, "gpt-6.1-sol");
+        assert_eq!(led.label(), codex::LABEL);
+        assert_eq!(led.model_choices().models, [codex::LABEL]);
+        assert_eq!(ran(&led, &service).await, codex::LABEL);
+        // A default model routed to a Claude plan wins over the provider.
+        on(&service, ProviderKind::ChatGpt, "claude_code:sonnet");
+        assert_eq!(led.label(), claude_code::LABEL);
+        // A Claude plan: Claude Code; and a switch is followed at once.
+        on(&service, ProviderKind::ClaudeCode, "sonnet");
+        assert_eq!(ran(&led, &service).await, claude_code::LABEL);
+        on(&service, ProviderKind::ChatGpt, "gpt-6.1-sol");
+        assert_eq!(ran(&led, &service).await, codex::LABEL);
+
+        // An engine set in the config is used whatever the provider.
+        let engines = Engines::default();
+        let set: CodingEngineConfig = toml::from_str("kind = \"claude_code\"\n").unwrap();
+        assert_eq!(
+            engines.for_agent(&set, &service).unwrap().label(),
+            claude_code::LABEL
+        );
+        let unset = CodingEngineConfig::default();
+        assert_eq!(
+            engines.for_agent(&unset, &service).unwrap().label(),
+            codex::LABEL
+        );
+        on(&service, ProviderKind::ClaudeCode, "sonnet");
+        assert_eq!(
+            engines.for_agent(&unset, &service).unwrap().label(),
+            claude_code::LABEL
+        );
     }
 
     #[test]
