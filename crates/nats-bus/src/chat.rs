@@ -310,12 +310,25 @@ mod tests {
         let end = serde_json::to_value(ChatProgress::TurnEnd(workforce_core::desk::TurnEnd {
             turn_ref: Some("ref-1".into()),
             reply_id: None,
+            command: false,
         }))
         .unwrap();
         assert_eq!(
             end,
             serde_json::json!({"type": "turn_end", "turn_ref": "ref-1"})
         );
+        // A command's end says so, and a gateway reads it back as one.
+        let command = serde_json::json!({"type": "turn_end", "turn_ref": "ref-2", "command": true});
+        match serde_json::from_value::<ChatProgress>(command.clone()).unwrap() {
+            ChatProgress::TurnEnd(end) => {
+                assert!(end.command);
+                assert_eq!(
+                    serde_json::to_value(ChatProgress::TurnEnd(end)).unwrap(),
+                    command
+                );
+            }
+            other => panic!("not a turn end: {other:?}"),
+        }
     }
 
     #[test]

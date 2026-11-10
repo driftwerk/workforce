@@ -682,6 +682,12 @@ pub struct TurnEnd {
     pub turn_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_id: Option<String>,
+    /// The turn was a command the hub answered itself (`/status`, `cmd:
+    /// help`, an unknown `/word`): neither the message it was asked with nor
+    /// its answer is kept, so the Desk that sent it shows the two as settled
+    /// there, and never waits for a kept copy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command: bool,
 }
 
 /// The Jira tools a Desk board's sync may call on a hub, and nothing else:

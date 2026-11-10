@@ -150,19 +150,22 @@ impl DeskStore {
         Ok(Some((sync, prefix)))
     }
 
-    /// The board other than `not` linked to `system`'s `target`, if any.
+    /// The board other than `not` linked to `system`'s `target` through
+    /// `via`, if any: two clients' hubs may each have a project of one key.
     pub async fn board_linked_to(
         &self,
         system: System,
         target: &str,
+        via: &crate::board::Via,
         not: Uuid,
     ) -> Result<Option<Uuid>> {
         let client = self.pool().get().await?;
+        let via = serde_json::to_value(via)?;
         client
             .query_opt(
                 "SELECT id FROM boards WHERE sync ->> 'system' = $1 AND sync ->> 'target' = $2 \
-                 AND id <> $3 LIMIT 1",
-                &[&system.as_str(), &target, &not],
+                 AND sync -> 'via' = $4 AND id <> $3 LIMIT 1",
+                &[&system.as_str(), &target, &not, &via],
             )
             .await?
             .map(|r| r.try_get(0))
@@ -170,13 +173,19 @@ impl DeskStore {
             .map_err(Into::into)
     }
 
-    /// The ticket whose issue is `system`'s `key`.
-    pub async fn ticket_by_external(&self, system: System, key: &str) -> Result<Option<Ticket>> {
+    /// The ticket the link `link` holds for `system`'s issue `key`.
+    pub async fn ticket_by_external(
+        &self,
+        system: System,
+        link: Uuid,
+        key: &str,
+    ) -> Result<Option<Ticket>> {
         let client = self.pool().get().await?;
         let id: Option<Uuid> = client
             .query_opt(
-                "SELECT id FROM tickets WHERE external ->> 'system' = $1 AND external ->> 'key' = $2",
-                &[&system.as_str(), &key],
+                "SELECT id FROM tickets WHERE external ->> 'system' = $1 AND external ->> 'key' = $2 \
+                 AND external ->> 'link' = $3",
+                &[&system.as_str(), &key, &link.to_string()],
             )
             .await?
             .map(|r| r.try_get(0))
@@ -188,23 +197,28 @@ impl DeskStore {
         }
     }
 
-    /// The ticket whose issue's key is `key`, on any system.
-    pub async fn ticket_by_issue_key(&self, key: &str) -> Result<Option<Ticket>> {
+    /// Every ticket whose issue's key is `key`, on any system and link,
+    /// latest changed first: two links may each hold one (two clients' hubs
+    /// with a project of one key), so the caller picks the one it reaches.
+    pub async fn tickets_by_issue_key(&self, key: &str) -> Result<Vec<Ticket>> {
         let client = self.pool().get().await?;
-        let id: Option<Uuid> = client
-            .query_opt(
-                "SELECT id FROM tickets WHERE external ->> 'key' = $1 \
-                 ORDER BY updated_at DESC LIMIT 1",
+        let ids: Vec<Uuid> = client
+            .query(
+                "SELECT id FROM tickets WHERE external ->> 'key' = $1 ORDER BY updated_at DESC",
                 &[&key],
             )
             .await?
+            .iter()
             .map(|r| r.try_get(0))
-            .transpose()?;
+            .collect::<std::result::Result<_, _>>()?;
         drop(client);
-        match id {
-            Some(id) => self.ticket(id).await,
-            None => Ok(None),
+        let mut out = vec![];
+        for id in ids {
+            if let Some(t) = self.ticket(id).await? {
+                out.push(t);
+            }
         }
+        Ok(out)
     }
 
     /// Queues `ticket` on `board` to be pushed from `at`. A ticket already

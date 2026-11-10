@@ -459,6 +459,11 @@ pub struct ServerMessage {
     /// On a `turn_snapshot`: what the turn has streamed of its answer so far.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// On a Desk connection's `turn_end`: the turn was a command the hub
+    /// answered itself, so neither the message it was asked with nor its
+    /// answer is kept, and the client shows both as settled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command: bool,
 }
 
 fn default_speakable() -> bool {
@@ -597,6 +602,7 @@ impl ServerMessage {
             status: None,
             since: None,
             text: None,
+            command: false,
         }
     }
 }

@@ -199,6 +199,19 @@ pub struct Sync {
     /// What it last couldn't do, in the hub's words.
     #[serde(default)]
     pub problem: Option<String>,
+    /// Issues a pull couldn't take in, tried again on their own back-off
+    /// while the cursor goes on past them.
+    #[serde(default)]
+    pub retry: BTreeMap<String, Retry>,
+}
+
+/// An issue a pull couldn't take in, and when it is tried again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Retry {
+    pub tries: u32,
+    pub next_at: DateTime<Utc>,
+    pub problem: String,
 }
 
 /// What a synced ticket's issue said when last pulled or pushed: what the
@@ -375,6 +388,22 @@ impl Ticket {
         self.external.as_ref().map(|e| e.system)
     }
 
+    /// Its title on one line as a model reads it in a list: a synced
+    /// ticket's defanged and marked as its issue's own words.
+    pub fn said_title(&self) -> String {
+        crate::board_sync::spoken_title(self)
+    }
+
+    /// Whether it is on the Left-the-filter shelf: its issue no longer
+    /// matches the board's import filter, and the person hasn't yet kept or
+    /// dropped it.
+    pub fn left_filter(&self) -> bool {
+        self.external
+            .as_ref()
+            .is_some_and(|e| !e.synced && !e.kept && !e.made_here)
+            && self.state != TicketState::Dropped
+    }
+
     /// The session it is assigned to, when it is.
     pub fn session(&self) -> Option<Uuid> {
         self.assignee.as_ref().and_then(crate::line::session_of)
@@ -518,11 +547,53 @@ pub fn goal_for(key: &str, title: &str) -> String {
     format!("{key} · {title}")
 }
 
+/// [`goal_for`] for `t`: a synced ticket's goal is its key alone, since its
+/// title is its issue's words, never the person's.
+pub fn goal_of(key: &str, t: &Ticket) -> String {
+    match t.from_remote() {
+        Some(system) => format!("{key} ({} issue)", system.title()),
+        None => goal_for(key, &t.title),
+    }
+}
+
+/// What a session or agent is handed of a synced ticket: its issue's title
+/// and description fenced as untrusted content, never the person's words.
+fn remote_handed_text(
+    key: &str,
+    system: System,
+    t: &Ticket,
+    needs: &[(String, TicketState)],
+) -> String {
+    let words = match t.body.trim().is_empty() {
+        true => t.title.clone(),
+        false => format!("{}\n\n{}", t.title, t.body),
+    };
+    let mut out = format!(
+        "{key} is yours: the {} issue {key}. Its title and description follow, as its writers put them.\n{}",
+        system.title(),
+        crate::board_sync::fence(system, key, &words, &crate::board_sync::nonce())
+    );
+    if !needs.is_empty() {
+        let list: Vec<String> = needs
+            .iter()
+            .map(|(k, s)| format!("{k} ({})", s.title()))
+            .collect();
+        out.push_str(&format!("\n\nIt needs {}.", list.join(", ")));
+    }
+    out.push_str(&format!(
+        "\n\nMove {key} with Desk's ticket tool as you go: doing, review, done."
+    ));
+    out
+}
+
 /// What the session it is assigned to reads: the ticket's title, body and
 /// what it needs. `needs` are the keys of its needs, with each one's state.
 /// It goes in as the assigner's words, so a ticket another session wrote
 /// is quoted as that session's note: never the person's say-so.
 pub fn handed_text(key: &str, t: &Ticket, needs: &[(String, TicketState)]) -> String {
+    if let Some(system) = t.from_remote() {
+        return remote_handed_text(key, system, t, needs);
+    }
     let theirs = t.created_by.kind != crate::crew::PartyKind::You;
     let mut out = match theirs {
         true => format!(

@@ -424,6 +424,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/models/health", get(model_health))
         .route("/api/models/aliases", get(model_aliases))
+        .route("/api/commands", get(list_commands))
         .route("/api/admin/reset-model", post(admin_reset_model))
         .route("/api/agents", get(list_agents))
         // Agent CRUD & detail endpoints (DW-421)
@@ -1511,6 +1512,25 @@ const DESK_ONLY_FRAMES: &[&str] = &[
     crate::broadcast::DESK_DELIVERED,
 ];
 
+/// Whether the person's message kept under client id `id` in `session_id`
+/// was asked already: its turn answered it, or is running it now. Kept but
+/// unanswered with nothing running, it is a question to take up again.
+fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
+    let Some(session) = service.sessions.get(session_id).ok().flatten() else {
+        return false;
+    };
+    let Some(at) = session.messages.iter().rposition(|m| {
+        m.role == workforce_common::session::MessageRole::User
+            && m.external_id.as_deref() == Some(id)
+    }) else {
+        return false;
+    };
+    service.live_turns.running(session_id)
+        || session.messages[at + 1..]
+            .iter()
+            .any(|m| m.role == workforce_common::session::MessageRole::Assistant)
+}
+
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
@@ -1637,6 +1657,7 @@ fn server_frame(mut msg: BroadcastMessage, declared: bool) -> Option<ServerMessa
         status: snapshot.as_ref().map(|s| s.status),
         since: snapshot.as_ref().map(|s| s.since.to_rfc3339()),
         text: snapshot.map(|s| s.text),
+        command: msg.command && declared,
         msg_type: msg.msg_type,
     })
 }
@@ -1780,6 +1801,7 @@ mod desk_frame_tests {
             TurnEnd {
                 turn_ref: Some("ref-1".into()),
                 reply_id: Some("reply-1".into()),
+                command: false,
             },
         );
         assert_eq!(
@@ -1790,6 +1812,22 @@ mod desk_frame_tests {
             })
         );
         assert!(server_frame(end, false).is_none());
+        // A command's end says so: the Desk settles it with nothing kept.
+        let command = BroadcastMessage::turn_end(
+            "s1",
+            TurnEnd {
+                turn_ref: Some("ref-2".into()),
+                reply_id: None,
+                command: true,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(server_frame(command, true).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "turn_end", "content": "", "session_id": "s1", "speakable": false,
+                "turn_ref": "ref-2", "command": true,
+            })
+        );
     }
 
     #[test]
@@ -2117,6 +2155,7 @@ async fn handle_ws(
         status: None,
         since: None,
         text: None,
+        command: false,
     };
     let _ = sender
         .send(Message::Text(
@@ -2637,6 +2676,30 @@ async fn handle_ws(
                             // turn instead, and the client queues it — as does
                             // one sent to queue, files or not, which a live
                             // turn never takes in.
+                            // The same DM message again (Desk's Retry sends it
+                            // under its own id): once its turn has answered it,
+                            // or while that turn runs, it is not asked twice. Its
+                            // turn just ends, and the Desk reads what was kept.
+                            if let Some(asked) = desk.as_ref().filter(|d| {
+                                matches!(d.turn.place, DeskPlace::Dm)
+                                    && d.turn.message.is_some_and(|id| {
+                                        asked_already(
+                                            &service,
+                                            &effective_session_id,
+                                            &id.to_string(),
+                                        )
+                                    })
+                            }) {
+                                let _ = broadcast_tx.send(BroadcastMessage::turn_end(
+                                    effective_session_id.clone(),
+                                    workforce_common::channels::desk::TurnEnd {
+                                        turn_ref: asked.turn_ref.clone(),
+                                        reply_id: None,
+                                        command: false,
+                                    },
+                                ));
+                                continue;
+                            }
                             let queued = client_msg.mode
                                 == Some(workforce_gateway_client::protocol::SendMode::Queue);
                             if !has_attachments || queued {
@@ -2664,11 +2727,16 @@ async fn handle_ws(
                                     continue;
                                 }
                                 if steered.applied() {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
-                                        effective_session_id.clone(),
-                                        "injected",
-                                        "Follow-up absorbed into active run".to_string(),
-                                    ));
+                                    // Named for the message's own turn, so its
+                                    // Desk knows that one got there.
+                                    let _ = broadcast_tx.send(
+                                        BroadcastMessage::new(
+                                            effective_session_id.clone(),
+                                            "injected",
+                                            "Follow-up absorbed into active run".to_string(),
+                                        )
+                                        .stamped(stamp.as_ref()),
+                                    );
                                     continue;
                                 }
                             }
@@ -2794,7 +2862,7 @@ async fn handle_ws(
                                         BroadcastMessage::turn_end(
                                             session_id,
                                             crate::desk_surface::turn_end(
-                                                &service, session_id, desk,
+                                                &service, session_id, desk, None,
                                             ),
                                         )
                                     })
@@ -2901,6 +2969,7 @@ async fn handle_ws(
                                         let tts_normalize = voice_turn;
                                         let service = Arc::clone(&service);
                                         let (desk, stamp) = (desk.clone(), stamp.clone());
+                                        let ran = content.clone();
                                         tokio::spawn(async move {
                                             let forward = {
                                                 let (tx, sid) = (tx.clone(), sid.clone());
@@ -2925,7 +2994,10 @@ async fn handle_ws(
                                                 BroadcastMessage::turn_end(
                                                     &sid,
                                                     crate::desk_surface::turn_end(
-                                                        &service, &sid, desk,
+                                                        &service,
+                                                        &sid,
+                                                        desk,
+                                                        Some(&ran),
                                                     ),
                                                 )
                                             });
@@ -4676,6 +4748,25 @@ async fn session_export(
             Err(StatusCode::NOT_FOUND)
         }
     }
+}
+
+/// The commands a person can type to an agent, as `/help` lists them: what
+/// a client's `/` menu offers, to a caller that may chat.
+async fn list_commands(
+    headers: axum::http::HeaderMap,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, ScopeRejection> {
+    require_scope(
+        &state,
+        &headers,
+        query.token.as_deref(),
+        crate::jwt::SCOPE_CHAT,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "commands": crate::commands::COMMANDS }),
+    ))
 }
 
 /// List available agents.

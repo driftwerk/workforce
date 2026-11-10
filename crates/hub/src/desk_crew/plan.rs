@@ -221,7 +221,7 @@ fn plan_out(p: &PlanDetail) -> Value {
         "tickets": p.tickets.iter().map(|t| json!({
             "id": t.ticket.ticket.id.to_string(),
             "key": t.ticket.key,
-            "title": t.ticket.ticket.title,
+            "title": t.ticket.ticket.said_title(),
             "state": t.ticket.ticket.state.as_str(),
             "engine": t.engine.map(Engine::as_str),
             "folder": t.folder,
@@ -420,7 +420,7 @@ impl CrewHub {
                     format!(
                         "{} {}",
                         t.ticket.key.as_deref().unwrap_or("·"),
-                        crew::one_line(&t.ticket.ticket.title, 80)
+                        crew::one_line(&t.ticket.ticket.said_title(), 80)
                     )
                 })
                 .collect();
@@ -1032,7 +1032,7 @@ impl CrewHub {
             return None;
         }
         let key = ticket.key.as_deref().unwrap_or("A ticket");
-        let title = crew::one_line(&ticket.ticket.title, 80);
+        let title = crew::one_line(&ticket.ticket.said_title(), 80);
         match now {
             TicketState::Review => Some((plan, format!("{key} “{title}” is in Review"))),
             TicketState::Done => Some((plan, format!("{key} “{title}” is Done"))),

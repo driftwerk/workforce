@@ -771,6 +771,7 @@ pub async fn mount(
         .await
         .context("opening the desk registry")?;
     let cancel_crew = cancel.clone();
+    let cancel_sync = cancel.clone();
     let floor = workforce_desk::Floor {
         pricer: Some(Arc::new(crate::desk_ledger::HubPricer::new(Arc::clone(
             &state.registry,
@@ -843,7 +844,8 @@ pub async fn mount(
         config,
         desk.clone(),
     )));
-    let (_board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
+    let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
+    board_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(board_sync_routes));
     Ok(app.merge(workforce_desk::router(
         desk,

@@ -279,6 +279,10 @@ pub struct BoardSync {
     pub state: Arc<GatewayState>,
     pub desk: Desk,
     http: Arc<reqwest::Client>,
+    /// Boards to sync at once (opened, or asked to), and what wakes the
+    /// loop for them.
+    kicked: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    wake: tokio::sync::Notify,
 }
 
 impl BoardSync {
@@ -293,7 +297,87 @@ impl BoardSync {
             state,
             desk,
             http: Arc::new(http),
+            kicked: Default::default(),
+            wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Syncs board `id` at once, not on its next turn.
+    pub fn kick(&self, id: Uuid) {
+        self.kicked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+        self.wake.notify_one();
+    }
+
+    /// The loop: every board's turn every [`sync::PULL_EVERY`], a kicked
+    /// board's at once, until `cancel`.
+    pub fn start(self: &Arc<Self>, cancel: CancellationToken) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = me.wake.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                }
+                me.pass().await;
+            }
+        });
+    }
+
+    /// One pass over every synced board whose turn it is.
+    pub async fn pass(&self) {
+        let boards = match self.desk.synced_boards().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "synced boards weren't read");
+                return;
+            }
+        };
+        let kicked: std::collections::HashSet<Uuid> =
+            std::mem::take(&mut *self.kicked.lock().unwrap_or_else(|e| e.into_inner()));
+        for id in boards {
+            if let Err(e) = self.pass_board(id, kicked.contains(&id)).await {
+                tracing::warn!(board = %id, error = %e, "a board's sync pass failed");
+            }
+        }
+    }
+
+    /// Board `id`'s turn: nothing while it is paused by the person, out of
+    /// its group or without its hub; else its pull, when due (or `now`).
+    pub async fn pass_board(&self, id: Uuid, now: bool) -> Result<(), DeskError> {
+        let Some((_, s)) = self.desk.board_sync(id).await? else {
+            return Ok(());
+        };
+        if matches!(
+            s.paused,
+            Some(Paused::ByYou | Paused::LeftGroup | Paused::HubUnpaired)
+        ) {
+            return Ok(());
+        }
+        let due = s
+            .pulled_at
+            .is_none_or(|at| chrono::Utc::now() - at >= sync::PULL_EVERY);
+        if !(due || now) {
+            return Ok(());
+        }
+        let remote = match self.remote(s.system, &s.via, &s.person).await {
+            Ok(r) => r,
+            Err(p) => {
+                if s.paused.as_ref() != Some(&p) {
+                    self.desk.set_sync_paused(id, Some(p)).await?;
+                }
+                return Ok(());
+            }
+        };
+        let pulled = self.desk.pull_board(id, &*remote).await?;
+        if pulled.imported + pulled.updated + pulled.detached + pulled.dropped > 0 {
+            tracing::info!(board = %id, imported = pulled.imported, updated = pulled.updated,
+                detached = pulled.detached, dropped = pulled.dropped, "board pulled");
+        }
+        Ok(())
     }
 
     /// What reaches `system` `via` a hub (or this one), as `person`; why
@@ -482,6 +566,7 @@ pub fn router(sync: Arc<BoardSync>) -> Router {
             put(link_board).delete(unlink_board),
         )
         .route("/api/desk/boards/{id}/pause", post(pause_board))
+        .route("/api/desk/boards/{id}/sync", post(sync_board))
         .with_state(Arc::new(Routes { sync }))
 }
 
@@ -955,6 +1040,24 @@ async fn pause_board(
     let _person = person!(r, h, q);
     match r.sync.desk.pause_board(id, body.paused).await {
         Ok(b) => Json(b).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Syncs a board at once: Desk asks when the board is opened.
+async fn sync_board(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let _person = person!(r, h, q);
+    match r.sync.desk.board_sync(id).await {
+        Ok(Some(_)) => {
+            r.sync.kick(id);
+            StatusCode::ACCEPTED.into_response()
+        }
+        Ok(None) => refusal(StatusCode::CONFLICT, "That board isn't synced."),
         Err(e) => e.into_response(),
     }
 }
