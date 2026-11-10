@@ -97,7 +97,8 @@ impl LinkView {
             link_id: link.link_id,
             label: token.label,
             agent_id: link.agent_id,
-            group_key: link.group_key,
+            // Desk's own key for its group; the hub's is derived from it.
+            group_key: link.desk_group_key,
             group_name: link.group_name,
             engine_id: link.engine_id,
             engine_name: link.engine_name,

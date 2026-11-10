@@ -46,6 +46,8 @@ pub const OVERLAYABLE_PREFIXES: &[&str] = &[
     "mcp.enabled",
     "environments",
     "games",
+    // Whether a paired Desk may make this hub's agents bosses, read live.
+    "desk_boss",
 ];
 
 /// The overlay keys an *agent-reachable* writer may change. Agent tools create,

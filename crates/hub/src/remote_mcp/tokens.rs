@@ -387,7 +387,11 @@ impl RemoteMcpTokenService {
 /// token and every Desk boss link it made. Authentication refuses them
 /// anyway (`super::auth`, `crate::boss_links`); this keeps the rows true.
 /// How many.
-pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) -> usize {
+pub fn revoke_device_tokens(
+    store: &dyn RemoteMcpTokenStore,
+    device_id: &str,
+    telemetry: Option<&Arc<dyn workforce_common::telemetry::TelemetryStore>>,
+) -> usize {
     let now = Utc::now();
     let tokens = match store.list_all_tokens() {
         Ok(t) => t,
@@ -408,6 +412,7 @@ pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) ->
         })
         .inspect(|t| {
             tracing::info!(target: "sentinel.audit", token_id = %t.id, device = %device_id, "remote MCP token revoked with its device");
+            crate::boss_links::audit_revoke(telemetry, "system", t, "unpaired");
         })
         .count()
 }
@@ -611,11 +616,11 @@ mod tests {
         assert_eq!(svc.list(me.id).unwrap().len(), 2);
         // Unpaired, the device's token leaves the listing and the cap; the
         // person's own stays.
-        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 1);
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1", None), 1);
         let left = svc.list(me.id).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].label, "laptop");
-        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 0);
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1", None), 0);
     }
 
     /// Links racing on one device leave it one live token.

@@ -438,6 +438,7 @@ mod tests {
                 link_id: uuid::Uuid::new_v4(),
                 agent_id: "allan".into(),
                 group_key: "d-1/g-acme".into(),
+                desk_group_key: "d-1/g-acme".into(),
                 group_name: "Acme".into(),
                 engine_id: "devbox".into(),
                 engine_name: "devbox".into(),

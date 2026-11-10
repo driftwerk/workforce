@@ -1,6 +1,7 @@
 //! Desk boss links: device-only mint, list and revoke; the link token
 //! reaching nothing but a link; and every way a link ends.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -15,30 +16,86 @@ use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole, IdentityStatus};
 
 use super::auth::{authenticate_link, LinkRefusal};
-use super::engine_key::{fresh_nonce, EngineKey};
+use super::engine_key::{fresh_nonce, Challenge, EngineKey};
 use super::links::{self, LinkError, MintRequest};
 use crate::gateway::GatewayState;
 use crate::remote_mcp::testing::{
     bearer, fixture_with_devices, pair_device, pair_device_as, Fixture,
 };
 
+const HUB: &str = "https://workforce.example.com";
+
+/// An identity store that answers as the one it wraps until told to fail
+/// its device-holder lookups.
+struct Flaky {
+    inner: Arc<dyn IdentityStore>,
+    fail: Arc<AtomicBool>,
+}
+
+impl IdentityStore for Flaky {
+    fn create(&self, identity: &Identity) -> eyre::Result<()> {
+        self.inner.create(identity)
+    }
+    fn get_by_id(&self, id: Uuid) -> eyre::Result<Option<Identity>> {
+        self.inner.get_by_id(id)
+    }
+    fn get_by_email(&self, email: &str) -> eyre::Result<Option<Identity>> {
+        self.inner.get_by_email(email)
+    }
+    fn get_by_linked_id(&self, platform: &str, id: &str) -> eyre::Result<Option<Identity>> {
+        if self.fail.load(Ordering::SeqCst) {
+            eyre::bail!("the identity store is down");
+        }
+        self.inner.get_by_linked_id(platform, id)
+    }
+    fn update(&self, identity: &Identity) -> eyre::Result<()> {
+        self.inner.update(identity)
+    }
+    fn delete(&self, id: Uuid) -> eyre::Result<()> {
+        self.inner.delete(id)
+    }
+    fn list(
+        &self,
+        filter: &workforce_identity::store::IdentityFilter,
+    ) -> eyre::Result<Vec<Identity>> {
+        self.inner.list(filter)
+    }
+    fn count_filtered(
+        &self,
+        filter: &workforce_identity::store::IdentityFilter,
+    ) -> eyre::Result<usize> {
+        self.inner.count_filtered(filter)
+    }
+}
+
 struct Hub {
     fx: Fixture,
     devices: Arc<workforce_pairing::SqlitePairingStore>,
+    /// Makes the identity store fail its device-holder lookups.
+    store_down: Arc<AtomicBool>,
+    audit: Arc<workforce_common::persistence::SqliteStore>,
     _dirs: Vec<tempfile::TempDir>,
 }
 
 /// A hub with `[desk_boss]` as `config` says, device minting of remote MCP
-/// tokens on, and two agents: `allan`, who accepts boss work, and `bea`,
-/// who doesn't.
+/// tokens on, an audit log, and two agents: `allan`, who accepts boss work,
+/// and `bea`, who doesn't.
 async fn hub(config: DeskBossConfig) -> Hub {
     let (fx, devices) = fixture_with_devices(true);
     let state = Arc::try_unwrap(fx.state)
         .ok()
         .expect("the fixture's only handle");
+    let store_down = Arc::new(AtomicBool::new(false));
+    let flaky = Flaky {
+        inner: state.identity_store.clone().unwrap(),
+        fail: Arc::clone(&store_down),
+    };
+    let audit = Arc::new(workforce_common::persistence::SqliteStore::in_memory().unwrap());
     let fx = Fixture {
         state: Arc::new(GatewayState {
-            desk_boss: config,
+            desk_boss: super::LiveConfig::new(config),
+            identity_store: Some(Arc::new(flaky)),
+            telemetry_store: Some(Arc::clone(&audit) as _),
             ..state
         }),
         identities: fx.identities,
@@ -60,7 +117,18 @@ async fn hub(config: DeskBossConfig) -> Hub {
     Hub {
         fx,
         devices,
+        store_down,
+        audit,
         _dirs: vec![accepting, declining],
+    }
+}
+
+fn challenge<'a>(nonce: &'a [u8; 32], token_id: Uuid, engine_id: &'a str) -> Challenge<'a> {
+    Challenge {
+        nonce,
+        token_id,
+        hub: HUB,
+        engine_id,
     }
 }
 
@@ -74,6 +142,21 @@ fn on() -> DeskBossConfig {
 impl Hub {
     fn state(&self) -> &GatewayState {
         &self.fx.state
+    }
+
+    /// The `desk_boss.*` audit rows, as (action, how).
+    fn audited(&self) -> Vec<(String, String)> {
+        self.audit
+            .recent_audit(100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action.starts_with("desk_boss."))
+            .map(|e| {
+                let detail: serde_json::Value =
+                    serde_json::from_str(e.detail.as_deref().unwrap_or("{}")).unwrap();
+                (e.action, detail["how"].as_str().unwrap_or("").to_string())
+            })
+            .collect()
     }
 
     fn person(&self, role: IdentityRole) -> Identity {
@@ -137,10 +220,27 @@ async fn a_desk_mints_a_link_bound_to_its_person_device_agent_and_engine_key() {
     assert!(!format!("{live:?}").contains(&minted.plaintext));
     // The engine proves its key over a fresh challenge; another key can't.
     let nonce = fresh_nonce().unwrap();
-    let proof = engine.sign_challenge(&nonce, record.id, "devbox");
-    assert!(live.proves(&nonce, &proof));
-    assert!(!live.proves(&nonce, &key().sign_challenge(&nonce, record.id, "devbox")));
-    assert!(!live.proves(&fresh_nonce().unwrap(), &proof));
+    let proof = engine
+        .sign_challenge(challenge(&nonce, record.id, "devbox"))
+        .unwrap();
+    assert!(live.proves(HUB, &nonce, &proof));
+    let stranger = key()
+        .sign_challenge(challenge(&nonce, record.id, "devbox"))
+        .unwrap();
+    assert!(!live.proves(HUB, &nonce, &stranger));
+    assert!(!live.proves(HUB, &fresh_nonce().unwrap(), &proof));
+    // A proof made for one hub is no proof to another.
+    assert!(!live.proves("https://other.example.com", &nonce, &proof));
+    // The hub keys the group itself, from Sam, this Desk and Desk's key.
+    assert_eq!(minted.link.desk_group_key, "d-1/acme");
+    assert_eq!(
+        minted.link.group_key,
+        super::group_key(sam.id, &device.id, "d-1/acme")
+    );
+    assert_eq!(
+        hub.audited(),
+        [("desk_boss.mint".to_string(), "new".to_string())]
+    );
 
     let listed = links::list(hub.state(), sam.id, &device.id).unwrap();
     assert_eq!(listed.len(), 1);
@@ -472,7 +572,11 @@ async fn unpairing_the_device_ends_its_links() {
     );
     // And the unpair paths' sweep revokes every link the device made.
     assert_eq!(
-        crate::remote_mcp::tokens::revoke_device_tokens(hub.fx.tokens.as_ref(), &device.id),
+        crate::remote_mcp::tokens::revoke_device_tokens(
+            hub.fx.tokens.as_ref(),
+            &device.id,
+            hub.fx.state.telemetry_store.as_ref(),
+        ),
         1
     );
     assert_eq!(
@@ -692,4 +796,337 @@ async fn the_routes_are_a_paired_desks_alone() {
         revoke(desk.clone(), id.to_string()).await.err(),
         Some(StatusCode::NOT_FOUND)
     );
+}
+
+/// Every way a link is revoked leaves a `desk_boss.revoke` row saying how.
+#[tokio::test]
+async fn every_revocation_is_audited() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let engine = key();
+    let mint = |group: &str| {
+        links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&engine, group, "devbox"),
+        )
+        .unwrap()
+    };
+    mint("a");
+    mint("a"); // replaces the first
+    let renew = |old: Uuid| {
+        links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &MintRequest {
+                renews: Some(old),
+                ..request(&engine, "b", "devbox")
+            },
+        )
+        .unwrap()
+    };
+    let b = mint("b");
+    let b2 = renew(b.record.id);
+    // A second renewal ends the first token, which Desk never revoked.
+    let b3 = renew(b2.record.id);
+    assert!(links::revoke(hub.state(), sam.id, &device.id, b3.record.id).unwrap());
+    let c = mint("c");
+    // An admin, with the hub's own token.
+    let state = Arc::clone(&hub.fx.state);
+    let status = crate::api_handlers::remote_mcp_tokens::revoke_any_token(
+        State(Arc::clone(&state)),
+        bearer("gateway-token"),
+        Path(c.record.id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let d = mint("d");
+    workforce_pairing::PairingStore::revoke_device(hub.devices.as_ref(), &device.id).unwrap();
+    assert!(authenticate_link(hub.state(), &d.plaintext).is_err());
+    let hows: Vec<String> = hub
+        .audited()
+        .into_iter()
+        .filter(|(action, _)| action == "desk_boss.revoke")
+        .map(|(_, how)| how)
+        .collect();
+    for how in ["replaced", "renewed", "device", "admin", "device gone"] {
+        assert!(hows.iter().any(|h| h == how), "no {how} row in {hows:?}");
+    }
+    // What's left goes with the unpair sweep.
+    let left = mint_left(&hub, &sam, &engine).await;
+    assert!(
+        crate::remote_mcp::tokens::revoke_device_tokens(
+            hub.fx.tokens.as_ref(),
+            &left,
+            hub.fx.state.telemetry_store.as_ref(),
+        ) >= 1
+    );
+    assert!(hub.audited().iter().any(|(_, how)| how == "unpaired"));
+}
+
+/// A second Desk of Sam's with one live link, for the unpair sweep: its id.
+async fn mint_left(hub: &Hub, sam: &Identity, engine: &EngineKey) -> String {
+    let mut same_sam = hub.fx.identities.get_by_id(sam.id).unwrap().unwrap();
+    let (laptop, _) = pair_device(&hub.fx, &hub.devices, &mut same_sam, "laptop");
+    links::mint(
+        hub.state(),
+        sam.id,
+        &laptop.id,
+        &request(engine, "e", "devbox"),
+    )
+    .unwrap();
+    laptop.id
+}
+
+/// Remote MCP off, a person's and an admin's token listings still show the
+/// boss links and only them, and an admin still revokes one; a remote MCP
+/// token is out of reach while it is off.
+#[tokio::test]
+async fn boss_links_are_listed_and_revoked_whatever_remote_mcp_says() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    let mcp = crate::remote_mcp::tokens::RemoteMcpTokenService::for_gateway(hub.state())
+        .unwrap()
+        .mint(sam.id, "laptop")
+        .unwrap();
+    let state = Arc::try_unwrap(hub.fx.state).ok().expect("one handle");
+    let off = Arc::new(GatewayState {
+        remote_mcp: workforce_common::settings::RemoteMcpConfig::default(),
+        ..state
+    });
+    let Json(listed) = crate::api_handlers::remote_mcp_tokens::list_all_tokens(
+        State(Arc::clone(&off)),
+        bearer("gateway-token"),
+    )
+    .await
+    .unwrap();
+    let listed = serde_json::to_value(listed).unwrap();
+    let ids: Vec<&str> = listed["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [link.record.id.to_string()]);
+    assert_eq!(listed["tokens"][0]["kind"], "desk_boss");
+    let revoke = |id: Uuid| {
+        let state = Arc::clone(&off);
+        async move {
+            crate::api_handlers::remote_mcp_tokens::revoke_any_token(
+                State(state),
+                bearer("gateway-token"),
+                Path(id.to_string()),
+            )
+            .await
+            .map_err(|(status, _)| status)
+        }
+    };
+    assert_eq!(revoke(mcp.record.id).await, Err(StatusCode::NOT_FOUND));
+    assert_eq!(revoke(link.record.id).await, Ok(StatusCode::NO_CONTENT));
+    assert_eq!(
+        authenticate_link(&off, &link.plaintext).err(),
+        Some(LinkRefusal::Unauthenticated)
+    );
+}
+
+/// A store that can't answer is never taken for an unpaired device: the
+/// link is unavailable for now, and stays live.
+#[tokio::test]
+async fn a_store_error_never_revokes_a_link() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    hub.store_down.store(true, Ordering::SeqCst);
+    assert_eq!(
+        authenticate_link(hub.state(), &link.plaintext).err(),
+        Some(LinkRefusal::Unavailable)
+    );
+    hub.store_down.store(false, Ordering::SeqCst);
+    assert!(authenticate_link(hub.state(), &link.plaintext).is_ok());
+    assert!(!hub
+        .audited()
+        .iter()
+        .any(|(action, _)| action == "desk_boss.revoke"));
+}
+
+/// `[desk_boss] enabled` is read live: off stops every link on its next
+/// check, and on again lets it back.
+#[tokio::test]
+async fn turning_boss_work_off_ends_links_at_once() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    hub.state().desk_boss.set(DeskBossConfig::default());
+    assert_eq!(
+        authenticate_link(hub.state(), &link.plaintext).err(),
+        Some(LinkRefusal::Disabled)
+    );
+    assert!(matches!(
+        links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&key(), "atlas", "devbox")
+        ),
+        Err(LinkError::Disabled)
+    ));
+    // Stopping a link works while it is off.
+    hub.state().desk_boss.set(on());
+    assert!(authenticate_link(hub.state(), &link.plaintext).is_ok());
+}
+
+#[tokio::test]
+async fn a_link_ends_when_the_matrix_denies_its_person() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    let denied = crate::authz::CapabilityMatrix::from_overrides(&[
+        workforce_permissions::capability::CapabilityOverride {
+            role: "member".into(),
+            capability: "desk_boss".into(),
+            decision: workforce_permissions::capability::CapabilityDecision::Deny,
+            updated_at: chrono::Utc::now(),
+            updated_by: None,
+        },
+    ]);
+    assert_eq!(
+        super::auth::authenticate_link_in(hub.state(), &link.plaintext, &denied).err(),
+        Some(LinkRefusal::NotAllowed)
+    );
+    assert!(super::auth::authenticate_link_in(
+        hub.state(),
+        &link.plaintext,
+        &crate::authz::CapabilityMatrix::default()
+    )
+    .is_ok());
+}
+
+#[tokio::test]
+async fn an_expired_link_is_no_link() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    let expired = workforce_identity::remote_mcp_token::mint_as(TokenScope::DeskBoss);
+    hub.fx
+        .tokens
+        .create_token(&workforce_identity::remote_mcp_token::RemoteMcpToken {
+            id: Uuid::new_v4(),
+            token_hash: expired.hash,
+            created_at: link.record.created_at - Duration::days(31),
+            expires_at: chrono::Utc::now() - Duration::seconds(1),
+            ..link.record.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        authenticate_link(hub.state(), &expired.plaintext).err(),
+        Some(LinkRefusal::Unauthenticated)
+    );
+}
+
+/// A link names its agent exactly: gone, it ends; another that now answers
+/// to the same name in another case never takes it over.
+#[tokio::test]
+async fn a_link_stays_with_exactly_its_agent() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let link = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&key(), "acme", "devbox"),
+    )
+    .unwrap();
+    let allan = hub.fx.state.registry.remove("allan").unwrap();
+    assert_eq!(
+        authenticate_link(hub.state(), &link.plaintext).err(),
+        Some(LinkRefusal::AgentGone)
+    );
+    hub.fx.state.registry.insert("Allan", allan);
+    assert_eq!(
+        authenticate_link(hub.state(), &link.plaintext).err(),
+        Some(LinkRefusal::AgentGone)
+    );
+}
+
+/// Two people, or two Desks, naming the same group key get different keys
+/// here.
+#[tokio::test]
+async fn the_hub_keys_each_group_itself() {
+    let hub = hub(on()).await;
+    let (sam, device, _) = hub.sam();
+    let (other, theirs, _) = hub.sam();
+    let engine = key();
+    let mine = links::mint(
+        hub.state(),
+        sam.id,
+        &device.id,
+        &request(&engine, "acme", "devbox"),
+    )
+    .unwrap();
+    let their = links::mint(
+        hub.state(),
+        other.id,
+        &theirs.id,
+        &request(&engine, "acme", "devbox"),
+    )
+    .unwrap();
+    assert_eq!(mine.link.desk_group_key, their.link.desk_group_key);
+    assert_ne!(mine.link.group_key, their.link.group_key);
+    assert_ne!(
+        super::group_key(sam.id, &device.id, "d-1/acme"),
+        super::group_key(sam.id, "other-device", "d-1/acme")
+    );
+}
+
+#[test]
+fn only_a_person_changes_an_agents_desk_boss() {
+    let on = "[desk_boss]\naccept = true\n";
+    let off = "[desk_boss]\naccept = false\n";
+    for (before, after) in [(None, on), (Some(off), on), (Some(on), off), (Some(on), "")] {
+        assert!(
+            super::desk_boss_refused(before, after, "agent_tool").is_some(),
+            "{before:?} -> {after:?}"
+        );
+        assert!(super::desk_boss_refused(before, after, "api").is_none());
+    }
+    assert!(super::desk_boss_refused(
+        Some(on),
+        "[desk_boss]\naccept = true\n[llm]\nmodel = \"x\"\n",
+        "agent_tool"
+    )
+    .is_none());
 }

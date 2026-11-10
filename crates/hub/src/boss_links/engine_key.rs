@@ -15,12 +15,17 @@
 //!   CHALLENGE_CONTEXT          40 bytes  "workforce desk-boss uplink challenge v1\0"
 //!   nonce                      32 bytes  the hub's, fresh per connect
 //!   token_id                   16 bytes  the link token's id, as raw UUID bytes
+//!   hub length                  2 bytes  big-endian length of the next field
+//!   hub                        that many the boss hub as the engine fixed it
+//!                                        at link time ([`canonical_hub`]), UTF-8
 //!   engine_id                  the rest  the engine's id as registered, UTF-8
 //!   ```
 //!
-//!   Every field but the last has a fixed length, so the framing is
-//!   unambiguous. The context keeps a signature from meaning anything to
-//!   any other protocol the key might ever be used in.
+//!   Every field but the last has a fixed or stated length, so the framing
+//!   is unambiguous. The hub's name makes a proof one hub asked for useless
+//!   to any other, so a hub can't relay a challenge it was sent elsewhere.
+//!   The context keeps a signature from meaning anything to any other
+//!   protocol the key might ever be used in.
 //! - The hub checks it with [`verify_challenge`] against the key registered
 //!   at mint, and drops a link whose proof fails.
 //!
@@ -107,28 +112,63 @@ impl EnginePublicKey {
     }
 }
 
-/// The bytes an engine signs to prove the link `token_id` to a hub that
-/// sent `nonce`: see the module docs.
-pub fn challenge_message(nonce: &[u8; NONCE_LEN], token_id: Uuid, engine_id: &str) -> Vec<u8> {
-    let mut message =
-        Vec::with_capacity(CHALLENGE_CONTEXT.len() + NONCE_LEN + 16 + engine_id.len());
-    message.extend_from_slice(CHALLENGE_CONTEXT);
-    message.extend_from_slice(nonce);
-    message.extend_from_slice(token_id.as_bytes());
-    message.extend_from_slice(engine_id.as_bytes());
-    message
+/// The longest hub name a challenge carries.
+pub const HUB_MAX_LEN: usize = 255;
+
+/// One uplink challenge: the hub's nonce, for one link of one engine, to one
+/// hub.
+#[derive(Debug, Clone, Copy)]
+pub struct Challenge<'a> {
+    pub nonce: &'a [u8; NONCE_LEN],
+    pub token_id: Uuid,
+    /// The boss hub, as [`canonical_hub`] gives it.
+    pub hub: &'a str,
+    pub engine_id: &'a str,
 }
 
-/// Whether `signature` proves the link `token_id` of the engine `engine_id`
-/// to the hub that sent `nonce`, under the key registered at mint.
-pub fn verify_challenge(
-    key: &EnginePublicKey,
-    nonce: &[u8; NONCE_LEN],
-    token_id: Uuid,
-    engine_id: &str,
-    signature: &[u8],
-) -> bool {
-    key.verify(&challenge_message(nonce, token_id, engine_id), signature)
+/// The name a boss hub goes by in a challenge: its `https` origin, the host
+/// in lower case and the port only when it isn't 443, with no user, path,
+/// query or fragment. `None` for anything else, so a challenge can't be
+/// made for a hub without one.
+pub fn canonical_hub(url: &str) -> Option<String> {
+    let url = url::Url::parse(url.trim()).ok()?;
+    let plain = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.path(), "" | "/");
+    let host = url.host_str().filter(|_| plain)?.to_ascii_lowercase();
+    let name = match url.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    };
+    (name.len() <= HUB_MAX_LEN).then_some(name)
+}
+
+/// The bytes an engine signs to prove one link to the hub that sent the
+/// nonce: see the module docs. `None` when the hub's name is too long to
+/// frame.
+pub fn challenge_message(c: Challenge<'_>) -> Option<Vec<u8>> {
+    let hub_len = u16::try_from(c.hub.len())
+        .ok()
+        .filter(|n| usize::from(*n) <= HUB_MAX_LEN)?;
+    let mut message = Vec::with_capacity(
+        CHALLENGE_CONTEXT.len() + NONCE_LEN + 16 + 2 + c.hub.len() + c.engine_id.len(),
+    );
+    message.extend_from_slice(CHALLENGE_CONTEXT);
+    message.extend_from_slice(c.nonce);
+    message.extend_from_slice(c.token_id.as_bytes());
+    message.extend_from_slice(&hub_len.to_be_bytes());
+    message.extend_from_slice(c.hub.as_bytes());
+    message.extend_from_slice(c.engine_id.as_bytes());
+    Some(message)
+}
+
+/// Whether `signature` proves the challenge `c` under the key registered at
+/// mint.
+pub fn verify_challenge(key: &EnginePublicKey, c: Challenge<'_>, signature: &[u8]) -> bool {
+    challenge_message(c).is_some_and(|message| key.verify(&message, signature))
 }
 
 /// A fresh challenge nonce, from the system's random source.
@@ -207,15 +247,10 @@ impl EngineKey {
         out
     }
 
-    /// This engine's proof of the link `token_id` to the hub that sent
-    /// `nonce`.
-    pub fn sign_challenge(
-        &self,
-        nonce: &[u8; NONCE_LEN],
-        token_id: Uuid,
-        engine_id: &str,
-    ) -> [u8; SIGNATURE_LEN] {
-        self.sign(&challenge_message(nonce, token_id, engine_id))
+    /// This engine's proof of the challenge `c`, or `None` when it can't be
+    /// framed.
+    pub fn sign_challenge(&self, c: Challenge<'_>) -> Option<[u8; SIGNATURE_LEN]> {
+        challenge_message(c).map(|message| self.sign(&message))
     }
 }
 
@@ -309,19 +344,42 @@ mod tests {
 
     const VECTOR_TOKEN: &str = "6f1c2b0e-8d4a-4c3e-9b7f-2a1d5e8c9f00";
     const VECTOR_NONCE: [u8; NONCE_LEN] = [0xa5; NONCE_LEN];
+    const VECTOR_HUB: &str = "https://workforce.example.com";
 
     fn vector_seed() -> [u8; 32] {
         std::array::from_fn(|i| i as u8)
     }
 
+    fn challenge<'a>(
+        nonce: &'a [u8; NONCE_LEN],
+        token_id: Uuid,
+        hub: &'a str,
+        engine_id: &'a str,
+    ) -> Challenge<'a> {
+        Challenge {
+            nonce,
+            token_id,
+            hub,
+            engine_id,
+        }
+    }
+
+    fn vector() -> Challenge<'static> {
+        challenge(
+            &VECTOR_NONCE,
+            Uuid::parse_str(VECTOR_TOKEN).unwrap(),
+            VECTOR_HUB,
+            "devbox",
+        )
+    }
+
     /// The challenge framing, pinned: computed independently (Python's
     /// `cryptography`) from seed 00 01 … 1f, nonce a5 × 32, token
-    /// 6f1c2b0e-…-2a1d5e8c9f00 and engine `devbox`. RB5's uplink must
-    /// produce exactly these bytes.
+    /// 6f1c2b0e-…-2a1d5e8c9f00, hub `https://workforce.example.com` and
+    /// engine `devbox`. RB5's uplink must produce exactly these bytes.
     #[test]
     fn the_challenge_framing_is_pinned() {
-        let token = Uuid::parse_str(VECTOR_TOKEN).unwrap();
-        let message = challenge_message(&VECTOR_NONCE, token, "devbox");
+        let message = challenge_message(vector()).unwrap();
         assert_eq!(
             hex::encode(&message),
             concat!(
@@ -329,6 +387,8 @@ mod tests {
                 "656e676520763100",
                 "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
                 "6f1c2b0e8d4a4c3e9b7f2a1d5e8c9f00",
+                "001d",
+                "68747470733a2f2f776f726b666f7263652e6578616d706c652e636f6d",
                 "646576626f78"
             )
         );
@@ -337,94 +397,120 @@ mod tests {
             key.public_key().to_text(),
             concat!("ed25519:", "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg")
         );
-        let signature = key.sign_challenge(&VECTOR_NONCE, token, "devbox");
+        let signature = key.sign_challenge(vector()).unwrap();
         assert_eq!(
             hex::encode(signature),
             concat!(
-                "d8be0fe55a905c0c5d61490823bef41476f455e654461eb00a407c623e740484",
-                "a519d064097849526b15d5f8ce256d78b609b77f78711cfb38b8b3e2c85a1706"
+                "9f974d85444d83fe70ee7002c7f2287071b9eaea49f9a342fc788740c90cb78c",
+                "58837ccf0ec693c32f85fd43db93c9980a711169b61294668b4195877b620801"
             )
         );
         let registered = EnginePublicKey::parse(&key.public_key().to_text()).unwrap();
-        assert!(verify_challenge(
-            &registered,
-            &VECTOR_NONCE,
-            token,
-            "devbox",
-            &signature
-        ));
+        assert!(verify_challenge(&registered, vector(), &signature));
     }
 
     #[test]
-    fn a_proof_holds_only_for_its_own_nonce_token_engine_and_key() {
+    fn a_proof_holds_only_for_its_own_nonce_token_hub_engine_and_key() {
         let token = Uuid::parse_str(VECTOR_TOKEN).unwrap();
         let key = EngineKey::from_seed(&vector_seed()).unwrap();
         let public = key.public_key();
-        let good = key.sign_challenge(&VECTOR_NONCE, token, "devbox");
-        assert!(verify_challenge(
-            &public,
-            &VECTOR_NONCE,
-            token,
-            "devbox",
-            &good
-        ));
+        let good = key.sign_challenge(vector()).unwrap();
+        assert!(verify_challenge(&public, vector(), &good));
         let mut other_nonce = VECTOR_NONCE;
         other_nonce[0] ^= 1;
-        assert!(!verify_challenge(
-            &public,
-            &other_nonce,
-            token,
-            "devbox",
+        let refused = |c: Challenge<'_>, sig: &[u8]| !verify_challenge(&public, c, sig);
+        assert!(refused(
+            challenge(&other_nonce, token, VECTOR_HUB, "devbox"),
             &good
         ));
-        assert!(!verify_challenge(
-            &public,
-            &VECTOR_NONCE,
-            Uuid::new_v4(),
-            "devbox",
+        assert!(refused(
+            challenge(&VECTOR_NONCE, Uuid::new_v4(), VECTOR_HUB, "devbox"),
+            &good
+        ));
+        for hub in [
+            "https://workforce.example.org",
+            "https://workforce.example.co",
+            "https://workforce.example.com:8443",
+            "",
+        ] {
+            assert!(
+                refused(challenge(&VECTOR_NONCE, token, hub, "devbox"), &good),
+                "{hub}"
+            );
+        }
+        // The length prefix keeps the hub and engine fields apart.
+        assert!(refused(
+            challenge(
+                &VECTOR_NONCE,
+                token,
+                "https://workforce.example.comdevbox",
+                ""
+            ),
             &good
         ));
         for engine in ["devbox2", "devbo", "Devbox", ""] {
             assert!(
-                !verify_challenge(&public, &VECTOR_NONCE, token, engine, &good),
+                refused(challenge(&VECTOR_NONCE, token, VECTOR_HUB, engine), &good),
                 "{engine}"
             );
         }
         for bit in [0usize, 7, 255, 256, 511] {
             let mut flipped = good;
             flipped[bit / 8] ^= 1 << (bit % 8);
-            assert!(
-                !verify_challenge(&public, &VECTOR_NONCE, token, "devbox", &flipped),
-                "bit {bit}"
-            );
+            assert!(refused(vector(), &flipped), "bit {bit}");
         }
         for wrong_len in [&good[..63], &[][..], &[good.as_slice(), &[0]].concat()[..]] {
-            assert!(!verify_challenge(
-                &public,
-                &VECTOR_NONCE,
-                token,
-                "devbox",
-                wrong_len
-            ));
+            assert!(refused(vector(), wrong_len));
         }
         let (stranger, _) = EngineKey::generate().unwrap();
-        assert!(!verify_challenge(
-            &stranger.public_key(),
-            &VECTOR_NONCE,
-            token,
-            "devbox",
+        assert!(!verify_challenge(&stranger.public_key(), vector(), &good));
+        // A signature over the bare fields, without the context, is no proof.
+        let bare = key.sign(&challenge_message(vector()).unwrap()[CHALLENGE_CONTEXT.len()..]);
+        assert!(refused(vector(), &bare));
+        // A hub name too long to frame is never signed nor accepted.
+        let long = format!("https://{}.example.com", "a".repeat(300));
+        assert!(key
+            .sign_challenge(challenge(&VECTOR_NONCE, token, &long, "devbox"))
+            .is_none());
+        assert!(refused(
+            challenge(&VECTOR_NONCE, token, &long, "devbox"),
             &good
         ));
-        // A signature over the bare fields, without the context, is no proof.
-        let bare =
-            key.sign(&challenge_message(&VECTOR_NONCE, token, "devbox")[CHALLENGE_CONTEXT.len()..]);
-        assert!(!verify_challenge(
-            &public,
-            &VECTOR_NONCE,
-            token,
-            "devbox",
-            &bare
-        ));
+    }
+
+    #[test]
+    fn a_hub_is_named_by_its_https_origin_alone() {
+        for (url, want) in [
+            (
+                "https://workforce.example.com",
+                "https://workforce.example.com",
+            ),
+            (
+                "https://Workforce.Example.com/",
+                "https://workforce.example.com",
+            ),
+            (
+                "https://workforce.example.com:443/",
+                "https://workforce.example.com",
+            ),
+            (
+                "https://workforce.example.com:8443",
+                "https://workforce.example.com:8443",
+            ),
+        ] {
+            assert_eq!(canonical_hub(url).as_deref(), Some(want), "{url}");
+        }
+        for refused in [
+            "http://workforce.example.com",
+            "https://user@workforce.example.com",
+            "https://workforce.example.com/hub",
+            "https://workforce.example.com/?a=1",
+            "https://workforce.example.com/#x",
+            "workforce.example.com",
+            "",
+        ] {
+            assert_eq!(canonical_hub(refused), None, "{refused}");
+        }
     }
 
     #[test]
@@ -433,13 +519,11 @@ mod tests {
         let again = EngineKey::load(&stored).unwrap();
         assert_eq!(key.public_key(), again.public_key());
         let nonce = fresh_nonce().unwrap();
-        let token = Uuid::new_v4();
-        let proof = again.sign_challenge(&nonce, token, "mac");
+        let c = challenge(&nonce, Uuid::new_v4(), VECTOR_HUB, "mac");
+        let proof = again.sign_challenge(c).unwrap();
         assert!(verify_challenge(
             &EnginePublicKey::parse(&key.public_key().to_text()).unwrap(),
-            &nonce,
-            token,
-            "mac",
+            c,
             &proof
         ));
         assert_ne!(fresh_nonce().unwrap(), nonce);

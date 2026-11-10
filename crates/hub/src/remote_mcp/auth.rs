@@ -145,7 +145,8 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
 /// tokens at once, and a device paired again (a new pairing under the same
 /// id) never revives a token minted before it. A token found dead is
 /// revoked on the spot, so it leaves the listing and the cap too. Fails
-/// closed when it can't be told.
+/// closed when it can't be told: a store that can't answer is
+/// [`AuthError::Unavailable`], and revokes nothing.
 pub(crate) fn device_still_paired(
     state: &GatewayState,
     device: &str,
@@ -163,16 +164,28 @@ pub(crate) fn device_still_paired(
     let paired = found.as_ref().is_some_and(|d| {
         !d.revoked && d.expires_at.is_none_or(|at| at > now) && d.created_at <= token.created_at
     });
-    let holder = state
+    let store = state
         .identity_store
         .as_ref()
-        .and_then(|store| crate::device_link::identity_for_device(store.as_ref(), device));
+        .ok_or(AuthError::Unavailable)?;
+    let holder =
+        crate::device_link::try_identity_for_device(store.as_ref(), device).map_err(|e| {
+            warn!(error = %e, "device holder lookup for a device-minted token failed — failing closed");
+            AuthError::Unavailable
+        })?;
     if paired && holder.as_deref() == Some(token.identity_id.to_string().as_str()) {
         return Ok(());
     }
     if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
-        if let Err(e) = tokens.revoke_token(token.id, None, now) {
-            warn!(error = %e, token = %token.id, "a dead device token wasn't revoked");
+        match tokens.revoke_token(token.id, None, now) {
+            Ok(true) => crate::boss_links::audit_revoke(
+                state.telemetry_store.as_ref(),
+                "system",
+                token,
+                "device gone",
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, token = %token.id, "a dead device token wasn't revoked"),
         }
     }
     Err(AuthError::Unauthenticated)
@@ -466,6 +479,7 @@ mod tests {
             link_id: uuid::Uuid::new_v4(),
             agent_id: "allan".into(),
             group_key: "d/g".into(),
+            desk_group_key: "d/g".into(),
             group_name: "Acme".into(),
             engine_id: "devbox".into(),
             engine_name: "devbox".into(),

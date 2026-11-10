@@ -98,7 +98,7 @@ fn engine_id_ok(id: &str) -> bool {
 }
 
 struct Checked {
-    group_key: String,
+    desk_group_key: String,
     group_name: String,
     engine_id: String,
     engine_name: String,
@@ -122,7 +122,7 @@ fn check(req: &MintRequest) -> Result<Checked, LinkError> {
     ))?;
     let key = EnginePublicKey::parse(req.engine_public_key.trim()).map_err(LinkError::BadKey)?;
     Ok(Checked {
-        group_key: group_key.to_string(),
+        desk_group_key: group_key.to_string(),
         group_name: group_name.to_string(),
         engine_id: req.engine_id.clone(),
         engine_name: engine_name.to_string(),
@@ -141,6 +141,7 @@ fn store(state: &GatewayState) -> Result<&dyn RemoteMcpTokenStore, LinkError> {
 pub fn require_enabled(state: &GatewayState) -> Result<(), LinkError> {
     state
         .desk_boss
+        .get()
         .enabled
         .then_some(())
         .ok_or(LinkError::Disabled)
@@ -160,11 +161,20 @@ fn require_active(state: &GatewayState, person: Uuid) -> Result<(), LinkError> {
 /// Whether `person` holds [`Capability::DeskBoss`] outright under the live
 /// matrix, by their own role (a device acts for them here, not as a member).
 pub fn holds_desk_boss(state: &GatewayState, person: Uuid) -> bool {
-    crate::authz::holds_capability(
-        state.identity_store.as_ref(),
-        &person.to_string(),
-        Capability::DeskBoss,
-    )
+    holds_desk_boss_in(state, person, &crate::authz::capability_matrix())
+}
+
+/// [`holds_desk_boss`] under `matrix`.
+pub fn holds_desk_boss_in(
+    state: &GatewayState,
+    person: Uuid,
+    matrix: &crate::authz::CapabilityMatrix,
+) -> bool {
+    crate::cap_gate::resolve_principal(state.identity_store.as_ref(), &person.to_string())
+        .is_some_and(|p| {
+            crate::authz::authorize(&p, Capability::DeskBoss, matrix)
+                == crate::authz::Decision::Allow
+        })
 }
 
 /// The agent `agent_id` names, when `person` may use it and it accepts boss
@@ -243,6 +253,7 @@ pub fn mint(
     req: &MintRequest,
 ) -> Result<MintedLink, LinkError> {
     require_enabled(state)?;
+    let config = state.desk_boss.get();
     require_active(state, person)?;
     if !holds_desk_boss(state, person) {
         return Err(LinkError::NotAllowed);
@@ -251,14 +262,16 @@ pub fn mint(
     let checked = check(req)?;
     let store = store(state)?;
 
+    let group_key = super::group_key(person, device_id, &checked.desk_group_key);
     let _one = LINK_MINT.lock().unwrap_or_else(|e| e.into_inner());
     let now = Utc::now();
     let held = device_links(store, person, device_id, now)?;
     let is_this = |t: &RemoteMcpToken| {
         t.desk_link
             .as_ref()
-            .is_some_and(|l| same_link(l, &agent_id, &checked.group_key, &checked.engine_id))
+            .is_some_and(|l| same_link(l, &agent_id, &group_key, &checked.engine_id))
     };
+    let actor = person.to_string();
     let link_id = match req.renews {
         Some(old_id) => {
             let old = held
@@ -273,7 +286,9 @@ pub fn mint(
             for stale in held.iter().filter(|t| {
                 t.id != old_id && t.desk_link.as_ref().is_some_and(|l| l.link_id == link_id)
             }) {
-                store.revoke_token(stale.id, Some(person), now)?;
+                if store.revoke_token(stale.id, Some(person), now)? {
+                    super::audit_revoke(state.telemetry_store.as_ref(), &actor, stale, "renewed");
+                }
             }
             link_id
         }
@@ -281,7 +296,9 @@ pub fn mint(
             let mut left = Vec::new();
             for t in held {
                 if is_this(&t) {
-                    store.revoke_token(t.id, Some(person), now)?;
+                    if store.revoke_token(t.id, Some(person), now)? {
+                        super::audit_revoke(state.telemetry_store.as_ref(), &actor, &t, "replaced");
+                    }
                 } else {
                     left.push(t);
                 }
@@ -290,7 +307,7 @@ pub fn mint(
                 .iter()
                 .filter_map(|t| t.desk_link.as_ref().map(|l| l.link_id))
                 .collect();
-            let cap = state.desk_boss.link_cap();
+            let cap = config.link_cap();
             if links.len() >= cap {
                 return Err(LinkError::LinkCap(cap));
             }
@@ -301,7 +318,8 @@ pub fn mint(
     let link = DeskLink {
         link_id,
         agent_id: agent_id.clone(),
-        group_key: checked.group_key,
+        group_key,
+        desk_group_key: checked.desk_group_key,
         group_name: checked.group_name,
         engine_id: checked.engine_id,
         engine_name: checked.engine_name,
@@ -318,20 +336,22 @@ pub fn mint(
             format!("{DEVICE_SCOPE_PREFIX}{device_id}"),
         ],
         created_at: now,
-        expires_at: now + Duration::days(i64::from(state.desk_boss.ttl_days())),
+        expires_at: now + Duration::days(i64::from(config.ttl_days())),
         last_used_at: None,
         revoked_at: None,
         desk_link: Some(link.clone()),
     };
     store.create_token(&record)?;
-    audit(
-        state,
-        person,
+    super::audit(
+        state.telemetry_store.as_ref(),
+        &actor,
         "desk_boss.mint",
         &record,
-        &link,
-        device_id,
-        req.renews.is_some(),
+        if req.renews.is_some() {
+            "renewal"
+        } else {
+            "new"
+        },
     );
     Ok(MintedLink {
         plaintext: minted.plaintext,
@@ -371,62 +391,12 @@ pub fn revoke(
     };
     let revoked = store.revoke_token(id, Some(person), now)?;
     if revoked {
-        if let Some(link) = &token.desk_link {
-            audit(
-                state,
-                person,
-                "desk_boss.revoke",
-                &token,
-                link,
-                device_id,
-                false,
-            );
-        }
+        super::audit_revoke(
+            state.telemetry_store.as_ref(),
+            &person.to_string(),
+            &token,
+            "device",
+        );
     }
     Ok(revoked)
-}
-
-/// One audit line and one `audit_log` row: who, which link, which device.
-/// Never the token, nor any part of it.
-fn audit(
-    state: &GatewayState,
-    person: Uuid,
-    action: &str,
-    token: &RemoteMcpToken,
-    link: &DeskLink,
-    device_id: &str,
-    renewal: bool,
-) {
-    tracing::info!(
-        target: "sentinel.audit",
-        identity_id = %person,
-        token_id = %token.id,
-        link_id = %link.link_id,
-        agent = %link.agent_id,
-        engine = %link.engine_id,
-        device = %device_id,
-        renewal,
-        expires_at = %token.expires_at,
-        "{action}"
-    );
-    if let Some(telemetry) = &state.telemetry_store {
-        let detail = serde_json::json!({
-            "token_id": token.id,
-            "agent_id": link.agent_id,
-            "group": link.group_name,
-            "engine": link.engine_name,
-            "device_id": device_id,
-            "renewal": renewal,
-        })
-        .to_string();
-        if let Err(e) = telemetry.record_audit(
-            &person.to_string(),
-            action,
-            &format!("desk_boss_link:{}", link.link_id),
-            Some(&detail),
-            workforce_common::admin::AuditOutcome::Success,
-        ) {
-            tracing::warn!(error = %e, "a Desk boss link's audit row wasn't written");
-        }
-    }
 }

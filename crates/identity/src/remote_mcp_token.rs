@@ -98,15 +98,21 @@ impl TokenScope {
 
 /// What one Desk boss link token binds, beside its person and device: the
 /// agent here that bosses, the Desk group, and the engine (one running Desk
-/// backend) whose uplink carries it. `group_key`, `group_name` and the
+/// backend) whose uplink carries it. `desk_group_key`, `group_name` and the
 /// engine's names are what the minting Desk says; the hub keeps them for
-/// fan-out and display and never trusts them for authority.
+/// display and never trusts them for authority. `group_key` is the hub's
+/// own, derived from the person, the device and `desk_group_key`, so two
+/// people's or two Desks' groups can never share one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeskLink {
     /// Stays the same across a renewal, so the link keeps its identity.
     pub link_id: Uuid,
     pub agent_id: String,
+    /// The hub's key for the group: see the type's docs.
     pub group_key: String,
+    /// The group's key as the minting Desk named it.
+    #[serde(default)]
+    pub desk_group_key: String,
     pub group_name: String,
     pub engine_id: String,
     pub engine_name: String,
@@ -335,6 +341,7 @@ mod tests {
             link_id: Uuid::new_v4(),
             agent_id: "allan".into(),
             group_key: "d-1/g-acme".into(),
+            desk_group_key: "d-1/g-acme".into(),
             group_name: "Acme".into(),
             engine_id: "devbox".into(),
             engine_name: "devbox".into(),

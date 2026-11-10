@@ -1,6 +1,11 @@
 //! Whether a presented boss link token is live, checked in full on every
 //! connect and frame: what the uplink (RB5) asks before it trusts a link,
 //! and the one place a `wfb_` token is ever looked up.
+//!
+//! **For RB5:** every link an uplink carries is proved by presenting that
+//! link's own plaintext token here, then its engine key's signature over
+//! this hub's challenge ([`LiveLink::proves`]). A link is never accepted by
+//! its id alone, nor by a lookup that skips this function.
 
 use chrono::Utc;
 use tracing::warn;
@@ -10,7 +15,7 @@ use workforce_identity::remote_mcp_token::{
 };
 use workforce_identity::types::{Identity, IdentityStatus};
 
-use super::engine_key::{self, EnginePublicKey, NONCE_LEN};
+use super::engine_key::{self, Challenge, EnginePublicKey, NONCE_LEN};
 use super::links::{self, LinkError};
 use crate::gateway::GatewayState;
 
@@ -20,7 +25,7 @@ pub struct LiveLink {
     pub link: DeskLink,
     pub person: Identity,
     pub device_id: String,
-    /// The bossing agent's canonical id.
+    /// The bossing agent's id, exactly as it was linked.
     pub agent_id: String,
     pub engine_key: EnginePublicKey,
 }
@@ -36,14 +41,18 @@ impl std::fmt::Debug for LiveLink {
 }
 
 impl LiveLink {
-    /// Whether `signature` proves this link's engine key over the hub's
-    /// challenge `nonce` ([`engine_key::verify_challenge`]).
-    pub fn proves(&self, nonce: &[u8; NONCE_LEN], signature: &[u8]) -> bool {
+    /// Whether `signature` proves this link's engine key over the challenge
+    /// `nonce` this hub sent, as the hub `hub` ([`engine_key::canonical_hub`]
+    /// of its own public URL: see [`this_hub`]).
+    pub fn proves(&self, hub: &str, nonce: &[u8; NONCE_LEN], signature: &[u8]) -> bool {
         engine_key::verify_challenge(
             &self.engine_key,
-            nonce,
-            self.token.id,
-            &self.link.engine_id,
+            Challenge {
+                nonce,
+                token_id: self.token.id,
+                hub,
+                engine_id: &self.link.engine_id,
+            },
             signature,
         )
     }
@@ -69,13 +78,31 @@ pub enum LinkRefusal {
     Unavailable,
 }
 
+/// The name this hub goes by in a challenge: its `[hub] public_url` as
+/// [`engine_key::canonical_hub`] gives it. `None` when it has none, and then
+/// no link can be proved here.
+pub fn this_hub(state: &GatewayState) -> Option<String> {
+    let service = state.registry.default_agent()?;
+    engine_key::canonical_hub(service.config.hub.public_url.as_deref()?)
+}
+
 /// The live link `presented` is, checked in full: a `wfb_` token this hub
 /// minted, unrevoked and unexpired, of exactly the `desk_boss` kind with
 /// its link; its minting device still paired to its person, as the same
 /// pairing; the person active; `[desk_boss] enabled`; the person still
 /// holding the capability; the agent still theirs to use and still
-/// accepting; the registered engine key readable. Fails closed.
+/// accepting, under exactly the id it was linked to; the registered engine
+/// key readable. Fails closed.
 pub fn authenticate_link(state: &GatewayState, presented: &str) -> Result<LiveLink, LinkRefusal> {
+    authenticate_link_in(state, presented, &crate::authz::capability_matrix())
+}
+
+/// [`authenticate_link`] under the capability matrix `matrix`.
+pub fn authenticate_link_in(
+    state: &GatewayState,
+    presented: &str,
+    matrix: &crate::authz::CapabilityMatrix,
+) -> Result<LiveLink, LinkRefusal> {
     if !presented.starts_with(DESK_BOSS_TOKEN_PREFIX) {
         return Err(LinkRefusal::Unauthenticated);
     }
@@ -115,11 +142,14 @@ pub fn authenticate_link(state: &GatewayState, presented: &str) -> Result<LiveLi
         return Err(LinkRefusal::NotActive);
     }
     links::require_enabled(state).map_err(|_| LinkRefusal::Disabled)?;
-    if !links::holds_desk_boss(state, person.id) {
+    if !links::holds_desk_boss_in(state, person.id, matrix) {
         return Err(LinkRefusal::NotAllowed);
     }
+    // The agent it was linked to, by exactly that id: never another that
+    // now answers to it in another case.
     let agent_id = match links::boss_agent(state, person.id, &link.agent_id) {
-        Ok(id) => id,
+        Ok(id) if id == link.agent_id => id,
+        Ok(_) => return Err(LinkRefusal::AgentGone),
         Err(LinkError::AgentDeclines) => return Err(LinkRefusal::AgentDeclines),
         Err(_) => return Err(LinkRefusal::AgentGone),
     };
