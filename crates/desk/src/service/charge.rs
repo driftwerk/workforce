@@ -41,7 +41,7 @@ pub(crate) struct Charges {
     /// The repositories each boss acting fully may ship in, by agent id:
     /// only those whose Act fully is in force (named repositories, a
     /// budget not yet spent), as the hub says.
-    full: HashMap<String, Vec<String>>,
+    full: HashMap<String, charge::FullGrant>,
     /// Every agent's own settings files (its `config.toml` and the like),
     /// as the hub says: withheld from what a boss answers for, as Desk's
     /// data is, so no boss allows a change to its own limits.
@@ -145,12 +145,12 @@ impl Desk {
     /// The repositories each boss acting fully may ship in, by its agent
     /// id, as the hub reads their settings and spend: a boss left out
     /// doesn't act fully anywhere.
-    pub fn set_full_repos(&self, full: HashMap<String, Vec<String>>) {
+    pub fn set_full(&self, full: HashMap<String, charge::FullGrant>) {
         self.0.state.lock().charges.full = full;
     }
 
-    /// The repositories `boss` acts fully in now; none when it doesn't.
-    fn full_repos(&self, boss: &str) -> Vec<String> {
+    /// Where `boss` acts fully now; nowhere when it doesn't.
+    fn full_of(&self, boss: &str) -> charge::FullGrant {
         self.0
             .state
             .lock()
@@ -159,6 +159,11 @@ impl Desk {
             .get(boss)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The repositories `boss` acts fully in now; none when it doesn't.
+    fn full_repos(&self, boss: &str) -> Vec<String> {
+        self.full_of(boss).repos
     }
 
     /// Whether `boss` acts fully in the repository session `id` works in:
@@ -328,7 +333,9 @@ impl Desk {
                     &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
                 )
                 .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
-                let named = self.full_repos(boss);
+                let grant = self.full_of(boss);
+                let named = grant.repos;
+                facts.workflows = grant.workflows;
                 if let Some(repo) = repo_of_own(&facts.own) {
                     facts.follow_tags = repo.follow_tags;
                     facts.hooks = repo.hooks;
@@ -347,23 +354,7 @@ impl Desk {
                 }
             }
         }
-        // What ships through a script is read first, as the default branch
-        // has it.
-        let reader = crate::computer::scripts::Reader {
-            top: crate::computer::boss::resolve_real(&facts.own).unwrap_or_default(),
-            default_branch: facts.default_branch.clone(),
-            home: bounds.home.clone(),
-        };
-        let scripts = |s: &crate::computer::boss::Script| match facts.ships {
-            true => reader.read(s),
-            false => crate::computer::boss::no_scripts(s),
-        };
-        charge::answerable(
-            &facts,
-            &bounds,
-            &crate::computer::boss::resolve_real,
-            &scripts,
-        )
+        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a

@@ -14,14 +14,19 @@
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
-//! full = { repos = ["acme/acme-web", "~/dev/globex-api"], budget_usd_per_day = 25 }
+//! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
 //!
 //! `full` is **Act fully**: everything `act` does, and, in the repositories
-//! `[oversight.full] repos` names (`owner/name`, a remote's URL, or a local
-//! checkout's path), answering and allowing what merges, pushes to the
-//! default branch, tags, promotes to staging or deploys, in the sessions it
-//! runs and, with `answer_sessions`, in the others too. It needs both named
+//! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
+//! remote's URL, or a local checkout's path), answering and allowing, in
+//! the sessions it runs and, with `answer_sessions`, in the others too:
+//! merging a pull request by its number, pushing the default branch to
+//! `origin`, creating and pushing one tag, `gh release create <tag>`, and
+//! `gh workflow run` of a workflow `workflows` lists (by its file name
+//! exactly) on the default branch, with no inputs. Deploys run through
+//! those workflows: deploy tools and the project's own release, deploy and
+//! promote scripts stay the person's. It needs both named
 //! repositories and `budget_usd_per_day`, and holds only while today's
 //! spend is under that budget; short of any of it, it acts as `act` and
 //! says why ([`Oversight::fully`]). What no overseer does at any level, Act
@@ -171,6 +176,9 @@ pub struct Full {
     pub repos: Vec<String>,
     /// What it may spend in a day, in cents; `None` until said.
     pub budget_cents_per_day: Option<u64>,
+    /// The GitHub workflows it may run (`gh workflow run`), by their file
+    /// names exactly (`deploy.yml`); none, it runs none.
+    pub workflows: Vec<String>,
 }
 
 impl Full {
@@ -185,6 +193,8 @@ pub const FULL_NO_REPOS: &str =
     "Act fully needs at least one repository named, so it acts within Desk for now.";
 /// Why Act fully isn't in force though chosen: no daily budget.
 pub const FULL_NO_BUDGET: &str = "Act fully needs a daily budget, so it acts within Desk for now.";
+/// The most workflows Act fully may name.
+pub const MAX_FULL_WORKFLOWS: usize = 20;
 /// The most repositories Act fully may name.
 pub const MAX_FULL_REPOS: usize = 50;
 /// The largest daily budget Act fully may have, in dollars.
@@ -404,6 +414,35 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
         }
         Some(_) => return Err(repos_wrong()),
     };
+    let workflows_wrong = || {
+        format!(
+            "The workflows it may run must be a list of up to {MAX_FULL_WORKFLOWS} file names like deploy.yml."
+        )
+    };
+    let workflows = match t.and_then(|t| t.get("workflows")) {
+        None => Vec::new(),
+        Some(Value::Array(items)) if items.len() <= MAX_FULL_WORKFLOWS => {
+            let mut out: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(w)
+                        if (w.ends_with(".yml") || w.ends_with(".yaml"))
+                            && w.len() <= 200
+                            && w.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                            }) =>
+                    {
+                        if !out.contains(w) {
+                            out.push(w.clone());
+                        }
+                    }
+                    _ => return Err(workflows_wrong()),
+                }
+            }
+            out
+        }
+        Some(_) => return Err(workflows_wrong()),
+    };
     let budget_wrong = || {
         format!(
             "Its daily budget must be an amount in dollars above 0 and up to {MAX_FULL_BUDGET_USD}."
@@ -425,6 +464,7 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
     Ok(Full {
         repos,
         budget_cents_per_day,
+        workflows,
     })
 }
 
@@ -807,6 +847,25 @@ mod tests {
             "How much the overseer does on its own must be watch, suggest, act or full."
         );
         assert_eq!(serde_json::to_value(Level::Full).unwrap(), "full");
+        let listed = parse(
+            "[oversight.full]\nworkflows = [\"deploy.yml\", \"promote.yaml\", \"deploy.yml\"]\n",
+        )
+        .unwrap();
+        assert_eq!(listed.full.workflows, vec!["deploy.yml", "promote.yaml"]);
+        assert!(parse("").unwrap().full.workflows.is_empty());
+        for bad in [
+            "\"deploy\"",
+            "\".github/workflows/deploy.yml\"",
+            "3",
+            "\"a b.yml\"",
+        ] {
+            assert!(
+                parse(&format!("[oversight.full]\nworkflows = [{bad}]\n"))
+                    .unwrap_err()
+                    .starts_with("The workflows it may run"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -533,11 +533,17 @@ impl CrewHub {
                 .flat_map(|s| crate::desk_computer::own_config(&s.workspace))
                 .collect(),
         );
-        self.desk.set_full_repos(
+        self.desk.set_full(
             list.iter()
                 .filter_map(|(s, o)| {
                     let full = self.fully(s.agent_id.as_str(), o).ok()?;
-                    Some((s.agent_id.as_str().to_string(), full.repos.clone()))
+                    Some((
+                        s.agent_id.as_str().to_string(),
+                        workforce_desk::charge::FullGrant {
+                            repos: full.repos.clone(),
+                            workflows: full.workflows.clone(),
+                        },
+                    ))
                 })
                 .collect(),
         );

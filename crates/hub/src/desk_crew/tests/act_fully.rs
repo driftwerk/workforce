@@ -9,7 +9,7 @@ use super::*;
 use workforce_common::oversight::{Level, Oversight, FULL_NO_BUDGET, FULL_NO_REPOS};
 
 const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
-                    [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 25\n";
+                    [oversight.full]\nrepos = [\"acme/acme-web\"]\nworkflows = [\"deploy.yml\", \"promote.yml\"]\nbudget_usd_per_day = 25\n";
 
 fn git(dir: &Path, args: &[&str]) {
     // Hub-side git is hardened, a test's too.
@@ -125,9 +125,10 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
             "gh pr merge 42 --squash",
             "git tag -a v1.2.0 -m 'Date picker'",
             "git push origin v1.2.0",
-            "gh workflow run promote-staging.yml",
+            "gh workflow run promote.yml",
+            "gh release create v1.2.0 --notes 'Date picker'",
             "git push origin HEAD:main",
-            "npm run deploy",
+            "gh workflow run deploy.yml --ref main",
         ] {
             let asked = ask(&url, command);
             let a = pending(s.id, command).await;
@@ -150,7 +151,12 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         // The hard limits stay the person's, Act fully or not.
         for (command, why) in [
             ("cargo publish -p acme-core", "package registry"),
-            ("npm run release", "package registry"),
+            ("npm run deploy", "named workflow"),
+            ("npm run release", "named workflow"),
+            ("kubectl apply -f k8s/", "named workflow"),
+            ("gh workflow run cleanup.yml", "hasn't listed"),
+            ("gh workflow run deploy.yml --ref feat/x", "another branch"),
+            ("gh workflow run deploy.yml -f env=prod", "inputs"),
             ("source ~/.aws-creds && aws s3 ls", "secrets"),
             ("git push --force origin main", "can't be undone"),
             ("gh release delete v1.1.0 --yes", "on the remote"),

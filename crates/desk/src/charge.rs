@@ -236,6 +236,15 @@ pub fn wheel(
 
 // ── Where a boss acts fully ─────────────────────────────────────────────
 
+/// Where a boss acting fully may ship, as its `[oversight.full]` says:
+/// the repositories named, and the workflows it may run there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullGrant {
+    pub repos: Vec<String>,
+    /// Workflow file names, matched exactly (`deploy.yml`).
+    pub workflows: Vec<String>,
+}
+
 /// A repository as a remote's address names it: its host, when said, and
 /// its `owner/name`, lowercased, without `.git`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +434,8 @@ pub struct Facts {
     pub follow_tags: bool,
     /// The repository has git hooks.
     pub hooks: bool,
+    /// The workflows the boss may run where it acts fully, by file name.
+    pub workflows: Vec<String>,
     pub what: What,
 }
 
@@ -527,6 +538,7 @@ pub fn facts_of(
         ships_gh: false,
         follow_tags: false,
         hooks: false,
+        workflows: Vec::new(),
         what,
     }
 }
@@ -607,7 +619,6 @@ pub fn answerable(
     facts: &Facts,
     bounds: &Bounds,
     real: &dyn Fn(&Path) -> Option<PathBuf>,
-    scripts: &dyn Fn(&boss::Script) -> Result<Vec<String>, String>,
 ) -> Result<(), Irreversible> {
     let no = |why: String| Err(Irreversible(why));
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
@@ -639,7 +650,7 @@ pub fn answerable(
                 ships_gh: facts.ships_gh,
                 follow_tags: facts.follow_tags,
                 hooks: facts.hooks,
-                scripts,
+                workflows: &facts.workflows,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
@@ -1098,8 +1109,7 @@ mod tests {
         let mut facts = facts_of(engine, p, s, Path::new("/Users/sam"), moved);
         facts.branch = Some("feat/date-picker".into());
         facts.default_branch = Some("main".into());
-        answerable(&facts, &bounds(), &real, &crate::computer::boss::no_scripts)
-            .map_err(|e| e.to_string())
+        answerable(&facts, &bounds(), &real).map_err(|e| e.to_string())
     }
 
     fn judged(engine: Engine, p: &PendingApproval, s: &SessionView) -> Result<(), String> {
