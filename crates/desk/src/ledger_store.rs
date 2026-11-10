@@ -202,7 +202,7 @@ impl DeskStore {
                SUM(input)::int8, SUM(output)::int8, SUM(cache_read)::int8, \
                SUM(cache_write)::int8, SUM(reasoning)::int8, \
                COALESCE(SUM(usd), 0)::float8, COUNT(*)::int8, \
-               (COUNT(*) FILTER (WHERE usd IS NULL))::int8, group_id \
+               (COUNT(*) FILTER (WHERE usd IS NULL OR priced = 'estimated'))::int8, group_id \
              FROM ledger WHERE at >= $1 AND at < $2 \
                AND ($4::text IS NULL OR engine = $4) \
                AND ($5::text IS NULL OR account = $5) \

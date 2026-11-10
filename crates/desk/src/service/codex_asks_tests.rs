@@ -291,10 +291,16 @@ async fn fast_mode_starts_codex_on_the_priority_tier_and_stays_on() {
         until(|| std::fs::read_to_string(&args).is_ok_and(|a| a.ends_with('\n'))).await;
         let args = std::fs::read_to_string(&args).unwrap();
         assert!(args.contains("-c service_tier=\"priority\""), "{args}");
-        assert!(
-            store.get(s.id).await.unwrap().unwrap().fast,
-            "kept, for its resume"
-        );
+        // The row is written as the session starts: wait for it.
+        let mut kept = false;
+        for _ in 0..100 {
+            if store.get(s.id).await.unwrap().is_some_and(|r| r.fast) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(kept, "kept, for its resume");
     })
     .await;
 }
@@ -370,6 +376,35 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let v = d.view(s.id).unwrap();
         assert_eq!((v.state, v.pending), (SessionState::Working, None));
+    })
+    .await;
+}
+
+/// A Codex session an agent starts (by a plan, a handoff or the crew) runs
+/// in Fast mode when the agent does; the person and Desk choose per session.
+#[tokio::test]
+async fn an_agents_codex_sessions_run_as_fast_as_the_agent() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let boss = crate::crew::Party::manager("boss-1", "Boss");
+        assert!(!d.fast_for(Engine::Codex, &boss), "until the hub says");
+        d.agent_fast_with(Arc::new(|agent: &str| agent == "boss-1"));
+        assert!(d.fast_for(Engine::Codex, &boss));
+        assert!(!d.fast_for(Engine::Claude, &boss), "Codex alone");
+        assert!(!d.fast_for(
+            Engine::Codex,
+            &crate::crew::Party::manager("boss-2", "Other")
+        ));
+        assert!(!d.fast_for(Engine::Codex, &crate::crew::Party::you()));
     })
     .await;
 }

@@ -110,9 +110,20 @@ pub enum UnsupportedModel {
     Unknown(String),
 }
 
-/// The listed models of the live catalogue, as last read; empty until the
-/// hub reads it.
-static LEARNED: std::sync::RwLock<Vec<ChatGptModel>> = std::sync::RwLock::new(Vec::new());
+/// The listed models of each login's live catalogue, as last read, by the
+/// login's fingerprint (never its secret): plans differ, and one person's
+/// list never decides what another's calls may name.
+static LEARNED: std::sync::RwLock<BTreeMap<String, Vec<ChatGptModel>>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+fn learned_of(login: &str) -> Vec<ChatGptModel> {
+    LEARNED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(login)
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// `name` as a `&'static str`: a built-in id, or one leaked once per new
 /// name. The catalogue lists a handful of models, so this stays small.
@@ -178,24 +189,26 @@ impl ChatGptModel {
         self.fast
     }
 
-    /// The model for `name`: one the live catalogue lists, else a built-in
-    /// one.
+    /// The model for `name` on the login `login` names: one its live
+    /// catalogue lists, else a built-in one.
+    pub fn parse_for(login: &str, name: &str) -> Result<Self, UnsupportedModel> {
+        match learned_of(login).into_iter().find(|m| m.id == name) {
+            Some(model) => Ok(model),
+            None => Self::parse_built_in(name),
+        }
+    }
+
+    /// The model for `name` as any login's catalogue or the built-in list
+    /// knows it: only for a config check's warning, which runs for no one
+    /// in particular. A call names its login ([`Self::parse_for`]).
     pub fn parse(name: &str) -> Result<Self, UnsupportedModel> {
         let learned = LEARNED
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        learned
-            .iter()
-            .chain(Self::ALL)
-            .copied()
-            .find(|m| m.id == name)
-            .ok_or_else(|| {
-                if RETIRED_MODELS.contains(&name) {
-                    UnsupportedModel::Retired(name.to_string())
-                } else {
-                    UnsupportedModel::Unknown(name.to_string())
-                }
-            })
+        match learned.values().flatten().find(|m| m.id == name) {
+            Some(model) => Ok(*model),
+            None => Self::parse_built_in(name),
+        }
     }
 
     /// The built-in model for `name`, whatever the live catalogue says: what
@@ -215,13 +228,10 @@ impl ChatGptModel {
             })
     }
 
-    /// Every model a call may name: the live catalogue's in its order, then
-    /// the built-in ones it doesn't list.
-    pub fn known() -> Vec<Self> {
-        let learned = LEARNED
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+    /// Every model a call on `login` may name: its live catalogue's in its
+    /// order, then the built-in ones it doesn't list.
+    pub fn known_for(login: &str) -> Vec<Self> {
+        let learned = learned_of(login);
         let built_in = Self::ALL
             .iter()
             .copied()
@@ -229,17 +239,15 @@ impl ChatGptModel {
         learned.iter().copied().chain(built_in).collect()
     }
 
-    /// Whether the live catalogue has been read since the hub started.
-    pub fn learned() -> bool {
-        !LEARNED
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+    /// Whether `login`'s live catalogue has been read since the hub started.
+    pub fn learned_for(login: &str) -> bool {
+        !learned_of(login).is_empty()
     }
 
-    /// Take the listed models of `catalog` (the backend's live list) as
-    /// the ones the backend serves, with their context windows and tiers.
-    pub fn learn(catalog: &[CatalogModel]) {
+    /// Take the listed models of `catalog` (the backend's live list for the
+    /// login `login` names) as the ones it serves that login, with their
+    /// context windows and tiers.
+    pub fn learn(login: &str, catalog: &[CatalogModel]) {
         let listed: Vec<Self> = catalog
             .iter()
             .filter(|m| m.listed())
@@ -252,18 +260,10 @@ impl ChatGptModel {
         if listed.is_empty() {
             return;
         }
-        *LEARNED
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = listed;
-    }
-
-    /// Forget the live catalogue (tests that learn one).
-    #[doc(hidden)]
-    pub fn forget() {
         LEARNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .insert(login.to_string(), listed);
     }
 }
 
@@ -1569,15 +1569,20 @@ mod tests {
                 description: "1.5x speed".into(),
             }],
         }];
-        assert!(ChatGptModel::parse("gpt-test-learned").is_err());
-        ChatGptModel::learn(&catalog);
-        let learned = ChatGptModel::parse("gpt-test-learned").expect("learned");
+        assert!(ChatGptModel::parse_for("acct-a", "gpt-test-learned").is_err());
+        ChatGptModel::learn("acct-a", &catalog);
+        let learned = ChatGptModel::parse_for("acct-a", "gpt-test-learned").expect("learned");
+        assert!(
+            ChatGptModel::parse_for("acct-b", "gpt-test-learned").is_err(),
+            "another login's list is its own"
+        );
+        assert!(!ChatGptModel::learned_for("acct-b"));
         assert_eq!(learned.id(), "gpt-test-learned");
         assert_eq!(learned.context_window(), 400_000);
         assert!(learned.fast());
-        assert!(ChatGptModel::known().contains(&learned));
+        assert!(ChatGptModel::known_for("acct-a").contains(&learned));
         assert!(
-            ChatGptModel::known().contains(&ChatGptModel::GPT_6_LUNA),
+            ChatGptModel::known_for("acct-a").contains(&ChatGptModel::GPT_6_LUNA),
             "a built-in model the catalogue doesn't list stays callable"
         );
         assert_eq!(
@@ -1585,8 +1590,8 @@ mod tests {
             Ok(ChatGptModel::GPT_6_1_SOL)
         );
         // A catalogue with nothing listed keeps what was learned.
-        ChatGptModel::learn(&[]);
-        assert!(ChatGptModel::parse("gpt-test-learned").is_ok());
+        ChatGptModel::learn("acct-a", &[]);
+        assert!(ChatGptModel::parse_for("acct-a", "gpt-test-learned").is_ok());
     }
 
     #[tokio::test]

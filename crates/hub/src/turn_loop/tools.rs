@@ -244,11 +244,14 @@ async fn session_registry(
     }
     let registry = workforce_agent::tools::registry::ToolRegistry::follow(&service.tools, |_| true);
     if let Some((node, original_exec)) = selected.zip(service.tools.get("exec.run")) {
-        registry.register(Arc::new(crate::local_agent_tool::LocalAgentExecTool::new(
-            Arc::clone(agents),
-            node.to_string(),
-            original_exec,
-        )));
+        registry.register(crate::sessions_only::SessionsOnly::wrap(
+            Arc::new(crate::local_agent_tool::LocalAgentExecTool::new(
+                Arc::clone(agents),
+                node.to_string(),
+                original_exec,
+            )),
+            &crate::sessions_only::bounds_of(service),
+        ));
     }
     for offered in node_tools {
         registry.register(Arc::new(crate::local_agent_tool::NodeTool::new(

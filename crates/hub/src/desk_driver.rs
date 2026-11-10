@@ -818,6 +818,15 @@ pub async fn mount(
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
     desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
+    // The Codex sessions an agent starts run as fast as it does.
+    desk.agent_fast_with({
+        let registry = Arc::clone(&state.registry);
+        Arc::new(move |agent: &str| {
+            registry
+                .get(agent)
+                .is_some_and(|service| service.resolved.snapshot().fast)
+        })
+    });
     for service in state.registry.all_services() {
         register_tools(&service);
     }
@@ -1609,6 +1618,7 @@ mod tests {
             ))
             .unwrap();
             workforce_agent::llm::responses::ChatGptModel::learn(
+                "desk-login",
                 &workforce_agent::llm::responses::parse_catalog(&body),
             );
             for (provider, model, effort) in [

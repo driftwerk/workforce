@@ -146,15 +146,17 @@ impl LedgerRun {
         let billing = spend.billing.unwrap_or(billing);
         let mut spend = spend;
         if spend.usd.is_none() {
-            spend.usd = spend.model.as_deref().and_then(|model| {
-                self.pricer
-                    .as_ref()?
-                    .usd(engine, billing, model, &spend.tokens)
-            });
-            spend.priced = match spend.usd {
-                Some(_) => Priced::Priced,
-                None => Priced::None,
-            };
+            let priced =
+                spend.model.as_deref().zip(self.pricer.as_ref()).map(
+                    |(model, pricer)| match pricer.usd(engine, billing, model, &spend.tokens) {
+                        Some(usd) => (Some(usd), Priced::Priced),
+                        None => match pricer.estimate(engine, billing, model, &spend.tokens) {
+                            Some(usd) => (Some(usd), Priced::Estimated),
+                            None => (None, Priced::None),
+                        },
+                    },
+                );
+            (spend.usd, spend.priced) = priced.unwrap_or((None, Priced::None));
         }
         Kept {
             spend,

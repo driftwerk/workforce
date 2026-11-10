@@ -130,6 +130,9 @@ pub enum RestorePolicy {
     Off,
 }
 
+/// Whether the agent with this id runs in Fast mode (`[llm] fast`).
+pub type AgentFast = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Each engine's program, as a path or a name looked up on `PATH`. An
@@ -873,6 +876,9 @@ struct Inner {
     /// Where a boss's answers for its sessions are judged; none until the
     /// hub says, and until then no boss answers a request.
     boss_bounds: Mutex<Option<crate::charge::Bounds>>,
+    /// Whether an agent runs in Fast mode (its `[llm] fast`), by its id:
+    /// the Codex sessions it starts do too. None until the hub says.
+    agent_fast: Mutex<Option<AgentFast>>,
     /// Whose scope each row is: members' groups and the bosses there are.
     /// Nothing is held under it, so events are stamped wherever noted.
     scopes: Mutex<scopes::Scopes>,
@@ -1528,6 +1534,7 @@ impl Desk {
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
+            agent_fast: Mutex::new(None),
             scopes: Mutex::default(),
             group_spend: Mutex::default(),
             group_counted: Arc::new(tokio::sync::Notify::new()),
@@ -2691,6 +2698,30 @@ impl Desk {
     /// session before it starts, so a start cut off between the two starts
     /// that same session, and never another. An `id` Desk already has is
     /// refused: it started.
+    /// Say whether an agent runs in Fast mode, by its id: a Codex session it
+    /// starts (by a plan, a handoff or the crew) runs in Fast mode then too.
+    pub fn agent_fast_with(&self, fast: AgentFast) {
+        *self.0.agent_fast.lock() = Some(fast);
+    }
+
+    /// Whether a Codex session `party` starts runs in Fast mode: an agent's
+    /// own `[llm] fast`; never for the person or Desk, who choose it per
+    /// session.
+    pub(crate) fn fast_for(&self, engine: Engine, party: &crew::Party) -> bool {
+        let agent = matches!(
+            party.kind,
+            crew::PartyKind::Agent | crew::PartyKind::Manager
+        );
+        engine == Engine::Codex
+            && agent
+            && self
+                .0
+                .agent_fast
+                .lock()
+                .as_ref()
+                .is_some_and(|fast| fast(&party.id))
+    }
+
     pub(super) async fn create_for_as(
         &self,
         id: Uuid,

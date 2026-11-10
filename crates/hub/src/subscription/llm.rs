@@ -224,12 +224,20 @@ pub struct SubscriptionProvider {
 }
 
 impl SubscriptionProvider {
-    /// The model a call runs on. A model this backend does not serve moves
-    /// the chain on without counting against the model.
-    fn model(&self, requested: Option<&str>) -> Result<ChatGptModel, SubscriptionError> {
+    /// The model a call runs on, as the login `login` names (its
+    /// fingerprint) knows it. A model this backend does not serve moves the
+    /// chain on without counting against the model.
+    fn model(
+        &self,
+        login: Option<&str>,
+        requested: Option<&str>,
+    ) -> Result<ChatGptModel, SubscriptionError> {
         requested
             .or(self.model.as_deref())
-            .map_or(Ok(DEFAULT_MODEL), ChatGptModel::parse)
+            .map_or(Ok(DEFAULT_MODEL), |name| match login {
+                Some(login) => ChatGptModel::parse_for(login, name),
+                None => ChatGptModel::parse_built_in(name),
+            })
             .map_err(|refused| {
                 let (UnsupportedModel::Retired(model) | UnsupportedModel::Unknown(model)) =
                     &refused;
@@ -241,19 +249,37 @@ impl SubscriptionProvider {
             })
     }
 
-    /// The model a call runs on, the backend's live catalogue read first
-    /// when the hub hasn't yet and the call needs it: for a model the
-    /// built-in list doesn't know (one released since), or to know whether
-    /// the model takes the faster tier the turn asks for.
+    /// The fingerprint of the login a call made now would run on, if any.
+    fn login_key(&self) -> Option<String> {
+        self.plans
+            .scope
+            .resolve(SubscriptionKind::ChatGpt)
+            .ok()
+            .map(|login| login.key.fingerprint)
+    }
+
+    /// The model a call runs on, its login's live catalogue read first when
+    /// the hub hasn't yet and the call needs it: for a model the built-in
+    /// list doesn't know (one released since), or to know whether the model
+    /// takes the faster tier the turn asks for.
     async fn chosen(&self, requested: Option<&str>) -> Result<ChatGptModel, SubscriptionError> {
+        let login = self.login_key();
         let unknown = requested.or(self.model.as_deref()).is_some_and(|name| {
-            matches!(ChatGptModel::parse(name), Err(UnsupportedModel::Unknown(_)))
+            let known = match login.as_deref() {
+                Some(login) => ChatGptModel::parse_for(login, name),
+                None => ChatGptModel::parse_built_in(name),
+            };
+            matches!(known, Err(UnsupportedModel::Unknown(_)))
         });
-        if !ChatGptModel::learned() && (unknown || workforce_agent::llm::provider::fast_mode()) {
+        if login
+            .as_deref()
+            .is_some_and(|login| !ChatGptModel::learned_for(login))
+            && (unknown || workforce_agent::llm::provider::fast_mode())
+        {
             super::catalog::chatgpt_models(self.plans.subscriptions.shared(), &self.plans.scope)
                 .await;
         }
-        self.model(requested)
+        self.model(login.as_deref(), requested)
     }
 
     /// The session's id, so the backend's prompt cache follows the
@@ -533,7 +559,7 @@ impl LlmProvider for SubscriptionProvider {
     async fn context_floor(&self, model: &str) -> Option<u32> {
         Some(match model.trim() {
             "" => DEFAULT_MODEL.context_window(),
-            name => ChatGptModel::parse(name).map_or(
+            name => self.model(self.login_key().as_deref(), Some(name)).map_or(
                 workforce_agent::llm::responses::CONTEXT_WINDOW,
                 ChatGptModel::context_window,
             ),

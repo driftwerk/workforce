@@ -1,18 +1,29 @@
 //! "Always work in real sessions": an agent that oversees the crew
 //! (`[oversight] enabled`, at a level that starts sessions) with
-//! `[oversight.work] prefer_sessions` does no coding work in-process. Every
-//! call of a coding tool that changes or runs something — an edit, a build,
-//! a test, a commit, a coding session or fan-out of its own — is refused
-//! with a pointer to `crew.start_session`, so the work always happens in a
-//! session the person can watch, type into and take over. A call that only
-//! reads (a file, a search, a diff, `git status`) still runs.
+//! `[oversight.work] prefer_sessions` does no coding work in-process, so the
+//! work always happens in a session the person can watch, type into and take
+//! over. While the switch is on, these calls are refused with a pointer to
+//! `crew.start_session`:
 //!
-//! The switch is read from the agent's config at each call, so turning it
-//! on or off applies to the next call. It is enforced in the tool itself
-//! ([`SessionsOnly`]), so every path a call takes — a turn, a CLI turn's
-//! gated MCP, a workflow step — meets it.
+//! - a coding tool's (`code.*`, `coding.*`) call that changes or runs
+//!   something: an edit, a build, a test, a commit, a coding session or
+//!   fan-out of its own;
+//! - every `exec.*` call: a shell runs anything;
+//! - a file write, edit or delete (`filesystem.write`, `filesystem.edit`,
+//!   `filesystem.delete`, `fs.remove`) that touches a path, its links
+//!   followed, inside a git work tree, a Desk session's folder, a project
+//!   checkout or the hub's worktrees.
+//!
+//! What only reads still runs, and so do writes elsewhere in the agent's own
+//! workspace (its notes, memory and scratch files). Workflow coding steps and
+//! pilot rounds run their own CLIs, not these tools, and are not held.
+//!
+//! The switch is read from the agent's config at each call, so turning it on
+//! or off applies to the next call. It is enforced in the tool itself
+//! ([`SessionsOnly`]), so every path a call takes — a turn, a worker
+//! sub-agent's snapshot, a CLI turn's gated MCP — meets it.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,11 +32,11 @@ use eyre::Result;
 use workforce_agent::tools::{SurfaceEffect, Tool, ToolDefinition, ToolResult};
 use workforce_core::computer::Effect;
 
-/// Why a call is refused while the switch is on: the same words for a
-/// coding tool and for a sub-agent that would do the work.
+/// Why a call is refused while the switch is on: the same words for every
+/// held tool and for a sub-agent that would do the work.
 pub const ALWAYS_SESSIONS: &str = "Desk is set to always work in real sessions: start one \
 with crew.start_session so the person can watch it. Here only read-only lookups run: reads, \
-search, and sub-agents with profile \"worker\".";
+search, notes in the agent's own workspace, and sub-agents with profile \"worker\".";
 
 /// Whether the agent whose workspace is `workspace` always works in real
 /// sessions: it oversees the crew at a level that starts sessions (Watch
@@ -41,10 +52,37 @@ pub fn always_sessions(workspace: &Path) -> bool {
         && oversight.work.prefer_sessions
 }
 
-/// Whether `name` is a tool that does coding work in-process: the native
-/// `code.*` tools and the `coding.*` sessions, fan-outs and CLI calls.
-pub fn is_coding_tool(name: &str) -> bool {
-    name.starts_with("code.") || name.starts_with("coding.")
+/// What a held tool is, for what of its calls is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// `code.*`, `coding.*`: refused unless the call only reads.
+    Coding,
+    /// `exec.*`: always refused.
+    Shell,
+    /// A file write, edit or delete: refused where it touches code.
+    Files,
+}
+
+impl Held {
+    fn of(name: &str) -> Option<Self> {
+        if name.starts_with("code.") || name.starts_with("coding.") {
+            return Some(Self::Coding);
+        }
+        if name.starts_with("exec.") {
+            return Some(Self::Shell);
+        }
+        matches!(
+            name,
+            "filesystem.write" | "filesystem.edit" | "filesystem.delete" | "fs.remove"
+        )
+        .then_some(Self::Files)
+    }
+}
+
+/// Whether `name` is a tool held to the switch: a coding tool, a shell, or
+/// a file write.
+pub fn is_held(name: &str) -> bool {
+    Held::of(name).is_some()
 }
 
 /// Whether a call with `effect` only reads.
@@ -52,30 +90,162 @@ fn reads_only(effect: &Effect) -> bool {
     matches!(effect, Effect::None | Effect::Read { .. })
 }
 
-/// A coding tool that refuses its working calls while its agent always
-/// works in real sessions.
+/// The folders whose files are code, beyond any git work tree: the hub's
+/// worktrees and project checkouts, and the folders Desk's sessions run in.
+pub type CodeRoots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
+
+/// Where an agent's held tools look: its workspace (its config, and where
+/// its own notes may be written) and the folders that hold code.
+#[derive(Clone)]
+pub struct Bounds {
+    workspace: PathBuf,
+    code: CodeRoots,
+}
+
+impl Bounds {
+    pub fn new(workspace: &Path, code: CodeRoots) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            code,
+        }
+    }
+
+    /// An agent's bounds on this hub: `roots` (its worktrees and project
+    /// checkouts) and the folders of Desk's sessions, read at each call.
+    pub fn of_agent(workspace: &Path, roots: Vec<PathBuf>) -> Self {
+        Self::new(
+            workspace,
+            Arc::new(move || {
+                let mut all = roots.clone();
+                all.extend(desk_session_folders());
+                all
+            }),
+        )
+    }
+
+    /// Whether writing or deleting `path` touches code: inside a git work
+    /// tree (other than one the workspace itself sits in), a code root, or
+    /// a Desk session's folder. Links are followed first.
+    fn touches_code(&self, path: &Path) -> bool {
+        let path = resolved(path);
+        let workspace = resolved(&self.workspace);
+        if (self.code)()
+            .iter()
+            .map(|root| resolved(root))
+            .any(|root| path.starts_with(&root))
+        {
+            return true;
+        }
+        // A repo of its own inside the workspace counts; a repo the
+        // workspace itself lives in doesn't make its notes code.
+        let stop = path.starts_with(&workspace).then_some(workspace.as_path());
+        path.ancestors()
+            .take_while(|dir| stop.is_none_or(|stop| dir.starts_with(stop) && *dir != stop))
+            .any(|dir| dir.join(".git").exists())
+    }
+
+    /// Why a call of a `held` tool acting as `effect` may not run now.
+    fn refusal(&self, held: Held, effect: &Effect) -> Option<&'static str> {
+        let refused = match held {
+            Held::Coding => !reads_only(effect),
+            Held::Shell => true,
+            Held::Files => match effect {
+                Effect::None | Effect::Read { .. } => false,
+                Effect::Write { paths } | Effect::Delete { paths } => {
+                    paths.iter().any(|p| self.touches_code(p))
+                }
+                Effect::Move { from, to } => from.iter().chain([to]).any(|p| self.touches_code(p)),
+                Effect::Exec { .. }
+                | Effect::Session { .. }
+                | Effect::Connector { .. }
+                | Effect::Unknown => true,
+            },
+        };
+        (refused && always_sessions(&self.workspace)).then_some(ALWAYS_SESSIONS)
+    }
+}
+
+/// `path` with its links followed: the deepest part that exists is
+/// canonicalised and the rest kept, so a file not yet written resolves
+/// through a linked folder.
+fn resolved(path: &Path) -> PathBuf {
+    let path: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    let mut rest = Vec::new();
+    let mut base = path.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
+/// The folders Desk's sessions run in, on a hub running Desk.
+fn desk_session_folders() -> Vec<PathBuf> {
+    #[cfg(feature = "postgres")]
+    if let Some(desk) = crate::desk_driver::desk() {
+        return desk
+            .list()
+            .into_iter()
+            .map(|s| PathBuf::from(s.cwd))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Hold the shell and file tools in `tools` to the switch, in place (the
+/// ones the registry was built with). Coding tools are held as they are
+/// registered.
+pub fn hold_registered(tools: &workforce_agent::tools::registry::ToolRegistry, bounds: &Bounds) {
+    for name in tools.names() {
+        let general = matches!(Held::of(&name), Some(Held::Shell | Held::Files));
+        if let Some(tool) = tools.get(&name).filter(|_| general) {
+            tools.register(SessionsOnly::wrap(tool, bounds));
+        }
+    }
+}
+
+/// `service`'s bounds: its workspace, the hub's worktrees and project
+/// checkouts, and Desk's session folders.
+pub fn bounds_of(service: &crate::serve::AgentService) -> Bounds {
+    let roots = crate::serve::compose::tool_roots(&service.config, &service.workspace);
+    Bounds::of_agent(&service.workspace, roots.into_iter().skip(1).collect())
+}
+
+/// A held tool that refuses its working calls while its agent always works
+/// in real sessions.
 pub struct SessionsOnly {
     inner: Arc<dyn Tool>,
-    workspace: PathBuf,
+    held: Held,
+    bounds: Bounds,
 }
 
 impl SessionsOnly {
-    /// `tool`, held to the switch of the agent at `workspace` when it is a
-    /// coding tool ([`is_coding_tool`]); any other tool as it is.
-    pub fn wrap(tool: Arc<dyn Tool>, workspace: &Path) -> Arc<dyn Tool> {
-        if !is_coding_tool(tool.name()) {
+    /// `tool`, held to the switch within `bounds` when it is a held tool
+    /// ([`is_held`]); any other tool as it is.
+    pub fn wrap(tool: Arc<dyn Tool>, bounds: &Bounds) -> Arc<dyn Tool> {
+        let Some(held) = Held::of(tool.name()) else {
             return tool;
-        }
+        };
         Arc::new(Self {
             inner: tool,
-            workspace: workspace.to_path_buf(),
+            held,
+            bounds: bounds.clone(),
         })
     }
 
     /// Why the call with `input` may not run now, if it may not.
     fn refusal(&self, input: &serde_json::Value) -> Option<&'static str> {
-        (!reads_only(&self.inner.effect(input)) && always_sessions(&self.workspace))
-            .then_some(ALWAYS_SESSIONS)
+        self.bounds.refusal(self.held, &self.inner.effect(input))
     }
 }
 
@@ -149,7 +319,7 @@ mod tests {
     use serde_json::json;
     use workforce_agent::tools::registry::ToolRegistry;
 
-    /// A coding tool that says what each call would do, and runs it.
+    /// A tool that says what each call would do, and runs it.
     struct Probe {
         name: &'static str,
         effect: fn(&serde_json::Value) -> Effect,
@@ -174,9 +344,19 @@ mod tests {
         }
     }
 
-    fn write(_: &serde_json::Value) -> Effect {
+    fn paths(input: &serde_json::Value) -> Vec<PathBuf> {
+        vec![PathBuf::from(
+            input["path"].as_str().unwrap_or("/nowhere/f"),
+        )]
+    }
+    fn write(input: &serde_json::Value) -> Effect {
         Effect::Write {
-            paths: vec![PathBuf::from("/w/src/lib.rs")],
+            paths: paths(input),
+        }
+    }
+    fn delete(input: &serde_json::Value) -> Effect {
+        Effect::Delete {
+            paths: paths(input),
         }
     }
     fn exec(_: &serde_json::Value) -> Effect {
@@ -188,9 +368,9 @@ mod tests {
     fn session(_: &serde_json::Value) -> Effect {
         Effect::Session { cwd: None }
     }
-    fn read(_: &serde_json::Value) -> Effect {
+    fn read(input: &serde_json::Value) -> Effect {
         Effect::Read {
-            paths: vec![PathBuf::from("/w/src/lib.rs")],
+            paths: paths(input),
         }
     }
     fn git(input: &serde_json::Value) -> Effect {
@@ -203,14 +383,71 @@ mod tests {
         Effect::Unknown
     }
 
-    fn workspace(config: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), config).unwrap();
-        dir
-    }
-
     const ON: &str =
         "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = true\n";
+
+    /// An agent's workspace holding `config`, a git checkout, a hub
+    /// worktrees folder and a Desk session folder beside it.
+    struct Place {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        bounds: Bounds,
+    }
+
+    impl Place {
+        fn new(config: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let workspace = root.join("agent");
+            std::fs::create_dir_all(workspace.join("notes")).unwrap();
+            std::fs::write(workspace.join("config.toml"), config).unwrap();
+            std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+            std::fs::create_dir_all(root.join("repo/src")).unwrap();
+            std::fs::create_dir_all(workspace.join("vendored/.git")).unwrap();
+            std::fs::create_dir_all(root.join("worktrees/wt-1")).unwrap();
+            std::fs::create_dir_all(root.join("session-folder")).unwrap();
+            std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(root.join("repo/src"), workspace.join("link-to-src"))
+                .unwrap();
+            let code_roots = vec![root.join("worktrees"), root.join("session-folder")];
+            let bounds = Bounds::new(&workspace, Arc::new(move || code_roots.clone()));
+            Self {
+                _dir: dir,
+                root,
+                bounds,
+            }
+        }
+
+        fn set(&self, config: &str) {
+            std::fs::write(self.root.join("agent/config.toml"), config).unwrap();
+        }
+
+        fn path(&self, rel: &str) -> String {
+            self.root.join(rel).to_string_lossy().into_owned()
+        }
+
+        fn tool(
+            &self,
+            name: &'static str,
+            effect: fn(&serde_json::Value) -> Effect,
+        ) -> Arc<dyn Tool> {
+            SessionsOnly::wrap(Arc::new(Probe { name, effect }), &self.bounds)
+        }
+
+        async fn runs(
+            &self,
+            name: &'static str,
+            effect: fn(&serde_json::Value) -> Effect,
+            input: serde_json::Value,
+        ) -> bool {
+            let result = self.tool(name, effect).execute(input).await.unwrap();
+            if !result.success {
+                assert_eq!(result.error.as_deref(), Some(ALWAYS_SESSIONS), "{name}");
+            }
+            result.success
+        }
+    }
 
     /// A tool's name, how it says a call acts, and the call.
     type Call = (
@@ -219,17 +456,21 @@ mod tests {
         serde_json::Value,
     );
 
-    /// Every coding tool, as each would say a working call of it acts.
-    fn working_calls() -> Vec<Call> {
+    /// Every held tool's working call: refused while the switch is on.
+    fn working_calls(at: &Place) -> Vec<Call> {
         vec![
             ("coding.session", session, json!({"task": "fix it"})),
             ("coding.fanout", session, json!({"tasks": ["a", "b"]})),
             ("coding.claude", session, json!({"prompt": "fix it"})),
-            ("code.edit", write, json!({"path": "src/lib.rs"})),
+            (
+                "code.edit",
+                write,
+                json!({"path": at.path("repo/src/lib.rs")}),
+            ),
             (
                 "code.find_replace",
                 write,
-                json!({"find": "a", "replace": "b"}),
+                json!({"path": at.path("repo/src/lib.rs")}),
             ),
             ("code.refactor", write, json!({"action": "rename"})),
             ("code.build", exec, json!({})),
@@ -238,92 +479,161 @@ mod tests {
             ("code.lint", exec, json!({})),
             ("code.git", git, json!({"action": "commit", "message": "m"})),
             ("code.anything_new", unknown, json!({})),
+            ("exec.run", exec, json!({"command": "ls"})),
+            ("exec.run", read, json!({"path": at.path("agent/notes")})),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("repo/src/lib.rs")}),
+            ),
+            (
+                "filesystem.edit",
+                write,
+                json!({"path": at.path("repo/new/dir/mod.rs")}),
+            ),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("worktrees/wt-1/a.rs")}),
+            ),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("session-folder/a.rs")}),
+            ),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("agent/vendored/x.rs")}),
+            ),
+            (
+                "filesystem.delete",
+                delete,
+                json!({"path": at.path("repo/src/lib.rs")}),
+            ),
+            (
+                "fs.remove",
+                delete,
+                json!({"path": at.path("session-folder/a.rs")}),
+            ),
+            ("filesystem.write", unknown, json!({})),
+            #[cfg(unix)]
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("agent/link-to-src/lib.rs")}),
+            ),
         ]
     }
 
-    async fn run(tool: &Arc<dyn Tool>, input: serde_json::Value) -> ToolResult {
-        tool.execute(input).await.unwrap()
-    }
-
     #[tokio::test]
-    async fn every_coding_tool_is_refused_while_the_agent_always_works_in_sessions() {
-        let dir = workspace(ON);
-        for (name, effect, input) in working_calls() {
-            let tool = SessionsOnly::wrap(Arc::new(Probe { name, effect }), dir.path());
-            let result = run(&tool, input).await;
-            assert!(!result.success, "{name} ran");
-            assert_eq!(result.error.as_deref(), Some(ALWAYS_SESSIONS), "{name}");
-            assert_eq!(tool.name(), name, "it keeps its name");
+    async fn every_held_call_is_refused_while_the_agent_always_works_in_sessions() {
+        let at = Place::new(ON);
+        for (name, effect, input) in working_calls(&at) {
+            assert!(
+                !at.runs(name, effect, input.clone()).await,
+                "{name} {input} ran"
+            );
         }
     }
 
     #[tokio::test]
-    async fn every_coding_tool_runs_with_the_switch_off_or_at_watch() {
-        let configs = [
+    async fn every_held_call_runs_with_the_switch_off_or_at_watch() {
+        for config in [
             "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n",
             "[oversight]\nenabled = false\n[oversight.work]\nprefer_sessions = true\n",
             "[oversight]\nenabled = true\nlevel = \"watch\"\n[oversight.work]\nprefer_sessions = true\n",
             "",
-        ];
-        for config in configs {
-            let dir = workspace(config);
-            for (name, effect, input) in working_calls() {
-                let tool = SessionsOnly::wrap(Arc::new(Probe { name, effect }), dir.path());
-                let result = run(&tool, input).await;
-                assert!(result.success, "{name} refused under {config:?}");
+        ] {
+            let at = Place::new(config);
+            for (name, effect, input) in working_calls(&at) {
+                assert!(at.runs(name, effect, input).await, "{name} refused under {config:?}");
             }
         }
     }
 
     #[tokio::test]
-    async fn read_only_lookups_still_run_under_the_switch() {
-        let dir = workspace(ON);
-        let reads: [Call; 7] = [
-            ("code.read", read, json!({"path": "src/lib.rs"})),
-            ("code.search", read, json!({"query": "fn main"})),
-            ("code.find", read, json!({"pattern": "*.rs"})),
+    async fn reads_and_the_agents_own_notes_still_run_under_the_switch() {
+        let at = Place::new(ON);
+        let allowed: Vec<Call> = vec![
+            (
+                "code.read",
+                read,
+                json!({"path": at.path("repo/src/lib.rs")}),
+            ),
+            ("code.search", read, json!({})),
             ("code.tree", read, json!({})),
-            ("code.symbols", read, json!({})),
             ("code.diff", read, json!({})),
             ("code.git", git, json!({"action": "status"})),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("agent/notes/today.md")}),
+            ),
+            (
+                "filesystem.edit",
+                write,
+                json!({"path": at.path("agent/memory/new.md")}),
+            ),
+            (
+                "filesystem.delete",
+                delete,
+                json!({"path": at.path("agent/notes/old.md")}),
+            ),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("elsewhere/list.txt")}),
+            ),
+            ("filesystem.write", read, json!({})),
+            ("memory.remember", unknown, json!({})),
         ];
-        for (name, effect, input) in reads {
-            let tool = SessionsOnly::wrap(Arc::new(Probe { name, effect }), dir.path());
-            assert!(run(&tool, input).await.success, "{name} refused");
+        for (name, effect, input) in allowed {
+            assert!(
+                at.runs(name, effect, input.clone()).await,
+                "{name} {input} refused"
+            );
         }
     }
 
     #[tokio::test]
     async fn the_switch_is_read_at_each_call() {
-        let dir = workspace("");
-        let tool = SessionsOnly::wrap(
-            Arc::new(Probe {
-                name: "code.edit",
-                effect: write,
-            }),
-            dir.path(),
-        );
-        assert!(run(&tool, json!({})).await.success);
-        std::fs::write(dir.path().join("config.toml"), ON).unwrap();
-        assert!(!run(&tool, json!({})).await.success);
+        let at = Place::new("");
+        let input = json!({"path": at.path("repo/src/lib.rs")});
+        assert!(at.runs("code.edit", write, input.clone()).await);
+        at.set(ON);
+        assert!(!at.runs("code.edit", write, input).await);
     }
 
-    #[test]
-    fn only_coding_tools_are_held_to_it() {
-        let dir = workspace(ON);
+    #[tokio::test]
+    async fn a_registry_built_with_a_shell_and_file_tools_has_them_held() {
+        let at = Place::new(ON);
         let registry = ToolRegistry::new();
-        for name in ["code.edit", "memory.remember", "exec.run"] {
-            registry.register(SessionsOnly::wrap(
-                Arc::new(Probe {
-                    name,
-                    effect: write,
-                }),
-                dir.path(),
-            ));
+        for (name, effect) in [
+            ("exec.run", exec as fn(&serde_json::Value) -> Effect),
+            ("filesystem.write", write),
+            ("filesystem.read", read),
+            ("memory.remember", write),
+        ] {
+            registry.register(Arc::new(Probe { name, effect }));
         }
-        assert!(registry.has("code.edit"));
-        assert!(is_coding_tool("coding.session"));
-        assert!(!is_coding_tool("crew.start_session"));
-        assert!(!is_coding_tool("exec.run"));
+        hold_registered(&registry, &at.bounds);
+        let call = |name: &str, input: serde_json::Value| {
+            let tool = registry.get(name).unwrap();
+            async move { tool.execute(input).await.unwrap().success }
+        };
+        assert!(!call("exec.run", json!({})).await);
+        assert!(!call("filesystem.write", json!({"path": at.path("repo/a.rs")})).await);
+        assert!(
+            call(
+                "filesystem.write",
+                json!({"path": at.path("agent/notes/a.md")})
+            )
+            .await
+        );
+        assert!(call("filesystem.read", json!({})).await);
+        assert!(call("memory.remember", json!({})).await, "not a held tool");
+        assert!(is_held("coding.session") && is_held("exec.run") && is_held("fs.remove"));
+        assert!(!is_held("crew.start_session") && !is_held("filesystem.read"));
     }
 }

@@ -106,6 +106,9 @@ struct Kept {
 #[derive(Default)]
 pub struct PlanCatalog {
     lists: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Kept>>,
+    /// One read at a time per login: a caller that finds one running waits
+    /// for it and takes its list, so cold callers start one CLI, not many.
+    reading: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl PlanCatalog {
@@ -130,11 +133,20 @@ impl PlanCatalog {
         Fut: Future<Output = Result<Vec<PlanModel>>>,
     {
         let key = (kind, login.to_string());
-        if let Some(kept) = self.lists.lock().get(&key) {
-            let fresh = kept.read_at.is_some_and(|at| at.elapsed() < FRESH_FOR);
-            if fresh || kept.tried_at.elapsed() < RETRY_AFTER {
-                return kept.models.clone();
-            }
+        let settled = |lists: &HashMap<(SubscriptionKind, String), Kept>| {
+            lists.get(&key).and_then(|kept| {
+                let fresh = kept.read_at.is_some_and(|at| at.elapsed() < FRESH_FOR);
+                (fresh || kept.tried_at.elapsed() < RETRY_AFTER).then(|| kept.models.clone())
+            })
+        };
+        if let Some(models) = settled(&self.lists.lock()) {
+            return models;
+        }
+        let gate = Arc::clone(self.reading.lock().entry(key.clone()).or_default());
+        let _reading = gate.lock().await;
+        // A read that ran while this one waited settles it.
+        if let Some(models) = settled(&self.lists.lock()) {
+            return models;
         }
         let result = read().await;
         let now = Instant::now();
@@ -162,16 +174,6 @@ impl PlanCatalog {
         }
         kept.models.clone()
     }
-
-    /// The list read most recently for any login of `kind`.
-    pub fn last(&self, kind: SubscriptionKind) -> Option<Arc<Vec<PlanModel>>> {
-        self.lists
-            .lock()
-            .iter()
-            .filter(|((k, _), kept)| *k == kind && kept.models.is_some())
-            .max_by_key(|(_, kept)| kept.read_at)
-            .and_then(|(_, kept)| kept.models.clone())
-    }
 }
 
 /// The models the ChatGPT backend lists for `login`, which the in-process
@@ -197,7 +199,7 @@ pub async fn read_chatgpt(backend: &ChatGptBackend, login: &Login) -> Result<Vec
             account_id: &account_id,
         })
         .await?;
-    ChatGptModel::learn(&catalog);
+    ChatGptModel::learn(&login.key.fingerprint, &catalog);
     Ok(catalog
         .iter()
         .filter(|m| m.listed())
@@ -330,11 +332,29 @@ mod tests {
             "a failed read rests before it is tried again"
         );
         assert_eq!(reads.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            catalog.last(SubscriptionKind::ChatGpt).expect("last")[0].id,
-            "gpt-6.2-nova"
-        );
-        assert!(catalog.last(SubscriptionKind::Claude).is_none());
+    }
+
+    #[tokio::test]
+    async fn cold_callers_for_one_login_start_one_read() {
+        let catalog = Arc::new(PlanCatalog::default());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let callers = (0..8).map(|_| {
+            let catalog = Arc::clone(&catalog);
+            let reads = Arc::clone(&reads);
+            tokio::spawn(async move {
+                catalog
+                    .models(SubscriptionKind::Claude, "login-1", || async move {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(vec![model("sonnet")])
+                    })
+                    .await
+            })
+        });
+        for caller in callers.collect::<Vec<_>>() {
+            assert_eq!(caller.await.unwrap().expect("listed")[0].id, "sonnet");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

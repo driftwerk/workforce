@@ -4,7 +4,7 @@
 pub use workforce_hub_core::serve::*;
 
 pub mod background;
-mod compose;
+pub(crate) mod compose;
 #[cfg(test)]
 mod composed_tests;
 #[cfg(test)]

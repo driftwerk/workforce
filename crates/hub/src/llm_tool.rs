@@ -993,35 +993,24 @@ impl SystemListModelsTool {
         }
     }
 
-    /// The models a subscription provider runs: what the ChatGPT backend
-    /// serves (its live catalogue once read, then the built-in models it
-    /// doesn't list), and for the CLIs the models the agent's tiers name,
-    /// then for Claude Code those its CLI last listed
-    /// ([`crate::subscription::catalog`]).
+    /// The models a subscription provider runs: the ChatGPT backend's
+    /// built-in list, and for the CLIs the models the agent's tiers name.
+    /// A plan's live list is its login's alone (Desk's picker reads it for
+    /// the person's own login), so none is mixed in here.
     fn subscription_models(&self, kind: ProviderKind) -> Vec<ModelInfo> {
-        let info = |id: String, display_name: Option<String>| ModelInfo { id, display_name };
-        if kind == ProviderKind::ChatGpt {
-            return ChatGptModel::known()
-                .into_iter()
-                .map(|model| info(model.id().to_string(), None))
-                .collect();
-        }
-        let mut models: Vec<ModelInfo> =
-            crate::hub_core::subscriptions::tier_models(kind, &self.ctx.tier_registry())
-                .into_iter()
-                .map(|id| info(id, None))
-                .collect();
-        let listed = match kind {
-            ProviderKind::ClaudeCode => crate::subscription::catalog::PlanCatalog::global()
-                .last(workforce_common::subscription::SubscriptionKind::Claude),
-            _ => None,
+        let ids: Vec<String> = match kind {
+            ProviderKind::ChatGpt => ChatGptModel::ALL
+                .iter()
+                .map(|model| model.id().to_string())
+                .collect(),
+            kind => crate::hub_core::subscriptions::tier_models(kind, &self.ctx.tier_registry()),
         };
-        for model in listed.iter().flat_map(|l| l.iter()) {
-            if !models.iter().any(|m| m.id == model.id) {
-                models.push(info(model.id.clone(), Some(model.name.clone())));
-            }
-        }
-        models
+        ids.into_iter()
+            .map(|id| ModelInfo {
+                id,
+                display_name: None,
+            })
+            .collect()
     }
 
     /// Fetch models from the Anthropic API.
