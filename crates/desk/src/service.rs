@@ -46,10 +46,12 @@ mod engine_sign_ins;
 mod identities;
 pub use accounts::Added;
 mod board;
+mod board_sync;
 pub use board::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
     TicketQuery, TicketView,
 };
+pub use board_sync::{check_hub_id, check_hub_url, LinkBoard};
 mod breaker;
 mod charge;
 pub use charge::ChargeView;

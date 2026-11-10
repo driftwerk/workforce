@@ -14,9 +14,10 @@ use crate::board::{Board, Link, Ticket, TicketState};
 use crate::crew::Party;
 use crate::store::DeskStore;
 
-const BOARD: &str = "id, name, group_id, prefix, next_number, created_at, updated_at";
+const BOARD: &str = "id, name, group_id, prefix, next_number, sync, created_at, updated_at";
 const TICKET: &str = "id, board, number, title, body, state, rank, assignee, created_by, \
-                      pinned, snoozed_until, snoozed_at, state_at, created_at, updated_at, version";
+                      pinned, snoozed_until, snoozed_at, state_at, created_at, updated_at, version, \
+                      external";
 
 fn board(row: &Row) -> Result<Board> {
     Ok(Board {
@@ -25,9 +26,17 @@ fn board(row: &Row) -> Result<Board> {
         group: row.try_get("group_id")?,
         prefix: row.try_get("prefix")?,
         next_number: row.try_get("next_number")?,
+        sync: json_of(row.try_get("sync")?).context("reading a board's link")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+/// A JSON column, as what it holds.
+pub(crate) fn json_of<T: serde::de::DeserializeOwned>(v: Option<Value>) -> Result<Option<T>> {
+    Ok(v.filter(|v| !v.is_null())
+        .map(serde_json::from_value)
+        .transpose()?)
 }
 
 fn party(v: Option<Value>) -> Result<Option<Party>> {
@@ -50,6 +59,7 @@ fn ticket(row: &Row) -> Result<Ticket> {
         assignee: party(row.try_get("assignee")?)?,
         needs: vec![],
         links: vec![],
+        external: json_of(row.try_get("external")?).context("reading a ticket's issue")?,
         created_by: party(Some(row.try_get("created_by")?))?
             .ok_or_else(|| eyre::eyre!("a ticket without its maker"))?,
         pinned: row.try_get("pinned")?,
@@ -150,8 +160,8 @@ impl DeskStore {
         let client = self.pool().get().await.map_err(eyre::Report::new)?;
         client
             .execute(
-                "INSERT INTO boards (id, name, group_id, prefix, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET \
+                "INSERT INTO boards (id, name, group_id, prefix, sync, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO UPDATE SET \
                  name = EXCLUDED.name, group_id = EXCLUDED.group_id, \
                  prefix = EXCLUDED.prefix, updated_at = EXCLUDED.updated_at",
                 &[
@@ -159,6 +169,11 @@ impl DeskStore {
                     &b.name,
                     &b.group,
                     &b.prefix,
+                    &b.sync
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(eyre::Report::new)?,
                     &b.created_at,
                     &b.updated_at,
                 ],
@@ -218,7 +233,7 @@ impl DeskStore {
             .query_opt(
                 "UPDATE tickets SET title = $3, body = $4, state = $5, rank = $6, \
                  assignee = $7, pinned = $8, snoozed_until = $9, snoozed_at = $10, \
-                 state_at = $11, updated_at = $12, version = version + 1 \
+                 state_at = $11, updated_at = $12, external = $13, version = version + 1 \
                  WHERE id = $1 AND version = $2 RETURNING version",
                 &[
                     &t.id,
@@ -233,6 +248,7 @@ impl DeskStore {
                     &t.snoozed_at,
                     &t.state_at,
                     &t.updated_at,
+                    &t.external.as_ref().map(serde_json::to_value).transpose()?,
                 ],
             )
             .await?;
@@ -515,13 +531,15 @@ impl DeskStore {
             .collect()
     }
 
-    /// The key of each ticket of `ids` whose board has a prefix.
+    /// The key of each ticket of `ids` that has one: its issue's, else its
+    /// board's prefix and number.
     pub async fn ticket_keys(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, String>> {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT t.id, b.prefix || '-' || t.number FROM tickets t \
-                 JOIN boards b ON b.id = t.board WHERE t.id = ANY($1) AND b.prefix IS NOT NULL",
+                "SELECT t.id, COALESCE(t.external ->> 'key', b.prefix || '-' || t.number) FROM tickets t \
+                 JOIN boards b ON b.id = t.board WHERE t.id = ANY($1) \
+                 AND (t.external IS NOT NULL OR b.prefix IS NOT NULL)",
                 &[&ids],
             )
             .await?
@@ -595,7 +613,7 @@ pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
         .execute(
             &format!(
                 "INSERT INTO tickets ({TICKET}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
             ),
             &[
                 &t.id,
@@ -614,6 +632,7 @@ pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
                 &t.created_at,
                 &t.updated_at,
                 &t.version,
+                &t.external.as_ref().map(serde_json::to_value).transpose()?,
             ],
         )
         .await

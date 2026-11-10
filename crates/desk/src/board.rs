@@ -3,7 +3,7 @@
 //! on them. History is the crew's activity log. This module decides;
 //! [`crate::service`]'s `board` submodule stores, announces and records.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,8 @@ impl TicketState {
 }
 
 /// A board. `group`: the sidebar group it belongs to; `None` is ungrouped.
-/// `prefix` is what its tickets' keys start with.
+/// `prefix` is what its tickets' keys start with; `None` exactly when it is
+/// synced (`sync`), and its tickets take their issues' keys.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Board {
@@ -45,6 +46,8 @@ pub struct Board {
     pub name: String,
     pub group: Option<String>,
     pub prefix: Option<String>,
+    /// Its link to a Jira project or a Linear team, when it has one.
+    pub sync: Option<Sync>,
     /// The number the next ticket takes; numbers are never used twice.
     #[serde(skip)]
     pub next_number: i32,
@@ -57,6 +60,199 @@ impl Board {
     /// stay what they were.
     pub fn numbered(&self) -> bool {
         self.next_number > 1
+    }
+}
+
+// ── Sync with Linear or Jira ─────────────────────────────────────────────
+
+text_enum!(System {
+    Linear => "linear",
+    Jira => "jira",
+});
+
+impl System {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Jira => "Jira",
+        }
+    }
+}
+
+/// How a board reaches its Jira or Linear: through a hub that has the
+/// integration, as the person (its remote MCP, with their `wfr_` token in
+/// this hub's vault), or with this computer's own Jira or Linear keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Via {
+    /// `hub` is a linked hub's id here (`sync_hubs`).
+    Hub {
+        hub: String,
+    },
+    ThisHub,
+}
+
+/// Which of the target's issues a board imports and keeps in sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum Filter {
+    AssignedToMe,
+    /// The open sprint (Jira) or the active cycle.
+    CurrentCycle,
+    Label(String),
+    /// Raw JQL, or a Linear filter as a JSON object.
+    Query(String),
+}
+
+/// Why a synced board isn't syncing, in both directions; local edits wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Paused {
+    /// The person paused it.
+    ByYou,
+    HubOffline {
+        since: DateTime<Utc>,
+    },
+    /// The hub it syncs through is no longer linked here.
+    HubUnpaired,
+    /// No token for the hub, or the hub refused it (revoked or expired).
+    NoToken,
+    /// The hub no longer offers the tools the sync needs.
+    Missing {
+        tools: Vec<String>,
+    },
+    /// The hub's policy said no, in its words.
+    Refused {
+        reason: String,
+    },
+    /// The board left the group it was linked in (its group was deleted):
+    /// a link belongs to one group, so it must be linked again.
+    LeftGroup,
+}
+
+impl Paused {
+    /// As the board says it.
+    pub fn say(&self, hub: &str) -> String {
+        match self {
+            Self::ByYou => "Paused by you; changes go out when you resume it.".into(),
+            Self::HubOffline { since } => format!(
+                "Paused: {hub} is offline since {}; changes go out when it's back.",
+                since.format("%H:%M")
+            ),
+            Self::HubUnpaired => format!(
+                "Paused: {hub} isn't linked any more. Link through another hub, or keep the board here, unsynced."
+            ),
+            Self::NoToken => format!("Paused: paste a new token for {hub}."),
+            Self::Missing { tools } => format!(
+                "Paused: {hub} no longer offers {}.",
+                tools.join(", ")
+            ),
+            Self::Refused { reason } => format!("Paused: {hub} refused: {reason}"),
+            Self::LeftGroup => "Paused: this board left the group it was linked in; unlink it and link it again.".into(),
+        }
+    }
+}
+
+/// A board's link: one Jira project or one Linear team, through one hub,
+/// for the person who linked it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sync {
+    /// Made new each time the board is linked: only issues this link
+    /// imported or made are ever written to.
+    pub link: Uuid,
+    pub system: System,
+    /// The Jira project's key, or the Linear team's.
+    pub target: String,
+    /// The Linear team's id, which its tools take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub via: Via,
+    /// Whose token or keys it syncs with: the person who linked it.
+    pub person: String,
+    pub filter: Filter,
+    /// The person's own Linear user id, for "assigned to me" there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me: Option<String>,
+    /// The remote state each column moves an issue to.
+    pub states: BTreeMap<TicketState, String>,
+    /// The sidebar group the board was in when it was linked: the link
+    /// syncs only while the board is still there.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// The `updated` time the last pull got to.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub paused: Option<Paused>,
+    /// When the last pull ran, and the last sweep of who is still in the
+    /// filter.
+    #[serde(default)]
+    pub pulled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub swept_at: Option<DateTime<Utc>>,
+    /// No calls before this: the hub said to slow down, or failed.
+    #[serde(default)]
+    pub backoff_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failures: u32,
+    /// What it last couldn't do, in the hub's words.
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+/// What a synced ticket's issue said when last pulled or pushed: what the
+/// next push compares with, so only what changed here goes out, and a
+/// pull's own changes never go back.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Seen {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub state: Option<TicketState>,
+    /// The keys of the issues it is blocked by.
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+/// A ticket's Jira or Linear issue. `synced`: false once the issue left the
+/// import filter (the Left-the-filter shelf), or the board was unlinked.
+/// `noted`: the state last commented on the issue (one comment per move
+/// into Doing or Review).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct External {
+    pub system: System,
+    pub key: String,
+    /// The issue's own id, which Linear's tools take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub url: String,
+    pub remote_updated_at: DateTime<Utc>,
+    pub synced: bool,
+    #[serde(default)]
+    pub noted: Option<TicketState>,
+    /// The link ([`Sync::link`]) that imported or made it.
+    pub link: Uuid,
+    /// Made in Desk and created there, not imported: it stays synced
+    /// whatever the filter says.
+    #[serde(default)]
+    pub made_here: bool,
+    /// The person kept it on the board after it left the filter.
+    #[serde(default)]
+    pub kept: bool,
+    /// Its text read as instructions to a model when it was pulled.
+    #[serde(default)]
+    pub flagged: bool,
+    #[serde(default)]
+    pub seen: Seen,
+}
+
+impl External {
+    /// Whether the link `link` may write to this issue.
+    pub fn writable_by(&self, link: Uuid) -> bool {
+        self.synced && !self.kept && self.link == link
     }
 }
 
@@ -149,6 +345,8 @@ pub struct Ticket {
     pub assignee: Option<Party>,
     pub needs: Vec<Uuid>,
     pub links: Vec<Link>,
+    /// Its Jira or Linear issue, on a synced board.
+    pub external: Option<External>,
     pub created_by: Party,
     pub pinned: bool,
     pub snoozed_until: Option<DateTime<Utc>>,
@@ -163,9 +361,18 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// Its key, `ACM-12`; `None` on a board with no prefix of its own.
+    /// Its key: its issue's (`ACME-482`) when it has one, else the board's
+    /// own (`ACM-12`); `None` while a synced ticket waits to be created.
     pub fn key(&self, b: &Board) -> Option<String> {
+        if let Some(e) = &self.external {
+            return Some(e.key.clone());
+        }
         b.prefix.as_ref().map(|p| format!("{p}-{}", self.number))
+    }
+
+    /// Whether its words came from Jira or Linear: never the person's.
+    pub fn from_remote(&self) -> Option<System> {
+        self.external.as_ref().map(|e| e.system)
     }
 
     /// The session it is assigned to, when it is.
@@ -581,6 +788,7 @@ mod tests {
             assignee: None,
             needs,
             links: vec![],
+            external: None,
             created_by: Party::you(),
             pinned: false,
             snoozed_until: None,
@@ -705,6 +913,7 @@ mod tests {
             name: "Acme".into(),
             group: None,
             prefix: Some("ACM".into()),
+            sync: None,
             next_number: 13,
             created_at: now,
             updated_at: now,

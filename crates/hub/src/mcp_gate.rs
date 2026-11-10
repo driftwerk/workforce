@@ -145,6 +145,9 @@ pub enum CallOrigin {
     RemoteToken(Uuid),
     /// A CLI round the hub spawned.
     Round,
+    /// A Desk board's sync with Linear or Jira, through this hub's own
+    /// tools, as the person who linked it.
+    BoardSync,
 }
 
 #[derive(Clone)]
@@ -176,6 +179,15 @@ impl CallAudit {
                 decision,
                 reason,
                 "round MCP tool call"
+            ),
+            CallOrigin::BoardSync => info!(
+                target: "mcp.audit",
+                identity = %self.identity_id,
+                agent = %self.agent_id,
+                tool,
+                decision,
+                reason,
+                "desk board sync tool call"
             ),
         }
     }

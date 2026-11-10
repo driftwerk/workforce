@@ -1,0 +1,650 @@
+//! Board sync against a fake hub: the real remote MCP router, served on a
+//! local port, with stand-in `jira.*` tools answering in the adapters' own
+//! shapes (their words wrapped as untrusted content, as the real ones
+//! are). No real Jira, Linear or hub is ever called.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+use uuid::Uuid;
+use workforce_agent::security::external_content::wrap_external_content;
+use workforce_agent::tools::{Tool, ToolResult};
+use workforce_common::settings::RemoteMcpConfig;
+use workforce_desk::board::{Filter, Paused, System, TicketState, Via};
+use workforce_desk::{Desk, LinkBoard, NewBoard};
+use workforce_identity::store::IdentityStore;
+use workforce_identity::types::{Identity, IdentityRole};
+use workforce_postgres::test_support::with_test_pool;
+
+use super::*;
+use crate::remote_mcp::testing::{fixture, issue, with_agents, TokenShape};
+
+// ── A fake Jira, as a hub's tools ────────────────────────────────────────
+
+/// A remote issue the fake keeps.
+#[derive(Clone, Debug)]
+pub(crate) struct FakeIssue {
+    pub key: String,
+    pub summary: String,
+    pub description: String,
+    pub status: String,
+    pub updated: String,
+    pub labels: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct Jira {
+    pub issues: BTreeMap<String, FakeIssue>,
+    pub calls: Vec<(String, Value)>,
+    pub next: u32,
+    /// A tool that answers as the hub's policy refusing it.
+    pub refuse: Option<&'static str>,
+}
+
+pub(crate) type Shared = Arc<Mutex<Jira>>;
+
+pub(crate) const JIRA_STATUSES: [&str; 4] = ["To Do", "In Progress", "In Review", "Done"];
+
+struct FakeJiraTool {
+    name: &'static str,
+    jira: Shared,
+}
+
+fn wrapped(s: &str, source: &str) -> Value {
+    json!(wrap_external_content(s, source).wrapped_content)
+}
+
+fn issue_json(i: &FakeIssue, full: bool) -> Value {
+    let mut v = json!({
+        "key": i.key, "id": format!("1{}", i.key.rsplit('-').next().unwrap_or("0")),
+        "summary": wrapped(&i.summary, "jira.search.summary"),
+        "status": i.status, "assignee": "Sam", "priority": "Medium",
+        "issuetype": "Task", "updated": i.updated, "labels": i.labels,
+    });
+    if full {
+        v["description_html"] = wrapped(
+            &format!("<p>{}</p>", i.description),
+            "jira.get_issue.description",
+        );
+    }
+    v
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeJiraTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "a fake Jira tool"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+        let mut j = self.jira.lock().unwrap();
+        j.calls.push((self.name.to_string(), input.clone()));
+        if j.refuse == Some(self.name) {
+            return Ok(ToolResult::failure("Policy denied: not on this hub", 0));
+        }
+        let key = input["issue_key"].as_str().unwrap_or_default().to_string();
+        let out = match self.name {
+            "jira.search" => {
+                let jql = input["jql"].as_str().unwrap_or_default();
+                let project = jql.split('"').nth(1).unwrap_or_default().to_string();
+                let label = jql
+                    .split("labels = \"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .map(str::to_string);
+                let issues: Vec<Value> = j
+                    .issues
+                    .values()
+                    .filter(|i| i.key.starts_with(&format!("{project}-")))
+                    .filter(|i| label.as_ref().is_none_or(|l| i.labels.contains(l)))
+                    .map(|i| issue_json(i, false))
+                    .collect();
+                json!({ "count": issues.len(), "issues": issues, "next_page_token": null, "is_last": true })
+            }
+            "jira.get_issue" => match j.issues.get(&key) {
+                Some(i) => issue_json(i, true),
+                None => {
+                    return Ok(ToolResult::failure(
+                        format!("Failed to get issue {key}: 404 Not Found"),
+                        0,
+                    ))
+                }
+            },
+            "jira.create_issue" => {
+                j.next += 1;
+                let project = input["project_key"].as_str().unwrap_or_default();
+                let key = format!("{project}-{}", 100 + j.next);
+                j.issues.insert(
+                    key.clone(),
+                    FakeIssue {
+                        key: key.clone(),
+                        summary: input["summary"].as_str().unwrap_or_default().into(),
+                        description: input["description"].as_str().unwrap_or_default().into(),
+                        status: "To Do".into(),
+                        updated: "2026-11-09T10:00:00.000+0000".into(),
+                        labels: input["labels"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                );
+                json!({ "key": key, "id": "1", "self": "https://acme.example/rest/api/3/issue/1" })
+            }
+            "jira.update_issue" => {
+                let Some(i) = j.issues.get_mut(&key) else {
+                    return Ok(ToolResult::failure("404", 0));
+                };
+                if let Some(s) = input["summary"].as_str() {
+                    i.summary = s.into();
+                }
+                if let Some(d) = input["description"].as_str() {
+                    i.description = d.into();
+                }
+                json!({ "key": key, "updated": true })
+            }
+            "jira.list_transitions" => json!({
+                "issue_key": key,
+                "transitions": JIRA_STATUSES.iter().enumerate()
+                    .map(|(n, s)| json!({ "id": n.to_string(), "name": s, "to_status": s }))
+                    .collect::<Vec<_>>(),
+            }),
+            "jira.transition_issue" => {
+                let to = input["transition"]
+                    .as_str()
+                    .and_then(|t| t.parse::<usize>().ok())
+                    .and_then(|n| JIRA_STATUSES.get(n))
+                    .copied()
+                    .unwrap_or("To Do");
+                if let Some(i) = j.issues.get_mut(&key) {
+                    i.status = to.into();
+                }
+                json!({ "key": key, "transitioned": true })
+            }
+            "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
+            other => json!({ "unexpected": other }),
+        };
+        Ok(ToolResult::success(out, 0))
+    }
+}
+
+/// Registers the fake's tools (all but `except`) on `registry`.
+pub(crate) fn register_jira(
+    registry: &workforce_agent::tools::registry::ToolRegistry,
+    jira: &Shared,
+    except: &[&str],
+) {
+    for name in workforce_desk::board_sync::JIRA_TOOLS
+        .iter()
+        .chain(["jira.api", "jira.delete_issue"].iter())
+    {
+        if !except.contains(name) {
+            registry.register(Arc::new(FakeJiraTool {
+                name,
+                jira: Arc::clone(jira),
+            }));
+        }
+    }
+}
+
+/// A remote hub: its remote MCP served on a local port, exposing `allow`,
+/// with the fake Jira's tools. Its address, and a member's token there.
+pub(crate) struct RemoteHub {
+    pub url: String,
+    pub token: String,
+    pub jira: Shared,
+}
+
+pub(crate) async fn remote_hub(
+    dir: &std::path::Path,
+    allow: &[&str],
+    except: &[&str],
+) -> RemoteHub {
+    let fx = fixture(true);
+    with_agents(&fx, dir, &["default"]).await;
+    let jira: Shared = Arc::default();
+    let service = fx.state.registry.default_agent().unwrap();
+    register_jira(&service.tools, &jira, except);
+    let state = Arc::try_unwrap(fx.state)
+        .ok()
+        .expect("the fixture's only handle");
+    let state = Arc::new(GatewayState {
+        remote_mcp: RemoteMcpConfig {
+            enabled: true,
+            tools_allow: allow.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        },
+        ..state
+    });
+    let fx = crate::remote_mcp::testing::Fixture {
+        state,
+        identities: fx.identities,
+        tokens: fx.tokens,
+    };
+    let member = Identity::new("Sam", IdentityRole::Member);
+    fx.identities.create(&member).unwrap();
+    let token = issue(&fx, &member, TokenShape::default());
+    let app = crate::remote_mcp::server::router(crate::remote_mcp::server::RemoteMcpState::new(
+        Arc::clone(&fx.state),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    RemoteHub { url, token, jira }
+}
+
+// ── The local hub ────────────────────────────────────────────────────────
+
+/// This hub: a person who holds it, a vault, and the routes, with a JWT
+/// for the person.
+pub(crate) struct LocalHub {
+    pub sync: Arc<BoardSync>,
+    pub app: axum::Router,
+    pub person: Identity,
+    pub jwt: String,
+    pub vault: Arc<Vault>,
+}
+
+pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
+    let fx = fixture(false);
+    let jwt_config =
+        crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600).unwrap();
+    let person = Identity::new("Sam", IdentityRole::SystemAdmin);
+    fx.identities.create(&person).unwrap();
+    let jwt = crate::jwt::generate_token_with_identity(
+        &jwt_config,
+        &person.display_name,
+        person.role,
+        Some(person.id.to_string()),
+    )
+    .unwrap();
+    let vault = Arc::new(Vault::open(&dir.join("vault"), "test-key").unwrap());
+    let state = Arc::try_unwrap(fx.state)
+        .ok()
+        .expect("the fixture's only handle");
+    let state = Arc::new(GatewayState {
+        jwt_config: Some(jwt_config),
+        vault: Some(Arc::clone(&vault)),
+        ..state
+    });
+    let (sync, app) = install(&state, desk);
+    LocalHub {
+        sync,
+        app,
+        person,
+        jwt,
+        vault,
+    }
+}
+
+impl LocalHub {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        self.send_as(&self.jwt, method, uri, body).await
+    }
+
+    pub(crate) async fn send_as(
+        &self,
+        bearer: &str,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let resp = self
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Links the remote hub as `atlas`, with its member's token.
+    pub(crate) async fn link_atlas(&self, remote: &RemoteHub) -> (StatusCode, Value) {
+        self.send(
+            "PUT",
+            "/api/desk/sync-hubs/atlas",
+            json!({ "name": "Atlas", "url": remote.url, "token": remote.token }),
+        )
+        .await
+    }
+}
+
+pub(crate) fn states() -> BTreeMap<TicketState, String> {
+    BTreeMap::from([
+        (TicketState::Todo, "To Do".to_string()),
+        (TicketState::Doing, "In Progress".to_string()),
+        (TicketState::Review, "In Review".to_string()),
+        (TicketState::Done, "Done".to_string()),
+    ])
+}
+
+pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
+    LinkBoard {
+        system: System::Jira,
+        target: "ACME".into(),
+        target_id: None,
+        via: Via::Hub {
+            hub: "atlas".into(),
+        },
+        filter,
+        me: None,
+        states: states(),
+    }
+}
+
+pub(crate) async fn board(desk: &Desk, name: &str) -> workforce_desk::board::Board {
+    desk.create_board(NewBoard {
+        name: name.into(),
+        group: None,
+        prefix: None,
+    })
+    .await
+    .unwrap()
+}
+
+pub(crate) fn seed(jira: &Shared, key: &str, summary: &str, labels: &[&str]) {
+    jira.lock().unwrap().issues.insert(
+        key.into(),
+        FakeIssue {
+            key: key.into(),
+            summary: summary.into(),
+            description: format!("About {summary}."),
+            status: "To Do".into(),
+            updated: "2026-11-09T10:00:00.000+0000".into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        },
+    );
+}
+
+// ── Linking ──────────────────────────────────────────────────────────────
+
+/// A hub's token is tried with `tools/list`, then kept in this hub's vault
+/// only, where no agent reads it; nothing the routes answer carries it.
+#[tokio::test]
+async fn a_hub_s_token_is_tried_then_kept_in_the_vault_only() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        let local = local_hub(desk, dir.path());
+        let (status, body) = local.link_atlas(&remote).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["offers"]["jira"], true);
+        assert_eq!(body["offers"]["linear"], false);
+        let key = token_key(&local.person.id.to_string(), "atlas");
+        assert_eq!(
+            local.vault.get(&key).as_deref(),
+            Some(remote.token.as_str())
+        );
+        assert!(
+            crate::vault_policy::agent_can_read(&key, Some(&local.person.id.to_string())).is_err()
+        );
+        let (_, listed) = local.send("GET", "/api/desk/sync-hubs", json!(null)).await;
+        assert_eq!(listed["hubs"][0]["hasToken"], true);
+        for said in [body.to_string(), listed.to_string()] {
+            assert!(!said.contains(&remote.token), "{said}");
+            assert!(!said.contains("wfr_"), "{said}");
+        }
+        // A token the hub refuses is never kept.
+        let bad = format!("wfr_{}", "x".repeat(43));
+        let (status, body) = local
+            .send(
+                "PUT",
+                "/api/desk/sync-hubs/globex",
+                json!({ "name": "Globex", "url": remote.url, "token": bad }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(local
+            .vault
+            .get(&token_key(&local.person.id.to_string(), "globex"))
+            .is_none());
+        assert!(local.sync.desk.sync_hub("globex").await.unwrap().is_none());
+        // Forgetting the hub removes its token.
+        let (status, _) = local
+            .send("DELETE", "/api/desk/sync-hubs/atlas", json!(null))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(local.vault.get(&key).is_none());
+    })
+    .await;
+}
+
+#[test]
+fn a_token_never_prints() {
+    let t = Secret::new(concat!(
+        "wfr_",
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+    ))
+    .unwrap();
+    assert_eq!(format!("{t:?}"), "wfr_…redacted");
+    assert_eq!(format!("{t}"), "wfr_…redacted");
+    assert!(Secret::new("ghp_abcdefghijklmnopqrstuvwxyz").is_none());
+    assert!(Secret::new("wfr_short").is_none());
+}
+
+/// Only the person who holds this hub links boards: anyone else, and the
+/// hub's own token, are refused.
+#[tokio::test]
+async fn only_the_person_whose_desk_it_is_links_a_board() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let local = local_hub(desk, dir.path());
+        let (status, _) = local
+            .send_as("gateway-token", "GET", "/api/desk/sync-hubs", json!(null))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = local
+            .send_as("nonsense", "GET", "/api/desk/sync-hubs", json!(null))
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    })
+    .await;
+}
+
+/// A hub that doesn't offer its Jira tools over remote MCP refuses the
+/// link, saying what its admin must add; nothing is linked.
+#[tokio::test]
+async fn a_hub_without_jira_on_remote_mcp_refuses_the_link() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["workflow"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let said = body["error"].as_str().unwrap();
+        assert!(
+            said.contains("Atlas doesn't offer its Jira tools"),
+            "{said}"
+        );
+        assert!(
+            said.contains("Ask its admin to add `jira.*` to remote MCP"),
+            "{said}"
+        );
+        let (status, _) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                serde_json::to_value(link_body(Filter::AssignedToMe)).unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(desk.boards().await.unwrap()[0].sync.is_none());
+    })
+    .await;
+}
+
+fn link_body(filter: Filter) -> Value {
+    json!({
+        "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+        "filter": filter, "states": states(),
+    })
+}
+
+/// The dialog's check: the tools are there, the states come prefilled, and
+/// the filter's matches are counted inside the project only.
+#[tokio::test]
+async fn the_link_dialog_is_told_the_states_and_the_matches() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        seed(&remote.jira, "ACME-2", "Ship the API", &[]);
+        seed(&remote.jira, "GLOBEX-1", "Their issue", &["web"]);
+        let local = local_hub(desk, dir.path());
+        local.link_atlas(&remote).await;
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": { "kind": "label", "value": "web" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["matches"], 1);
+        assert_eq!(body["prefill"]["doing"], "In Progress");
+        assert_eq!(body["prefill"]["review"], "In Review");
+        // Raw JQL that would reach another project is refused before any call.
+        let calls = remote.jira.lock().unwrap().calls.len();
+        let (status, _) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": { "kind": "query", "value": "x) OR (project = GLOBEX" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(remote.jira.lock().unwrap().calls.len(), calls, "no call was made");
+    })
+    .await;
+}
+
+/// A link is one board's: the board takes the issues' keys (no prefix),
+/// a project is linked to one board, and a synced board doesn't change
+/// groups.
+#[tokio::test]
+async fn a_board_links_to_one_project_and_keeps_to_its_group() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let acme = board(&desk, "Acme").await;
+        let globex = board(&desk, "Globex").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", acme.id),
+                link_body(Filter::AssignedToMe),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["prefix"], Value::Null);
+        assert_eq!(body["sync"]["target"], "ACME");
+        assert_eq!(body["sync"]["person"], local.person.id.to_string());
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", globex.id),
+                link_body(Filter::AssignedToMe),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("linked to the board Acme"));
+        // Pausing stops it; unlinking gives it a prefix of its own again.
+        let (_, body) = local
+            .send(
+                "POST",
+                &format!("/api/desk/boards/{}/pause", acme.id),
+                json!({ "paused": true }),
+            )
+            .await;
+        assert_eq!(body["sync"]["paused"]["kind"], "byYou");
+        let (_, body) = local
+            .send(
+                "DELETE",
+                &format!("/api/desk/boards/{}/link", acme.id),
+                json!(null),
+            )
+            .await;
+        assert_eq!(body["sync"], Value::Null);
+        assert_eq!(body["prefix"], "ACM");
+    })
+    .await;
+}
+
+/// Forgetting a hub pauses the boards that sync through it; linking it
+/// again lets them go on.
+#[tokio::test]
+async fn a_board_pauses_when_its_hub_is_forgotten() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        desk.link_board(
+            b.id,
+            link_jira(Filter::AssignedToMe),
+            &local.person.id.to_string(),
+        )
+        .await
+        .unwrap();
+        local
+            .send("DELETE", "/api/desk/sync-hubs/atlas", json!(null))
+            .await;
+        let paused = desk.board_sync(b.id).await.unwrap().unwrap().1.paused;
+        assert_eq!(paused, Some(Paused::HubUnpaired));
+        local.link_atlas(&remote).await;
+        let paused = desk.board_sync(b.id).await.unwrap().unwrap().1.paused;
+        assert_eq!(paused, None);
+        let _ = Uuid::nil();
+    })
+    .await;
+}

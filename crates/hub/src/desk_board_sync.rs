@@ -1,0 +1,887 @@
+//! Desk boards synced with Linear or Jira (`workforce_desk::board_sync`).
+//!
+//! A board syncs **through a hub that has the integration, as the person**:
+//! this hub calls that hub's remote MCP (`/mcp`, `crates/mcp-client`) with
+//! the person's `wfr_` token for it, so that hub's permissions, gates and
+//! audit apply to every call and no Jira or Linear key is ever copied here.
+//! Only where no linked hub offers the system does a board use **this
+//! hub's own** `jira.*` / `linear.*` tools, in-process, through the same
+//! gate chain the remote MCP server runs (`GatedExecutor`), as the person.
+//!
+//! The token is kept in this hub's vault only, at
+//! `users/<person>/desk/hubs/<hub>/remote_mcp`, which no agent's vault tools
+//! can read, list or write (`AgentReadDenial::DeskLink`). It is never in
+//! config, Postgres, events or the UI, never logged, and held in memory as a
+//! [`Secret`] whose `Debug` and `Display` print `wfr_…redacted`.
+//!
+//! Routes, the person's whose hub this is only:
+//! - `GET /api/desk/sync-hubs`: the hubs a board can sync through, and
+//!   whether each has a token. Never a token.
+//! - `PUT /api/desk/sync-hubs/{hub}` `{name, url, token}`: checks the token
+//!   with `tools/list`, then keeps it (write-only).
+//! - `DELETE /api/desk/sync-hubs/{hub}`: forgets the hub and its token; its
+//!   boards pause.
+//! - `POST /api/desk/boards/link/check` `{system, via, target?, filter?, me?}`:
+//!   what the link dialog needs: whether the hub offers the tools (and if
+//!   not, what its admin must add), the teams, the states with the map
+//!   prefilled, and how many issues the filter matches.
+//! - `PUT|DELETE /api/desk/boards/{id}/link`: links or unlinks a board.
+//! - `POST /api/desk/boards/{id}/pause` `{paused}`: pauses or resumes it.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use workforce_common::settings::VaultActor;
+use workforce_desk::board::{Filter, Paused, System, Via};
+use workforce_desk::board_sync::{self as sync, Remote, RemoteError, RemoteState};
+use workforce_desk::{Desk, DeskError, LinkBoard};
+use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
+
+use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
+use crate::vault::Vault;
+
+/// The longest a call to a hub may take.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ── The token ────────────────────────────────────────────────────────────
+
+/// A person's `wfr_` token for a hub. Never printed, even in part.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(token: &str) -> Option<Self> {
+        let t = token.trim();
+        (t.starts_with(workforce_identity::remote_mcp_token::TOKEN_PREFIX)
+            && t.len() > 20
+            && t.len() < 200
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .then(|| Self(t.to_string()))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wfr_…redacted")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wfr_…redacted")
+    }
+}
+
+/// Where `person`'s token for `hub` is kept in this hub's vault.
+pub fn token_key(person: &str, hub: &str) -> String {
+    format!("users/{person}/desk/hubs/{hub}/remote_mcp")
+}
+
+fn read_token(vault: &Vault, person: &str, hub: &str) -> Option<Secret> {
+    vault
+        .get(&token_key(person, hub))
+        .and_then(|t| Secret::new(&t))
+}
+
+// ── A hub, through its remote MCP ────────────────────────────────────────
+
+/// A linked hub's tools, called through its `/mcp` as the person.
+pub struct HubRemote {
+    client: McpClient,
+    ready: tokio::sync::OnceCell<()>,
+}
+
+impl HubRemote {
+    pub fn new(url: &str, token: &Secret, http: Arc<reqwest::Client>) -> Result<Self, RemoteError> {
+        let endpoint = url::Url::parse(&format!("{}/mcp", url.trim_end_matches('/')))
+            .map_err(|_| RemoteError::Offline("the hub's address isn't one".into()))?;
+        Ok(Self {
+            client: McpClient::new(
+                endpoint,
+                http,
+                Arc::new(StaticBearer::new(token.expose())),
+                McpLimits::default(),
+            ),
+            ready: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    async fn ready(&self) -> Result<(), RemoteError> {
+        self.ready
+            .get_or_try_init(|| async {
+                self.client.initialize().await.map(drop).map_err(mcp_error)
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
+/// What a hub's answer means for the sync. Its words are already redacted
+/// by the client; they are clipped here too.
+fn mcp_error(e: McpError) -> RemoteError {
+    let said = |s: &str| s.chars().take(300).collect::<String>();
+    match e {
+        McpError::Unreachable(m) => RemoteError::Offline(said(&m)),
+        McpError::AuthExpired(_) => RemoteError::NoToken,
+        McpError::RateLimited {
+            retry_after_secs, ..
+        } => RemoteError::RateLimited { retry_after_secs },
+        McpError::Transport(m) if m.contains("404") => {
+            RemoteError::Refused("the hub doesn't offer remote MCP".into())
+        }
+        McpError::Transport(m) => RemoteError::Offline(said(&m)),
+        McpError::Protocol(m) if m.contains("404") => {
+            RemoteError::Refused("the hub doesn't offer remote MCP".into())
+        }
+        McpError::ServerError { message, .. } => RemoteError::Failed(said(&message)),
+        other => RemoteError::Failed(said(&other.to_string())),
+    }
+}
+
+#[async_trait]
+impl Remote for HubRemote {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        self.ready().await?;
+        let survey = tokio::time::timeout(CALL_TIMEOUT, self.client.list_tool_names())
+            .await
+            .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
+            .map_err(mcp_error)?;
+        Ok(survey.names.into_iter().map(|t| t.name).collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.ready().await?;
+        let wire = tool.replace('.', "_");
+        let result = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.client
+                .tools_call(&wire, args, CancellationToken::new()),
+        )
+        .await
+        .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
+        .map_err(mcp_error)?;
+        sync::mcp_answer(&result)
+    }
+}
+
+// ── This hub's own tools ─────────────────────────────────────────────────
+
+/// This hub's own `jira.*` / `linear.*` tools, with the person's keys from
+/// its vault, run through the gate chain remote MCP runs, as the person.
+pub struct LocalRemote {
+    state: Arc<GatewayState>,
+    person: String,
+    system: System,
+}
+
+impl LocalRemote {
+    pub fn new(state: Arc<GatewayState>, person: &str, system: System) -> Self {
+        Self {
+            state,
+            person: person.to_string(),
+            system,
+        }
+    }
+
+    fn service(&self) -> Result<Arc<crate::serve::AgentService>, RemoteError> {
+        self.state
+            .registry
+            .default_agent()
+            .ok_or_else(|| RemoteError::Refused("this hub runs no agent".into()))
+    }
+
+    /// The registry's tools the sync may call for this system.
+    fn surface(
+        &self,
+        service: &crate::serve::AgentService,
+    ) -> workforce_agent::tools::registry::ToolRegistry {
+        let patterns: Vec<String> = sync::tools_of(self.system)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        crate::mcp::build_mcp_registry(&service.tools, &patterns)
+    }
+}
+
+#[async_trait]
+impl Remote for LocalRemote {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        let service = self.service()?;
+        Ok(self.surface(&service).names())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        use crate::mcp::ToolCallExecutor as _;
+        use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor};
+        let service = self.service()?;
+        let surface = Arc::new(self.surface(&service));
+        let Some(t) = surface.get(tool) else {
+            return Err(RemoteError::Refused(format!(
+                "this hub has no {tool}; connect {} here first",
+                self.system.title()
+            )));
+        };
+        let ctx = crate::remote_mcp::session_context::session_context(&service, &self.person)
+            .await
+            .map_err(|e| RemoteError::Failed(format!("no session to run in: {e}")))?;
+        let executor = GatedExecutor {
+            site: CallSite {
+                gates: service.tool_gates(crate::desk_surface::allows()),
+                policy: Arc::clone(&service.policy),
+                surface: crate::mcp::Surface::Fixed(Arc::clone(&surface)),
+                access: service.tool_access_snapshot(),
+                spill: service.current_spill_config(),
+                audit: CallAudit {
+                    origin: CallOrigin::BoardSync,
+                    identity_id: self.person.clone(),
+                    agent_id: service.agent_id.to_string(),
+                },
+            },
+            ctx,
+            router: service.approval_router.read().clone(),
+            mode: ApprovalMode::Park {
+                pending: Arc::new(crate::mcp_gate::PendingCalls::default()),
+                routed: self.state.registry.routed_delivery(),
+                bridge: Arc::from(Vec::new()),
+            },
+        };
+        let reply = tokio::time::timeout(CALL_TIMEOUT, executor.call(t, tool, args))
+            .await
+            .map_err(|_| RemoteError::Offline("the tool didn't answer in time".into()))?
+            .map_err(|e| RemoteError::Failed(format!("{e:#}").chars().take(300).collect()))?;
+        sync::mcp_answer(&serde_json::to_value(reply).unwrap_or_default())
+    }
+}
+
+// ── Reaching a board's Jira or Linear ────────────────────────────────────
+
+/// What a board syncs through, and what reaches it.
+pub struct BoardSync {
+    pub state: Arc<GatewayState>,
+    pub desk: Desk,
+    http: Arc<reqwest::Client>,
+}
+
+impl BoardSync {
+    pub fn new(state: Arc<GatewayState>, desk: Desk) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(CALL_TIMEOUT)
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
+        Self {
+            state,
+            desk,
+            http: Arc::new(http),
+        }
+    }
+
+    /// What reaches `system` `via` a hub (or this one), as `person`; why
+    /// not, as a board's pause says it.
+    pub async fn remote(
+        &self,
+        system: System,
+        via: &Via,
+        person: &str,
+    ) -> Result<Arc<dyn Remote>, Paused> {
+        match via {
+            Via::ThisHub => Ok(Arc::new(LocalRemote::new(
+                Arc::clone(&self.state),
+                person,
+                system,
+            ))),
+            Via::Hub { hub } => {
+                let h = self
+                    .desk
+                    .sync_hub(hub)
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or(Paused::HubUnpaired)?;
+                let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
+                let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
+                HubRemote::new(&h.url, &token, Arc::clone(&self.http))
+                    .map(|r| Arc::new(r) as Arc<dyn Remote>)
+                    .map_err(|e| Paused::Refused {
+                        reason: e.to_string(),
+                    })
+            }
+        }
+    }
+
+    /// `remote`, once it has said it offers every tool `system`'s sync
+    /// needs.
+    pub async fn offered(
+        &self,
+        system: System,
+        via: &Via,
+        person: &str,
+    ) -> Result<Arc<dyn Remote>, Paused> {
+        let remote = self.remote(system, via, person).await?;
+        let tools = remote.tools().await.map_err(|e| paused_by(&e))?;
+        let missing = sync::missing_tools(system, &tools);
+        match missing.is_empty() {
+            true => Ok(remote),
+            false => Err(Paused::Missing { tools: missing }),
+        }
+    }
+
+    /// The name a board's hub goes by, for what the board says.
+    pub async fn hub_name(&self, via: &Via) -> String {
+        match via {
+            Via::ThisHub => "This computer".to_string(),
+            Via::Hub { hub } => self
+                .desk
+                .sync_hub(hub)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| hub.clone(), |h| h.name),
+        }
+    }
+}
+
+/// What a failed call pauses a board for; `None`-like errors (a tool that
+/// failed on one issue) pause nothing, and are the caller's to handle.
+pub fn paused_by(e: &RemoteError) -> Paused {
+    match e {
+        RemoteError::Offline(_) => Paused::HubOffline {
+            since: chrono::Utc::now(),
+        },
+        RemoteError::NoToken => Paused::NoToken,
+        RemoteError::Refused(reason) => Paused::Refused {
+            reason: reason.clone(),
+        },
+        other => Paused::Refused {
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// What a hub's admin must do for a board to link through it, in plain
+/// words.
+fn missing_words(hub: &str, system: System, tools: &[String]) -> String {
+    format!(
+        "{hub} doesn't offer its {} tools to your own apps ({} missing). Ask its admin to add `{}.*` to remote MCP.",
+        system.title(),
+        tools.join(", "),
+        system.as_str()
+    )
+}
+
+fn paused_words(hub: &str, system: System, p: &Paused) -> String {
+    match p {
+        Paused::Missing { tools } => missing_words(hub, system, tools),
+        other => other.say(hub),
+    }
+}
+
+// ── Routes ───────────────────────────────────────────────────────────────
+
+struct Routes {
+    sync: Arc<BoardSync>,
+}
+
+type S = State<Arc<Routes>>;
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
+
+fn refusal(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "error": error }))).into_response()
+}
+
+/// The person asking: signed in as themselves, holding this hub.
+async fn person(r: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<String, Response> {
+    let state = &r.sync.state;
+    let caller = resolve_caller_context(state, headers, token).await;
+    match caller.auth_failure {
+        Some(AuthFailure::InvalidCredentials) => {
+            return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
+        }
+        Some(AuthFailure::StoreError) => {
+            return Err(refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hub could not check that token",
+            ))
+        }
+        None => {}
+    }
+    let Some(person) = caller.identity_id else {
+        return Err(refusal(
+            StatusCode::FORBIDDEN,
+            "A board's sync is a person's: ask as yourself, not as the hub",
+        ));
+    };
+    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, Some(&person)) {
+        return Err(refusal(
+            StatusCode::FORBIDDEN,
+            "Only the person whose Desk this is links its boards",
+        ));
+    }
+    Ok(person)
+}
+
+macro_rules! person {
+    ($r:expr, $h:expr, $q:expr) => {
+        match person(&$r, &$h, $q.token.as_deref()).await {
+            Ok(person) => person,
+            Err(refused) => return refused,
+        }
+    };
+}
+
+/// The board sync's routes.
+pub fn router(sync: Arc<BoardSync>) -> Router {
+    Router::new()
+        .route("/api/desk/sync-hubs", get(list_hubs))
+        .route("/api/desk/sync-hubs/{hub}", put(put_hub).delete(delete_hub))
+        .route("/api/desk/boards/link/check", post(check_link))
+        .route(
+            "/api/desk/boards/{id}/link",
+            put(link_board).delete(unlink_board),
+        )
+        .route("/api/desk/boards/{id}/pause", post(pause_board))
+        .with_state(Arc::new(Routes { sync }))
+}
+
+async fn list_hubs(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    let person = person!(r, h, q);
+    let hubs = match r.sync.desk.sync_hubs().await {
+        Ok(h) => h,
+        Err(e) => return e.into_response(),
+    };
+    let vault = r.sync.state.vault.as_ref();
+    let hubs: Vec<Value> = hubs
+        .into_iter()
+        .map(|hub| {
+            let has = vault.is_some_and(|v| read_token(v, &person, &hub.id).is_some());
+            json!({ "id": hub.id, "name": hub.name, "url": hub.url, "hasToken": has })
+        })
+        .collect();
+    Json(json!({ "hubs": hubs })).into_response()
+}
+
+#[derive(Deserialize)]
+struct HubBody {
+    name: String,
+    url: String,
+    /// The person's `wfr_` token for that hub, given once and never read
+    /// back. Without one, a hub kept before keeps its token.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn put_hub(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(hub): Path<String>,
+    Json(body): Json<HubBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    if let Err(e) = workforce_desk::check_hub_id(&hub) {
+        return e.into_response();
+    }
+    let url = match workforce_desk::check_hub_url(&body.url) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+    let Some(vault) = r.sync.state.vault.clone() else {
+        return refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This hub keeps no vault for the token",
+        );
+    };
+    let token = match body.token.as_deref() {
+        Some(t) => match Secret::new(t) {
+            Some(t) => Some(t),
+            None => {
+                return refusal(
+                    StatusCode::BAD_REQUEST,
+                    "That isn't a hub's token: it starts wfr_.",
+                )
+            }
+        },
+        None => None,
+    };
+    // A new token is tried before it is kept: one the hub refuses is never
+    // kept.
+    let offers = match &token {
+        Some(t) => {
+            let remote = match HubRemote::new(url.as_str(), t, Arc::clone(&r.sync.http)) {
+                Ok(remote) => remote,
+                Err(e) => return refusal(StatusCode::BAD_REQUEST, &e.to_string()),
+            };
+            match remote.tools().await {
+                Ok(tools) => Some(tools),
+                Err(RemoteError::NoToken) => {
+                    return refusal(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!(
+                            "{} refused that token; make a new one there.",
+                            body.name.trim()
+                        ),
+                    )
+                }
+                Err(e) => {
+                    return refusal(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("{} couldn't be reached with it: {e}", body.name.trim()),
+                    )
+                }
+            }
+        }
+        None => None,
+    };
+    let kept = match r
+        .sync
+        .desk
+        .put_sync_hub(&hub, &body.name, url.as_str(), &person)
+        .await
+    {
+        Ok(k) => k,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(t) = &token {
+        let key = token_key(&person, &hub);
+        if let Err(e) = vault.set_with_actor(&key, t.expose(), VaultActor::User(&person)) {
+            tracing::error!(error = %format!("{e:#}"), hub = %hub, "a hub's token wasn't kept");
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Desk couldn't keep the token. Try again.",
+            );
+        }
+        tracing::info!(target: "sentinel.audit", hub = %hub, person = %person, "a hub's token for board sync was kept");
+    }
+    let offers = offers.map(|tools| {
+        json!({
+            "jira": sync::missing_tools(System::Jira, &tools).is_empty(),
+            "linear": sync::missing_tools(System::Linear, &tools).is_empty(),
+        })
+    });
+    Json(json!({ "id": kept.id, "name": kept.name, "url": kept.url, "offers": offers }))
+        .into_response()
+}
+
+async fn delete_hub(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(hub): Path<String>,
+) -> Response {
+    let person = person!(r, h, q);
+    if let Err(e) = workforce_desk::check_hub_id(&hub) {
+        return e.into_response();
+    }
+    if let Some(vault) = r.sync.state.vault.as_ref() {
+        if let Err(e) =
+            vault.delete_with_actor(&token_key(&person, &hub), VaultActor::User(&person))
+        {
+            tracing::error!(error = %format!("{e:#}"), hub = %hub, "a hub's token wasn't removed");
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Desk couldn't remove the token. Try again.",
+            );
+        }
+    }
+    match r.sync.desk.forget_sync_hub(&hub).await {
+        Ok(()) | Err(DeskError::NotFound) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckBody {
+    system: System,
+    via: Via,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    target_id: Option<String>,
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default)]
+    me: Option<String>,
+}
+
+/// How many issues a filter's first page matched, at most.
+const MATCH_PAGE: u64 = 100;
+
+async fn check_link(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<CheckBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    if let Some(target) = body.target.as_deref() {
+        if let Err(e) = sync::check_target(body.system, target) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    if let Some(filter) = &body.filter {
+        if let Err(e) = sync::check_filter(body.system, filter, body.me.as_deref()) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    let hub = r.sync.hub_name(&body.via).await;
+    let remote = match r.sync.offered(body.system, &body.via, &person).await {
+        Ok(remote) => remote,
+        Err(p) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": paused_words(&hub, body.system, &p), "paused": p })),
+            )
+                .into_response()
+        }
+    };
+    let mut out = json!({ "offered": true });
+    let said = |e: RemoteError| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("{hub}: {e}") })),
+        )
+            .into_response()
+    };
+    if body.system == System::Linear {
+        match sync::call(&*remote, body.system, "linear.teams_list", json!({})).await {
+            Ok(teams) => out["teams"] = teams_of(&teams),
+            Err(e) => return said(e),
+        }
+    }
+    let Some(target) = body.target.as_deref() else {
+        return Json(out).into_response();
+    };
+    let states = match remote_states(&*remote, body.system, target, body.target_id.as_deref()).await
+    {
+        Ok(s) => s,
+        Err(e) => return said(e),
+    };
+    out["states"] = json!(states.iter().map(|s| &s.name).collect::<Vec<_>>());
+    out["prefill"] = json!(sync::prefill_states(&states));
+    if let Some(filter) = &body.filter {
+        let matched = match body.system {
+            System::Jira => sync::call(
+                &*remote,
+                body.system,
+                "jira.search",
+                json!({ "jql": sync::jql(target, filter, None), "max_results": MATCH_PAGE, "fields": ["summary"] }),
+            )
+            .await
+            .map(|a| {
+                sync::jira_search_issues(&a, "")
+                    .0
+                    .into_iter()
+                    .filter(|i| sync::key_in_target(&i.key, target))
+                    .count()
+            }),
+            System::Linear => {
+                let team = body.target_id.as_deref().unwrap_or_default();
+                sync::call(
+                    &*remote,
+                    body.system,
+                    "linear.issue_list",
+                    sync::linear_args(team, filter, body.me.as_deref()),
+                )
+                .await
+                .map(|a| {
+                    sync::linear_issues(&a)
+                        .into_iter()
+                        .filter(|i| sync::key_in_target(&i.key, target))
+                        .filter(|i| match filter {
+                            Filter::Label(l) => i.labels.iter().any(|x| x.eq_ignore_ascii_case(l)),
+                            _ => true,
+                        })
+                        .count()
+                })
+            }
+        };
+        match matched {
+            Ok(n) => {
+                out["matches"] = json!(n);
+                out["matchesAtLeast"] = json!(n as u64 >= MATCH_PAGE);
+            }
+            Err(e) => return said(e),
+        }
+    }
+    Json(out).into_response()
+}
+
+/// A team list as the dialog shows it: id, key and name.
+fn teams_of(answer: &Value) -> Value {
+    let teams = answer
+        .get("teams")
+        .or_else(|| answer.get("nodes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(
+        teams
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "id": t["id"],
+                    "key": t["key"],
+                    "name": sync::unfence(t["name"].as_str().unwrap_or_default()).0,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The states an issue in `target` can be in: Linear's team states with
+/// their types; Jira's from the transitions of one of the project's
+/// issues, by name.
+pub async fn remote_states(
+    remote: &dyn Remote,
+    system: System,
+    target: &str,
+    target_id: Option<&str>,
+) -> Result<Vec<RemoteState>, RemoteError> {
+    match system {
+        System::Linear => {
+            let answer = sync::call(
+                remote,
+                system,
+                "linear.states_list",
+                json!({ "team_id": target_id.unwrap_or_default() }),
+            )
+            .await?;
+            let list = answer
+                .get("states")
+                .or_else(|| answer.get("nodes"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Ok(list
+                .iter()
+                .filter_map(|s| {
+                    Some(RemoteState {
+                        name: s["name"].as_str()?.to_string(),
+                        kind: s["type"].as_str().map(str::to_string),
+                    })
+                })
+                .collect())
+        }
+        System::Jira => {
+            let page = sync::call(
+                remote,
+                system,
+                "jira.search",
+                json!({ "jql": format!("project = \"{target}\" ORDER BY updated DESC"), "max_results": 20, "fields": ["status"] }),
+            )
+            .await?;
+            let mut names: Vec<String> = vec![];
+            for i in page["issues"].as_array().into_iter().flatten() {
+                if let Some(s) = i["status"].as_str() {
+                    names.push(s.to_string());
+                }
+            }
+            if let Some(key) = page["issues"][0]["key"].as_str() {
+                let t = sync::call(
+                    remote,
+                    system,
+                    "jira.list_transitions",
+                    json!({ "issue_key": key }),
+                )
+                .await?;
+                for tr in t["transitions"].as_array().into_iter().flatten() {
+                    if let Some(s) = tr["to_status"].as_str() {
+                        names.push(s.to_string());
+                    }
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|n| seen.insert(n.to_ascii_lowercase()));
+            Ok(names
+                .into_iter()
+                .map(|name| RemoteState { name, kind: None })
+                .collect())
+        }
+    }
+}
+
+async fn link_board(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+    Json(link): Json<LinkBoard>,
+) -> Response {
+    let person = person!(r, h, q);
+    let hub = r.sync.hub_name(&link.via).await;
+    if let Err(p) = r.sync.offered(link.system, &link.via, &person).await {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": paused_words(&hub, link.system, &p), "paused": p })),
+        )
+            .into_response();
+    }
+    match r.sync.desk.link_board(id, link, &person).await {
+        Ok(b) => Json(b).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn unlink_board(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let _person = person!(r, h, q);
+    match r.sync.desk.unlink_board(id).await {
+        Ok(b) => Json(b).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PauseBody {
+    paused: bool,
+}
+
+async fn pause_board(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PauseBody>,
+) -> Response {
+    let _person = person!(r, h, q);
+    match r.sync.desk.pause_board(id, body.paused).await {
+        Ok(b) => Json(b).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The board sync for this `[desk]` hub, and its routes.
+pub fn install(state: &Arc<GatewayState>, desk: Desk) -> (Arc<BoardSync>, Router) {
+    let sync = Arc::new(BoardSync::new(Arc::clone(state), desk));
+    let routes = router(Arc::clone(&sync));
+    (sync, routes)
+}
+
+#[cfg(test)]
+#[path = "desk_board_sync_tests.rs"]
+mod tests;

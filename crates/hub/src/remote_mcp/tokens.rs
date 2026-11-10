@@ -17,6 +17,19 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 pub const TOKEN_SCOPE: &str = "remote_mcp";
+/// What a token a paired device minted carries beside [`TOKEN_SCOPE`]:
+/// `device:<device id>`. Authentication then checks that device is still
+/// paired to the token's person, and the token acts with a member's
+/// capabilities only (`super::auth`).
+pub const DEVICE_SCOPE_PREFIX: &str = "device:";
+
+/// The device a token's scopes say minted it.
+pub fn minted_by_device(scopes: &[String]) -> Option<&str> {
+    scopes
+        .iter()
+        .find_map(|s| s.strip_prefix(DEVICE_SCOPE_PREFIX))
+        .filter(|d| !d.is_empty())
+}
 const LABEL_MAX_CHARS: usize = 64;
 /// Stands in for `[hub].public_url` in any URL shown before an operator has
 /// set it, so what a user copies is visibly incomplete rather than wrong.
@@ -38,6 +51,8 @@ pub enum TokenError {
     IdentityNotActive,
     #[error("you already hold {0} live tokens; revoke one first")]
     TokenCap(u32),
+    #[error("this hub's admin hasn't let paired devices make remote MCP tokens (`[remote_mcp] allow_device_tokens`)")]
+    DevicesNotAllowed,
     #[error("token store error: {0}")]
     Store(#[from] eyre::Report),
 }
@@ -185,6 +200,49 @@ impl RemoteMcpTokenService {
     }
 
     pub fn mint(&self, identity_id: Uuid, label: &str) -> Result<Minted, TokenError> {
+        self.mint_scoped(identity_id, label, None)
+    }
+
+    /// A token the paired device `device_id` (named `device_name`) mints for
+    /// the person it is linked to, when `[remote_mcp] allow_device_tokens`
+    /// lets it: labelled "Desk on <device>", with the identity's member
+    /// scope only, and replacing any token the same device minted before, so
+    /// a device holds one and repeated links never use up the person's cap.
+    pub fn mint_for_device(
+        &self,
+        identity_id: Uuid,
+        device_id: &str,
+        device_name: &str,
+    ) -> Result<Minted, TokenError> {
+        self.require_enabled()?;
+        if !self.config.allow_device_tokens {
+            return Err(TokenError::DevicesNotAllowed);
+        }
+        self.require_active(identity_id)?;
+        let now = Utc::now();
+        for old in self.store.list_tokens_for_identity(identity_id)? {
+            if minted_by_device(&old.scopes) == Some(device_id) {
+                self.store.revoke_token(old.id, Some(identity_id), now)?;
+            }
+        }
+        let name: String = device_name
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(LABEL_MAX_CHARS - "Desk on ".len())
+            .collect();
+        let name = match name.trim() {
+            "" => "a paired device",
+            n => n,
+        };
+        self.mint_scoped(identity_id, &format!("Desk on {name}"), Some(device_id))
+    }
+
+    fn mint_scoped(
+        &self,
+        identity_id: Uuid,
+        label: &str,
+        device: Option<&str>,
+    ) -> Result<Minted, TokenError> {
         self.require_enabled()?;
         self.require_active(identity_id)?;
         let label = label.trim();
@@ -206,7 +264,9 @@ impl RemoteMcpTokenService {
             identity_id,
             label: label.to_string(),
             token_hash: minted.hash,
-            scopes: vec![TOKEN_SCOPE.to_string()],
+            scopes: std::iter::once(TOKEN_SCOPE.to_string())
+                .chain(device.map(|d| format!("{DEVICE_SCOPE_PREFIX}{d}")))
+                .collect(),
             created_at: now,
             expires_at: now + Duration::days(i64::from(self.config.token_ttl_days)),
             last_used_at: None,
@@ -219,6 +279,7 @@ impl RemoteMcpTokenService {
             token_id = %record.id,
             label = %record.label,
             expires_at = %record.expires_at,
+            minted_by_device = device.unwrap_or(""),
             "remote MCP token minted"
         );
         Ok(Minted {
@@ -417,6 +478,51 @@ mod tests {
 
         assert!(svc.revoke(me.id, first.record.id).unwrap());
         assert!(svc.mint(me.id, "third").is_ok());
+    }
+
+    #[test]
+    fn a_device_mints_only_when_the_hub_allows_it() {
+        let (off, store) = service(enabled_config(), None);
+        let me = identity(IdentityStatus::Active);
+        store.create(&me).unwrap();
+        assert!(matches!(
+            off.mint_for_device(me.id, "dev-1", "Mac"),
+            Err(TokenError::DevicesNotAllowed)
+        ));
+        assert!(off.list(me.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_device_mints_one_token_with_the_identitys_scope_and_its_name() {
+        let config = RemoteMcpConfig {
+            allow_device_tokens: true,
+            max_tokens_per_user: 2,
+            ..enabled_config()
+        };
+        let (svc, store) = service(config, None);
+        let me = identity(IdentityStatus::Active);
+        store.create(&me).unwrap();
+        let first = svc.mint_for_device(me.id, "dev-1", "Mac\n").unwrap();
+        assert_eq!(first.record.label, "Desk on Mac");
+        assert_eq!(first.record.identity_id, me.id);
+        assert_eq!(first.record.scopes, [TOKEN_SCOPE, "device:dev-1"]);
+        assert_eq!(minted_by_device(&first.record.scopes), Some("dev-1"));
+        assert_eq!(
+            first.record.expires_at - first.record.created_at,
+            Duration::days(90)
+        );
+        // Linking again replaces the device's token rather than using up
+        // the person's cap.
+        for _ in 0..3 {
+            svc.mint_for_device(me.id, "dev-1", "Mac").unwrap();
+        }
+        let live = svc.list(me.id).unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(svc.revoke(me.id, first.record.id).is_ok_and(|r| !r));
+        // A person's own tokens are untouched by a device's.
+        svc.mint(me.id, "laptop").unwrap();
+        svc.mint_for_device(me.id, "dev-1", "Mac").unwrap();
+        assert_eq!(svc.list(me.id).unwrap().len(), 2);
     }
 
     #[test]

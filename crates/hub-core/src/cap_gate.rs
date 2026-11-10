@@ -68,6 +68,9 @@ pub struct HubCapabilityGate {
     /// Where role changes are recorded, to tell a capability a person lost
     /// from one they never held.
     role_history: Option<Arc<dyn LifecycleOpStore>>,
+    /// Score every caller as a member, whatever their role
+    /// ([`CapabilityGate::as_member`]).
+    member_only: bool,
 }
 
 impl HubCapabilityGate {
@@ -79,6 +82,7 @@ impl HubCapabilityGate {
             identity_store,
             matrix,
             role_history: None,
+            member_only: false,
         }
     }
 
@@ -92,7 +96,15 @@ impl HubCapabilityGate {
     }
 
     fn principal(&self, user_id: &str) -> Option<Principal> {
-        resolve_principal(self.identity_store.as_ref(), user_id)
+        let principal = resolve_principal(self.identity_store.as_ref(), user_id)?;
+        Some(match self.member_only {
+            true => Principal {
+                identity_id: principal.identity_id,
+                status: principal.status,
+                ..fallback_principal()
+            },
+            false => principal,
+        })
     }
 
     /// Human-readable, action-named denial — mirrors `reject_non_admin`'s
@@ -239,6 +251,15 @@ impl HubCapabilityGate {
 }
 
 impl CapabilityGate for HubCapabilityGate {
+    fn as_member(&self) -> Option<Arc<dyn CapabilityGate>> {
+        Some(Arc::new(Self {
+            identity_store: self.identity_store.clone(),
+            matrix: self.matrix.clone(),
+            role_history: None,
+            member_only: true,
+        }))
+    }
+
     fn lost(&self, user_id: &str, tool: &str, input: &serde_json::Value) -> bool {
         self.principal(user_id).is_some_and(|principal| {
             self.lacking(&principal, tool, input)
@@ -337,6 +358,26 @@ mod tests {
             HubCapabilityGate::new(Some(Arc::new(store)), empty_matrix()),
             id,
         )
+    }
+
+    /// A gate held to a member denies an administrator what a member is
+    /// denied, and nothing more.
+    #[test]
+    fn a_gate_held_to_a_member_scores_an_admin_as_one() {
+        let (gate, admin) = gate_with(IdentityRole::SystemAdmin, IdentityStatus::Active);
+        let input = serde_json::json!({});
+        assert!(gate
+            .deny_reason(&admin, "a", "agent.create", &input)
+            .is_none());
+        let member = gate
+            .as_member()
+            .expect("the hub gate can be held to a member");
+        assert!(member
+            .deny_reason(&admin, "a", "agent.create", &input)
+            .is_some());
+        assert!(member
+            .deny_reason(&admin, "a", "system.enable_skill", &input)
+            .is_none());
     }
 
     #[test]
