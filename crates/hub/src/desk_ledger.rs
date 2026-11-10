@@ -74,22 +74,27 @@ impl Pricer for HubPricer {
         Some(tracker.calculate_cost(&key, t.input, t.output, t.cache_write, t.cache_read))
     }
 
-    /// A model the table has no row for, counted as its engine's plan
-    /// family at its dearest rates ([`CostTracker::calculate_cost`]), so a
-    /// budget never counts it low.
-    fn estimate(&self, engine: Engine, _billing: Billing, model: &str, t: &Tokens) -> Option<f64> {
-        let tracker = (self.tracker)()?;
+    /// A model the table has no row for on a plan engine (Codex, or Claude
+    /// Code on a plan), counted as that plan's family at its dearest rates
+    /// ([`CostTracker::calculate_cost`]), so a budget never counts it low.
+    /// Any other engine's is left unpriced, as before.
+    fn estimate(&self, engine: Engine, billing: Billing, model: &str, t: &Tokens) -> Option<f64> {
         let bare = model.split('[').next().unwrap_or(model).trim();
-        let key = match engine {
-            Engine::Codex => format!("codex:{bare}"),
-            Engine::Claude => format!("claude-code:{bare}"),
-            Engine::Gemini
-            | Engine::Copilot
-            | Engine::OpenCode
-            | Engine::Cursor
-            | Engine::Devin
-            | Engine::Custom => bare.to_string(),
+        let key = match (engine, billing) {
+            (Engine::Codex, _) => format!("codex:{bare}"),
+            (Engine::Claude, Billing::Plan) => format!("claude-code:{bare}"),
+            (Engine::Claude, Billing::Key | Billing::Vendor | Billing::Unknown)
+            | (
+                Engine::Gemini
+                | Engine::Copilot
+                | Engine::OpenCode
+                | Engine::Cursor
+                | Engine::Devin
+                | Engine::Custom,
+                _,
+            ) => return None,
         };
+        let tracker = (self.tracker)()?;
         Some(tracker.calculate_cost(&key, t.input, t.output, t.cache_write, t.cache_read))
     }
 }
@@ -167,6 +172,39 @@ mod tests {
             .usd(Engine::Codex, Billing::Plan, "gpt-5.6-sol", &t)
             .unwrap();
         assert!(codex >= sol, "{codex} vs {sol}");
+    }
+
+    #[test]
+    fn only_a_plan_engine_is_estimated() {
+        let pricer = HubPricer::with(table());
+        let t = Tokens {
+            input: 1_000,
+            ..Default::default()
+        };
+        for engine in [
+            Engine::Gemini,
+            Engine::Copilot,
+            Engine::OpenCode,
+            Engine::Cursor,
+            Engine::Devin,
+            Engine::Custom,
+        ] {
+            assert_eq!(
+                pricer.estimate(engine, Billing::Plan, "new-model", &t),
+                None,
+                "{engine:?}"
+            );
+        }
+        assert_eq!(
+            pricer.estimate(Engine::Claude, Billing::Key, "claude-new", &t),
+            None
+        );
+        assert!(pricer
+            .estimate(Engine::Claude, Billing::Plan, "claude-new", &t)
+            .is_some());
+        assert!(pricer
+            .estimate(Engine::Codex, Billing::Key, "gpt-new", &t)
+            .is_some());
     }
 
     #[test]

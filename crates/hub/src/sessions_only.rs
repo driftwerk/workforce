@@ -14,6 +14,10 @@
 //!   followed, inside a git work tree, a Desk session's folder, a project
 //!   checkout or the hub's worktrees.
 //!
+//! What a call does decides as much as what its tool is called: any tool
+//! whose call runs a command is refused, and any whose call writes, deletes
+//! or moves a path inside code (an MCP server's, a WASM skill's).
+//!
 //! What only reads still runs, and so do writes elsewhere in the agent's own
 //! workspace (its notes, memory and scratch files). Workflow coding steps and
 //! pilot rounds run their own CLIs, not these tools, and are not held.
@@ -85,11 +89,6 @@ pub fn is_held(name: &str) -> bool {
     Held::of(name).is_some()
 }
 
-/// Whether a call with `effect` only reads.
-fn reads_only(effect: &Effect) -> bool {
-    matches!(effect, Effect::None | Effect::Read { .. })
-}
-
 /// The folders whose files are code, beyond any git work tree: the hub's
 /// worktrees and project checkouts, and the folders Desk's sessions run in.
 pub type CodeRoots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
@@ -129,10 +128,11 @@ impl Bounds {
     fn touches_code(&self, path: &Path) -> bool {
         let path = resolved(path);
         let workspace = resolved(&self.workspace);
+        let folded = folded(&path);
         if (self.code)()
             .iter()
-            .map(|root| resolved(root))
-            .any(|root| path.starts_with(&root))
+            .map(|root| folded_buf(resolved(root)))
+            .any(|root| folded.starts_with(&root))
         {
             return true;
         }
@@ -144,24 +144,40 @@ impl Bounds {
             .any(|dir| dir.join(".git").exists())
     }
 
-    /// Why a call of a `held` tool acting as `effect` may not run now.
-    fn refusal(&self, held: Held, effect: &Effect) -> Option<&'static str> {
-        let refused = match held {
-            Held::Coding => !reads_only(effect),
-            Held::Shell => true,
-            Held::Files => match effect {
+    /// Why a call of a tool `held` names (none for any other tool) acting
+    /// as `effect` may not run now. What a call does decides, whatever its
+    /// tool is called: a command it runs is refused, and so is a write,
+    /// delete or move that touches code. A tool named as held is refused
+    /// besides for what it can't say it only reads.
+    fn refusal(&self, held: Option<Held>, effect: &Effect) -> Option<&'static str> {
+        // Most calls are none of this: say so before reading anything.
+        let may_be = matches!(held, Some(Held::Shell))
+            || match effect {
                 Effect::None | Effect::Read { .. } => false,
-                Effect::Write { paths } | Effect::Delete { paths } => {
-                    paths.iter().any(|p| self.touches_code(p))
-                }
-                Effect::Move { from, to } => from.iter().chain([to]).any(|p| self.touches_code(p)),
                 Effect::Exec { .. }
-                | Effect::Session { .. }
-                | Effect::Connector { .. }
-                | Effect::Unknown => true,
-            },
+                | Effect::Write { .. }
+                | Effect::Delete { .. }
+                | Effect::Move { .. } => true,
+                Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown => {
+                    held.is_some()
+                }
+            };
+        if !may_be || !always_sessions(&self.workspace) {
+            return None;
+        }
+        let touches = |paths: &[&PathBuf]| paths.iter().any(|p| self.touches_code(p));
+        let refused = match (held, effect) {
+            (Some(Held::Shell), _) | (_, Effect::Exec { .. }) => true,
+            (_, Effect::None | Effect::Read { .. }) => false,
+            (Some(Held::Coding), _) => true,
+            (_, Effect::Write { paths } | Effect::Delete { paths }) => {
+                touches(&paths.iter().collect::<Vec<_>>())
+            }
+            (_, Effect::Move { from, to }) => touches(&from.iter().chain([to]).collect::<Vec<_>>()),
+            (Some(Held::Files), _) => true,
+            (None, Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown) => false,
         };
-        (refused && always_sessions(&self.workspace)).then_some(ALWAYS_SESSIONS)
+        refused.then_some(ALWAYS_SESSIONS)
     }
 }
 
@@ -189,6 +205,20 @@ fn resolved(path: &Path) -> PathBuf {
     }
 }
 
+/// `path` as compared on this computer: on macOS, whose disks ignore case,
+/// lowercased, so `~/Code/App` and `~/code/app` are one folder.
+fn folded(path: &Path) -> PathBuf {
+    folded_buf(path.to_path_buf())
+}
+
+fn folded_buf(path: PathBuf) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path
+    }
+}
+
 /// The folders Desk's sessions run in, on a hub running Desk.
 fn desk_session_folders() -> Vec<PathBuf> {
     #[cfg(feature = "postgres")]
@@ -202,43 +232,28 @@ fn desk_session_folders() -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Hold the shell and file tools in `tools` to the switch, in place (the
-/// ones the registry was built with). Coding tools are held as they are
-/// registered.
-pub fn hold_registered(tools: &workforce_agent::tools::registry::ToolRegistry, bounds: &Bounds) {
-    for name in tools.names() {
-        let general = matches!(Held::of(&name), Some(Held::Shell | Held::Files));
-        if let Some(tool) = tools.get(&name).filter(|_| general) {
-            tools.register(SessionsOnly::wrap(tool, bounds));
-        }
-    }
+/// Hold every tool `tools` has and is given later — and every copy of it
+/// takes — to the switch within `bounds`: MCP, WASM and skill tools as much
+/// as the hub's own, since what a call does decides.
+pub fn hold(tools: &workforce_agent::tools::registry::ToolRegistry, bounds: &Bounds) {
+    let bounds = bounds.clone();
+    tools.guard_with(Arc::new(move |tool| SessionsOnly::wrap(tool, &bounds)));
 }
 
-/// `service`'s bounds: its workspace, the hub's worktrees and project
-/// checkouts, and Desk's session folders.
-pub fn bounds_of(service: &crate::serve::AgentService) -> Bounds {
-    let roots = crate::serve::compose::tool_roots(&service.config, &service.workspace);
-    Bounds::of_agent(&service.workspace, roots.into_iter().skip(1).collect())
-}
-
-/// A held tool that refuses its working calls while its agent always works
-/// in real sessions.
+/// A tool that refuses its working calls while its agent always works in
+/// real sessions.
 pub struct SessionsOnly {
     inner: Arc<dyn Tool>,
-    held: Held,
+    held: Option<Held>,
     bounds: Bounds,
 }
 
 impl SessionsOnly {
-    /// `tool`, held to the switch within `bounds` when it is a held tool
-    /// ([`is_held`]); any other tool as it is.
+    /// `tool`, held to the switch within `bounds`.
     pub fn wrap(tool: Arc<dyn Tool>, bounds: &Bounds) -> Arc<dyn Tool> {
-        let Some(held) = Held::of(tool.name()) else {
-            return tool;
-        };
         Arc::new(Self {
+            held: Held::of(tool.name()),
             inner: tool,
-            held,
             bounds: bounds.clone(),
         })
     }
@@ -606,34 +621,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registry_built_with_a_shell_and_file_tools_has_them_held() {
+    async fn any_tool_is_held_by_what_its_call_does_whatever_its_name() {
         let at = Place::new(ON);
-        let registry = ToolRegistry::new();
-        for (name, effect) in [
-            ("exec.run", exec as fn(&serde_json::Value) -> Effect),
-            ("filesystem.write", write),
-            ("filesystem.read", read),
-            ("memory.remember", write),
-        ] {
-            registry.register(Arc::new(Probe { name, effect }));
-        }
-        hold_registered(&registry, &at.bounds);
-        let call = |name: &str, input: serde_json::Value| {
-            let tool = registry.get(name).unwrap();
-            async move { tool.execute(input).await.unwrap().success }
-        };
-        assert!(!call("exec.run", json!({})).await);
-        assert!(!call("filesystem.write", json!({"path": at.path("repo/a.rs")})).await);
+        // An MCP server's shell, a WASM skill's build: they run commands.
+        assert!(!at.runs("mcp__ops__shell", exec, json!({})).await);
+        assert!(!at.runs("wasm_skill.build", exec, json!({})).await);
+        // An MCP server's file write lands in code; elsewhere it runs.
         assert!(
-            call(
-                "filesystem.write",
+            !at.runs(
+                "mcp__fs__write_file",
+                write,
+                json!({"path": at.path("repo/src/a.rs")})
+            )
+            .await
+        );
+        assert!(
+            !at.runs(
+                "wasm_skill.scaffold",
+                write,
+                json!({"path": at.path("worktrees/wt-1/s")})
+            )
+            .await
+        );
+        assert!(
+            at.runs(
+                "mcp__fs__write_file",
+                write,
                 json!({"path": at.path("agent/notes/a.md")})
             )
             .await
         );
-        assert!(call("filesystem.read", json!({})).await);
-        assert!(call("memory.remember", json!({})).await, "not a held tool");
+        // Starting a session, a connector, a tool that names nothing: run.
+        assert!(at.runs("crew.start_session", session, json!({})).await);
+        assert!(at.runs("memory.remember", unknown, json!({})).await);
+    }
+
+    #[tokio::test]
+    async fn a_registry_holds_every_tool_it_has_and_gets_and_its_copies_do_too() {
+        let at = Place::new(ON);
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(Probe {
+            name: "exec.run",
+            effect: exec,
+        }));
+        hold(&registry, &at.bounds);
+        registry.register(Arc::new(Probe {
+            name: "mcp__fs__write_file",
+            effect: write,
+        }));
+        let copy = ToolRegistry::follow(&registry, |_| true);
+        copy.register(Arc::new(Probe {
+            name: "exec.run",
+            effect: exec,
+        }));
+        let runs = |registry: &ToolRegistry, name: &str, input: serde_json::Value| {
+            let tool = registry.get(name).unwrap();
+            async move { tool.execute(input).await.unwrap().success }
+        };
+        assert!(!runs(&registry, "exec.run", json!({})).await);
+        assert!(
+            !runs(
+                &registry,
+                "mcp__fs__write_file",
+                json!({"path": at.path("repo/a.rs")})
+            )
+            .await
+        );
+        assert!(
+            runs(
+                &registry,
+                "mcp__fs__write_file",
+                json!({"path": at.path("agent/notes/a.md")})
+            )
+            .await
+        );
+        assert!(
+            !runs(&copy, "exec.run", json!({})).await,
+            "a turn's own exec.run"
+        );
         assert!(is_held("coding.session") && is_held("exec.run") && is_held("fs.remove"));
         assert!(!is_held("crew.start_session") && !is_held("filesystem.read"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_code_folder_named_in_another_case_is_the_same_folder_on_macos() {
+        let at = Place::new(ON);
+        let upper = at.path("Session-Folder/a.rs");
+        assert!(
+            !at.runs("mcp__fs__write_file", write, json!({"path": upper}))
+                .await
+        );
     }
 }

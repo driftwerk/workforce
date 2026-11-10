@@ -1281,12 +1281,7 @@ pub fn register_coding_session_tool(
         Arc::clone(&engine),
     ));
     fanout.host();
-    service
-        .tools
-        .register(crate::sessions_only::SessionsOnly::wrap(
-            fanout,
-            &crate::sessions_only::bounds_of(service),
-        ));
+    service.tools.register(fanout);
     let tool = crate::coding_session_tool::CodingSessionTool::new(
         Arc::clone(service),
         project_store,
@@ -1299,12 +1294,7 @@ pub fn register_coding_session_tool(
         launcher,
         engine,
     );
-    service
-        .tools
-        .register(crate::sessions_only::SessionsOnly::wrap(
-            Arc::new(tool),
-            &crate::sessions_only::bounds_of(service),
-        ));
+    service.tools.register(Arc::new(tool));
     info!(
         target: "coding_session",
         agent = %service.agent_id,
@@ -1338,13 +1328,10 @@ pub fn register_claude_code_tool(service: &Arc<AgentService>) {
     ];
     service
         .tools
-        .register(crate::sessions_only::SessionsOnly::wrap(
-            Arc::new(crate::claude_code_tool::ClaudeCodeTool::new(
-                Arc::clone(service),
-                paths,
-            )),
-            &crate::sessions_only::bounds_of(service),
-        ));
+        .register(Arc::new(crate::claude_code_tool::ClaudeCodeTool::new(
+            Arc::clone(service),
+            paths,
+        )));
     info!(agent = %service.agent_id, "Claude Code tool registered (coding.claude)");
 }
 
@@ -2691,11 +2678,10 @@ fn register_code_tools(
     // Register native coding tools, each held to "always work in real
     // sessions" (`crate::sessions_only`).
     let bounds = crate::sessions_only::Bounds::of_agent(workspace, tool_paths[1..].to_vec());
-    // The shell and file tools the registry was built with, too.
-    crate::sessions_only::hold_registered(tools, &bounds);
-    let register = |tool: Arc<dyn workforce_agent::tools::Tool>| {
-        tools.register(crate::sessions_only::SessionsOnly::wrap(tool, &bounds));
-    };
+    // Every tool the agent has, and every one it gets later (MCP, WASM,
+    // skills, coding sessions), and every copy a turn or worker runs on.
+    crate::sessions_only::hold(tools, &bounds);
+    let register = |tool: Arc<dyn workforce_agent::tools::Tool>| tools.register(tool);
     // Include worktrees dir so code tools can access workflow worktree files.
     let mut allowed_paths = vec![workspace.clone()];
     allowed_paths.push(worktrees_dir.clone());
