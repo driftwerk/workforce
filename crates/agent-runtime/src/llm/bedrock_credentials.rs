@@ -248,8 +248,8 @@ fn profile_provider(profile: &str) -> SharedCredentialsProvider {
     )
 }
 
-/// Every message along `error`'s chain of causes, lower case: the SDK puts
-/// what went wrong in a source, not in the top-level message.
+/// Every message along `error`'s chain of causes: the SDK puts what went
+/// wrong in a source, not in the top-level message.
 fn causes(error: &(dyn std::error::Error + 'static)) -> String {
     let mut out = error.to_string();
     let mut next = error.source();
@@ -258,7 +258,7 @@ fn causes(error: &(dyn std::error::Error + 'static)) -> String {
         out.push_str(&cause.to_string());
         next = cause.source();
     }
-    out.to_lowercase()
+    out
 }
 
 /// Whether a failure to load `profile` is its SSO sign-in having run out:
@@ -284,14 +284,20 @@ fn profile_failure(
     profile: &str,
     error: &aws_credential_types::provider::error::CredentialsError,
 ) -> String {
-    let causes = causes(error);
+    let said = causes(error);
+    let causes = said.to_lowercase();
     if sso_expired(&causes) {
         return sso_expired_message(profile);
     }
     if causes.contains("was not defined") || causes.contains("no profiles were defined") {
         return format!("There is no AWS profile named {profile} in ~/.aws/config on the machine the hub runs on.");
     }
-    format!("AWS gave no credentials for profile {profile}: {causes}")
+    // What AWS or a credential process said can carry a key or a token:
+    // hidden before anyone reads it.
+    format!(
+        "AWS gave no credentials for profile {profile}: {}",
+        workforce_common::redact::redact_secrets(&said)
+    )
 }
 
 /// Whether an AWS answer says the signing credentials have expired.
@@ -643,6 +649,26 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("credential_process exited with 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_profile_failure_never_shows_a_key_it_carries() {
+        let resolver = CredentialResolver::from_profile_provider(
+            "work",
+            SharedCredentialsProvider::new(FailsWith(
+                "credential_process printed AKIAIOSFODNN7EXAMPLE and aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            )),
+        );
+        let err = resolver.resolve().await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("AWS gave no credentials for profile work: "),
+            "{err}"
+        );
+        assert!(!err.contains("AKIAIOSFODNN7EXAMPLE"), "{err}");
+        assert!(
+            !err.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
