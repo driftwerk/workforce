@@ -33,6 +33,7 @@ use workforce_common::settings::SecretStore;
 use crate::adapters::credential_resolver::resolve_vault_refs;
 
 use super::config::{BrowserSkillConfig, MAX_WAIT_MS};
+use super::untrusted::{self, Seen};
 
 const VAULT_PREFIX: &str = "browser_creds/";
 const MIN_SCREENSHOT_BYTES: usize = 200;
@@ -55,6 +56,12 @@ fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
 const DEFAULT_AGENT: &str = "default";
 const PROFILE_ROOT_NAME: &str = "workforce-browser";
 const LEGACY_PROFILE_DIR: &str = "chromiumoxide-runner";
+
+/// What the browser session of `agent` for `user` has read, if it has a
+/// page: the hub's gate reads it.
+pub fn page_state(agent: &str, user: &str) -> Option<untrusted::PageState> {
+    untrusted::state(&SessionId::derive(agent, user).0)
+}
 
 /// Stable, filesystem-safe handle for one `(agent, user)` browser session. The
 /// digest both keys the in-memory cell registry and names the on-disk Chromium
@@ -188,6 +195,8 @@ struct Active {
 /// Chromium lifecycle bound to an isolated on-disk `profile_dir`.
 struct SessionCell {
     config: Arc<BrowserSkillConfig>,
+    /// Its [`SessionId`], which keys what it has read ([`untrusted`]).
+    key: String,
     profile_dir: PathBuf,
     inner: Mutex<Option<Active>>,
     respawn: Mutex<RespawnBudget>,
@@ -196,10 +205,22 @@ struct SessionCell {
     consecutive_timeouts: AtomicUsize,
 }
 
+impl Drop for SessionCell {
+    fn drop(&mut self) {
+        untrusted::forget(&self.key);
+    }
+}
+
 impl SessionCell {
-    fn new(config: Arc<BrowserSkillConfig>, profile_dir: PathBuf, now: Instant) -> Self {
+    fn new(
+        config: Arc<BrowserSkillConfig>,
+        key: String,
+        profile_dir: PathBuf,
+        now: Instant,
+    ) -> Self {
         Self {
             config,
+            key,
             profile_dir,
             inner: Mutex::new(None),
             respawn: Mutex::new(RespawnBudget::new(RESPAWN_WINDOW_MS, RESPAWN_LIMIT)),
@@ -369,9 +390,19 @@ impl SessionCell {
                 .and_then(|r| r.into_value::<String>().ok())
                 .unwrap_or_default();
             let final_url = page.url().await.ok().flatten().unwrap_or(url);
-            Ok(json!({ "url": final_url, "title": title }))
+            untrusted::on(&self.key, &final_url);
+            let mut seen = Seen::at(&final_url);
+            let title = seen.text(&title);
+            Ok(seen.into_output(&self.key, json!({ "url": final_url, "title": title })))
         })
         .await
+    }
+
+    /// The page's address as the browser has it now, noted for the gate.
+    async fn current_url(&self, page: &Page) -> String {
+        let url = page.url().await.ok().flatten().unwrap_or_default();
+        untrusted::on(&self.key, &url);
+        url
     }
 
     async fn snapshot(&self) -> Result<Value> {
@@ -388,8 +419,13 @@ impl SessionCell {
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok())
                 .unwrap_or_default();
-            let url = page.url().await.ok().flatten().unwrap_or_default();
-            Ok(json!({ "url": url, "title": title, "body_text": body_text }))
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let (title, body_text) = (seen.text(&title), seen.text(&body_text));
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "url": url, "title": title, "body_text": body_text }),
+            ))
         })
         .await
     }
@@ -517,7 +553,10 @@ impl SessionCell {
                 .await
                 .wrap_err("evaluate failed")?;
             let value = result.into_value::<Value>().unwrap_or(Value::Null);
-            Ok(json!({ "result": value }))
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let value = seen.value(value);
+            Ok(seen.into_output(&self.key, json!({ "result": value })))
         })
         .await
     }
@@ -558,25 +597,37 @@ impl SessionCell {
                 .into_value::<String>()
                 .unwrap_or_default();
             let len = content.len();
-            Ok(json!({ "format": format, "content": content, "size_bytes": len }))
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let content = seen.text(&content);
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "format": format, "content": content, "size_bytes": len }),
+            ))
         })
         .await
     }
 
     async fn network_requests(&self) -> Result<Value> {
-        self.with_page(|_p, network_log, _c| async move {
-            let log = network_log.lock().await;
-            let entries: Vec<Value> = log.iter().cloned().collect();
-            Ok(json!({ "count": entries.len(), "requests": entries }))
+        self.with_page(|page, network_log, _c| async move {
+            let entries: Vec<Value> = network_log.lock().await.iter().cloned().collect();
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let count = entries.len();
+            let requests = seen.value(Value::Array(entries));
+            Ok(seen.into_output(&self.key, json!({ "count": count, "requests": requests })))
         })
         .await
     }
 
     async fn console_messages(&self) -> Result<Value> {
-        self.with_page(|_p, _n, console_log| async move {
-            let log = console_log.lock().await;
-            let entries: Vec<Value> = log.iter().cloned().collect();
-            Ok(json!({ "count": entries.len(), "messages": entries }))
+        self.with_page(|page, _n, console_log| async move {
+            let entries: Vec<Value> = console_log.lock().await.iter().cloned().collect();
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let count = entries.len();
+            let messages = seen.value(Value::Array(entries));
+            Ok(seen.into_output(&self.key, json!({ "count": count, "messages": messages })))
         })
         .await
     }
@@ -693,6 +744,7 @@ impl BrowserClient {
                 .or_insert_with(|| {
                     Arc::new(SessionCell::new(
                         self.config.clone(),
+                        target.0.clone(),
                         self.profile_root.join(&target.0),
                         now,
                     ))
@@ -703,7 +755,8 @@ impl BrowserClient {
             let live_dirs: HashSet<PathBuf> =
                 sessions.values().map(|c| c.profile_dir.clone()).collect();
 
-            let reap = {
+            // Kept profiles (Desk's, signed in by hand) are never reaped.
+            let reap = !self.config.keep_profiles && {
                 let mut last = self.last_reap.lock().unwrap();
                 let due = should_reap(
                     *last,
@@ -962,6 +1015,12 @@ async fn launch_chromium(
         Some(path) => builder.chrome_executable(path),
         None => builder,
     };
+    // On screen, so the person can watch it and sign in once by hand.
+    let builder = if config.show {
+        builder.with_head()
+    } else {
+        builder
+    };
     let cfg = builder
         .build()
         .map_err(|e| eyre!("invalid chromium config: {e}"))?;
@@ -1192,7 +1251,7 @@ fn stage_pdf_artifact(bytes: Vec<u8>, filename: &str) -> Result<Value> {
 /// Extract the lowercase host from a URL for egress matching. Strips the
 /// scheme, any `userinfo@`, the path/query/fragment, and the `:port`. Returns
 /// `None` for an empty or scheme-only string.
-fn host_of(url: &str) -> Option<String> {
+pub(super) fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = after_scheme
         .split(['/', '?', '#'])

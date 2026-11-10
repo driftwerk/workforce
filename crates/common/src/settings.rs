@@ -10217,6 +10217,39 @@ pub struct SkillsConfig {
     /// binary; each install opts in by pointing at one or more catalogs.
     #[serde(default)]
     pub catalogs: Vec<CatalogSource>,
+    /// The browser skill. See [`BrowserSkillsConfig`].
+    #[serde(default)]
+    pub browser: BrowserSkillsConfig,
+}
+
+/// `[skills.browser]`: where the browser skill keeps its profiles and
+/// whether its window shows.
+///
+/// ```toml
+/// [skills.browser]
+/// # profile_root = "/var/lib/workforce/browser"
+/// # show = true
+/// # chrome_binary = "/usr/bin/chromium"
+/// ```
+///
+/// On a hub with `[desk]`, profiles live in Desk's own folder
+/// (`…/Desk/browser`), which every agent's tools are kept from, they are
+/// never reaped (the person signs in to them once, by hand), and the window
+/// shows. Elsewhere they live in the system's temp folder and are reaped
+/// after a week, headless, as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSkillsConfig {
+    /// Where profiles live, in place of the default above. Profiles under a
+    /// root named here are never reaped.
+    #[serde(default)]
+    pub profile_root: Option<String>,
+    /// Show the window (`true`) or run headless (`false`); unset, it shows
+    /// on Desk only.
+    #[serde(default)]
+    pub show: Option<bool>,
+    /// The Chrome or Chromium to run; found on `PATH` where unset.
+    #[serde(default)]
+    pub chrome_binary: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -10228,6 +10261,7 @@ impl Default for SkillsConfig {
             metabase: MetabaseSyncConfig::default(),
             auto_load: true,
             catalogs: Vec::new(),
+            browser: BrowserSkillsConfig::default(),
         }
     }
 }

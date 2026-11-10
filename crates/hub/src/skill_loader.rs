@@ -3915,13 +3915,39 @@ fn load_notion_from_vault(
     })
 }
 
+/// The browser skill as this hub runs it: `[skills.browser]` over its
+/// defaults. On Desk, profiles live in Desk's own folder (which every
+/// agent's tools are kept from), are never reaped, and the window shows, so
+/// the person can watch it and sign in once by hand.
+pub(crate) fn browser_skill_config(
+    config: &WorkforceConfig,
+) -> workforce_skills::adapters::browser::BrowserSkillConfig {
+    let set = &config.skills.browser;
+    let named = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let desk = crate::desk_folder::browser_profiles(config);
+    let profile_root =
+        named(&set.profile_root).or_else(|| desk.as_ref().map(|d| d.display().to_string()));
+    workforce_skills::adapters::browser::BrowserSkillConfig {
+        chrome_binary: named(&set.chrome_binary),
+        keep_profiles: profile_root.is_some(),
+        profile_root,
+        show: set.show.unwrap_or(desk.is_some()),
+        ..Default::default()
+    }
+}
+
 fn load_browser_from_vault(
     vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
-    _config: &WorkforceConfig,
+    config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
-    let config = workforce_skills::adapters::browser::BrowserSkillConfig::default();
+    let config = browser_skill_config(config);
     let store = layered_user_store(vault, global_vault);
     let skill = workforce_skills::adapters::browser::BrowserSkill::with_store(config, store)?;
     let tools = skill.tools();
@@ -4988,6 +5014,45 @@ mod tests {
         assert!(tpl.contains("response_mode = \"mention_only\""));
         assert!(tpl.contains("thread_isolation = true"));
         assert!(tpl.contains("paragraph_spacing = true"));
+    }
+
+    /// On Desk the browser keeps its profiles in Desk's folder, never reaped,
+    /// on screen; elsewhere it runs as before: temp folder, reaped, headless.
+    #[test]
+    fn browser_skill_config_puts_desks_profiles_in_desks_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().canonicalize().unwrap().join("Desk/hub/data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut config = WorkforceConfig::default();
+        config.hub.data_dir = data.display().to_string();
+
+        let server = browser_skill_config(&config);
+        assert_eq!(server.profile_root, None, "no [desk]: the temp default");
+        assert!(!server.keep_profiles && !server.show);
+
+        config.desk.enabled = true;
+        let desk = browser_skill_config(&config);
+        let root = desk.profile_root.clone().expect("Desk's folder");
+        assert_eq!(
+            std::path::PathBuf::from(&root),
+            dir.path().canonicalize().unwrap().join("Desk/browser")
+        );
+        assert!(desk.keep_profiles, "Desk's profiles are never reaped");
+        assert!(desk.show, "Desk's browser shows by default");
+
+        config.skills.browser.show = Some(false);
+        config.skills.browser.chrome_binary = Some("/opt/chrome".into());
+        let hidden = browser_skill_config(&config);
+        assert!(!hidden.show);
+        assert_eq!(hidden.chrome_binary.as_deref(), Some("/opt/chrome"));
+    }
+
+    #[test]
+    fn browser_skills_config_reads_from_install_toml() {
+        let config: workforce_common::settings::SkillsConfig =
+            toml::from_str("[browser]\nprofile_root = \"/srv/browser\"\nshow = true\n").unwrap();
+        assert_eq!(config.browser.profile_root.as_deref(), Some("/srv/browser"));
+        assert_eq!(config.browser.show, Some(true));
     }
 
     #[test]
