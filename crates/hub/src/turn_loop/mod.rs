@@ -4254,6 +4254,8 @@ pub(crate) fn worker_tool_registry(
 ) -> workforce_agent::tools::registry::ToolRegistry {
     let registry = crate::mcp::build_mcp_registry(&service.tools, &worker_tool_patterns());
     registry.register(Arc::new(crate::findings::ReportFindingsTool));
+    // A worker's tools are its agent's own, held to "always work in real
+    // sessions" alike (`crate::sessions_only::hold`).
     registry
 }
 

@@ -1788,6 +1788,8 @@ impl Desk {
             prompt: Some(board::handed_text(&key, t, &needs)),
             approvals: None,
             approve_for_me: false,
+            // As its boss runs: an agent's `[llm] fast`.
+            fast: self.fast_for(engine, boss),
             account: None,
             env: BTreeMap::new(),
             group,

@@ -1,0 +1,10 @@
+{
+  "models": [
+    {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "description": "Frontier model for the hardest work.", "visibility": "list", "priority": 2, "context_window": 272000, "default_reasoning_level": "medium", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}], "service_tiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}], "additional_speed_tiers": ["fast"]},
+    {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "description": "Latest workhorse model for coding and everyday work.", "visibility": "list", "priority": 1, "context_window": 500000, "default_reasoning_level": "low", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}], "service_tiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}]},
+    {"slug": "gpt-6.2-nova", "display_name": "GPT-6.2-Nova", "description": "A model released after Desk was.", "visibility": "list", "priority": 3, "context_window": 400000, "default_reasoning_level": "medium", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}], "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed"}]},
+    {"slug": "gpt-6-luna", "display_name": "GPT-6-Luna", "description": "Quick model.", "visibility": "list", "priority": 4, "context_window": 272000, "default_reasoning_level": "medium", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}], "service_tiers": []},
+    {"slug": "codex-auto-review", "visibility": "hide", "priority": 9},
+    {"visibility": "list", "display_name": "No slug, skipped"}
+  ]
+}

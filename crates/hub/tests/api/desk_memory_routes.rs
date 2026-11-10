@@ -50,6 +50,7 @@ fn session(name: &str, cwd: &Path, transcript: &Path) -> SessionRecord {
         view: View::Terminal,
         engine_version: Some("2.1.300".into()),
         approve_for_me: false,
+        fast: false,
         account: None,
         name: name.into(),
         goal: "fix the login race".into(),

@@ -6454,6 +6454,7 @@ impl AgentRunner {
         // takes.
         let thinking_override = crate::llm::provider::thinking_budget_override();
         let effort = crate::llm::provider::effort_override();
+        let fast = crate::llm::provider::fast_mode();
         let stream_handle = spawn_in_session_context(async move {
             with_cached_prefix(
                 cached_prefix,
@@ -6463,14 +6464,17 @@ impl AgentRunner {
                         thinking_override,
                         crate::llm::provider::with_effort_override(
                             effort,
-                            llm.create_message_stream(
-                                Some(&system_prompt),
-                                &messages_owned,
-                                &tool_defs_owned,
-                                model.as_deref(),
-                                max_tokens,
-                                true,
-                                stream_tx,
+                            crate::llm::provider::with_fast_mode(
+                                fast,
+                                llm.create_message_stream(
+                                    Some(&system_prompt),
+                                    &messages_owned,
+                                    &tool_defs_owned,
+                                    model.as_deref(),
+                                    max_tokens,
+                                    true,
+                                    stream_tx,
+                                ),
                             ),
                         ),
                     ),
@@ -11075,6 +11079,7 @@ mod tests {
     struct BudgetProbeProvider {
         seen: std::sync::Mutex<Option<Option<u32>>>,
         effort: std::sync::Mutex<Option<crate::llm::anthropic::Effort>>,
+        fast: std::sync::Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -11110,6 +11115,7 @@ mod tests {
         ) -> Result<()> {
             *self.seen.lock().unwrap() = Some(crate::llm::provider::thinking_budget_override());
             *self.effort.lock().unwrap() = crate::llm::provider::effort_override();
+            *self.fast.lock().unwrap() = crate::llm::provider::fast_mode();
             let _ = tx.send(StreamEvent::ContentStart { index: 0 }).await;
             let _ = tx
                 .send(StreamEvent::TextDelta {
@@ -11133,6 +11139,7 @@ mod tests {
         let provider = Arc::new(BudgetProbeProvider {
             seen: std::sync::Mutex::new(None),
             effort: std::sync::Mutex::new(None),
+            fast: std::sync::Mutex::new(false),
         });
         let runner = make_runner(provider.clone());
         let (tx, _rx) = mpsc::channel(64);
@@ -11152,11 +11159,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_turns_fast_mode_survives_the_streaming_spawn() {
+        let provider = Arc::new(BudgetProbeProvider {
+            seen: std::sync::Mutex::new(None),
+            effort: std::sync::Mutex::new(None),
+            fast: std::sync::Mutex::new(false),
+        });
+        let runner = make_runner(provider.clone());
+        let (tx, _rx) = mpsc::channel(64);
+
+        crate::llm::provider::with_fast_mode(true, runner.run_with_progress("Hi", tx))
+            .await
+            .unwrap();
+
+        assert!(*provider.fast.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn the_turns_effort_survives_the_streaming_spawn() {
         use crate::llm::anthropic::Effort;
         let provider = Arc::new(BudgetProbeProvider {
             seen: std::sync::Mutex::new(None),
             effort: std::sync::Mutex::new(None),
+            fast: std::sync::Mutex::new(false),
         });
         let runner = make_runner(provider.clone());
         let (tx, _rx) = mpsc::channel(64);
@@ -11176,6 +11201,7 @@ mod tests {
         let provider = Arc::new(BudgetProbeProvider {
             seen: std::sync::Mutex::new(None),
             effort: std::sync::Mutex::new(None),
+            fast: std::sync::Mutex::new(false),
         });
         let runner = make_runner(provider.clone());
         let (tx, _rx) = mpsc::channel(64);

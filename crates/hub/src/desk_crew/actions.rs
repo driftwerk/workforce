@@ -1744,6 +1744,9 @@ impl CrewHub {
                     prompt: Some(goal.clone()),
                     approvals: None,
                     approve_for_me: false,
+                    // A Codex session the overseer starts runs as fast as
+                    // the overseer does (`[llm] fast`).
+                    fast: engine == Engine::Codex && service.resolved.snapshot().fast,
                     account: None,
                     env: Default::default(),
                     group: self.boss_group(&service, &o),

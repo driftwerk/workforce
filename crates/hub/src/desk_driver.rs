@@ -216,9 +216,47 @@ struct HubAccounts {
     /// Where the person's Google login (Application Default Credentials) is
     /// on this machine, if they have one.
     google_login: GoogleLogin,
+    /// Where a plan is asked which models it lists now.
+    plans: Option<PlanSource>,
 }
 
 type GoogleLogin = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
+/// How Desk asks a plan which models it lists: on the hub's shared
+/// subscriptions, with the login the hub's own work would run on (the one
+/// Desk's sign-in stores).
+#[derive(Clone)]
+struct PlanSource {
+    shared: crate::subscription::SharedSubscriptions,
+    scope: crate::subscription::CredentialScope,
+}
+
+impl PlanSource {
+    async fn listed(
+        &self,
+        kind: SubscriptionKind,
+    ) -> Option<Vec<workforce_desk::providers::Listed>> {
+        use crate::subscription::catalog;
+        let models = match kind {
+            SubscriptionKind::ChatGpt => catalog::chatgpt_models(&self.shared, &self.scope).await,
+            SubscriptionKind::Claude => catalog::claude_models(&self.shared, &self.scope).await,
+        }?;
+        Some(
+            models
+                .iter()
+                .map(|m| workforce_desk::providers::Listed {
+                    id: m.id.clone(),
+                    resolves_to: m.resolves_to.clone(),
+                    name: m.name.clone(),
+                    description: m.description.clone(),
+                    efforts: m.efforts.clone(),
+                    default_effort: m.default_effort.clone(),
+                    fast: m.fast.clone(),
+                })
+                .collect(),
+        )
+    }
+}
 
 /// The subscription a plan provider signs in to.
 fn plan(spec: &Spec) -> Option<SubscriptionKind> {
@@ -418,11 +456,17 @@ impl Accounts for HubAccounts {
             return Standing::default();
         };
         if let Some(kind) = plan(spec) {
+            let connected = vault
+                .get(kind.vault_key())
+                .is_some_and(|v| !v.trim().is_empty());
+            let listed = match (&self.plans, connected) {
+                (Some(plans), true) => plans.listed(kind).await,
+                _ => None,
+            };
             return Standing {
-                connected: vault
-                    .get(kind.vault_key())
-                    .is_some_and(|v| !v.trim().is_empty()),
+                connected,
                 installed: Vec::new(),
+                listed,
             };
         }
         let Ok((kind, name)) = metered(spec) else {
@@ -433,6 +477,7 @@ impl Accounts for HubAccounts {
             return Standing {
                 connected: vault.find_account(name).is_some(),
                 installed: Vec::new(),
+                listed: None,
             };
         }
         if spec.group != Group::Local {
@@ -441,6 +486,7 @@ impl Accounts for HubAccounts {
                     .find_account_api_key(name)
                     .is_some_and(|key| !key.trim().is_empty()),
                 installed: Vec::new(),
+                listed: None,
             };
         }
         let (Some(server), Some((url, token))) = (Server::of(spec.id), self.endpoint(kind)) else {
@@ -452,6 +498,7 @@ impl Accounts for HubAccounts {
             // Ollama is connected when it answers; vLLM when it has an address.
             connected: installed.is_some() || server == Server::Vllm,
             installed: installed.unwrap_or_default(),
+            listed: None,
         }
     }
 
@@ -772,6 +819,15 @@ pub async fn mount(
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
     desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
+    // The Codex sessions an agent starts run as fast as it does.
+    desk.agent_fast_with({
+        let registry = Arc::clone(&state.registry);
+        Arc::new(move |agent: &str| {
+            registry
+                .get(agent)
+                .is_some_and(|service| service.resolved.snapshot().fast)
+        })
+    });
     for service in state.registry.all_services() {
         register_tools(&service);
     }
@@ -803,6 +859,17 @@ pub async fn mount(
                 Arc::new(move || crate::gateway::login_vaults(&state))
             },
             google_login: Arc::new(adc_file),
+            plans: state
+                .registry
+                .host()
+                .zip(state.vault.clone())
+                .map(|(host, vault)| PlanSource {
+                    shared: host.subscriptions().clone(),
+                    scope: crate::subscription::CredentialScope::system(
+                        vault,
+                        &config.subscription,
+                    ),
+                }),
         }),
         crew,
     )))
@@ -1117,6 +1184,7 @@ mod tests {
                 vault: Some(Arc::clone(vault)),
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             }
         }
 
@@ -1479,6 +1547,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             }
             .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
             .await
@@ -1510,6 +1579,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             };
             for spec in PROVIDERS {
                 let models: Vec<&str> = match spec.lists_installed() {
@@ -1529,6 +1599,38 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+
+        /// A model a plan lists now that Desk's table doesn't (one released
+        /// since) loads as Desk offers it, once the plan's list is read, and
+        /// so does Fast mode; before the list is read it still loads.
+        #[test]
+        fn a_model_released_since_and_fast_mode_load() {
+            let admission = admission();
+            let toml = |provider, model, effort| {
+                format!("{}fast = true\n", agent_toml(provider, model, effort))
+            };
+            let before = admission
+                .review_toml(&toml("chatgpt", "gpt-test-released", Some("high")))
+                .expect("it loads before the plan's list is read");
+            assert!(before.iter().all(|f| !f.is_refused()), "{before:?}");
+            let body: serde_json::Value = serde_json::from_str(include_str!(
+                "../../agent-runtime/src/llm/testdata/chatgpt/models_live.json"
+            ))
+            .unwrap();
+            workforce_agent::llm::responses::ChatGptModel::learn(
+                "desk-login",
+                &workforce_agent::llm::responses::parse_catalog(&body),
+            );
+            for (provider, model, effort) in [
+                ("chatgpt", "gpt-6.2-nova", Some("high")),
+                ("claude-code", "claude-fable-5-2", Some("max")),
+            ] {
+                let findings = admission
+                    .review_toml(&toml(provider, model, effort))
+                    .unwrap_or_else(|e| panic!("{provider} {model}: {e}"));
+                assert!(findings.is_empty(), "{provider} {model}: {findings:?}");
             }
         }
 
@@ -1565,6 +1667,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             };
             let bedrock = spec("bedrock").unwrap();
             let unhonoured: Vec<&str> = bedrock

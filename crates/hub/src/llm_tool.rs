@@ -993,10 +993,12 @@ impl SystemListModelsTool {
         }
     }
 
-    /// The models a subscription provider runs: what the ChatGPT backend
-    /// serves, and for the CLIs the models the agent's tiers name.
+    /// The models a subscription provider runs: the ChatGPT backend's
+    /// built-in list, and for the CLIs the models the agent's tiers name.
+    /// A plan's live list is its login's alone (Desk's picker reads it for
+    /// the person's own login), so none is mixed in here.
     fn subscription_models(&self, kind: ProviderKind) -> Vec<ModelInfo> {
-        let ids = match kind {
+        let ids: Vec<String> = match kind {
             ProviderKind::ChatGpt => ChatGptModel::ALL
                 .iter()
                 .map(|model| model.id().to_string())
@@ -3664,18 +3666,23 @@ mod tests {
             listed(ProviderKind::Codex).await,
             ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
         );
-        assert_eq!(
-            listed(ProviderKind::ChatGpt).await,
-            [
-                "gpt-6.1-sol",
-                "gpt-6-astra",
-                "gpt-6-sol",
-                "gpt-6-luna",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna"
-            ]
-        );
+        // The live catalogue comes first once read (another test may have
+        // had it read); every built-in model stays listed either way.
+        let chatgpt = listed(ProviderKind::ChatGpt).await;
+        for built_in in [
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(
+                chatgpt.iter().any(|id| id == built_in),
+                "{built_in}: {chatgpt:?}"
+            );
+        }
     }
 
     #[tokio::test]

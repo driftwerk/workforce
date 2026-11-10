@@ -701,8 +701,13 @@ impl Tool for CodeRefactorTool {
     }
 
     fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
-        workforce_core::computer::Effect::Write {
-            paths: super::utils::effect_paths(input, "path", &self.roots),
+        let paths = super::utils::effect_paths(input, "path", &self.roots);
+        match input["action"].as_str() {
+            // Lookups: they change nothing.
+            Some("diagnostics" | "references" | "definition") => {
+                workforce_core::computer::Effect::Read { paths }
+            }
+            _ => workforce_core::computer::Effect::Write { paths },
         }
     }
 

@@ -867,6 +867,9 @@ impl Desk {
             prompt: Some(brief::short_prompt(r.engine, named(r), false, tools)),
             approvals: None,
             approve_for_me: false,
+            // As the session handed from ran, or as the agent handing it
+            // over runs (`[llm] fast`).
+            fast: c.target == Engine::Codex && (r.fast || self.fast_for(c.target, &by.party)),
             account: c.ask.account,
             env: Default::default(),
             group: c.facts.source_group.clone(),

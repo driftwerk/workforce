@@ -203,27 +203,14 @@ impl Tool for SubAgentTool {
     }
 }
 
-/// Why an overseer that prefers real sessions may not spawn a full
-/// sub-agent: the work is to be seen. Read-only lookups (`worker`) run.
-const PREFER_SESSIONS: &str = "Desk is set to prefer real sessions: start one with crew.start_session so the person can watch it. Sub-agents here are for read-only lookups (profile \"worker\").";
-
 impl SubAgentTool {
-    /// Why `profile` may not run for this agent: it oversees the crew and
-    /// prefers real sessions (`[oversight.work] prefer_sessions`), and the
-    /// sub-agent would do work rather than look things up.
+    /// Why `profile` may not run for this agent: it always works in real
+    /// sessions ([`crate::sessions_only`]), and the sub-agent would do work
+    /// rather than look things up.
     fn prefers_sessions(&self, profile: AgentProfile) -> Option<&'static str> {
-        if profile == AgentProfile::Worker {
-            return None;
-        }
-        let oversight =
-            workforce_common::settings::AgentWorkspaceConfig::load(&self.service.workspace)
-                .ok()
-                .flatten()
-                .and_then(|c| c.oversight().ok())
-                .unwrap_or_default();
-        // Watching only, it starts no sessions: its sub-agents run as before.
-        let starts = oversight.level != workforce_common::oversight::Level::Watch;
-        (oversight.enabled && starts && oversight.work.prefer_sessions).then_some(PREFER_SESSIONS)
+        (profile != AgentProfile::Worker
+            && crate::sessions_only::always_sessions(&self.service.workspace))
+        .then_some(crate::sessions_only::ALWAYS_SESSIONS)
     }
 
     async fn handle_spawn(&self, input: SubAgentInput, start: Instant) -> Result<ToolResult> {
@@ -596,26 +583,26 @@ mod tests {
         // goes as far as the runner).
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
         }
         config("[oversight]\nenabled = true\nlevel = \"act\"\n");
         for p in [None, Some("full")] {
             let r = tool.execute(spawn(p)).await.unwrap();
             assert!(!r.success);
-            assert_eq!(said(r), PREFER_SESSIONS, "{p:?}");
+            assert_eq!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
         }
         let r = tool.execute(spawn(Some("worker"))).await.unwrap();
-        assert_ne!(said(r), PREFER_SESSIONS);
+        assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS);
         // Watching only, it has no sessions to start instead.
         config("[oversight]\nenabled = true\nlevel = \"watch\"\n");
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
         }
         config("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n");
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
         }
     }
 

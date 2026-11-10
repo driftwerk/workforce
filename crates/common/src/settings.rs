@@ -7490,6 +7490,20 @@ pub struct AgentLlmConfig {
     /// ```
     #[serde(default)]
     pub effort: Option<String>,
+    /// Ask for the provider's faster service tier on the agent's turns,
+    /// where its model offers one: the ChatGPT backend's `priority` tier
+    /// (Codex's Fast mode), sent only to a model its catalogue lists with
+    /// the tier. The catalogue words it per model ("2x speed, increased
+    /// usage" on some): faster replies that can use the plan's limits
+    /// sooner. Read every turn; a provider or model without the tier
+    /// ignores it.
+    ///
+    /// ```toml
+    /// [llm]
+    /// fast = true
+    /// ```
+    #[serde(default)]
+    pub fast: Option<bool>,
     /// Model tier equivalences across providers. Maps tier names ("powerful",
     /// "standard", "cheap") to lists of equivalent models. Used by adaptive
     /// routing and failover to pick the right model when switching providers.

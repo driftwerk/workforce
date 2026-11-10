@@ -5,6 +5,7 @@
 //! `claude-code` completions ([`completion`]).
 
 pub use crate::hub_core::logins::chatgpt_auth;
+pub mod catalog;
 mod cli_kind;
 pub mod completion;
 pub use crate::hub_core::logins::cooldown;
@@ -728,7 +729,7 @@ mod tests {
             [Finding {
                 severity: Severity::Warning,
                 spec: "chatgpt:gpt-4o".into(),
-                message: "\"chatgpt:gpt-4o\": gpt-4o is not served on a ChatGPT plan here; use gpt-6.1-sol; calls for this model skip the chatgpt route".into(),
+                message: "\"chatgpt:gpt-4o\": gpt-4o isn't a model this hub knows on a ChatGPT plan; calls for it run if the plan lists it, and skip the chatgpt route if it doesn't".into(),
             }]
         );
     }

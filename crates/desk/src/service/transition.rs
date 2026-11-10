@@ -469,6 +469,7 @@ mod tests {
                 view: View::Terminal,
                 engine_version: None,
                 approve_for_me: false,
+                fast: false,
                 account: None,
                 name: "auth-fix".into(),
                 goal: String::new(),

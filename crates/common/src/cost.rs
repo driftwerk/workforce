@@ -291,6 +291,49 @@ fn default_pricing() -> HashMap<String, ModelPricing> {
 
 // ─── CostTracker ─────────────────────────────────────────────────────────────
 
+/// The subscription plan route `model`'s cost key is on, if any.
+fn plan_route(model: &str) -> Option<&'static str> {
+    ["chatgpt:", "claude-code:", "codex:"]
+        .into_iter()
+        .find(|route| model.starts_with(route))
+}
+
+/// The dearest input, output, cache-read and cache-write rates among the
+/// priced models of `route`, each on its own.
+fn family_ceiling(
+    pricing: &HashMap<String, ModelPricing>,
+    route: &str,
+) -> Option<(f64, f64, f64, f64)> {
+    pricing
+        .iter()
+        .filter(|(key, _)| key.starts_with(route))
+        .map(|(_, p)| {
+            (
+                p.input_per_million,
+                p.output_per_million,
+                p.cache_read_per_million.unwrap_or(p.input_per_million),
+                p.cache_write_per_million.unwrap_or(p.input_per_million),
+            )
+        })
+        .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.max(b.2), a.3.max(b.3)))
+}
+
+/// Say once per model that a plan call on it has no price.
+fn warn_unpriced_once(model: &str) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(model.to_string());
+    if first {
+        tracing::info!(
+            model,
+            "no price for this plan model yet: its calls are counted at its plan's dearest rates"
+        );
+    }
+}
+
 impl CostTracker {
     pub fn new() -> Self {
         Self {
@@ -424,22 +467,56 @@ impl CostTracker {
         cache_read_input_tokens: u64,
     ) -> f64 {
         let pricing = self.model_pricing.read();
+        let at = |input: f64, output: f64, cache_read: f64, cache_write: f64| {
+            (input_tokens as f64 * input / 1_000_000.0)
+                + (output_tokens as f64 * output / 1_000_000.0)
+                + (cache_creation_input_tokens as f64 * cache_write / 1_000_000.0)
+                + (cache_read_input_tokens as f64 * cache_read / 1_000_000.0)
+        };
         if let Some(p) = pricing.get(model) {
-            let cache_read_rate = p.cache_read_per_million.unwrap_or(p.input_per_million);
-            let cache_write_rate = p.cache_write_per_million.unwrap_or(p.input_per_million);
-            (input_tokens as f64 * p.input_per_million / 1_000_000.0)
-                + (output_tokens as f64 * p.output_per_million / 1_000_000.0)
-                + (cache_creation_input_tokens as f64 * cache_write_rate / 1_000_000.0)
-                + (cache_read_input_tokens as f64 * cache_read_rate / 1_000_000.0)
+            at(
+                p.input_per_million,
+                p.output_per_million,
+                p.cache_read_per_million.unwrap_or(p.input_per_million),
+                p.cache_write_per_million.unwrap_or(p.input_per_million),
+            )
+        } else if let Some(rates) =
+            plan_route(model).and_then(|route| family_ceiling(&pricing, route))
+        {
+            // A plan model released since the table was written: priced at
+            // the dearest rates its plan's models have, so a budget never
+            // counts it low. Desk names it as having no price of its own.
+            warn_unpriced_once(model);
+            at(rates.0, rates.1, rates.2, rates.3)
         } else {
             // Default estimate for unknown models ($3/$15 per M — Sonnet-tier).
             // Cache rates default to 0.10× / 1.25× of the input rate.
             let input_rate = 3.0;
-            (input_tokens as f64 * input_rate / 1_000_000.0)
-                + (output_tokens as f64 * 15.0 / 1_000_000.0)
-                + (cache_creation_input_tokens as f64 * input_rate * 1.25 / 1_000_000.0)
-                + (cache_read_input_tokens as f64 * input_rate * 0.10 / 1_000_000.0)
+            at(input_rate, 15.0, input_rate * 0.10, input_rate * 1.25)
         }
+    }
+
+    /// What a call on `model` with these tokens costs, and whether that is
+    /// its own price; `false` for an estimate ([`Self::calculate_cost`]'s
+    /// conservative one for a model with no row).
+    pub fn priced_cost(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+    ) -> (f64, bool) {
+        (
+            self.calculate_cost(
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            ),
+            self.is_priced(model),
+        )
     }
 
     /// Whether the pricing map has an entry for `model`. A `false` means
@@ -852,6 +929,41 @@ mod tests {
         let tracker = CostTracker::new();
         let cost = tracker.calculate_cost("unknown-model", 1_000_000, 1_000_000, 0, 0);
         assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn a_plan_model_without_a_price_counts_at_its_plans_dearest_rates() {
+        let tracker = CostTracker::new();
+        let rate = |model: &str, input, output, cache_read, cache_write| ModelPricing {
+            model: model.into(),
+            input_per_million: input,
+            output_per_million: output,
+            cache_read_per_million: Some(cache_read),
+            cache_write_per_million: Some(cache_write),
+            source: None,
+            updated_at: None,
+        };
+        tracker.set_pricing(rate("chatgpt:sol", 5.0, 30.0, 0.5, 5.0));
+        tracker.set_pricing(rate("chatgpt:astra", 10.0, 20.0, 1.0, 2.0));
+        let (cost, own) = tracker.priced_cost(
+            "chatgpt:gpt-6.2-nova",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert!(!own);
+        assert_eq!(
+            cost,
+            10.0 + 30.0 + 5.0 + 1.0,
+            "each rate at its family's highest"
+        );
+        let (_, own) = tracker.priced_cost("chatgpt:sol", 1, 1, 0, 0);
+        assert!(own);
+        // A plan with no priced model, and a metered model, are estimated
+        // at the usual default: never nothing.
+        assert!(tracker.calculate_cost("codex:gpt-9", 1_000_000, 0, 0, 0) > 0.0);
+        assert!(tracker.calculate_cost("some-new-api-model", 1_000_000, 0, 0, 0) > 0.0);
     }
 
     #[test]

@@ -749,6 +749,7 @@ mod tests {
             view: View::Terminal,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             name: "acme-web".into(),
             goal: String::new(),

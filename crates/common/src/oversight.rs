@@ -223,8 +223,9 @@ impl TakeOn {
 /// How the overseer runs sessions for the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Work {
-    /// Real, visible sessions for the work; helpers only for read-only
-    /// lookups.
+    /// Always work in real, visible sessions: no coding work in-process
+    /// (`code.*` and `coding.*` calls that change or run something) and
+    /// helpers only for read-only lookups. The key keeps its first name.
     pub prefer_sessions: bool,
     /// How many of its sessions may be starting or working at once.
     pub parallel: u32,
@@ -702,7 +703,7 @@ impl Oversight {
                     work,
                     "prefer_sessions",
                     d.work.prefer_sessions,
-                    "preferring real sessions to helpers",
+                    "always using real sessions",
                 )?,
                 parallel: whole(
                     work,
@@ -1056,7 +1057,7 @@ mod tests {
             ),
             (
                 "[oversight]\nwork = { prefer_sessions = \"yes\" }\n",
-                "Whether preferring real sessions to helpers is on or off must be true or false.",
+                "Whether always using real sessions is on or off must be true or false.",
             ),
             (
                 "[oversight]\nwork = { engine = \"Claude Code\" }\n",

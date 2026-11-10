@@ -88,6 +88,13 @@ tokio::task_local! {
     /// [`THINKING_BUDGET_OVERRIDE`].
     static REASONING_EFFORT: super::anthropic::Effort;
 
+    /// The agent's `[llm] fast` for the turn in scope: its calls ask the
+    /// provider's faster service tier where the model offers one (the
+    /// ChatGPT backend's `priority`). Set once per turn from the agent's live
+    /// config and carried across the streaming spawn by hand like
+    /// [`REASONING_EFFORT`].
+    static FAST_MODE: bool;
+
     /// Number of leading messages that recur byte-identically on the next
     /// turn (the replayed history). Set by the runner for round 1 of a turn
     /// with history so providers place the message breakpoint at the end of
@@ -163,6 +170,24 @@ where
     match budget {
         Some(b) => THINKING_BUDGET_OVERRIDE.scope(b, fut).await,
         None => fut.await,
+    }
+}
+
+/// Whether the turn in scope asks for the faster service tier. See
+/// [`FAST_MODE`].
+pub fn fast_mode() -> bool {
+    FAST_MODE.try_with(|v| *v).unwrap_or(false)
+}
+
+/// Run `fut` asking for the faster service tier when `fast`; `false` is a
+/// plain passthrough.
+pub async fn with_fast_mode<F>(fast: bool, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    match fast {
+        true => FAST_MODE.scope(true, fut).await,
+        false => fut.await,
     }
 }
 

@@ -118,15 +118,15 @@ impl DeskStore {
                 "INSERT INTO sessions (id, engine, name, goal, cwd, branch, origin, state, \
                  approvals, cli_session_id, transcript, last_prompt, last_reply, external_pid, \
                  restore_offer, created_at, updated_at, terminal_id, display_name, asked, \
-                 state_at, view, engine_version, approve_for_me, account, folder_chosen) \
+                 state_at, view, engine_version, approve_for_me, account, folder_chosen, fast) \
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, \
-                 $17, $21, $22, $23, $24, $25) \
+                 $17, $21, $22, $23, $24, $25, $26) \
                  ON CONFLICT (id) DO UPDATE SET engine = $2, name = $3, goal = $4, cwd = $5, \
                  branch = $6, origin = $7, state = $8, approvals = $9, cli_session_id = $10, \
                  transcript = $11, last_prompt = $12, last_reply = $13, external_pid = $14, \
                  restore_offer = $15, updated_at = $17, terminal_id = $18, display_name = $19, \
                  asked = $20, view = $21, engine_version = $22, approve_for_me = $23, account = $24, \
-                 folder_chosen = $25, \
+                 folder_chosen = $25, fast = $26, \
                  state_at = CASE WHEN sessions.state = $8 THEN sessions.state_at ELSE $17 END",
                 &[
                     &r.id,
@@ -154,6 +154,7 @@ impl DeskStore {
                     &r.approve_for_me,
                     &r.account,
                     &r.folder_chosen,
+                    &r.fast,
                 ],
             )
             .await
@@ -304,6 +305,7 @@ pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
         view: View::parse(row.try_get("view")?)?,
         engine_version: row.try_get("engine_version")?,
         approve_for_me: row.try_get("approve_for_me")?,
+        fast: row.try_get("fast")?,
         account: row.try_get("account")?,
         name: row.try_get("name")?,
         goal: row.try_get("goal")?,
@@ -359,6 +361,7 @@ pub(crate) mod tests {
             view: View::Terminal,
             engine_version: Some("2.1.300".into()),
             approve_for_me: false,
+            fast: false,
             account: None,
             name: name.into(),
             goal: "fix the auth race".into(),
