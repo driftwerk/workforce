@@ -1386,8 +1386,27 @@ impl Session {
     pub fn clear_driver_claude_session_uuid(&mut self, project: &str) {
         let obj = self.metadata_object_mut();
         obj.remove(&format!("driver_claude_session_uuid:{project}"));
+        obj.remove(&format!("driver_engine:{project}"));
         obj.remove(&format!("driver_chat_turn_count:{project}"));
         obj.remove(&format!("driver_chat_last_reply_at:{project}"));
+    }
+
+    /// The engine `project`'s driver thread runs on, fixed at its first
+    /// round so a later change of the agent's provider never moves it to
+    /// another CLI (and loses its thread); `None` before then, or once the
+    /// thread is dropped.
+    pub fn driver_engine(&self, project: &str) -> Option<crate::settings::CodingEngineKind> {
+        self.metadata
+            .get(format!("driver_engine:{project}"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Fix `project`'s driver thread to `engine`.
+    pub fn set_driver_engine(&mut self, project: &str, engine: crate::settings::CodingEngineKind) {
+        if let Ok(value) = serde_json::to_value(engine) {
+            self.metadata_object_mut()
+                .insert(format!("driver_engine:{project}"), value);
+        }
     }
 
     /// Completed `coding.session` rounds under `project`'s current driver

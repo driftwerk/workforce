@@ -143,8 +143,10 @@ pub struct Mark {
     pub activity: Activity,
 }
 
-/// The state a line says, when it is a turn marker (`task_started`,
-/// `task_complete`, `turn_aborted`). Only the event kind is read.
+/// The state a line says, when it is a turn marker: `task_started`,
+/// `task_complete` (what Codex writes, 0.166 included) or their newer names
+/// `turn_started` and `turn_complete` (which its reader takes for them),
+/// and `turn_aborted`. Only the event kind is read.
 fn marker(line: &str) -> Option<Activity> {
     // Cheap test first: most lines are tool calls and output.
     if !line.contains("\"event_msg\"") || !line.contains("\"task_") && !line.contains("\"turn_") {
@@ -155,8 +157,8 @@ fn marker(line: &str) -> Option<Activity> {
         return None;
     }
     match v["payload"]["type"].as_str()? {
-        "task_started" => Some(Activity::Working),
-        "task_complete" | "turn_aborted" => Some(Activity::Done),
+        "task_started" | "turn_started" => Some(Activity::Working),
+        "task_complete" | "turn_complete" | "turn_aborted" => Some(Activity::Done),
         _ => None,
     }
 }
@@ -434,6 +436,67 @@ mod tests {
             Activity::Working
         );
         assert_eq!(at(&["task_started", "turn_aborted"]), Activity::Done);
+    }
+
+    /// A rollout Codex 0.166 wrote (against a stand-in model), its session
+    /// line first, kept as `id` in `home`.
+    fn recorded(home: &Path, id: &str, recording: &str) -> PathBuf {
+        let dir = home.join(".codex/sessions/2026/11/10");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-11-10T16-47-47-{id}.jsonl"));
+        std::fs::write(&path, recording).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_turn_ends_in_every_shape_codex_writes() {
+        let home = tempfile::tempdir().unwrap();
+        // Today's (0.166): `task_started` … `task_complete`, with its turn,
+        // attribution, and a failed turn's error; or `turn_aborted`.
+        for (id, recording) in [
+            (
+                "ok",
+                include_str!("../fixtures/codex/rollout-0.166-ok.jsonl"),
+            ),
+            (
+                "failed",
+                include_str!("../fixtures/codex/rollout-0.166-failed.jsonl"),
+            ),
+            (
+                "interrupted",
+                include_str!("../fixtures/codex/rollout-0.166-interrupted.jsonl"),
+            ),
+        ] {
+            // Up to its last line, working; with it, done.
+            let (begun, _end) = recording.trim_end().rsplit_once('\n').unwrap();
+            let path = recorded(home.path(), id, &format!("{begun}\n"));
+            assert_eq!(
+                activity(&path, None).unwrap().activity,
+                Activity::Working,
+                "{id}"
+            );
+            std::fs::write(&path, recording).unwrap();
+            assert_eq!(
+                activity(&path, None).unwrap().activity,
+                Activity::Done,
+                "{id}"
+            );
+        }
+        // Older rollouts: the bare event kinds.
+        let old = session(
+            home.path(),
+            "old",
+            "/w",
+            None,
+            &["task_started", "task_complete"],
+        );
+        assert_eq!(activity(&old, None).unwrap().activity, Activity::Done);
+        // The newer names Codex's reader takes for the same events.
+        let new = session(home.path(), "new", "/w", None, &["turn_started"]);
+        let m = activity(&new, None).unwrap();
+        assert_eq!(m.activity, Activity::Working);
+        append(&new, &["turn_complete"], 0);
+        assert_eq!(activity(&new, Some(&m)).unwrap().activity, Activity::Done);
     }
 
     fn append(path: &Path, kinds: &[&str], filler: usize) {

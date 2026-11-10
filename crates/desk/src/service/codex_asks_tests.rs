@@ -408,3 +408,62 @@ async fn an_agents_codex_sessions_run_as_fast_as_the_agent() {
     })
     .await;
 }
+
+/// A turn that hits the plan's usage limit, as Codex 0.166 recorded it:
+/// its thread goes to `systemError`, never `idle`, and the session is done
+/// with it rather than working for good.
+#[tokio::test]
+async fn a_codex_turn_that_failed_leaves_its_session_done() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Floor {
+                turns: None,
+                plans: None,
+                pricer: None,
+                redactor: None,
+                index: None,
+                deriver: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let server = serve(dir.path());
+        let s = d
+            .create(codex_session(dir.path(), false), None)
+            .await
+            .unwrap();
+        let mut ws = server.await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "initialized").await;
+        let recording = include_str!("../../fixtures/codex/app-server-0.166-failed.jsonl");
+        let lines: Vec<Value> = recording
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let (turn, end) = lines.split_at(lines.len() - 3);
+        for v in turn {
+            say(&mut ws, v.clone()).await;
+        }
+        until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
+        assert_eq!(
+            d.view(s.id).unwrap().last_prompt.as_deref(),
+            Some("fix the failing test")
+        );
+        // `systemError`, the error, and the turn's completion as failed.
+        for v in end {
+            say(&mut ws, v.clone()).await;
+        }
+        until(|| d.view(s.id).unwrap().state == SessionState::Done).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            d.view(s.id).unwrap().state,
+            SessionState::Done,
+            "and stays so"
+        );
+    })
+    .await;
+}

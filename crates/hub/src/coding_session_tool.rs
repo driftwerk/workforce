@@ -374,6 +374,10 @@ struct RoundPlan {
     /// Whom the round bills apart from who it runs as, whose plan pays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bill_to: Option<String>,
+    /// The engine its thread is fixed to, for an engine that picks per
+    /// agent; `None` for one that is always itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<workforce_common::settings::CodingEngineKind>,
 }
 
 impl RoundPlan {
@@ -708,6 +712,13 @@ impl CodingSessionTool {
         }
 
         let uuid = session.get_or_init_driver_claude_uuid(&project.name);
+        // The thread's engine, fixed at its first round: a provider changed
+        // since never moves it to another CLI, which would lose its thread.
+        let pinned = session.driver_engine(&project.name);
+        let (_, engine) = crate::coding_engine::picked(&self.engine, &self.service, pinned);
+        if let Some(kind) = engine.filter(|kind| pinned != Some(*kind)) {
+            session.set_driver_engine(&project.name, kind);
+        }
         self.persist(&session)?;
         Ok(RoundPlan {
             key: RoundKey::new(),
@@ -717,7 +728,17 @@ impl CodingSessionTool {
             resumed,
             identity: principal.run_as,
             bill_to: principal.bill_to,
+            engine,
         })
+    }
+
+    /// The engine a prepared round runs on, the same for every step of its
+    /// call: the kind its thread is fixed to, else this tool's engine.
+    fn engine_of(&self, plan: &RoundPlan) -> Arc<dyn CodingEngine> {
+        match plan.engine {
+            Some(kind) => crate::coding_engine::picked(&self.engine, &self.service, Some(kind)).0,
+            None => Arc::clone(&self.engine),
+        }
     }
 
     /// Run a prepared round to its result, from its start or, collecting it,
@@ -732,6 +753,7 @@ impl CodingSessionTool {
         from: Option<Resume>,
         start: Instant,
     ) -> ToolResult {
+        let engine = self.engine_of(plan);
         let elapsed = || start.elapsed().as_millis() as u64;
         let project = match self.project_store.get(&self.agent_id, &plan.project) {
             Ok(Some(p)) => p,
@@ -807,7 +829,7 @@ impl CodingSessionTool {
         let first = match first {
             Some(jobs) => {
                 let leg = round(plan.uuid, plan.resumed, jobs, from_start.then_some(plan));
-                match self.run_leg(leg, ctx).await {
+                match self.run_leg(leg, ctx, &engine).await {
                     Ok(ran) => Some(ran),
                     Err(e) => return ToolResult::failure(e, elapsed()),
                 }
@@ -830,13 +852,19 @@ impl CodingSessionTool {
                 let moved = self.session(session_id).and_then(|mut session| {
                     session.clear_driver_claude_session_uuid(&project.name);
                     session.set_driver_claude_uuid(&project.name, &uuid.to_string());
+                    if let Some(kind) = plan.engine {
+                        session.set_driver_engine(&project.name, kind);
+                    }
                     self.persist(&session)
                 });
                 if let Err(e) = moved {
                     return ToolResult::failure(e, elapsed());
                 }
                 let jobs = cold.unwrap_or_else(|| plan.key.jobs(true));
-                match self.run_leg(round(uuid, false, jobs, None), ctx).await {
+                match self
+                    .run_leg(round(uuid, false, jobs, None), ctx, &engine)
+                    .await
+                {
                     Ok(ran) => (uuid, false, ran),
                     Err(e) => return ToolResult::failure(e, elapsed()),
                 }
@@ -876,16 +904,24 @@ impl CodingSessionTool {
                 ToolResult::success(result, elapsed())
             }
             _ => {
-                let reason = claude_code::classify_failure(&ran.result)
-                    .map(|f| f.human_reason())
-                    .unwrap_or_else(|| "Claude Code failed for an unknown reason.".to_string());
+                // Named by the engine that ran it, else the one picked.
+                let label = match &ran.result {
+                    Ok(r) if !r.engine.is_empty() => r.engine.clone(),
+                    _ => engine.label().to_string(),
+                };
+                let reason = crate::coding_engine::round_failure(&label, &ran.result);
                 ToolResult::failure(reason, elapsed())
             }
         }
     }
 
     /// Provision a leg's workspace and run it on the engine.
-    async fn run_leg(&self, leg: Leg<'_>, ctx: &RoundContext<'_>) -> Result<Ran, String> {
+    async fn run_leg(
+        &self,
+        leg: Leg<'_>,
+        ctx: &RoundContext<'_>,
+        engine: &Arc<dyn CodingEngine>,
+    ) -> Result<Ran, String> {
         let scope = workspace_scope(
             !leg.project.repos.is_empty(),
             leg.session_id,
@@ -913,8 +949,7 @@ impl CodingSessionTool {
             (true, None) => Some(sandbox_git::revisions(sandbox.as_ref()).await),
             _ => None,
         };
-        let result = self
-            .engine
+        let result = engine
             .run(Arc::clone(&sandbox), &round, ctx, None, None)
             .await;
         Ok(Ran {
@@ -1022,17 +1057,17 @@ impl Tool for CodingSessionTool {
         };
         let identity_id = crate::user_config::current_identity_id();
         let ctx = self.round_context(identity_id.as_deref());
-        // Fail fast before the expensive workspace provision when the engine
-        // cannot serve this user (identity is in scope, so per-user tokens
-        // resolve).
-        if let Err(refusal) = self.engine.preflight(&ctx) {
-            return Ok(ToolResult::failure(refusal.reason, elapsed()));
-        }
         let principal = crate::user_config::current_principal();
         let plan = match self.prepare(&input, &session_id, principal).await {
             Ok(plan) => plan,
             Err(reason) => return Ok(ToolResult::failure(reason, elapsed())),
         };
+        // Fail fast before the expensive workspace provision when the engine
+        // the round runs on cannot serve this user (identity is in scope, so
+        // per-user tokens resolve).
+        if let Err(refusal) = self.engine_of(&plan).preflight(&ctx) {
+            return Ok(ToolResult::failure(refusal.reason, elapsed()));
+        }
         Ok(self
             .drive(&plan, &input, &session_id, &ctx, None, start)
             .await)
@@ -1106,7 +1141,7 @@ mod tests {
     use crate::serve::Compose as _;
 
     use crate::coding_testing::{Rounds, Seats, ANSWER};
-    use workforce_common::settings::ProgramsMode;
+    use workforce_common::settings::{CodingEngineKind, ProgramsMode};
 
     #[derive(Default)]
     struct Plans {
@@ -1163,6 +1198,18 @@ mod tests {
 
     /// A bench whose install runs the compile gate in `gate` mode.
     async fn bench_gated(engine: Rounds, seats: Seats, gate: ProgramsMode) -> Bench {
+        let engine = Arc::new(engine);
+        bench_running(Arc::clone(&engine), seats, gate, move |_| engine).await
+    }
+
+    /// A bench whose tool runs on what `tool_engine` makes of its agent,
+    /// `engine` the rounds it reports.
+    async fn bench_running(
+        engine: Arc<Rounds>,
+        seats: Seats,
+        gate: ProgramsMode,
+        tool_engine: impl FnOnce(&Arc<AgentService>) -> Arc<dyn CodingEngine>,
+    ) -> Bench {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = workforce_common::settings::WorkforceConfig::default();
         config.tools.compile_gate.mode = gate;
@@ -1176,8 +1223,8 @@ mod tests {
         let sessions: Arc<dyn SessionStore> =
             Arc::new(workforce_common::session::InMemorySessionStore::new());
         let session_id = sessions.get_or_create("c", "o", "a").unwrap().id;
-        let engine = Arc::new(engine);
         let seats = Arc::new(seats);
+        let runs_on = tool_engine(&service);
         let tool = CodingSessionTool::new(
             service,
             Arc::new(workforce_projects::sqlite::SqliteProjectStore::in_memory().unwrap()),
@@ -1194,7 +1241,7 @@ mod tests {
                 cache_dir: None,
             },
             seats.clone(),
-            engine.clone(),
+            runs_on,
         );
         std::mem::forget(tmp);
         Bench {
@@ -1264,6 +1311,14 @@ mod tests {
             self.engine.runs()
         }
 
+        fn driver_engine(&self) -> Option<workforce_common::settings::CodingEngineKind> {
+            self.sessions
+                .get(&self.session_id)
+                .unwrap()
+                .unwrap()
+                .driver_engine(crate::projects::BENCH_PROJECT)
+        }
+
         fn driver_uuid(&self) -> Option<String> {
             self.sessions
                 .get(&self.session_id)
@@ -1272,6 +1327,50 @@ mod tests {
                 .driver_claude_session_uuid(crate::projects::BENCH_PROJECT)
                 .map(str::to_string)
         }
+    }
+
+    /// A thread led by the agent's provider stays on the engine it started
+    /// on when the provider changes: its later rounds resume it there, and
+    /// only a new thread follows the provider.
+    #[tokio::test]
+    async fn a_threads_engine_is_fixed_at_its_first_round() {
+        use workforce_agent::llm::provider::ProviderKind;
+        let claude = Arc::new(Rounds::default());
+        let codex = Arc::new(Rounds::default());
+        let (c, x) = (Arc::clone(&claude), Arc::clone(&codex));
+        let b = bench_running(
+            Arc::clone(&codex),
+            Seats::default(),
+            ProgramsMode::OptIn,
+            move |s| crate::coding_engine::provider_led(s, c, x),
+        )
+        .await;
+        let on = |provider: ProviderKind| {
+            *b.tool.service.provider_kind.write() = provider;
+            *b.tool.service.current_default_model.write() = "default".into();
+        };
+        on(ProviderKind::ChatGpt);
+        assert!(b.run().await.success);
+        assert_eq!(b.driver_engine(), Some(CodingEngineKind::Codex));
+        let thread = b.driver_uuid();
+        assert_eq!((claude.runs().len(), codex.runs().len()), (0, 1));
+
+        // The agent moves to a Claude plan: the thread stays on Codex.
+        on(ProviderKind::ClaudeCode);
+        assert!(b.run().await.success);
+        assert_eq!((claude.runs().len(), codex.runs().len()), (0, 2));
+        assert_eq!(b.driver_engine(), Some(CodingEngineKind::Codex));
+        assert_eq!(b.driver_uuid(), thread, "the same thread");
+
+        // A new thread follows the provider.
+        let fresh = serde_json::json!({ "message": ASK, "new_session": true });
+        let r = b
+            .in_turn("alice", fresh.clone(), b.tool.execute(fresh))
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert_eq!((claude.runs().len(), codex.runs().len()), (1, 2));
+        assert_eq!(b.driver_engine(), Some(CodingEngineKind::ClaudeCode));
     }
 
     /// A round a runner turn's `coding.session` starts belongs to that

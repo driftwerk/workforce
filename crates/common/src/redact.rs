@@ -149,6 +149,14 @@ static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
             "JWT",
             r"eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+",
         ),
+        // A raw JWT (JWS) whatever its payload starts with: a JSON header,
+        // then two more base64url parts.
+        (
+            "JWT",
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+        ),
+        // An OAuth authorization code in a redirect (`?code=…&state=…`).
+        ("OAUTH_CODE", r"\bcode=[A-Za-z0-9._~%/+-]{16,}"),
         ("BASIC_AUTH", r"Basic\s+[A-Za-z0-9+/=]{20,}"),
         ("BEARER_TOKEN", r"Bearer\s+[a-zA-Z0-9._-]{20,}"),
         // ── Context-keyword fallback (catches unknown vendors) ──

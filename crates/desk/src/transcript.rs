@@ -286,7 +286,7 @@ pub fn read_codex_tail(path: &Path) -> std::io::Result<Tail> {
         .fold(Tail::default(), |mut tail, v| {
             let payload = &v["payload"];
             match (v["type"].as_str(), payload["type"].as_str()) {
-                (Some("event_msg"), Some("task_complete")) => {
+                (Some("event_msg"), Some("task_complete" | "turn_complete")) => {
                     if let Some(m) = payload["last_agent_message"]
                         .as_str()
                         .filter(|m| !m.trim().is_empty())

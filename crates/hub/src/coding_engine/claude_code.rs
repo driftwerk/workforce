@@ -10,7 +10,7 @@ use workforce_agent::runner::ProgressEvent;
 
 use std::sync::Arc;
 
-use workforce_common::settings::CLAUDE_CODE_EFFORTS;
+use workforce_common::settings::{CodingEngineKind, CLAUDE_CODE_EFFORTS};
 use workforce_common::subscription::{SubscriptionKind, SubscriptionRoute};
 
 use super::{
@@ -49,7 +49,11 @@ pub(crate) fn config_for(
         append_system_prompt: round.system_prompt.clone(),
         timeout: round.timeout,
         model: round.model.clone(),
-        effort: round.effort.clone(),
+        // A round led by the agent's provider may carry Codex's `xhigh`.
+        effort: round
+            .effort
+            .as_deref()
+            .map(|e| CodingEngineKind::ClaudeCode.clamp_effort(e)),
         mcp,
         session_id,
         resume,
@@ -290,6 +294,29 @@ pub(super) mod tests {
         );
         assert_eq!(one_shot.session_id, None);
         assert!(!one_shot.persist_session && !one_shot.resume);
+    }
+
+    /// A round led by the agent's provider may ask for Codex's `xhigh`:
+    /// Claude Code runs it at its own nearest, `max`.
+    #[test]
+    fn an_effort_claude_code_lacks_is_clamped_to_its_nearest() {
+        let login = crate::subscription::test_support::claude_login("sk-ant-oat01-config");
+        let at = |effort: &str| {
+            let round = CodingRound {
+                effort: Some(effort.into()),
+                ..CodingRound::one_shot("t".into(), Duration::from_secs(1))
+            };
+            config_for(
+                &StubSandbox,
+                &round,
+                None,
+                ClaudeAuth::Resolved(login.clone()),
+            )
+            .effort
+        };
+        assert_eq!(at("xhigh").as_deref(), Some("max"));
+        assert_eq!(at("high").as_deref(), Some("high"));
+        assert_eq!(at("max").as_deref(), Some("max"));
     }
 
     const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";

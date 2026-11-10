@@ -278,6 +278,26 @@ pub async fn create_device_token(
     ))
 }
 
+/// `DELETE /api/me/remote-mcp-tokens/desk/{id}`: a paired Desk revokes a
+/// token it minted (when `[remote_mcp] allow_device_tokens` is on), as when
+/// this computer's hub couldn't keep it. Only its own: any other id is
+/// "not found", whoever holds it.
+pub async fn revoke_device_token(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Rejection> {
+    let service = service(&state)?;
+    let (device, person) = paired_device(&state, &headers).await?;
+    enforce_action_rate_limit(&state, &person.to_string())?;
+    let id = parse_id(&id)?;
+    revoked(
+        service
+            .revoke_for_device(person, &device.id, id)
+            .map_err(rejection)?,
+    )
+}
+
 pub async fn revoke_my_token(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -429,6 +449,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn revoke_as(state: &Arc<GatewayState>, bearer: &str, id: Uuid) -> StatusCode {
+        match revoke_device_token(
+            State(Arc::clone(state)),
+            crate::remote_mcp::testing::bearer(bearer),
+            Path(id.to_string()),
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((status, _)) => status,
+        }
+    }
+
+    /// A device revokes the token it minted, and only that one: another
+    /// device's, the person's own and one that isn't there are all "not
+    /// found"; with the switch off it is refused.
+    #[tokio::test]
+    async fn a_paired_device_revokes_only_the_token_it_minted() {
+        use crate::remote_mcp::testing::{fixture_with_devices, issue, pair_device, TokenShape};
+        use workforce_identity::store::IdentityStore;
+        let (fx, devices) = fixture_with_devices(true);
+        let mut me = workforce_identity::types::Identity::new("Sam", IdentityRole::Member);
+        fx.identities.create(&me).unwrap();
+        let (_, mac) = pair_device(&fx, &devices, &mut me, "Sam's Mac");
+        let (_, laptop) = pair_device(&fx, &devices, &mut me, "Sam's laptop");
+        let mine = mint_as(&fx.state, &mac).await.unwrap();
+        let mine: Uuid = mine["id"].as_str().unwrap().parse().unwrap();
+        let theirs = mint_as(&fx.state, &laptop).await.unwrap();
+        let theirs: Uuid = theirs["id"].as_str().unwrap().parse().unwrap();
+        issue(&fx, &me, TokenShape::default());
+        let persons = fx
+            .tokens
+            .list_tokens_for_identity(me.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| crate::remote_mcp::tokens::minted_by_device(&t.scopes).is_none())
+            .unwrap()
+            .id;
+        for other in [theirs, persons, Uuid::new_v4()] {
+            assert_eq!(
+                revoke_as(&fx.state, &mac, other).await,
+                StatusCode::NOT_FOUND
+            );
+        }
+        // Neither a login nor the hub's own token revokes here.
+        assert_eq!(
+            revoke_as(&fx.state, "gateway-token", mine).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            revoke_as(&fx.state, &mac, mine).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            revoke_as(&fx.state, &mac, mine).await,
+            StatusCode::NOT_FOUND
+        );
+        let live: Vec<Uuid> = fx
+            .tokens
+            .list_tokens_for_identity(me.id)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.revoked_at.is_none())
+            .map(|t| t.id)
+            .collect();
+        assert!(!live.contains(&mine));
+        assert!(live.contains(&theirs) && live.contains(&persons));
+
+        // With the switch off, it is refused.
+        let (off, devices) = fixture_with_devices(false);
+        let mut me = workforce_identity::types::Identity::new("Sam", IdentityRole::Member);
+        off.identities.create(&me).unwrap();
+        let (device, mac) = pair_device(&off, &devices, &mut me, "Sam's Mac");
+        issue(
+            &off,
+            &me,
+            TokenShape {
+                scopes: vec![
+                    crate::remote_mcp::tokens::TOKEN_SCOPE.into(),
+                    format!("device:{}", device.id),
+                ],
+                ..TokenShape::default()
+            },
+        );
+        let id = off.tokens.list_tokens_for_identity(me.id).unwrap()[0].id;
+        assert_eq!(revoke_as(&off.state, &mac, id).await, StatusCode::FORBIDDEN);
+        assert!(off.tokens.list_tokens_for_identity(me.id).unwrap()[0]
+            .revoked_at
+            .is_none());
     }
 
     #[test]
