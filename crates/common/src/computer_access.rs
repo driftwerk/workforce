@@ -12,9 +12,10 @@
 //!
 //! `works_in` names folders (a repo cloned into one, say) the agent reads,
 //! changes and runs in beside its own, at every level, and starts coding
-//! work in. Only the person sets it: the agent's own config file is never
-//! changed by its tools. Never `/`, a volume, the home folder or anything
-//! above it, nor anything Desk keeps from every agent; deleting there still
+//! work in. The person sets it in Desk, or the agent through its own config
+//! tool when the person asks; a command rewriting the file is never applied.
+//! Always inside home, never home itself, a secret or start-file folder, nor
+//! anything Desk keeps from every agent; deleting there still
 //! asks.
 //!
 //! An agent with no `[computer]` is at Full access and asks only before what

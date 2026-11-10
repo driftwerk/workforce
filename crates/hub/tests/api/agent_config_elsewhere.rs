@@ -64,37 +64,24 @@ async fn config_tool(
         .unwrap()
 }
 
-/// Who may talk to the agent is the person's: its own tool refuses
-/// `[access]`, and the file stays as the person saved it. A setting that is
-/// the agent's own applies at once on a Desk hub, guarded file and all.
+/// Asked by the person, the agent sets up who may talk to it through its
+/// own tool, and that applies at once on a Desk hub, guarded file and all.
 /// (Who may call the tool is the gate's to say, as on any hub.)
 #[tokio::test(flavor = "multi_thread")]
-async fn the_agent_cannot_set_its_own_access_but_its_own_settings_apply() {
+async fn the_agent_sets_its_own_access_through_its_tool_and_it_applies() {
     let data = tempfile::tempdir().unwrap();
     let service = agent(data.path(), true).await;
     let gateway = Gateway::new(vec![("scout", Arc::clone(&service))], None);
     assert_eq!(put(&gateway, SAVED).await.0, StatusCode::OK);
 
-    let refused = config_tool(
+    let result = config_tool(
         &service,
         serde_json::json!({"action": "set", "key": "access.mode", "value": "allowlist"}),
     )
     .await;
-    assert!(!refused.success, "{:?}", refused.output);
-    assert!(
-        refused.error.unwrap_or_default().contains("human-only"),
-        "said why"
-    );
-    assert_eq!(on_disk(&service), SAVED, "the person's file is untouched");
-
-    let result = config_tool(
-        &service,
-        serde_json::json!({"action": "set", "key": "llm.max_rounds", "value": 20}),
-    )
-    .await;
     assert!(result.success, "{:?}", result.error);
     let body = on_disk(&service);
-    assert!(body.contains("max_rounds = 20"), "{body}");
+    assert!(body.contains("mode = \"allowlist\""), "{body}");
     assert_eq!(
         running(&service).as_deref(),
         Some(content_hash(&body).as_str()),
