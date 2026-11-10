@@ -300,7 +300,10 @@ impl DeskStore {
             .execute(
                 "DELETE FROM access_grants
                   WHERE session_id IS NOT NULL
-                    AND (connector = 'browser' OR connector LIKE 'browser:%')
+                    AND (connector IN ('browser', 'chrome')
+                         OR connector LIKE 'browser:%'
+                         OR connector LIKE 'chrome:%'
+                         OR connector LIKE 'chrome-visit:%')
                     AND ($1::TEXT IS NULL OR agent = $1)",
                 &[&agent],
             )
@@ -537,6 +540,12 @@ mod tests {
                 .add_grant(&site("ben", "browser:docs.example", Some("s2")))
                 .await
                 .unwrap();
+            for theirs in ["chrome", "chrome-visit:bank.test"] {
+                store
+                    .add_grant(&site("ben", theirs, Some("s2")))
+                    .await
+                    .unwrap();
+            }
             let linear = store
                 .add_grant(&site("allan", "linear", Some("s1")))
                 .await
@@ -547,7 +556,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(store.forget_browser_grants(Some("allan")).await.unwrap(), 1);
-            assert_eq!(store.forget_browser_grants(None).await.unwrap(), 1);
+            assert_eq!(store.forget_browser_grants(None).await.unwrap(), 3);
             let mut left: Vec<Uuid> = store
                 .live_grants("local", "allan")
                 .await

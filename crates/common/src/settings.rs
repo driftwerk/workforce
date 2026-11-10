@@ -10230,6 +10230,7 @@ pub struct SkillsConfig {
 /// # profile_root = "/var/lib/workforce/browser"
 /// # show = true
 /// # chrome_binary = "/usr/bin/chromium"
+/// # chrome_user_data_dir = "/Users/me/Library/Application Support/Google/Chrome"
 /// ```
 ///
 /// On a hub with `[desk]`, profiles live in Desk's own folder
@@ -10250,6 +10251,11 @@ pub struct BrowserSkillsConfig {
     /// The Chrome or Chromium to run; found on `PATH` where unset.
     #[serde(default)]
     pub chrome_binary: Option<String>,
+    /// The person's own Chrome's user data folder, where it writes
+    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
+    /// own for this platform.
+    #[serde(default)]
+    pub chrome_user_data_dir: Option<String>,
 }
 
 impl Default for SkillsConfig {

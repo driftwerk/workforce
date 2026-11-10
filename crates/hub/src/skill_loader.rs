@@ -3934,6 +3934,7 @@ pub(crate) fn browser_skill_config(
         named(&set.profile_root).or_else(|| desk.as_ref().map(|d| d.display().to_string()));
     workforce_skills::adapters::browser::BrowserSkillConfig {
         chrome_binary: named(&set.chrome_binary),
+        chrome_user_data_dir: named(&set.chrome_user_data_dir),
         keep_profiles: profile_root.is_some(),
         profile_root,
         show: set.show.unwrap_or(desk.is_some()),

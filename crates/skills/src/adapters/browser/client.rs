@@ -34,8 +34,9 @@ use workforce_common::settings::SecretStore;
 
 use crate::adapters::credential_resolver::resolve_vault_refs;
 
+use super::chrome_cell::ChromeCell;
 use super::config::{BrowserSkillConfig, MAX_WAIT_MS};
-use super::hooks::{self, Done, OnPage};
+use super::hooks::{self, Done, OnPage, Uses};
 use super::untrusted::{self, Seen};
 
 const VAULT_PREFIX: &str = "browser_creds/";
@@ -44,7 +45,7 @@ const SIZE_DELTA_WARN_RATIO: f64 = 0.5;
 
 const RESPAWN_WINDOW_MS: u64 = 60_000;
 const RESPAWN_LIMIT: usize = 3;
-const POLL_BACKOFF_MS: u64 = 100;
+pub(super) const POLL_BACKOFF_MS: u64 = 100;
 /// Consecutive timed-out calls after which a session is torn down. A CDP
 /// connection that has silently died answers nothing, so every call times out;
 /// two in a row is the signal, while a single slow page is not.
@@ -52,7 +53,7 @@ const TIMEOUT_RECYCLE_LIMIT: usize = 2;
 
 /// The polling budget a `browser.wait` call gets: the requested `timeout_ms`,
 /// else the configured call timeout, never more than [`MAX_WAIT_MS`].
-fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
+pub(super) fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
     requested.unwrap_or(default_ms).min(MAX_WAIT_MS)
 }
 
@@ -69,6 +70,19 @@ pub(super) fn register(client: &Arc<BrowserClient>) {
     let mut clients = CLIENTS.lock().unwrap();
     clients.retain(|c| c.strong_count() > 0);
     clients.push(Arc::downgrade(client));
+    // The person's Chrome is let go after its idle time, on a clock: no
+    // later call is needed to notice.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let weak = Arc::downgrade(client);
+        let every = Duration::from_millis(client.config.session_idle_ttl_ms.clamp(1_000, 60_000));
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(client) = weak.upgrade() else { return };
+                client.detach_idle().await;
+            }
+        });
+    }
 }
 
 fn clients() -> Vec<Arc<BrowserClient>> {
@@ -121,6 +135,21 @@ pub async fn live() -> Vec<Live> {
                 idle_secs: cell.last_used.lock().unwrap().elapsed().as_secs(),
             });
         }
+        let chromes: Vec<Arc<ChromeCell>> = client.chromes.lock().await.values().cloned().collect();
+        for cell in chromes.into_iter().filter(|c| c.attached()) {
+            let url = untrusted::state(&cell.key)
+                .map(|s| s.url)
+                .unwrap_or_default();
+            out.push(Live {
+                agent: cell.agent.clone(),
+                user: cell.user.clone(),
+                session: cell.last_session.lock().unwrap().clone(),
+                host: host_of(&url).filter(|_| !url.starts_with("about:")),
+                url,
+                backend: "chrome",
+                idle_secs: cell.last_used.lock().unwrap().elapsed().as_secs(),
+            });
+        }
     }
     out.sort_by_key(|l| l.idle_secs);
     out
@@ -161,14 +190,199 @@ pub async fn close(which: Which<'_>) -> usize {
             }
             untrusted::forget(&cell.key);
         }
+        closed += detach(&client, which).await;
     }
     closed
+}
+
+/// Lets go of the person's Chrome where `which` names it: Desk's tab there
+/// closes, nothing else of theirs is touched.
+async fn detach(client: &BrowserClient, which: Which<'_>) -> usize {
+    let taken: Vec<Arc<ChromeCell>> = {
+        let mut chromes = client.chromes.lock().await;
+        let ids: Vec<SessionId> = chromes
+            .iter()
+            .filter(|(_, cell)| match which {
+                Which::All => true,
+                Which::Agent(agent) => cell.agent == agent,
+                Which::Session(session) => {
+                    cell.last_session.lock().unwrap().as_deref() == Some(session)
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.iter().filter_map(|id| chromes.remove(id)).collect()
+    };
+    let mut n = 0;
+    for cell in taken {
+        if cell.detach().await {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Closes every browser of one kind now: the person turned it off.
+pub async fn close_backend(backend: Backend) -> usize {
+    let mut n = 0;
+    for client in clients() {
+        n += match backend {
+            Backend::Chrome => detach(&client, Which::All).await,
+            Backend::Desk => {
+                let taken: Vec<Arc<SessionCell>> = client
+                    .sessions
+                    .lock()
+                    .await
+                    .drain()
+                    .map(|(_, c)| c)
+                    .collect();
+                let mut closed = 0;
+                for cell in taken {
+                    if cell.inner.lock().await.take().is_some() {
+                        closed += 1;
+                    }
+                    untrusted::forget(&cell.key);
+                }
+                closed
+            }
+        };
+    }
+    n
+}
+
+/// At the end of a turn: lets go of the person's Chrome the turn's
+/// conversation was using. Desk's own browser stays open for the next.
+pub async fn turn_ended(session: &str) -> usize {
+    let mut n = 0;
+    for client in clients() {
+        n += detach(&client, Which::Session(session)).await;
+    }
+    n
 }
 
 /// What the browser session of `agent` for `user` has read, if it has a
 /// page: the hub's gate reads it.
 pub fn page_state(agent: &str, user: &str) -> Option<untrusted::PageState> {
-    untrusted::state(&SessionId::derive(agent, user).0)
+    let desk = untrusted::state(&SessionId::derive(agent, user).0);
+    let chrome = untrusted::state(&chrome_id(agent, user).0);
+    let on_chrome = STICKY
+        .lock()
+        .unwrap()
+        .get(&SessionId::derive(agent, user))
+        .copied()
+        == Some(Backend::Chrome);
+    let hostile =
+        desk.as_ref().is_some_and(|s| s.hostile) || chrome.as_ref().is_some_and(|s| s.hostile);
+    let mut now = if on_chrome {
+        chrome.or(desk)
+    } else {
+        desk.or(chrome)
+    }?;
+    now.hostile = hostile;
+    Some(now)
+}
+
+/// Which browser a call works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Desk's own browser.
+    Desk,
+    /// The person's Chrome.
+    Chrome,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Desk => "desk",
+            Self::Chrome => "chrome",
+        }
+    }
+}
+
+/// The browser each `(agent, user)` worked in last, so a call that names
+/// none carries on where the last one was.
+static STICKY: std::sync::LazyLock<StdMutex<HashMap<SessionId, Backend>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The key of `(agent, user)`'s tab in the person's Chrome.
+fn chrome_id(agent: &str, user: &str) -> SessionId {
+    SessionId::derive(agent, &format!("{user}\u{1f}chrome"))
+}
+
+/// Which browser a call works in: the one it names (`browser`), where the
+/// person's settings allow it; else the last one used; else the person's
+/// Chrome for an unbound overseer when both are on, and Desk's own for
+/// everyone else.
+pub(super) fn pick(requested: Option<&str>, peek: bool) -> Result<Backend> {
+    let settings = hooks::settings();
+    let id = current_session_id();
+    let (agent, _) = current_identity();
+    let allowed = |b: Backend| {
+        matches!(
+            (settings.uses, b),
+            (Uses::Both, _) | (Uses::Desk, Backend::Desk) | (Uses::Chrome, Backend::Chrome)
+        )
+    };
+    let chosen = match requested.map(str::trim).filter(|r| !r.is_empty()) {
+        _ if settings.uses == Uses::Off => {
+            return Err(eyre!(
+                "The browser is off on this Desk. The person can turn it on in Settings → Browser."
+            ))
+        }
+        Some("desk") if allowed(Backend::Desk) => Backend::Desk,
+        Some("chrome") if allowed(Backend::Chrome) => Backend::Chrome,
+        Some("desk") => {
+            return Err(eyre!(
+                "Desk uses only the person's Chrome (Settings → Browser)."
+            ))
+        }
+        Some("chrome") => {
+            return Err(eyre!(
+            "Desk doesn't use the person's Chrome (Settings → Browser); use Desk's own browser."
+        ))
+        }
+        Some(other) => return Err(eyre!("`browser` is `desk` or `chrome`, not `{other}`")),
+        None => match STICKY
+            .lock()
+            .unwrap()
+            .get(&id)
+            .copied()
+            .filter(|b| allowed(*b))
+        {
+            Some(last) => last,
+            None => match settings.uses {
+                Uses::Chrome => Backend::Chrome,
+                Uses::Both if hooks::hooks().is_some_and(|h| h.unbound(&agent)) => Backend::Chrome,
+                _ => Backend::Desk,
+            },
+        },
+    };
+    if !peek {
+        STICKY.lock().unwrap().insert(id, chosen);
+    }
+    Ok(chosen)
+}
+
+/// The host of the page the identity in scope has open in `backend`.
+pub(super) fn host_now(backend: Backend) -> Option<String> {
+    let (agent, user) = current_identity();
+    let key = match backend {
+        Backend::Desk => SessionId::derive(&agent, &user),
+        Backend::Chrome => chrome_id(&agent, &user),
+    };
+    let url = untrusted::state(&key.0)?.url;
+    host_of(&url).filter(|_| !url.starts_with("about:"))
+}
+
+/// The browser the identity in scope works in now, without choosing.
+fn current_backend() -> Backend {
+    STICKY
+        .lock()
+        .unwrap()
+        .get(&current_session_id())
+        .copied()
+        .unwrap_or(Backend::Desk)
 }
 
 /// Stable, filesystem-safe handle for one `(agent, user)` browser session. The
@@ -459,7 +673,9 @@ impl SessionCell {
 
     async fn start(&self) -> Result<Active> {
         ensure_profile_dir(&self.profile_dir)?;
-        let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir).await?;
+        // On screen as the person's settings say, else as configured.
+        let show = hooks::settings().show.unwrap_or(self.config.show);
+        let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir, show).await?;
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -854,6 +1070,10 @@ pub struct BrowserClient {
     config: Arc<BrowserSkillConfig>,
     profile_root: PathBuf,
     sessions: Mutex<HashMap<SessionId, Arc<SessionCell>>>,
+    /// Each identity's tab in the person's Chrome.
+    chromes: Mutex<HashMap<SessionId, Arc<ChromeCell>>>,
+    /// Where the person's Chrome writes `DevToolsActivePort`.
+    chrome_dir: Option<PathBuf>,
     last_reap: StdMutex<Instant>,
     store: Option<Arc<dyn SecretStore>>,
 }
@@ -877,10 +1097,18 @@ impl BrowserClient {
         let last_reap = now
             .checked_sub(Duration::from_millis(config.reap_interval_ms))
             .unwrap_or(now);
+        let chrome_dir = config
+            .chrome_user_data_dir
+            .clone()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(super::chrome::default_user_data_dir);
         Self {
             config: Arc::new(config),
             profile_root,
             sessions: Mutex::new(HashMap::new()),
+            chromes: Mutex::new(HashMap::new()),
+            chrome_dir,
             last_reap: StdMutex::new(last_reap),
             store,
         }
@@ -998,27 +1226,92 @@ impl BrowserClient {
         tokio::task::spawn_blocking(move || reap_blocking(&root, &live_dirs, retention));
     }
 
+    /// The tab in the person's Chrome for the identity in scope, made if
+    /// needed (it attaches on its first call).
+    async fn chrome(&self) -> Result<Arc<ChromeCell>> {
+        let dir = self.chrome_dir.clone().ok_or_else(|| {
+            eyre!("Desk can't find where Chrome keeps its data on this computer.")
+        })?;
+        let (agent, user) = current_identity();
+        let id = chrome_id(&agent, &user);
+        let mut chromes = self.chromes.lock().await;
+        let cell = chromes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(ChromeCell::new(
+                    self.config.clone(),
+                    (id.0.clone(), agent, user),
+                    dir,
+                ))
+            })
+            .clone();
+        Ok(cell)
+    }
+
+    /// Lets go of the person's Chrome where it has been idle its idle time.
+    pub(super) async fn detach_idle(&self) -> usize {
+        let idle = Duration::from_millis(self.config.session_idle_ttl_ms);
+        let cells: Vec<Arc<ChromeCell>> = self.chromes.lock().await.values().cloned().collect();
+        let mut n = 0;
+        for cell in cells {
+            let quiet = cell.last_used.lock().unwrap().elapsed() >= idle;
+            if quiet && cell.attached() && cell.detach().await {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn on_chrome(&self) -> bool {
+        current_backend() == Backend::Chrome
+    }
+
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.navigate(url).await;
+        }
         self.acquire().await?.navigate(url).await
     }
 
     pub(super) async fn snapshot(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.snapshot().await;
+        }
         self.acquire().await?.snapshot().await
     }
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.screenshot().await;
+        }
         self.acquire().await?.screenshot().await
     }
 
     pub(super) async fn pdf(&self, filename: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return Err(eyre!(
+                "The person's Chrome can't render a PDF for Desk; use Desk's own browser (`browser: \"desk\"`)."
+            ));
+        }
         self.acquire().await?.pdf(filename).await
     }
 
     pub(super) async fn click(&self, selector: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.click(selector).await;
+        }
         self.acquire().await?.click(selector).await
     }
 
     pub(super) async fn fill(&self, selector: &str, value: &str) -> Result<Value> {
+        if self.on_chrome() {
+            let cell = self.chrome().await?;
+            return cell
+                .fill(selector, value, |raw, host| {
+                    self.resolve_credential(raw, host)
+                })
+                .await;
+        }
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let value = value.to_string();
@@ -1054,6 +1347,14 @@ impl BrowserClient {
     }
 
     pub(super) async fn type_text(&self, selector: &str, text: &str) -> Result<Value> {
+        if self.on_chrome() {
+            let cell = self.chrome().await?;
+            return cell
+                .type_text(selector, text, |raw, host| {
+                    self.resolve_credential(raw, host)
+                })
+                .await;
+        }
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let text = text.to_string();
@@ -1086,10 +1387,16 @@ impl BrowserClient {
     }
 
     pub(super) async fn select_option(&self, selector: &str, value: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.select_option(selector, value).await;
+        }
         self.acquire().await?.select_option(selector, value).await
     }
 
     pub(super) async fn evaluate(&self, expression: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.evaluate(expression).await;
+        }
         self.acquire().await?.evaluate(expression).await
     }
 
@@ -1098,6 +1405,13 @@ impl BrowserClient {
         selector: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
+        if self.on_chrome() {
+            return self
+                .chrome()
+                .await?
+                .wait_for_selector(selector, timeout_ms)
+                .await;
+        }
         self.acquire()
             .await?
             .wait_for_selector(selector, timeout_ms)
@@ -1105,18 +1419,30 @@ impl BrowserClient {
     }
 
     pub(super) async fn get_content(&self, format: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.get_content(format).await;
+        }
         self.acquire().await?.get_content(format).await
     }
 
     pub(super) async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.press_key(key, selector).await;
+        }
         self.acquire().await?.press_key(key, selector).await
     }
 
     pub(super) async fn network_requests(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.network_requests().await;
+        }
         self.acquire().await?.network_requests().await
     }
 
     pub(super) async fn console_messages(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.console_messages().await;
+        }
         self.acquire().await?.console_messages().await
     }
 
@@ -1145,6 +1471,13 @@ impl BrowserClient {
         // disk; the OS temp sweep reclaims it.
         let path = write_upload_temp(&name, &staged.bytes)?;
         let path_str = path.to_string_lossy().to_string();
+        if self.on_chrome() {
+            return self
+                .chrome()
+                .await?
+                .upload_file(selector, &path_str, &name)
+                .await;
+        }
 
         let selector = selector.to_string();
         let cell = self.acquire().await?;
@@ -1238,6 +1571,7 @@ fn reap_blocking(profile_root: &Path, live: &HashSet<PathBuf>, retention: Durati
 async fn launch_chromium(
     config: &BrowserSkillConfig,
     profile_dir: &Path,
+    show: bool,
 ) -> Result<(Browser, Handler)> {
     let builder: BrowserConfigBuilder = BrowserConfig::builder()
         .no_sandbox()
@@ -1262,11 +1596,7 @@ async fn launch_chromium(
         None => builder,
     };
     // On screen, so the person can watch it and sign in once by hand.
-    let builder = if config.show {
-        builder.with_head()
-    } else {
-        builder
-    };
+    let builder = if show { builder.with_head() } else { builder };
     let cfg = builder
         .build()
         .map_err(|e| eyre!("invalid chromium config: {e}"))?;
@@ -1449,7 +1779,7 @@ fn stage_for_delivery(
 
 /// Stage a screenshot PNG for auto-delivery, or fall back to inline base64 when
 /// no artifact store is in scope. See [`stage_for_delivery`].
-fn stage_screenshot_artifact(bytes: Vec<u8>, size: usize) -> Result<Value> {
+pub(super) fn stage_screenshot_artifact(bytes: Vec<u8>, size: usize) -> Result<Value> {
     tracing::info!(target: "browser", size_bytes = size, "screenshot captured");
     match stage_for_delivery(bytes, "browser.screenshot", "image/png", "screenshot.png")? {
         Ok(entry) => Ok(json!({
@@ -1512,7 +1842,7 @@ pub(super) fn host_of(url: &str) -> Option<String> {
 /// where none): its text, a button's value, its label, title, type, name,
 /// autocomplete hint and placeholder, and with `form` its form's action.
 /// Never what a field holds.
-fn shown_expression(selector: Option<&str>, form: bool) -> String {
+pub(super) fn shown_expression(selector: Option<&str>, form: bool) -> String {
     let el = match selector {
         Some(sel) => format!(
             "document.querySelector({})",
@@ -1532,7 +1862,7 @@ fn shown_expression(selector: Option<&str>, form: bool) -> String {
     )
 }
 
-fn fill_expression(selector: &str, value: &str) -> String {
+pub(super) fn fill_expression(selector: &str, value: &str) -> String {
     let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     format!(
@@ -1544,7 +1874,7 @@ fn fill_expression(selector: &str, value: &str) -> String {
     )
 }
 
-fn select_option_expression(selector: &str, value: &str) -> String {
+pub(super) fn select_option_expression(selector: &str, value: &str) -> String {
     let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     format!(

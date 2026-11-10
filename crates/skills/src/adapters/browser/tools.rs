@@ -40,11 +40,30 @@ impl Tool for BrowserTool {
     }
 
     fn input_schema(&self) -> Value {
-        self.spec.schema.clone()
+        with_browser(self.spec.schema.clone())
+    }
+
+    /// A browser call, as Desk's gate keeps it: which browser, which site,
+    /// and whether it changes the page.
+    fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
+        let backend = super::client::pick(input["browser"].as_str(), true)
+            .unwrap_or(super::client::Backend::Desk);
+        let navigating = self.spec.name == "browser.navigate";
+        let host = match navigating {
+            true => input["url"].as_str().and_then(super::client::host_of),
+            false => super::client::host_now(backend),
+        };
+        workforce_core::computer::Effect::Connector {
+            connector: site_key(backend, navigating, host.as_deref()),
+            write: !READS.contains(&self.spec.name),
+        }
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Err(e) = super::client::pick(input["browser"].as_str(), false) {
+            return Ok(ToolResult::failure(e.to_string(), elapsed(start)));
+        }
         match (self.spec.handler)(self.client.clone(), input).await {
             Ok(output) => Ok(ToolResult::success(output, elapsed(start))),
             Err(e) => {
@@ -53,6 +72,50 @@ impl Tool for BrowserTool {
             }
         }
     }
+}
+
+/// The tools that only read a page; the rest change one.
+pub const READS: &[&str] = &[
+    "browser.navigate",
+    "browser.snapshot",
+    "browser.screenshot",
+    "browser.pdf",
+    "browser.get_content",
+    "browser.console_messages",
+    "browser.network_requests",
+    "browser.wait",
+];
+
+/// What Desk's gate keeps a browser call under: `browser:<host>` in Desk's
+/// own browser; in the person's Chrome, `chrome:<host>`, and for opening a
+/// site there, `chrome-visit:<host>`. With no host, the browser alone.
+pub fn site_key(backend: super::client::Backend, navigating: bool, host: Option<&str>) -> String {
+    use super::client::Backend;
+    let kind = match (backend, navigating) {
+        (Backend::Desk, _) => "browser",
+        (Backend::Chrome, true) => "chrome-visit",
+        (Backend::Chrome, false) => "chrome",
+    };
+    match host.filter(|h| !h.is_empty()) {
+        Some(h) => format!("{kind}:{h}"),
+        None if backend == Backend::Chrome => "chrome".into(),
+        None => kind.into(),
+    }
+}
+
+/// Every tool's `browser`: which browser it works in.
+fn with_browser(mut schema: Value) -> Value {
+    if let Some(props) = schema["properties"].as_object_mut() {
+        props.insert(
+            "browser".into(),
+            json!({
+                "type": "string",
+                "enum": ["desk", "chrome"],
+                "description": "Which browser: `desk` (Desk's own, which the person signs in to by hand) or `chrome` (the person's own Chrome, signed in as them, where Desk works in a window of its own). Leave it out to carry on in the one used last."
+            }),
+        );
+    }
+    schema
 }
 
 fn elapsed(start: std::time::Instant) -> u64 {
@@ -376,7 +439,7 @@ pub(super) fn skill_tools_and_policies() -> (Vec<SkillTool>, Vec<SkillPolicy>) {
                 SkillTool {
                     name: spec.name.to_string(),
                     description: spec.description.to_string(),
-                    input_schema: spec.schema,
+                    input_schema: with_browser(spec.schema),
                 },
                 SkillPolicy {
                     tool: spec.name.to_string(),
@@ -424,5 +487,61 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn every_tool_names_its_browser() {
+        for spec in specs() {
+            let schema = with_browser(spec.schema);
+            assert_eq!(
+                schema["properties"]["browser"]["enum"],
+                json!(["desk", "chrome"]),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_is_kept_under_its_browser_and_site() {
+        use super::super::client::Backend;
+        assert_eq!(
+            site_key(Backend::Desk, false, Some("a.test")),
+            "browser:a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Desk, true, Some("a.test")),
+            "browser:a.test"
+        );
+        assert_eq!(site_key(Backend::Desk, false, None), "browser");
+        assert_eq!(
+            site_key(Backend::Chrome, false, Some("a.test")),
+            "chrome:a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Chrome, true, Some("a.test")),
+            "chrome-visit:a.test"
+        );
+        assert_eq!(site_key(Backend::Chrome, true, None), "chrome");
+    }
+
+    #[test]
+    fn reads_are_every_tool_that_changes_no_page() {
+        let names = tool_names();
+        for r in READS {
+            assert!(names.contains(r), "{r}");
+        }
+        for w in [
+            "browser.click",
+            "browser.fill",
+            "browser.type",
+            "browser.press_key",
+            "browser.select_option",
+            "browser.evaluate",
+            "browser.upload_file",
+        ] {
+            assert!(names.contains(&w) && !READS.contains(&w), "{w}");
+        }
+        assert_eq!(READS.len() + 7, names.len());
     }
 }

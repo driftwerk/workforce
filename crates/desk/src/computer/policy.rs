@@ -680,21 +680,78 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     ask(choices, why)
 }
 
+/// The grant that covers writes to exactly `connector` for this call, if
+/// one does: a standing one first, then a session's.
+fn site_granted(
+    p: &AgentPolicy,
+    grants: &[Grant],
+    call: &CallFacts,
+    connector: &str,
+) -> Option<By> {
+    let mut found = grants.iter().filter(|g| {
+        g.hub == p.hub
+            && g.agent == p.agent
+            && call.person.as_deref() == Some(g.person.as_str())
+            && g.ability == Ability::ConnectorWrite
+            && g.connector.as_deref() == Some(connector)
+            && g.run
+                .as_ref()
+                .is_none_or(|run| call.run.as_ref() == Some(run))
+            && g.session_id
+                .as_ref()
+                .is_none_or(|s| call.session_id.as_ref() == Some(s))
+    });
+    let standing = found.clone().find(|g| g.session_id.is_none());
+    standing
+        .or_else(|| found.next())
+        .map(|g| match g.session_id {
+            Some(_) => By::Session(g.id),
+            None => By::Grant(g.id),
+        })
+}
+
+/// Allow once, for this session where there is one, or Deny.
+fn once_or_session(call: &CallFacts, why: Why) -> Verdict {
+    let mut choices = vec![Choice::AllowOnce];
+    if call.session_id.is_some() {
+        choices.push(Choice::AllowSession);
+    }
+    choices.push(Choice::Deny);
+    ask(choices, why)
+}
+
 /// The verdict on a `browser.*` call. Reading (a snapshot, a screenshot, a
 /// navigation) runs. Changing a page (a click, typing, a key, a script, an
 /// upload) runs for an unbound overseer, is refused for one that only
 /// suggests, and otherwise asks, unless Full access that never asks or a
 /// session allowance for the site covers it. After a hostile page it asks
 /// every time, offering Allow once only.
+///
+/// In the person's own Chrome (`chrome…`) it asks first, once a session,
+/// before using it at all ("Desk wants to use your Chrome"), and before
+/// opening each new site there; an overseer that only suggests doesn't use
+/// it, and an unbound one asks nothing.
 fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
-    let write = matches!(call.effect, Effect::Connector { write: true, .. });
-    if !write {
-        return Verdict::Run { by: By::Rule };
-    }
+    let (connector, write) = match &call.effect {
+        Effect::Connector { connector, write } => (connector.as_str(), *write),
+        _ => ("browser", true),
+    };
+    let theirs = connector == "chrome"
+        || connector.starts_with("chrome:")
+        || connector.starts_with("chrome-visit:");
     let hostile = p.browser.hostile;
     match p.browser.browsing {
         Browsing::Unbound if !hostile => return Verdict::Run { by: By::Rule },
-        Browsing::Suggests => {
+        Browsing::Suggests if theirs => {
+            return refuse(
+                Refused::OutsideLevel,
+                format!(
+                    "{} doesn't use the person's own Chrome at its oversight level. Use Desk's own browser to look, and say what you would do.",
+                    p.name
+                ),
+            )
+        }
+        Browsing::Suggests if write => {
             return refuse(
                 Refused::OutsideLevel,
                 format!(
@@ -705,19 +762,28 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
         }
         _ => {}
     }
-    if hostile {
+    if hostile && write {
         return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
+    }
+    if theirs {
+        if site_granted(p, grants, call, "chrome").is_none() {
+            return once_or_session(call, Why::TheirChrome);
+        }
+        if connector.starts_with("chrome-visit:") {
+            return match site_granted(p, grants, call, connector) {
+                Some(by) => Verdict::Run { by },
+                None => once_or_session(call, Why::NewSite),
+            };
+        }
+    }
+    if !write {
+        return Verdict::Run { by: By::Rule };
     }
     if p.access.access == Access::Full && p.access.asks == Asking::Never {
         return Verdict::Run { by: By::Rule };
     }
-    if let Some(by) = granted(p, grants, call) {
+    if let Some(by) = site_granted(p, grants, call, connector) {
         return Verdict::Run { by };
     }
-    let mut choices = vec![Choice::AllowOnce];
-    if call.session_id.is_some() {
-        choices.push(Choice::AllowSession);
-    }
-    choices.push(Choice::Deny);
-    ask(choices, Why::OnAPage)
+    once_or_session(call, Why::OnAPage)
 }

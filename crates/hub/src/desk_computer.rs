@@ -50,16 +50,18 @@ pub struct HubComputerGate {
 
 /// The browser tools that only read: everything else in `browser.*`
 /// changes a page.
-pub const BROWSER_READS: &[&str] = &[
-    "browser.navigate",
-    "browser.snapshot",
-    "browser.screenshot",
-    "browser.pdf",
-    "browser.get_content",
-    "browser.console_messages",
-    "browser.network_requests",
-    "browser.wait",
-];
+pub const BROWSER_READS: &[&str] = workforce_skills::adapters::browser::READS;
+
+/// Whether `connector` is what a browser call is kept under: `browser…` in
+/// Desk's own, `chrome…` in the person's.
+pub fn is_browser_key(connector: &str) -> bool {
+    ["browser", "chrome"].iter().any(|k| {
+        connector == *k
+            || connector
+                .strip_prefix(k)
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
+    })
+}
 
 /// Whether `tool` is a browser tool that changes a page.
 pub fn changes_a_page(tool: &str) -> bool {
@@ -337,7 +339,8 @@ impl HubComputerGate {
         // A session allowance is scoped to the same folder an "always" would
         // be: where no folder can be offered, neither can it. A browser's
         // holds for its site, and no "always" is offered there.
-        let site = matches!(effect, Effect::Connector { connector, .. } if connector.starts_with("browser"));
+        let site =
+            matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector));
         options.allow_session =
             (always.is_some() || site) && choices.iter().any(|c| matches!(c, Choice::AllowSession));
         options.allow_in_folder = always;
@@ -557,8 +560,13 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
-        // A browser call is kept under the site its page is on.
+        // A browser call is kept under the browser and site it names
+        // (`browser.*`'s own effect); one that names none, under the site
+        // Desk's own browser is on.
         if tool.starts_with("browser.") {
+            if matches!(effect, Effect::Connector { .. }) {
+                return effect;
+            }
             let (host, _) = page_now(&self.policy.agent);
             return Effect::Connector {
                 connector: browser_site(host.as_deref()),
@@ -625,6 +633,13 @@ impl ComputerGate for HubComputerGate {
                 ..
             }
         );
+        let their_chrome = matches!(
+            &decision.verdict,
+            Verdict::Ask {
+                why: workforce_core::computer::Why::TheirChrome,
+                ..
+            }
+        );
         let facts = self.facts("", &decision.effect);
         let person = facts
             .person
@@ -639,10 +654,14 @@ impl ComputerGate for HubComputerGate {
             Effect::Move { .. } => (vec![Ability::Write, Ability::Delete], None),
             Effect::Exec { .. } => (vec![Ability::Run], None),
             Effect::Session { .. } => (vec![Ability::Session], None),
-            Effect::Connector {
-                connector,
-                write: true,
-            } => (vec![Ability::ConnectorWrite], Some(connector.clone())),
+            // "Use my Chrome for this session" is kept for the Chrome as a
+            // whole; a browser's other answers for their site.
+            Effect::Connector { .. } if their_chrome => {
+                (vec![Ability::ConnectorWrite], Some("chrome".to_string()))
+            }
+            Effect::Connector { connector, write } if *write || is_browser_key(connector) => {
+                (vec![Ability::ConnectorWrite], Some(connector.clone()))
+            }
             _ => eyre::bail!("nothing to keep for this call"),
         };
         let session = matches!(choice, PermissionChoice::AllowSession);
@@ -678,6 +697,26 @@ impl ComputerGate for HubComputerGate {
                 run_name: None,
             };
             self.block_on(self.computer.store().add_grant(&grant))?;
+        }
+        // Allowing the Chrome to open a site allows that site too: one
+        // question, not two, for the first page.
+        if let (true, Effect::Connector { connector, .. }) = (their_chrome, &decision.effect) {
+            if connector.starts_with("chrome-visit:") {
+                let grant = NewGrant {
+                    hub: self.policy.hub.clone(),
+                    agent: self.policy.agent.clone(),
+                    person,
+                    ability: Ability::ConnectorWrite,
+                    folder: None,
+                    connector: Some(connector.clone()),
+                    session_id,
+                    expires_at: session
+                        .then(|| chrono::Utc::now() + chrono::Duration::hours(SESSION_HOURS)),
+                    run: None,
+                    run_name: None,
+                };
+                self.block_on(self.computer.store().add_grant(&grant))?;
+            }
         }
         Ok(())
     }
@@ -1200,6 +1239,91 @@ mod tests {
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
         })
         .await;
+    }
+
+    /// "Use my Chrome for this session" keeps the Chrome for the session,
+    /// and the site it was opening; a change on a site keeps that site. A
+    /// browser's card offers this session, never "always".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_persons_chrome_answers_are_kept_for_the_session() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let visit = Effect::Connector {
+                connector: "chrome-visit:shop.example".into(),
+                write: false,
+            };
+            assert_eq!(
+                gate.effect_of("browser.navigate", visit.clone()),
+                visit,
+                "the tool's own effect stands"
+            );
+            let first = Decision {
+                verdict: as_sarah(|| gate.verdict("browser.navigate", &visit)),
+                effect: visit,
+                reach: None,
+            };
+            assert!(
+                matches!(
+                    &first.verdict,
+                    Verdict::Ask {
+                        why: workforce_core::computer::Why::TheirChrome,
+                        ..
+                    }
+                ),
+                "{:?}",
+                first.verdict
+            );
+            let card = as_sarah(|| gate.prompt(&first));
+            assert!(card.allow_session);
+            assert_eq!(card.allow_in_folder, None, "no always for a browser");
+            as_sarah(|| gate.keep(&first, PermissionChoice::AllowSession)).unwrap();
+            let mut kept: Vec<String> = store
+                .grants(Some("allan"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|g| g.grant.connector)
+                .collect();
+            kept.sort();
+            assert_eq!(kept, ["chrome", "chrome-visit:shop.example"]);
+            // Now the visit runs on the session's allowance.
+            let again = as_sarah(|| {
+                gate.verdict(
+                    "browser.navigate",
+                    &Effect::Connector {
+                        connector: "chrome-visit:shop.example".into(),
+                        write: false,
+                    },
+                )
+            });
+            assert!(
+                matches!(again, Verdict::Run { by: By::Session(_) }),
+                "{again:?}"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn browser_keys_are_desks_and_the_persons_chrome() {
+        for k in [
+            "browser",
+            "browser:a.test",
+            "chrome",
+            "chrome:a.test",
+            "chrome-visit:a.test",
+        ] {
+            assert!(is_browser_key(k), "{k}");
+        }
+        for k in ["linear", "browserx", "chromecast", "chrome-x:a"] {
+            assert!(!is_browser_key(k), "{k}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

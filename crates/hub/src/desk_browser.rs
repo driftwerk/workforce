@@ -11,6 +11,13 @@
 //!   a browser holds.
 //! - `GET /api/desk/browser/shots/{file}`: one screenshot an activity row
 //!   names.
+//! - `GET`/`PUT /api/desk/browser/settings`: which browsers Desk uses (Off,
+//!   Desk's own, My Chrome, Both), whether Desk's own shows on screen, the
+//!   sites My Chrome may and may not go to, and whether the person's Chrome
+//!   has remote debugging on and Desk is connected to it. Kept in
+//!   `…/Desk/browser/settings.json`, which no agent's tools reach.
+//!
+//! When a turn ends, Desk lets go of the person's Chrome there.
 //!
 //! Below unbound, what Desk's never-list holds (paying, signing in or out,
 //! a credential's file) is refused on the page with a sentence for the
@@ -30,7 +37,7 @@ use tracing::warn;
 use uuid::Uuid;
 use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_desk::computer::{Activity, Computer};
-use workforce_skills::adapters::browser::{self, BrowserHooks, Done, OnPage, Which};
+use workforce_skills::adapters::browser::{self, BrowserHooks, Done, OnPage, Settings, Which};
 
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 
@@ -40,6 +47,100 @@ struct DeskHooks {
     computer: Computer,
     /// `…/Desk/browser/shots`.
     shots: PathBuf,
+    settings: Arc<SettingsFile>,
+}
+
+/// The person's browser settings, kept in a file of Desk's own and read
+/// again when it changes.
+pub(crate) struct SettingsFile {
+    path: PathBuf,
+    read: parking_lot::Mutex<Option<(Option<std::time::SystemTime>, Settings)>>,
+}
+
+/// The most sites a list holds.
+const MAX_SITES: usize = 200;
+
+impl SettingsFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            read: Default::default(),
+        }
+    }
+
+    /// What the person set; Desk's defaults (both browsers) where they set
+    /// nothing. One that can't be read is the browser off, said in the log.
+    pub(crate) fn get(&self) -> Settings {
+        let at = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if let Some((seen, s)) = self.read.lock().as_ref() {
+            if *seen == at && at.is_some() {
+                return s.clone();
+            }
+        }
+        let s = match std::fs::read(&self.path) {
+            Err(_) => Settings::default(),
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                warn!(error = %e, "Desk's browser settings can't be read; the browser is off");
+                Settings {
+                    uses: browser::Uses::Off,
+                    ..Settings::default()
+                }
+            }),
+        };
+        *self.read.lock() = Some((at, s.clone()));
+        s
+    }
+
+    fn set(&self, settings: &Settings) -> eyre::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        *self.read.lock() = None;
+        Ok(())
+    }
+}
+
+/// `settings` as the person may keep them, or what is wrong, in words.
+fn checked(mut settings: Settings) -> Result<Settings, String> {
+    for (what, list) in [
+        ("allowed", &mut settings.sites.allow),
+        ("kept away from", &mut settings.sites.block),
+    ] {
+        list.iter_mut()
+            .for_each(|s| *s = s.trim().to_ascii_lowercase());
+        list.retain(|s| !s.is_empty());
+        list.dedup();
+        if list.len() > MAX_SITES {
+            return Err(format!("At most {MAX_SITES} sites can be {what}."));
+        }
+        if let Some(bad) = list.iter().find(|s| {
+            s.len() > 253
+                || !s
+                    .trim_start_matches("*.")
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        }) {
+            return Err(format!(
+                "\"{bad}\" isn't a site: write its host, like example.com."
+            ));
+        }
+    }
+    Ok(settings)
 }
 
 /// The sentence a browser call the never-list holds is refused with.
@@ -51,6 +152,10 @@ fn persons(never: workforce_desk::never::Never) -> String {
 }
 
 impl BrowserHooks for DeskHooks {
+    fn settings(&self) -> Settings {
+        self.settings.get()
+    }
+
     fn unbound(&self, agent: &str) -> bool {
         let Some(service) = self.state.registry.get(agent) else {
             return false;
@@ -189,6 +294,9 @@ struct Routes {
     state: Arc<GatewayState>,
     computer: Computer,
     shots: PathBuf,
+    settings: Arc<SettingsFile>,
+    /// Where the person's Chrome writes `DevToolsActivePort`.
+    chrome_dir: Option<PathBuf>,
 }
 
 type S = State<Arc<Routes>>;
@@ -305,6 +413,62 @@ async fn stop(
         .into_response()
 }
 
+/// The settings, and how the person's Chrome stands: remote debugging on
+/// (`available`) and Desk attached to it now (`connected`).
+async fn settings_view(r: &Routes) -> serde_json::Value {
+    let connected = browser::live().await.iter().any(|l| l.backend == "chrome");
+    json!({
+        "settings": r.settings.get(),
+        "chrome": {
+            "available": r.chrome_dir.as_deref().is_some_and(browser::chrome_available),
+            "connected": connected,
+            "min_version": browser::MIN_CHROME,
+            "turn_on": "chrome://inspect/#remote-debugging",
+        },
+    })
+}
+
+async fn get_settings(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    holder!(r, h, q);
+    Json(settings_view(&r).await).into_response()
+}
+
+/// The person changes them: a browser turned off closes, and My Chrome
+/// turned off is let go, now.
+async fn put_settings(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(next): Json<Settings>,
+) -> Response {
+    holder!(r, h, q);
+    let next = match checked(next) {
+        Ok(s) => s,
+        Err(why) => return refusal(StatusCode::BAD_REQUEST, &why),
+    };
+    if let Err(e) = r.settings.set(&next) {
+        warn!(error = %format!("{e:#}"), "saving Desk's browser settings failed");
+        return refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Desk couldn't save the browser settings. Try again.",
+        );
+    }
+    use browser::{Backend, Uses};
+    match next.uses {
+        Uses::Off => {
+            browser::close(Which::All).await;
+        }
+        Uses::Desk => {
+            browser::close_backend(Backend::Chrome).await;
+        }
+        Uses::Chrome => {
+            browser::close_backend(Backend::Desk).await;
+        }
+        Uses::Both => {}
+    }
+    Json(settings_view(&r).await).into_response()
+}
+
 /// Whether `file` names a kept screenshot: a UUID and `.png`, nothing else.
 fn shot_name(file: &str) -> Option<&str> {
     let id = file.strip_suffix(".png")?;
@@ -377,14 +541,34 @@ pub fn install(
     computer: Computer,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Router {
-    let shots = crate::desk_folder::browser_profiles(config)
-        .unwrap_or_else(|| PathBuf::from(&config.hub.data_dir).join("browser"))
-        .join("shots");
+    let root = crate::desk_folder::browser_profiles(config)
+        .unwrap_or_else(|| PathBuf::from(&config.hub.data_dir).join("browser"));
+    let shots = root.join("shots");
+    let settings = Arc::new(SettingsFile::new(root.join("settings.json")));
+    let chrome_dir = config
+        .skills
+        .browser
+        .chrome_user_data_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(browser::chrome_user_data_dir);
     let hooks = Arc::new(DeskHooks {
         state: Arc::clone(state),
         computer: computer.clone(),
         shots: shots.clone(),
+        settings: Arc::clone(&settings),
     });
+    // A turn's end lets go of the person's Chrome it was using.
+    workforce_hub_core::hub_core::live_turns::on_turn_end(Box::new(|session: &str| {
+        let session = session.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                browser::turn_ended(&session).await;
+            });
+        }
+    }));
     if !browser::install_hooks(hooks) {
         warn!("Desk's browser hooks were installed twice; the first stand");
     }
@@ -405,10 +589,16 @@ pub fn install(
         .route("/api/desk/browser", get(list))
         .route("/api/desk/browser/stop", post(stop))
         .route("/api/desk/browser/shots/{file}", get(shot))
+        .route(
+            "/api/desk/browser/settings",
+            get(get_settings).put(put_settings),
+        )
         .with_state(Arc::new(Routes {
             state: Arc::clone(state),
             computer,
             shots,
+            settings,
+            chrome_dir,
         }))
 }
 
@@ -494,5 +684,59 @@ mod tests {
         use workforce_desk::never::{on_page, Never};
         assert_eq!(on_page("Buy now"), Some(Never::Money));
         assert!(persons(Never::Money).contains("spends or moves money"));
+    }
+
+    #[test]
+    fn settings_default_to_both_and_keep_what_was_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = SettingsFile::new(dir.path().join("browser/settings.json"));
+        assert_eq!(file.get().uses, browser::Uses::Both, "nothing set: both on");
+        let set = Settings {
+            uses: browser::Uses::Chrome,
+            show: Some(false),
+            sites: browser::Sites {
+                allow: vec![],
+                block: vec!["bank.test".into()],
+            },
+        };
+        file.set(&set).unwrap();
+        assert_eq!(file.get(), set);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("browser/settings.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::write(dir.path().join("browser/settings.json"), "{ not json").unwrap();
+        // A later mtime may share the second; drop what was read.
+        *file.read.lock() = None;
+        assert_eq!(file.get().uses, browser::Uses::Off, "unreadable: off");
+    }
+
+    #[test]
+    fn a_site_list_is_hosts_only() {
+        let ok = checked(Settings {
+            sites: browser::Sites {
+                allow: vec![" Example.COM ".into(), "*.docs.test".into(), "".into()],
+                block: vec![],
+            },
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(ok.sites.allow, vec!["example.com", "*.docs.test"]);
+        for bad in ["https://x.test/", "a b", "x.test/path"] {
+            let err = checked(Settings {
+                sites: browser::Sites {
+                    allow: vec![],
+                    block: vec![bad.into()],
+                },
+                ..Settings::default()
+            })
+            .unwrap_err();
+            assert!(err.contains("isn't a site"), "{bad}: {err}");
+        }
     }
 }
