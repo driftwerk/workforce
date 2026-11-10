@@ -12,7 +12,10 @@ const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 25\n";
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    // Hub-side git is hardened, a test's too.
+    let mut git = crate::git_hardening::hardened_git();
+    let out = git
+        .as_std_mut()
         .arg("-C")
         .arg(dir)
         .args(args)
