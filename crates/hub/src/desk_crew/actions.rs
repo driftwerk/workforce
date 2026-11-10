@@ -1413,7 +1413,7 @@ impl CrewHub {
                             .map_err(line)?;
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
-                                "told {name}; the person is driving it, so your message waits until they hand it back"
+                                "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
                             ));
                         }
                         Ok(match told.delivery {
@@ -1698,7 +1698,10 @@ impl CrewHub {
     ) -> Result<workforce_desk::TicketView, String> {
         let t = match id {
             Some(id) => self.desk.ticket(id).await,
-            None => self.desk.ticket_by_key(key).await,
+            None => match seen {
+                Some(seen) => self.desk.ticket_by_key_in(key, |g| seen.sees(g)).await,
+                None => self.desk.ticket_by_key(key).await,
+            },
         };
         if let Some(seen) = seen {
             let group = match &t {

@@ -456,3 +456,41 @@ async fn plans_and_moves_keep_off_a_synced_board() {
     })
     .await;
 }
+
+/// Two links in two groups may each hold ACME-1: a key names the one the
+/// caller reaches, and the palette shows both.
+#[tokio::test]
+async fn one_key_on_two_links_names_the_one_in_reach() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.put_sync_hub("acme", "Acme", "https://acme.example", "sam").await.unwrap();
+        d.put_sync_hub("globex", "Globex", "https://globex.example", "sam").await.unwrap();
+        let a = synced(&d, "Acme", Some("acme")).await;
+        let g = synced(&d, "Globex", Some("globex")).await;
+        // Each board's group, as the sidebar would have it.
+        for (b, group) in [(a.id, "g-acme"), (g.id, "g-globex")] {
+            let c = d.0.store.pool().get().await.unwrap();
+            c.execute("UPDATE boards SET group_id = $2 WHERE id = $1", &[&b, &group])
+                .await
+                .unwrap();
+        }
+        let remote = jira(1, &[]);
+        for b in [a.id, g.id] {
+            let c = d.0.store.pool().get().await.unwrap();
+            c.execute("UPDATE boards SET sync = jsonb_set(sync, '{group}', to_jsonb(group_id)) WHERE id = $1", &[&b])
+                .await
+                .unwrap();
+            d.pull_board(b, &remote).await.unwrap();
+        }
+        for (group, board) in [("g-acme", a.id), ("g-globex", g.id)] {
+            let t = d
+                .ticket_by_key_in("ACME-1", |g| g == Some(group))
+                .await
+                .unwrap();
+            assert_eq!(t.ticket.board, board, "{group}");
+        }
+        assert_eq!(d.search_tickets("ACME-1").await.unwrap().len(), 2);
+    })
+    .await;
+}

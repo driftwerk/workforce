@@ -492,6 +492,16 @@ impl CrewHub {
                 })
                 .collect(),
         );
+        self.desk.set_holds(
+            list.iter()
+                .map(|(s, o)| {
+                    (
+                        s.agent_id.as_str().to_string(),
+                        chrono::Duration::minutes(o.wake.hold_minutes.into()),
+                    )
+                })
+                .collect(),
+        );
         list
     }
 
