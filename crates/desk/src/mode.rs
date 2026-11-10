@@ -78,9 +78,13 @@ impl Mode {
         matches!(self, Self::Default | Self::AcceptEdits | Self::Plan)
     }
 
-    /// Claude Code's arguments to start in it.
-    pub fn claude_args(self) -> [String; 2] {
-        ["--permission-mode".to_string(), self.as_str().to_string()]
+    /// Claude Code's arguments to start in it: bypass by
+    /// `--dangerously-skip-permissions`, the rest by `--permission-mode`.
+    pub fn claude_args(self) -> Vec<String> {
+        match self {
+            Self::BypassPermissions => vec!["--dangerously-skip-permissions".to_string()],
+            m => vec!["--permission-mode".to_string(), m.as_str().to_string()],
+        }
     }
 
     /// Codex's settings to start in it: its approval policy and sandbox.
@@ -119,9 +123,10 @@ mod tests {
             Some(Mode::Auto)
         );
         assert_eq!(of_hook(br#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(Mode::Plan.claude_args(), ["--permission-mode", "plan"]);
         assert_eq!(
-            Mode::Plan.claude_args(),
-            ["--permission-mode".to_string(), "plan".to_string()]
+            Mode::BypassPermissions.claude_args(),
+            ["--dangerously-skip-permissions"]
         );
         assert!(Mode::Default.asks() && !Mode::Auto.asks());
     }
