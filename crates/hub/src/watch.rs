@@ -101,6 +101,15 @@ fn is_watchable(tool: &str, params: &Value) -> bool {
         && !workforce_policy::rules::is_destructive(tool)
 }
 
+/// Why `watch` doesn't poll the crew: an overseer is already woken for the
+/// sessions it oversees, and a poll would run outside its scope.
+pub(crate) const CREW_WATCH: &str = "No extra watch is needed for Desk's sessions: Desk already \
+     wakes you for every session you oversee when it waits on a question or an approval, goes \
+     quiet, finishes a turn or fails (how soon is the person's `[oversight.wake]`), and the \
+     sessions in your charge at each turn's end; unbound, it also sweeps them all every two \
+     minutes. Just say what you'll do when it next wakes you; \
+     `watch` only polls read-only status tools.";
+
 /// "Keep an eye on X" tool.
 pub struct WatchTool {
     service: Arc<AgentService>,
@@ -183,6 +192,9 @@ impl Tool for WatchTool {
         // role (an admin's watch is just as unscoped). Recurring *actions* belong
         // in `scheduler`, which runs as a real owner through the gate.
         let watch_params = input.params.clone().unwrap_or_else(|| json!({}));
+        if input.tool.starts_with("crew.") {
+            return Ok(ToolResult::failure(CREW_WATCH, elapsed()));
+        }
         if !is_watchable(&input.tool, &watch_params) {
             return Ok(ToolResult::failure(
                 format!(
@@ -271,6 +283,12 @@ impl Tool for WatchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crew_is_not_watched_and_says_why() {
+        assert!(!is_watchable("crew.overview", &json!({})));
+        assert!(CREW_WATCH.contains("already wakes you"));
+    }
 
     #[test]
     fn allowlisted_read_tools_are_watchable() {

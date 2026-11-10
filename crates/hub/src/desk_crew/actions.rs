@@ -13,6 +13,7 @@ use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
+use workforce_desk::mode::Mode;
 use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
@@ -143,6 +144,12 @@ pub(crate) enum Action {
         /// the CLI's own sign-in.
         account: Option<Option<Uuid>>,
     },
+    /// Change a session's permission mode ([`workforce_desk::mode`]): it
+    /// starts again in place, its conversation kept.
+    SetMode {
+        session: Uuid,
+        mode: Mode,
+    },
 }
 
 #[derive(Deserialize)]
@@ -173,6 +180,8 @@ struct Input {
     draft: Option<String>,
     /// A handoff's account: an account's id, or `own`.
     account: Option<String>,
+    /// A permission mode, as Claude Code spells it.
+    mode: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -366,6 +375,12 @@ impl Action {
                     })?)),
                 },
             },
+            "crew.set_mode" => Self::SetMode {
+                session: session()?,
+                mode: i.mode.as_deref().and_then(Mode::parse).ok_or(
+                    "Say which mode: default, acceptEdits, auto, plan or bypassPermissions.",
+                )?,
+            },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -406,8 +421,8 @@ impl Action {
         Self::parse(tool, &action["input"])
     }
 
-    /// What it says, as [`CrewHub::said_outward`] reads it for pushing
-    /// code, deleting something, or reaching outside Desk.
+    /// What it says, as [`workforce_desk::never::said`] reads it for what
+    /// no overseer does at any level.
     /// A session it starts is said by its name too, so a name it picks
     /// ("The Release") is read as what it says.
     fn said(&self) -> Cow<'_, str> {
@@ -432,414 +447,10 @@ impl Action {
             | Self::Escalate { .. }
             | Self::TakeOn { .. }
             | Self::Release { .. }
-            | Self::Handoff { .. } => "",
+            | Self::Handoff { .. }
+            | Self::SetMode { .. } => "",
         })
     }
-}
-
-/// Words that name pushing, deploying, deleting or sending: each word of a
-/// text is matched whole against `OUTWARD_WORDS`, and by its start against
-/// `OUTWARD_STEMS` (so pushing, deployment, publishing, merged, released
-/// and deleting are caught with push, deploy and the rest).
-const OUTWARD_STEMS: &[&str] = &[
-    "push",
-    "deploy",
-    "ship",
-    "publish",
-    "releas",
-    "merg",
-    "delet",
-    "remov",
-    "destroy",
-    "wip",
-    "purg",
-    "send",
-    "upload",
-    "submit",
-    "notif",
-    "announc",
-    "invit",
-    "purchas",
-    "email",
-    "mail",
-    "messag",
-    "tweet",
-    "slack",
-    "migrat",
-    "commit",
-    "production",
-    "rollout",
-    "rebase",
-    "drop",
-    "force",
-];
-const OUTWARD_WORDS: &[&str] = &[
-    "sent", "post", "posts", "posted", "posting", "pr", "prs", "rm", "dm", "share", "shares",
-    "shared", "sharing", "reply", "replies", "replied", "pay", "pays", "paid", "buy", "order",
-    "prod", "apply", "applies", "applied", "applying", "reset",
-];
-
-/// Words that undo the outward word they come just before: "make no
-/// production changes", "don't push", "hold off on merging". Two cancel
-/// ("don't stop deploying", "you can't not deploy" still deploy). Matched
-/// whole, apostrophes dropped.
-const NEGATIONS: &[&str] = &[
-    "no", "not", "dont", "never", "without", "avoid", "stop", "cant", "cannot",
-];
-
-/// Words that may stand between a negation and the word it undoes ("no
-/// more pushes", "don't do any deploys"). Any other word, an outward one
-/// too, ends the negation's reach: "don't wait push it" and "don't merge
-/// push to main" still push.
-const BETWEEN: &[&str] = &[
-    "a", "an", "the", "any", "more", "ever", "further", "new", "yet", "do", "make", "to",
-];
-
-/// Outward words that may come between a negation and the word it undoes,
-/// one at most and right before it: "no force-push", "no prod deploys".
-const MODIFIERS: &[&str] = &["force", "prod", "production"];
-
-/// The words a negation is honoured after, besides the start of its clause
-/// and `BETWEEN`'s "do" and "make": "please don't push", "we never
-/// deploy". After any other ("a shame not to deploy", "yes or no the
-/// deploy") the word stays outward.
-const SAYERS: &[&str] = &["i", "we", "you", "please"];
-
-/// Words before which a reply is the person's, not something to send:
-/// "until the person replies".
-const UNTIL: &[&str] = &["until", "till", "unless"];
-
-/// How many words back a negation or an `UNTIL` may be.
-const REACH: usize = 4;
-
-/// A word of a text, as matched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Word {
-    /// Its letters and digits, run together.
-    text: String,
-    /// Its pieces, where something that is no letter split it ("de⠀ploy"):
-    /// each is matched too, so a symbol can't hide a word.
-    parts: Vec<String>,
-    /// Joined to the word before by a hyphen ("non-stop"), so it is no
-    /// negation of its own.
-    hyphened: bool,
-}
-
-/// Whether `c` is left out: invisible formatting (General Category Cf,
-/// zero-width spaces and joiners, direction marks, soft hyphens, tags),
-/// combining marks (Mn: "pu\u{301}sh"), and the blank letters that show
-/// as nothing (Hangul fillers, the blank Braille pattern).
-fn hidden(c: char) -> bool {
-    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
-    matches!(
-        c.general_category(),
-        GeneralCategory::Format | GeneralCategory::NonspacingMark
-    ) || matches!(
-        c,
-        '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
-    )
-}
-
-/// The letters of `word` as matched: lowercased, then read past
-/// look-alikes by its UTS #39 confusables skeleton ("pսsh", "merɡe" are
-/// push and merge), with what isn't a letter or digit left out.
-fn letters(word: &str) -> String {
-    let lower = word.to_lowercase();
-    unicode_security::skeleton(&lower)
-        .filter(|c| !hidden(*c))
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-/// The words of `text`: decomposed (NFKD), what is hidden left out, split
-/// only at ASCII whitespace and punctuation (and dashes), so a symbol joins
-/// the word it is in rather than splitting it; `None` where a clause ends
-/// (`.,;:!?()`, a dash standing alone, a line break), so nothing reaches
-/// across one.
-fn words(text: &str) -> Vec<Option<Word>> {
-    use unicode_normalization::UnicodeNormalization;
-    let chars: Vec<char> = text
-        .nfkd()
-        .filter(|c| !hidden(*c) && !matches!(c, '\'' | '\u{2019}'))
-        .collect();
-    let mut out: Vec<Option<Word>> = Vec::new();
-    let mut word = String::new();
-    let mut hyphened = false;
-    let mut joined = false;
-    let push = |out: &mut Vec<Option<Word>>, word: &mut String, hyphened: bool| {
-        if word.is_empty() {
-            return;
-        }
-        let raw = std::mem::take(word);
-        let parts: Vec<String> = raw
-            .split(|c: char| !c.is_alphanumeric())
-            .map(letters)
-            .filter(|p| !p.is_empty())
-            .collect();
-        let text = letters(
-            &raw.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>(),
-        );
-        if !text.is_empty() {
-            out.push(Some(Word {
-                text,
-                parts,
-                hyphened,
-            }));
-        }
-    };
-    for (i, &c) in chars.iter().enumerate() {
-        // Only ASCII spaces split (NFKD made most others one), so a line
-        // separator inside a word joins it.
-        let splits = c.is_ascii_whitespace()
-            || c.is_ascii_punctuation()
-            || matches!(c, '\u{2014}' | '\u{2013}');
-        if !splits {
-            if word.is_empty() {
-                hyphened = joined;
-            }
-            word.push(c);
-            continue;
-        }
-        push(&mut out, &mut word, hyphened);
-        let spaced = |j: Option<usize>| {
-            j.and_then(|j| chars.get(j))
-                .is_none_or(|c| c.is_whitespace())
-        };
-        let (ends, joins) = match c {
-            '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '\n' | '\u{2014}' | '\u{2013}' => {
-                (true, false)
-            }
-            '-' if spaced(i.checked_sub(1)) || spaced(Some(i + 1)) => (true, false),
-            '-' => (false, true),
-            _ => (false, false),
-        };
-        joined = joins;
-        if ends && out.last().is_some_and(Option::is_some) {
-            out.push(None);
-        }
-    }
-    push(&mut out, &mut word, hyphened);
-    out
-}
-
-/// The word lists, each read once as [`letters`] reads a text's words.
-struct Keys {
-    words: Vec<String>,
-    stems: Vec<String>,
-    shipping_words: Vec<String>,
-    shipping_stems: Vec<String>,
-    lists: std::collections::HashMap<&'static str, String>,
-}
-
-static KEYS: std::sync::LazyLock<Keys> = std::sync::LazyLock::new(|| {
-    let keyed = |list: &[&str]| list.iter().map(|w| letters(w)).collect::<Vec<_>>();
-    let mut lists = std::collections::HashMap::new();
-    for list in [
-        NEGATIONS,
-        BETWEEN,
-        MODIFIERS,
-        SAYERS,
-        UNTIL,
-        REPLIES,
-        &["on", "off", "hold"],
-    ] {
-        for w in list {
-            lists.insert(*w, letters(w));
-        }
-    }
-    Keys {
-        words: keyed(OUTWARD_WORDS),
-        stems: keyed(OUTWARD_STEMS),
-        shipping_words: keyed(SHIPPING_WORDS),
-        shipping_stems: keyed(SHIPPING_STEMS),
-        lists,
-    }
-});
-
-/// The words a reply is waited on by.
-const REPLIES: &[&str] = &["reply", "replies", "replied"];
-
-/// What Act fully lets through in its named repositories: the words of
-/// shipping (pushing, merging, tagging, releasing, promoting, deploying),
-/// by start, and a few whole. Deleting, sending, paying and the rest stay
-/// outward.
-const SHIPPING_STEMS: &[&str] = &[
-    "push",
-    "deploy",
-    "ship",
-    "publish",
-    "releas",
-    "merg",
-    "commit",
-    "production",
-    "rollout",
-    "tag",
-    "promot",
-];
-const SHIPPING_WORDS: &[&str] = &["prod", "pr", "prs"];
-
-/// Whether `w`, as [`letters`] reads it, is a word of shipping.
-fn shipping_text(w: &str) -> bool {
-    KEYS.shipping_words.iter().any(|k| k == w)
-        || KEYS
-            .shipping_stems
-            .iter()
-            .any(|s| w.starts_with(s.as_str()))
-}
-
-/// Whether `word` reads as outward past what ships.
-fn outward_past_shipping(word: &Word) -> bool {
-    std::iter::once(&word.text)
-        .chain(&word.parts)
-        .any(|p| outward_text(p) && !shipping_text(p))
-}
-
-fn outward_text(w: &str) -> bool {
-    KEYS.words.iter().any(|k| k == w) || KEYS.stems.iter().any(|s| w.starts_with(s.as_str()))
-}
-
-/// Whether `word` reads as outward, whole or by any piece of it.
-fn outward_word(word: &Word) -> bool {
-    outward_text(&word.text) || word.parts.iter().any(|p| outward_text(p))
-}
-
-/// Whether `w` is one of `list` (all of whose words are in [`KEYS`]), as
-/// [`letters`] reads both.
-fn one_of(w: &str, list: &[&str]) -> bool {
-    list.iter()
-        .any(|l| KEYS.lists.get(l).is_some_and(|k| k == w))
-}
-
-fn text_at(ws: &[Option<Word>], j: usize) -> Option<&str> {
-    ws.get(j)?.as_ref().map(|w| w.text.as_str())
-}
-
-/// Whether the word at `i` is undone by negations just before it, in its
-/// clause: an odd number of them, with only `BETWEEN` words, other
-/// negations and one `MODIFIERS` word right before it between; and
-/// before them the start of the clause or one of `SAYERS`, with no other
-/// negation earlier in the clause ("no reason not to deploy" deploys).
-fn negated(ws: &[Option<Word>], i: usize) -> bool {
-    let mut j = i;
-    if j > 0 && text_at(ws, j - 1).is_some_and(|w| one_of(w, MODIFIERS)) {
-        j -= 1;
-    }
-    let mut negations = 0;
-    let mut seen = 0;
-    // Where the negations' run starts: the clause's start, or the word
-    // before them, once found.
-    let mut opened = false;
-    loop {
-        if j == 0 || text_at(ws, j - 1).is_none() {
-            opened = true;
-            break;
-        }
-        if seen == REACH {
-            break;
-        }
-        j -= 1;
-        seen += 1;
-        let w = text_at(ws, j).unwrap_or_default();
-        if negation_at(ws, j) {
-            negations += 1;
-            if one_of(w, &["on"]) {
-                j -= 2;
-            }
-        } else if !one_of(w, BETWEEN) {
-            opened = one_of(w, SAYERS);
-            break;
-        }
-    }
-    let clause = ws[..i]
-        .iter()
-        .rposition(Option::is_none)
-        .map_or(0, |b| b + 1);
-    opened && negations % 2 == 1 && !(clause..j).any(|k| negation_at(ws, k))
-}
-
-/// Whether a negation ends at `j`: one of `NEGATIONS` standing alone (not
-/// "non-stop"), or "hold off on".
-fn negation_at(ws: &[Option<Word>], j: usize) -> bool {
-    let Some(w) = ws[j].as_ref() else {
-        return false;
-    };
-    if w.hyphened {
-        return false;
-    }
-    let is = |k: usize, word: &str| text_at(ws, k).is_some_and(|w| one_of(w, &[word]));
-    if is(j, "on") {
-        return j >= 2 && is(j - 1, "off") && is(j - 2, "hold");
-    }
-    one_of(&w.text, NEGATIONS)
-}
-
-/// Whether the reply-word at `i` is a wait on someone's reply: an `UNTIL`
-/// a few words before it, in its clause ("until the person replies").
-fn awaited(ws: &[Option<Word>], i: usize) -> bool {
-    text_at(ws, i).is_some_and(|w| one_of(w, REPLIES))
-        && ws[i.saturating_sub(REACH)..i]
-            .iter()
-            .rev()
-            .map_while(Option::as_ref)
-            .any(|w| one_of(&w.text, UNTIL))
-}
-
-/// Whether `text` names something that pushes, deploys, deletes or sends.
-/// Words can't say all that a message leads to ("may I go on?" with the
-/// push only in what came before), so this only ever narrows what runs.
-///
-/// What `names` call sessions and agents isn't read where it only names
-/// one. A name with no outward word is let go anywhere ("How is Acme
-/// doing?"); one with an outward word only when the message opens by
-/// addressing it ("Acme Migration: …"), and never one that starts with
-/// one ("Release 4.2: go ahead" releases), so "go ahead with the release"
-/// stays outward whatever a session is called. An outward word is let go
-/// only when clearly negated just before ("make no production changes") or
-/// a reply waited on ("until the person replies").
-#[cfg(test)]
-pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
-    outward_unless_shipping(text, names, false)
-}
-
-/// [`outward_except`], where shipping (`ships`: Act fully in the session's
-/// repository) doesn't count: pushing, merging, tagging and deploying are
-/// let go; deleting, sending, paying and the rest are still outward.
-pub(crate) fn outward_unless_shipping(text: &str, names: &[String], ships: bool) -> bool {
-    let mut ws = words(text);
-    let mut names: Vec<Vec<Word>> = names
-        .iter()
-        .map(|n| words(n).into_iter().flatten().collect::<Vec<_>>())
-        .filter(|n| n.first().is_some_and(|w| !outward_word(w)))
-        .collect();
-    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    for name in &names {
-        let inward = !name.iter().any(outward_word);
-        let mut i = 0;
-        while i + name.len() <= ws.len() {
-            let here = ws[i..i + name.len()]
-                .iter()
-                .zip(name)
-                .all(|(w, n)| w.as_ref().is_some_and(|w| w.text == n.text));
-            // Addressed: first in the message, a clause ending after it.
-            let addressed = i == 0 && ws.get(name.len()).is_some_and(Option::is_none);
-            if here && (inward || addressed) {
-                // A clause ends where it was, so no negation reaches across.
-                ws.splice(i..i + name.len(), [None]);
-            }
-            i += 1;
-        }
-    }
-    (0..ws.len()).any(|i| {
-        ws[i].as_ref().is_some_and(|w| {
-            let outward = match ships {
-                true => outward_past_shipping(w),
-                false => outward_word(w),
-            };
-            outward && !negated(&ws, i) && !awaited(&ws, i)
-        })
-    })
 }
 
 /// A charge refused in the words the person reads, as they are.
@@ -881,6 +492,12 @@ pub(crate) enum Gate {
 impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        // Unbound, every crew action runs: Desk answers what it asks for
+        // itself (`boss_decides`), and only the hold while the person types
+        // into a session it runs waits, as a courtesy.
+        if o.level != Level::Watch && self.unbound(o) {
+            return self.unbound_gate(action, o);
+        }
         // Continuing a session in another engine sends its brief to that
         // engine's vendor: the person's call, every time.
         if let Action::Handoff { .. } = action {
@@ -932,34 +549,10 @@ impl CrewHub {
         if let Some(why) = self.uncontained(action, &o.act) {
             return Gate::Suggest(why.into());
         }
-        // Acting fully, an answer to a session in a repository it ships in
-        // may speak of shipping; what else reaches outside is the person's.
-        let ships = match action {
-            Action::Nudge {
-                to: Target::Session(s),
-                reply_to: Some(_),
-                ..
-            } => o.act.answer_sessions && self.ships_in(*s, o),
-            _ => false,
-        };
-        let asked_outward = match action {
-            Action::Nudge {
-                reply_to: Some(ask),
-                ..
-            } => {
-                let asked = self.questions.lock().get(ask).cloned();
-                asked.is_none_or(|q| self.said_outward_unless(&q, ships))
-            }
-            _ => false,
-        };
-        if self.said_outward_unless(&action.said(), ships)
-            || asked_outward
-            || self.ticket_outward(action)
-        {
-            return Gate::Suggest(
-                "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
-            );
-        }
+        // What a message, an answer or a ticket's text says isn't read for
+        // pushing or sending: a message can't act. What the session or
+        // agent then does is judged as it does it (its approvals, Desk's
+        // `judge` and never-list), so its words don't hold it here.
         // Letting go of a ticket for good is the person's, whatever else
         // they let it hand out; so is bringing back one they dropped.
         if let Action::MoveTicket { state, was, .. } = action {
@@ -1055,6 +648,20 @@ impl CrewHub {
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => true,
             Action::Handoff { .. } => false,
+            // At Act, only to a mode that still asks before it runs a
+            // command; any other is an unbound overseer's alone.
+            Action::SetMode { mode, .. } => {
+                if !mode.asks() {
+                    return Gate::Suggest(
+                        format!(
+                            "only an unbound overseer puts a session in {} mode",
+                            mode.title()
+                        )
+                        .into(),
+                    );
+                }
+                o.act.set_mode
+            }
         };
         if allowed {
             Gate::Run
@@ -1063,44 +670,32 @@ impl CrewHub {
         }
     }
 
-    /// Whether the ticket `action` hands out says something reaching
-    /// outside Desk, as `crew.assign` and `crew.start_session` are judged by
-    /// what they say: to an agent, to a session started for it, and to a
-    /// session in another terminal (one Desk started waits on its
-    /// approvals).
-    fn ticket_outward(&self, action: &Action) -> bool {
-        let Action::AssignTicket { to, text, .. } = action else {
-            return false;
-        };
-        let says = match to {
-            Handout::Agent(_) | Handout::NewSession { .. } => true,
-            Handout::Session(s) => self
-                .desk
-                .view(*s)
-                .is_ok_and(|v| v.origin == Origin::External),
-        };
-        says && self.said_outward(text)
+    /// [`Self::gate`] for an unbound overseer: everything runs, but what
+    /// it does to a session it runs waits while the person is driving it
+    /// (a plain message waits on its line as before).
+    fn unbound_gate(&self, action: &Action, o: &Oversight) -> Gate {
+        let charged = Self::session_of(action).filter(|s| self.overseer_runs(*s, &o.scope));
+        if let Some(session) = charged {
+            let driving = self.desk.wheel_of(session).is_some_and(|w| w.person());
+            if driving && !matches!(action, Action::Nudge { reply_to: None, .. }) {
+                let name = self.session_name(session);
+                return Gate::Suggest(
+                    format!(
+                        "the person is driving {name}, so I've held this for them as a suggestion"
+                    )
+                    .into(),
+                );
+            }
+        }
+        Gate::Run
     }
 
-    /// Whether `text` reads as pushing, deleting or sending, past what
-    /// sessions and agents are called: a session's name naming a migration
-    /// isn't asking for one.
-    fn said_outward(&self, text: &str) -> bool {
-        self.said_outward_unless(text, false)
-    }
-
-    /// [`Self::said_outward`], shipping not counted when `ships`.
-    fn said_outward_unless(&self, text: &str, ships: bool) -> bool {
-        let mut names = Vec::new();
-        for v in self.desk.list() {
-            names.push(v.label().to_string());
-            names.push(v.name);
-        }
-        for s in self.services() {
-            names.push(super::name_of(&s));
-            names.push(s.agent_id.as_str().to_string());
-        }
-        outward_unless_shipping(text, &names, ships)
+    /// Whether `by` is an overseer that is unbound now.
+    pub(crate) fn by_unbound(&self, by: &By) -> bool {
+        by.party.kind == crew::PartyKind::Manager
+            && self
+                .overseer_named(&by.party.id)
+                .is_some_and(|(s, o)| self.unbound_given(&s, &o))
     }
 
     /// The hard limit what `action` says, or the question it answers,
@@ -1136,7 +731,8 @@ impl CrewHub {
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
-            | Action::Handoff { session: s, .. } => Some(*s),
+            | Action::Handoff { session: s, .. }
+            | Action::SetMode { session: s, .. } => Some(*s),
             _ => None,
         }
     }
@@ -1172,11 +768,6 @@ impl CrewHub {
                 )),
             };
         }
-        let outward_said = || {
-            Some(Gate::Suggest(
-                "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
-            ))
-        };
         match action {
             Action::Approve { approval, .. } => {
                 let boss = self.boss_id(o).unwrap_or_default();
@@ -1188,24 +779,16 @@ impl CrewHub {
                 })
             }
             Action::Deny { .. } => Some(Gate::Run),
+            // An answer is a message: what it leads to is judged as the
+            // session does it.
             Action::Nudge {
-                reply_to: Some(ask),
-                ..
-            } => {
-                // Acting fully in its repository, shipping is its to answer.
-                let ships = o.act.answer_sessions && self.ships_in(session, o);
-                let asked = self.questions.lock().get(ask).cloned();
-                let asked_outward = asked.is_none_or(|q| self.said_outward_unless(&q, ships));
-                if self.said_outward_unless(&action.said(), ships) || asked_outward {
-                    return outward_said();
+                reply_to: Some(_), ..
+            } => Some(match o.act.answer_sessions {
+                true => Gate::Run,
+                false => {
+                    Gate::Suggest("the person hasn't let you answer sessions without asking".into())
                 }
-                Some(match o.act.answer_sessions {
-                    true => Gate::Run,
-                    false => Gate::Suggest(
-                        "the person hasn't let you answer sessions without asking".into(),
-                    ),
-                })
-            }
+            }),
             Action::Interrupt { .. } => Some(Gate::Run),
             // A session started again reads its settings again: changes to
             // them it made by itself are the person's to let take effect.
@@ -1282,7 +865,9 @@ impl CrewHub {
             | Action::Release { .. }
             // The session it starts waits on its approvals, as any Desk
             // starts; and it is only ever suggested.
-            | Action::Handoff { .. } => true,
+            | Action::Handoff { .. }
+            // Below unbound, only to a mode that still asks.
+            | Action::SetMode { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -1352,7 +937,8 @@ impl CrewHub {
             | Action::Restart { session: s, .. }
             | Action::TakeOn { session: s }
             | Action::Release { session: s }
-            | Action::Handoff { session: s, .. } => {
+            | Action::Handoff { session: s, .. }
+            | Action::SetMode { session: s, .. } => {
                 self.desk.view(*s).ok().map(|v| Party::session(&v))
             }
         }
@@ -1462,6 +1048,11 @@ impl CrewHub {
                 self.session_name(*session),
                 engine.title(),
                 workforce_desk::handoff::egress(*engine)
+            ),
+            Action::SetMode { session, mode } => format!(
+                "Put {} in {} mode",
+                self.session_name(*session),
+                mode.title()
             ),
         }
     }
@@ -1668,7 +1259,7 @@ impl CrewHub {
             } => {
                 // The person, saying yes to the suggestion that named who
                 // receives the brief: no one else hands work on.
-                if by.party.kind != crew::PartyKind::You {
+                if by.party.kind != crew::PartyKind::You && !self.by_unbound(&by) {
                     return Err("Only the person continues a session in another engine.".into());
                 }
                 let name = self.session_name(*session);
@@ -1695,6 +1286,34 @@ impl CrewHub {
                     engine.title(),
                     done.session.label()
                 ))
+            }
+            Action::SetMode { session, mode } => {
+                let set = d.set_mode(*session, *mode, by).await.map_err(|e| match e {
+                    workforce_desk::DeskError::Conflict(why)
+                    | workforce_desk::DeskError::Invalid(why) => why,
+                    e => plain(e),
+                })?;
+                let name = set.view.label().to_string();
+                Ok(match (set.running, set.confirmed) {
+                    (false, _) => format!(
+                        "{name} isn't running; it starts in {} mode next time",
+                        mode.title()
+                    ),
+                    (true, Some(m)) if m == *mode => format!(
+                        "started {name} again in place in {} mode, its conversation kept; it says it runs in {} mode",
+                        mode.title(),
+                        m.title()
+                    ),
+                    (true, Some(m)) => format!(
+                        "started {name} again in place, but it says it runs in {} mode, not {}; check it before relying on it",
+                        m.title(),
+                        mode.title()
+                    ),
+                    (true, None) => format!(
+                        "started {name} again in place in {} mode, its conversation kept; it hasn't said its mode yet",
+                        mode.title()
+                    ),
+                })
             }
         }
     }
@@ -2298,234 +1917,6 @@ impl CrewHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn outward(text: &str) -> bool {
-        outward_except(text, &[])
-    }
-
-    #[test]
-    fn acting_fully_lets_shipping_words_go_and_keeps_the_rest_outward() {
-        for said in [
-            "Yes: merge, tag and promote.",
-            "Merge PR 42 and deploy to production.",
-            "Push to main, then release v1.2.0.",
-        ] {
-            assert!(outward_except(said, &[]), "at Act: {said}");
-            assert!(!outward_unless_shipping(said, &[], true), "{said}");
-        }
-        for said in [
-            "Merge it and delete the old branch.",
-            "Deploy, then email the customer.",
-            "Push it and post in Slack.",
-            "Merge it and buy more seats.",
-        ] {
-            assert!(outward_unless_shipping(said, &[], true), "{said}");
-        }
-    }
-
-    #[test]
-    fn a_negated_outward_word_is_not_outward() {
-        for said in [
-            "Make no production changes",
-            "Do not deploy yet",
-            "Don't push anything",
-            "Don\u{2019}t merge yet",
-            "No force-push",
-            "No prod deploys",
-            "No more force pushes",
-            "Never force-push to main",
-            "Please don't deploy",
-            "We never force-push",
-            "Avoid publishing for now",
-            "Stop deploying",
-            "No more pushes today",
-            "Hold off on merging",
-            "Don't do any deploys",
-            "Wait until the person replies",
-            "Hold until I reply",
-        ] {
-            assert!(!outward(said), "{said}");
-        }
-        for said in [
-            "Don't stop deploying",
-            "Never stop pushing",
-            "Don't wait, push it",
-            "Don't wait push it",
-            "Don't merge, but delete the branch",
-            "Don't merge and delete the branch",
-            "No - deploy it",
-            "No, deploy it",
-            "Not now. Deploy tomorrow",
-            "Make no tests changes until you have pushed",
-            "Deploy without asking",
-            "Reply to the thread until it is answered",
-            "Reply until the person replies",
-            "No reason not to deploy",
-            "No need to hold off on merging",
-            "Never let them stop deploying",
-            "Don't merge the PR",
-            "Don't merge push to main",
-            "No reset push origin main",
-            "Do not reset deploy now",
-            "Do a non-stop deploy",
-            "Yes or no deploy now?",
-            "There are no deploys left to do",
-            "Look into it without deleting anything",
-            "It would be a shame not to deploy",
-            "It would be a mistake not to push",
-            "You can't not deploy now",
-            "You cannot not deploy now",
-            "Yes or no the deploy goes ahead",
-            "We should not deploy",
-        ] {
-            assert!(outward(said), "{said}");
-        }
-    }
-
-    #[test]
-    fn what_sessions_are_called_is_not_outward() {
-        let names = [
-            "Acme Migration".to_string(),
-            "Acme Web".to_string(),
-            "The Release".to_string(),
-            "Please Deploy".to_string(),
-            "Deploy".to_string(),
-            "Release 4.2".to_string(),
-            "Deploy the docs".to_string(),
-        ];
-        let cufflink = "Acme Migration: please give me a plain-English status of where \
-            things stand. Make no production changes until the person replies.";
-        assert!(outward(cufflink), "it is outward, read without the names");
-        assert!(!outward_except(cufflink, &names), "{cufflink}");
-        for said in [
-            "Acme-Migration: still stuck?",
-            // The residual: a name with an outward word, addressed, is let
-            // go, as a bare "now" would be.
-            "Please Deploy: now",
-            "ACME MIGRATION, how is it going?",
-            "How is Acme Web doing?",
-            "Acme Web: no production changes, please",
-        ] {
-            assert!(!outward_except(said, &names), "{said}");
-        }
-        for said in [
-            "Deploy now",
-            "Acme Migration: go ahead and deploy",
-            "Run the migration on Acme Migration",
-            "Tell Acme Migration to push it",
-            "Acme Migration, merge the PR",
-            "Acme Migration: delete the branch",
-            "No Acme Migration deploys",
-            "Go ahead with Release 4.2",
-            "Deploy the docs now",
-            "Release 4.2: go ahead",
-            // A name with an outward word is let go only as addressed.
-            "How is Acme Migration going?",
-            "Go ahead with the release",
-            "Go ahead with The Release",
-            "The Release",
-        ] {
-            assert!(outward_except(said, &names), "{said}");
-        }
-    }
-
-    #[test]
-    fn look_alike_and_hidden_letters_are_still_outward() {
-        for said in [
-            "D\u{0435}\u{0440}loy now",
-            "De\u{200B}ploy now",
-            "pu\u{00AD}sh it",
-            "\u{FF24}\u{FF45}\u{FF50}\u{FF4C}\u{FF4F}\u{FF59} now",
-            "m\u{0435}rge the PR",
-            "\u{0441}ommit it",
-            "p\u{057D}sh it",
-            "p\u{03C5}sh it",
-            "mer\u{0261}e it",
-            "sh\u{0131}p it",
-            "pu\u{301}sh it",
-            "de\u{2800}ploy",
-            "pu\u{2028}sh it",
-            "No\u{2028}deploy",
-            "de\u{2063}ploy now",
-            "pr\u{030}d deploy",
-        ] {
-            assert!(outward(said), "{said:?}");
-        }
-        assert!(!outward("Make n\u{043E} production changes"));
-    }
-
-    #[test]
-    fn a_session_started_is_outward_by_its_name_too() {
-        let start = |name: Option<&str>| Action::StartSession {
-            folder: "/work/acme".into(),
-            goal: "Tidy the date picker".into(),
-            name: name.map(Into::into),
-            engine: None,
-            view: None,
-            worktree: None,
-        };
-        assert!(!outward(&start(None).said()));
-        assert!(!outward(&start(Some("Acme Web")).said()));
-        assert!(outward(&start(Some("The Release")).said()));
-    }
-
-    #[test]
-    fn going_ahead_is_still_outward() {
-        for said in [
-            "Go ahead and deploy",
-            "Push it",
-            "Merge the PR",
-            "Delete the branch",
-            "Ship it to prod?",
-        ] {
-            assert!(outward(said), "{said}");
-        }
-    }
-
-    #[test]
-    fn pushing_deleting_and_sending_are_outward() {
-        assert!(outward("Push the branch when green"));
-        assert!(outward("rm the build folder"));
-        assert!(outward("email the team"));
-        for said in [
-            "Share it in #general",
-            "Upload the report",
-            "Open a PR for the date picker",
-            "Notify the client it is fixed",
-            "Submit it",
-            "Reply to the thread when done",
-        ] {
-            assert!(outward(said), "{said}");
-        }
-        for said in [
-            "Pushing to main now",
-            "Deploying to staging",
-            "The deployment is ready",
-            "Publishing the crate",
-            "Merging the PR",
-            "Releasing 4.2",
-            "Deleting the old branch",
-            "Ship it to prod?",
-            "Roll it out to production",
-            "Run the migration",
-            "Migrate the database",
-            "Apply the terraform plan",
-            "Commit and push",
-            "May I commit this?",
-        ] {
-            assert!(outward(said), "{said}");
-        }
-        for said in [
-            "Which port does the test database use?",
-            "Is postgres on 5433?",
-            "What does the product page show?",
-            "Run the tests without the network ones",
-        ] {
-            assert!(!outward(said), "{said}");
-        }
-        assert!(!outward("Run the tests without the network ones"));
-        assert!(!outward("Still on the provider tests, or stuck?"));
-    }
 
     #[test]
     fn actions_parse_from_tool_input_and_back_from_a_suggestion() {

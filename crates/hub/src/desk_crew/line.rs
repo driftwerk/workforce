@@ -489,6 +489,12 @@ impl CrewHub {
                 "pushes, deletes, deploys, spends, sends to people or changes scope",
             ),
         };
+        // Unbound, it answers everything itself.
+        let unbound = self.unbound(o);
+        let (outward, level_line) = match unbound {
+            true => ("you truly can't decide, and say why", Self::boss_hint(o)),
+            false => (outward, Self::level_line(level).to_string()),
+        };
         if !ended.is_empty() {
             let said = match lines.is_empty() {
                 true => String::new(),
@@ -502,7 +508,7 @@ impl CrewHub {
             return format!(
                 "{}\n{about}{said}\n\nAlways give the person anything that {outward}. {}",
                 self.work_intro(session, ended, o),
-                Self::level_line(level),
+                level_line,
             );
         }
         format!(
@@ -513,7 +519,7 @@ impl CrewHub {
              you are unsure. A reply with no tool call is taken as your answer to a single question. \
              Messages that only tell you something need no answer. {}",
             reported(&lines.join("\n"), "the session"),
-            Self::level_line(level),
+            level_line,
         )
     }
 

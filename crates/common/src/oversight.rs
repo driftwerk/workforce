@@ -12,7 +12,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
@@ -32,6 +32,15 @@
 //! says why ([`Oversight::fully`]). What no overseer does at any level, Act
 //! fully included, is Desk's own list (`workforce_desk::never`).
 //!
+//! `anywhere = true` takes the lists away: Act fully ships in any
+//! repository and runs any workflow, and `budget_usd_per_day` is optional.
+//! With `level = "full"`, `anywhere` and every `[oversight.act]` switch on,
+//! the overseer is **unbound** ([`Oversight::unbound`]): it answers every
+//! request and question itself, does every crew action, and checks in as
+//! often as the work needs; the never-list doesn't hold it. Only its
+//! budget (when set), the person's Stop and kill switches, the hold while
+//! they type, and the activity log remain. A remote boss is never unbound.
+//!
 //! `group` is the sidebar group it oversees, as that group's boss: it sees
 //! only that group, and the main overseer (no `group`) sees nothing inside
 //! it. One agent oversees each scope; Desk checks the group is one of the
@@ -44,17 +53,18 @@
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
-//! person. At `act`, `answer_sessions` lets it answer; anything that reads
-//! as pushing, deleting or sending, in the question or the answer, is the
-//! person's to answer, and the overseer can only draft it.
+//! person. At `act`, `answer_sessions` lets it answer. An answer is a
+//! message, so its words don't hold it: what the session then does is
+//! judged as it does it, by its approvals and Desk's never-list.
 //!
 //! What the overseer sends an agent, or a session started in another
 //! terminal, may lead to something done without asking: an agent acts under
 //! its own permissions, and such a session may have been started not to ask.
 //! So at level `act` it only suggests them, unless `message_agents` (nudges
 //! and tasks to agents) or `message_terminal_sessions` (nudges to those
-//! sessions) is on. Words that read as pushing, deleting or sending still
-//! make any action a suggestion.
+//! sessions) is on. What a message says isn't read for pushing or
+//! sending; only what no overseer does at any level
+//! (`workforce_desk::never`) holds it.
 //!
 //! A session in its charge is the person's while they are active in it:
 //! `hold_minutes` after their last keystroke, prompt or message there. What
@@ -166,6 +176,10 @@ pub struct Act {
     /// only ever a suggestion, since its brief goes to that engine's
     /// vendor; off, it isn't even suggested.
     pub hand_off: bool,
+    /// Changing a session's permission mode (`crew.set_mode`): at `act`,
+    /// to manual, accept edits or plan, never one that asks for less;
+    /// unbound, to any.
+    pub set_mode: bool,
 }
 
 /// `[oversight.full]`: where, and on what budget, Act fully ships.
@@ -179,6 +193,9 @@ pub struct Full {
     /// The GitHub workflows it may run (`gh workflow run`), by their file
     /// names exactly (`deploy.yml`); none, it runs none.
     pub workflows: Vec<String>,
+    /// Not limited to `repos` and `workflows`: it ships in any repository
+    /// and runs any workflow, and its budget is optional.
+    pub anywhere: bool,
 }
 
 impl Full {
@@ -314,6 +331,7 @@ impl Default for Oversight {
                 message_terminal_sessions: false,
                 answer_sessions: true,
                 hand_off: false,
+                set_mode: false,
             },
             work: Work {
                 prefer_sessions: true,
@@ -470,10 +488,12 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
         }
         Some(_) => return Err(budget_wrong()),
     };
+    let anywhere = switch(t, "anywhere", false, "Act fully anywhere")?;
     Ok(Full {
         repos,
         budget_cents_per_day,
         workflows,
+        anywhere,
     })
 }
 
@@ -697,6 +717,12 @@ impl Oversight {
                     d.act.hand_off,
                     "suggesting a session continue in another engine",
                 )?,
+                set_mode: switch(
+                    act,
+                    "set_mode",
+                    d.act.set_mode,
+                    "changing a session's permission mode",
+                )?,
             },
             work: Work {
                 prefer_sessions: switch(
@@ -738,6 +764,11 @@ impl Oversight {
         if self.level != Level::Full {
             return Err(None);
         }
+        // Anywhere, no list limits it, and a budget is the person's to set
+        // or leave blank.
+        if self.full.anywhere {
+            return Ok(&self.full);
+        }
         if self.full.repos.is_empty() {
             return Err(Some(FULL_NO_REPOS));
         }
@@ -745,6 +776,29 @@ impl Oversight {
             return Err(Some(FULL_NO_BUDGET));
         }
         Ok(&self.full)
+    }
+
+    /// Whether it is **unbound**: Act fully, anywhere, with every
+    /// `[oversight.act]` switch on. Unbound, no word or list holds the
+    /// overseer back and it answers every request itself; only the person's
+    /// budget, their Stop and kill switches, the hold while they type, and
+    /// the activity log remain. `local`: the overseer is an agent of this
+    /// hub. A remote boss is never unbound.
+    pub fn unbound(&self, local: bool) -> bool {
+        let a = &self.act;
+        local
+            && self.level == Level::Full
+            && self.full.anywhere
+            && a.nudge
+            && a.resume_restart
+            && a.read_only_approvals
+            && a.hand_out_work
+            && a.interrupt
+            && a.message_agents
+            && a.message_terminal_sessions
+            && a.answer_sessions
+            && a.hand_off
+            && a.set_mode
     }
 
     /// `[oversight]` as a config holds it: absent is the defaults (off).
@@ -1135,5 +1189,48 @@ mod tests {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }
+    }
+
+    /// Every `[oversight.act]` switch on, Act fully anywhere.
+    pub(crate) const UNBOUND: &str = "[oversight]\nlevel = \"full\"\n\
+        act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
+        interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
+        hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
+
+    #[test]
+    fn unbound_is_act_fully_anywhere_with_every_switch_on_and_never_remote() {
+        let o = parse(UNBOUND).unwrap();
+        assert!(o.full.anywhere);
+        assert!(o.unbound(true));
+        assert!(!o.unbound(false), "a remote boss is never unbound");
+        // Anywhere needs no repositories, and no budget.
+        assert!(o.fully().is_ok());
+        for off in [
+            "nudge",
+            "resume_restart",
+            "read_only_approvals",
+            "hand_out_work",
+            "interrupt",
+            "message_agents",
+            "message_terminal_sessions",
+            "answer_sessions",
+            "hand_off",
+            "set_mode",
+        ] {
+            let one = UNBOUND.replace(&format!("{off} = true"), &format!("{off} = false"));
+            assert!(!parse(&one).unwrap().unbound(true), "{off} off");
+        }
+        let listed = UNBOUND.replace("anywhere = true", "anywhere = false");
+        assert!(!parse(&listed).unwrap().unbound(true), "not anywhere");
+        assert_eq!(
+            parse(&listed).unwrap().fully().unwrap_err(),
+            Some(FULL_NO_REPOS)
+        );
+        let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+        assert!(!parse(&act).unwrap().unbound(true), "at act");
+        assert_eq!(
+            parse("[oversight.full]\nanywhere = 1\n").unwrap_err(),
+            "Whether Act fully anywhere is on or off must be true or false."
+        );
     }
 }

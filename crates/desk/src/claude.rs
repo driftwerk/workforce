@@ -33,6 +33,8 @@ pub struct ClaudeSpawn<'a> {
     /// terminal, [`crate::first_run::claude_follows_terminal`]); none keeps
     /// the person's.
     pub theme: Option<&'a str>,
+    /// The permission mode to start in ([`crate::mode`]); none, its own.
+    pub mode: Option<crate::mode::Mode>,
 }
 
 const TOOL_EVENTS: [&str; 5] = [
@@ -112,6 +114,7 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         "--settings".to_string(),
         settings.to_string(),
     ]);
+    args.extend(s.mode.into_iter().flat_map(crate::mode::Mode::claude_args));
     args.extend(s.prompt.map(str::to_string));
     let mut env = s.env.clone();
     env.insert(USAGE_URL.into(), s.hook_url.to_string());
@@ -607,6 +610,7 @@ pub(crate) mod tests {
             approval_timeout_secs: 60,
             env: &env,
             theme: None,
+            mode: None,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
@@ -634,6 +638,7 @@ pub(crate) mod tests {
                 approval_timeout_secs: 60,
                 env: &env,
                 theme,
+                mode: None,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();
             serde_json::from_str::<Value>(&s.args[at + 1]).unwrap()

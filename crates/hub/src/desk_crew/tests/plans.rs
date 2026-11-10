@@ -186,6 +186,71 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
     .await;
 }
 
+/// Unbound, a boss's plan is its own to approve: it starts at once, four
+/// of five tickets up to its limit, the fifth when one finishes, and its
+/// changes to the plan apply as they are made.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) =
+            hub_with(dir.path(), pool, super::unbound::UNBOUND).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty(), "nothing waits on the person");
+        let four = eventually("four sessions", async || {
+            let s = started(&d);
+            (s.len() == 4).then_some(s)
+        })
+        .await;
+        let one = four[0].id;
+        let url = hook_url(dir.path(), one).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": one.to_string()}),
+        )
+        .await;
+        eventually("the fifth session", async || {
+            (started(&d).len() == 5).then_some(())
+        })
+        .await;
+
+        // A change of scope applies at once, as the person's would.
+        let before = d.plan(id).await.unwrap().summary.plan.revision;
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id.to_string(), "goal": "Make the whole suite green", "why": "Wider." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], true, "{r:?}");
+        let p = d.plan(id).await.unwrap();
+        assert!(p.summary.plan.revision > before);
+        assert_eq!(p.summary.plan.approved_revision, Some(p.summary.plan.revision));
+        assert!(d.plan_needs().is_empty());
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_start_cut_off_between_its_link_and_its_session_starts_exactly_once_after_a_restart() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {

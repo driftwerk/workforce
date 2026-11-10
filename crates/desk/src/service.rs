@@ -91,6 +91,7 @@ mod memory_line;
 #[cfg(test)]
 mod memory_line_tests;
 mod memory_recall;
+mod modes;
 mod moves;
 #[cfg(test)]
 mod moves_tests;
@@ -591,6 +592,9 @@ impl Drop for CodexLink {
 
 #[derive(Default)]
 struct State {
+    /// The permission mode each Claude Code session last said it runs in
+    /// ([`crate::mode`]).
+    modes_seen: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -3444,12 +3448,14 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        // The boss of a session it runs, checked in `decide`.
+        // The boss of a session it runs, checked in `decide`; an unbound
+        // boss answers Codex too, wherever it asks.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
-                && self
-                    .charge_of(id)
-                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
         };
         let by = by
             .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
@@ -4192,6 +4198,8 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
+        // The mode Desk keeps for it, as an overseer set it.
+        let mode = self.kept_mode(r.id).await;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {
@@ -4219,6 +4227,7 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
+                    mode,
                 });
                 (spec, None)
             }
@@ -4242,6 +4251,7 @@ impl Desk {
                     prompt,
                     approve_for_me: r.approve_for_me,
                     fast: r.fast,
+                    mode,
                     env: &env,
                 });
                 let link =
@@ -4537,6 +4547,9 @@ impl Desk {
             .is_some_and(|l| l.token == token);
         if !authorised {
             return None;
+        }
+        if let Some(mode) = crate::mode::of_hook(body) {
+            self.0.state.lock().modes_seen.insert(id, mode);
         }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,
