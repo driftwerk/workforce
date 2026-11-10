@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(
             refused,
             ConfigRefusal::Said(
-                "How much the overseer does on its own must be watch, suggest or act.".into()
+                "How much the overseer does on its own must be watch, suggest, act or full.".into()
             )
         );
         assert!(matches!(

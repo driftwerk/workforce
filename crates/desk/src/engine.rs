@@ -194,6 +194,9 @@ pub struct Caps {
     /// Whether it can be started with its own reviewer answering its
     /// approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// Whether it can be started asking its plan's faster tier ("Fast
+    /// mode").
+    pub fast: bool,
     /// Whether its sessions can each run on one of several of the person's
     /// accounts, and how those sign in.
     pub accounts: crate::engine_accounts::AccountsVia,
@@ -222,6 +225,7 @@ impl Caps {
             usage: UsageSource::None,
             plan: None,
             approve_for_me: false,
+            fast: false,
             accounts: crate::engine_accounts::AccountsVia::None,
             line: Deliver::None,
             steer: Steer::None,
@@ -275,6 +279,7 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Claude),
             approve_for_me: false,
+            fast: false,
             // `claude setup-token`, given to each session as
             // `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above its
             // keychain login (code.claude.com/docs/en/authentication).
@@ -296,6 +301,7 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Codex),
             approve_for_me: true,
+            fast: true,
             accounts: crate::engine_accounts::AccountsVia::None,
             line: Deliver::Paste,
             steer: Steer::TurnSteer,

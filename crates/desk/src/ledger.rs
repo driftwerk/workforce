@@ -58,6 +58,9 @@ impl Tokens {
 text_enum!(Priced {
     Priced => "priced",
     Reported => "reported",
+    // No price of its own: counted at a conservative estimate so a budget
+    // never counts it low, and shown as having no price.
+    Estimated => "estimated",
     None => "none",
 });
 
@@ -90,6 +93,19 @@ pub trait Pricer: Send + Sync {
     /// What `t` on `model` costs at API list prices; `None` for a model the
     /// table has no row for (never a guess).
     fn usd(&self, engine: Engine, billing: Billing, model: &str, t: &Tokens) -> Option<f64>;
+
+    /// What a budget counts `t` on a `model` [`Self::usd`] has no price for:
+    /// a conservative estimate (never less than it could cost), or `None`
+    /// when there is none to make.
+    fn estimate(
+        &self,
+        _engine: Engine,
+        _billing: Billing,
+        _model: &str,
+        _t: &Tokens,
+    ) -> Option<f64> {
+        None
+    }
 }
 
 fn number(v: &Value, pointer: &str) -> u64 {
@@ -389,10 +405,11 @@ pub struct Cell {
     pub billing: Billing,
     pub day: NaiveDate,
     pub tokens: Tokens,
-    /// What its priced calls cost.
+    /// What its calls cost: their own price, or a conservative estimate
+    /// for one with none.
     pub usd: f64,
     pub calls: u64,
-    /// Its calls with no price.
+    /// Its calls with no price of their own (estimated or not).
     pub unpriced: u64,
 }
 

@@ -7490,6 +7490,20 @@ pub struct AgentLlmConfig {
     /// ```
     #[serde(default)]
     pub effort: Option<String>,
+    /// Ask for the provider's faster service tier on the agent's turns,
+    /// where its model offers one: the ChatGPT backend's `priority` tier
+    /// (Codex's Fast mode), sent only to a model its catalogue lists with
+    /// the tier. The catalogue words it per model ("2x speed, increased
+    /// usage" on some): faster replies that can use the plan's limits
+    /// sooner. Read every turn; a provider or model without the tier
+    /// ignores it.
+    ///
+    /// ```toml
+    /// [llm]
+    /// fast = true
+    /// ```
+    #[serde(default)]
+    pub fast: Option<bool>,
     /// Model tier equivalences across providers. Maps tier names ("powerful",
     /// "standard", "cheap") to lists of equivalent models. Used by adaptive
     /// routing and failover to pick the right model when switching providers.
@@ -8887,6 +8901,14 @@ pub struct RemoteMcpConfig {
     /// whose keepalives outlast a proxy's idle timeout.
     #[serde(default = "default_remote_mcp_chat_max_wait_secs")]
     pub chat_max_wait_secs: u64,
+    /// Whether a paired device (Desk) may mint a `wfr_` token for the person
+    /// it is linked to, with its device token
+    /// (`POST /api/me/remote-mcp-tokens/desk`). Off by default: a person then
+    /// makes the token on this hub themselves and pastes it once. A token a
+    /// device minted acts with a member's capabilities, never an admin's, and
+    /// stops working the moment its device is unpaired.
+    #[serde(default)]
+    pub allow_device_tokens: bool,
 }
 
 impl Default for RemoteMcpConfig {
@@ -8898,6 +8920,7 @@ impl Default for RemoteMcpConfig {
             tools_allow: default_remote_mcp_tools_allow(),
             chat_default_wait_secs: default_remote_mcp_chat_default_wait_secs(),
             chat_max_wait_secs: default_remote_mcp_chat_max_wait_secs(),
+            allow_device_tokens: false,
         }
     }
 }

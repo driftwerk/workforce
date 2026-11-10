@@ -40,8 +40,8 @@ const ORIGINATOR: &str = "workforce";
 const USER_AGENT_VALUE: &str = concat!("workforce/", env!("CARGO_PKG_VERSION"));
 
 /// Context window of every model the backend serves on a ChatGPT plan but
-/// gpt-6.1-sol (codex `models.json`).
-const CONTEXT_WINDOW: u32 = 272_000;
+/// gpt-6.1-sol (codex `models.json`), and of one it hasn't said.
+pub const CONTEXT_WINDOW: u32 = 272_000;
 
 /// A reasoning item rides in a [`ContentBlock::Thinking`] signature under
 /// this prefix, so it round-trips through the runner untouched.
@@ -66,21 +66,28 @@ pub struct Call<'a> {
     pub thinking_budget: Option<u32>,
 }
 
-/// A model the backend serves to a ChatGPT sign-in: the listed models of
-/// its catalogue (`testdata/chatgpt/models.json`, 2026-10-16). Each takes
-/// plain function tools, verified live on every one of them the day
-/// gpt-5.5, the only model this provider knew before, had been retired from
-/// ChatGPT sign-ins (2026-10-14).
+/// A model the backend serves to a ChatGPT sign-in. The built-in ones are
+/// the listed models of its catalogue as recorded
+/// (`testdata/chatgpt/models.json`, 2026-10-16), each verified live to take
+/// plain function tools; the backend's live catalogue
+/// ([`ResponsesClient::models`]) adds the ones released since, once the hub
+/// has read it ([`ChatGptModel::learn`]). A model it lists that a call then
+/// finds refused moves the chain on like any other refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatGptModel {
-    Gpt61Sol,
-    Gpt6Astra,
-    Gpt6Sol,
-    Gpt6Luna,
-    Gpt56Sol,
-    Gpt56Terra,
-    Gpt56Luna,
+pub struct ChatGptModel {
+    id: &'static str,
+    context_window: u32,
+    /// Its catalogue entry offers the backend's faster tier ([`FAST_TIER`]).
+    fast: bool,
 }
+
+/// The service tier Codex calls Fast: what a request names to be served
+/// ahead of the standard queue (`service_tier = "priority"`, CLI 0.166).
+pub const FAST_TIER: &str = "priority";
+
+/// The `client_version` the catalogue is asked for: the Codex CLI release
+/// its listing was verified against.
+pub const CATALOG_CLIENT_VERSION: &str = "0.166.0";
 
 /// Models the backend no longer serves to a ChatGPT sign-in (OpenAI's Codex
 /// changelog: gpt-5.5 on 2026-10-14, gpt-5.4 and gpt-5.4-mini on 2026-08-31,
@@ -103,35 +110,115 @@ pub enum UnsupportedModel {
     Unknown(String),
 }
 
+/// The listed models of each login's live catalogue, as last read, by the
+/// login's fingerprint (never its secret): plans differ, and one person's
+/// list never decides what another's calls may name.
+static LEARNED: std::sync::RwLock<BTreeMap<String, Vec<ChatGptModel>>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+fn learned_of(login: &str) -> Vec<ChatGptModel> {
+    LEARNED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(login)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `name` as a `&'static str`: a built-in id, or one leaked once per new
+/// name. The catalogue lists a handful of models, so this stays small.
+fn intern(name: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<BTreeSet<&'static str>> = std::sync::Mutex::new(BTreeSet::new());
+    if let Some(known) = ChatGptModel::ALL.iter().find(|m| m.id == name) {
+        return known.id;
+    }
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match names.get(name) {
+        Some(&known) => known,
+        None => {
+            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+            names.insert(leaked);
+            leaked
+        }
+    }
+}
+
 impl ChatGptModel {
+    pub const GPT_6_1_SOL: Self = Self::built_in("gpt-6.1-sol", 500_000);
+    pub const GPT_6_ASTRA: Self = Self::built_in("gpt-6-astra", CONTEXT_WINDOW);
+    pub const GPT_6_SOL: Self = Self::built_in("gpt-6-sol", CONTEXT_WINDOW);
+    pub const GPT_6_LUNA: Self = Self::built_in("gpt-6-luna", CONTEXT_WINDOW);
+    pub const GPT_5_6_SOL: Self = Self::built_in("gpt-5.6-sol", CONTEXT_WINDOW);
+    pub const GPT_5_6_TERRA: Self = Self::built_in("gpt-5.6-terra", CONTEXT_WINDOW);
+    pub const GPT_5_6_LUNA: Self = Self::built_in("gpt-5.6-luna", CONTEXT_WINDOW);
+
+    /// The built-in models, served when the live catalogue can't be read.
     pub const ALL: &'static [Self] = &[
-        Self::Gpt61Sol,
-        Self::Gpt6Astra,
-        Self::Gpt6Sol,
-        Self::Gpt6Luna,
-        Self::Gpt56Sol,
-        Self::Gpt56Terra,
-        Self::Gpt56Luna,
+        Self::GPT_6_1_SOL,
+        Self::GPT_6_ASTRA,
+        Self::GPT_6_SOL,
+        Self::GPT_6_LUNA,
+        Self::GPT_5_6_SOL,
+        Self::GPT_5_6_TERRA,
+        Self::GPT_5_6_LUNA,
     ];
 
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Gpt61Sol => "gpt-6.1-sol",
-            Self::Gpt6Astra => "gpt-6-astra",
-            Self::Gpt6Sol => "gpt-6-sol",
-            Self::Gpt6Luna => "gpt-6-luna",
-            Self::Gpt56Sol => "gpt-5.6-sol",
-            Self::Gpt56Terra => "gpt-5.6-terra",
-            Self::Gpt56Luna => "gpt-5.6-luna",
+    /// A built-in model; whether it takes the faster tier is the
+    /// catalogue's to say, so until it is read none does.
+    const fn built_in(id: &'static str, context_window: u32) -> Self {
+        Self {
+            id,
+            context_window,
+            fast: false,
         }
     }
 
-    /// The model for `name`.
+    pub const fn id(self) -> &'static str {
+        self.id
+    }
+
+    /// The context window the catalogue reports for the model.
+    pub const fn context_window(self) -> u32 {
+        self.context_window
+    }
+
+    /// Whether its catalogue entry offers the faster tier ([`FAST_TIER`]).
+    pub const fn fast(self) -> bool {
+        self.fast
+    }
+
+    /// The model for `name` on the login `login` names: one its live
+    /// catalogue lists, else a built-in one.
+    pub fn parse_for(login: &str, name: &str) -> Result<Self, UnsupportedModel> {
+        match learned_of(login).into_iter().find(|m| m.id == name) {
+            Some(model) => Ok(model),
+            None => Self::parse_built_in(name),
+        }
+    }
+
+    /// The model for `name` as any login's catalogue or the built-in list
+    /// knows it: only for a config check's warning, which runs for no one
+    /// in particular. A call names its login ([`Self::parse_for`]).
     pub fn parse(name: &str) -> Result<Self, UnsupportedModel> {
+        let learned = LEARNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match learned.values().flatten().find(|m| m.id == name) {
+            Some(model) => Ok(*model),
+            None => Self::parse_built_in(name),
+        }
+    }
+
+    /// The built-in model for `name`, whatever the live catalogue says: what
+    /// a config check reads, so its answer doesn't depend on whether the
+    /// catalogue has been read yet.
+    pub fn parse_built_in(name: &str) -> Result<Self, UnsupportedModel> {
         Self::ALL
             .iter()
             .copied()
-            .find(|m| m.id() == name)
+            .find(|m| m.id == name)
             .ok_or_else(|| {
                 if RETIRED_MODELS.contains(&name) {
                     UnsupportedModel::Retired(name.to_string())
@@ -141,13 +228,123 @@ impl ChatGptModel {
             })
     }
 
-    /// The context window the catalogue reports for the model.
-    pub const fn context_window(self) -> u32 {
-        match self {
-            Self::Gpt61Sol => 500_000,
-            _ => CONTEXT_WINDOW,
-        }
+    /// Every model a call on `login` may name: its live catalogue's in its
+    /// order, then the built-in ones it doesn't list.
+    pub fn known_for(login: &str) -> Vec<Self> {
+        let learned = learned_of(login);
+        let built_in = Self::ALL
+            .iter()
+            .copied()
+            .filter(|m| !learned.iter().any(|l| l.id == m.id));
+        learned.iter().copied().chain(built_in).collect()
     }
+
+    /// Whether `login`'s live catalogue has been read since the hub started.
+    pub fn learned_for(login: &str) -> bool {
+        !learned_of(login).is_empty()
+    }
+
+    /// Take the listed models of `catalog` (the backend's live list for the
+    /// login `login` names) as the ones it serves that login, with their
+    /// context windows and tiers.
+    pub fn learn(login: &str, catalog: &[CatalogModel]) {
+        let listed: Vec<Self> = catalog
+            .iter()
+            .filter(|m| m.listed())
+            .map(|m| Self {
+                id: intern(&m.slug),
+                context_window: m.context_window.unwrap_or(CONTEXT_WINDOW),
+                fast: m.fast_tier().is_some(),
+            })
+            .collect();
+        if listed.is_empty() {
+            return;
+        }
+        LEARNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(login.to_string(), listed);
+    }
+}
+
+/// One model of the backend's catalogue (`GET …/codex/models`), as Codex
+/// reads it: only what the hub uses, every field optional but the slug.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CatalogModel {
+    pub slug: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `list` for a model a picker shows; `hide` for one it doesn't.
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Lower first.
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CatalogEffort>,
+    #[serde(default)]
+    pub service_tiers: Vec<CatalogTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CatalogEffort {
+    pub effort: String,
+}
+
+/// A service tier a model offers, as the catalogue words it ("Fast", "2x
+/// speed, increased usage").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CatalogTier {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl CatalogModel {
+    /// Whether a picker shows it.
+    pub fn listed(&self) -> bool {
+        self.visibility.as_deref() == Some("list")
+    }
+
+    /// Its faster tier, when it offers one.
+    pub fn fast_tier(&self) -> Option<&CatalogTier> {
+        self.service_tiers.iter().find(|t| t.id == FAST_TIER)
+    }
+
+    /// The efforts it takes that the hub sends ([`CHATGPT_EFFORTS`]),
+    /// lowest first.
+    pub fn efforts(&self) -> Vec<&'static str> {
+        CHATGPT_EFFORTS
+            .iter()
+            .copied()
+            .filter(|e| {
+                self.supported_reasoning_levels
+                    .iter()
+                    .any(|l| l.effort == *e)
+            })
+            .collect()
+    }
+}
+
+/// The models of a catalogue body, in its priority order: entries that
+/// don't decode are skipped, never the whole list.
+pub fn parse_catalog(body: &Value) -> Vec<CatalogModel> {
+    let mut models: Vec<CatalogModel> = body["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| serde_json::from_value(m.clone()).ok())
+        .collect();
+    models.sort_by_key(|m| m.priority.unwrap_or(i64::MAX));
+    models
 }
 
 /// Why a call failed. Each `Display` carries the `"ChatGPT API error
@@ -322,13 +519,45 @@ impl ResponsesClient {
     }
 
     fn post(&self, path: &str, access: &ChatGptAccess<'_>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, path, access)
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        access: &ChatGptAccess<'_>,
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}/{path}", self.base.as_str().trim_end_matches('/'));
         self.http
-            .post(url)
+            .request(method, url)
             .bearer_auth(access.access_token)
             .header("ChatGPT-Account-ID", access.account_id)
             .header("originator", ORIGINATOR)
             .header(USER_AGENT, USER_AGENT_VALUE)
+    }
+
+    /// The models the backend serves to this login, as Codex lists them
+    /// (`GET models?client_version=…`, codex-rs `endpoint/models.rs`), in
+    /// their priority order.
+    pub async fn models(
+        &self,
+        access: &ChatGptAccess<'_>,
+    ) -> Result<Vec<CatalogModel>, ResponsesError> {
+        let response = self
+            .request(reqwest::Method::GET, "models", access)
+            .query(&[("client_version", CATALOG_CLIENT_VERSION)])
+            .header(ACCEPT, "application/json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ResponsesError::Stream(format!("catalogue request failed: {e}")))?;
+        let response = error_for_status(response).await?;
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| ResponsesError::Stream(format!("catalogue unreadable: {e}")))?;
+        Ok(parse_catalog(&body))
     }
 
     /// Stream one response into `tx`. `limits` sees every plan-usage
@@ -413,6 +642,10 @@ fn request_body(call: &Call<'_>) -> Value {
     if !call.tools.is_empty() {
         body["tools"] = call.tools.iter().map(tool_def).collect();
         body["parallel_tool_calls"] = json!(true);
+    }
+    // Codex sends a tier only to a model its catalogue says takes it.
+    if super::provider::fast_mode() && call.model.fast() {
+        body["service_tier"] = json!(FAST_TIER);
     }
     body
 }
@@ -984,7 +1217,7 @@ mod tests {
     /// model id is no wire decision.
     fn request_fixture(raw: &str) -> Value {
         let mut fixture: Value = serde_json::from_str(raw).expect("fixture json");
-        fixture["model"] = json!(ChatGptModel::Gpt61Sol.id());
+        fixture["model"] = json!(ChatGptModel::GPT_6_1_SOL.id());
         fixture
     }
 
@@ -1017,7 +1250,7 @@ mod tests {
             system: Some(SYSTEM),
             messages,
             tools,
-            model: ChatGptModel::Gpt61Sol,
+            model: ChatGptModel::GPT_6_1_SOL,
             cache_key,
             thinking_budget,
         }
@@ -1283,6 +1516,162 @@ mod tests {
     }
 
     #[test]
+    fn the_live_catalogue_is_read_in_priority_order_and_bad_entries_are_skipped() {
+        let body: Value =
+            serde_json::from_str(include_str!("testdata/chatgpt/models_live.json")).expect("json");
+        let models = parse_catalog(&body);
+        let slugs: Vec<&str> = models.iter().map(|m| m.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            [
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6.2-nova",
+                "gpt-6-luna",
+                "codex-auto-review"
+            ]
+        );
+        let nova = &models[2];
+        assert!(nova.listed());
+        assert_eq!(nova.efforts(), ["low", "medium", "high"]);
+        assert_eq!(
+            nova.fast_tier().map(|t| t.description.as_str()),
+            Some("1.5x speed")
+        );
+        assert_eq!(
+            models[0].efforts(),
+            CHATGPT_EFFORTS,
+            "max and ultra are not sent"
+        );
+        assert!(models[3].fast_tier().is_none());
+        assert!(!models[4].listed());
+        // The recorded catalogue, from before the backend listed tiers.
+        let recorded: Value =
+            serde_json::from_str(include_str!("testdata/chatgpt/models.json")).expect("json");
+        assert_eq!(parse_catalog(&recorded).len(), 9);
+    }
+
+    #[test]
+    fn a_model_the_live_catalogue_lists_parses_with_its_window_and_tier() {
+        // Its own slug, so no other test's built-in model changes under it.
+        let catalog = [CatalogModel {
+            slug: "gpt-test-learned".into(),
+            display_name: None,
+            description: None,
+            visibility: Some("list".into()),
+            priority: Some(1),
+            context_window: Some(400_000),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            service_tiers: vec![CatalogTier {
+                id: FAST_TIER.into(),
+                name: "Fast".into(),
+                description: "1.5x speed".into(),
+            }],
+        }];
+        assert!(ChatGptModel::parse_for("acct-a", "gpt-test-learned").is_err());
+        ChatGptModel::learn("acct-a", &catalog);
+        let learned = ChatGptModel::parse_for("acct-a", "gpt-test-learned").expect("learned");
+        assert!(
+            ChatGptModel::parse_for("acct-b", "gpt-test-learned").is_err(),
+            "another login's list is its own"
+        );
+        assert!(!ChatGptModel::learned_for("acct-b"));
+        assert_eq!(learned.id(), "gpt-test-learned");
+        assert_eq!(learned.context_window(), 400_000);
+        assert!(learned.fast());
+        assert!(ChatGptModel::known_for("acct-a").contains(&learned));
+        assert!(
+            ChatGptModel::known_for("acct-a").contains(&ChatGptModel::GPT_6_LUNA),
+            "a built-in model the catalogue doesn't list stays callable"
+        );
+        assert_eq!(
+            ChatGptModel::parse("gpt-6.1-sol"),
+            Ok(ChatGptModel::GPT_6_1_SOL)
+        );
+        // A catalogue with nothing listed keeps what was learned.
+        ChatGptModel::learn("acct-a", &[]);
+        assert!(ChatGptModel::parse_for("acct-a", "gpt-test-learned").is_ok());
+    }
+
+    #[tokio::test]
+    async fn fast_mode_asks_the_priority_tier_only_of_a_model_that_offers_it() {
+        use crate::llm::provider::with_fast_mode;
+        let messages = [LlmMessage::user("hi")];
+        let fast_model = ChatGptModel {
+            fast: true,
+            ..ChatGptModel::GPT_6_1_SOL
+        };
+        let on = |model| {
+            let messages = &messages;
+            async move {
+                with_fast_mode(true, async {
+                    request_body(&Call {
+                        model,
+                        ..call(messages, &[], "k", None)
+                    })
+                })
+                .await
+            }
+        };
+        assert_eq!(on(fast_model).await["service_tier"], json!("priority"));
+        assert!(
+            on(ChatGptModel::GPT_6_1_SOL)
+                .await
+                .get("service_tier")
+                .is_none(),
+            "no tier the catalogue hasn't offered"
+        );
+        let off = request_body(&Call {
+            model: fast_model,
+            ..call(&messages, &[], "k", None)
+        });
+        assert!(off.get("service_tier").is_none(), "off unless asked");
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_is_asked_with_the_login_and_a_client_version() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/backend-api/codex/models"))
+            .and(query_param("client_version", CATALOG_CLIENT_VERSION))
+            .and(header("authorization", "Bearer at-123"))
+            .and(header("chatgpt-account-id", "acct-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                include_str!("testdata/chatgpt/models_live.json"),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&format!("{}/backend-api/codex", server.uri())).expect("url");
+        let client = ResponsesClient::new(reqwest::Client::new(), base);
+        let access = ChatGptAccess {
+            access_token: "at-123",
+            account_id: "acct-9",
+        };
+        let models = client.models(&access).await.expect("listed");
+        assert_eq!(models.len(), 5);
+
+        let refused = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_raw(r#"{"detail":"expired"}"#, "application/json"),
+            )
+            .mount(&refused)
+            .await;
+        let base = Url::parse(&format!("{}/backend-api/codex", refused.uri())).expect("url");
+        let err = ResponsesClient::new(reqwest::Client::new(), base)
+            .models(&access)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ResponsesError::Unauthorized(_)), "{err}");
+    }
+
+    #[test]
     fn every_listed_model_parses_and_hidden_or_retired_ones_do_not() {
         let listed: Value =
             serde_json::from_str(include_str!("testdata/chatgpt/models.json")).expect("json");
@@ -1310,7 +1699,7 @@ mod tests {
         }
         assert_eq!(
             ChatGptModel::parse("gpt-6.1-sol"),
-            Ok(ChatGptModel::Gpt61Sol)
+            Ok(ChatGptModel::GPT_6_1_SOL)
         );
         assert_eq!(
             ChatGptModel::parse("gpt-5.5").unwrap_err().to_string(),
@@ -1326,8 +1715,8 @@ mod tests {
             ChatGptModel::parse("gpt-4o").unwrap_err().to_string(),
             "gpt-4o is not served on a ChatGPT plan here; use gpt-6.1-sol"
         );
-        assert_eq!(ChatGptModel::Gpt61Sol.context_window(), 500_000);
-        assert_eq!(ChatGptModel::Gpt6Luna.context_window(), 272_000);
+        assert_eq!(ChatGptModel::GPT_6_1_SOL.context_window(), 500_000);
+        assert_eq!(ChatGptModel::GPT_6_LUNA.context_window(), 272_000);
     }
 
     // ── Response stream ─────────────────────────────────────────────────

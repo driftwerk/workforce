@@ -1529,6 +1529,123 @@ pub async fn run(
     Ok(assemble_result(run, config, start.elapsed()))
 }
 
+/// One model the Claude Code CLI offers its login, as its SDK `initialize`
+/// reply lists it (`models`, verified on CLI 2.1.322): an alias such as
+/// `sonnet` with the model it runs now, or a model's full name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliModel {
+    pub value: String,
+    #[serde(default)]
+    pub resolved_model: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Empty for a model that takes no effort.
+    #[serde(default)]
+    pub supported_effort_levels: Vec<String>,
+}
+
+/// The request id of [`list_models`]' `initialize`.
+const LIST_MODELS_ID: &str = "wf-list-models";
+
+/// The models the Claude Code CLI runs for `login`: its own list, asked of
+/// it with the SDK's `initialize` control request in a contained, tool-less
+/// CLI in `workdir`, which then ends unprompted, so nothing is sent to a
+/// model. The login reaches the CLI as its token, as every round's does;
+/// the hub itself never calls Anthropic with it.
+pub async fn list_models(
+    login: crate::subscription::Login,
+    workdir: &Path,
+    system_prompt_file: &Path,
+    timeout: Duration,
+) -> Result<Vec<CliModel>> {
+    let mut config = ClaudeCodeConfig::contained(
+        workdir.to_path_buf(),
+        login,
+        Contained {
+            tools: Vec::new(),
+            system_prompt_file: system_prompt_file.to_path_buf(),
+            input: Vec::new(),
+            tool_timeout: None,
+            exclude_dynamic: false,
+        },
+        String::new(),
+        timeout,
+    );
+    config.model = None;
+    let auth = ResolvedAuth::resolve(&config.auth).await?;
+    let mut cmd = command(&config, &auth, None, None, None);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| eyre!("the Claude Code CLI didn't start: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| eyre!("the Claude Code CLI took no input"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| eyre!("the Claude Code CLI gave no output"))?;
+    let request = serde_json::json!({
+        "type": "control_request",
+        "request_id": LIST_MODELS_ID,
+        "request": { "subtype": "initialize" },
+    });
+    let read = async {
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| eyre!("the Claude Code CLI closed its input: {e}"))?;
+        stdin.flush().await.ok();
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| eyre!("the Claude Code CLI's output couldn't be read: {e}"))?
+        {
+            if let Some(models) = initialize_models(&line) {
+                return models;
+            }
+        }
+        Err(eyre!(
+            "the Claude Code CLI ended without listing its models"
+        ))
+    };
+    let listed = tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| eyre!("the Claude Code CLI didn't list its models within {timeout:?}"))?;
+    let _ = child.start_kill();
+    listed
+}
+
+/// The models in `line` when it is the reply to [`list_models`]'
+/// `initialize`; `None` for any other line.
+fn initialize_models(line: &str) -> Option<Result<Vec<CliModel>>> {
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    let response = &event["response"];
+    if event["type"] != "control_response" || response["request_id"] != LIST_MODELS_ID {
+        return None;
+    }
+    if response["subtype"] == "error" {
+        let why = response["error"].as_str().unwrap_or("no reason given");
+        return Some(Err(eyre!(
+            "the Claude Code CLI refused to list its models: {why}"
+        )));
+    }
+    Some(Ok(response["response"]["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| serde_json::from_value(m.clone()).ok())
+        .collect()))
+}
+
 /// The `claude` program a round runs.
 #[cfg(not(test))]
 pub(crate) fn claude_program() -> PathBuf {

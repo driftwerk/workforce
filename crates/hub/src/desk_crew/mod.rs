@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_common::oversight::{Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_common::settings::AgentWorkspaceConfig;
 use workforce_desk::crew::{By, Crew, CrewAgent, LiveTurn, Overseer, Party, Suggestion};
 use workforce_desk::floor::Need;
@@ -117,6 +117,11 @@ pub struct CrewHub {
     sent: Mutex<Vec<DateTime<Utc>>>,
     /// Each agent's `[oversight]`, by the config.toml mtime it was read at.
     read: Mutex<HashMap<String, (Option<SystemTime>, Oversight)>>,
+    /// What each overseer acting fully has spent today, in dollars, by
+    /// agent, as last read: its scope's Desk sessions and its own model
+    /// calls. Act fully holds only under its budget, and not before this is
+    /// read.
+    spent_today: Mutex<HashMap<String, f64>>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
     tooled: Mutex<HashMap<String, (Scope, String)>>,
@@ -362,6 +367,28 @@ pub(crate) fn group_named_in(body: &str) -> Option<String> {
     (!g.is_empty() && g != workforce_desk::UNGROUPED).then(|| g.to_string())
 }
 
+/// Whether Act fully is in force for `o`, having spent `spent` dollars
+/// today in its scope (`None`: not read), or why not in plain words.
+pub(crate) fn fully_given(
+    o: &Oversight,
+    spent: Option<f64>,
+) -> Result<&workforce_common::oversight::Full, String> {
+    let full = o.fully().map_err(|why| {
+        why.unwrap_or("It acts within Desk: Act fully isn't chosen.")
+            .to_string()
+    })?;
+    let budget = full.budget_usd_per_day().unwrap_or_default();
+    match spent {
+        None => Err(
+            "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
+        ),
+        Some(spent) if spent >= budget => Err(format!(
+            "Act fully's daily budget of ${budget:.2}, for the Desk sessions' spend in this scope and the overseer's own model use, is spent (${spent:.2} today), so it acts within Desk until tomorrow."
+        )),
+        Some(_) => Ok(full),
+    }
+}
+
 fn mtime(workspace: &Path) -> Option<SystemTime> {
     std::fs::metadata(workspace.join(workforce_common::config_files::WORKSPACE_CONFIG))
         .and_then(|m| m.modified())
@@ -390,6 +417,7 @@ impl CrewHub {
             listed: Mutex::default(),
             sent: Mutex::default(),
             read: Mutex::default(),
+            spent_today: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
@@ -482,13 +510,40 @@ impl CrewHub {
         }
         let mut list: Vec<(Arc<AgentService>, Oversight)> = by_scope.into_values().collect();
         list.sort_by(|(_, a), (_, b)| a.scope.group().cmp(&b.scope.group()));
+        // The level each runs at: Act fully only while it is in force.
+        let level = |s: &AgentService, o: &Oversight| match o.level {
+            Level::Full if self.fully(s.agent_id.as_str(), o).is_err() => Level::Act,
+            l => l,
+        };
         self.desk.set_bosses(
             list.iter()
                 .map(|(s, o)| workforce_desk::Boss {
                     agent: s.agent_id.as_str().to_string(),
                     name: name_of(s),
                     scope: o.scope.clone(),
-                    level: o.level.as_str().to_string(),
+                    level: level(s, o).as_str().to_string(),
+                })
+                .collect(),
+        );
+        // No boss allows a change to any agent's own settings, its own
+        // limits among them.
+        self.desk.withhold_agent_settings(
+            self.services()
+                .iter()
+                .flat_map(|s| crate::desk_computer::own_config(&s.workspace))
+                .collect(),
+        );
+        self.desk.set_full(
+            list.iter()
+                .filter_map(|(s, o)| {
+                    let full = self.fully(s.agent_id.as_str(), o).ok()?;
+                    Some((
+                        s.agent_id.as_str().to_string(),
+                        workforce_desk::charge::FullGrant {
+                            repos: full.repos.clone(),
+                            workflows: full.workflows.clone(),
+                        },
+                    ))
                 })
                 .collect(),
         );
@@ -503,6 +558,101 @@ impl CrewHub {
                 .collect(),
         );
         list
+    }
+
+    /// Whether the overseer `agent`, with settings `o`, acts fully now, or
+    /// why not in plain words: it chose Act fully, named repositories and a
+    /// daily budget, and today's spend in its scope has been read and is
+    /// under that budget. Short of any of it, it acts within Desk.
+    pub(crate) fn fully<'o>(
+        &self,
+        agent: &str,
+        o: &'o Oversight,
+    ) -> Result<&'o workforce_common::oversight::Full, String> {
+        let spent = self.spent_today.lock().get(agent).copied();
+        fully_given(o, spent)
+    }
+
+    /// The level the overseer `agent` runs at now, and, when it chose Act
+    /// fully but that isn't in force, why it acts within Desk instead.
+    pub(crate) fn level_now(&self, agent: &str, o: &Oversight) -> (Level, Option<String>) {
+        match (o.level, self.fully(agent, o)) {
+            (Level::Full, Ok(_)) => (Level::Full, None),
+            (Level::Full, Err(why)) => (Level::Act, Some(why)),
+            (l, _) => (l, None),
+        }
+    }
+
+    /// `by`, the overseer `agent` acting on its own, as Activity records
+    /// it: what it does while Act fully is in force says so.
+    pub(crate) fn by_at_level(&self, mut by: By, o: &Oversight) -> By {
+        if self.level_now(&by.party.id, o).0 == Level::Full {
+            by.reason = Some(match by.reason.take() {
+                Some(r) => format!("{} (at Act fully)", r.trim_end()),
+                None => "At Act fully.".into(),
+            });
+        }
+        by
+    }
+
+    /// Whether the overseer of `o`'s scope acts fully in the repository
+    /// session `session` works in, now.
+    pub(crate) fn ships_in(&self, session: uuid::Uuid, o: &Oversight) -> bool {
+        o.level == Level::Full
+            && self.overseer_for(&o.scope).is_some_and(|(s, _)| {
+                let id = s.agent_id.as_str();
+                self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id)
+            })
+    }
+
+    /// Reads what each overseer that chose Act fully has spent today (its
+    /// scope's Desk sessions and its own model calls), for
+    /// [`Self::fully`]. One that can't be read isn't in
+    /// force until it can be.
+    pub(crate) async fn read_spent_today(&self, overseers: &[(Arc<AgentService>, Oversight)]) {
+        let now = Utc::now();
+        let from = self
+            .desk
+            .period_start(workforce_desk::ledger::Period::Day, now);
+        let mut spent = HashMap::new();
+        for (s, o) in overseers {
+            if o.fully().is_err() {
+                continue;
+            }
+            let query = workforce_desk::SpendQuery {
+                by: workforce_desk::ledger::SpendBy::Group,
+                from,
+                to: now,
+                limit: 1,
+                filter: workforce_desk::ledger_store::Filter {
+                    seen: Some(self.desk.seen_by(&o.scope)),
+                    ..Default::default()
+                },
+            };
+            match self.desk.spend(&query).await {
+                Ok(view) => {
+                    // Its own model calls count too, where the hub records
+                    // them.
+                    let own: f64 = s
+                        .telemetry_store
+                        .agent_use(from, now)
+                        .map(|rows| {
+                            rows.iter()
+                                .filter(|u| u.agent_id == s.agent_id.as_str())
+                                .map(|u| u.cost_usd)
+                                .sum()
+                        })
+                        .unwrap_or_default();
+                    spent.insert(s.agent_id.as_str().to_string(), view.total.usd + own);
+                }
+                Err(e) => tracing::warn!(
+                    agent = s.agent_id.as_str(),
+                    error = %e,
+                    "couldn't read today's spend; Act fully waits until it can"
+                ),
+            }
+        }
+        *self.spent_today.lock() = spent;
     }
 
     /// Every group an agent's config.toml on disk names in `[oversight]

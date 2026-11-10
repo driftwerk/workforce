@@ -94,6 +94,8 @@ pub mod freeagent_oauth_callback;
 pub use hub_core::fs_watcher;
 pub mod desk_attachments;
 #[cfg(feature = "postgres")]
+pub mod desk_board_sync;
+#[cfg(feature = "postgres")]
 pub mod desk_ceilings;
 #[cfg(feature = "postgres")]
 pub mod desk_computer;
@@ -284,6 +286,7 @@ pub mod sqlite_memory_move;
 pub(crate) use hub_core::standing;
 pub mod state;
 pub use hub_core::stop_registry;
+pub mod sessions_only;
 pub mod subagent_tool;
 pub mod subscription;
 pub mod system_tool;

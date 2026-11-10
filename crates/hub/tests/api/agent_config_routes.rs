@@ -139,7 +139,7 @@ async fn config_put_refusing_unloadable_toml_leaves_file_and_revisions() {
         assert_eq!(
             body["error"],
             "That change couldn’t be saved. How much the overseer does on its own must be \
-             watch, suggest or act."
+             watch, suggest, act or full."
         );
         assert_eq!(fx.on_disk(), KEPT);
     })

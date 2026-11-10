@@ -78,7 +78,7 @@ impl CrewHub {
             if let Ok(t) = self.desk.ticket(t).await {
                 return format!(
                     "the ticket {}",
-                    t.key.unwrap_or_else(|| t.ticket.title.clone())
+                    t.key.unwrap_or_else(|| t.ticket.said_title())
                 );
             }
         }

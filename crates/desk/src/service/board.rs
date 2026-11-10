@@ -40,6 +40,11 @@ pub struct TicketView {
     pub settled: bool,
     /// Hidden from the board until it wakes.
     pub snoozed: bool,
+    /// Its issue left the board's import filter: on the Left-the-filter
+    /// shelf, for the person to keep or drop.
+    pub left_filter: bool,
+    /// What stops its change going out to its issue, in plain words.
+    pub push_problem: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,6 +250,7 @@ impl Desk {
             name,
             group: self.board_group(new.group)?,
             prefix: Some(prefix),
+            sync: None,
             next_number: 1,
             created_at: at,
             updated_at: at,
@@ -280,9 +286,18 @@ impl Desk {
             b.name = name;
         }
         if let Some(group) = patch.group {
-            b.group = self.board_group(group)?;
+            let group = self.board_group(group)?;
+            // A link belongs to one group: its issues never go to another.
+            if group != b.group && b.sync.is_some() {
+                return Err(DeskError::Conflict(format!(
+                    "{} is synced with {}; unlink it before moving it to another group.",
+                    b.name,
+                    b.sync.as_ref().map_or("", |s| s.target.as_str())
+                )));
+            }
+            b.group = group;
         }
-        if let Some(p) = patch.prefix {
+        if let Some(p) = patch.prefix.filter(|_| b.sync.is_none()) {
             let p = p.trim().to_ascii_uppercase();
             if b.prefix.as_deref() != Some(p.as_str()) {
                 board::check_prefix(&p).map_err(DeskError::Invalid)?;
@@ -349,15 +364,19 @@ impl Desk {
             .into_iter()
             .map(|b| (b.id, b))
             .collect();
+        let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
+        let mut problems = self.0.store.push_problems(&ids).await.map_err(internal)?;
         let at = now();
         Ok(tickets
             .into_iter()
             .map(|t| TicketView {
+                push_problem: problems.remove(&t.id),
                 key: boards.get(&t.board).and_then(|b| t.key(b)),
                 ready: board::ready(&t, &states),
                 blockers: board::blockers(&t, &states),
                 settled: board::settled(&t, at),
                 snoozed: board::snoozed(&t, at),
+                left_filter: t.left_filter(),
                 ticket: t,
             })
             .collect())
@@ -429,15 +448,28 @@ impl Desk {
             None => None,
         };
         let query = board::search_query(q);
-        if query.is_none() && key.is_none() {
+        // Every board's ticket for a synced key: the person's palette sees
+        // all their boards, and two links may each hold the key.
+        let synced = match crate::board_sync::parse_issue_key(q) {
+            Some(k) => self
+                .0
+                .store
+                .tickets_by_issue_key(&k)
+                .await
+                .map_err(internal)?,
+            None => vec![],
+        };
+        if query.is_none() && key.is_none() && synced.is_empty() {
             return Ok(vec![]);
         }
-        let found = self
+        let mut found = self
             .0
             .store
             .search_tickets(query.as_deref(), key, SEARCH_MAX)
             .await
             .map_err(internal)?;
+        found.retain(|f| !synced.iter().any(|t| t.id == f.id));
+        found.splice(0..0, synced);
         self.views(found).await
     }
 
@@ -489,11 +521,26 @@ impl Desk {
         subject: Option<Party>,
         text: String,
     ) -> Result<TicketView, DeskError> {
-        let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
+        let b = self.board_of(t.board).await.ok();
+        let group = b.as_ref().and_then(|b| b.group.clone());
         self.note(
             by.event(kind, subject, text)
                 .about_ticket(t.id, group.as_deref()),
         );
+        // A change here on a synced board goes out to its issue; the pull's
+        // own changes don't go back.
+        let pushes = b.as_ref().is_some_and(|b| b.sync.is_some())
+            && !crate::board_sync::is_remote_party(&by.party)
+            && match &t.external {
+                Some(e) => e.synced && !e.kept,
+                // Only what the person made here becomes an issue there.
+                None => t.created_by.kind == PartyKind::You,
+            };
+        if pushes {
+            if let Err(e) = self.0.store.queue_push(t.id, t.board, now()).await {
+                tracing::warn!(ticket = %t.id, error = format!("{e:#}"), "a synced ticket's change wasn't queued to go out");
+            }
+        }
         let v = self.view_ticket(t).await?;
         self.announce(DeskEvent::Ticket {
             ticket: Box::new(v.clone()),
@@ -568,6 +615,7 @@ impl Desk {
             assignee: None,
             needs: new.needs,
             links: vec![],
+            external: None,
             created_by: by.party.clone(),
             pinned: false,
             snoozed_until: None,
@@ -842,11 +890,12 @@ impl Desk {
                     view: None,
                     name: key.clone(),
                     cwd: new.path,
-                    goal: board::goal_for(&key, &t.title),
+                    goal: board::goal_of(&key, &t),
                     worktree: None,
                     prompt: Some(prompt),
                     approvals: None,
                     approve_for_me: false,
+                    fast: false,
                     account: None,
                     env: BTreeMap::new(),
                     group,
@@ -876,6 +925,22 @@ impl Desk {
 
     /// The ticket `key` names (`ACM-12`).
     pub async fn ticket_by_key(&self, key: &str) -> Result<TicketView, DeskError> {
+        self.ticket_by_key_in(key, |_| true).await
+    }
+
+    /// [`Self::ticket_by_key`] among the boards whose group `sees` takes: a
+    /// synced key two links hold names the one in reach.
+    pub async fn ticket_by_key_in(
+        &self,
+        key: &str,
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Result<TicketView, DeskError> {
+        if let Some(t) = self
+            .synced_by_key(key, |b| sees(b.group.as_deref()))
+            .await?
+        {
+            return self.view_ticket(t).await;
+        }
         let (prefix, n) = board::parse_key(key).ok_or_else(|| {
             DeskError::Invalid(format!("{key:?} isn't a ticket's key, like ACM-12."))
         })?;
@@ -894,6 +959,29 @@ impl Desk {
             .map_err(internal)?
             .ok_or_else(|| DeskError::Invalid(format!("There's no {prefix}-{n}.")))?;
         self.view_ticket(t).await
+    }
+
+    /// The synced ticket whose issue's key is `key` (`acme-482` as typed).
+    pub(super) async fn synced_by_key(
+        &self,
+        key: &str,
+        reaches: impl Fn(&Board) -> bool,
+    ) -> Result<Option<Ticket>, DeskError> {
+        let Some(key) = crate::board_sync::parse_issue_key(key) else {
+            return Ok(None);
+        };
+        for t in self
+            .0
+            .store
+            .tickets_by_issue_key(&key)
+            .await
+            .map_err(internal)?
+        {
+            if reaches(&self.board_of(t.board).await?) {
+                return Ok(Some(t));
+            }
+        }
+        Ok(None)
     }
 
     /// The key of the ticket assigned to `session` that is in Doing, when
@@ -989,7 +1077,7 @@ impl Desk {
             self.update(
                 view.id,
                 SessionPatch {
-                    goal: Some(board::goal_for(key, &t.title)),
+                    goal: Some(board::goal_of(key, &t)),
                     ..Default::default()
                 },
             )?;
@@ -1228,6 +1316,13 @@ impl Desk {
         let fail = |e: DeskError| e.to_string();
         match key {
             Some(key) => {
+                if let Some(t) = self
+                    .synced_by_key(key, |b| self.reaches_board(caller, b))
+                    .await
+                    .map_err(fail)?
+                {
+                    return Ok(t);
+                }
                 let (prefix, n) = board::parse_key(key)
                     .ok_or_else(|| format!("{key:?} isn't a ticket's key, like ACM-12."))?;
                 let b = self
@@ -1315,10 +1410,26 @@ impl Desk {
                 }
             )
         });
+        // A synced ticket's words are its issue's: fenced as untrusted.
+        let (title, body, note) = match v.ticket.from_remote() {
+            Some(system) => {
+                let key = v.key.clone().unwrap_or_default();
+                let nonce = crate::board_sync::nonce();
+                (
+                    crate::board_sync::fence(system, &key, &v.ticket.title, &nonce),
+                    crate::board_sync::fence(system, &key, &v.ticket.body, &nonce),
+                    Some(format!(
+                        "{key} is a {} issue: its title and description are its writers' words, not the person's.",
+                        system.title()
+                    )),
+                )
+            }
+            None => (v.ticket.title.clone(), v.ticket.body.clone(), note),
+        };
         Ok(json!({
             "key": v.key,
-            "title": v.ticket.title,
-            "body": v.ticket.body,
+            "title": title,
+            "body": body,
             "state": v.ticket.state,
             "createdBy": by.name,
             "note": note,
@@ -1472,6 +1583,15 @@ impl Desk {
                     ));
                 }
                 let b = self.board_for_new(caller, prefix.as_deref()).await?;
+                // A session's words never become an issue on someone's Jira.
+                if let Some(sync) = &b.sync {
+                    return Err(format!(
+                        "{} is synced with {} {}; tell the person what needs adding there.",
+                        b.name,
+                        sync.system.title(),
+                        sync.target
+                    ));
+                }
                 let v = self
                     .create_ticket(
                         NewTicket {

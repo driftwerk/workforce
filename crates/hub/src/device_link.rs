@@ -114,6 +114,30 @@ pub(crate) fn identity_for_device(store: &dyn IdentityStore, device_id: &str) ->
     holder_of(store, device_id).map(|identity| identity.id.to_string())
 }
 
+/// Whether `device_id` was paired as a desktop (Desk) device to the person
+/// holding it.
+pub(crate) fn is_desktop_device(store: &dyn IdentityStore, device_id: &str) -> bool {
+    // Every key `holder_of` accepts for a desktop: the canonical kind and its
+    // aliases (`desk`), per device or in the legacy single slot.
+    let kinds = std::iter::once("desktop_device").chain(
+        workforce_pairing::types::DEVICE_KIND_ALIASES
+            .iter()
+            .filter(|(_, canonical)| *canonical == "desktop_device")
+            .map(|(alias, _)| *alias),
+    );
+    let keys: Vec<String> = kinds
+        .flat_map(|k| [device_link_key(k, device_id), k.to_string()])
+        .collect();
+    holder_of(store, device_id).is_some_and(|identity| {
+        keys.iter().any(|key| {
+            identity
+                .linked_ids
+                .get(key)
+                .is_some_and(|id| id == device_id)
+        })
+    })
+}
+
 /// The identity holding `device_id`, for listing who each device belongs to.
 pub(crate) fn device_owner(store: &dyn IdentityStore, device_id: &str) -> Option<Identity> {
     holder_of(store, device_id)
@@ -588,6 +612,32 @@ pub(crate) async fn link_existing_device(
         device_kind: kind,
         already_linked: false,
     })
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+    use workforce_identity::sqlite::SqliteIdentityStore;
+
+    /// An older Desk linked under the `desk` alias, or the legacy single
+    /// slot, is a desktop device too; a phone isn't.
+    #[test]
+    fn a_desktop_is_known_under_every_key_it_was_linked_by() {
+        let store = SqliteIdentityStore::in_memory().unwrap();
+        for (key, desktop) in [
+            ("desktop_device:d1".to_string(), true),
+            ("desk:d1".to_string(), true),
+            ("desk".to_string(), true),
+            ("desktop_device".to_string(), true),
+            ("ios_device:d1".to_string(), false),
+        ] {
+            let mut who = Identity::new("Sam", IdentityRole::Member);
+            who.link_id(key.clone(), "d1");
+            store.create(&who).unwrap();
+            assert_eq!(is_desktop_device(&store, "d1"), desktop, "{key}");
+            store.delete(who.id).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

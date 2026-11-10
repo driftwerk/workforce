@@ -3085,7 +3085,8 @@ pub(crate) async fn process_turn(
             crate::hub_core::standing::refusal(&person),
         )));
     }
-    if let Some(cmd) = crate::commands::parse_command(message) {
+    let with_files = attachments.as_ref().is_some_and(|files| !files.is_empty());
+    if let Some(cmd) = crate::commands::command_of(message, with_files) {
         let result = crate::commands::execute_command(&cmd, service, channel, user).await;
         return Ok(TurnOutcome::Answered(result.text));
     }
@@ -4253,6 +4254,8 @@ pub(crate) fn worker_tool_registry(
 ) -> workforce_agent::tools::registry::ToolRegistry {
     let registry = crate::mcp::build_mcp_registry(&service.tools, &worker_tool_patterns());
     registry.register(Arc::new(crate::findings::ReportFindingsTool));
+    // A worker's tools are its agent's own, held to "always work in real
+    // sessions" alike (`crate::sessions_only::hold`).
     registry
 }
 
@@ -4392,7 +4395,7 @@ pub(crate) async fn process_message_with_progress(
     // workflow_runtime self-dispatch). Slash commands run on raw
     // text and may legitimately consume cleartext.
     let tokenized;
-    let message: &str = if crate::commands::parse_command(message).is_some() {
+    let message: &str = if crate::commands::runs_raw(message) {
         message
     } else {
         tokenized = workforce_common::redact::tokenize_secrets(
@@ -4405,7 +4408,8 @@ pub(crate) async fn process_message_with_progress(
     };
 
     // Check for slash commands first
-    if let Some(cmd) = crate::commands::parse_command(message) {
+    let with_files = attachments.as_ref().is_some_and(|files| !files.is_empty());
+    if let Some(cmd) = crate::commands::command_of(message, with_files) {
         let service = Arc::clone(service);
         let channel_owned = channel.to_string();
         let user_owned = user.to_string();

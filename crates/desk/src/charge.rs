@@ -234,6 +234,145 @@ pub fn wheel(
     }
 }
 
+// ── Where a boss acts fully ─────────────────────────────────────────────
+
+/// Where a boss acting fully may ship, as its `[oversight.full]` says:
+/// the repositories named, and the workflows it may run there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullGrant {
+    pub repos: Vec<String>,
+    /// Workflow file names, matched exactly (`deploy.yml`).
+    pub workflows: Vec<String>,
+}
+
+/// A repository as a remote's address names it: its host, when said, and
+/// its `owner/name`, lowercased, without `.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoName {
+    pub host: Option<String>,
+    pub path: String,
+}
+
+/// `text` (`git@github.com:acme/acme-web.git`, `https://github.com/acme/
+/// acme-web`, `ssh://git@host:22/acme/acme-web.git`, `acme/acme-web`) as
+/// the repository it names; `None` when it names none.
+pub fn repo_name(text: &str) -> Option<RepoName> {
+    let t = text.trim();
+    if t.is_empty() || t.starts_with('/') || t.starts_with('~') || t.starts_with('.') {
+        return None;
+    }
+    let (host, path) = if let Some((_, rest)) = t.split_once("://") {
+        // scheme://[user@]host[:port]/path
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?.split(':').next()?;
+        (Some(host), path)
+    } else if let Some((left, path)) = t.split_once(':') {
+        // [user@]host:path
+        (Some(left.rsplit('@').next()?), path)
+    } else {
+        let parts: Vec<&str> = t.split('/').collect();
+        match parts.as_slice() {
+            [owner, name] => (None, &t[..owner.len() + 1 + name.len()]),
+            [host, _, _] if host.contains('.') => (Some(*host), &t[host.len() + 1..]),
+            _ => return None,
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).to_lowercase();
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return None;
+    }
+    Some(RepoName {
+        host: host.filter(|h| !h.is_empty()).map(str::to_lowercase),
+        path,
+    })
+}
+
+/// Whether the repository a session works in is one of `named` (as
+/// `[oversight.full] repos` writes them): by its `origin` remote's address
+/// (`owner/name`, or the whole address), or by a local checkout's path,
+/// which must be its main checkout or the worktree itself (`checkouts`,
+/// real). A path named is read as `real` resolves it, `~` the home.
+pub fn repo_named(
+    origin: Option<&str>,
+    checkouts: &[PathBuf],
+    named: &[String],
+    home: &Path,
+    real: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> bool {
+    let origin = origin.and_then(repo_name);
+    let checkouts: Vec<PathBuf> = checkouts.iter().map(|c| boss::fold(c)).collect();
+    named.iter().any(|n| {
+        let n = n.trim();
+        let path = if n == "~" {
+            Some(home.to_path_buf())
+        } else if let Some(rest) = n.strip_prefix("~/") {
+            Some(home.join(rest))
+        } else if n.starts_with('/') {
+            Some(PathBuf::from(n))
+        } else {
+            None
+        };
+        if let Some(p) = path {
+            return real(&p).is_some_and(|p| checkouts.contains(&boss::fold(&p)));
+        }
+        match (repo_name(n), &origin) {
+            (Some(want), Some(have)) => same_repo(&want, have),
+            _ => false,
+        }
+    })
+}
+
+/// The host a name without one means: GitHub's.
+pub const DEFAULT_HOST: &str = "github.com";
+
+/// Whether `want`, as the person named it, is the repository `have`: the
+/// same `owner/name`, on the host named, `github.com` when none is.
+fn same_repo(want: &RepoName, have: &RepoName) -> bool {
+    let host = |r: &RepoName| r.host.clone().unwrap_or_else(|| DEFAULT_HOST.into());
+    want.path == have.path && host(want) == host(have)
+}
+
+/// Whether every one of a repository's remote addresses (`remotes`, fetch
+/// and push, every remote) is the same repository as its `origin`: so
+/// whichever one `gh` resolves the repository to (its `gh-resolved`
+/// default, then upstream, github, origin), it is that one. None at all,
+/// or one that names no repository, isn't.
+pub fn remotes_one_repo(origin: Option<&str>, remotes: &[String]) -> bool {
+    let Some(origin) = origin.and_then(repo_name) else {
+        return false;
+    };
+    !remotes.is_empty()
+        && remotes
+            .iter()
+            .all(|r| repo_name(r).is_some_and(|r| same_repo(&r, &origin)))
+}
+
+/// Whether what `gh repo set-default` wrote (`remote.<name>.gh-resolved`:
+/// `base`, that remote, or an `owner/name`) is the repository at `origin`:
+/// each value `base` (its remote is checked with the rest) or that one.
+pub fn gh_resolved_named(origin: Option<&str>, resolved: &[String]) -> bool {
+    let Some(origin) = origin.and_then(repo_name) else {
+        return false;
+    };
+    resolved.iter().all(|v| {
+        v == "base"
+            || repo_name(v).is_some_and(|r| {
+                // `owner/name` alone is on origin's host.
+                let r = RepoName {
+                    host: r.host.or_else(|| origin.host.clone()),
+                    path: r.path,
+                };
+                same_repo(&r, &origin)
+            })
+    })
+}
+
 // ── What a boss answers for ─────────────────────────────────────────────
 
 /// Where a boss's answers for its sessions are judged: the person's home,
@@ -287,6 +426,25 @@ pub struct Facts {
     pub branch: Option<String>,
     /// The repository's default branch, when it says (`origin/HEAD`).
     pub default_branch: Option<String>,
+    /// The boss acts fully in this repository: what ships is its to allow.
+    pub ships: bool,
+    /// Every remote of the repository is the one named: `gh` ships too.
+    pub ships_gh: bool,
+    /// The repository says `push.followTags`.
+    pub follow_tags: bool,
+    /// The repository has git hooks.
+    pub hooks: bool,
+    /// The workflows the boss may run where it acts fully, by file name.
+    pub workflows: Vec<String>,
+    /// `HEAD` is the commit `origin`'s default branch is at.
+    pub at_tip: bool,
+    /// `HEAD` has commits `origin`'s default branch hasn't, or Desk can't
+    /// tell.
+    pub unpushed: bool,
+    /// The repository's branch names, local and `origin`'s.
+    pub branches: Vec<String>,
+    /// The tags at `origin`'s default branch's commit.
+    pub tip_tags: Vec<String>,
     pub what: What,
 }
 
@@ -332,7 +490,7 @@ fn under(pattern: &str) -> &str {
 
 /// The folder a session works in: its cwd, or the worktree under
 /// `.worktrees/` that holds it.
-fn own_folder(cwd: &Path) -> PathBuf {
+pub(crate) fn own_folder(cwd: &Path) -> PathBuf {
     let parts: Vec<Component<'_>> = cwd.components().collect();
     match parts
         .iter()
@@ -385,6 +543,15 @@ pub fn facts_of(
         cwd,
         branch: None,
         default_branch: None,
+        ships: false,
+        ships_gh: false,
+        follow_tags: false,
+        hooks: false,
+        workflows: Vec::new(),
+        at_tip: false,
+        unpushed: true,
+        branches: Vec::new(),
+        tip_tags: Vec::new(),
         what,
     }
 }
@@ -465,6 +632,7 @@ pub fn answerable(
     facts: &Facts,
     bounds: &Bounds,
     real: &dyn Fn(&Path) -> Option<PathBuf>,
+    tracked: &dyn Fn(&Path) -> bool,
 ) -> Result<(), Irreversible> {
     let no = |why: String| Err(Irreversible(why));
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
@@ -492,6 +660,16 @@ pub fn answerable(
                 real,
                 branch: facts.branch.as_deref(),
                 default_branch: facts.default_branch.as_deref(),
+                ships: facts.ships,
+                ships_gh: facts.ships_gh,
+                follow_tags: facts.follow_tags,
+                hooks: facts.hooks,
+                workflows: &facts.workflows,
+                at_tip: facts.at_tip,
+                unpushed: facts.unpushed,
+                branches: &facts.branches,
+                tip_tags: &facts.tip_tags,
+                tracked,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
@@ -505,7 +683,11 @@ pub fn answerable(
                     None => return no("reads through a link to nothing".into()),
                 }
             }
-            Ok(())
+            // A file credentials are kept in, by its name, wherever it is.
+            match paths.iter().find_map(|p| crate::never::path(p)) {
+                Some(n) => no(n.why().into()),
+                None => Ok(()),
+            }
         }
         What::Web { carries: true } => no("Desk can't tell what this address sends".into()),
         What::Web { carries: false } | What::Inside => Ok(()),
@@ -524,7 +706,11 @@ pub fn answerable(
                     return no(format!("changes a file outside {}", facts.folder));
                 }
             }
-            Ok(())
+            // A file credentials are kept in, by its name.
+            match paths.iter().find_map(|p| crate::never::path(p)) {
+                Some(n) => no(n.why().into()),
+                None => Ok(()),
+            }
         }
         What::Mcp {
             server,
@@ -563,6 +749,7 @@ mod tests {
             view: View::Terminal,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             name: "acme-web".into(),
             goal: String::new(),
@@ -743,6 +930,118 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_is_named_by_its_origin_or_its_checkout() {
+        let gh = |p: &str| RepoName {
+            host: Some("github.com".into()),
+            path: p.into(),
+        };
+        for (text, want) in [
+            (
+                "git@github.com:acme/acme-web.git",
+                Some(gh("acme/acme-web")),
+            ),
+            (
+                "https://github.com/Acme/Acme-Web",
+                Some(gh("acme/acme-web")),
+            ),
+            (
+                "ssh://git@github.com:22/acme/acme-web.git",
+                Some(gh("acme/acme-web")),
+            ),
+            ("github.com/acme/acme-web", Some(gh("acme/acme-web"))),
+            (
+                "acme/acme-web",
+                Some(RepoName {
+                    host: None,
+                    path: "acme/acme-web".into(),
+                }),
+            ),
+            ("acme-web", None),
+            ("~/dev/acme-web", None),
+            ("https://github.com/acme", None),
+        ] {
+            assert_eq!(repo_name(text), want, "{text}");
+        }
+        let home = Path::new("/Users/sam");
+        let real = |p: &Path| Some(p.to_path_buf());
+        let origin = Some("git@github.com:acme/acme-web.git");
+        let main = [PathBuf::from("/Users/sam/dev/acme-web")];
+        let named = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for yes in [
+            named(&["acme/acme-web"]),
+            named(&["globex/globex-api", "ACME/acme-web"]),
+            named(&["https://github.com/acme/acme-web.git"]),
+            named(&["~/dev/acme-web"]),
+            named(&["/Users/sam/dev/acme-web"]),
+        ] {
+            assert!(repo_named(origin, &main, &yes, home, &real), "{yes:?}");
+        }
+        // A name with no host is GitHub's: a lookalike elsewhere isn't it.
+        let gitlab = Some("git@gitlab.com:acme/acme-web.git");
+        assert!(!repo_named(
+            gitlab,
+            &[],
+            &named(&["acme/acme-web"]),
+            home,
+            &real
+        ));
+        assert!(repo_named(
+            gitlab,
+            &[],
+            &named(&["gitlab.com/acme/acme-web"]),
+            home,
+            &real
+        ));
+        // gh acts on the repository only where every remote is that one: a
+        // fork whose upstream is its parent isn't.
+        let fork = Some("git@github.com:acme/acme-web.git");
+        let urls = |u: &[&str]| u.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(remotes_one_repo(
+            fork,
+            &urls(&[
+                "git@github.com:acme/acme-web.git",
+                "https://github.com/acme/acme-web"
+            ])
+        ));
+        assert!(!remotes_one_repo(
+            fork,
+            &urls(&[
+                "git@github.com:acme/acme-web.git",
+                "git@github.com:globex/acme-web.git"
+            ])
+        ));
+        assert!(!remotes_one_repo(fork, &[]));
+        // `gh repo set-default` pointed at the parent: not the one named.
+        assert!(gh_resolved_named(fork, &urls(&["base"])));
+        assert!(gh_resolved_named(fork, &urls(&["acme/acme-web"])));
+        assert!(gh_resolved_named(fork, &[]));
+        assert!(!gh_resolved_named(fork, &urls(&["globex/acme-web"])));
+        assert!(!gh_resolved_named(
+            fork,
+            &urls(&["base", "globex/acme-web"])
+        ));
+        assert!(!remotes_one_repo(
+            None,
+            &urls(&["git@github.com:acme/acme-web.git"])
+        ));
+        for no in [
+            named(&[]),
+            named(&["globex/globex-api"]),
+            named(&["acme/acme-web-fork"]),
+            named(&["gitlab.com/acme/acme-web"]),
+            named(&["~/dev"]),
+            named(&["/Users/sam/dev/acme-web/src"]),
+            named(&["acme-web"]),
+        ] {
+            assert!(!repo_named(origin, &main, &no, home, &real), "{no:?}");
+        }
+        assert!(
+            !repo_named(None, &[], &named(&["acme/acme-web"]), home, &real),
+            "no origin, no checkout: not named"
+        );
+    }
+
+    #[test]
     fn the_wheel_reads_and_writes_as_its_words() {
         for w in [Wheel::Boss, Wheel::Person, Wheel::PersonPinned] {
             assert_eq!(Wheel::parse(w.as_str()).unwrap(), w);
@@ -830,7 +1129,7 @@ mod tests {
         let mut facts = facts_of(engine, p, s, Path::new("/Users/sam"), moved);
         facts.branch = Some("feat/date-picker".into());
         facts.default_branch = Some("main".into());
-        answerable(&facts, &bounds(), &real).map_err(|e| e.to_string())
+        answerable(&facts, &bounds(), &real, &|_| false).map_err(|e| e.to_string())
     }
 
     fn judged(engine: Engine, p: &PendingApproval, s: &SessionView) -> Result<(), String> {

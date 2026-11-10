@@ -304,6 +304,7 @@ pub(crate) async fn new_session(
             prompt: None,
             approvals: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             env: Default::default(),
             group: None,
@@ -496,7 +497,7 @@ async fn one_agent_oversees_and_has_the_tools_its_level_allows() {
         .unwrap_err();
         assert_eq!(
             refused.to_string(),
-            "the agent would not load that: How much the overseer does on its own must be watch, suggest or act."
+            "the agent would not load that: How much the overseer does on its own must be watch, suggest, act or full."
         );
     })
     .await;
@@ -1242,6 +1243,7 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
             engine: Engine::Claude,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             view: workforce_desk::model::View::Terminal,
             name: "elsewhere".into(),
@@ -1784,6 +1786,8 @@ mod groups;
 mod handovers;
 
 mod plans;
+
+mod act_fully;
 
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them
@@ -2390,6 +2394,7 @@ mod floor {
             view: View::Terminal,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             name: name.into(),
             goal: String::new(),
@@ -2807,6 +2812,7 @@ async fn the_overseer_answers_which_session_spends_most_from_the_ledger_at_watch
             view: workforce_desk::model::View::Terminal,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             name: "acme-web".into(),
             goal: "Fix the login race".into(),
@@ -4448,6 +4454,7 @@ mod board {
             engine: Engine::Claude,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             view: workforce_desk::model::View::Terminal,
             name: "elsewhere".into(),

@@ -996,6 +996,7 @@ mod tests {
             view: View::Terminal,
             engine_version: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             name: name.into(),
             goal: String::new(),

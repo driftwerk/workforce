@@ -179,6 +179,23 @@ async fn assign(
 }
 
 #[derive(Deserialize)]
+struct LeftFilter {
+    keep: bool,
+}
+
+/// A ticket on the Left-the-filter shelf: kept here, unsynced, or dropped.
+async fn left_filter(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<LeftFilter>,
+) -> Response {
+    guarded!(s, h, q);
+    reply(s.desk.left_filter(id, b.keep, &By::you()).await)
+}
+
+#[derive(Deserialize)]
 struct Page {
     before: Option<String>,
     #[serde(default = "page")]
@@ -258,6 +275,7 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             put(add_need).delete(remove_need),
         )
         .route("/api/desk/tickets/{id}/assign", post(assign))
+        .route("/api/desk/tickets/{id}/left-filter", post(left_filter))
         .route("/api/desk/tickets/{id}/history", get(ticket_history))
         .route("/api/desk/history", get(history))
         .with_state(Arc::new(Api { desk, auth }))

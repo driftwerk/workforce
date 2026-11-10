@@ -91,6 +91,11 @@ pub enum AgentReadDenial {
     /// `codex/auth_json`), whose token runs as its owner's plan wherever it
     /// is read back.
     Login,
+    /// The path holds a Desk link to another hub (`desk/hubs/...`,
+    /// `desk/links/...`, shared or per-user): the `wfr_` token Desk's board
+    /// sync calls that hub with as the person. Only the sync reads it, never
+    /// an agent, the overseer included.
+    DeskLink,
     /// No `CURRENT_USER_ID` is in scope but the path is per-user. System
     /// jobs must opt into a synthetic identity via
     /// `workforce_agent::runner::with_system_identity` rather than read
@@ -135,6 +140,11 @@ impl std::fmt::Display for AgentReadDenial {
                 f,
                 "vault path holds a subscription login, which is never read back; \
                  store a new one with claude_code.setup_token, codex.setup_auth or My Settings"
+            ),
+            AgentReadDenial::DeskLink => write!(
+                f,
+                "vault path holds a Desk link to another hub and is not \
+                 accessible from the agent vault tool"
             ),
             AgentReadDenial::NoUserIdentity => write!(
                 f,
@@ -187,6 +197,11 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
     if logical.starts_with(crate::subscription::device_login::RECORD_PREFIX) {
         return Err(AgentReadDenial::DeviceLogin);
     }
+    // Before the per-user branch, so no identity (`system` included) reads
+    // a Desk link.
+    if is_desk_link(path) {
+        return Err(AgentReadDenial::DeskLink);
+    }
     if let Some(rest) = path.strip_prefix("users/") {
         let uid = rest.split('/').next().unwrap_or("");
         if uid.is_empty() {
@@ -204,6 +219,8 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
         Ok(())
     }
 }
+
+pub use workforce_common::vault_scope::{is_desk_link, DESK_LINK_PREFIXES};
 
 /// [`agent_can_read`] for a tool that hands the value back: never a
 /// subscription login's, whatever the redaction policy, since its token is
@@ -235,6 +252,39 @@ pub fn org_wide_rejection_message(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Desk's links to other hubs are no agent's to read, list, write or
+    /// move, shared or per-user, under any identity, `system` included.
+    #[test]
+    fn a_desk_link_is_refused_to_every_agent() {
+        for path in [
+            "desk/hubs/atlas/remote_mcp",
+            "users/sam/desk/hubs/atlas/remote_mcp",
+            "users/sam/desk/links/atlas/ungrouped",
+            "desk/links/atlas",
+            "Desk/Hubs/atlas/remote_mcp",
+            "users/sam/desk//hubs/atlas",
+            "desk/hubs",
+        ] {
+            for who in [Some("sam"), Some("system"), None, Some("bob")] {
+                assert_eq!(
+                    agent_can_read(path, who),
+                    Err(AgentReadDenial::DeskLink),
+                    "{path} as {who:?}"
+                );
+            }
+        }
+        for path in ["desk/notes", "users/sam/desk/hubsx/a", "skills/desk/hubs"] {
+            assert_ne!(
+                agent_can_read(path, Some("sam")),
+                Err(AgentReadDenial::DeskLink),
+                "{path}"
+            );
+        }
+        assert!(AgentReadDenial::DeskLink
+            .to_string()
+            .contains("holds a Desk link to another hub"));
+    }
 
     #[test]
     fn google_oauth_client_is_org_wide() {

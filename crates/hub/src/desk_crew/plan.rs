@@ -221,7 +221,7 @@ fn plan_out(p: &PlanDetail) -> Value {
         "tickets": p.tickets.iter().map(|t| json!({
             "id": t.ticket.ticket.id.to_string(),
             "key": t.ticket.key,
-            "title": t.ticket.ticket.title,
+            "title": t.ticket.ticket.said_title(),
             "state": t.ticket.ticket.state.as_str(),
             "engine": t.engine.map(Engine::as_str),
             "folder": t.folder,
@@ -420,7 +420,7 @@ impl CrewHub {
                     format!(
                         "{} {}",
                         t.ticket.key.as_deref().unwrap_or("·"),
-                        crew::one_line(&t.ticket.ticket.title, 80)
+                        crew::one_line(&t.ticket.ticket.said_title(), 80)
                     )
                 })
                 .collect();
@@ -575,7 +575,7 @@ impl CrewHub {
         };
         let limit = o.work.parallel as usize;
         match o.level {
-            Level::Act => {
+            Level::Act | Level::Full => {
                 // A ticket that failed to start waits longer each time, and
                 // is tried afresh once the plan changes.
                 let mut rows = tickets.clone();
@@ -793,7 +793,7 @@ impl CrewHub {
                 let boss = plan
                     .as_ref()
                     .and_then(|p| self.boss_of_plan(p))
-                    .filter(|(_, o)| o.level == Level::Act);
+                    .filter(|(_, o)| o.level.acts());
                 let Some((service, _)) = boss else {
                     // No boss may start it now: the ticket waits in To do.
                     let by = By::desk("No boss may start it now.");
@@ -1032,7 +1032,7 @@ impl CrewHub {
             return None;
         }
         let key = ticket.key.as_deref().unwrap_or("A ticket");
-        let title = crew::one_line(&ticket.ticket.title, 80);
+        let title = crew::one_line(&ticket.ticket.said_title(), 80);
         match now {
             TicketState::Review => Some((plan, format!("{key} “{title}” is in Review"))),
             TicketState::Done => Some((plan, format!("{key} “{title}” is Done"))),

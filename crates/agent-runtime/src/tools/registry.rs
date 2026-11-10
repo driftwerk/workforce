@@ -24,7 +24,14 @@ pub struct ToolRegistry {
     /// The registry this one was copied from, for a copy that may still take
     /// tools the source gains later ([`follow`](Self::follow)).
     upstream: Option<Upstream>,
+    /// What every tool registered here is wrapped in ([`Self::guard_with`]);
+    /// kept by every copy, so a tool a copy registers is held alike.
+    guard: RwLock<Option<Guard>>,
 }
+
+/// A wrapper every tool a registry holds runs through, such as one that
+/// refuses a call its agent may not make now.
+pub type Guard = Arc<dyn Fn(Arc<dyn Tool>) -> Arc<dyn Tool> + Send + Sync>;
 
 /// Where a [followed](ToolRegistry::follow) copy takes later tools from, and
 /// which of them it lets in.
@@ -45,6 +52,7 @@ impl ToolRegistry {
             generation: AtomicU64::new(0),
             credential_pins: Arc::default(),
             upstream: None,
+            guard: RwLock::new(None),
         }
     }
 
@@ -53,8 +61,24 @@ impl ToolRegistry {
     pub fn empty_like(source: &ToolRegistry) -> Self {
         Self {
             credential_pins: source.credential_pins(),
+            guard: RwLock::new(source.guard.read().clone()),
             ..Self::new()
         }
+    }
+
+    /// Wrap every tool registered here in `guard`: the ones it holds now,
+    /// and each one registered later, here or on a copy. Set once; the tools
+    /// already held are wrapped once.
+    pub fn guard_with(&self, guard: Guard) {
+        let mut held = self.guard.write();
+        if held.is_some() {
+            return;
+        }
+        for tool in self.tools.write().values_mut() {
+            *tool = guard(Arc::clone(tool));
+        }
+        *held = Some(guard);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The slot this agent's credential pins go in.
@@ -64,6 +88,10 @@ impl ToolRegistry {
 
     /// Register a tool.
     pub fn register(&self, tool: Arc<dyn Tool>) {
+        let tool = match self.guard.read().as_ref() {
+            Some(guard) => guard(tool),
+            None => tool,
+        };
         let name = tool.name().to_string();
         tracing::info!(tool = %name, "Registered tool");
         if let Some(upstream) = &self.upstream {
@@ -165,6 +193,7 @@ impl ToolRegistry {
             generation: AtomicU64::new(0),
             credential_pins: Arc::clone(&self.credential_pins),
             upstream: None,
+            guard: RwLock::new(self.guard.read().clone()),
         }
     }
 
@@ -556,5 +585,55 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output["echo"], "hello");
+    }
+
+    #[test]
+    fn a_guard_wraps_every_tool_held_and_registered_later_and_on_copies() {
+        struct Named(&'static str);
+        #[async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "plain"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult::success(serde_json::json!("ran"), 0))
+            }
+        }
+        struct Guarded(Arc<dyn Tool>);
+        #[async_trait]
+        impl Tool for Guarded {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn description(&self) -> &str {
+                "guarded"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                self.0.input_schema()
+            }
+            async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
+                self.0.execute(input).await
+            }
+        }
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(Named("before")));
+        registry.guard_with(Arc::new(|tool| Arc::new(Guarded(tool)) as Arc<dyn Tool>));
+        registry.guard_with(Arc::new(|tool| tool));
+        registry.register(Arc::new(Named("after")));
+        let copy = ToolRegistry::follow(&registry, |_| true);
+        copy.register(Arc::new(Named("on-copy")));
+        for (holder, name) in [
+            (&*registry, "before"),
+            (&*registry, "after"),
+            (&copy, "on-copy"),
+        ] {
+            assert_eq!(holder.get(name).unwrap().description(), "guarded", "{name}");
+        }
     }
 }

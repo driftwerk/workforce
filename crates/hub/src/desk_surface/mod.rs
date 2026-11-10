@@ -85,11 +85,14 @@ pub(crate) fn origin() -> Option<workforce_common::delivery::DeliveryTarget> {
 
 /// How the Desk turn `desk` in `session_id` ended: its client's id, and
 /// its reply id when an answer was saved under it. A turn answered by a slash
-/// command, refused by the budget or stopped saved none.
+/// command, refused by the budget or stopped saved none. `ran`: the text the
+/// turn ran, where it ran at all (a refused turn ran nothing); a command
+/// there is said to be one, so the Desk settles it without a kept copy.
 pub(crate) fn turn_end(
     service: &crate::serve::AgentService,
     session_id: &str,
     desk: &workforce_common::channels::desk::DeskTurnContext,
+    ran: Option<&str>,
 ) -> workforce_common::channels::desk::TurnEnd {
     let saved = service
         .sessions
@@ -97,9 +100,13 @@ pub(crate) fn turn_end(
         .ok()
         .flatten()
         .is_some_and(|session| session.messages.iter().any(|m| m.id == desk.reply_id));
+    // A command saves no answer: a near miss sent with files went to the
+    // agent, which did.
+    let command = !saved && ran.is_some_and(|text| crate::commands::parse_command(text).is_some());
     workforce_common::channels::desk::TurnEnd {
         turn_ref: desk.turn_ref.clone(),
         reply_id: saved.then(|| desk.reply_id.clone()),
+        command,
     }
 }
 

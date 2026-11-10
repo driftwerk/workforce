@@ -628,6 +628,8 @@ fn words(text: &str) -> Vec<Option<Word>> {
 struct Keys {
     words: Vec<String>,
     stems: Vec<String>,
+    shipping_words: Vec<String>,
+    shipping_stems: Vec<String>,
     lists: std::collections::HashMap<&'static str, String>,
 }
 
@@ -650,12 +652,49 @@ static KEYS: std::sync::LazyLock<Keys> = std::sync::LazyLock::new(|| {
     Keys {
         words: keyed(OUTWARD_WORDS),
         stems: keyed(OUTWARD_STEMS),
+        shipping_words: keyed(SHIPPING_WORDS),
+        shipping_stems: keyed(SHIPPING_STEMS),
         lists,
     }
 });
 
 /// The words a reply is waited on by.
 const REPLIES: &[&str] = &["reply", "replies", "replied"];
+
+/// What Act fully lets through in its named repositories: the words of
+/// shipping (pushing, merging, tagging, releasing, promoting, deploying),
+/// by start, and a few whole. Deleting, sending, paying and the rest stay
+/// outward.
+const SHIPPING_STEMS: &[&str] = &[
+    "push",
+    "deploy",
+    "ship",
+    "publish",
+    "releas",
+    "merg",
+    "commit",
+    "production",
+    "rollout",
+    "tag",
+    "promot",
+];
+const SHIPPING_WORDS: &[&str] = &["prod", "pr", "prs"];
+
+/// Whether `w`, as [`letters`] reads it, is a word of shipping.
+fn shipping_text(w: &str) -> bool {
+    KEYS.shipping_words.iter().any(|k| k == w)
+        || KEYS
+            .shipping_stems
+            .iter()
+            .any(|s| w.starts_with(s.as_str()))
+}
+
+/// Whether `word` reads as outward past what ships.
+fn outward_past_shipping(word: &Word) -> bool {
+    std::iter::once(&word.text)
+        .chain(&word.parts)
+        .any(|p| outward_text(p) && !shipping_text(p))
+}
 
 fn outward_text(w: &str) -> bool {
     KEYS.words.iter().any(|k| k == w) || KEYS.stems.iter().any(|s| w.starts_with(s.as_str()))
@@ -759,7 +798,15 @@ fn awaited(ws: &[Option<Word>], i: usize) -> bool {
 /// stays outward whatever a session is called. An outward word is let go
 /// only when clearly negated just before ("make no production changes") or
 /// a reply waited on ("until the person replies").
+#[cfg(test)]
 pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
+    outward_unless_shipping(text, names, false)
+}
+
+/// [`outward_except`], where shipping (`ships`: Act fully in the session's
+/// repository) doesn't count: pushing, merging, tagging and deploying are
+/// let go; deleting, sending, paying and the rest are still outward.
+pub(crate) fn outward_unless_shipping(text: &str, names: &[String], ships: bool) -> bool {
     let mut ws = words(text);
     let mut names: Vec<Vec<Word>> = names
         .iter()
@@ -785,9 +832,13 @@ pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
         }
     }
     (0..ws.len()).any(|i| {
-        ws[i]
-            .as_ref()
-            .is_some_and(|w| outward_word(w) && !negated(&ws, i) && !awaited(&ws, i))
+        ws[i].as_ref().is_some_and(|w| {
+            let outward = match ships {
+                true => outward_past_shipping(w),
+                false => outward_word(w),
+            };
+            outward && !negated(&ws, i) && !awaited(&ws, i)
+        })
     })
 }
 
@@ -835,7 +886,7 @@ impl CrewHub {
         if let Action::Handoff { .. } = action {
             return match o.level {
                 Level::Watch => Gate::Refuse,
-                Level::Suggest | Level::Act => Gate::Suggest(
+                Level::Suggest | Level::Act | Level::Full => Gate::Suggest(
                     "continuing a session in another engine is the person's call, as its brief goes to that engine's vendor".into(),
                 ),
             };
@@ -845,13 +896,24 @@ impl CrewHub {
         if let Action::Escalate { .. } | Action::Release { .. } = action {
             return match o.level {
                 Level::Watch => Gate::Refuse,
-                Level::Suggest | Level::Act => Gate::Run,
+                Level::Suggest | Level::Act | Level::Full => Gate::Run,
             };
         }
         match o.level {
             Level::Watch => return Gate::Refuse,
             Level::Suggest => return Gate::Suggest("you suggest; the person decides".into()),
-            Level::Act => {}
+            Level::Act | Level::Full => {}
+        }
+        // What no boss does at any level, said in words: in what it says,
+        // and in the question it answers.
+        if let Some(n) = self.never_said(action) {
+            return Gate::Suggest(
+                format!(
+                    "it {}; that is always the person's, at every level",
+                    n.why()
+                )
+                .into(),
+            );
         }
         // Taking on a session the person runs is theirs to say, unless
         // they let it take on every one.
@@ -870,17 +932,30 @@ impl CrewHub {
         if let Some(why) = self.uncontained(action, &o.act) {
             return Gate::Suggest(why.into());
         }
+        // Acting fully, an answer to a session in a repository it ships in
+        // may speak of shipping; what else reaches outside is the person's.
+        let ships = match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                reply_to: Some(_),
+                ..
+            } => o.act.answer_sessions && self.ships_in(*s, o),
+            _ => false,
+        };
         let asked_outward = match action {
             Action::Nudge {
                 reply_to: Some(ask),
                 ..
             } => {
                 let asked = self.questions.lock().get(ask).cloned();
-                asked.is_none_or(|q| self.said_outward(&q))
+                asked.is_none_or(|q| self.said_outward_unless(&q, ships))
             }
             _ => false,
         };
-        if self.said_outward(&action.said()) || asked_outward || self.ticket_outward(action) {
+        if self.said_outward_unless(&action.said(), ships)
+            || asked_outward
+            || self.ticket_outward(action)
+        {
             return Gate::Suggest(
                 "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
             );
@@ -946,6 +1021,20 @@ impl CrewHub {
                 if codex {
                     return Gate::Suggest("Codex's requests are the person's to answer".into());
                 }
+                // Acting fully in its repository, answering sessions: judged
+                // as for a session it runs, shipping its to allow.
+                if o.act.answer_sessions && self.ships_in(*session, o) {
+                    let Some(boss) = self.boss_id(o) else {
+                        return Gate::Suggest("no overseer runs this scope now".into());
+                    };
+                    return match self.desk.boss_answerable(*session, *approval, &boss) {
+                        Ok(()) => Gate::Run,
+                        Err(why) => Gate::Suggest(
+                            format!("it {why}, so it's the person's to allow; tell them why")
+                                .into(),
+                        ),
+                    };
+                }
                 if !o.act.read_only_approvals {
                     false
                 } else {
@@ -997,6 +1086,11 @@ impl CrewHub {
     /// sessions and agents are called: a session's name naming a migration
     /// isn't asking for one.
     fn said_outward(&self, text: &str) -> bool {
+        self.said_outward_unless(text, false)
+    }
+
+    /// [`Self::said_outward`], shipping not counted when `ships`.
+    fn said_outward_unless(&self, text: &str, ships: bool) -> bool {
         let mut names = Vec::new();
         for v in self.desk.list() {
             names.push(v.label().to_string());
@@ -1006,7 +1100,27 @@ impl CrewHub {
             names.push(super::name_of(&s));
             names.push(s.agent_id.as_str().to_string());
         }
-        outward_except(text, &names)
+        outward_unless_shipping(text, &names, ships)
+    }
+
+    /// The hard limit what `action` says, or the question it answers,
+    /// speaks of ([`workforce_desk::never::said`]).
+    fn never_said(&self, action: &Action) -> Option<workforce_desk::never::Never> {
+        let asked = match action {
+            Action::Nudge {
+                reply_to: Some(ask),
+                ..
+            } => self.questions.lock().get(ask).cloned(),
+            _ => None,
+        };
+        workforce_desk::never::said(&action.said())
+            .or_else(|| asked.as_deref().and_then(workforce_desk::never::said))
+    }
+
+    /// The agent id of the overseer of `o`'s scope, now.
+    fn boss_id(&self, o: &Oversight) -> Option<String> {
+        self.overseer_for(&o.scope)
+            .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
     /// The session `action` is done to, when it is one.
@@ -1065,7 +1179,8 @@ impl CrewHub {
         };
         match action {
             Action::Approve { approval, .. } => {
-                Some(match self.desk.boss_answerable(session, *approval) {
+                let boss = self.boss_id(o).unwrap_or_default();
+                Some(match self.desk.boss_answerable(session, *approval, &boss) {
                     Ok(()) => Gate::Run,
                     Err(why) => Gate::Suggest(
                         format!("it {why}, so it's the person's to allow; tell them why").into(),
@@ -1077,9 +1192,11 @@ impl CrewHub {
                 reply_to: Some(ask),
                 ..
             } => {
+                // Acting fully in its repository, shipping is its to answer.
+                let ships = o.act.answer_sessions && self.ships_in(session, o);
                 let asked = self.questions.lock().get(ask).cloned();
-                let asked_outward = asked.is_none_or(|q| self.said_outward(&q));
-                if self.said_outward(&action.said()) || asked_outward {
+                let asked_outward = asked.is_none_or(|q| self.said_outward_unless(&q, ships));
+                if self.said_outward_unless(&action.said(), ships) || asked_outward {
                     return outward_said();
                 }
                 Some(match o.act.answer_sessions {
@@ -1627,6 +1744,9 @@ impl CrewHub {
                     prompt: Some(goal.clone()),
                     approvals: None,
                     approve_for_me: false,
+                    // A Codex session the overseer starts runs as fast as
+                    // the overseer does (`[llm] fast`).
+                    fast: engine == Engine::Codex && service.resolved.snapshot().fast,
                     account: None,
                     env: Default::default(),
                     group: self.boss_group(&service, &o),
@@ -1698,7 +1818,10 @@ impl CrewHub {
     ) -> Result<workforce_desk::TicketView, String> {
         let t = match id {
             Some(id) => self.desk.ticket(id).await,
-            None => self.desk.ticket_by_key(key).await,
+            None => match seen {
+                Some(seen) => self.desk.ticket_by_key_in(key, |g| seen.sees(g)).await,
+                None => self.desk.ticket_by_key(key).await,
+            },
         };
         if let Some(seen) = seen {
             let group = match &t {
@@ -1763,7 +1886,15 @@ impl CrewHub {
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
                 }
-                *text = format!("{}\n{}", t.ticket.title, t.ticket.body);
+                *text = match t.ticket.from_remote() {
+                    Some(system) => workforce_desk::board_sync::fence(
+                        system,
+                        t.key.as_deref().unwrap_or_default(),
+                        &format!("{}\n{}", t.ticket.title, t.ticket.body),
+                        &workforce_desk::board_sync::nonce(),
+                    ),
+                    None => format!("{}\n{}", t.ticket.title, t.ticket.body),
+                };
             }
             Action::MoveTicket {
                 ticket,
@@ -2170,6 +2301,26 @@ mod tests {
 
     fn outward(text: &str) -> bool {
         outward_except(text, &[])
+    }
+
+    #[test]
+    fn acting_fully_lets_shipping_words_go_and_keeps_the_rest_outward() {
+        for said in [
+            "Yes: merge, tag and promote.",
+            "Merge PR 42 and deploy to production.",
+            "Push to main, then release v1.2.0.",
+        ] {
+            assert!(outward_except(said, &[]), "at Act: {said}");
+            assert!(!outward_unless_shipping(said, &[], true), "{said}");
+        }
+        for said in [
+            "Merge it and delete the old branch.",
+            "Deploy, then email the customer.",
+            "Push it and post in Slack.",
+            "Merge it and buy more seats.",
+        ] {
+            assert!(outward_unless_shipping(said, &[], true), "{said}");
+        }
     }
 
     #[test]

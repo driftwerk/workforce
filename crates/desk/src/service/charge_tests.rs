@@ -379,6 +379,7 @@ fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSess
         prompt: None,
         approvals: None,
         approve_for_me: false,
+        fast: false,
         account: None,
         env: Default::default(),
         group: group.map(Into::into),
@@ -1014,7 +1015,7 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
         let elsewhere = ask(&other);
         let a = open().await;
         assert_eq!(
-            d.boss_answerable(s.id, a).unwrap_err().to_string(),
+            d.boss_answerable(s.id, a, "sarah").unwrap_err().to_string(),
             "Desk can't tell which branch this pushes"
         );
         d.decide(s.id, a, Decision::Deny, Some(boss.clone()))
@@ -1023,7 +1024,7 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
 
         let here = ask(&own);
         let a = open().await;
-        assert_eq!(d.boss_answerable(s.id, a), Ok(()));
+        assert_eq!(d.boss_answerable(s.id, a, "sarah"), Ok(()));
         d.decide(s.id, a, Decision::Allow, Some(boss)).unwrap();
         assert_eq!(
             here.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],

@@ -356,7 +356,7 @@ pub enum Problem {
     LongBody { ticket: usize, len: usize },
     #[error("Ticket {ticket} names {engine:?}, which isn't an engine Desk knows.")]
     UnknownEngine { ticket: usize, engine: String },
-    #[error("Ticket {ticket} asks for a sub-agent; Desk is set to prefer real sessions, so give it an engine.")]
+    #[error("Ticket {ticket} asks for a sub-agent; Desk is set to always work in real sessions, so give it an engine.")]
     Subagent { ticket: usize },
     #[error("Ticket {ticket} names the view {view:?}; Desk starts sessions in its terminal view.")]
     UnknownView { ticket: usize, view: String },

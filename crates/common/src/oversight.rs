@@ -6,7 +6,7 @@
 //! [oversight]
 //! enabled = true
 //! group = "g-acme" # absent: everything ungrouped
-//! level = "watch" # watch | suggest | act
+//! level = "watch" # watch | suggest | act | full
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
 //! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true, hold_minutes = 2 }
 //! summaries = { morning = "09:00", evening = "" }
@@ -14,7 +14,23 @@
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
+//! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
+//!
+//! `full` is **Act fully**: everything `act` does, and, in the repositories
+//! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
+//! remote's URL, or a local checkout's path), answering and allowing, in
+//! the sessions it runs and, with `answer_sessions`, in the others too:
+//! merging a pull request by its number, pushing the default branch to
+//! `origin`, creating and pushing one tag, `gh release create <tag>`, and
+//! `gh workflow run` of a workflow `workflows` lists (by its file name
+//! exactly) on the default branch, with no inputs. Deploys run through
+//! those workflows: deploy tools and the project's own release, deploy and
+//! promote scripts stay the person's. It needs both named
+//! repositories and `budget_usd_per_day`, and holds only while today's
+//! spend is under that budget; short of any of it, it acts as `act` and
+//! says why ([`Oversight::fully`]). What no overseer does at any level, Act
+//! fully included, is Desk's own list (`workforce_desk::never`).
 //!
 //! `group` is the sidebar group it oversees, as that group's boss: it sees
 //! only that group, and the main overseer (no `group`) sees nothing inside
@@ -69,6 +85,10 @@ pub enum Level {
     Suggest,
     /// The actions `[oversight.act]` allows run; the rest are suggestions.
     Act,
+    /// Act fully: as `Act`, and shipping (merging, pushing to the default
+    /// branch, tagging, promoting, deploying) in the repositories
+    /// `[oversight.full]` names, within its daily budget.
+    Full,
 }
 
 impl Level {
@@ -77,7 +97,14 @@ impl Level {
             Self::Watch => "watch",
             Self::Suggest => "suggest",
             Self::Act => "act",
+            Self::Full => "full",
         }
+    }
+
+    /// Whether it acts on its own: `act`, or `full` (which acts as `act`
+    /// wherever Act fully doesn't reach).
+    pub fn acts(self) -> bool {
+        matches!(self, Self::Act | Self::Full)
     }
 }
 
@@ -141,6 +168,38 @@ pub struct Act {
     pub hand_off: bool,
 }
 
+/// `[oversight.full]`: where, and on what budget, Act fully ships.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Full {
+    /// The repositories it may ship in: `owner/name`, a remote's URL, or a
+    /// local checkout's path, as the person wrote them.
+    pub repos: Vec<String>,
+    /// What it may spend in a day, in cents; `None` until said.
+    pub budget_cents_per_day: Option<u64>,
+    /// The GitHub workflows it may run (`gh workflow run`), by their file
+    /// names exactly (`deploy.yml`); none, it runs none.
+    pub workflows: Vec<String>,
+}
+
+impl Full {
+    /// The daily budget in dollars, when there is one.
+    pub fn budget_usd_per_day(&self) -> Option<f64> {
+        self.budget_cents_per_day.map(|c| c as f64 / 100.0)
+    }
+}
+
+/// Why Act fully isn't in force though chosen: no repositories named.
+pub const FULL_NO_REPOS: &str =
+    "Act fully needs at least one repository named, so it acts within Desk for now.";
+/// Why Act fully isn't in force though chosen: no daily budget.
+pub const FULL_NO_BUDGET: &str = "Act fully needs a daily budget, so it acts within Desk for now.";
+/// The most workflows Act fully may name.
+pub const MAX_FULL_WORKFLOWS: usize = 20;
+/// The most repositories Act fully may name.
+pub const MAX_FULL_REPOS: usize = 50;
+/// The largest daily budget Act fully may have, in dollars.
+pub const MAX_FULL_BUDGET_USD: f64 = 10_000.0;
+
 /// Which sessions the overseer takes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -164,8 +223,9 @@ impl TakeOn {
 /// How the overseer runs sessions for the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Work {
-    /// Real, visible sessions for the work; helpers only for read-only
-    /// lookups.
+    /// Always work in real, visible sessions: no coding work in-process
+    /// (`code.*` and `coding.*` calls that change or run something) and
+    /// helpers only for read-only lookups. The key keeps its first name.
     pub prefer_sessions: bool,
     /// How many of its sessions may be starting or working at once.
     pub parallel: u32,
@@ -197,6 +257,9 @@ pub struct Oversight {
     pub max_checkins_per_day: u32,
     pub act: Act,
     pub work: Work,
+    /// `[oversight.full]`, read whatever the level (kept for when it is
+    /// `full`).
+    pub full: Full,
 }
 
 /// What the group it oversees is said wrongly as.
@@ -259,6 +322,7 @@ impl Default for Oversight {
                 engine: "claude".into(),
                 max_turns_per_hour: 60,
             },
+            full: Full::default(),
         }
     }
 }
@@ -325,6 +389,94 @@ fn time(
     }
 }
 
+/// `[oversight.full]` as written, or what is wrong with it.
+fn full_of(t: Option<&Table>) -> Result<Full, String> {
+    let repos_wrong = || {
+        format!(
+            "The repositories it may ship in must be a list of up to {MAX_FULL_REPOS} names like acme/acme-web, remote addresses, or folder paths."
+        )
+    };
+    let repos = match t.and_then(|t| t.get("repos")) {
+        None => Vec::new(),
+        Some(Value::Array(items)) if items.len() <= MAX_FULL_REPOS => {
+            let mut out: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(r) if !r.trim().is_empty() && r.trim().len() <= 500 => {
+                        let r = r.trim().to_string();
+                        if !out.contains(&r) {
+                            out.push(r);
+                        }
+                    }
+                    _ => return Err(repos_wrong()),
+                }
+            }
+            out
+        }
+        Some(_) => return Err(repos_wrong()),
+    };
+    let workflows_wrong = || {
+        format!(
+            "The workflows it may run must be a list of up to {MAX_FULL_WORKFLOWS} file names like deploy.yml."
+        )
+    };
+    let workflows = match t.and_then(|t| t.get("workflows")) {
+        None => Vec::new(),
+        Some(Value::Array(items)) if items.len() <= MAX_FULL_WORKFLOWS => {
+            let mut out: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    // A plain file name: gh would read a path, or a number
+                    // as a workflow's id.
+                    Value::String(w)
+                        if w.len() <= 200
+                            && w.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                            })
+                            && w.strip_suffix(".yml")
+                                .or_else(|| w.strip_suffix(".yaml"))
+                                .is_some_and(|stem| {
+                                    !stem.is_empty()
+                                        && !stem.starts_with('.')
+                                        && !stem.chars().all(|c| c.is_ascii_digit())
+                                }) =>
+                    {
+                        if !out.contains(w) {
+                            out.push(w.clone());
+                        }
+                    }
+                    _ => return Err(workflows_wrong()),
+                }
+            }
+            out
+        }
+        Some(_) => return Err(workflows_wrong()),
+    };
+    let budget_wrong = || {
+        format!(
+            "Its daily budget must be an amount in dollars above 0 and up to {MAX_FULL_BUDGET_USD}."
+        )
+    };
+    let usd = match t.and_then(|t| t.get("budget_usd_per_day")) {
+        None => None,
+        Some(Value::Integer(n)) => Some(*n as f64),
+        Some(Value::Float(f)) => Some(*f),
+        Some(_) => return Err(budget_wrong()),
+    };
+    let budget_cents_per_day = match usd {
+        None => None,
+        Some(u) if u.is_finite() && u > 0.0 && u <= MAX_FULL_BUDGET_USD => {
+            Some(((u * 100.0).round() as u64).max(1))
+        }
+        Some(_) => return Err(budget_wrong()),
+    };
+    Ok(Full {
+        repos,
+        budget_cents_per_day,
+        workflows,
+    })
+}
+
 impl Oversight {
     /// The `[oversight]` table as the hub runs it, or what is wrong with it,
     /// in plain words. Keys this hub does not know are ignored.
@@ -337,16 +489,16 @@ impl Oversight {
                 "watch" => Level::Watch,
                 "suggest" => Level::Suggest,
                 "act" => Level::Act,
-                _ => {
-                    return Err(
-                        "How much the overseer does on its own must be watch, suggest or act."
-                            .into(),
-                    )
-                }
+                "full" => Level::Full,
+                _ => return Err(
+                    "How much the overseer does on its own must be watch, suggest, act or full."
+                        .into(),
+                ),
             },
             Some(_) => {
                 return Err(
-                    "How much the overseer does on its own must be watch, suggest or act.".into(),
+                    "How much the overseer does on its own must be watch, suggest, act or full."
+                        .into(),
                 )
             }
         };
@@ -369,6 +521,10 @@ impl Oversight {
             root.and_then(|t| t.get("work")),
             "how it runs sessions for you",
         )?;
+        let full = full_of(table(
+            root.and_then(|t| t.get("full")),
+            "what it may ship on its own",
+        )?)?;
         let take_on = match work.and_then(|t| t.get("take_on")) {
             None => d.work.take_on,
             Some(Value::String(s)) if s.trim() == "handed" => TakeOn::Handed,
@@ -547,7 +703,7 @@ impl Oversight {
                     work,
                     "prefer_sessions",
                     d.work.prefer_sessions,
-                    "preferring real sessions to helpers",
+                    "always using real sessions",
                 )?,
                 parallel: whole(
                     work,
@@ -570,7 +726,25 @@ impl Oversight {
                     ),
                 )?,
             },
+            full,
         })
+    }
+
+    /// Whether Act fully is in force by its settings, or why not: it is
+    /// chosen, with repositories named and a daily budget. (Whether today's
+    /// spend is under that budget is the hub's to read.) `Err(None)` when
+    /// it isn't chosen at all.
+    pub fn fully(&self) -> Result<&Full, Option<&'static str>> {
+        if self.level != Level::Full {
+            return Err(None);
+        }
+        if self.full.repos.is_empty() {
+            return Err(Some(FULL_NO_REPOS));
+        }
+        if self.full.budget_cents_per_day.is_none() {
+            return Err(Some(FULL_NO_BUDGET));
+        }
+        Ok(&self.full)
     }
 
     /// `[oversight]` as a config holds it: absent is the defaults (off).
@@ -628,6 +802,80 @@ mod tests {
             assert_eq!(
                 parse(&format!("[oversight]\nwake = {{ hold_minutes = {bad} }}\n")).unwrap_err(),
                 wrong,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn act_fully_needs_named_repositories_and_a_budget_else_it_acts_within_desk() {
+        let full = parse(
+            "[oversight]\nenabled = true\nlevel = \"full\"\n\
+             [oversight.full]\nrepos = [\"acme/acme-web\", \" ~/dev/globex-api \", \"acme/acme-web\"]\nbudget_usd_per_day = 25\n",
+        )
+        .unwrap();
+        assert_eq!(full.level, Level::Full);
+        assert!(full.level.acts());
+        let f = full.fully().unwrap();
+        assert_eq!(f.repos, vec!["acme/acme-web", "~/dev/globex-api"]);
+        assert_eq!(f.budget_cents_per_day, Some(2500));
+        assert_eq!(f.budget_usd_per_day(), Some(25.0));
+        let cents = parse("[oversight.full]\nbudget_usd_per_day = 7.5\n").unwrap();
+        assert_eq!(cents.full.budget_cents_per_day, Some(750));
+
+        // Short of either, it acts as act and says why; not chosen, it's
+        // nothing to say.
+        let no_repos =
+            parse("[oversight]\nlevel = \"full\"\nfull = { budget_usd_per_day = 5 }\n").unwrap();
+        assert_eq!(no_repos.fully(), Err(Some(FULL_NO_REPOS)));
+        let no_budget =
+            parse("[oversight]\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n")
+                .unwrap();
+        assert_eq!(no_budget.fully(), Err(Some(FULL_NO_BUDGET)));
+        let act = parse("[oversight]\nlevel = \"act\"\nfull = { repos = [\"acme/acme-web\"], budget_usd_per_day = 5 }\n").unwrap();
+        assert_eq!(act.fully(), Err(None));
+
+        for bad in ["repos = \"acme/acme-web\"", "repos = [\"\"]", "repos = [3]"] {
+            assert!(
+                parse(&format!("[oversight.full]\n{bad}\n"))
+                    .unwrap_err()
+                    .starts_with("The repositories it may ship in"),
+                "{bad}"
+            );
+        }
+        for bad in ["0", "-5", "\"25\"", "10001"] {
+            assert!(
+                parse(&format!("[oversight.full]\nbudget_usd_per_day = {bad}\n"))
+                    .unwrap_err()
+                    .starts_with("Its daily budget"),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse("[oversight]\nlevel = \"fully\"\n").unwrap_err(),
+            "How much the overseer does on its own must be watch, suggest, act or full."
+        );
+        assert_eq!(serde_json::to_value(Level::Full).unwrap(), "full");
+        let listed = parse(
+            "[oversight.full]\nworkflows = [\"deploy.yml\", \"promote.yaml\", \"deploy.yml\"]\n",
+        )
+        .unwrap();
+        assert_eq!(listed.full.workflows, vec!["deploy.yml", "promote.yaml"]);
+        assert!(parse("").unwrap().full.workflows.is_empty());
+        for bad in [
+            "\"deploy\"",
+            "\".github/workflows/deploy.yml\"",
+            "3",
+            "\"a b.yml\"",
+            "\"123.yml\"",
+            "\".yml\"",
+            "\"..yml\"",
+            "\"deploy.yml.txt\"",
+        ] {
+            assert!(
+                parse(&format!("[oversight.full]\nworkflows = [{bad}]\n"))
+                    .unwrap_err()
+                    .starts_with("The workflows it may run"),
                 "{bad}"
             );
         }
@@ -809,7 +1057,7 @@ mod tests {
             ),
             (
                 "[oversight]\nwork = { prefer_sessions = \"yes\" }\n",
-                "Whether preferring real sessions to helpers is on or off must be true or false.",
+                "Whether always using real sessions is on or off must be true or false.",
             ),
             (
                 "[oversight]\nwork = { engine = \"Claude Code\" }\n",
@@ -847,7 +1095,10 @@ mod tests {
     #[test]
     fn mistakes_are_said_in_plain_words_without_key_names() {
         for (source, says) in [
-            ("[oversight]\nlevel = \"boss\"\n", "watch, suggest or act"),
+            (
+                "[oversight]\nlevel = \"boss\"\n",
+                "watch, suggest, act or full",
+            ),
             ("[oversight]\nenabled = \"yes\"\n", "true or false"),
             (
                 "[oversight]\nwake = { quiet_minutes = -1 }\n",

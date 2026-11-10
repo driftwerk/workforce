@@ -46,10 +46,12 @@ mod engine_sign_ins;
 mod identities;
 pub use accounts::Added;
 mod board;
+mod board_sync;
 pub use board::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
     TicketQuery, TicketView,
 };
+pub use board_sync::{check_hub_id, check_hub_url, LinkBoard};
 mod breaker;
 mod charge;
 pub use charge::ChargeView;
@@ -127,6 +129,9 @@ pub enum RestorePolicy {
     Auto,
     Off,
 }
+
+/// Whether the agent with this id runs in Fast mode (`[llm] fast`).
+pub type AgentFast = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -871,6 +876,9 @@ struct Inner {
     /// Where a boss's answers for its sessions are judged; none until the
     /// hub says, and until then no boss answers a request.
     boss_bounds: Mutex<Option<crate::charge::Bounds>>,
+    /// Whether an agent runs in Fast mode (its `[llm] fast`), by its id:
+    /// the Codex sessions it starts do too. None until the hub says.
+    agent_fast: Mutex<Option<AgentFast>>,
     /// Whose scope each row is: members' groups and the bosses there are.
     /// Nothing is held under it, so events are stamped wherever noted.
     scopes: Mutex<scopes::Scopes>,
@@ -1526,6 +1534,7 @@ impl Desk {
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
+            agent_fast: Mutex::new(None),
             scopes: Mutex::default(),
             group_spend: Mutex::default(),
             group_counted: Arc::new(tokio::sync::Notify::new()),
@@ -2689,6 +2698,30 @@ impl Desk {
     /// session before it starts, so a start cut off between the two starts
     /// that same session, and never another. An `id` Desk already has is
     /// refused: it started.
+    /// Say whether an agent runs in Fast mode, by its id: a Codex session it
+    /// starts (by a plan, a handoff or the crew) runs in Fast mode then too.
+    pub fn agent_fast_with(&self, fast: AgentFast) {
+        *self.0.agent_fast.lock() = Some(fast);
+    }
+
+    /// Whether a Codex session `party` starts runs in Fast mode: an agent's
+    /// own `[llm] fast`; never for the person or Desk, who choose it per
+    /// session.
+    pub(crate) fn fast_for(&self, engine: Engine, party: &crew::Party) -> bool {
+        let agent = matches!(
+            party.kind,
+            crew::PartyKind::Agent | crew::PartyKind::Manager
+        );
+        engine == Engine::Codex
+            && agent
+            && self
+                .0
+                .agent_fast
+                .lock()
+                .as_ref()
+                .is_some_and(|fast| fast(&party.id))
+    }
+
     pub(super) async fn create_for_as(
         &self,
         id: Uuid,
@@ -2783,6 +2816,11 @@ impl Desk {
                 "only Codex sessions can approve for you".into(),
             ));
         }
+        if new.fast && new.engine != Engine::Codex {
+            return Err(DeskError::Invalid(
+                "only Codex sessions run in Fast mode".into(),
+            ));
+        }
         let account = self.account_for(new.engine, new.account)?;
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
@@ -2810,6 +2848,7 @@ impl Desk {
             view,
             engine_version: self.version_of(new.engine),
             approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
+            fast: new.fast && new.engine == Engine::Codex,
             account,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
@@ -4202,6 +4241,7 @@ impl Desk {
                     },
                     prompt,
                     approve_for_me: r.approve_for_me,
+                    fast: r.fast,
                     env: &env,
                 });
                 let link =
@@ -6070,6 +6110,7 @@ impl Desk {
                         view: View::Terminal,
                         engine_version: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         name: ext
                             .name
@@ -6392,6 +6433,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                fast: false,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -6937,6 +6979,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                fast: false,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -7100,6 +7143,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                         group: None,
@@ -7157,6 +7201,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                         group: None,
@@ -7207,6 +7252,7 @@ mod tests {
                     prompt: None,
                     approvals: None,
                     approve_for_me: false,
+                    fast: false,
                     account: None,
                     env: added.clone(),
                     group: None,
@@ -7639,6 +7685,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: Default::default(),
                         group: None,

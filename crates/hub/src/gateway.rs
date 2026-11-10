@@ -424,6 +424,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/models/health", get(model_health))
         .route("/api/models/aliases", get(model_aliases))
+        .route("/api/commands", get(list_commands))
         .route("/api/admin/reset-model", post(admin_reset_model))
         .route("/api/agents", get(list_agents))
         // Agent CRUD & detail endpoints (DW-421)
@@ -1056,6 +1057,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/subscriptions/chatgpt/device", post(crate::api_handlers::subscriptions::start_device_login).get(crate::api_handlers::subscriptions::current_device_login))
         .route("/api/me/subscriptions/chatgpt/device/{flow_id}", get(crate::api_handlers::subscriptions::get_device_login).delete(crate::api_handlers::subscriptions::cancel_device_login))
         .route("/api/me/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_my_tokens).post(crate::api_handlers::remote_mcp_tokens::create_my_token))
+        .route("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
         .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
@@ -1513,6 +1515,25 @@ const DESK_ONLY_FRAMES: &[&str] = &[
     crate::broadcast::DESK_DELIVERED,
 ];
 
+/// Whether the person's message kept under client id `id` in `session_id`
+/// was asked already: its turn answered it, or is running it now. Kept but
+/// unanswered with nothing running, it is a question to take up again.
+fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
+    let Some(session) = service.sessions.get(session_id).ok().flatten() else {
+        return false;
+    };
+    let Some(at) = session.messages.iter().rposition(|m| {
+        m.role == workforce_common::session::MessageRole::User
+            && m.external_id.as_deref() == Some(id)
+    }) else {
+        return false;
+    };
+    service.live_turns.running(session_id)
+        || session.messages[at + 1..]
+            .iter()
+            .any(|m| m.role == workforce_common::session::MessageRole::Assistant)
+}
+
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
@@ -1639,6 +1660,7 @@ fn server_frame(mut msg: BroadcastMessage, declared: bool) -> Option<ServerMessa
         status: snapshot.as_ref().map(|s| s.status),
         since: snapshot.as_ref().map(|s| s.since.to_rfc3339()),
         text: snapshot.map(|s| s.text),
+        command: msg.command && declared,
         msg_type: msg.msg_type,
     })
 }
@@ -1782,6 +1804,7 @@ mod desk_frame_tests {
             TurnEnd {
                 turn_ref: Some("ref-1".into()),
                 reply_id: Some("reply-1".into()),
+                command: false,
             },
         );
         assert_eq!(
@@ -1792,6 +1815,22 @@ mod desk_frame_tests {
             })
         );
         assert!(server_frame(end, false).is_none());
+        // A command's end says so: the Desk settles it with nothing kept.
+        let command = BroadcastMessage::turn_end(
+            "s1",
+            TurnEnd {
+                turn_ref: Some("ref-2".into()),
+                reply_id: None,
+                command: true,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(server_frame(command, true).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "turn_end", "content": "", "session_id": "s1", "speakable": false,
+                "turn_ref": "ref-2", "command": true,
+            })
+        );
     }
 
     #[test]
@@ -2119,6 +2158,7 @@ async fn handle_ws(
         status: None,
         since: None,
         text: None,
+        command: false,
     };
     let _ = sender
         .send(Message::Text(
@@ -2639,6 +2679,30 @@ async fn handle_ws(
                             // turn instead, and the client queues it — as does
                             // one sent to queue, files or not, which a live
                             // turn never takes in.
+                            // The same DM message again (Desk's Retry sends it
+                            // under its own id): once its turn has answered it,
+                            // or while that turn runs, it is not asked twice. Its
+                            // turn just ends, and the Desk reads what was kept.
+                            if let Some(asked) = desk.as_ref().filter(|d| {
+                                matches!(d.turn.place, DeskPlace::Dm)
+                                    && d.turn.message.is_some_and(|id| {
+                                        asked_already(
+                                            &service,
+                                            &effective_session_id,
+                                            &id.to_string(),
+                                        )
+                                    })
+                            }) {
+                                let _ = broadcast_tx.send(BroadcastMessage::turn_end(
+                                    effective_session_id.clone(),
+                                    workforce_common::channels::desk::TurnEnd {
+                                        turn_ref: asked.turn_ref.clone(),
+                                        reply_id: None,
+                                        command: false,
+                                    },
+                                ));
+                                continue;
+                            }
                             let queued = client_msg.mode
                                 == Some(workforce_gateway_client::protocol::SendMode::Queue);
                             if !has_attachments || queued {
@@ -2666,11 +2730,16 @@ async fn handle_ws(
                                     continue;
                                 }
                                 if steered.applied() {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
-                                        effective_session_id.clone(),
-                                        "injected",
-                                        "Follow-up absorbed into active run".to_string(),
-                                    ));
+                                    // Named for the message's own turn, so its
+                                    // Desk knows that one got there.
+                                    let _ = broadcast_tx.send(
+                                        BroadcastMessage::new(
+                                            effective_session_id.clone(),
+                                            "injected",
+                                            "Follow-up absorbed into active run".to_string(),
+                                        )
+                                        .stamped(stamp.as_ref()),
+                                    );
                                     continue;
                                 }
                             }
@@ -2796,7 +2865,7 @@ async fn handle_ws(
                                         BroadcastMessage::turn_end(
                                             session_id,
                                             crate::desk_surface::turn_end(
-                                                &service, session_id, desk,
+                                                &service, session_id, desk, None,
                                             ),
                                         )
                                     })
@@ -2903,6 +2972,7 @@ async fn handle_ws(
                                         let tts_normalize = voice_turn;
                                         let service = Arc::clone(&service);
                                         let (desk, stamp) = (desk.clone(), stamp.clone());
+                                        let ran = content.clone();
                                         tokio::spawn(async move {
                                             let forward = {
                                                 let (tx, sid) = (tx.clone(), sid.clone());
@@ -2927,7 +2997,10 @@ async fn handle_ws(
                                                 BroadcastMessage::turn_end(
                                                     &sid,
                                                     crate::desk_surface::turn_end(
-                                                        &service, &sid, desk,
+                                                        &service,
+                                                        &sid,
+                                                        desk,
+                                                        Some(&ran),
                                                     ),
                                                 )
                                             });
@@ -4678,6 +4751,25 @@ async fn session_export(
             Err(StatusCode::NOT_FOUND)
         }
     }
+}
+
+/// The commands a person can type to an agent, as `/help` lists them: what
+/// a client's `/` menu offers, to a caller that may chat.
+async fn list_commands(
+    headers: axum::http::HeaderMap,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, ScopeRejection> {
+    require_scope(
+        &state,
+        &headers,
+        query.token.as_deref(),
+        crate::jwt::SCOPE_CHAT,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "commands": crate::commands::COMMANDS }),
+    ))
 }
 
 /// List available agents.
@@ -8521,6 +8613,9 @@ async fn pair_revoke_device(
         .unwrap_or_else(|| device_id.clone());
     match pairing.revoke_async(device_id.clone()).await {
         Ok(()) => {
+            if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
+                crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device_id);
+            }
             retarget_device(&state, &owner, &device_id).await;
             state.local_agents.forget_desk(&device_id).await;
             Ok(Json(serde_json::json!({ "revoked": true })))
@@ -8558,6 +8653,9 @@ async fn pair_device_revoke_self(
         warn!("Device self-revocation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
+        crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device.id);
+    }
     retarget_device(&state, &owner, &device.id).await;
     state.local_agents.forget_desk(&device.id).await;
     Ok(Json(serde_json::json!({ "revoked": true })))
@@ -8802,6 +8900,7 @@ async fn vault_list(
         .list(query.prefix.as_deref())
         .into_iter()
         .filter(|path| !crate::hub_core::logins::device_login::is_record(path))
+        .filter(|path| !crate::vault_policy::is_desk_link(path))
         .collect();
     let resolve_display = crate::vault_view::actor_display(state.identity_store.clone());
     let entries = global_vault_entries_for_admin(vault, query.prefix.as_deref(), &resolve_display);
@@ -8825,6 +8924,7 @@ fn global_vault_entries_for_admin(
         .into_iter()
         .filter(|p| !p.starts_with("wasm-skills/"))
         .filter(|p| !crate::hub_core::logins::device_login::is_record(p))
+        .filter(|p| !crate::vault_policy::is_desk_link(p))
         .filter_map(|raw| {
             let entry = vault.get_entry(&raw)?;
             let (logical_path, tier) = if let Some(rest) = raw.strip_prefix("users/") {
@@ -8867,6 +8967,8 @@ async fn vault_get(
     match vault
         .get(&path)
         .filter(|_| !crate::hub_core::logins::device_login::is_record(&path))
+        // A Desk link's token is read only by Desk's board sync.
+        .filter(|_| !crate::vault_policy::is_desk_link(&path))
     {
         Some(value) => Ok(Json(serde_json::json!({ "path": path, "value": value }))),
         None => Err(StatusCode::NOT_FOUND),
@@ -14915,13 +15017,13 @@ mod vault_admin_tests {
         assert_eq!(plain(&body), "Saving the change failed; try again.");
 
         let (status, body) = said(Refused::Unloadable(ConfigRefusal::Said(
-            "How much the overseer does on its own must be watch, suggest or act.".into(),
+            "How much the overseer does on its own must be watch, suggest, act or full.".into(),
         )));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             plain(&body),
             "That change couldn’t be saved. How much the overseer does on its own must be \
-             watch, suggest or act."
+             watch, suggest, act or full."
         );
         assert!(body.get("findings").is_none(), "{body}");
 
@@ -17351,5 +17453,52 @@ mod fallback_tests {
         }
         let (status, _, _) = call(Method::POST, "/agents/allan").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+#[cfg(test)]
+mod desk_link_vault_tests {
+    use super::*;
+
+    /// The owner's own vault routes never show a Desk link's token: not by
+    /// path, not in a listing.
+    #[tokio::test]
+    async fn the_vault_routes_never_show_a_desk_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::open(&dir.path().join("v"), "test-key").unwrap());
+        vault
+            .set("users/sam/desk/hubs/atlas/remote_mcp", "the-token")
+            .unwrap();
+        vault.set("skills/jira/site", "acme").unwrap();
+        let fx = crate::remote_mcp::testing::fixture(false);
+        let state = Arc::try_unwrap(fx.state)
+            .ok()
+            .expect("the fixture's only handle");
+        let state = Arc::new(GatewayState {
+            vault: Some(vault),
+            ..state
+        });
+        let headers = crate::remote_mcp::testing::bearer("gateway-token");
+        let got = vault_get(
+            Path("users/sam/desk/hubs/atlas/remote_mcp".to_string()),
+            Query(serde_json::from_value::<WsQuery>(serde_json::json!({})).unwrap()),
+            headers.clone(),
+            State(Arc::clone(&state)),
+        )
+        .await;
+        assert_eq!(got.err(), Some(StatusCode::NOT_FOUND));
+        let listed = vault_list(
+            Query(VaultListQuery {
+                token: None,
+                prefix: None,
+            }),
+            headers,
+            State(state),
+        )
+        .await
+        .unwrap();
+        let said = listed.0.to_string();
+        assert!(said.contains("skills/jira/site"), "{said}");
+        assert!(!said.contains("desk/hubs"), "{said}");
     }
 }

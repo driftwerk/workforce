@@ -388,7 +388,7 @@ impl Desk {
     }
 
     /// What the person calls `item`.
-    async fn item_label(&self, item: &Item) -> String {
+    pub(super) async fn item_label(&self, item: &Item) -> String {
         match item {
             Item::Session(id) => self
                 .view(*id)
@@ -396,8 +396,8 @@ impl Desk {
                 .unwrap_or_else(|_| "the session".into()),
             Item::Ticket(id) => match self.0.store.ticket(*id).await.ok().flatten() {
                 Some(t) => match self.key_of(&t).await {
-                    Ok(key) => format!("{key} · {}", crew::one_line(&t.title, 80)),
-                    Err(_) => crew::one_line(&t.title, 80),
+                    Ok(key) => format!("{key} · {}", crew::one_line(&t.said_title(), 80)),
+                    Err(_) => crew::one_line(&t.said_title(), 80),
                 },
                 None => "the ticket".into(),
             },
@@ -432,8 +432,8 @@ impl Desk {
         if let Some(t) = ctx.tickets.iter().find(|t| t.open) {
             if let Ok(Some(ticket)) = self.0.store.ticket(t.id).await {
                 f.ticket = Some(match &t.key {
-                    Some(k) => format!("{k} · {}", crew::one_line(&ticket.title, 120)),
-                    None => crew::one_line(&ticket.title, 120),
+                    Some(k) => format!("{k} · {}", crew::one_line(&ticket.said_title(), 120)),
+                    None => crew::one_line(&ticket.said_title(), 120),
                 });
             }
         }
@@ -862,9 +862,39 @@ impl Desk {
 
     /// Ticket `id` goes to board `board`: a new key there, out of its plan,
     /// its history left with the old board's group.
-    async fn ticket_goes(&self, id: Uuid, board: Uuid, by: &By) -> Result<String, DeskError> {
+    pub(super) async fn ticket_goes(
+        &self,
+        id: Uuid,
+        board: Uuid,
+        by: &By,
+    ) -> Result<String, DeskError> {
         let before = self.ticket(id).await?;
-        let old_group = self.board_of(before.ticket.board).await?.group;
+        let old_board = self.board_of(before.ticket.board).await?;
+        // A synced ticket's issue belongs to its board's link, in its
+        // group: it never goes to another board.
+        // A client's synced ticket stays on its board, and never stays with
+        // a session that leaves for another group: it is released.
+        if let Some(e) = &before.ticket.external {
+            self.leave_ticket(id, by).await?;
+            return Err(DeskError::Conflict(format!(
+                "{} lives on {}'s {}. It stays there, unassigned.",
+                e.key,
+                old_board.name,
+                e.system.title()
+            )));
+        }
+        // Onto a synced board: refused before anything changes, so it keeps
+        // who has it.
+        let to = self.board_of(board).await?;
+        if let Some(sync) = &to.sync {
+            return Err(DeskError::Conflict(format!(
+                "{} is synced with {} {}: a ticket from elsewhere doesn't go onto it. It stays where it was.",
+                to.name,
+                sync.system.title(),
+                sync.target
+            )));
+        }
+        let old_group = old_board.group;
         let moved = self
             .0
             .store
