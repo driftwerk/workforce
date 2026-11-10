@@ -595,6 +595,9 @@ struct State {
     /// The permission mode each Claude Code session last said it runs in
     /// ([`crate::mode`]).
     modes_seen: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode that doesn't ask each session was last started in, as a
+    /// boss kept it ([`SessionView::mode`]).
+    modes_started: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -1875,6 +1878,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.mode = live.and(state.modes_started.get(&r.id).copied());
         view
     }
 
@@ -3076,6 +3080,7 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -3200,6 +3205,7 @@ impl Desk {
         self.boss_holds(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
+        self.person_resumes(id, Some(&by)).await;
         let running = self.0.state.lock().live.contains_key(&id);
         if running {
             self.0.state.lock().acted.insert(id);
@@ -4198,8 +4204,16 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
-        // The mode Desk keeps for it, as an overseer set it.
-        let mode = self.kept_mode(r.id).await;
+        // The mode Desk keeps for it, as an overseer set it; one that
+        // doesn't ask is shown on its card while it runs in it.
+        let mode = self.mode_to_start(r.id).await;
+        {
+            let mut st = self.0.state.lock();
+            match mode.filter(|m| !m.asks()) {
+                Some(m) => st.modes_started.insert(r.id, m),
+                None => st.modes_started.remove(&r.id),
+            };
+        }
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {

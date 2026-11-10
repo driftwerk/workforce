@@ -306,6 +306,15 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
         .await;
         let s = new_session(&d, &base, "acme-web").await;
         hook_url(&base, s.id).await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        // Desk's grant says it is unbound once the crew has synced.
+        eventually("Desk to know it acts anywhere", async || {
+            d.acts_fully_in(s.id, "desk").then_some(())
+        })
+        .await;
         let tool = overseer.tools.get("crew.set_mode").unwrap();
         for (mode, title) in [("auto", "auto"), ("default", "manual")] {
             // Claude Code says the mode it started in on its first hook.
@@ -334,6 +343,11 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
             assert_eq!(
                 d.mode_seen(s.id),
                 workforce_desk::mode::Mode::parse(mode)
+            );
+            // Its card shows a mode that doesn't ask.
+            assert_eq!(
+                d.view(s.id).unwrap().mode,
+                workforce_desk::mode::Mode::parse(mode).filter(|m| !m.asks())
             );
             eventually("the change in Activity", async || {
                 d.activity(Filter::All, None, 50)
@@ -397,9 +411,10 @@ async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_a
 }
 
 /// A mode is set between turns: a session waiting on an answer keeps its
-/// request, and Claude Code is never put past auto.
+/// request. Unbound, Claude Code goes as far as bypass, on a session it
+/// runs; on one it doesn't run, a mode that doesn't ask is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mode_waits_for_the_turn_and_claude_code_is_never_set_to_bypass() {
+async fn a_mode_waits_for_the_turn_and_bypass_is_only_on_a_session_it_runs() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -412,8 +427,16 @@ async fn a_mode_waits_for_the_turn_and_claude_code_is_never_set_to_bypass() {
         let url = hook_url(&base, s.id).await;
         let tool = overseer.tools.get("crew.set_mode").unwrap();
         let set = |mode: &str| json!({"session_id": s.id.to_string(), "mode": mode, "reason": "Routine."});
-        let bypass = tool.execute(set("bypassPermissions")).await.unwrap();
-        assert!(bypass.output["done"].is_null(), "{bypass:?}");
+        let not_run = tool.execute(set("bypassPermissions")).await.unwrap();
+        assert!(not_run.output["done"].is_null(), "{not_run:?}");
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        eventually("Desk to know it acts anywhere", async || {
+            d.acts_fully_in(s.id, "desk").then_some(())
+        })
+        .await;
         let asked = ask(&url, "npm test");
         let a = pending(&d, s.id, "npm test").await;
         let held = tool.execute(set("auto")).await.unwrap();
@@ -427,6 +450,139 @@ async fn a_mode_waits_for_the_turn_and_claude_code_is_never_set_to_bypass() {
             .await
             .unwrap();
         asked.await.unwrap();
+        // Its turn ends.
+        hook(&url, json!({"hook_event_name": "Stop"})).await;
+        eventually("its turn to end", async || {
+            let v = d.view(s.id).unwrap();
+            (v.pending.is_none() && v.state != workforce_desk::model::SessionState::Working)
+                .then_some(())
+        })
+        .await;
+        let done = tool.execute(set("bypassPermissions")).await.unwrap();
+        assert!(done.output["done"].is_string(), "{done:?}");
+        started_with(&base, s.id, "--dangerously-skip-permissions\n").await;
+        assert_eq!(
+            d.view(s.id).unwrap().mode,
+            Some(workforce_desk::mode::Mode::BypassPermissions)
+        );
+    })
+    .await;
+}
+
+/// The args files of `id`'s CLI starts.
+fn starts_of(dir: &Path, id: uuid::Uuid) -> Vec<String> {
+    let marker = format!("/hook/{id}/");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("args-"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .filter(|a| a.contains(&marker))
+        .collect()
+}
+
+/// Waits for a start of `id`'s CLI whose arguments hold `wanted`.
+async fn started_with(dir: &Path, id: uuid::Uuid, wanted: &str) {
+    eventually(wanted, async || {
+        starts_of(dir, id)
+            .iter()
+            .any(|a| a.contains(wanted))
+            .then_some(())
+    })
+    .await;
+}
+
+/// Waits for a start of `id`'s CLI other than those `before`, and returns
+/// its arguments.
+async fn next_start(dir: &Path, id: uuid::Uuid, before: &[String]) -> String {
+    eventually("another start", async || {
+        starts_of(dir, id).into_iter().find(|a| !before.contains(a))
+    })
+    .await
+}
+
+async fn stopped(d: &Desk, id: uuid::Uuid) {
+    d.stop(id, None).unwrap();
+    eventually("it to stop", async || {
+        (!d.view(id).unwrap().live).then_some(())
+    })
+    .await;
+}
+
+/// Auto mode lasts only while the boss that set it is unbound and runs the
+/// session: the person resuming it, or the boss no longer unbound, starts
+/// it in its own mode again, and Desk forgets the mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.set_mode").then_some(())
+        })
+        .await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let tool = overseer.tools.get("crew.set_mode").unwrap();
+        let mut sessions = Vec::new();
+        for name in ["acme-web", "acme-api"] {
+            let s = new_session(&d, &base, name).await;
+            hook_url(&base, s.id).await;
+            d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            eventually("Desk to know it acts anywhere", async || {
+                d.acts_fully_in(s.id, "desk").then_some(())
+            })
+            .await;
+            let done = tool
+                .execute(
+                    json!({"session_id": s.id.to_string(), "mode": "auto", "reason": "Routine."}),
+                )
+                .await
+                .unwrap();
+            assert!(done.output["done"].is_string(), "{done:?}");
+            started_with(&base, s.id, "--permission-mode\nauto\n").await;
+            sessions.push(s.id);
+        }
+        let (web, api) = (sessions[0], sessions[1]);
+
+        // The person resumes one themselves: it starts in its own mode.
+        stopped(&d, web).await;
+        let before = starts_of(&base, web);
+        d.resume(web, None, Some(By::you())).await.unwrap();
+        let args = next_start(&base, web, &before).await;
+        assert!(!args.contains("--permission-mode"), "{args}");
+        assert_eq!(d.view(web).unwrap().mode, None);
+
+        // A box unticked: it is no longer unbound, and the other starts in
+        // its own mode at its next start, whoever starts it.
+        write_config(
+            &overseer,
+            &UNBOUND.replace("interrupt = true", "interrupt = false"),
+        );
+        eventually("no longer unbound", async || {
+            let (_, o) = crew.overseer_service()?;
+            (!crew.unbound(&o)).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stopped(&d, api).await;
+        let before = starts_of(&base, api);
+        d.resume(api, None, None).await.unwrap();
+        let args = next_start(&base, api, &before).await;
+        assert!(!args.contains("--permission-mode"), "{args}");
+        assert_eq!(d.view(api).unwrap().mode, None);
+
+        // Unbound ends too with Anywhere off, or its budget spent.
+        let (_, mut o) = crew.overseer_service().unwrap();
+        o.act.interrupt = true;
+        o.full.anywhere = false;
+        assert!(!crew.unbound(&o));
+        o.full.anywhere = true;
+        o.full.budget_cents_per_day = Some(500);
+        assert!(super::super::fully_given(&o, Some(5.0)).is_err(), "spent");
+        assert!(super::super::fully_given(&o, Some(1.0)).is_ok());
     })
     .await;
 }
