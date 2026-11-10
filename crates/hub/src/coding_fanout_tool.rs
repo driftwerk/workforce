@@ -434,7 +434,8 @@ impl CodingFanoutTool {
             agent_id: self.service.agent_id.as_str().to_string(),
             profile: self.profile.clone(),
             launcher: Arc::clone(&self.launcher),
-            engine: Arc::clone(&self.engine),
+            // Resolved once: every coder of the wave on the same engine.
+            engine: crate::coding_engine::picked(&self.engine, &self.service, None).0,
             project,
             tokens,
             gh_token,
@@ -1086,7 +1087,8 @@ impl Tool for CodingFanoutTool {
         }
 
         let identity_id = crate::user_config::current_identity_id();
-        if let Err(reason) = self.engine.preflight(&RoundContext {
+        let (engine, _) = crate::coding_engine::picked(&self.engine, &self.service, None);
+        if let Err(reason) = engine.preflight(&RoundContext {
             service: &self.service,
             identity: identity_id.as_deref(),
             stand_in: SCHEDULER,

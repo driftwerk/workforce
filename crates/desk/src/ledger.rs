@@ -284,7 +284,7 @@ fn codex_spend_of(v: &Value, state: &mut CodexState) -> Option<Spend> {
             state.model = text(p, "model").or(state.model.take());
             None
         }
-        ("event_msg", Some("task_started")) => {
+        ("event_msg", Some("task_started" | "turn_started")) => {
             state.turn = text(p, "turn_id").or(state.turn.take());
             None
         }

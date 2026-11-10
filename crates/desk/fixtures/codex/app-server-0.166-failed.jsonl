@@ -1,0 +1,8 @@
+{"method": "thread/started", "params": {"thread": {"id": "t1", "parentThreadId": null, "ephemeral": false, "path": "/home/me/.codex/sessions/rollout.jsonl"}}}
+{"method": "thread/status/changed", "params": {"threadId": "t1", "status": {"type": "active", "activeFlags": []}}}
+{"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u1", "status": "inProgress", "items": []}}}
+{"method": "item/started", "params": {"threadId": "t1", "turnId": "u1", "item": {"type": "userMessage", "id": "i1", "content": [{"type": "text", "text": "fix the failing test"}]}}}
+{"method": "item/completed", "params": {"threadId": "t1", "turnId": "u1", "item": {"type": "userMessage", "id": "i1", "content": [{"type": "text", "text": "fix the failing test"}]}}}
+{"method": "thread/status/changed", "params": {"threadId": "t1", "status": {"type": "systemError"}}}
+{"method": "error", "params": {"threadId": "t1", "error": {"message": "You\u2019ve hit your usage limit. Try again later.", "codexErrorInfo": "usageLimitExceeded"}, "willRetry": false, "turnId": "u1"}}
+{"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u1", "status": "failed", "items": [], "error": {"message": "You\u2019ve hit your usage limit. Try again later."}}}}

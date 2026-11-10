@@ -563,12 +563,45 @@ pub struct DeskStep {
     pub tool: String,
     pub ok: bool,
     pub ms: u64,
+    /// For a call of the advisor: what it was asked and what it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<DeskAdvice>,
+}
+
+/// What an agent asked its advisor and what the advisor answered, as the
+/// person reads it on the step: its secrets hidden before it is made, and
+/// each part clipped to its most.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskAdvice {
+    /// The question the agent sent; empty for a review with none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub question: String,
+    /// The advisor's answer (markdown), or why it gave none.
+    pub answer: String,
+    /// The model that answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The answer says why there was no advice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
+    /// The answer was longer than a step keeps.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
 }
 
 /// Steps kept on one message, the first ones.
 pub const MAX_STEPS: usize = 100;
 /// The longest tool name a step keeps.
 pub const STEP_TOOL_CHARS: usize = 120;
+/// The longest question an advice step keeps.
+pub const ADVICE_QUESTION_CHARS: usize = 2_000;
+/// The longest answer an advice step keeps.
+pub const ADVICE_ANSWER_CHARS: usize = 8_000;
+/// The longest model name an advice step keeps.
+pub const ADVICE_MODEL_CHARS: usize = 120;
+/// The most of advisors' answers one message keeps across its steps; the
+/// steps past it keep their question and say the rest is in the session.
+pub const ADVICE_MESSAGE_CHARS: usize = 40_000;
 
 impl DeskStep {
     /// The step a tool's run makes, its name clipped to [`STEP_TOOL_CHARS`].
@@ -577,6 +610,51 @@ impl DeskStep {
             tool: clip(tool, STEP_TOOL_CHARS),
             ok,
             ms,
+            advice: None,
+        }
+    }
+
+    /// The step with what its advisor was asked and said.
+    pub fn with_advice(self, advice: DeskAdvice) -> Self {
+        Self {
+            advice: Some(advice),
+            ..self
+        }
+    }
+
+    /// Whether its advice keeps to the limits a step is held to.
+    pub fn advice_fits(&self) -> bool {
+        self.advice.as_ref().is_none_or(|a| {
+            a.question.chars().count() <= ADVICE_QUESTION_CHARS
+                && a.answer.chars().count() <= ADVICE_ANSWER_CHARS
+                && a.model
+                    .as_ref()
+                    .is_none_or(|m| m.chars().count() <= ADVICE_MODEL_CHARS)
+        })
+    }
+}
+
+impl DeskAdvice {
+    /// Advice of already redacted text, each part clipped to its most, the
+    /// answer to `room` characters where less than its most is left.
+    pub fn new(
+        question: &str,
+        answer: &str,
+        model: Option<&str>,
+        unavailable: bool,
+        room: usize,
+    ) -> Self {
+        let most = ADVICE_ANSWER_CHARS.min(room);
+        let clipped = answer.chars().count() > most;
+        Self {
+            question: clip(question.trim(), ADVICE_QUESTION_CHARS),
+            answer: clip(answer.trim(), most),
+            model: model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(|m| clip(m, ADVICE_MODEL_CHARS)),
+            unavailable,
+            clipped,
         }
     }
 }

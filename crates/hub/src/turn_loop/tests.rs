@@ -2132,3 +2132,100 @@ async fn completions(server: &wiremock::MockServer) -> usize {
         .filter(|r| r.url.path() == "/v1/chat/completions")
         .count()
 }
+
+fn invocation(
+    tool: &str,
+    input: serde_json::Value,
+    output: serde_json::Value,
+) -> workforce_agent::runner::ToolInvocation {
+    workforce_agent::runner::ToolInvocation {
+        tool_name: tool.to_string(),
+        input,
+        output,
+        success: true,
+        policy_decision: "allow".to_string(),
+        duration_ms: 4100,
+        denial_reason: None,
+        error: None,
+    }
+}
+
+/// An advisor call's step keeps what it was asked, what it said and its
+/// model, its secrets hidden; other tools' steps keep only how they went.
+#[test]
+fn an_advisor_step_keeps_its_question_and_answer_with_secrets_hidden() {
+    use workforce_common::channels::desk::{ADVICE_ANSWER_CHARS, ADVICE_MESSAGE_CHARS};
+    let key = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+    let asked = invocation(
+        crate::advisor::AdvisorTool::NAME,
+        serde_json::json!({"question": "Is the retry safe to merge?"}),
+        serde_json::json!({
+            "advice": format!("**No.** The token `{key}` is in the log; rotate it first."),
+            "source": "chatgpt",
+            "model": "gpt-6.1-sol",
+            "duration_ms": 4000,
+        }),
+    );
+    let searched = invocation(
+        "web.search",
+        serde_json::json!({"query": "x"}),
+        serde_json::json!({"results": []}),
+    );
+    let steps = crate::turn_loop::records::steps_of(&[searched, asked]);
+    assert_eq!(steps[0].advice, None);
+    let advice = steps[1].advice.clone().unwrap();
+    assert_eq!(advice.question, "Is the retry safe to merge?");
+    assert!(
+        advice.answer.starts_with("**No.** The token"),
+        "{}",
+        advice.answer
+    );
+    assert!(!advice.answer.contains(&key) && !advice.answer.contains("a1B2c3D4e5"));
+    assert!(advice.answer.contains("REDACTED"), "{}", advice.answer);
+    assert_eq!(advice.model.as_deref(), Some("gpt-6.1-sol"));
+    assert!(!advice.unavailable && !advice.clipped);
+
+    // No advice: why, as its answer.
+    let refused = invocation(
+        crate::advisor::AdvisorTool::NAME,
+        serde_json::json!({}),
+        serde_json::json!({"advisor_unavailable": "The advisor is turned off for this agent; answer without it."}),
+    );
+    let advice = crate::turn_loop::records::steps_of(&[refused])[0]
+        .advice
+        .clone()
+        .unwrap();
+    assert!(advice.unavailable && advice.question.is_empty());
+    assert!(advice.answer.starts_with("The advisor is turned off"));
+
+    // A long answer is clipped to a step's most, and a message keeps no
+    // more than its most across its steps.
+    let long = |n: usize| {
+        invocation(
+            crate::advisor::AdvisorTool::NAME,
+            serde_json::json!({"question": format!("round {n}")}),
+            serde_json::json!({"advice": "é".repeat(ADVICE_ANSWER_CHARS * 2), "model": "opus"}),
+        )
+    };
+    let many: Vec<_> = (0..(ADVICE_MESSAGE_CHARS / ADVICE_ANSWER_CHARS) + 2)
+        .map(long)
+        .collect();
+    let steps = crate::turn_loop::records::steps_of(&many);
+    let first = steps[0].advice.as_ref().unwrap();
+    assert!(first.clipped && first.answer.chars().count() == ADVICE_ANSWER_CHARS);
+    let kept: usize = steps
+        .iter()
+        .filter_map(|s| s.advice.as_ref())
+        .filter(|a| a.clipped)
+        .map(|a| a.answer.chars().count())
+        .sum();
+    assert!(kept <= ADVICE_MESSAGE_CHARS, "{kept}");
+    let last = steps.last().unwrap().advice.as_ref().unwrap();
+    assert!(
+        last.answer.contains("the agent has it whole"),
+        "{}",
+        last.answer
+    );
+    assert_eq!(last.question, format!("round {}", many.len() - 1));
+    assert!(steps.iter().all(|s| s.advice_fits()));
+}

@@ -1261,7 +1261,8 @@ pub fn register_coding_session_tool(
         }
     };
     let engines = crate::coding_engine::Engines::from_config(&coding, &roots.data_dir);
-    let engine = match engines.configured(&coding.engine, None, None) {
+    // The engine set, else the agent's provider's, picked at each round.
+    let engine = match engines.for_agent(&coding.engine, service) {
         Ok(engine) => engine,
         Err(e) => {
             tracing::error!(
