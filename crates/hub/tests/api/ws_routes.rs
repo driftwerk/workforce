@@ -895,3 +895,90 @@ async fn an_approval_decision_is_a_persons_for_a_request_that_exists() {
     assert_eq!(decide(crate::support::GATEWAY_TOKEN.to_string()).await, 403);
     assert_eq!(decide("not-a-token".to_string()).await, 401);
 }
+
+/// A command Desk sends is answered by the hub itself and kept nowhere: its
+/// turn ends saying it was a command and naming no saved reply, so the Desk
+/// settles it there rather than wait for a kept copy. Unknown commands are
+/// answered at once like any other; a plain message's end says no such thing.
+#[tokio::test]
+async fn a_command_ends_its_desk_turn_as_one_kept_nowhere() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let session = connected["session_id"].as_str().unwrap().to_string();
+    let dm = |content: &str, turn: &str| {
+        json!({"type": "chat", "content": content, "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"},
+                        "message": uuid::Uuid::new_v4()}})
+    };
+
+    for (i, (content, says)) in [
+        ("cmd: status", "Model"),
+        ("/status", "Model"),
+        ("/help", "cmd: skills"),
+        ("/clear", ""),
+        ("/skills", ""),
+        ("/new", ""),
+        ("/compact", ""),
+        ("/model", "Current"),
+        ("/frobnicate", "Unknown command `/frobnicate`. Type `/help`"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let turn = format!("ref-cmd-{i}");
+        send(&mut desk, dm(content, &turn)).await;
+        let frames = frames_until(&mut desk, "turn_end").await;
+        let end = frames.last().unwrap();
+        assert_eq!(
+            (&end["turn_ref"], &end["command"]),
+            (&json!(turn), &json!(true)),
+            "{content}: {frames:?}"
+        );
+        assert!(end.get("id").is_none(), "{content} saved nothing: {end}");
+        let reply = frames
+            .iter()
+            .find(|f| f["type"] == "message")
+            .unwrap_or_else(|| panic!("{content} is answered: {frames:?}"));
+        assert_eq!(reply["turn_ref"], json!(turn), "{content}: {reply}");
+        let text = reply["content"].as_str().unwrap();
+        assert!(!text.is_empty() && text.contains(says), "{content}: {text}");
+    }
+    let kept = service
+        .sessions
+        .get(&session)
+        .unwrap()
+        .map(|s| s.messages.len())
+        .unwrap_or(0);
+    assert_eq!(kept, 0, "no command, nor its answer, is kept");
+
+    send(&mut desk, dm("hello there", "ref-plain")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let end = frames.last().unwrap();
+    assert!(end.get("command").is_none(), "{end}");
+    assert!(
+        end["id"].is_string(),
+        "a plain turn names its saved reply: {end}"
+    );
+
+    // What Desk's `/` menu offers: every command with its one line.
+    let listed = call(addr, &token, reqwest::Method::GET, "/api/commands", None).await;
+    let status = listed["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "status")
+        .expect("status is listed");
+    assert_eq!(status["aliases"], json!(["s"]), "{status}");
+    assert!(status["summary"].as_str().is_some_and(|s| !s.is_empty()));
+    let refused = reqwest::Client::new()
+        .get(format!("http://{addr}/api/commands"))
+        .bearer_auth("not-a-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+}

@@ -117,6 +117,158 @@ pub enum Command {
     /// `create`, `add`, `remove`, `delete`). Human-only: the agent cannot emit a
     /// `cmd:`, so it can never switch or weaken an environment itself.
     Env { args: Option<String> },
+    /// `/skills` — the agent's skills and whether each is ready, as
+    /// `system.list_skills` reads them.
+    Skills,
+    /// `/<word>` naming no command: answered at once, never passed to the
+    /// model. Only a lone, command-shaped word ([`unknown_command`]).
+    Unknown { name: String },
+}
+
+/// One command as `/help` and Desk's `/` menu list it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CommandInfo {
+    /// Its name, without the prefix: `status`.
+    pub name: &'static str,
+    /// What it takes, as typed after the name: `[model]`.
+    pub args: &'static str,
+    /// Its other names.
+    pub aliases: &'static [&'static str],
+    /// What it does, in one line.
+    pub summary: &'static str,
+}
+
+const fn info(
+    name: &'static str,
+    args: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+) -> CommandInfo {
+    CommandInfo {
+        name,
+        args,
+        aliases,
+        summary,
+    }
+}
+
+/// The commands a person types to an agent, in the order `/help` lists them.
+/// Every name and alias parses to a command ([`parse_command`]).
+pub const COMMANDS: &[CommandInfo] = &[
+    info(
+        "new",
+        "[model]",
+        &["n"],
+        "Start a fresh session (optionally with a different model)",
+    ),
+    info("reset", "", &["r", "clear"], "Clear session history"),
+    info(
+        "status",
+        "",
+        &["s"],
+        "Show session info (model, tokens, channel)",
+    ),
+    info("compact", "", &["gc"], "Trigger manual context compaction"),
+    info("context", "", &["ctx"], "Show context window usage"),
+    info("model", "[name]", &["m"], "Show or switch the current model"),
+    info(
+        "config",
+        "save",
+        &[],
+        "(deprecated) Config auto-saves to workspace config.toml",
+    ),
+    info("health", "", &[], "Show model health status"),
+    info("wake", "", &["w"], "Trigger an immediate heartbeat check"),
+    info(
+        "heartbeat",
+        "[history]",
+        &["hb"],
+        "Show heartbeat status, or its recent results",
+    ),
+    info(
+        "select-agent",
+        "",
+        &["sa"],
+        "List connected local agents or switch execution target",
+    ),
+    info(
+        "tools",
+        "[prefix]",
+        &["t"],
+        "List available tools (filter by prefix)",
+    ),
+    info(
+        "skills",
+        "",
+        &[],
+        "List the agent's skills and whether each is ready",
+    ),
+    info(
+        "secret",
+        "<name> <value>",
+        &[],
+        "Store a credential the agent can use as `[[secret:<name>]]`, without the value reaching the model",
+    ),
+    info(
+        "endpoint",
+        "",
+        &[],
+        "Configure the HTTP endpoints the agent can call (`list`, `cred`; `add`/`auth` are admin-only)",
+    ),
+    info(
+        "skill",
+        "grant|grants|revoke …",
+        &[],
+        "Approve WASM skill credentials; re-approval is required after every skill rebuild",
+    ),
+    info(
+        "workflow",
+        "run <id> [key=value …]",
+        &["wf"],
+        "Start a workflow now; its report posts in this channel",
+    ),
+    info(
+        "playbook",
+        "shares|share|unshare|visibility|transfer <id> …",
+        &[],
+        "Who else can reach a playbook of yours, or who owns it (`workflow` and `monitor` take the same)",
+    ),
+    info(
+        "remote-mcp",
+        "token [label]|tokens|token revoke <id|label>",
+        &[],
+        "Mint, list and revoke your remote MCP tokens for Claude Code / workforce-local",
+    ),
+    info("help", "", &["h", "?"], "Show this help"),
+];
+
+/// The playbook directives and the Claude Code chat words: commands of their
+/// own that are read elsewhere (or reach the agent), never an unknown one.
+const READ_ELSEWHERE: &[&str] = &[
+    "continue",
+    "exit",
+    "goto",
+    "cc",
+    "cc-rebase",
+    "cx",
+    "cx-rebase",
+];
+
+/// A message that is a lone command-shaped word naming no command: `/clear2`,
+/// `cmd: frobnicate`. A path (`/etc/hosts`), prose after a prefix (`cmd: what
+/// is happening`), or a word read elsewhere is not one, and goes on as before.
+fn unknown_command(word: &str, args: Option<&str>) -> Option<Command> {
+    let name = word.strip_prefix('/')?;
+    let shaped = name.len() <= 32
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    (shaped && args.is_none_or(str::is_empty) && !READ_ELSEWHERE.contains(&name)).then(|| {
+        Command::Unknown {
+            name: name.to_string(),
+        }
+    })
 }
 
 /// Result of executing a command.
@@ -367,6 +519,9 @@ pub fn parse_command(message: &str) -> Option<Command> {
             Some(Command::Secret { name, value })
         }
         "/endpoint" | "/endpoints" | "/ep" => Some(Command::Endpoint { args }),
+        // Bare `/skills` lists them, as in Claude Code; with words it is the
+        // grants command it always was (`skill list` is its grants).
+        "/skills" if args.is_none() => Some(Command::Skills),
         "/skill" | "/skills" => Some(Command::Skill { args }),
         "/workflow" | "/wf" => Some(Command::Workflow { args }),
         "/playbook" | "/playbooks" => {
@@ -397,7 +552,8 @@ pub fn parse_command(message: &str) -> Option<Command> {
         }
         "/remote-mcp" => Some(Command::RemoteMcp { args }),
         "/env" => Some(Command::Env { args }),
-        _ => None, // Unknown command — let it pass through to the LLM
+        // A lone unknown word is answered; anything else goes to the agent.
+        other => unknown_command(other, args.as_deref()),
     }
 }
 
@@ -542,6 +698,10 @@ pub async fn execute_command(
             crate::remote_mcp::command::execute(service, user, args.as_deref()).await
         }
         Command::Env { args } => execute_env(service, channel, user, args.as_deref()).await,
+        Command::Skills => execute_skills(service),
+        Command::Unknown { name } => CommandResult::info(format!(
+            "Unknown command `/{name}`. Type `/help` for what this agent understands."
+        )),
     }
 }
 
@@ -1560,33 +1720,75 @@ async fn execute_context(service: &Arc<AgentService>, channel: &str, user: &str)
 }
 
 fn execute_help() -> CommandResult {
-    CommandResult::info(
-        "📖 *Available Commands*\n\
-         \n  `cmd: new [model]` — Start a fresh session (optionally with a different model)\
-         \n  `cmd: reset` — Clear session history\
-         \n  `cmd: status` — Show session info (model, tokens, channel)\
-         \n  `cmd: compact` — Trigger manual context compaction\
-         \n  `cmd: context` — Show context window usage\
-         \n  `cmd: model [name]` — Show or switch the current model\
-         \n  `cmd: config save` — (deprecated) Config auto-saves to workspace config.toml\
-         \n  `cmd: health` — Show model health status\
-         \n  `cmd: wake` — Trigger an immediate heartbeat check\
-         \n  `cmd: heartbeat` — Show heartbeat status (use `cmd: heartbeat history` for recent results)\
-         \n  `cmd: select-agent` — List connected local agents or switch execution target\
-         \n  `cmd: tools [prefix]` — List available tools (filter by prefix)\
-         \n  `cmd: secret <name> <value>` — Store a credential the agent can use as `[[secret:<name>]]`, without the value reaching the model\
-         \n  `cmd: endpoint` — Configure the HTTP endpoints the agent can call (`list`, `cred`; `add`/`auth` are admin-only)\
-         \n  `cmd: skill` — Approve WASM skill credentials (`grant`, `grants`, `revoke`); re-approval is required after every skill rebuild\
-         \n  `cmd: workflow run <id> [key=value …]` — Start a workflow now; its report posts in this channel\
-         \n  `cmd: workflow|playbook|monitor shares|share|unshare|visibility|transfer <id> …` — Who else can reach a definition of yours, or who owns it\
-         \n  `cmd: remote-mcp` — Mint, list and revoke your remote MCP tokens for Claude Code / workforce-local (`token [label]`, `tokens`, `token revoke <id|label>`)\
-         \n  `cmd: help` — Show this help\
-         \n\
-         \n  *Aliases (same `cmd:` prefix):* `n`=new, `r`=reset, `s`=status, `gc`=compact, `ctx`=context, `m`=model, `w`=wake, `hb`=heartbeat, `sa`=select-agent, `t`=tools, `h`=help\
-         \n\
-         \n  _Use the `cmd:` prefix — it works everywhere, including Slack threads (where a `/` triggers autocomplete and won't reach the agent). A plain `/` prefix, e.g. `/status`, still works outside threads._"
-            .to_string(),
-    )
+    let mut text = String::from("📖 *Available Commands*\n");
+    for c in COMMANDS {
+        let args = if c.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", c.args)
+        };
+        text.push_str(&format!("\n  `cmd: {}{args}` — {}", c.name, c.summary));
+    }
+    let aliases: Vec<String> = COMMANDS
+        .iter()
+        .flat_map(|c| c.aliases.iter().map(move |a| format!("`{a}`={}", c.name)))
+        .collect();
+    text.push_str(&format!(
+        "\n\n  *Aliases (same `cmd:` prefix):* {}\
+         \n\n  _Use the `cmd:` prefix — it works everywhere, including Slack threads (where a `/` triggers autocomplete and won't reach the agent). A plain `/` prefix, e.g. `/status`, still works outside threads._",
+        aliases.join(", ")
+    ));
+    CommandResult::info(text)
+}
+
+/// The agent's skills: the built-in catalog with whether each is loaded or
+/// has what it needs, then any other skill loaded now. The same reading as
+/// `system.list_skills`.
+fn execute_skills(service: &AgentService) -> CommandResult {
+    let loaded = service.skill_state.all_loaded();
+    let catalog = service
+        .vault
+        .as_ref()
+        .map(|vault| {
+            crate::skill_loader::check_skill_credentials(
+                Arc::clone(vault),
+                service.global_vault.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let mut lines: Vec<String> = catalog
+        .iter()
+        .map(|skill| {
+            let state = if loaded.iter().any(|l| l.name == skill.name) {
+                "loaded"
+            } else if skill.ready {
+                "ready"
+            } else {
+                "needs credentials"
+            };
+            let about = workforce_common::text::truncate_str(&skill.description, 80);
+            format!("  `{}` — {about} ({state})", skill.name)
+        })
+        .collect();
+    let mut others: Vec<&str> = loaded
+        .iter()
+        .filter(|l| !catalog.iter().any(|c| c.name == l.name))
+        .map(|l| l.name.as_str())
+        .collect();
+    others.sort_unstable();
+    lines.extend(
+        others
+            .into_iter()
+            .map(|name| format!("  `{name}` — (loaded)")),
+    );
+    if lines.is_empty() {
+        return CommandResult::info("This agent has no skills yet.");
+    }
+    CommandResult::info(format!(
+        "🧩 *Skills* ({} total)\n\n{}",
+        lines.len(),
+        lines.join("\n")
+    ))
 }
 
 async fn execute_model(service: &Arc<AgentService>, name: Option<&str>) -> CommandResult {
@@ -2617,8 +2819,15 @@ mod tests {
         );
         // Aliases resolve through the same path.
         assert_eq!(parse_command("cmd: s"), Some(Command::Status));
-        // Unknown command still falls through to the LLM.
-        assert_eq!(parse_command("cmd: not-a-command"), None);
+        // A lone unknown word is answered as one; prose after the prefix
+        // still goes to the agent.
+        assert_eq!(
+            parse_command("cmd: not-a-command"),
+            Some(Command::Unknown {
+                name: "not-a-command".into()
+            })
+        );
+        assert_eq!(parse_command("cmd: what is happening"), None);
         // Bare prefixes are not commands.
         assert_eq!(parse_command("cmd:"), None);
         assert_eq!(parse_command("/"), None);
@@ -2792,10 +3001,86 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_command() {
-        // Unknown commands return None (pass through to LLM)
-        assert_eq!(parse_command("/unknown"), None);
-        assert_eq!(parse_command("/foo bar"), None);
+    fn a_lone_unknown_word_is_an_unknown_command() {
+        for (text, name) in [
+            ("/unknown", "unknown"),
+            ("/Frobnicate", "frobnicate"),
+            ("cmd: clear2", "clear2"),
+            ("  /re_index  ", "re_index"),
+        ] {
+            assert_eq!(
+                parse_command(text),
+                Some(Command::Unknown { name: name.into() }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_prose_and_words_read_elsewhere_are_no_unknown_command() {
+        for text in [
+            "/foo bar",
+            "/tmp is full",
+            "/Users/someone/notes.txt",
+            "/etc/hosts",
+            "//foo",
+            "/2fa",
+            "/ status",
+            "cmd: what's happening",
+            "cmd: continue 1234",
+            "/continue",
+            "/exit",
+            "cmd: goto abc step-2",
+            "/cc",
+            "cmd: cx-rebase",
+        ] {
+            assert_eq!(parse_command(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn bare_skills_lists_them_and_skill_words_stay_grants() {
+        assert_eq!(parse_command("/skills"), Some(Command::Skills));
+        assert_eq!(parse_command("cmd: skills"), Some(Command::Skills));
+        assert_eq!(parse_command("/skill"), Some(Command::Skill { args: None }));
+        assert_eq!(
+            parse_command("/skills grants"),
+            Some(Command::Skill {
+                args: Some("grants".into())
+            })
+        );
+        assert_eq!(
+            parse_command("/skill list"),
+            Some(Command::Skill {
+                args: Some("list".into())
+            })
+        );
+    }
+
+    #[test]
+    fn every_listed_command_and_alias_parses_to_a_command() {
+        for c in COMMANDS {
+            // A literal word it takes (`config save`) is typed with it.
+            let literal = c.args.chars().all(|ch| ch.is_ascii_lowercase());
+            let args = if literal && !c.args.is_empty() {
+                format!(" {}", c.args)
+            } else {
+                String::new()
+            };
+            for name in std::iter::once(&c.name).chain(c.aliases) {
+                let parsed = parse_command(&format!("/{name}{args}"));
+                assert!(
+                    parsed.is_some() && !matches!(parsed, Some(Command::Unknown { .. })),
+                    "/{name} is listed but parses to {parsed:?}"
+                );
+            }
+        }
+        assert_eq!(parse_command("/clear"), Some(Command::Reset));
+        let help = execute_help().text;
+        for c in COMMANDS {
+            assert!(help.contains(&format!("cmd: {}", c.name)), "{}", c.name);
+        }
+        assert!(help.contains("`clear`=reset"), "{help}");
     }
 
     #[test]

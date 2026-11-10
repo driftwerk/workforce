@@ -424,6 +424,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/models/health", get(model_health))
         .route("/api/models/aliases", get(model_aliases))
+        .route("/api/commands", get(list_commands))
         .route("/api/admin/reset-model", post(admin_reset_model))
         .route("/api/agents", get(list_agents))
         // Agent CRUD & detail endpoints (DW-421)
@@ -1636,6 +1637,7 @@ fn server_frame(mut msg: BroadcastMessage, declared: bool) -> Option<ServerMessa
         status: snapshot.as_ref().map(|s| s.status),
         since: snapshot.as_ref().map(|s| s.since.to_rfc3339()),
         text: snapshot.map(|s| s.text),
+        command: msg.command && declared,
         msg_type: msg.msg_type,
     })
 }
@@ -1779,6 +1781,7 @@ mod desk_frame_tests {
             TurnEnd {
                 turn_ref: Some("ref-1".into()),
                 reply_id: Some("reply-1".into()),
+                command: false,
             },
         );
         assert_eq!(
@@ -1789,6 +1792,22 @@ mod desk_frame_tests {
             })
         );
         assert!(server_frame(end, false).is_none());
+        // A command's end says so: the Desk settles it with nothing kept.
+        let command = BroadcastMessage::turn_end(
+            "s1",
+            TurnEnd {
+                turn_ref: Some("ref-2".into()),
+                reply_id: None,
+                command: true,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(server_frame(command, true).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "turn_end", "content": "", "session_id": "s1", "speakable": false,
+                "turn_ref": "ref-2", "command": true,
+            })
+        );
     }
 
     #[test]
@@ -2116,6 +2135,7 @@ async fn handle_ws(
         status: None,
         since: None,
         text: None,
+        command: false,
     };
     let _ = sender
         .send(Message::Text(
@@ -2793,7 +2813,7 @@ async fn handle_ws(
                                         BroadcastMessage::turn_end(
                                             session_id,
                                             crate::desk_surface::turn_end(
-                                                &service, session_id, desk,
+                                                &service, session_id, desk, None,
                                             ),
                                         )
                                     })
@@ -2900,6 +2920,7 @@ async fn handle_ws(
                                         let tts_normalize = voice_turn;
                                         let service = Arc::clone(&service);
                                         let (desk, stamp) = (desk.clone(), stamp.clone());
+                                        let ran = content.clone();
                                         tokio::spawn(async move {
                                             let forward = {
                                                 let (tx, sid) = (tx.clone(), sid.clone());
@@ -2924,7 +2945,10 @@ async fn handle_ws(
                                                 BroadcastMessage::turn_end(
                                                     &sid,
                                                     crate::desk_surface::turn_end(
-                                                        &service, &sid, desk,
+                                                        &service,
+                                                        &sid,
+                                                        desk,
+                                                        Some(&ran),
                                                     ),
                                                 )
                                             });
@@ -4674,6 +4698,24 @@ async fn session_export(
             warn!(session_id = %session_id, error = %e, "Failed to export session");
             Err(StatusCode::NOT_FOUND)
         }
+    }
+}
+
+/// The commands a person can type to an agent, as `/help` lists them: what
+/// a client's `/` menu offers. The same for every agent and every caller, so
+/// it asks only that a credential sent is good.
+async fn list_commands(
+    headers: axum::http::HeaderMap,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller = resolve_caller_context(&state, &headers, query.token.as_deref()).await;
+    match caller.auth_failure {
+        Some(AuthFailure::InvalidCredentials) => Err(StatusCode::UNAUTHORIZED),
+        Some(AuthFailure::StoreError) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        None => Ok(Json(
+            serde_json::json!({ "commands": crate::commands::COMMANDS }),
+        )),
     }
 }
 

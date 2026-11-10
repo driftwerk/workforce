@@ -95,6 +95,10 @@ pub struct BroadcastMessage {
     /// On a `turn_snapshot`, the live Desk turn as it stands.
     #[serde(skip_serializing)]
     pub snapshot: Option<workforce_core::desk::TurnSnapshot>,
+    /// On a `turn_end`: the turn was a command the hub answered itself, kept
+    /// nowhere ([`workforce_core::desk::TurnEnd::command`]).
+    #[serde(skip_serializing)]
+    pub command: bool,
 }
 
 /// The frame that closes a Desk turn's frames.
@@ -140,6 +144,7 @@ impl BroadcastMessage {
             target_identity: None,
             delivered: None,
             snapshot: None,
+            command: false,
         }
     }
 
@@ -211,6 +216,7 @@ impl BroadcastMessage {
             target_identity: None,
             delivered: None,
             snapshot: None,
+            command: false,
         }
     }
 
@@ -256,6 +262,7 @@ impl BroadcastMessage {
         Self {
             turn_ref: end.turn_ref,
             id: end.reply_id,
+            command: end.command,
             ..Self::silent(session_id, TURN_END, String::new())
         }
     }
