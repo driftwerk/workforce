@@ -388,7 +388,7 @@ impl Desk {
     }
 
     /// What the person calls `item`.
-    async fn item_label(&self, item: &Item) -> String {
+    pub(super) async fn item_label(&self, item: &Item) -> String {
         match item {
             Item::Session(id) => self
                 .view(*id)
@@ -396,8 +396,8 @@ impl Desk {
                 .unwrap_or_else(|_| "the session".into()),
             Item::Ticket(id) => match self.0.store.ticket(*id).await.ok().flatten() {
                 Some(t) => match self.key_of(&t).await {
-                    Ok(key) => format!("{key} · {}", crew::one_line(&t.title, 80)),
-                    Err(_) => crew::one_line(&t.title, 80),
+                    Ok(key) => format!("{key} · {}", crew::one_line(&t.said_title(), 80)),
+                    Err(_) => crew::one_line(&t.said_title(), 80),
                 },
                 None => "the ticket".into(),
             },
@@ -432,8 +432,8 @@ impl Desk {
         if let Some(t) = ctx.tickets.iter().find(|t| t.open) {
             if let Ok(Some(ticket)) = self.0.store.ticket(t.id).await {
                 f.ticket = Some(match &t.key {
-                    Some(k) => format!("{k} · {}", crew::one_line(&ticket.title, 120)),
-                    None => crew::one_line(&ticket.title, 120),
+                    Some(k) => format!("{k} · {}", crew::one_line(&ticket.said_title(), 120)),
+                    None => crew::one_line(&ticket.said_title(), 120),
                 });
             }
         }

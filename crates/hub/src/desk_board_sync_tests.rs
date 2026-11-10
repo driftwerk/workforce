@@ -925,6 +925,10 @@ async fn an_imported_issue_reaches_a_model_only_fenced() {
             "ACME-1 (Jira issue)"
         );
         assert!(t.ticket.said_title().contains("Jira issue's own words"));
+    })
+    .await;
+}
+
 /// A Linear link names its team by key and id, and the two must be one
 /// team on the hub: another team's id under this key is refused.
 #[tokio::test]

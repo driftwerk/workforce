@@ -154,6 +154,8 @@ fn a_linear_filter_is_the_tool_s_own_arguments_for_the_team() {
     assert!(check_filter(System::Linear, &Filter::AssignedToMe, Some(me)).is_ok());
     assert!(check_filter(System::Linear, &Filter::CurrentCycle, None).is_err());
     assert!(check_filter(System::Jira, &Filter::Label("a \"b".into()), None).is_err());
+    // A backslash would escape the label's own closing quote in the JQL.
+    assert!(check_filter(System::Jira, &Filter::Label("web\\".into()), None).is_err());
 }
 
 #[test]

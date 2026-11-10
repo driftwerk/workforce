@@ -69,6 +69,10 @@ pub enum RemoteError {
     /// A tool the sync may not call.
     #[error("the sync never calls {0}")]
     NotAllowed(String),
+    /// This pass has made all the calls it may: the rest wait for the
+    /// next. Not a failure.
+    #[error("this pass's calls are spent")]
+    Spent,
 }
 
 /// A Jira or Linear reached one way or another, as the person.
@@ -185,8 +189,10 @@ pub fn key_in_target(key: &str, target: &str) -> bool {
 /// that is a JSON object of the keys its tool takes, a label that is one.
 pub fn check_filter(system: System, f: &Filter, me: Option<&str>) -> Result<(), String> {
     match (system, f) {
-        (_, Filter::Label(l)) if l.trim().is_empty() || l.contains('"') || l.len() > 100 => {
-            Err("A label is a word or two, without quotes.".into())
+        (_, Filter::Label(l))
+            if l.trim().is_empty() || l.contains('"') || l.contains('\\') || l.len() > 100 =>
+        {
+            Err("A label is a word or two, without quotes or backslashes.".into())
         }
         (System::Jira, Filter::Query(q)) => check_jql(q),
         (System::Linear, Filter::Query(q)) => linear_query(q).map(|_| ()),

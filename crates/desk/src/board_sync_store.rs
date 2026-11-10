@@ -150,19 +150,22 @@ impl DeskStore {
         Ok(Some((sync, prefix)))
     }
 
-    /// The board other than `not` linked to `system`'s `target`, if any.
+    /// The board other than `not` linked to `system`'s `target` through
+    /// `via`, if any: two clients' hubs may each have a project of one key.
     pub async fn board_linked_to(
         &self,
         system: System,
         target: &str,
+        via: &crate::board::Via,
         not: Uuid,
     ) -> Result<Option<Uuid>> {
         let client = self.pool().get().await?;
+        let via = serde_json::to_value(via)?;
         client
             .query_opt(
                 "SELECT id FROM boards WHERE sync ->> 'system' = $1 AND sync ->> 'target' = $2 \
-                 AND id <> $3 LIMIT 1",
-                &[&system.as_str(), &target, &not],
+                 AND sync -> 'via' = $4 AND id <> $3 LIMIT 1",
+                &[&system.as_str(), &target, &not, &via],
             )
             .await?
             .map(|r| r.try_get(0))
@@ -170,13 +173,19 @@ impl DeskStore {
             .map_err(Into::into)
     }
 
-    /// The ticket whose issue is `system`'s `key`.
-    pub async fn ticket_by_external(&self, system: System, key: &str) -> Result<Option<Ticket>> {
+    /// The ticket the link `link` holds for `system`'s issue `key`.
+    pub async fn ticket_by_external(
+        &self,
+        system: System,
+        link: Uuid,
+        key: &str,
+    ) -> Result<Option<Ticket>> {
         let client = self.pool().get().await?;
         let id: Option<Uuid> = client
             .query_opt(
-                "SELECT id FROM tickets WHERE external ->> 'system' = $1 AND external ->> 'key' = $2",
-                &[&system.as_str(), &key],
+                "SELECT id FROM tickets WHERE external ->> 'system' = $1 AND external ->> 'key' = $2 \
+                 AND external ->> 'link' = $3",
+                &[&system.as_str(), &key, &link.to_string()],
             )
             .await?
             .map(|r| r.try_get(0))

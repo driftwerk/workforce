@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::{Desk, DeskError};
 use crate::board::{
-    self, Board, External, Filter, Paused, Seen, Sync, System, Ticket, TicketState, Via,
+    self, Board, External, Filter, Paused, Retry, Seen, Sync, System, Ticket, TicketState, Via,
 };
 use crate::board_sync::{check_filter, check_target, Issue, Remote, RemoteError};
 use crate::board_sync_store::SyncHub;
@@ -194,7 +194,7 @@ impl Desk {
         if let Some(other) = self
             .0
             .store
-            .board_linked_to(link.system, &link.target, id)
+            .board_linked_to(link.system, &link.target, &link.via, id)
             .await
             .map_err(internal)?
         {
@@ -237,6 +237,7 @@ impl Desk {
             backoff_until: None,
             failures: 0,
             problem: None,
+            retry: Default::default(),
         };
         self.0
             .store
@@ -387,11 +388,27 @@ impl Budget {
                 self.0 = left;
                 Ok(())
             }
-            None => Err(RemoteError::RateLimited {
-                retry_after_secs: None,
-            }),
+            None => Err(RemoteError::Spent),
         }
     }
+}
+
+/// The issue `key` failed again: tried later, on its own back-off.
+fn failed_again(
+    retry: &mut BTreeMap<String, Retry>,
+    key: &str,
+    why: String,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let tries = retry.get(key).map_or(0, |r| r.tries) + 1;
+    retry.insert(
+        key.to_string(),
+        Retry {
+            tries,
+            next_at: now + crate::board_sync::backoff(tries),
+            problem: why.chars().take(300).collect(),
+        },
+    );
 }
 
 /// Whether a sync's pause is one a pass tries past once its back-off is
@@ -463,9 +480,11 @@ impl Desk {
         id: Uuid,
         cursor: Option<String>,
         swept: bool,
+        retry: BTreeMap<String, Retry>,
     ) -> Result<(), DeskError> {
         let now = crate::crew::now();
         self.change_sync(id, |s| {
+            s.retry = retry;
             if s.paused.as_ref().is_some_and(retried) {
                 s.paused = None;
             }
@@ -511,12 +530,13 @@ impl Desk {
             .swept_at
             .is_none_or(|at| now - at >= crate::board_sync::SWEEP_EVERY);
         let mut out = Pulled::default();
+        let mut retry = s.retry.clone();
         match self
-            .pull_pass(&b, &s, remote, &mut budget, sweep, &mut out)
+            .pull_pass(&b, &s, remote, &mut budget, sweep, &mut retry, &mut out)
             .await
         {
-            Ok(cursor) => {
-                self.sync_ok(id, cursor, sweep).await?;
+            Ok((cursor, swept)) => {
+                self.sync_ok(id, cursor, swept, retry).await?;
                 Ok(out)
             }
             Err(e) => {
@@ -549,7 +569,10 @@ impl Desk {
                         complete = false;
                         break;
                     }
-                    budget.take()?;
+                    if budget.take().is_err() {
+                        complete = false;
+                        break;
+                    }
                     let mut args = json!({
                         "jql": crate::board_sync::jql(&s.target, &s.filter, since),
                         "max_results": 100,
@@ -568,7 +591,9 @@ impl Desk {
                 }
             }
             System::Linear => {
-                budget.take()?;
+                if budget.take().is_err() {
+                    return Ok((vec![], false));
+                }
                 let team = s.target_id.as_deref().unwrap_or_default();
                 let answer = crate::board_sync::call(
                     remote,
@@ -608,8 +633,32 @@ impl Desk {
         remote: &dyn Remote,
         budget: &mut Budget,
         sweep: bool,
+        retry: &mut BTreeMap<String, Retry>,
         out: &mut Pulled,
-    ) -> Result<Option<String>, RemoteError> {
+    ) -> Result<(Option<String>, bool), RemoteError> {
+        let now = crate::crew::now();
+        // What failed before, when its turn comes.
+        let due: Vec<String> = retry
+            .iter()
+            .filter(|(_, r)| r.next_at <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in due {
+            let taken = match self.fetch_issue(s, remote, budget, &key).await {
+                Ok(Some(issue)) => self.take_in(b, s, remote, budget, &issue, out).await,
+                // Gone from the project: the sweep sees to its ticket.
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            };
+            match taken {
+                Ok(()) => {
+                    retry.remove(&key);
+                }
+                Err(RemoteError::Failed(why)) => failed_again(retry, &key, why, now),
+                Err(RemoteError::Spent) => return Ok((None, false)),
+                Err(e) => return Err(e),
+            }
+        }
         let (changed, complete) = self
             .matching(s, remote, s.cursor.as_deref(), budget)
             .await?;
@@ -617,23 +666,51 @@ impl Desk {
         for issue in changed {
             match self.take_in(b, s, remote, budget, &issue, out).await {
                 Ok(()) => {}
-                // A tool that failed on this one issue: the rest go on, and
-                // the cursor stops before it so it is tried again.
+                // A tool that failed on this one issue: it is tried again on
+                // its own back-off, and the cursor goes on past it.
                 Err(RemoteError::Failed(why)) => {
                     tracing::info!(board = %b.id, issue = %issue.key, error = %why, "an issue wasn't pulled");
-                    return Ok(cursor);
+                    failed_again(retry, &issue.key, why, now);
                 }
+                // The pass's calls are spent: what was taken in stands.
+                Err(RemoteError::Spent) => return Ok((cursor, false)),
                 Err(e) => return Err(e),
             }
             cursor = Some(issue.updated_at.to_rfc3339());
         }
         if !complete {
-            return Ok(cursor);
+            return Ok((cursor, false));
         }
         if sweep {
-            self.sweep(b, s, remote, budget, out).await?;
+            match self.sweep(b, s, remote, budget, out).await {
+                Ok(()) => return Ok((cursor, true)),
+                Err(RemoteError::Spent) => return Ok((cursor, false)),
+                Err(e) => return Err(e),
+            }
         }
-        Ok(cursor)
+        Ok((cursor, false))
+    }
+
+    /// The issue `key`, read whole; `None` when it isn't in the board's
+    /// project or team any more.
+    async fn fetch_issue(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        key: &str,
+    ) -> Result<Option<Issue>, RemoteError> {
+        budget.take()?;
+        let (tool, args) = match s.system {
+            System::Jira => ("jira.get_issue", json!({ "issue_key": key })),
+            System::Linear => ("linear.issue_get", json!({ "identifier": key })),
+        };
+        let v = crate::board_sync::call(remote, s.system, tool, args).await?;
+        let issue = match s.system {
+            System::Jira => crate::board_sync::jira_issue(&v, ""),
+            System::Linear => crate::board_sync::linear_issue(v.get("issue").unwrap_or(&v)),
+        };
+        Ok(issue.filter(|i| crate::board_sync::key_in_target(&i.key, &s.target)))
     }
 
     /// Takes `issue` in: updates its ticket on this board, brings one back
@@ -651,7 +728,7 @@ impl Desk {
         let existing = self
             .0
             .store
-            .ticket_by_external(s.system, &issue.key)
+            .ticket_by_external(s.system, s.link, &issue.key)
             .await
             .map_err(|e| fail(internal(e)))?;
         if let Some(t) = &existing {
@@ -1001,3 +1078,7 @@ impl Desk {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "board_sync_tests.rs"]
+mod tests;
