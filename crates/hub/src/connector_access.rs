@@ -225,32 +225,40 @@ mod tests {
         assert!(!access.snapshot().is_blocked("linear.issue_get"));
     }
 
-    /// Asked on the person's turn, the agent turns its own connectors on
-    /// and off through its config tool: nothing refuses `[skills]`, and the
-    /// policy follows what it wrote.
+    /// Which connectors the agent has, and which it may write to, are the
+    /// person's: its config tool refuses `[skills]`, and the policy stays as
+    /// the person left it. Which of them use its own connection
+    /// (`own_credential`) stays the agent's to set.
     #[tokio::test]
-    async fn the_agent_sets_its_own_connectors_through_its_config_tool() {
+    async fn the_agent_cannot_turn_its_own_connectors_on_through_its_config_tool() {
         use workforce_agent::tools::Tool;
         let service = crate::environments::test_service().await;
         for name in ["linear.issue_get", "github.pr_get"] {
             service.tools.register(Arc::new(NamedTool(name)));
         }
+        std::fs::write(
+            service
+                .workspace
+                .join(workforce_common::config_files::WORKSPACE_CONFIG),
+            "[skills]\nenabled = [\"linear\"]\n",
+        )
+        .unwrap();
         let tool = crate::config_tool::ConfigTool::new(Arc::clone(&service), None);
-        let set = tool
-            .execute(serde_json::json!({
-                "action": "set",
-                "key": "skills.enabled",
-                "value": ["linear"],
-            }))
-            .await
-            .unwrap();
-        assert!(set.success, "{:?}", set.error);
+        for input in [
+            serde_json::json!({ "action": "set", "key": "skills.enabled", "value": ["linear", "github"] }),
+            serde_json::json!({ "action": "unset", "key": "skills.enabled" }),
+            serde_json::json!({ "action": "set", "key": "skills.read_only", "value": [] }),
+        ] {
+            let refused = tool.execute(input.clone()).await.unwrap();
+            assert!(!refused.success, "{input}");
+            assert!(refused.error.unwrap_or_default().contains("human-only"), "{input}");
+        }
         let policy =
             ConnectorToolAccess::policy(service.workspace.clone(), Arc::clone(&service.tools));
         let snapshot = policy.snapshot();
         assert!(!snapshot.is_blocked("linear.issue_get"));
-        assert!(snapshot.is_blocked("github.pr_get"));
-        // Its own connection is a binding, not a secret the tool refuses.
+        assert!(snapshot.is_blocked("github.pr_get"), "still off");
+        // Its own connection is a binding, not a secret, and its own.
         let own = tool
             .execute(serde_json::json!({
                 "action": "set",
@@ -260,15 +268,6 @@ mod tests {
             .await
             .unwrap();
         assert!(own.success, "{:?}", own.error);
-
-        let unset = tool
-            .execute(serde_json::json!({ "action": "unset", "key": "skills.enabled" }))
-            .await
-            .unwrap();
-        assert!(unset.success, "{:?}", unset.error);
-        let policy =
-            ConnectorToolAccess::policy(service.workspace.clone(), Arc::clone(&service.tools));
-        assert!(policy.snapshot().is_empty());
     }
 
     #[test]

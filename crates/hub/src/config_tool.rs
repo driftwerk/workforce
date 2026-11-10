@@ -205,10 +205,26 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
 
 /// Refuse the settings only a human changes: the agent's environments decide
 /// which instances it may reach, `[oversight]` what it oversees and may do
-/// there, and `[computer]` how far it reaches on the person's computer and
-/// the folders it works in, so it never edits them itself.
+/// there, `[computer]` how far it reaches on the person's computer and the
+/// folders it works in, `[access]` who may use it, `[tools]` which of its
+/// tools are denied, and `[skills]` which connectors it has and may write
+/// to, so it never edits them itself. `[skills] own_credential`, which of
+/// its connectors use its own connection, stays its to set.
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
+        Some(&"access") => Err(
+            "access is human-only: the person sets who may use an agent in its settings"
+                .to_string(),
+        ),
+        Some(&"tools") => Err(
+            "tools are human-only: the person sets which tools an agent has in its settings"
+                .to_string(),
+        ),
+        Some(&"skills") if path.get(1) != Some(&"own_credential") => Err(
+            "skills are human-only, but for own_credential: the person sets which connectors an \
+             agent has, and which it may write to, in Desk"
+                .to_string(),
+        ),
         Some(&"computer") => Err(
             "computer is human-only: the person sets how far an agent reaches on this computer, \
              and the folders it works in, in Desk"
@@ -449,12 +465,59 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             "computer.access",
             "computer.asks",
             "computer.works_in",
+            // Who may use it, and the tools it was denied.
+            "access",
+            "access.mode",
+            "access.allowed_users",
+            "tools",
+            "tools.deny",
+            "tools.allow",
+            // Which connectors it has, and which it may write to.
+            "skills",
+            "skills.enabled",
+            "skills.read_only",
         ] {
             assert!(
                 human_only(&key_path(key).unwrap()).is_err(),
                 "{key} is the person's"
             );
         }
+    }
+
+    /// The agent can't open its `[access]` to more people, nor give itself
+    /// back a tool the person denied: the file stays as the person wrote it.
+    #[tokio::test]
+    async fn the_agent_cannot_open_its_access_or_re_enable_denied_tools() {
+        use workforce_agent::tools::Tool;
+        let service = crate::environments::test_service().await;
+        let file = service
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        let written = "[access]\nmode = \"owner_only\"\n\n[tools]\ndeny = [\"exec.run\"]\n";
+        std::fs::write(&file, written).unwrap();
+        let tool = ConfigTool::new(std::sync::Arc::clone(&service), None);
+        for input in [
+            serde_json::json!({ "action": "set", "key": "access.mode", "value": "everyone" }),
+            serde_json::json!({ "action": "unset", "key": "access" }),
+            serde_json::json!({ "action": "set", "key": "tools.deny", "value": [] }),
+            serde_json::json!({ "action": "unset", "key": "tools.deny" }),
+            serde_json::json!({ "action": "set", "key": "tools", "value": {} }),
+        ] {
+            let refused = tool.execute(input.clone()).await.unwrap();
+            assert!(!refused.success, "{input}");
+            assert!(
+                refused.error.unwrap_or_default().contains("human-only"),
+                "{input}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    }
+
+    #[test]
+    fn its_own_connection_binding_stays_the_agents() {
+        assert!(human_only(&key_path("skills.own_credential").unwrap()).is_ok());
+        assert!(human_only(&key_path("skills.own_credential.github").unwrap()).is_ok());
+        assert!(human_only(&key_path("compaction.keep_recent_messages").unwrap()).is_ok());
     }
 
     #[test]
