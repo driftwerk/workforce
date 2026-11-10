@@ -875,3 +875,152 @@ async fn an_imported_issue_reaches_a_model_only_fenced() {
     })
     .await;
 }
+
+// ── The push ─────────────────────────────────────────────────────────────
+
+fn calls_of(jira: &Shared, tool: &str) -> Vec<Value> {
+    jira.lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|(t, _)| t == tool)
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+/// A ticket made here is created there once, in the board's project and
+/// filter, and takes its issue's key; its moves go out as transitions, and
+/// a move into Review earns one comment, said to be Desk's on the person's
+/// behalf.
+#[tokio::test]
+async fn a_change_here_goes_out_once_to_its_own_issue() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        let you = workforce_desk::crew::By::you();
+        let t = desk
+            .create_ticket(
+                workforce_desk::NewTicket {
+                    board: b.id,
+                    title: "Add a logout button".into(),
+                    body: "On every page.".into(),
+                    state: Some(TicketState::Todo),
+                    needs: vec![],
+                },
+                &you,
+            )
+            .await
+            .unwrap();
+        assert_eq!(t.key, None, "not on Jira yet");
+        local.sync.pass_board(b.id, false).await.unwrap();
+        let made = calls_of(&remote.jira, "jira.create_issue");
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0]["project_key"], "ACME");
+        let labels = made[0]["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|l| l == "web"), "it stays in the filter");
+        let t = desk.ticket(t.ticket.id).await.unwrap();
+        assert_eq!(t.key.as_deref(), Some("ACME-101"));
+        assert!(t.ticket.external.as_ref().unwrap().made_here);
+        // Nothing more to send: a second pass sends nothing.
+        local.sync.pass_board(b.id, false).await.unwrap();
+        assert_eq!(calls_of(&remote.jira, "jira.create_issue").len(), 1);
+        // A move into Review: transitioned, and commented on once.
+        desk.move_ticket(
+            t.ticket.id,
+            workforce_desk::Move {
+                state: TicketState::Review,
+                before: None,
+                after: None,
+            },
+            &you,
+        )
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, false).await.unwrap();
+        assert_eq!(
+            remote.jira.lock().unwrap().issues["ACME-101"].status,
+            "In Review"
+        );
+        let comments = calls_of(&remote.jira, "jira.add_comment");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["body"], "Desk, on my behalf: Ready for review.");
+        // An edit while in Review: the title goes, no second comment.
+        desk.edit_ticket(
+            t.ticket.id,
+            workforce_desk::TicketPatch {
+                title: Some("Add a logout button everywhere".into()),
+                ..Default::default()
+            },
+            &you,
+        )
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, false).await.unwrap();
+        assert_eq!(
+            remote.jira.lock().unwrap().issues["ACME-101"].summary,
+            "Add a logout button everywhere"
+        );
+        assert_eq!(calls_of(&remote.jira, "jira.add_comment").len(), 1);
+        // The pull that follows takes nothing back.
+        let t = desk.ticket(t.ticket.id).await.unwrap();
+        assert_eq!(t.ticket.title, "Add a logout button everywhere");
+        assert_eq!(t.ticket.state, TicketState::Review);
+    })
+    .await;
+}
+
+/// Paused, nothing goes out, and what waits goes once it resumes; a ticket
+/// kept off the filter is never written to.
+#[tokio::test]
+async fn a_paused_board_sends_nothing_and_a_kept_ticket_is_never_written() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        seed(&remote.jira, "ACME-2", "Ship the API", &["web"]);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let you = workforce_desk::crew::By::you();
+        let one = desk.ticket_by_key("ACME-1").await.unwrap();
+        desk.pause_board(b.id, true).await.unwrap();
+        desk.edit_ticket(
+            one.ticket.id,
+            workforce_desk::TicketPatch {
+                title: Some("Fix the login, now".into()),
+                ..Default::default()
+            },
+            &you,
+        )
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        assert!(calls_of(&remote.jira, "jira.update_issue").is_empty());
+        desk.pause_board(b.id, false).await.unwrap();
+        local.sync.pass_board(b.id, false).await.unwrap();
+        let updates = calls_of(&remote.jira, "jira.update_issue");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["issue_key"], "ACME-1");
+        // ACME-2 leaves the filter and is kept here: its edits stay here.
+        touch(&remote.jira, "ACME-2", |i| i.labels.clear());
+        desk.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let two = desk.ticket_by_key("ACME-2").await.unwrap();
+        desk.left_filter(two.ticket.id, true, &you).await.unwrap();
+        desk.edit_ticket(
+            two.ticket.id,
+            workforce_desk::TicketPatch {
+                title: Some("Ours now".into()),
+                ..Default::default()
+            },
+            &you,
+        )
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        assert!(calls_of(&remote.jira, "jira.update_issue")
+            .iter()
+            .all(|a| a["issue_key"] != "ACME-2"));
+    })
+    .await;
+}

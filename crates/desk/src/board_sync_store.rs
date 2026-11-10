@@ -48,6 +48,7 @@ pub struct Queued {
     pub creating_at: Option<DateTime<Utc>>,
     pub waiting: Option<String>,
     pub error: Option<String>,
+    pub queued_at: DateTime<Utc>,
 }
 
 fn queued(row: &Row) -> Result<Queued> {
@@ -59,6 +60,7 @@ fn queued(row: &Row) -> Result<Queued> {
         creating_at: row.try_get("creating_at")?,
         waiting: row.try_get("waiting")?,
         error: row.try_get("error")?,
+        queued_at: row.try_get("queued_at")?,
     })
 }
 

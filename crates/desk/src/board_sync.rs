@@ -812,6 +812,11 @@ pub fn spoken_title(t: &Ticket) -> String {
     }
 }
 
+/// Whether `p` is a remote ([`remote_party`]): its changes came from there.
+pub fn is_remote_party(p: &Party) -> bool {
+    p.kind == PartyKind::Desk && (p.id.starts_with("jira:") || p.id.starts_with("linear:"))
+}
+
 /// The party a pulled change is by: the remote, never the person.
 pub fn remote_party(system: System, target: &str) -> Party {
     Party {

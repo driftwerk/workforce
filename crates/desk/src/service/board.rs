@@ -508,11 +508,22 @@ impl Desk {
         subject: Option<Party>,
         text: String,
     ) -> Result<TicketView, DeskError> {
-        let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
+        let b = self.board_of(t.board).await.ok();
+        let group = b.as_ref().and_then(|b| b.group.clone());
         self.note(
             by.event(kind, subject, text)
                 .about_ticket(t.id, group.as_deref()),
         );
+        // A change here on a synced board goes out to its issue; the pull's
+        // own changes don't go back.
+        let pushes = b.as_ref().is_some_and(|b| b.sync.is_some())
+            && !crate::board_sync::is_remote_party(&by.party)
+            && t.external.as_ref().is_none_or(|e| e.synced && !e.kept);
+        if pushes {
+            if let Err(e) = self.0.store.queue_push(t.id, t.board, now()).await {
+                tracing::warn!(ticket = %t.id, error = format!("{e:#}"), "a synced ticket's change wasn't queued to go out");
+            }
+        }
         let v = self.view_ticket(t).await?;
         self.announce(DeskEvent::Ticket {
             ticket: Box::new(v.clone()),
@@ -1529,6 +1540,15 @@ impl Desk {
                     ));
                 }
                 let b = self.board_for_new(caller, prefix.as_deref()).await?;
+                // A session's words never become an issue on someone's Jira.
+                if let Some(sync) = &b.sync {
+                    return Err(format!(
+                        "{} is synced with {} {}; tell the person what needs adding there.",
+                        b.name,
+                        sync.system.title(),
+                        sync.target
+                    ));
+                }
                 let v = self
                     .create_ticket(
                         NewTicket {

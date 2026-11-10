@@ -1001,3 +1001,507 @@ impl Desk {
         }
     }
 }
+
+// ── The push ─────────────────────────────────────────────────────────────
+
+/// What one pass of a board's push did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pushed {
+    pub created: usize,
+    pub updated: usize,
+    pub commented: usize,
+    pub waiting: usize,
+    pub skipped: Option<String>,
+}
+
+/// How long a push the hub holds for the person's approval waits before
+/// it is sent again.
+const WAITING_RETRY: chrono::Duration = chrono::Duration::hours(1);
+
+impl Desk {
+    /// Whether board `id` has no change due to go out now.
+    pub async fn nothing_to_push(&self, id: Uuid) -> Result<bool, DeskError> {
+        Ok(self
+            .0
+            .store
+            .due_pushes(id, crate::crew::now(), 1)
+            .await
+            .map_err(internal)?
+            .is_empty())
+    }
+
+    /// Sends board `id`'s queued changes to their issues through `remote`:
+    /// creates what was made here, then each change since its issue was last
+    /// seen, and one comment per move into Doing or Review. Only issues this
+    /// link imported or made are written to; nothing is ever deleted or
+    /// reassigned there.
+    pub async fn push_board(&self, id: Uuid, remote: &dyn Remote) -> Result<Pushed, DeskError> {
+        let now = crate::crew::now();
+        let Some((b, s)) = self.board_sync(id).await? else {
+            return Ok(Pushed {
+                skipped: Some("not synced".into()),
+                ..Default::default()
+            });
+        };
+        if let Some(why) = held(&b, &s, now) {
+            return Ok(Pushed {
+                skipped: Some(why),
+                ..Default::default()
+            });
+        }
+        let due = self
+            .0
+            .store
+            .due_pushes(id, now, 20)
+            .await
+            .map_err(internal)?;
+        let mut budget = Budget(crate::board_sync::CALLS_PER_PASS);
+        let mut out = Pushed::default();
+        for q in due {
+            match self
+                .push_one(&b, &s, remote, &mut budget, &q, &mut out)
+                .await
+            {
+                Ok(()) => self
+                    .0
+                    .store
+                    .pushed(q.ticket, q.queued_at)
+                    .await
+                    .map_err(internal)?,
+                Err(RemoteError::Waiting { request_id }) => {
+                    out.waiting += 1;
+                    self.0
+                        .store
+                        .push_failed(q.ticket, now + WAITING_RETRY, None, Some(&request_id))
+                        .await
+                        .map_err(internal)?;
+                }
+                Err(RemoteError::Failed(why)) => {
+                    let next = now + crate::board_sync::backoff(q.tries.max(0) as u32);
+                    self.0
+                        .store
+                        .push_failed(q.ticket, next, Some(&why), None)
+                        .await
+                        .map_err(internal)?;
+                }
+                // Budget spent: the rest wait for the next pass.
+                Err(RemoteError::RateLimited {
+                    retry_after_secs: None,
+                }) => break,
+                Err(e) => {
+                    self.sync_failed(id, &e).await?;
+                    out.skipped = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One queued ticket's push.
+    async fn push_one(
+        &self,
+        b: &Board,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        q: &crate::board_sync_store::Queued,
+        out: &mut Pushed,
+    ) -> Result<(), RemoteError> {
+        let fail = |e: DeskError| RemoteError::Failed(e.to_string());
+        let t = match self
+            .0
+            .store
+            .ticket(q.ticket)
+            .await
+            .map_err(|e| fail(internal(e)))?
+        {
+            Some(t) if t.board == b.id => t,
+            // Gone, or on another board: nothing of it goes out from here.
+            _ => return Ok(()),
+        };
+        let mut t = match &t.external {
+            None => {
+                let made = self.create_issue(b, s, remote, budget, t, q).await?;
+                out.created += 1;
+                made
+            }
+            Some(e) if e.writable_by(s.link) => t,
+            // Kept, on the shelf, or another link's: never written to.
+            Some(_) => return Ok(()),
+        };
+        let needs = self.need_keys(&t).await.map_err(fail)?;
+        let need_keys: Vec<String> = needs.iter().map(|(k, _)| k.clone()).collect();
+        let push = crate::board_sync::push_of(&t, &need_keys);
+        if push.is_empty() {
+            return Ok(());
+        }
+        let e = t.external.clone().expect("a synced ticket");
+        if push.title.is_some() || push.body.is_some() {
+            budget.take()?;
+            let args = match s.system {
+                System::Jira => {
+                    let mut a = json!({ "issue_key": e.key });
+                    if let Some(title) = &push.title {
+                        a["summary"] = json!(title);
+                    }
+                    if let Some(body) = &push.body {
+                        a["description"] = json!(body);
+                    }
+                    a
+                }
+                System::Linear => {
+                    let mut a = json!({ "identifier": e.key });
+                    if let Some(title) = &push.title {
+                        a["title"] = json!(title);
+                    }
+                    if let Some(body) = &push.body {
+                        a["description"] = json!(body);
+                    }
+                    a
+                }
+            };
+            let tool = match s.system {
+                System::Jira => "jira.update_issue",
+                System::Linear => "linear.issue_update",
+            };
+            crate::board_sync::call(remote, s.system, tool, args).await?;
+        }
+        let mut commented = false;
+        if let Some(state) = push.state {
+            if let Some(name) = s.states.get(&state) {
+                self.transition(s, remote, budget, &e.key, name).await?;
+            }
+            let pr = t.links.iter().rev().find_map(|l| match l {
+                crate::board::Link::Pr { url, .. } => Some(url.clone()),
+                _ => None,
+            });
+            if let Some(note) =
+                crate::board_sync::note_for(&t, state, t.assignee.as_ref(), pr.as_deref())
+            {
+                budget.take()?;
+                let (tool, args) = match s.system {
+                    System::Jira => (
+                        "jira.add_comment",
+                        json!({ "issue_key": e.key, "body": note }),
+                    ),
+                    System::Linear => (
+                        "linear.comment_add",
+                        json!({ "identifier": e.key, "body": note }),
+                    ),
+                };
+                crate::board_sync::call(remote, s.system, tool, args).await?;
+                commented = true;
+                out.commented += 1;
+            }
+        }
+        // Jira's tools here link no issues: its needs stay Desk's own.
+        if s.system == System::Linear {
+            for need in push
+                .needs
+                .iter()
+                .filter(|k| crate::board_sync::key_in_target(k, &s.target))
+            {
+                budget.take()?;
+                crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "linear.issue_link",
+                    json!({ "identifier": e.key, "related_identifier": need, "type": "blocked_by" }),
+                )
+                .await?;
+            }
+        }
+        // What the issue now says, as far as this push knows: kept on the
+        // ticket as it is now, so what changed meanwhile goes next time.
+        let sent = Seen {
+            title: t.title.clone(),
+            body: t.body.clone(),
+            state: Some(t.state),
+            needs: need_keys,
+        };
+        let noted = crate::board_sync::noted_after(e.noted, t.state, commented);
+        for _ in 0..3 {
+            if let Some(ext) = t.external.as_mut() {
+                ext.seen = sent.clone();
+                ext.noted = noted;
+            }
+            match self.0.store.put_ticket(&mut t).await {
+                Ok(()) => {
+                    out.updated += 1;
+                    if crate::board_sync::push_of(&t, &sent.needs) != Default::default() {
+                        let _ = self
+                            .0
+                            .store
+                            .queue_push(t.id, t.board, crate::crew::now())
+                            .await;
+                    }
+                    return Ok(());
+                }
+                Err(crate::board_store::TicketWrite::Stale) => {
+                    t = self.ticket_of(t.id).await.map_err(fail)?;
+                }
+                Err(e) => return Err(RemoteError::Failed(e.to_string())),
+            }
+        }
+        Err(RemoteError::Failed(
+            "the ticket kept changing while it was pushed".into(),
+        ))
+    }
+
+    /// Moves the issue `key` to the remote state `name`.
+    async fn transition(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        key: &str,
+        name: &str,
+    ) -> Result<(), RemoteError> {
+        budget.take()?;
+        match s.system {
+            System::Jira => {
+                let list = crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "jira.list_transitions",
+                    json!({ "issue_key": key }),
+                )
+                .await?;
+                let Some(id) = list["transitions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| {
+                        t["to_status"]
+                            .as_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                    })
+                    .and_then(|t| t["id"].as_str().map(str::to_string))
+                else {
+                    // No way there from where it is: the state stays Desk's.
+                    return Ok(());
+                };
+                budget.take()?;
+                crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "jira.transition_issue",
+                    json!({ "issue_key": key, "transition": id }),
+                )
+                .await
+                .map(drop)
+            }
+            System::Linear => {
+                let list = crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "linear.states_list",
+                    json!({ "team_id": s.target_id.clone().unwrap_or_default() }),
+                )
+                .await?;
+                let Some(id) = list["states"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|st| {
+                        st["name"]
+                            .as_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                    })
+                    .and_then(|st| st["id"].as_str().map(str::to_string))
+                else {
+                    return Ok(());
+                };
+                budget.take()?;
+                crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "linear.issue_update",
+                    json!({ "identifier": key, "state_id": id }),
+                )
+                .await
+                .map(drop)
+            }
+        }
+    }
+
+    /// Creates the issue for `t`, made here on a synced board, and gives `t`
+    /// its key. A create that may have gone through before is looked for by
+    /// its Desk ref first, so it is never made twice.
+    async fn create_issue(
+        &self,
+        b: &Board,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        mut t: Ticket,
+        q: &crate::board_sync_store::Queued,
+    ) -> Result<Ticket, RemoteError> {
+        let fail = |e: DeskError| RemoteError::Failed(e.to_string());
+        let reference = crate::board_sync::desk_ref(t.id);
+        let found = match q.creating_at {
+            Some(_) => self.find_made(s, remote, budget, &reference).await?,
+            None => None,
+        };
+        let (key, issue_id, url) = match found {
+            Some(made) => made,
+            None => {
+                self.0
+                    .store
+                    .creating(t.id, crate::crew::now())
+                    .await
+                    .map_err(|e| fail(internal(e)))?;
+                budget.take()?;
+                match s.system {
+                    System::Jira => {
+                        let mut labels = vec![reference.clone()];
+                        if let Filter::Label(l) = &s.filter {
+                            labels.push(l.trim().to_string());
+                        }
+                        let made = crate::board_sync::call(
+                            remote,
+                            s.system,
+                            "jira.create_issue",
+                            json!({
+                                "project_key": s.target,
+                                "summary": t.title,
+                                "issue_type": "Task",
+                                "description": t.body,
+                                "labels": labels,
+                            }),
+                        )
+                        .await?;
+                        let key = made["key"]
+                            .as_str()
+                            .and_then(crate::board_sync::parse_issue_key)
+                            .filter(|k| crate::board_sync::key_in_target(k, &s.target))
+                            .ok_or_else(|| {
+                                RemoteError::Failed("Jira gave no key for the new issue".into())
+                            })?;
+                        (key, made["id"].as_str().map(str::to_string), String::new())
+                    }
+                    System::Linear => {
+                        let body = format!("{}\n\n(Desk ref: {reference})", t.body.trim());
+                        let made = crate::board_sync::call(
+                            remote,
+                            s.system,
+                            "linear.issue_create",
+                            json!({
+                                "title": t.title,
+                                "description": body.trim(),
+                                "team_id": s.target_id.clone().unwrap_or_default(),
+                            }),
+                        )
+                        .await?;
+                        let issue = made.get("issue").unwrap_or(&made);
+                        let key = issue["identifier"]
+                            .as_str()
+                            .and_then(crate::board_sync::parse_issue_key)
+                            .filter(|k| crate::board_sync::key_in_target(k, &s.target))
+                            .ok_or_else(|| {
+                                RemoteError::Failed("Linear gave no key for the new issue".into())
+                            })?;
+                        (
+                            key,
+                            issue["id"].as_str().map(str::to_string),
+                            issue["url"].as_str().unwrap_or_default().to_string(),
+                        )
+                    }
+                }
+            }
+        };
+        let at = crate::crew::now();
+        t.external = Some(External {
+            system: s.system,
+            key: key.clone(),
+            id: issue_id,
+            url,
+            remote_updated_at: at,
+            synced: true,
+            noted: None,
+            link: s.link,
+            made_here: true,
+            kept: false,
+            flagged: false,
+            // What was sent; its state is the remote's default, so the
+            // column's state goes next.
+            seen: Seen {
+                title: t.title.clone(),
+                body: t.body.clone(),
+                state: None,
+                needs: vec![],
+            },
+        });
+        loop {
+            match self.0.store.put_ticket(&mut t).await {
+                Ok(()) => break,
+                Err(crate::board_store::TicketWrite::Stale) => {
+                    let ext = t.external.clone();
+                    t = self.ticket_of(t.id).await.map_err(fail)?;
+                    t.external = ext;
+                }
+                Err(e) => return Err(RemoteError::Failed(e.to_string())),
+            }
+        }
+        let by = By {
+            party: crate::crew::Party::desk(),
+            reason: None,
+            suggestion_id: None,
+            hop: 0,
+        };
+        let text = format!("created {key} on {} for it", s.system.title());
+        let group = b.group.clone();
+        self.note(
+            by.event(Kind::TicketEdited, None, text)
+                .about_ticket(t.id, group.as_deref()),
+        );
+        if let Ok(v) = self.view_ticket(t.clone()).await {
+            self.announce(crate::model::DeskEvent::Ticket {
+                ticket: Box::new(v),
+            });
+        }
+        Ok(t)
+    }
+
+    /// An issue a create may have made already, found by its Desk ref.
+    async fn find_made(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        reference: &str,
+    ) -> Result<Option<(String, Option<String>, String)>, RemoteError> {
+        budget.take()?;
+        let found = match s.system {
+            System::Jira => {
+                let answer = crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "jira.search",
+                    json!({ "jql": format!("project = \"{}\" AND labels = \"{reference}\"", s.target), "max_results": 2 }),
+                )
+                .await?;
+                crate::board_sync::jira_search_issues(&answer, "").0
+            }
+            System::Linear => {
+                let answer = crate::board_sync::call(
+                    remote,
+                    s.system,
+                    "linear.issue_search",
+                    json!({ "query": reference, "limit": 5 }),
+                )
+                .await?;
+                crate::board_sync::linear_issues(&answer)
+                    .into_iter()
+                    .filter(|i| i.body.as_deref().is_some_and(|b| b.contains(reference)))
+                    .collect()
+            }
+        };
+        Ok(found
+            .into_iter()
+            .find(|i| crate::board_sync::key_in_target(&i.key, &s.target))
+            .map(|i| (i.key, i.id, i.url)))
+    }
+}

@@ -356,7 +356,8 @@ impl BoardSync {
         let due = s
             .pulled_at
             .is_none_or(|at| chrono::Utc::now() - at >= sync::PULL_EVERY);
-        if !(due || now) {
+        let queued = !self.desk.nothing_to_push(id).await?;
+        if !(due || now || queued) {
             return Ok(());
         }
         let remote = match self.remote(s.system, &s.via, &s.person).await {
@@ -368,6 +369,16 @@ impl BoardSync {
                 return Ok(());
             }
         };
+        // What changed here goes out first, so the pull that follows finds
+        // its own changes there and takes nothing back.
+        let pushed = self.desk.push_board(id, &*remote).await?;
+        if pushed.created + pushed.updated + pushed.waiting > 0 {
+            tracing::info!(board = %id, created = pushed.created, updated = pushed.updated,
+                commented = pushed.commented, waiting = pushed.waiting, "board pushed");
+        }
+        if !(due || now) {
+            return Ok(());
+        }
         let pulled = self.desk.pull_board(id, &*remote).await?;
         if pulled.imported + pulled.updated + pulled.detached + pulled.dropped > 0 {
             tracing::info!(board = %id, imported = pulled.imported, updated = pulled.updated,
