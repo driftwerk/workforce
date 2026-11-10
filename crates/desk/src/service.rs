@@ -57,6 +57,9 @@ mod charge;
 pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
+mod grants;
+#[cfg(test)]
+mod grants_tests;
 mod groups;
 mod handoff;
 #[cfg(test)]
@@ -107,6 +110,8 @@ mod unread;
 
 use transition::Transition;
 
+pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
+pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
@@ -162,6 +167,9 @@ pub struct Options {
     pub line_reach: crate::line::Reach,
     /// What session memory keeps, from `[desk.memory]`.
     pub memory: crate::memory::MemoryOptions,
+    /// Whether this is a machine's hub, and how long grants last
+    /// (`[desk.bosses]`).
+    pub bosses: crate::grant::BossOptions,
 }
 
 #[cfg(test)]
@@ -899,6 +907,11 @@ struct Inner {
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
+    /// This engine's copy of the home's grants, and its pause.
+    grants: Mutex<grants::GrantsRun>,
+    /// Held while a grant is written: one at a time, from reading the copy
+    /// to keeping it.
+    grant_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -1543,9 +1556,12 @@ impl Desk {
             plan_write: tokio::sync::Mutex::new(()),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
+            grants: Mutex::default(),
+            grant_write: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
+        desk.grants_load().await;
         desk.lineage_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -2925,6 +2941,11 @@ impl Desk {
             self.charge_started(id, boss, group).await?;
         }
         if let Some(g) = group {
+            // On a machine whose groups are its grants, it is born in its
+            // group's grant.
+            if self.born_in(id, g).await? {
+                return Ok(());
+            }
             let item = groups::session_item(id);
             // Starting in its group is no move: nothing of a move is done.
             self.0.scopes.lock().placing.insert(id);
@@ -6400,6 +6421,7 @@ mod tests {
             account_keys: None,
             line_reach: crate::line::Reach::Group,
             memory: Default::default(),
+            bosses: Default::default(),
         }
     }
 
@@ -8500,6 +8522,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8543,6 +8566,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8621,6 +8645,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -8684,6 +8709,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {

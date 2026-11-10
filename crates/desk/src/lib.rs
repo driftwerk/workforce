@@ -33,6 +33,9 @@ mod first_run;
 pub mod floor;
 pub mod folders;
 pub mod gist;
+pub mod grant;
+mod grant_api;
+pub mod grant_store;
 pub mod handoff;
 pub mod holder;
 pub mod identity;
@@ -105,6 +108,7 @@ pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
+pub use service::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

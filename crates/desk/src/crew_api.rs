@@ -335,6 +335,7 @@ mod tests {
                 account_keys: None,
                 line_reach: crate::line::Reach::Group,
                 memory: Default::default(),
+                bosses: Default::default(),
             },
             Default::default(),
             CancellationToken::new(),

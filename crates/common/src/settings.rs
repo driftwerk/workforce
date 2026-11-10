@@ -765,6 +765,70 @@ pub struct DeskConfig {
     /// conversations, and its limits.
     #[serde(default)]
     pub memory: DeskMemoryConfig,
+    /// Bosses of Desk's groups (`[desk.bosses]`): how long the grants this
+    /// engine is given last.
+    #[serde(default)]
+    pub bosses: DeskBossesConfig,
+}
+
+/// `[desk.bosses]`: this engine's limits for the grants Desk on the
+/// person's Mac gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeskBossesConfig {
+    /// How long a grant lasts after Desk last wrote or renewed it, when
+    /// Desk doesn't say: 1 to 336 hours (14 days). Past it, the grant's
+    /// boss is served nothing. Default: 72.
+    #[serde(default = "default_desk_bosses_grant_hours")]
+    pub grant_hours: u32,
+}
+
+impl Default for DeskBossesConfig {
+    fn default() -> Self {
+        Self {
+            grant_hours: default_desk_bosses_grant_hours(),
+        }
+    }
+}
+
+fn default_desk_bosses_grant_hours() -> u32 {
+    72
+}
+
+impl DeskBossesConfig {
+    /// Refuses a setting that can't work, saying so in plain words.
+    pub fn validate(&self) -> eyre::Result<()> {
+        if !(1..=336).contains(&self.grant_hours) {
+            eyre::bail!(
+                "[desk.bosses] grant_hours must be 1 to 336 (14 days), not {}.",
+                self.grant_hours
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod desk_bosses_tests {
+    use super::DeskBossesConfig;
+
+    #[test]
+    fn a_grant_lasts_72_hours_unless_set_and_never_past_14_days() {
+        assert_eq!(DeskBossesConfig::default().grant_hours, 72);
+        for ok in [1, 72, 336] {
+            assert!(
+                DeskBossesConfig { grant_hours: ok }.validate().is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [0, 337] {
+            assert!(
+                DeskBossesConfig { grant_hours: bad }.validate().is_err(),
+                "{bad}"
+            );
+        }
+        assert!(toml::from_str::<DeskBossesConfig>("calls = 1").is_err());
+    }
 }
 
 /// `[desk.memory]`: the install's defaults and limits for session memory.
@@ -969,6 +1033,7 @@ impl Default for DeskConfig {
             machine: None,
             forget_agents: Vec::new(),
             memory: DeskMemoryConfig::default(),
+            bosses: DeskBossesConfig::default(),
         }
     }
 }
@@ -11440,6 +11505,7 @@ impl WorkforceConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> eyre::Result<()> {
         self.desk.memory.validate()?;
+        self.desk.bosses.validate()?;
         if self.nats.url.as_deref().is_some_and(str::is_empty) {
             return Err(eyre::eyre!("NATS URL cannot be empty"));
         }
