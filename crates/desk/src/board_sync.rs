@@ -69,6 +69,10 @@ pub enum RemoteError {
     /// A tool the sync may not call.
     #[error("the sync never calls {0}")]
     NotAllowed(String),
+    /// This pass has made all the calls it may: the rest wait for the
+    /// next. Not a failure.
+    #[error("this pass's calls are spent")]
+    Spent,
 }
 
 /// A Jira or Linear reached one way or another, as the person.
@@ -185,8 +189,10 @@ pub fn key_in_target(key: &str, target: &str) -> bool {
 /// that is a JSON object of the keys its tool takes, a label that is one.
 pub fn check_filter(system: System, f: &Filter, me: Option<&str>) -> Result<(), String> {
     match (system, f) {
-        (_, Filter::Label(l)) if l.trim().is_empty() || l.contains('"') || l.len() > 100 => {
-            Err("A label is a word or two, without quotes.".into())
+        (_, Filter::Label(l))
+            if l.trim().is_empty() || l.contains('"') || l.contains('\\') || l.len() > 100 =>
+        {
+            Err("A label is a word or two, without quotes or backslashes.".into())
         }
         (System::Jira, Filter::Query(q)) => check_jql(q),
         (System::Linear, Filter::Query(q)) => linear_query(q).map(|_| ()),
@@ -781,17 +787,16 @@ pub fn nonce() -> String {
     Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
-/// A synced ticket's title on one line, for a list a model reads: its words
-/// defanged and marked as the issue's.
+/// A ticket's title for a list a model reads: a synced one's on one line,
+/// defanged and marked as its issue's words; anyone else's as it is.
 pub fn spoken_title(t: &Ticket) -> String {
-    let one = crate::crew::one_line(&t.title, 120);
     match t.from_remote() {
         Some(system) => format!(
             "«{}» ({} issue's own words)",
-            crate::memory::render::defanged(&one),
+            crate::memory::render::defanged(&crate::crew::one_line(&t.title, 120)),
             system.title()
         ),
-        None => one,
+        None => t.title.clone(),
     }
 }
 

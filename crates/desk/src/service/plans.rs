@@ -1765,7 +1765,7 @@ impl Desk {
             view: runs.view,
             name: key.clone(),
             cwd,
-            goal: board::goal_for(&key, &t.title),
+            goal: board::goal_of(&key, t),
             worktree: branch,
             prompt: Some(board::handed_text(&key, t, &needs)),
             approvals: None,

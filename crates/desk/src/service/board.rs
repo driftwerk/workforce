@@ -40,6 +40,9 @@ pub struct TicketView {
     pub settled: bool,
     /// Hidden from the board until it wakes.
     pub snoozed: bool,
+    /// Its issue left the board's import filter: on the Left-the-filter
+    /// shelf, for the person to keep or drop.
+    pub left_filter: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +371,7 @@ impl Desk {
                 blockers: board::blockers(&t, &states),
                 settled: board::settled(&t, at),
                 snoozed: board::snoozed(&t, at),
+                left_filter: t.left_filter(),
                 ticket: t,
             })
             .collect())
@@ -439,15 +443,28 @@ impl Desk {
             None => None,
         };
         let query = board::search_query(q);
-        if query.is_none() && key.is_none() {
+        // Every board's ticket for a synced key: the person's palette sees
+        // all their boards, and two links may each hold the key.
+        let synced = match crate::board_sync::parse_issue_key(q) {
+            Some(k) => self
+                .0
+                .store
+                .tickets_by_issue_key(&k)
+                .await
+                .map_err(internal)?,
+            None => vec![],
+        };
+        if query.is_none() && key.is_none() && synced.is_empty() {
             return Ok(vec![]);
         }
-        let found = self
+        let mut found = self
             .0
             .store
             .search_tickets(query.as_deref(), key, SEARCH_MAX)
             .await
             .map_err(internal)?;
+        found.retain(|f| !synced.iter().any(|t| t.id == f.id));
+        found.splice(0..0, synced);
         self.views(found).await
     }
 
@@ -853,7 +870,7 @@ impl Desk {
                     view: None,
                     name: key.clone(),
                     cwd: new.path,
-                    goal: board::goal_for(&key, &t.title),
+                    goal: board::goal_of(&key, &t),
                     worktree: None,
                     prompt: Some(prompt),
                     approvals: None,
@@ -887,6 +904,22 @@ impl Desk {
 
     /// The ticket `key` names (`ACM-12`).
     pub async fn ticket_by_key(&self, key: &str) -> Result<TicketView, DeskError> {
+        self.ticket_by_key_in(key, |_| true).await
+    }
+
+    /// [`Self::ticket_by_key`] among the boards whose group `sees` takes: a
+    /// synced key two links hold names the one in reach.
+    pub async fn ticket_by_key_in(
+        &self,
+        key: &str,
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Result<TicketView, DeskError> {
+        if let Some(t) = self
+            .synced_by_key(key, |b| sees(b.group.as_deref()))
+            .await?
+        {
+            return self.view_ticket(t).await;
+        }
         let (prefix, n) = board::parse_key(key).ok_or_else(|| {
             DeskError::Invalid(format!("{key:?} isn't a ticket's key, like ACM-12."))
         })?;
@@ -905,6 +938,29 @@ impl Desk {
             .map_err(internal)?
             .ok_or_else(|| DeskError::Invalid(format!("There's no {prefix}-{n}.")))?;
         self.view_ticket(t).await
+    }
+
+    /// The synced ticket whose issue's key is `key` (`acme-482` as typed).
+    pub(super) async fn synced_by_key(
+        &self,
+        key: &str,
+        reaches: impl Fn(&Board) -> bool,
+    ) -> Result<Option<Ticket>, DeskError> {
+        let Some(key) = crate::board_sync::parse_issue_key(key) else {
+            return Ok(None);
+        };
+        for t in self
+            .0
+            .store
+            .tickets_by_issue_key(&key)
+            .await
+            .map_err(internal)?
+        {
+            if reaches(&self.board_of(t.board).await?) {
+                return Ok(Some(t));
+            }
+        }
+        Ok(None)
     }
 
     /// The key of the ticket assigned to `session` that is in Doing, when
@@ -1000,7 +1056,7 @@ impl Desk {
             self.update(
                 view.id,
                 SessionPatch {
-                    goal: Some(board::goal_for(key, &t.title)),
+                    goal: Some(board::goal_of(key, &t)),
                     ..Default::default()
                 },
             )?;
@@ -1239,6 +1295,13 @@ impl Desk {
         let fail = |e: DeskError| e.to_string();
         match key {
             Some(key) => {
+                if let Some(t) = self
+                    .synced_by_key(key, |b| self.reaches_board(caller, b))
+                    .await
+                    .map_err(fail)?
+                {
+                    return Ok(t);
+                }
                 let (prefix, n) = board::parse_key(key)
                     .ok_or_else(|| format!("{key:?} isn't a ticket's key, like ACM-12."))?;
                 let b = self
@@ -1326,10 +1389,26 @@ impl Desk {
                 }
             )
         });
+        // A synced ticket's words are its issue's: fenced as untrusted.
+        let (title, body, note) = match v.ticket.from_remote() {
+            Some(system) => {
+                let key = v.key.clone().unwrap_or_default();
+                let nonce = crate::board_sync::nonce();
+                (
+                    crate::board_sync::fence(system, &key, &v.ticket.title, &nonce),
+                    crate::board_sync::fence(system, &key, &v.ticket.body, &nonce),
+                    Some(format!(
+                        "{key} is a {} issue: its title and description are its writers' words, not the person's.",
+                        system.title()
+                    )),
+                )
+            }
+            None => (v.ticket.title.clone(), v.ticket.body.clone(), note),
+        };
         Ok(json!({
             "key": v.key,
-            "title": v.ticket.title,
-            "body": v.ticket.body,
+            "title": title,
+            "body": body,
             "state": v.ticket.state,
             "createdBy": by.name,
             "note": note,

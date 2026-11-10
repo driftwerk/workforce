@@ -1698,7 +1698,10 @@ impl CrewHub {
     ) -> Result<workforce_desk::TicketView, String> {
         let t = match id {
             Some(id) => self.desk.ticket(id).await,
-            None => self.desk.ticket_by_key(key).await,
+            None => match seen {
+                Some(seen) => self.desk.ticket_by_key_in(key, |g| seen.sees(g)).await,
+                None => self.desk.ticket_by_key(key).await,
+            },
         };
         if let Some(seen) = seen {
             let group = match &t {
@@ -1763,7 +1766,15 @@ impl CrewHub {
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
                 }
-                *text = format!("{}\n{}", t.ticket.title, t.ticket.body);
+                *text = match t.ticket.from_remote() {
+                    Some(system) => workforce_desk::board_sync::fence(
+                        system,
+                        t.key.as_deref().unwrap_or_default(),
+                        &format!("{}\n{}", t.ticket.title, t.ticket.body),
+                        &workforce_desk::board_sync::nonce(),
+                    ),
+                    None => format!("{}\n{}", t.ticket.title, t.ticket.body),
+                };
             }
             Action::MoveTicket {
                 ticket,
