@@ -197,23 +197,28 @@ impl DeskStore {
         }
     }
 
-    /// The ticket whose issue's key is `key`, on any system.
-    pub async fn ticket_by_issue_key(&self, key: &str) -> Result<Option<Ticket>> {
+    /// Every ticket whose issue's key is `key`, on any system and link,
+    /// latest changed first: two links may each hold one (two clients' hubs
+    /// with a project of one key), so the caller picks the one it reaches.
+    pub async fn tickets_by_issue_key(&self, key: &str) -> Result<Vec<Ticket>> {
         let client = self.pool().get().await?;
-        let id: Option<Uuid> = client
-            .query_opt(
-                "SELECT id FROM tickets WHERE external ->> 'key' = $1 \
-                 ORDER BY updated_at DESC LIMIT 1",
+        let ids: Vec<Uuid> = client
+            .query(
+                "SELECT id FROM tickets WHERE external ->> 'key' = $1 ORDER BY updated_at DESC",
                 &[&key],
             )
             .await?
+            .iter()
             .map(|r| r.try_get(0))
-            .transpose()?;
+            .collect::<std::result::Result<_, _>>()?;
         drop(client);
-        match id {
-            Some(id) => self.ticket(id).await,
-            None => Ok(None),
+        let mut out = vec![];
+        for id in ids {
+            if let Some(t) = self.ticket(id).await? {
+                out.push(t);
+            }
         }
+        Ok(out)
     }
 
     /// Queues `ticket` on `board` to be pushed from `at`. A ticket already

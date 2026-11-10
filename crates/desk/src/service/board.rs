@@ -443,8 +443,18 @@ impl Desk {
             None => None,
         };
         let query = board::search_query(q);
-        let synced = self.synced_by_key(q).await?;
-        if query.is_none() && key.is_none() && synced.is_none() {
+        // Every board's ticket for a synced key: the person's palette sees
+        // all their boards, and two links may each hold the key.
+        let synced = match crate::board_sync::parse_issue_key(q) {
+            Some(k) => self
+                .0
+                .store
+                .tickets_by_issue_key(&k)
+                .await
+                .map_err(internal)?,
+            None => vec![],
+        };
+        if query.is_none() && key.is_none() && synced.is_empty() {
             return Ok(vec![]);
         }
         let mut found = self
@@ -453,10 +463,8 @@ impl Desk {
             .search_tickets(query.as_deref(), key, SEARCH_MAX)
             .await
             .map_err(internal)?;
-        if let Some(t) = synced {
-            found.retain(|f| f.id != t.id);
-            found.insert(0, t);
-        }
+        found.retain(|f| !synced.iter().any(|t| t.id == f.id));
+        found.splice(0..0, synced);
         self.views(found).await
     }
 
@@ -896,7 +904,20 @@ impl Desk {
 
     /// The ticket `key` names (`ACM-12`).
     pub async fn ticket_by_key(&self, key: &str) -> Result<TicketView, DeskError> {
-        if let Some(t) = self.synced_by_key(key).await? {
+        self.ticket_by_key_in(key, |_| true).await
+    }
+
+    /// [`Self::ticket_by_key`] among the boards whose group `sees` takes: a
+    /// synced key two links hold names the one in reach.
+    pub async fn ticket_by_key_in(
+        &self,
+        key: &str,
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Result<TicketView, DeskError> {
+        if let Some(t) = self
+            .synced_by_key(key, |b| sees(b.group.as_deref()))
+            .await?
+        {
             return self.view_ticket(t).await;
         }
         let (prefix, n) = board::parse_key(key).ok_or_else(|| {
@@ -920,15 +941,26 @@ impl Desk {
     }
 
     /// The synced ticket whose issue's key is `key` (`acme-482` as typed).
-    pub(super) async fn synced_by_key(&self, key: &str) -> Result<Option<Ticket>, DeskError> {
+    pub(super) async fn synced_by_key(
+        &self,
+        key: &str,
+        reaches: impl Fn(&Board) -> bool,
+    ) -> Result<Option<Ticket>, DeskError> {
         let Some(key) = crate::board_sync::parse_issue_key(key) else {
             return Ok(None);
         };
-        self.0
+        for t in self
+            .0
             .store
-            .ticket_by_issue_key(&key)
+            .tickets_by_issue_key(&key)
             .await
-            .map_err(internal)
+            .map_err(internal)?
+        {
+            if reaches(&self.board_of(t.board).await?) {
+                return Ok(Some(t));
+            }
+        }
+        Ok(None)
     }
 
     /// The key of the ticket assigned to `session` that is in Doing, when
@@ -1263,11 +1295,12 @@ impl Desk {
         let fail = |e: DeskError| e.to_string();
         match key {
             Some(key) => {
-                if let Some(t) = self.synced_by_key(key).await.map_err(fail)? {
-                    let b = self.board_of(t.board).await.map_err(fail)?;
-                    if self.reaches_board(caller, &b) {
-                        return Ok(t);
-                    }
+                if let Some(t) = self
+                    .synced_by_key(key, |b| self.reaches_board(caller, b))
+                    .await
+                    .map_err(fail)?
+                {
+                    return Ok(t);
                 }
                 let (prefix, n) = board::parse_key(key)
                     .ok_or_else(|| format!("{key:?} isn't a ticket's key, like ACM-12."))?;

@@ -1698,7 +1698,10 @@ impl CrewHub {
     ) -> Result<workforce_desk::TicketView, String> {
         let t = match id {
             Some(id) => self.desk.ticket(id).await,
-            None => self.desk.ticket_by_key(key).await,
+            None => match seen {
+                Some(seen) => self.desk.ticket_by_key_in(key, |g| seen.sees(g)).await,
+                None => self.desk.ticket_by_key(key).await,
+            },
         };
         if let Some(seen) = seen {
             let group = match &t {
