@@ -96,7 +96,7 @@ pub enum Wait {
     /// It is asking the person something: only the person answers it.
     Asking,
     /// The person has the wheel of a session a boss runs: the boss's
-    /// messages wait until they hand it back.
+    /// messages wait until their hold is up or they hand it back.
     PersonDriving,
 }
 

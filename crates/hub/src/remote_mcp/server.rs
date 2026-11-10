@@ -212,10 +212,17 @@ async fn serve(
             return (StatusCode::INTERNAL_SERVER_ERROR, "session unavailable").into_response();
         }
     };
-    let surface = remote.surface_for(&service);
+    let mut surface = remote.surface_for(&service);
+    if caller.as_member {
+        surface = Arc::new(device_surface(&surface));
+    }
+    let mut gates = service.tool_gates(crate::desk_surface::allows());
+    if caller.as_member {
+        held_to_member(&mut gates);
+    }
     let executor = GatedExecutor {
         site: CallSite {
-            gates: service.tool_gates(crate::desk_surface::allows()),
+            gates,
             policy: Arc::clone(&service.policy),
             surface: Surface::Fixed(Arc::clone(&surface)),
             access: service.tool_access_snapshot(),
@@ -258,6 +265,57 @@ async fn serve(
         )
             .into_response(),
         None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// What a token a paired device minted may call besides the board sync's
+/// own Jira and Linear tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
+/// by exact name, within what the hub exposes anyway. Never `agent.*` (a
+/// delegated turn runs with the person's own role), `approval.*`, `vault.*`,
+/// `jira.api`, a delete, an assign or a bulk change.
+pub const DEVICE_SURFACE_EXTRA: &[&str] = &["help", "identity.whoami"];
+
+/// `surface` narrowed to the device surface, by exact names only.
+fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
+    let narrowed = ToolRegistry::empty_like(surface);
+    workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+        .iter()
+        .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        .chain(DEVICE_SURFACE_EXTRA)
+        .filter_map(|name| surface.get(name))
+        .for_each(|tool| narrowed.register(tool));
+    narrowed
+}
+
+/// `gates` for a token a paired device minted: scored as a member whatever
+/// the person's role. A gate that can't be held to that is replaced by one
+/// refusing every privileged call, so the token never carries an admin's
+/// powers.
+fn held_to_member(gates: &mut workforce_agent::tools::dispatch::ToolGates) {
+    gates.role = Some("member".to_string());
+    gates.capability_gate = Some(
+        gates
+            .capability_gate
+            .as_ref()
+            .and_then(|g| g.as_member())
+            .unwrap_or_else(|| Arc::new(NoPrivilegedCalls)),
+    );
+}
+
+/// Refuses every call that needs a capability.
+struct NoPrivilegedCalls;
+
+impl workforce_agent::runner::CapabilityGate for NoPrivilegedCalls {
+    fn deny_reason(
+        &self,
+        _user_id: &str,
+        _agent_id: &str,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
+        crate::authz::tool_capability(tool, input).map(|_| {
+            format!("{tool} needs an administrator; a token a device minted acts as a member")
+        })
     }
 }
 
@@ -886,6 +944,75 @@ mod tests {
             runs: Arc::clone(&runs),
         }));
         (Arc::new(surface), runs)
+    }
+
+    /// An admin's call through a token a device minted is gated as a
+    /// member's: a tool needing an admin is refused at `tools/call`, and the
+    /// same call through the admin's own token runs.
+    #[tokio::test]
+    async fn a_device_minted_token_gets_an_admin_no_admin_tools() {
+        let identities =
+            Arc::new(workforce_identity::sqlite::SqliteIdentityStore::in_memory().unwrap());
+        let admin = Identity::new("Admin", IdentityRole::SystemAdmin);
+        identities.create(&admin).unwrap();
+        let surface = Arc::new(registry(&["agent.create"]));
+        let gate: Arc<dyn CapabilityGate> = Arc::new(crate::cap_gate::HubCapabilityGate::new(
+            Some(identities as Arc<dyn IdentityStore>),
+            Arc::new(parking_lot::RwLock::new(Arc::new(
+                crate::authz::CapabilityMatrix::default(),
+            ))),
+        ));
+        let with = |held: bool| {
+            let mut exec = executor_as(
+                &admin.id.to_string(),
+                Arc::clone(&surface),
+                None,
+                CascadeState::Allow,
+                &Bridge::default(),
+            );
+            exec.site.gates.capability_gate = Some(Arc::clone(&gate));
+            if held {
+                held_to_member(&mut exec.site.gates);
+            }
+            exec
+        };
+        let (is_error, text) = text_of(&call(&surface, with(false), "agent_create").await);
+        assert!(!is_error, "{text}");
+        let (is_error, text) = text_of(&call(&surface, with(true), "agent_create").await);
+        assert!(is_error, "{text}");
+        assert!(text.contains("SystemAdmin"), "{text}");
+        // A gate that can't be held to a member refuses privileged calls.
+        let mut exec = with(false);
+        exec.site.gates.capability_gate = Some(Arc::new(FixedCapability(None)));
+        held_to_member(&mut exec.site.gates);
+        let (is_error, _) = text_of(&call(&surface, exec, "agent_create").await);
+        assert!(is_error);
+    }
+
+    /// A device's token sees only the board sync's tools: no `agent.*`
+    /// (whose turns run with the person's own role), approvals or vault.
+    #[test]
+    fn a_device_minted_token_sees_only_the_sync_tools() {
+        let source = registry(&[
+            "jira.search",
+            "jira.api",
+            "jira.delete_issue",
+            "jira.assign_issue",
+            "linear.issue_list",
+            "linear.issue_bulk_update",
+            "linear.document_delete",
+            "vault.get",
+            "workflow",
+            "help",
+        ]);
+        let extra: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Named("agent.chat")),
+            Arc::new(Named("approval.decide")),
+        ];
+        let full = curated_surface(&source, &extra, &["*".to_string()]);
+        let mut names = device_surface(&full).names();
+        names.sort();
+        assert_eq!(names, ["help", "jira.search", "linear.issue_list"]);
     }
 
     #[tokio::test]

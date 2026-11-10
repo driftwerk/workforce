@@ -245,6 +245,7 @@ impl Desk {
             name,
             group: self.board_group(new.group)?,
             prefix: Some(prefix),
+            sync: None,
             next_number: 1,
             created_at: at,
             updated_at: at,
@@ -280,9 +281,18 @@ impl Desk {
             b.name = name;
         }
         if let Some(group) = patch.group {
-            b.group = self.board_group(group)?;
+            let group = self.board_group(group)?;
+            // A link belongs to one group: its issues never go to another.
+            if group != b.group && b.sync.is_some() {
+                return Err(DeskError::Conflict(format!(
+                    "{} is synced with {}; unlink it before moving it to another group.",
+                    b.name,
+                    b.sync.as_ref().map_or("", |s| s.target.as_str())
+                )));
+            }
+            b.group = group;
         }
-        if let Some(p) = patch.prefix {
+        if let Some(p) = patch.prefix.filter(|_| b.sync.is_none()) {
             let p = p.trim().to_ascii_uppercase();
             if b.prefix.as_deref() != Some(p.as_str()) {
                 board::check_prefix(&p).map_err(DeskError::Invalid)?;
@@ -568,6 +578,7 @@ impl Desk {
             assignee: None,
             needs: new.needs,
             links: vec![],
+            external: None,
             created_by: by.party.clone(),
             pinned: false,
             snoozed_until: None,

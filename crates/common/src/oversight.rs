@@ -8,7 +8,7 @@
 //! group = "g-acme" # absent: everything ungrouped
 //! level = "watch" # watch | suggest | act
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
-//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true }
+//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true, hold_minutes = 2 }
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
@@ -39,6 +39,11 @@
 //! and tasks to agents) or `message_terminal_sessions` (nudges to those
 //! sessions) is on. Words that read as pushing, deleting or sending still
 //! make any action a suggestion.
+//!
+//! A session in its charge is the person's while they are active in it:
+//! `hold_minutes` after their last keystroke, prompt or message there. What
+//! the session asks after that is the overseer's to answer; what it asks
+//! while they are still typing waits for them.
 //!
 //! Check-ins are spent from a rolling hour, `max_checkins_per_day` the
 //! ceiling over a day; what happens while they are spent waits for the next
@@ -98,6 +103,9 @@ pub struct Wake {
     /// A session's message to it on Desk's line wakes it; off, sessions'
     /// questions go to the person.
     pub on_message: bool,
+    /// How long the person's last input into a session it runs keeps that
+    /// session theirs.
+    pub hold_minutes: u32,
 }
 
 /// The local times of the morning and evening summaries, `None` when off.
@@ -201,6 +209,11 @@ pub const MAX_MINUTES: i64 = 1440;
 pub const MAX_CHECKINS: i64 = 500;
 /// The most check-ins an hour may allow: one a minute.
 pub const MAX_CHECKINS_PER_HOUR: i64 = 60;
+/// How long, by default, the person's last input into a session the
+/// overseer runs keeps it theirs.
+pub const HOLD_MINUTES: u32 = 2;
+/// The longest that hold may be: an hour.
+pub const MAX_HOLD_MINUTES: i64 = 60;
 
 impl Default for Oversight {
     fn default() -> Self {
@@ -221,6 +234,7 @@ impl Default for Oversight {
                 on_finish: true,
                 on_failure: true,
                 on_message: true,
+                hold_minutes: HOLD_MINUTES,
             },
             summaries: Summaries {
                 morning: Some((9, 0)),
@@ -446,6 +460,15 @@ impl Oversight {
                     d.wake.on_message,
                     "answering when a session asks it something",
                 )?,
+                hold_minutes: whole(
+                    wake,
+                    "hold_minutes",
+                    d.wake.hold_minutes,
+                    1..=MAX_HOLD_MINUTES,
+                    &format!(
+                        "How long your typing in a session keeps it yours must be a whole number of minutes from 1 to {MAX_HOLD_MINUTES}."
+                    ),
+                )?,
             },
             summaries: Summaries {
                 morning: time(summaries, "morning", d.summaries.morning, "morning")?,
@@ -583,6 +606,32 @@ mod tests {
             parse("[oversight]\nwake = { on_message = 1 }\n").unwrap_err(),
             "Whether answering when a session asks it something is on or off must be true or false."
         );
+    }
+
+    #[test]
+    fn the_persons_hold_is_two_minutes_unless_said_and_said_plainly_when_wrong() {
+        assert_eq!(
+            parse("[oversight]\nenabled = true\n")
+                .unwrap()
+                .wake
+                .hold_minutes,
+            2
+        );
+        assert_eq!(
+            parse("[oversight.wake]\nhold_minutes = 5\n")
+                .unwrap()
+                .wake
+                .hold_minutes,
+            5
+        );
+        let wrong = "How long your typing in a session keeps it yours must be a whole number of minutes from 1 to 60.";
+        for bad in ["0", "61", "\"2\"", "1.5"] {
+            assert_eq!(
+                parse(&format!("[oversight]\nwake = {{ hold_minutes = {bad} }}\n")).unwrap_err(),
+                wrong,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

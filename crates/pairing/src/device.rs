@@ -149,6 +149,12 @@ impl DevicePairingService {
         Ok(())
     }
 
+    /// The paired device `device_id`, revoked or not; `None` when there is
+    /// no such device.
+    pub fn device(&self, device_id: &str) -> Result<Option<ApprovedDevice>> {
+        self.store.get_device_by_id(device_id)
+    }
+
     /// List all paired devices.
     pub fn list_devices(&self) -> Result<Vec<ApprovedDevice>> {
         self.store.list_devices()

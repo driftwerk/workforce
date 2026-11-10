@@ -2,8 +2,9 @@
 //! one the boss orchestrates over its line, is woken for at each turn's end,
 //! and answers for. The person can always take the wheel: typing in its
 //! terminal, prompting it or writing to it puts it in their hands, and the
-//! boss's messages wait until it comes back, by click or after
-//! [`QUIET`] with the session idle.
+//! boss's messages wait until it comes back, by click or once they have
+//! given it no input for the hold ([`HOLD`] unless the boss's settings say
+//! otherwise).
 //!
 //! Desk says "take on" and "release" here: picking up a session from
 //! another terminal is [`crate::adopt`]'s, and is something else.
@@ -40,7 +41,8 @@ text_enum!(How {
 #[serde(rename_all = "snake_case")]
 pub enum Wheel {
     Boss,
-    /// The person: back to the boss after [`QUIET`] with the session idle.
+    /// The person: back to the boss once they have given the session no
+    /// input for the hold ([`HOLD`] by default).
     Person,
     /// The person, until they hand it back.
     PersonPinned,
@@ -70,9 +72,15 @@ impl Wheel {
     }
 }
 
-/// How long the person's wheel lasts with no input from them and the
-/// session idle, before it goes back to the boss.
-pub const QUIET: chrono::Duration = chrono::Duration::minutes(10);
+/// How long the person's wheel lasts after their last input (a keystroke,
+/// a prompt, a message) before it goes back to the boss, unless the boss's
+/// `[oversight.wake] hold_minutes` says otherwise.
+pub const HOLD: chrono::Duration = chrono::Duration::minutes(2);
+
+/// How often, at most, Desk's window says the person is typing in a
+/// session's composer (`POST /api/desk/sessions/{id}/typing`): well inside
+/// the shortest hold.
+pub const TYPING_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// One session's charge, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,28 +203,19 @@ pub fn busy(charges: &[Charge], states: &HashMap<Uuid, SessionState>) -> usize {
         .count()
 }
 
-/// Whether a session in `state` is idle: the person's wheel comes back to
-/// the boss only then.
-fn idle(state: SessionState) -> bool {
-    !matches!(
-        state,
-        SessionState::Starting | SessionState::Working | SessionState::Blocked
-    )
-}
-
 /// Who has the wheel of `c` at `now`, given when the person last gave the
-/// session input (typed in its terminal, prompted it, wrote to it), its
-/// state, and since when it is in that state. Only input since the boss
-/// last had the wheel counts: since it was charged, or handed back. The
-/// person keeps it while they give input, and while the session works on
-/// it; it comes back after [`QUIET`] with no input and the session idle
-/// all that time, unless they pinned it. A long turn the person started
-/// keeps it theirs for [`QUIET`] after it ends.
+/// session input (typed in its terminal, prompted it, wrote to it) and how
+/// long that input holds it (`hold`). Only input since the boss last had
+/// the wheel counts: since it was charged, or handed back. The person keeps
+/// it only while they are active, `hold` after their last input (or after
+/// they took it by a click); then it is the boss's again, whatever the
+/// session is doing, unless they pinned it. So a question or request the
+/// session raises once they have stopped is the boss's to answer, and one
+/// raised while they are still typing waits for them.
 pub fn wheel(
     c: &Charge,
     last_person_input: Option<DateTime<Utc>>,
-    state: SessionState,
-    state_since: Option<DateTime<Utc>>,
+    hold: chrono::Duration,
     now: DateTime<Utc>,
 ) -> Wheel {
     let taken = match c.wheel {
@@ -229,16 +228,9 @@ pub fn wheel(
         Wheel::Person | Wheel::PersonPinned => c.since,
     };
     let input = last_person_input.filter(|t| *t > boss_since);
-    let Some(last) = taken.max(input) else {
-        return Wheel::Boss;
-    };
-    // Quiet from whichever came later: their last input, or the session
-    // coming to rest (unknown is now: it has only just been seen idle).
-    let quiet_from = last.max(state_since.unwrap_or(now));
-    if idle(state) && now - quiet_from >= QUIET {
-        Wheel::Boss
-    } else {
-        Wheel::Person
+    match taken.max(input) {
+        Some(last) if now - last < hold => Wheel::Person,
+        _ => Wheel::Boss,
     }
 }
 
@@ -700,84 +692,55 @@ mod tests {
     }
 
     #[test]
-    fn the_persons_input_takes_the_wheel_and_ten_quiet_minutes_give_it_back() {
+    fn the_persons_input_holds_the_wheel_only_while_they_are_active() {
         let now = Utc::now();
+        let secs = |s: i64| now - chrono::Duration::seconds(s);
         let ago = |m: i64| now - chrono::Duration::minutes(m);
         let mut c = Charge::new(Uuid::new_v4(), "sarah", How::Handed, None);
         c.since = ago(60);
-        let idle = SessionState::Idle;
-        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Boss);
+        assert_eq!(wheel(&c, None, HOLD, now), Wheel::Boss);
         assert_eq!(
-            wheel(&c, Some(ago(61)), idle, Some(ago(60)), now),
+            wheel(&c, Some(ago(61)), HOLD, now),
             Wheel::Boss,
             "input before the charge doesn't count"
         );
         assert_eq!(
-            wheel(&c, Some(ago(1)), idle, Some(ago(60)), now),
-            Wheel::Person
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(9)), idle, Some(ago(60)), now),
-            Wheel::Person
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(10)), idle, Some(ago(60)), now),
-            Wheel::Boss
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(30)), SessionState::Working, Some(ago(60)), now),
+            wheel(&c, Some(secs(30)), HOLD, now),
             Wheel::Person,
-            "it stays the person's while the session works on what they said"
+            "30 seconds after their last keystroke they are still at it"
         );
         assert_eq!(
-            wheel(&c, Some(ago(30)), SessionState::Blocked, Some(ago(60)), now),
-            Wheel::Person
+            wheel(&c, Some(ago(3)), HOLD, now),
+            Wheel::Boss,
+            "3 minutes after it, an ask is the boss's"
         );
+        assert_eq!(
+            wheel(&c, Some(ago(2)), HOLD, now),
+            Wheel::Boss,
+            "the hold is up at 2 minutes"
+        );
+        // A longer hold, as the boss's settings say.
+        let five = chrono::Duration::minutes(5);
+        assert_eq!(wheel(&c, Some(ago(3)), five, now), Wheel::Person);
+        assert_eq!(wheel(&c, Some(ago(5)), five, now), Wheel::Boss);
 
         // Handed back: what they typed before doesn't take it again.
         c.wheel = Wheel::Boss;
-        c.wheel_since = Some(ago(2));
-        assert_eq!(
-            wheel(&c, Some(ago(3)), idle, Some(ago(60)), now),
-            Wheel::Boss
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(1)), idle, Some(ago(60)), now),
-            Wheel::Person
-        );
+        c.wheel_since = Some(secs(90));
+        assert_eq!(wheel(&c, Some(secs(100)), HOLD, now), Wheel::Boss);
+        assert_eq!(wheel(&c, Some(secs(10)), HOLD, now), Wheel::Person);
 
-        // Taken by a click with no input since: it still comes back.
+        // Taken by a click with no input since: it comes back after the hold.
         c.wheel = Wheel::Person;
-        c.wheel_since = Some(ago(11));
-        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Boss);
-        c.wheel_since = Some(ago(5));
-        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Person);
-
-        // A long turn the person started: quiet counts from its end.
-        c.wheel = Wheel::Boss;
-        c.wheel_since = None;
-        assert_eq!(
-            wheel(&c, Some(ago(30)), idle, Some(ago(1)), now),
-            Wheel::Person,
-            "it only just came to rest"
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(30)), idle, Some(ago(10)), now),
-            Wheel::Boss
-        );
-        assert_eq!(
-            wheel(&c, Some(ago(30)), idle, None, now),
-            Wheel::Person,
-            "not known when it came to rest: from now"
-        );
+        c.wheel_since = Some(ago(3));
+        assert_eq!(wheel(&c, None, HOLD, now), Wheel::Boss);
+        c.wheel_since = Some(secs(60));
+        assert_eq!(wheel(&c, None, HOLD, now), Wheel::Person);
 
         // Pinned, it stays.
         c.wheel = Wheel::PersonPinned;
         c.wheel_since = Some(ago(600));
-        assert_eq!(
-            wheel(&c, None, idle, Some(ago(60)), now),
-            Wheel::PersonPinned
-        );
+        assert_eq!(wheel(&c, None, HOLD, now), Wheel::PersonPinned);
     }
 
     #[test]

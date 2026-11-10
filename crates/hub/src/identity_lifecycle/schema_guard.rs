@@ -188,6 +188,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     ("desk", "attachments", "owner", By(C::Sessions)),
     ("desk", "connections", "person", By(C::Vault)),
+    ("desk", "sync_hubs", "person", By(C::Vault)),
     (
         "desk",
         "engine_account_identities",

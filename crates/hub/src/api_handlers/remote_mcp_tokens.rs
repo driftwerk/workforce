@@ -29,6 +29,7 @@ fn rejection(e: TokenError) -> Rejection {
         TokenError::InvalidLabel => err(StatusCode::BAD_REQUEST, &e.to_string()),
         TokenError::IdentityNotActive => err(StatusCode::FORBIDDEN, &e.to_string()),
         TokenError::TokenCap(_) => err(StatusCode::CONFLICT, &e.to_string()),
+        TokenError::DevicesNotAllowed => err(StatusCode::FORBIDDEN, &e.to_string()),
         TokenError::Store(inner) => {
             tracing::warn!(error = %inner, "remote MCP token store error");
             err(StatusCode::INTERNAL_SERVER_ERROR, "token store error")
@@ -95,12 +96,17 @@ pub struct TokenView {
     expires_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
     expired: bool,
+    /// The paired device that minted it, when one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minted_by_device: Option<String>,
 }
 
 impl TokenView {
     fn new(token: RemoteMcpToken, now: DateTime<Utc>) -> Self {
         Self {
             expired: is_expired(&token, now),
+            minted_by_device: crate::remote_mcp::tokens::minted_by_device(&token.scopes)
+                .map(str::to_owned),
             fingerprint: token.fingerprint(),
             id: token.id,
             label: token.label,
@@ -168,6 +174,94 @@ pub async fn create_my_token(
     enforce_action_rate_limit(&state, &identity.to_string())?;
     let minted = service(&state)?
         .mint(identity, &body.label)
+        .map_err(rejection)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedTokenResponse {
+            id: minted.record.id,
+            label: minted.record.label,
+            token: minted.plaintext,
+            expires_at: minted.record.expires_at,
+            connect: ConnectView {
+                claude_code: minted.connect.claude_code,
+                workforce_local: minted.connect.workforce_local,
+            },
+        }),
+    ))
+}
+
+/// The paired device a request's bearer is, and the person it is linked
+/// to. Only a device token is taken here: a login or the hub's own token is
+/// refused, so this route is never a second way for a person to mint.
+async fn paired_device(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> Result<(workforce_pairing::ApprovedDevice, Uuid), Rejection> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Unauthorized"))?;
+    let pairing = state.device_pairing.as_ref().ok_or_else(|| {
+        err(
+            StatusCode::FORBIDDEN,
+            "This endpoint takes a paired device's token",
+        )
+    })?;
+    let device = match pairing.validate_token_async(bearer.to_string()).await {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "This endpoint takes a paired device's token",
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pairing store error minting a device's remote MCP token");
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hub could not check that device",
+            ));
+        }
+    };
+    let person = state
+        .identity_store
+        .as_ref()
+        .and_then(|store| crate::device_link::identity_for_device(store.as_ref(), &device.id))
+        .and_then(|id| Uuid::parse_str(&id).ok())
+        .ok_or_else(|| {
+            err(
+                StatusCode::FORBIDDEN,
+                "This device isn't linked to a person here, so it can't act for anyone",
+            )
+        })?;
+    // Only Desk on a computer mints: not a phone, a voice box or the rest.
+    let desktop = state
+        .identity_store
+        .as_ref()
+        .is_some_and(|store| crate::device_link::is_desktop_device(store.as_ref(), &device.id));
+    if !desktop {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "Only Desk on a computer makes its own token here",
+        ));
+    }
+    Ok((device, person))
+}
+
+/// `POST /api/me/remote-mcp-tokens/desk`: a paired Desk mints a token for
+/// the person it is linked to, when `[remote_mcp] allow_device_tokens` is
+/// on. The token is the person's with a member's capabilities only, named
+/// "Desk on <device>", and dies with the device's pairing.
+pub async fn create_device_token(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<CreatedTokenResponse>), Rejection> {
+    let service = service(&state)?;
+    let (device, person) = paired_device(&state, &headers).await?;
+    enforce_action_rate_limit(&state, &person.to_string())?;
+    let minted = service
+        .mint_for_device(person, &device.id, &device.device_name)
         .map_err(rejection)?;
     Ok((
         StatusCode::CREATED,
@@ -269,6 +363,71 @@ mod tests {
         let text = json.to_string();
         for start in 0..=body.len() - 6 {
             assert!(!text.contains(&body[start..start + 6]));
+        }
+    }
+
+    async fn mint_as(
+        state: &Arc<GatewayState>,
+        bearer: &str,
+    ) -> Result<serde_json::Value, StatusCode> {
+        create_device_token(
+            State(Arc::clone(state)),
+            crate::remote_mcp::testing::bearer(bearer),
+        )
+        .await
+        .map(|(_, Json(body))| serde_json::to_value(body).unwrap())
+        .map_err(|(status, _)| status)
+    }
+
+    /// The four answers the device-token decision asked for, at the route:
+    /// off is refused, on mints the identity's member-scoped token, and
+    /// neither a login nor the hub's own token mints here.
+    #[tokio::test]
+    async fn a_paired_device_mints_only_where_the_hub_allows_it() {
+        use crate::remote_mcp::testing::{fixture_with_devices, pair_device};
+        use workforce_identity::store::IdentityStore;
+        for allowed in [false, true] {
+            let (fx, devices) = fixture_with_devices(allowed);
+            let mut me = workforce_identity::types::Identity::new("Sam", IdentityRole::Member);
+            fx.identities.create(&me).unwrap();
+            let (device, bearer) = pair_device(&fx, &devices, &mut me, "Sam's Mac");
+            let minted = mint_as(&fx.state, &bearer).await;
+            if !allowed {
+                assert_eq!(minted.unwrap_err(), StatusCode::FORBIDDEN);
+                continue;
+            }
+            let body = minted.unwrap();
+            assert_eq!(body["label"], "Desk on Sam's Mac");
+            let token = body["token"].as_str().unwrap();
+            let caller = crate::remote_mcp::auth::authenticate(
+                &fx.state,
+                &crate::remote_mcp::testing::bearer(token),
+            )
+            .unwrap();
+            assert_eq!(caller.identity.id, me.id);
+            assert!(caller.as_member);
+            assert_eq!(
+                crate::remote_mcp::tokens::minted_by_device(&caller.token.scopes),
+                Some(device.id.as_str())
+            );
+            // A phone paired to the same person doesn't mint.
+            let (_, phone) = crate::remote_mcp::testing::pair_device_as(
+                &fx,
+                &devices,
+                &mut me,
+                "Sam's phone",
+                "ios_device",
+            );
+            assert_eq!(
+                mint_as(&fx.state, &phone).await.unwrap_err(),
+                StatusCode::FORBIDDEN
+            );
+            for not_a_device in ["gateway-token", "eyJhbGciOi.not.a.jwt"] {
+                assert_eq!(
+                    mint_as(&fx.state, not_a_device).await.unwrap_err(),
+                    StatusCode::FORBIDDEN
+                );
+            }
         }
     }
 

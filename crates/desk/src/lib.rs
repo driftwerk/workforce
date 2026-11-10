@@ -10,6 +10,8 @@ mod background;
 pub mod board;
 mod board_api;
 pub mod board_store;
+pub mod board_sync;
+pub mod board_sync_store;
 pub mod breaker;
 pub mod budget_store;
 pub mod charge;
@@ -87,6 +89,7 @@ pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
     BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
 };
+pub use service::{check_hub_id, check_hub_url, LinkBoard};
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
     Import, Imported, Layout, LedgerPage, LineError, MemoryHitView, MemorySearch, NewTerminal,

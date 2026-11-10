@@ -2231,6 +2231,15 @@ pub trait CapabilityGate: Send + Sync {
     fn lost(&self, _user_id: &str, _tool: &str, _input: &serde_json::Value) -> bool {
         false
     }
+
+    /// This gate as it would decide for a member: whoever the caller is,
+    /// scored with a member's capabilities. For a credential that must never
+    /// carry its holder's admin role (a token a paired device minted).
+    /// `None` when the gate can't be held to that, and the caller must then
+    /// refuse every privileged call itself.
+    fn as_member(&self) -> Option<Arc<dyn CapabilityGate>> {
+        None
+    }
 }
 
 /// Combine the PolicyEngine decision with a cascade state, returning

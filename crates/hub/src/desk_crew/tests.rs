@@ -3489,6 +3489,37 @@ async fn set_to_take_on_every_session_it_does_but_never_one_taken_back() {
     .await;
 }
 
+/// How long the person's typing keeps a session theirs is the overseer's
+/// `[oversight.wake] hold_minutes`, 2 when it says nothing, and Desk holds
+/// its sessions for that long.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseers_hold_minutes_are_how_long_desk_holds_its_sessions_for_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let id = overseer.agent_id.as_str().to_string();
+        crew.overseers();
+        assert_eq!(d.hold_for(&id), chrono::Duration::minutes(2));
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nhold_minutes = 5\n",
+        );
+        eventually("the new hold", async || {
+            crew.overseers();
+            (d.hold_for(&id) == chrono::Duration::minutes(5)).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
 /// The overseer answers for a session it runs all but what can't be
 /// undone, denies and interrupts it whatever `[oversight.act]` says of
 /// other sessions, and only suggests while the person drives it; a
