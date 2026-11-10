@@ -40,8 +40,8 @@ const ORIGINATOR: &str = "workforce";
 const USER_AGENT_VALUE: &str = concat!("workforce/", env!("CARGO_PKG_VERSION"));
 
 /// Context window of every model the backend serves on a ChatGPT plan but
-/// gpt-6.1-sol (codex `models.json`).
-const CONTEXT_WINDOW: u32 = 272_000;
+/// gpt-6.1-sol (codex `models.json`), and of one it hasn't said.
+pub const CONTEXT_WINDOW: u32 = 272_000;
 
 /// A reasoning item rides in a [`ContentBlock::Thinking`] signature under
 /// this prefix, so it round-trips through the runner untouched.
@@ -187,6 +187,23 @@ impl ChatGptModel {
         learned
             .iter()
             .chain(Self::ALL)
+            .copied()
+            .find(|m| m.id == name)
+            .ok_or_else(|| {
+                if RETIRED_MODELS.contains(&name) {
+                    UnsupportedModel::Retired(name.to_string())
+                } else {
+                    UnsupportedModel::Unknown(name.to_string())
+                }
+            })
+    }
+
+    /// The built-in model for `name`, whatever the live catalogue says: what
+    /// a config check reads, so its answer doesn't depend on whether the
+    /// catalogue has been read yet.
+    pub fn parse_built_in(name: &str) -> Result<Self, UnsupportedModel> {
+        Self::ALL
+            .iter()
             .copied()
             .find(|m| m.id == name)
             .ok_or_else(|| {

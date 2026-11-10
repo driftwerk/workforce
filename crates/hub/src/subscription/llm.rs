@@ -528,12 +528,16 @@ impl LlmProvider for SubscriptionProvider {
         Ok(())
     }
 
+    /// A model the hub hasn't learned yet is held to the backend's usual
+    /// window, never the default model's larger one.
     async fn context_floor(&self, model: &str) -> Option<u32> {
-        Some(
-            ChatGptModel::parse(model)
-                .unwrap_or(DEFAULT_MODEL)
-                .context_window(),
-        )
+        Some(match model.trim() {
+            "" => DEFAULT_MODEL.context_window(),
+            name => ChatGptModel::parse(name).map_or(
+                workforce_agent::llm::responses::CONTEXT_WINDOW,
+                ChatGptModel::context_window,
+            ),
+        })
     }
 
     /// Always passes: a login is resolved per call, for a payer that only

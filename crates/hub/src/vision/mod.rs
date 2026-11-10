@@ -170,8 +170,14 @@ pub(crate) fn route(
             kind.canonical_name()
         ));
     }
+    // A retired model is refused; one the hub wasn't built with is left to
+    // the plan's live catalogue, read when it is first called.
     if kind == ProviderKind::ChatGpt {
-        ChatGptModel::parse(&model).map_err(|e| eyre!("[llm.vision] model: {e}"))?;
+        if let Err(retired @ workforce_agent::llm::responses::UnsupportedModel::Retired(_)) =
+            ChatGptModel::parse_built_in(&model)
+        {
+            return Err(eyre!("[llm.vision] model: {retired}"));
+        }
     }
     Ok((kind, model))
 }
@@ -260,7 +266,7 @@ mod tests {
             ("cheap", "'cheap' names no known provider"),
             ("grok:cheap", "the cheap tier of 'grok'"),
             ("openai:standard", "the standard tier of 'openai'"),
-            ("chatgpt:gpt-4o", "gpt-4o is not served on a ChatGPT plan"),
+            ("chatgpt:gpt-5.5", "gpt-5.5 retired from ChatGPT sign-ins"),
         ] {
             let config = vision(spec);
             let error = routed(&config).unwrap_err().to_string();

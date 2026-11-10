@@ -291,6 +291,29 @@ fn default_pricing() -> HashMap<String, ModelPricing> {
 
 // ─── CostTracker ─────────────────────────────────────────────────────────────
 
+/// Whether `model` is a cost key of a subscription plan's route.
+fn is_plan_route(model: &str) -> bool {
+    ["chatgpt:", "claude-code:", "codex:"]
+        .iter()
+        .any(|route| model.starts_with(route))
+}
+
+/// Say once per model that a plan call on it has no price.
+fn warn_unpriced_once(model: &str) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(model.to_string());
+    if first {
+        tracing::info!(
+            model,
+            "no price for this plan model yet: its calls are counted without a cost"
+        );
+    }
+}
+
 impl CostTracker {
     pub fn new() -> Self {
         Self {
@@ -431,6 +454,14 @@ impl CostTracker {
                 + (output_tokens as f64 * p.output_per_million / 1_000_000.0)
                 + (cache_creation_input_tokens as f64 * cache_write_rate / 1_000_000.0)
                 + (cache_read_input_tokens as f64 * cache_read_rate / 1_000_000.0)
+        } else if is_plan_route(model) {
+            // A call on a subscription plan (`chatgpt:`, `claude-code:`,
+            // `codex:`) is paid by the plan; one on a model released since
+            // the table was written has no price, and none is invented for
+            // it: it adds nothing to spend totals, and Desk shows its price
+            // as unknown.
+            warn_unpriced_once(model);
+            0.0
         } else {
             // Default estimate for unknown models ($3/$15 per M — Sonnet-tier).
             // Cache rates default to 0.10× / 1.25× of the input rate.
@@ -852,6 +883,26 @@ mod tests {
         let tracker = CostTracker::new();
         let cost = tracker.calculate_cost("unknown-model", 1_000_000, 1_000_000, 0, 0);
         assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn a_plan_model_without_a_price_costs_nothing_rather_than_a_guess() {
+        let tracker = CostTracker::new();
+        for model in [
+            "chatgpt:gpt-6.2-nova",
+            "claude-code:claude-fable-5-2",
+            "codex:gpt-6.2-nova",
+        ] {
+            assert!(!tracker.is_priced(model));
+            assert_eq!(
+                tracker.calculate_cost(model, 1_000_000, 1_000_000, 0, 0),
+                0.0,
+                "{model}"
+            );
+        }
+        // A metered model without a price is still estimated, so budgets
+        // still see it.
+        assert!(tracker.calculate_cost("some-new-api-model", 1_000_000, 0, 0, 0) > 0.0);
     }
 
     #[test]

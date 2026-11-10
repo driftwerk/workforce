@@ -334,25 +334,34 @@ pub fn removed_provider_finding(spec: &str) -> Option<Finding> {
     })
 }
 
-/// A ChatGPT model the backend doesn't serve (retired from ChatGPT sign-ins,
-/// or never offered) is a warning, since a call for it moves on down the
-/// chain. Tier and provider names are left to the tiers.
+/// A ChatGPT model the backend doesn't serve is a warning, never a refusal,
+/// since a call for it moves on down the chain: one retired from ChatGPT
+/// sign-ins, or one neither this hub's built-in list nor the plan's live
+/// catalogue (once read) lists. A model released since the hub was built
+/// runs once the catalogue lists it, which is where Desk's picker found it.
+/// Tier and provider names are left to the tiers.
 pub fn chatgpt_model_finding(spec: &str, model: &str) -> Option<Finding> {
     if ModelTier::from_name(model).is_some() || ProviderKind::from_str_loose(model).is_some() {
         return None;
     }
-    ChatGptModel::parse(model).err().map(|unknown| {
-        Finding::warning(
-            spec,
-            format!("{spec:?}: {unknown}; calls for this model skip the chatgpt route"),
-        )
+    ChatGptModel::parse(model).err().map(|refused| {
+        let said = match refused {
+            UnsupportedModel::Retired(_) => {
+                format!("{spec:?}: {refused}; calls for this model skip the chatgpt route")
+            }
+            UnsupportedModel::Unknown(id) => format!(
+                "{spec:?}: {id} isn't a model this hub knows on a ChatGPT plan; calls for it \
+                 run if the plan lists it, and skip the chatgpt route if it doesn't"
+            ),
+        };
+        Finding::warning(spec, said)
     })
 }
 
 /// A Codex turn or tool loop runs as a plain function-calling loop, verified
 /// on the models the ChatGPT backend serves: any other model is refused there.
 pub fn codex_turn_model_finding(spec: &str, model: &str) -> Option<Finding> {
-    let reason = match ChatGptModel::parse(model) {
+    let reason = match ChatGptModel::parse_built_in(model) {
         Ok(_) => return None,
         Err(UnsupportedModel::Retired(id)) => {
             format!("{id} retired from ChatGPT sign-ins on 2026-10-14")

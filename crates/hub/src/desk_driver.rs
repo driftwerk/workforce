@@ -1589,6 +1589,37 @@ mod tests {
             }
         }
 
+        /// A model a plan lists now that Desk's table doesn't (one released
+        /// since) loads as Desk offers it, once the plan's list is read, and
+        /// so does Fast mode; before the list is read it still loads.
+        #[test]
+        fn a_model_released_since_and_fast_mode_load() {
+            let admission = admission();
+            let toml = |provider, model, effort| {
+                format!("{}fast = true\n", agent_toml(provider, model, effort))
+            };
+            let before = admission
+                .review_toml(&toml("chatgpt", "gpt-test-released", Some("high")))
+                .expect("it loads before the plan's list is read");
+            assert!(before.iter().all(|f| !f.is_refused()), "{before:?}");
+            let body: serde_json::Value = serde_json::from_str(include_str!(
+                "../../agent-runtime/src/llm/testdata/chatgpt/models_live.json"
+            ))
+            .unwrap();
+            workforce_agent::llm::responses::ChatGptModel::learn(
+                &workforce_agent::llm::responses::parse_catalog(&body),
+            );
+            for (provider, model, effort) in [
+                ("chatgpt", "gpt-6.2-nova", Some("high")),
+                ("claude-code", "claude-fable-5-2", Some("max")),
+            ] {
+                let findings = admission
+                    .review_toml(&toml(provider, model, effort))
+                    .unwrap_or_else(|e| panic!("{provider} {model}: {e}"));
+                assert!(findings.is_empty(), "{provider} {model}: {findings:?}");
+            }
+        }
+
         #[test]
         fn a_level_the_provider_does_not_take_is_refused_naming_the_ones_it_does() {
             let admission = admission();
