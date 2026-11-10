@@ -65,10 +65,17 @@ async fn resolve_for_workspace(
             return Ok(s);
         }
     }
+    // A surface of the hub's own sessions (Desk) answers for its platform,
+    // as `resolve` has it do for a channel.
     registry
         .all_for(platform)
         .into_iter()
         .next()
+        .or_else(|| {
+            registry
+                .get(&workforce_common::channels::SurfaceKey::platform(platform))
+                .cloned()
+        })
         .ok_or_else(|| eyre::eyre!("no {platform} surface registered for this agent"))
 }
 

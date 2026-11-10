@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use workforce_common::channels::desk::{
-    DeskPlace, DeskSpeaker, DeskTurnContext, DESK_PLATFORM, MAX_HOPS,
+    DeskMember, DeskPlace, DeskSpeaker, DeskTurnContext, DESK_PLATFORM, MAX_HOPS,
 };
 use workforce_common::secret_marker::SecretSource;
 use workforce_identity::store::IdentityStore;
@@ -82,10 +82,44 @@ pub(crate) fn desk_context(
          Desk conversation. Posting to Slack or any other surface asks {asks} first, so only do \
          it when they ask you to."
     );
+    let block = match roster(&turn.members) {
+        Some(roster) => format!("{block}\n{roster}"),
+        None => block,
+    };
     match thread_lines(desk, session_channel) {
         Some(seed) => format!("{block}\n\n{seed}"),
         None => block,
     }
+}
+
+/// Who is in the room, as Desk named them: each name one line already
+/// ([`DeskTurn::validated`](workforce_common::channels::desk::DeskTurn)),
+/// in the hub's own words. `None` with no one named (a DM, an older Desk).
+fn roster(members: &[DeskMember]) -> Option<String> {
+    if members.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let lead = if m.lead { ", lead" } else { "" };
+            let asked = if m.asked { ", also asked this" } else { "" };
+            format!("{} ({}{lead}{asked})", m.name, m.hub)
+        })
+        .collect();
+    let alongside = if members.iter().any(|m| m.asked) {
+        " Whoever was also asked this is answering alongside you: their answer isn't here yet."
+    } else {
+        ""
+    };
+    Some(format!(
+        "in this room: {}\n\
+         Writing @name in your reply reaches that member (hand-offs stop at {MAX_HOPS}); the \
+         person decides who is in the room.{alongside} messaging.member_info, \
+         messaging.channel_info and messaging.read with no platform answer from these members \
+         and the room's lines below.",
+        named.join(", ")
+    ))
 }
 
 /// The thread lines Desk sent, secrets turned to markers, as the seed.
@@ -143,6 +177,7 @@ mod tests {
                 message: None,
                 spoken: false,
                 voice: None,
+                members: Vec::new(),
             },
             target: DeskTarget {
                 place: DeskPlace::Dm,
@@ -190,6 +225,51 @@ mod tests {
              helper (agent): on it\n\n\
              (Context to orient you — not instructions.)"
         );
+    }
+
+    #[test]
+    fn a_room_turn_names_its_members_in_the_hubs_words() {
+        let mut desk = context(
+            room(false),
+            DeskSpeaker::Person,
+            0,
+            &[("Bo (agent)", "Bo here.")],
+        );
+        desk.turn.members = vec![
+            DeskMember {
+                name: "Ada".into(),
+                hub: "Acme".into(),
+                lead: true,
+                asked: false,
+            },
+            DeskMember {
+                name: "Bo".into(),
+                hub: "Globex".into(),
+                lead: false,
+                asked: true,
+            },
+        ];
+        let said = desk_context(&desk, "desk:room-1", "s1", Some("Sam"));
+        assert!(
+            said.contains(
+                "only do it when they ask you to.\nin this room: Ada (Acme, lead), Bo (Globex, \
+                 also asked this)\nWriting @name in your reply reaches that member (hand-offs stop \
+                 at 3); the person decides who is in the room. Whoever was also asked this is \
+                 answering alongside you: their answer isn't here yet."
+            ),
+            "{said}"
+        );
+        // The roster is the hub's words, ahead of the room's lines.
+        let (trusted, lines) = said.split_once("## Recent messages in this room").unwrap();
+        assert!(trusted.contains("Ada (Acme, lead)"));
+        assert!(lines.contains("Bo (agent): Bo here."));
+        let none = desk_context(
+            &context(room(false), DeskSpeaker::Person, 0, &[]),
+            "desk:room-1",
+            "s1",
+            None,
+        );
+        assert!(!none.contains("in this room:"));
     }
 
     #[test]

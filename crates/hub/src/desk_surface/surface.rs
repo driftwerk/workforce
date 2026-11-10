@@ -12,11 +12,13 @@ use workforce_common::channels::desk::{
     is_desk_room, DeliveryKind, DeskPlace, DeskScope, DeskTarget, DESK_CHANNEL, DESK_PLATFORM,
 };
 use workforce_common::channels::{
-    ChannelCapabilities, ChannelSurface, OutboundMessage, Reaction, SentMessage,
+    ChannelCapabilities, ChannelInfo, ChannelMessage, ChannelSurface, MemberInfo, OutboundMessage,
+    Reaction, SentMessage,
 };
 use workforce_common::session::SessionStore;
 
 use super::deliver::{deliver, deliver_file, Delivery};
+use super::room_view::{self, RoomView};
 use crate::desk_attachments::StagedFile;
 use crate::serve::AgentService;
 
@@ -140,6 +142,48 @@ impl DeskSurface {
     }
 }
 
+impl DeskSurface {
+    /// The room this turn is in, as Desk told it: `channel` must name it
+    /// (or nothing, for here). A room lives on the person's Desk, so only
+    /// what its turn carried can be answered.
+    fn room_here(&self, channel: &str) -> Result<(DeskTarget, RoomView)> {
+        let (service, _, target) = self.addressed(channel, None)?;
+        let here = current_desk().map(|scope| scope.target.channel);
+        if here.as_deref() != Some(target.channel.as_str()) {
+            return Err(eyre!(
+                "only the room this turn is in can be read: its members and recent lines are \
+                 in your context"
+            ));
+        }
+        let view = room_view::of(service.agent_id.as_str(), &target.channel).ok_or_else(|| {
+            eyre!("this is not a room: the conversation's recent messages are in your context")
+        })?;
+        Ok((target, view))
+    }
+}
+
+/// The room's newest `limit` lines, as messages.
+fn lines_of(target: &DeskTarget, view: &RoomView, limit: usize) -> Vec<ChannelMessage> {
+    let skip = view.lines.len().saturating_sub(limit);
+    view.lines
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(i, line)| ChannelMessage {
+            channel: target.channel.clone(),
+            message_id: format!("line-{i}"),
+            user: line.from.clone(),
+            user_name: Some(line.from.clone()),
+            channel_name: Some(format!("room \"{}\"", view.name)),
+            text: line.text.clone(),
+            timestamp: String::new(),
+            thread_id: None,
+            files: Vec::new(),
+            bot_id: None,
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ChannelSurface for DeskSurface {
     fn platform(&self) -> &str {
@@ -165,13 +209,56 @@ impl ChannelSurface for DeskSurface {
 
     async fn read_messages(
         &self,
-        _channel: &str,
-        _limit: usize,
+        channel: &str,
+        limit: usize,
         _oldest: Option<&str>,
-    ) -> Result<Vec<workforce_common::channels::ChannelMessage>> {
-        Err(eyre!(
-            "not supported: the conversation's recent messages are in your context"
-        ))
+    ) -> Result<Vec<ChannelMessage>> {
+        let (target, view) = self.room_here(channel)?;
+        Ok(lines_of(&target, &view, limit))
+    }
+
+    async fn read_thread(
+        &self,
+        channel: &str,
+        _thread_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<ChannelMessage>> {
+        let (target, view) = self.room_here(channel)?;
+        Ok(lines_of(&target, &view, limit))
+    }
+
+    async fn member_info(&self, user_id: &str) -> Result<MemberInfo> {
+        let (_, view) = self.room_here("")?;
+        let member = view.member(user_id).ok_or_else(|| {
+            eyre!(
+                "{user_id:?} is not in room \"{}\"; its members are {}",
+                view.name,
+                view.roster()
+            )
+        })?;
+        Ok(MemberInfo {
+            user_id: format!("{}@{}", member.name, member.hub),
+            display_name: member.name.clone(),
+            real_name: member.name.clone(),
+            title: format!(
+                "agent on {}{}, in room \"{}\"",
+                member.hub,
+                if member.lead { ", the room's lead" } else { "" },
+                view.name
+            ),
+            timezone: None,
+            status_text: None,
+            status_emoji: None,
+            avatar_url: None,
+        })
+    }
+
+    async fn channel_info(&self, channel_id: &str) -> Result<ChannelInfo> {
+        let (target, view) = self.room_here(channel_id)?;
+        Ok(ChannelInfo {
+            channel_id: target.channel,
+            display_name: format!("room \"{}\" — members: {}", view.name, view.roster()),
+        })
     }
 
     async fn send_message(&self, message: &OutboundMessage) -> Result<SentMessage> {

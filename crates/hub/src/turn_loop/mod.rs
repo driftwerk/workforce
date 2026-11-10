@@ -4642,6 +4642,10 @@ pub(crate) async fn stream_admitted(
     let person = desk.and_then(|_| {
         crate::desk_surface::person_name(service.identity_store.read().as_ref(), principal)
     });
+    // A room's lookups in this turn answer from what Desk told of it.
+    if let Some(desk) = desk {
+        crate::desk_surface::room_view::remember(service.agent_id.as_str(), desk);
+    }
     if let Some(block) = surface::surface_context(
         &surface::TurnSurface::of(channel_id, thread_id, desk),
         channel,

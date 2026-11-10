@@ -1501,6 +1501,9 @@ const DESK_DELIVERIES: &str = "desk.deliveries";
 /// sent under one, and every kept row's place in the archive: Desk knows its
 /// copy by that id and orders by that place, not by words and times.
 const DESK_CLIENT_IDS: &str = "desk.client_ids";
+/// A room turn may name the room's members, told to the agent in the hub's
+/// words and answering its room lookups (`desk_surface::room_view`).
+const DESK_ROSTER: &str = "desk.roster";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
@@ -1522,7 +1525,7 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     // points beside it, and what numbers every row and keeps its client id.
     let in_postgres = deliveries && crate::session_store_factory::keeps_desk_reads();
     let reads = in_postgres.then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
-    [DESK_PLACE, DESK_STREAM, DESK_QUEUE]
+    [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER]
         .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
