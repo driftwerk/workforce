@@ -66,22 +66,12 @@ pub fn changes_a_page(tool: &str) -> bool {
     tool.starts_with("browser.") && !BROWSER_READS.contains(&tool)
 }
 
-/// Whether an overseer is unbound: Act fully in force with every
-/// `[oversight.act]` switch on. A stand-in for `Oversight::unbound`, which
-/// the overseer's own change brings; this one goes when that lands.
+/// Whether an overseer of this hub is unbound: Act fully, anywhere, every
+/// `[oversight.act]` switch on ([`Oversight::unbound`]), and overseeing.
+///
+/// [`Oversight::unbound`]: workforce_common::oversight::Oversight::unbound
 pub fn unbound(o: &workforce_common::oversight::Oversight) -> bool {
-    let a = &o.act;
-    o.enabled
-        && o.fully().is_ok()
-        && a.nudge
-        && a.resume_restart
-        && a.read_only_approvals
-        && a.hand_out_work
-        && a.interrupt
-        && a.message_agents
-        && a.message_terminal_sessions
-        && a.answer_sessions
-        && a.hand_off
+    o.enabled && o.unbound(true)
 }
 
 /// Where an agent stands in a browser, by its `[oversight]`: an overseer
@@ -1121,14 +1111,14 @@ mod tests {
         .await;
     }
 
-    /// Every `[oversight.act]` switch on, Act fully in force.
+    /// Every `[oversight.act]` switch on, Act fully anywhere.
     const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
         act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
         interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
-        hand_off = true }\nfull = { repos = [\"acme/web\"], budget_usd_per_day = 20 }\n";
+        hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
 
     #[test]
-    fn unbound_is_act_fully_in_force_with_every_switch_on() {
+    fn unbound_is_act_fully_anywhere_with_every_switch_on() {
         let parse = |body: &str| {
             let value: toml::Value = toml::from_str(body).unwrap();
             workforce_common::oversight::Oversight::of(value.get("oversight")).unwrap()
@@ -1140,11 +1130,14 @@ mod tests {
             Browsing::Asks,
             "one switch off"
         );
-        let no_budget = UNBOUND.replace(", budget_usd_per_day = 20", "");
+        let listed = UNBOUND.replace(
+            "anywhere = true",
+            "repos = [\"acme/web\"], budget_usd_per_day = 20",
+        );
         assert_eq!(
-            browsing_of(&parse(&no_budget)),
+            browsing_of(&parse(&listed)),
             Browsing::Asks,
-            "Act fully not in force"
+            "Act fully, not anywhere"
         );
         let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
         assert_eq!(browsing_of(&parse(&act)), Browsing::Asks, "at Act");
