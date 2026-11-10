@@ -70,6 +70,7 @@ pub(crate) fn fixture_with(enabled: bool, bind_tokens: bool) -> Fixture {
             enabled,
             ..Default::default()
         },
+        desk_boss: Default::default(),
         permission_evaluator: None,
         destructive_baseline_active: false,
         telemetry_store: None,
@@ -141,6 +142,7 @@ pub(crate) fn issue(fixture: &Fixture, identity: &Identity, shape: TokenShape) -
             expires_at: shape.expires_at,
             last_used_at: shape.last_used_at,
             revoked_at: shape.revoked_at,
+            desk_link: None,
         })
         .expect("token persists");
     minted.plaintext

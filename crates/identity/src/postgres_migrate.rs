@@ -236,11 +236,22 @@ async fn write_teams(pool: &PostgresPool, rows: Vec<TeamMigRow>) -> Result<usize
 }
 
 fn read_remote_mcp_tokens(sqlite: &Connection) -> Result<Vec<RemoteMcpToken>> {
-    let mut stmt = sqlite.prepare(
+    // A source an older release wrote has no `desk_link`: every key in it
+    // is a remote MCP key.
+    let has_link = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('remote_mcp_tokens') WHERE name = 'desk_link'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    let mut stmt = sqlite.prepare(&format!(
         "SELECT id, identity_id, label, token_hash, scopes,
-                created_at, expires_at, last_used_at, revoked_at
+                created_at, expires_at, last_used_at, revoked_at{}
          FROM remote_mcp_tokens",
-    )?;
+        if has_link { ", desk_link" } else { "" }
+    ))?;
     let rows = stmt
         .query_map([], parse_remote_mcp_token_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -254,11 +265,12 @@ async fn write_remote_mcp_tokens(pool: &PostgresPool, rows: Vec<RemoteMcpToken>)
     let conn = pool.get().await?;
     for t in &rows {
         let scopes = serde_json::to_value(&t.scopes)?;
+        let desk_link = t.desk_link.as_ref().map(serde_json::to_value).transpose()?;
         conn.execute(
             "INSERT INTO remote_mcp_tokens
              (id, identity_id, label, token_hash, scopes,
-              created_at, expires_at, last_used_at, revoked_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              created_at, expires_at, last_used_at, revoked_at, desk_link)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO NOTHING",
             &[
                 &t.id,
@@ -270,6 +282,7 @@ async fn write_remote_mcp_tokens(pool: &PostgresPool, rows: Vec<RemoteMcpToken>)
                 &t.expires_at,
                 &t.last_used_at,
                 &t.revoked_at,
+                &desk_link,
             ],
         )
         .await
@@ -360,6 +373,7 @@ mod tests {
                 expires_at: Utc::now() + chrono::Duration::days(90),
                 last_used_at: None,
                 revoked_at: None,
+                desk_link: None,
             };
             sqlite.create_token(&token).unwrap();
             let op = crate::lifecycle::contract::op(alice_id, Utc::now());
@@ -403,6 +417,56 @@ mod tests {
             assert_eq!(report2.identities, 1);
             assert_eq!(report2.teams, 1);
             assert_eq!(report2.remote_mcp_tokens, 1);
+        })
+        .await;
+    }
+
+    /// A Desk boss link's `desk_link` copies across with its token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copies_desk_boss_links() {
+        use crate::remote_mcp_token::{DeskLink, TokenScope};
+        use chrono::DurationRound as _;
+        with_test_pool(PostgresIdentityStore::build_pool, |pool| async move {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let source = SqliteIdentityStore::new(tmp.path()).unwrap();
+            let owner = Identity::new("Sam", IdentityRole::Member);
+            source.create(&owner).unwrap();
+            let now = Utc::now()
+                .duration_trunc(chrono::Duration::microseconds(1))
+                .unwrap();
+            let link = DeskLink {
+                link_id: uuid::Uuid::new_v4(),
+                agent_id: "allan".into(),
+                group_key: "d-1/g-acme".into(),
+                desk_group_key: "d-1/g-acme".into(),
+                group_name: "Acme".into(),
+                engine_id: "devbox".into(),
+                engine_name: "devbox".into(),
+                engine_public_key: "ed25519:key".into(),
+            };
+            let boss = RemoteMcpToken {
+                id: uuid::Uuid::new_v4(),
+                identity_id: owner.id,
+                label: "allan bosses Acme on devbox".into(),
+                token_hash: crate::remote_mcp_token::mint_as(TokenScope::DeskBoss).hash,
+                scopes: vec!["desk_boss".into(), "device:d1".into()],
+                created_at: now,
+                expires_at: now + chrono::Duration::days(30),
+                last_used_at: None,
+                revoked_at: None,
+                desk_link: Some(link.clone()),
+            };
+            source.create_token(&boss).unwrap();
+            drop(source);
+
+            let report = migrate_sqlite_to_postgres_with_pool(tmp.path(), pool.clone())
+                .await
+                .expect("copy a source with a boss link");
+            assert_eq!(report.remote_mcp_tokens, 1);
+            let dest = PostgresIdentityStore::with_pool(pool).await.unwrap();
+            let got = dest.get_token_by_hash(&boss.token_hash).unwrap().unwrap();
+            assert_eq!(got.desk_link, Some(link));
+            assert_eq!(got.scope(), Some(TokenScope::DeskBoss));
         })
         .await;
     }
