@@ -150,6 +150,42 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
             assert_eq!(decided(asked.await.unwrap()), "deny", "{command}");
         }
 
+        // Its own settings, and a credentials file read by a tool rather
+        // than a command, stay the person's too.
+        let own_config = overseer.workspace.join("config.toml");
+        let env_file = acme.join(".env");
+        for (tool_name, input, why) in [
+            // Withheld as Desk's data is: reading another folder is
+            // otherwise the boss's to allow.
+            (
+                "Bash",
+                json!({"command": format!("cat {}", own_config.display())}),
+                "secrets",
+            ),
+            (
+                "Bash",
+                json!({"command": format!("cat {}", env_file.display())}),
+                "secrets",
+            ),
+        ] {
+            let url = url.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": tool_name,
+                "tool_input": input});
+            let asked = tokio::spawn(async move { hook(&url, body).await });
+            let detail = input["command"].as_str().unwrap().to_string();
+            let a = eventually(&detail, async || {
+                d.view(s.id).unwrap().pending.filter(|p| p.detail == detail)
+            })
+            .await
+            .id;
+            let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
+            assert!(held.output["suggested"].is_string(), "{tool_name}: {held:?}");
+            let note = held.output["note"].as_str().unwrap();
+            assert!(note.contains(why), "{tool_name}: {note}");
+            tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+            asked.await.unwrap();
+        }
+
         // A repository not named: shipping is a suggestion.
         let g = new_session(&d, &globex, "globex-api").await;
         let g_url = hook_url(&base, g.id).await;

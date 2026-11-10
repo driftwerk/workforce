@@ -2103,6 +2103,12 @@ fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
             if words.iter().any(|w| *w == "-R" || w.starts_with("--repo")) {
                 return no(PUBLISHES);
             }
+            // A pull request by its number, or the branch's own: one named
+            // by an address, `owner/name#7` or a branch elsewhere may be
+            // another repository's.
+            if words[..2] == ["pr", "merge"] && !merges_by_number(&words[2..]) {
+                return no(PUBLISHES);
+            }
             walk.ships()
         }
         ["release", "delete" | "delete-asset", ..] => no(crate::never::Never::DeleteRemote.why()),
@@ -2175,6 +2181,40 @@ fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
             }
         }
         _ => no("Desk can't tell what this gh command does"),
+    }
+}
+
+/// Whether `gh pr merge`'s `args` name the pull request only by its
+/// number, or not at all (the branch's own).
+fn merges_by_number(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "-t",
+        "--subject",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-A",
+        "--author-email",
+        "--match-head-commit",
+    ];
+    let mut operands = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if VALUED.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with('-') {
+            operands.push(a);
+        }
+        i += 1;
+    }
+    match operands.as_slice() {
+        [] => true,
+        [n] => n.chars().all(|c| c.is_ascii_digit()),
+        _ => false,
     }
 }
 
@@ -2726,6 +2766,7 @@ pub(crate) mod tests {
     fn acting_fully_ships_what_was_the_persons_and_nothing_past_the_hard_limits() {
         for command in [
             "gh pr merge 42 --squash",
+            "gh pr merge --squash --subject 'Fix: the date picker'",
             "gh release create v1.2.0 --notes 'Date picker'",
             "gh workflow run promote-staging.yml",
             "git tag v1.2.0",
@@ -2769,6 +2810,12 @@ pub(crate) mod tests {
                 ),
             ),
             ("gh pr merge 42 -R globex/globex-api", Err(PUBLISHES.into())),
+            (
+                "gh pr merge https://github.com/globex/globex-api/pull/7",
+                Err(PUBLISHES.into()),
+            ),
+            ("gh pr merge globex/globex-api#7", Err(PUBLISHES.into())),
+            ("gh pr merge feat/elsewhere --squash", Err(PUBLISHES.into())),
             ("git push upstream main", Err(PUBLISHES.into())),
             (
                 "git push --tags origin",

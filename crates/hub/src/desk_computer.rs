@@ -166,7 +166,7 @@ fn scratch_of(named: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// An agent's own config files and folders, which no call changes.
-fn own_config(workspace: &Path) -> Vec<PathBuf> {
+pub(crate) fn own_config(workspace: &Path) -> Vec<PathBuf> {
     let root = workforce_agent::tools::paths::resolve_real(workspace);
     workforce_common::config_files::agent_config_files()
         .chain(workforce_common::config_files::AGENT_CONFIG_DIRS)

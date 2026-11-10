@@ -524,6 +524,14 @@ impl CrewHub {
                 })
                 .collect(),
         );
+        // No boss allows a change to any agent's own settings, its own
+        // limits among them.
+        self.desk.withhold_agent_settings(
+            self.services()
+                .iter()
+                .flat_map(|s| crate::desk_computer::own_config(&s.workspace))
+                .collect(),
+        );
         self.desk.set_full_repos(
             list.iter()
                 .filter_map(|(s, o)| {

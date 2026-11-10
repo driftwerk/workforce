@@ -595,7 +595,11 @@ pub fn answerable(
                     None => return no("reads through a link to nothing".into()),
                 }
             }
-            Ok(())
+            // A file credentials are kept in, by its name, wherever it is.
+            match paths.iter().find_map(|p| crate::never::path(p)) {
+                Some(n) => no(n.why().into()),
+                None => Ok(()),
+            }
         }
         What::Web { carries: true } => no("Desk can't tell what this address sends".into()),
         What::Web { carries: false } | What::Inside => Ok(()),
@@ -614,7 +618,11 @@ pub fn answerable(
                     return no(format!("changes a file outside {}", facts.folder));
                 }
             }
-            Ok(())
+            // A file credentials are kept in, by its name.
+            match paths.iter().find_map(|p| crate::never::path(p)) {
+                Some(n) => no(n.why().into()),
+                None => Ok(()),
+            }
         }
         What::Mcp {
             server,

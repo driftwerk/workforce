@@ -8,6 +8,7 @@
 //! - [`command`]: a command a session asks to run, as a boss would allow it.
 //!   [`crate::computer::boss::judge`] calls it first, so nothing it opens
 //!   (Act fully's shipping in the named repositories) reaches past it.
+//! - [`path`]: a file a session asks to read or change, by its name.
 //! - [`said`]: what a session asks a boss, or the boss answers, in words.
 //!   The hub reads both before letting an answer go without the person.
 //!
@@ -736,6 +737,79 @@ fn one(words: &[String], at: &Where<'_>, depth: usize) -> Option<Never> {
     None
 }
 
+/// The hard limit reading or changing `path` runs into: a file credentials
+/// are kept in (`.env`, `~/.aws-creds`, `~/.ssh/…`), by its name.
+pub fn path(path: &Path) -> Option<Never> {
+    secret_file(&path.to_string_lossy()).then_some(Never::Secrets)
+}
+
+/// The programs a line of words is read as a command after: the ones
+/// [`command`] knows something of.
+const PROGRAMS: &[&str] = &[
+    "git",
+    "gh",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "npx",
+    "pnpx",
+    "bunx",
+    "rm",
+    "rmdir",
+    "find",
+    "curl",
+    "wget",
+    "scp",
+    "sftp",
+    "rsync",
+    "nc",
+    "source",
+    ".",
+    "printenv",
+    "env",
+    "export",
+    "security",
+    "op",
+    "vault",
+    "aws",
+    "aws-vault",
+    "gcloud",
+    "az",
+    "claude",
+    "codex",
+    "docker",
+    "podman",
+    "twine",
+    "uv",
+    "poetry",
+    "flit",
+    "hatch",
+    "pdm",
+    "gem",
+    "python",
+    "python3",
+    "make",
+    "just",
+    "sudo",
+    "bash",
+    "sh",
+    "zsh",
+    "eval",
+    "stripe",
+    "brew",
+    "ssh-keyscan",
+    "ssh-add",
+    "ssh-keygen",
+    "cat",
+    "cp",
+    "mv",
+    "sed",
+    "lerna",
+    "changeset",
+];
+
 /// The hard limit `command`, a shell command a session asks to run, runs
 /// into; `None` when it runs into none of them (which doesn't make it safe:
 /// [`crate::computer::boss::judge`] still decides).
@@ -857,7 +931,6 @@ const SAID: &[(Never, &[&str])] = &[
             "access key",
             "secret key",
             "client secret",
-            "the secrets",
             "access token",
             "auth token",
             "api token",
@@ -976,18 +1049,22 @@ pub fn said(text: &str) -> Option<Never> {
         home,
         scratch: &[],
     };
-    // Code spans and lines, as commands; a sentence that reads as none
-    // runs into nothing.
-    text.split('`')
-        .chain(text.lines())
+    // Code spans, and lines that start with a program, as commands; prose
+    // ("the token limit", "the secrets loader") is read by its phrases
+    // alone.
+    let spans = text.split('`').skip(1).step_by(2);
+    let lines = text.lines().filter(|l| {
+        commands(l).first().is_some_and(|w| {
+            from_program(w)
+                .first()
+                .is_some_and(|p| PROGRAMS.contains(&program(p)))
+        })
+    });
+    spans
+        .chain(lines)
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .find_map(|l| {
-            let found = command(l, &nowhere)?;
-            // A sentence reads loosely as words: only what a command names
-            // by a program counts there.
-            (found != Never::DeleteOutside || l.starts_with("rm ")).then_some(found)
-        })
+        .find_map(|l| command(l, &nowhere))
 }
 
 #[cfg(test)]
@@ -1093,6 +1170,23 @@ mod tests {
             }
             assert_eq!(run(caught), Some(n), "{caught}");
             assert_eq!(run(let_be), None, "{let_be}");
+        }
+    }
+
+    #[test]
+    fn a_file_credentials_are_kept_in_is_known_by_its_name() {
+        for p in [
+            "/Users/sam/dev/acme-web/.env",
+            "/Users/sam/.aws-creds",
+            "/srv/acme/.env.production",
+        ] {
+            assert_eq!(path(Path::new(p)), Some(Never::Secrets), "{p}");
+        }
+        for p in [
+            "/Users/sam/dev/acme-web/.env.example",
+            "/Users/sam/dev/acme-web/src/credentials.rs",
+        ] {
+            assert_eq!(path(Path::new(p)), None, "{p}");
         }
     }
 
@@ -1334,6 +1428,9 @@ mod tests {
             "The login form's tests fail; shall I fix the password reset too?",
             "The payment service's tests pass. Merge it?",
             "cat src/tokenizer.rs",
+            "Should I bump the token limit?",
+            "The secrets loader test fails; shall I fix it?",
+            "password_reset.rs is failing; may I look?",
         ] {
             assert_eq!(said(t), None, "{t}");
         }

@@ -42,6 +42,10 @@ pub(crate) struct Charges {
     /// only those whose Act fully is in force (named repositories, a
     /// budget not yet spent), as the hub says.
     full: HashMap<String, Vec<String>>,
+    /// Every agent's own settings files (its `config.toml` and the like),
+    /// as the hub says: withheld from what a boss answers for, as Desk's
+    /// data is, so no boss allows a change to its own limits.
+    agent_settings: Vec<std::path::PathBuf>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -265,6 +269,12 @@ impl Desk {
         *self.0.boss_bounds.lock() = Some(bounds);
     }
 
+    /// Every agent's own settings files, as the hub serves them now: no
+    /// boss allows a session to read or change them, wherever they are.
+    pub fn withhold_agent_settings(&self, paths: Vec<std::path::PathBuf>) {
+        self.0.state.lock().charges.agent_settings = paths;
+    }
+
     /// Whether `boss` may answer `id`'s open request `approval` itself; why
     /// not, in the person's words, when it may not. Where it acts fully,
     /// what ships is its to allow too.
@@ -275,9 +285,11 @@ impl Desk {
         boss: &str,
     ) -> Result<(), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
-        let Some(bounds) = self.0.boss_bounds.lock().clone() else {
+        let Some(mut bounds) = self.0.boss_bounds.lock().clone() else {
             return no("Desk can't judge requests for a boss yet");
         };
+        let settings = self.0.state.lock().charges.agent_settings.clone();
+        bounds.withheld.extend(settings);
         let Ok(view) = self.view(id) else {
             return no("that session isn't there any more");
         };
@@ -867,7 +879,8 @@ fn repo_of_own(own: &std::path::Path) -> Option<OwnRepo> {
         }
     }
     Some(OwnRepo {
-        origin: git_line(own, &["remote", "get-url", "origin"]),
+        // Where a push to it goes: its push address, when it has one.
+        origin: git_line(own, &["remote", "get-url", "--push", "origin"]),
         checkouts,
     })
 }
