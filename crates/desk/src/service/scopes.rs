@@ -377,6 +377,13 @@ impl Desk {
     /// sees, once the hub has said who the bosses are (before, there is one
     /// scope). One that isn't a boss reaches nothing.
     pub(crate) fn boss_reaches(&self, agent: &str, group: Option<&str>) -> bool {
+        // A boss served from a grant reaches its live grant's group alone.
+        if crate::grant::is_served(agent) {
+            return group.is_some_and(|g| {
+                self.grant_live(g)
+                    .is_ok_and(|grant| grant.boss.is_some_and(|b| b.party_id() == agent))
+            });
+        }
         let s = self.0.scopes.lock();
         let Some(bosses) = &s.bosses else {
             return true;

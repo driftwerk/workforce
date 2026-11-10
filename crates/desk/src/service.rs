@@ -2937,6 +2937,14 @@ impl Desk {
         group: Option<&str>,
         boss: Option<&Party>,
     ) -> Result<(), DeskError> {
+        // A session a boss served from a grant starts is born in that
+        // grant first, whichever engine this is: it is the boss's only while
+        // its grant names it.
+        if let (Some(g), Some(b)) = (group, boss) {
+            if crate::grant::is_served(&b.id) {
+                self.served_born(id, g).await?;
+            }
+        }
         if let Some(boss) = boss {
             self.charge_started(id, boss, group).await?;
         }
@@ -4241,6 +4249,9 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
+                    // A boss served from a grant runs it: Desk's check of
+                    // each call fails closed.
+                    fail_closed: self.served_runs(r.id),
                 });
                 (spec, None)
             }
@@ -4645,10 +4656,21 @@ impl Desk {
             Hook::ToolStart { tool, .. } => self.breaker_tool(id, tool),
             _ => None,
         };
-        let answer = move || match (held, allowed) {
-            (Some(why), _) => claude::deny_call(&why),
-            (None, true) => claude::allow_call(),
-            (None, false) => empty(),
+        // A session a boss served from a grant runs: every call Desk doesn't
+        // judge safe for that boss is refused before it runs, the person's
+        // own allow rules notwithstanding, unless the person allowed it in
+        // Desk. Sub-agents' calls too.
+        let served = match (&hook, held.is_some() || allowed) {
+            (Hook::ToolStart { call, input, .. }, false) => {
+                self.served_refuses(id, &call.tool, input, None)
+            }
+            _ => None,
+        };
+        let answer = move || match (held, allowed, served) {
+            (Some(why), ..) => claude::deny_call(&why),
+            (None, true, _) => claude::allow_call(),
+            (None, false, Some(why)) => claude::deny_call(&why),
+            (None, false, None) => empty(),
         };
         // A steer waiting for this tool call's result goes with it.
         let steer = |desk: &Desk, event: &str| {

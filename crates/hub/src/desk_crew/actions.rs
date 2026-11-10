@@ -474,8 +474,17 @@ pub(crate) enum Gate {
 }
 
 impl CrewHub {
-    /// What `level` and `[oversight.act]` let the overseer do with `action`.
+    /// What `level` and `[oversight.act]` let the overseer of `o`'s scope
+    /// do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        let boss = self.boss_id(o);
+        self.gate_as(action, o, boss.as_deref())
+    }
+
+    /// What `level` and `[oversight.act]` let `boss` do with `action`: the
+    /// boss named, never looked up by its scope, so a boss served from a
+    /// grant is never taken for a local overseer of the same group.
+    pub(crate) fn gate_as(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Gate {
         // Continuing a session in another engine sends its brief to that
         // engine's vendor: the person's call, every time.
         if let Action::Handoff { .. } = action {
@@ -521,7 +530,7 @@ impl CrewHub {
                 TakeOn::Handed => Gate::Suggest("the person hands you the sessions you run; offer to take it on and they accept".into()),
             };
         }
-        if let Some(gate) = self.gate_charged(action, o) {
+        if let Some(gate) = self.gate_charged(action, o, boss) {
             return gate;
         }
         if let Some(why) = self.uncontained(action, &o.act) {
@@ -594,11 +603,11 @@ impl CrewHub {
                 }
                 // Acting fully in its repository, answering sessions: judged
                 // as for a session it runs, shipping its to allow.
-                if o.act.answer_sessions && self.ships_in(*session, o) {
-                    let Some(boss) = self.boss_id(o) else {
+                if o.act.answer_sessions && self.ships_in_for(*session, o, boss) {
+                    let Some(boss) = boss else {
                         return Gate::Suggest("no overseer runs this scope now".into());
                     };
-                    return match self.desk.boss_answerable(*session, *approval, &boss) {
+                    return match self.desk.boss_answerable(*session, *approval, boss) {
                         Ok(()) => Gate::Run,
                         Err(why) => Gate::Suggest(
                             format!("it {why}, so it's the person's to allow; tell them why")
@@ -636,7 +645,7 @@ impl CrewHub {
 
     /// The hard limit what `action` says, or the question it answers,
     /// speaks of ([`workforce_desk::never::said`]).
-    fn never_said(&self, action: &Action) -> Option<workforce_desk::never::Never> {
+    pub(crate) fn never_said(&self, action: &Action) -> Option<workforce_desk::never::Never> {
         let asked = match action {
             Action::Nudge {
                 reply_to: Some(ask),
@@ -655,7 +664,7 @@ impl CrewHub {
     }
 
     /// The session `action` is done to, when it is one.
-    fn session_of(action: &Action) -> Option<Uuid> {
+    pub(crate) fn session_of(action: &Action) -> Option<Uuid> {
         match action {
             Action::Nudge {
                 to: Target::Session(s),
@@ -672,21 +681,15 @@ impl CrewHub {
         }
     }
 
-    /// Whether the overseer of `scope` runs `session` now: it is in its
-    /// charge.
-    fn overseer_runs(&self, session: Uuid, scope: &Scope) -> bool {
-        self.overseer_for(scope)
-            .is_some_and(|(service, _)| self.runs(session, service.agent_id.as_str()))
-    }
-
     /// What the overseer may do, at `act`, to a session it runs: answer
     /// for it what Desk reads in full and judges safe (Desk checks again as
     /// it answers), deny, and interrupt it whatever `[oversight.act]` says
     /// of sessions it doesn't run; resuming and restarting it stay the
     /// person's; only suggest while the person drives it. `None`: the usual rules decide (a plain
     /// message waits on its line while the person drives).
-    fn gate_charged(&self, action: &Action, o: &Oversight) -> Option<Gate> {
-        let session = Self::session_of(action).filter(|s| self.overseer_runs(*s, &o.scope))?;
+    fn gate_charged(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
+        let session =
+            Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)))?;
         // What it leads to must wait on the person as for any session.
         if let Some(why) = self.uncontained(action, &o.act) {
             return Some(Gate::Suggest(why.into()));
@@ -705,8 +708,8 @@ impl CrewHub {
         }
         match action {
             Action::Approve { approval, .. } => {
-                let boss = self.boss_id(o).unwrap_or_default();
-                Some(match self.desk.boss_answerable(session, *approval, &boss) {
+                let boss = boss.unwrap_or_default();
+                Some(match self.desk.boss_answerable(session, *approval, boss) {
                     Ok(()) => Gate::Run,
                     Err(why) => Gate::Suggest(
                         format!("it {why}, so it's the person's to allow; tell them why").into(),
@@ -1310,7 +1313,7 @@ impl CrewHub {
     /// Whether `boss` has a slot free for one more session it starts, when
     /// `by` is the overseer itself: the person saying yes to a start is
     /// theirs to decide. Call it holding `starting`.
-    fn slot_free(&self, boss: &Party, o: &Oversight, by: &By) -> Result<(), String> {
+    pub(crate) fn slot_free(&self, boss: &Party, o: &Oversight, by: &By) -> Result<(), String> {
         if by.party.kind != crew::PartyKind::Manager {
             return Ok(());
         }
@@ -1649,7 +1652,7 @@ impl CrewHub {
     /// `engine` in `view` (its default when none), when the overseer may
     /// start it: Desk runs it there, it has a line to run it on, and it is
     /// installed on this computer.
-    fn startable(&self, engine: Engine, view: Option<View>) -> Result<View, String> {
+    pub(crate) fn startable(&self, engine: Engine, view: Option<View>) -> Result<View, String> {
         let title = engine.title();
         let view = view
             .or_else(|| engine::views(engine).first().copied())

@@ -175,7 +175,85 @@ async fn audit(tx: &tokio_postgres::Transaction<'_>, c: &CallRow) -> Result<()> 
     Ok(())
 }
 
+/// What a boss's call recorded before it was acted on finds: a new row to
+/// finish, or the one an earlier sending of the same call left.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Begun {
+    New(Uuid),
+    /// The same `(link_id, call_id)` came before: its outcome and what was
+    /// said, never acted on again.
+    Again {
+        outcome: String,
+        said: Option<String>,
+    },
+}
+
 impl DeskStore {
+    /// Records a boss's call before it is acted on, `pending`; one whose
+    /// `(link_id, call_id)` came already is found instead.
+    pub async fn boss_call_begin(
+        &self,
+        link_id: Option<&str>,
+        call_id: Option<&str>,
+        c: &CallRow,
+    ) -> Result<Begun> {
+        let client = self.pool().get().await?;
+        let id = Uuid::new_v4();
+        let made = client
+            .query_opt(
+                "INSERT INTO boss_calls (id, at, link_id, call_id, caller, boss, group_id, tool, \
+                   input, input_hash, outcome, result) \
+                 VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, 'pending', '{}') \
+                 ON CONFLICT (link_id, call_id) DO NOTHING RETURNING id",
+                &[
+                    &id,
+                    &link_id,
+                    &call_id,
+                    &c.caller,
+                    &c.boss,
+                    &c.group,
+                    &c.tool,
+                    &c.input,
+                    &c.input_hash,
+                ],
+            )
+            .await
+            .context("recording a boss's call")?;
+        if made.is_some() {
+            return Ok(Begun::New(id));
+        }
+        let r = client
+            .query_one(
+                "SELECT outcome, said FROM boss_calls WHERE link_id = $1 AND call_id = $2",
+                &[&link_id, &call_id],
+            )
+            .await
+            .context("reading a boss's call sent again")?;
+        Ok(Begun::Again {
+            outcome: r.try_get(0)?,
+            said: r.try_get(1)?,
+        })
+    }
+
+    /// What became of the call `id` began.
+    pub async fn boss_call_end(
+        &self,
+        id: Uuid,
+        outcome: &str,
+        said: Option<&str>,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_calls SET outcome = $2, said = $3, result = $4 WHERE id = $1",
+                &[&id, &outcome, &said, result],
+            )
+            .await
+            .context("recording what became of a boss's call")?;
+        Ok(())
+    }
+
     /// Every grant this engine keeps.
     pub async fn boss_grants(&self) -> Result<Vec<Grant>> {
         let client = self.pool().get().await?;

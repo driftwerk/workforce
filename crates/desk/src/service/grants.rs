@@ -212,6 +212,18 @@ impl Desk {
         Ok(g)
     }
 
+    /// The group whose grant names `id` (as a member or born), when one
+    /// does.
+    pub fn grant_group_of(&self, id: Uuid) -> Option<String> {
+        self.0
+            .grants
+            .lock()
+            .grants
+            .values()
+            .find(|g| g.members.contains(&id) || g.born.contains(&id))
+            .map(|g| g.group.clone())
+    }
+
     fn grant_view_of(run: &GrantsRun, g: &Grant, now: DateTime<Utc>) -> GrantView {
         let mut g = g.clone();
         if let Some(s) = run.stopping.get(&g.group) {
@@ -561,6 +573,9 @@ impl Desk {
         let Some(g) = self.0.grants.lock().grants.get(group).cloned() else {
             return Err(DeskError::NotFound);
         };
+        if g.born.contains(&id) {
+            return Ok(true);
+        }
         let call = CallRow {
             caller: "engine".into(),
             boss: None,
@@ -577,11 +592,35 @@ impl Desk {
         Ok(true)
     }
 
+    /// Puts `id`, about to start for the boss of `group`'s grant, in that
+    /// grant as born, on any engine.
+    pub(super) async fn served_born(&self, id: Uuid, group: &str) -> Result<(), DeskError> {
+        let _one = self.0.grant_write.lock().await;
+        self.grants_loaded().await?;
+        let Some(g) = self.0.grants.lock().grants.get(group).cloned() else {
+            return Err(DeskError::NotFound);
+        };
+        if g.born.contains(&id) || g.members.contains(&id) {
+            return Ok(());
+        }
+        let call = CallRow {
+            caller: "engine".into(),
+            boss: g.boss.as_ref().map(grant::BossRef::key),
+            group: Some(group.into()),
+            tool: "grant.born",
+            input: "{}".into(),
+            input_hash: hash(id.as_bytes()),
+            outcome: "ok",
+            said: None,
+            result: serde_json::json!({}),
+        };
+        self.commit_grants(vec![grant::with_born(&g, id)], None, call)
+            .await
+            .map(drop)
+    }
+
     /// `id` didn't start: it is born in no grant.
     pub(super) async fn born_undo(&self, id: Uuid) {
-        if !self.0.opts.bosses.machine {
-            return;
-        }
         let _one = self.0.grant_write.lock().await;
         let Some(mut g) = self
             .0

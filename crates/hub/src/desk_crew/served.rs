@@ -1,0 +1,665 @@
+//! The deciding side of a boss's crew call (remote bosses, RB2): a call
+//! from a boss served from a grant (a boss on another hub, or the home's
+//! own boss of a machine's sessions) is decided here, on the engine that
+//! holds the session, by [`CrewHub::serve_crew`], whatever carried it. The
+//! carriers come later (the relay, RB3; the uplink, RB5): nothing reaches
+//! this yet but its tests.
+//!
+//! Every call goes through the same steps, in order, each refusal in plain
+//! words (design §4.1):
+//!
+//! 1. it is recorded before anything is done, so one sent again is never
+//!    acted on twice;
+//! 2. the grant is live (not paused, stopped, expired or unreadable);
+//! 3. the caller is the grant's boss, exactly;
+//! 4. the tool is one served, and what it names is this engine's session in
+//!    the grant (`members` or `born`), or it is "not ours";
+//! 5. the never-list, at every level;
+//! 6. the level: the grant's, never the caller's word, through the same
+//!    gate a local overseer's calls go through, the boss named;
+//! 7. what it may see ([`workforce_desk::sees`]), every string redacted
+//!    whole and capped.
+//!
+//! The boss here is a value the grant gives, `<hub>/<agent>`, never looked
+//! up by its scope or as one of this hub's agents, so a local overseer of
+//! the same group is never taken for it, nor it for one.
+
+use std::sync::Arc;
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use uuid::Uuid;
+use workforce_common::oversight::{Act, Full, Level, Oversight, Scope, TakeOn};
+use workforce_desk::crew::{By, ItemKind, Party};
+use workforce_desk::grant::{self, BossRef, Grant};
+use workforce_desk::grant_store::{Begun, CallRow};
+use workforce_desk::model::{Engine, NewSession};
+use workforce_desk::sees::{self, Part};
+
+use super::actions::{Action, Gate, Target};
+use super::watcher::reported;
+use super::CrewHub;
+
+/// The reading tools served.
+pub const SERVED_READ: [&str; 3] = ["crew.overview", "crew.activity", "crew.history"];
+/// The acting tools served.
+pub const SERVED_ACT: [&str; 10] = [
+    "crew.nudge",
+    "crew.escalate",
+    "crew.approve",
+    "crew.deny",
+    "crew.stop",
+    "crew.interrupt",
+    "crew.resume",
+    "crew.restart",
+    "crew.start_session",
+    "crew.release",
+];
+
+/// The most sessions a served boss runs at once when its grant doesn't
+/// say.
+const PARALLEL: u32 = 2;
+
+/// One crew call as its carrier brings it.
+#[derive(Debug, Clone)]
+pub struct ServedCall {
+    pub tool: String,
+    pub input: Value,
+    /// Who asks: what the carrier proved (the link's boss).
+    pub boss: BossRef,
+    /// The boss link it came on, and the boss hub's id for the call: one
+    /// call is acted on once.
+    pub link_id: Option<String>,
+    pub call_id: Option<String>,
+}
+
+/// What became of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServedStatus {
+    Ok,
+    /// Not done: it is the person's to decide.
+    Suggested,
+    Refused,
+}
+
+impl ServedStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Suggested => "suggested",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// The answer to a served call: already filtered, redacted and capped.
+#[derive(Debug, Clone, Serialize)]
+pub struct Served {
+    pub status: ServedStatus,
+    pub body: Value,
+    /// Its row in `boss_calls`.
+    pub audit: Option<Uuid>,
+}
+
+fn refused(why: impl Into<String>) -> (ServedStatus, Value) {
+    (ServedStatus::Refused, json!({ "error": why.into() }))
+}
+
+/// The oversight a grant gives its boss, and nothing else: its level, its
+/// act switches (each one off unless the grant turns it on), sessions only
+/// as handed or started, Act fully's repositories with no budget (so Act
+/// fully isn't in force until leases give one, RB8). There is no field that
+/// widens it beyond the grant's group: never Ungrouped for a boss on
+/// another hub, never anywhere.
+pub fn served_oversight(g: &Grant) -> Oversight {
+    let on = |k: &str| g.act.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let parallel = g
+        .act
+        .get("parallel")
+        .and_then(Value::as_u64)
+        .map_or(PARALLEL, |p| {
+            p.clamp(1, workforce_common::oversight::MAX_PARALLEL as u64) as u32
+        });
+    let mut o = Oversight {
+        enabled: true,
+        scope: match g.group.as_str() {
+            workforce_desk::UNGROUPED => Scope::Ungrouped,
+            group => Scope::Group(group.to_string()),
+        },
+        level: match g.level {
+            grant::Level::Watch => Level::Watch,
+            grant::Level::Suggest => Level::Suggest,
+            grant::Level::Act => Level::Act,
+            grant::Level::Full => Level::Full,
+        },
+        act: Act {
+            nudge: on("nudge"),
+            resume_restart: on("resume_restart"),
+            read_only_approvals: on("read_only_approvals"),
+            hand_out_work: on("hand_out_work"),
+            interrupt: on("interrupt"),
+            answer_sessions: on("answer_sessions"),
+            // Agents, other terminals' sessions and other engines are this
+            // hub's person's own: never a served boss's.
+            message_agents: false,
+            message_terminal_sessions: false,
+            hand_off: false,
+        },
+        full: Full {
+            repos: g.repos.clone(),
+            budget_cents_per_day: None,
+            workflows: Vec::new(),
+        },
+        ..Oversight::default()
+    };
+    o.work.take_on = TakeOn::Handed;
+    o.work.parallel = parallel;
+    o.work.engine = Engine::Claude.as_str().to_string();
+    o
+}
+
+/// Whether `folder`, said plainly, is inside one of `allowed` on this
+/// computer: each read where it really leads, compared part by part, so
+/// `/src/acme-evil` is not inside `/src/acme` and a link doesn't lead out.
+pub fn folder_inside(folder: &str, allowed: &[String]) -> bool {
+    if !grant::canonical(folder) {
+        return false;
+    }
+    let Ok(real) = std::fs::canonicalize(folder) else {
+        return false;
+    };
+    allowed
+        .iter()
+        .any(|a| grant::canonical(a) && std::fs::canonicalize(a).is_ok_and(|a| real.starts_with(a)))
+}
+
+/// Every string of `v`, secrets hidden whole and each capped: how many
+/// were changed.
+fn cleaned(v: &mut Value) -> usize {
+    match v {
+        Value::String(s) => {
+            let hidden = crate::redact::hide_secrets(s);
+            let capped = sees::capped(&hidden, sees::MAX_CHARS);
+            let changed = capped != *s;
+            *s = capped;
+            usize::from(changed)
+        }
+        Value::Array(a) => a.iter_mut().map(cleaned).sum(),
+        Value::Object(o) => o.values_mut().map(cleaned).sum(),
+        _ => 0,
+    }
+}
+
+impl CrewHub {
+    /// Decides `call` for `group`'s grant on this engine, as the module
+    /// says, and records what came of it.
+    pub async fn serve_crew(self: &Arc<Self>, call: ServedCall, group: &str) -> Served {
+        let tool = SERVED_READ
+            .iter()
+            .chain(SERVED_ACT.iter())
+            .find(|t| **t == call.tool)
+            .copied();
+        let row = CallRow {
+            caller: format!("boss:{}", call.boss.party_id()),
+            boss: Some(call.boss.key()),
+            group: Some(group.to_string()),
+            tool: tool.unwrap_or("crew.unknown"),
+            input: {
+                let mut i = call.input.clone();
+                cleaned(&mut i);
+                sees::capped(&i.to_string(), 2000)
+            },
+            input_hash: {
+                use sha2::Digest;
+                hex::encode(sha2::Sha256::digest(call.input.to_string().as_bytes()))
+            },
+            outcome: "pending",
+            said: None,
+            result: json!({}),
+        };
+        let store = self.desk.store();
+        let begun = store
+            .boss_call_begin(call.link_id.as_deref(), call.call_id.as_deref(), &row)
+            .await;
+        let audit = match begun {
+            Ok(Begun::New(id)) => id,
+            Ok(Begun::Again { outcome, said }) => {
+                // Sent again: never acted on twice; what came of it, said.
+                return Served {
+                    status: match outcome.as_str() {
+                        "ok" => ServedStatus::Ok,
+                        "suggested" => ServedStatus::Suggested,
+                        _ => ServedStatus::Refused,
+                    },
+                    body: json!({ "again": true, "said": said }),
+                    audit: None,
+                };
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "a boss's call couldn't be recorded"
+                );
+                return Served {
+                    status: ServedStatus::Refused,
+                    body: json!({ "error": "This engine couldn't record the call, so it did nothing." }),
+                    audit: None,
+                };
+            }
+        };
+        let (status, mut body) = match tool {
+            None => refused(format!("{} isn't served to a boss here.", call.tool)),
+            Some(tool) => self.decide_served(tool, &call, group).await,
+        };
+        let changed = cleaned(&mut body);
+        let size = body.to_string().len();
+        let said = body
+            .get("done")
+            .or_else(|| body.get("suggested"))
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .map(|s| sees::capped(s, 500));
+        if let Err(e) = store
+            .boss_call_end(
+                audit,
+                status.as_str(),
+                said.as_deref(),
+                &json!({ "bytes": size, "redacted": changed }),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "what came of a boss's call wasn't recorded"
+            );
+        }
+        Served {
+            status,
+            body,
+            audit: Some(audit),
+        }
+    }
+
+    async fn decide_served(
+        self: &Arc<Self>,
+        tool: &'static str,
+        call: &ServedCall,
+        group: &str,
+    ) -> (ServedStatus, Value) {
+        let grant = match self.desk.grant_live(group) {
+            Ok(g) => g,
+            Err(why) => return refused(why),
+        };
+        if !call.boss.servable() || grant.boss.as_ref() != Some(&call.boss) {
+            return refused(workforce_desk::scope::not_ours(None));
+        }
+        let boss = call.boss.party_id();
+        let o = served_oversight(&grant);
+        let result = if SERVED_READ.contains(&tool) {
+            self.served_read(tool, &call.input, &grant, &boss)
+                .await
+                .map(|v| (ServedStatus::Ok, v))
+        } else {
+            self.served_act(tool, &call.input, &grant, &o, &boss).await
+        };
+        result.unwrap_or_else(refused)
+    }
+
+    /// Whether `id` is one of this engine's sessions in `g`.
+    fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
+        (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()
+    }
+
+    fn not_in_grant(&self, g: &Grant) -> String {
+        workforce_desk::scope::not_ours(Some(&g.name))
+    }
+
+    async fn served_read(
+        &self,
+        tool: &str,
+        input: &Value,
+        g: &Grant,
+        boss: &str,
+    ) -> Result<Value, String> {
+        let internal = |e: eyre::Report| {
+            tracing::warn!(error = %e, "a served crew reading failed");
+            "This engine couldn't read its sessions just now.".to_string()
+        };
+        // Everything is read, then only the grant's own sessions kept: the
+        // grant, not this engine's sidebar, says what is the boss's.
+        let shows = |p| sees::shows(g.sees, p);
+        match tool {
+            "crew.overview" => {
+                let o = self
+                    .desk
+                    .overview_for(self, None, None)
+                    .await
+                    .map_err(internal)?;
+                let rows: Vec<Value> = o
+                    .items
+                    .iter()
+                    .filter(|i| i.kind == ItemKind::Session)
+                    .filter(|i| i.id.parse().is_ok_and(|id| self.in_grant(g, id)))
+                    .map(|i| {
+                        let runs = i.id.parse().is_ok_and(|id| self.runs(id, boss));
+                        let mut r = json!({
+                            "id": i.id, "name": i.name, "cwd": i.cwd,
+                            "engine": i.engine.map(|e| e.as_str()),
+                            "state": i.state, "task": i.task, "since": i.since,
+                            "you_run_it": runs,
+                            "asks": i.approval.is_some() || i.question.is_some(),
+                        });
+                        if shows(Part::Question) {
+                            r["detail"] = json!(i.detail);
+                            r["approval"] = json!(i.approval.as_ref().map(|a| (&a.id, &a.summary)));
+                            r["question"] = json!(i.question.as_ref().map(|q| &q.text));
+                        }
+                        r
+                    })
+                    .collect();
+                Ok(json!({
+                    "sessions": reported(&Value::Array(rows).to_string(), "the group's sessions here"),
+                    "slots": {
+                        "busy": self.desk.charges_busy(boss),
+                        "parallel": served_oversight(g).work.parallel,
+                    },
+                }))
+            }
+            "crew.activity" => {
+                let limit = input["limit"].as_i64().unwrap_or(30).clamp(1, 100);
+                let since = chrono::Utc::now() - chrono::Duration::days(7);
+                let page = self
+                    .desk
+                    .store()
+                    .events_since(since, &[], limit * 4, None)
+                    .await
+                    .map_err(internal)?;
+                let lines: Vec<String> = page
+                    .iter()
+                    .filter(|e| {
+                        e.subject
+                            .as_ref()
+                            .and_then(|s| s.id.parse().ok())
+                            .is_some_and(|id| self.in_grant(g, id))
+                    })
+                    .take(limit as usize)
+                    .map(|e| {
+                        let about = e
+                            .subject
+                            .as_ref()
+                            .map(|s| format!(" (about {} {})", s.name, s.id))
+                            .unwrap_or_default();
+                        match shows(Part::Words) {
+                            true => format!(
+                                "{} {} {} {}{}{}",
+                                e.at.to_rfc3339(),
+                                e.kind.as_str(),
+                                e.actor.name,
+                                e.text,
+                                about,
+                                e.reason
+                                    .as_deref()
+                                    .map(|r| format!(" — {r}"))
+                                    .unwrap_or_default()
+                            ),
+                            false => format!(
+                                "{} {} {}{about}",
+                                e.at.to_rfc3339(),
+                                e.kind.as_str(),
+                                e.actor.name
+                            ),
+                        }
+                    })
+                    .collect();
+                Ok(json!({ "events": reported(&lines.join("\n"), "the group's activity here") }))
+            }
+            "crew.history" => {
+                let id: Uuid = input["session_id"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("Say which session, by its id from crew.overview.")?;
+                if !self.in_grant(g, id) {
+                    return Err(self.not_in_grant(g));
+                }
+                let v = self.desk.view(id).map_err(|_| self.not_in_grant(g))?;
+                let mut said = json!({
+                    "name": v.label(), "goal": v.goal, "cwd": v.cwd, "state": v.state,
+                });
+                if shows(Part::Reply) {
+                    said["last_prompt"] = json!(v.last_prompt);
+                    said["last_reply"] = json!(v.last_reply);
+                }
+                if shows(Part::Question) {
+                    said["pending"] = json!(v.pending);
+                }
+                if shows(Part::Terminal) {
+                    said["terminal"] = json!(self
+                        .desk
+                        .terminal_text(id, sees::MAX_CHARS)
+                        .ok()
+                        .map(|t| sees::last_rows(&t)));
+                }
+                Ok(json!({ "session": reported(&said.to_string(), "the session") }))
+            }
+            _ => Err("not a reading tool".into()),
+        }
+    }
+
+    async fn served_act(
+        self: &Arc<Self>,
+        tool: &'static str,
+        input: &Value,
+        g: &Grant,
+        o: &Oversight,
+        boss: &str,
+    ) -> Result<(ServedStatus, Value), String> {
+        let reason = input["reason"]
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or("Give the reason: the person reads it in Activity.")?;
+        let mut kept = input.clone();
+        if let Some(o) = kept.as_object_mut() {
+            o.remove("ticket_id");
+        }
+        let action = Action::parse(tool, &kept)?;
+        // What it names is this engine's session in the grant, or nothing
+        // is said of it.
+        match &action {
+            Action::Nudge {
+                to: Target::Agent(_),
+                ..
+            } => return Err("A boss on another hub messages sessions only.".into()),
+            Action::Escalate { message, .. } => {
+                let asked_by = self
+                    .desk
+                    .store()
+                    .line_message(*message)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.from.id.parse::<Uuid>().ok());
+                if !asked_by.is_some_and(|s| self.in_grant(g, s)) {
+                    return Err(self.not_in_grant(g));
+                }
+            }
+            Action::StartSession { .. } | Action::Release { .. } => {}
+            other => {
+                let s = Self::session_of(other).ok_or("That isn't served to a boss here.")?;
+                if !self.in_grant(g, s) {
+                    return Err(self.not_in_grant(g));
+                }
+            }
+        }
+        if let Action::Nudge {
+            reply_to: Some(ask),
+            ..
+        } = &action
+        {
+            let of = self
+                .desk
+                .store()
+                .line_message(*ask)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.from.id.parse::<Uuid>().ok());
+            if !of.is_some_and(|s| self.in_grant(g, s)) {
+                return Err(self.not_in_grant(g));
+            }
+        }
+        if let Action::Release { session } = &action {
+            if !self.in_grant(g, *session) || !self.runs(*session, boss) {
+                return Err("You don't run that session.".into());
+            }
+        }
+        self.know_question(&action).await;
+        // What no boss does, at every level, before the level is looked at.
+        if let Some(n) = self.never_said(&action) {
+            if o.level == Level::Watch {
+                return Err("You only watch: tell the person what you would do instead.".into());
+            }
+            return Ok(self.served_suggestion(
+                &action,
+                &format!(
+                    "it {}; that is always the person's, at every level",
+                    n.why()
+                ),
+            ));
+        }
+        // A boss on another hub acts only on the sessions it runs; on any
+        // other, what it would do is the person's.
+        if let Some(s) = Self::session_of(&action) {
+            if !self.runs(s, boss) {
+                if o.level == Level::Watch {
+                    return Err("You only watch: tell the person what you would do instead.".into());
+                }
+                return Ok(self.served_suggestion(
+                    &action,
+                    "you don't run this session; the person decides it",
+                ));
+            }
+        }
+        let by = By::manager(boss, &boss_name(g), reason);
+        match self.gate_as(&action, o, Some(boss)) {
+            Gate::Refuse => {
+                Err("You only watch the crew: tell the person what you would do instead.".into())
+            }
+            Gate::Suggest(why) => Ok(self.served_suggestion(&action, &why)),
+            Gate::Run => {
+                let done = match &action {
+                    Action::StartSession { .. } => {
+                        self.served_start(&action, g, o, boss, by).await?
+                    }
+                    _ => self.perform(&action, by).await?,
+                };
+                Ok((ServedStatus::Ok, json!({ "done": done })))
+            }
+        }
+    }
+
+    fn served_suggestion(&self, action: &Action, why: &str) -> (ServedStatus, Value) {
+        (
+            ServedStatus::Suggested,
+            json!({
+                "suggested": self.describe(action),
+                "note": format!("Not done: {why}. It goes to the person to decide."),
+            }),
+        )
+    }
+
+    /// Starts the session `action` asks for, for the served boss: only in a
+    /// folder the grant names, only on an engine whose every call Desk
+    /// checks (and refuses when it can't), in that engine's own mode, with
+    /// nothing of the person's (no approvals said for it, no environment,
+    /// no account, no worktree), in the grant's group.
+    async fn served_start(
+        &self,
+        action: &Action,
+        g: &Grant,
+        o: &Oversight,
+        boss: &str,
+        by: By,
+    ) -> Result<String, String> {
+        let Action::StartSession {
+            folder,
+            goal,
+            name,
+            engine,
+            view,
+            worktree,
+        } = action
+        else {
+            return Err("That isn't a session to start.".into());
+        };
+        if worktree.is_some() {
+            return Err(
+                "A boss on another hub starts sessions in the grant's folders themselves, not in a worktree."
+                    .into(),
+            );
+        }
+        if !folder_inside(folder, &g.folders) {
+            return Err(format!(
+                "{folder} isn't one of {}'s folders here: start it in one of those.",
+                g.name
+            ));
+        }
+        let engine = engine.unwrap_or(Engine::Claude);
+        if !workforce_desk::engine::boss_safe(engine) {
+            return Err(format!(
+                "A boss on another hub runs only sessions Desk checks every call of, so not {}.",
+                engine.title()
+            ));
+        }
+        let view = self.startable(engine, *view)?;
+        let party = Party::manager(boss, &boss_name(g));
+        let _one = self.starting.lock().await;
+        self.slot_free(&party, o, &by)?;
+        let label = name.clone().unwrap_or_else(|| {
+            std::path::Path::new(folder)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "session".into())
+        });
+        let v = self
+            .desk
+            .create_for(
+                NewSession {
+                    engine,
+                    view: Some(view),
+                    name: label,
+                    cwd: folder.clone(),
+                    goal: goal.clone(),
+                    worktree: None,
+                    prompt: Some(goal.clone()),
+                    approvals: None,
+                    approve_for_me: false,
+                    fast: false,
+                    account: None,
+                    env: Default::default(),
+                    group: (g.group != workforce_desk::UNGROUPED).then(|| g.group.clone()),
+                },
+                &party,
+                by,
+            )
+            .await
+            .map_err(|e| match e {
+                workforce_desk::DeskError::Internal(e) => {
+                    tracing::warn!(error = %e, "a served session didn't start");
+                    "Something went wrong on this engine.".to_string()
+                }
+                other => other.to_string(),
+            })?;
+        Ok(format!("started {} ({}); you run it", v.label(), v.id))
+    }
+}
+
+/// What a served boss is called here: its agent, of its hub.
+fn boss_name(g: &Grant) -> String {
+    match &g.boss {
+        Some(BossRef::Remote { hub, agent }) => format!("{agent} ({hub})"),
+        Some(BossRef::Local { agent }) => agent.clone(),
+        None => "a boss".into(),
+    }
+}

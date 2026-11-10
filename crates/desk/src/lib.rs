@@ -68,6 +68,7 @@ pub mod reads;
 pub mod realtime;
 pub mod rooms;
 pub mod scope;
+pub mod sees;
 mod service;
 pub mod speech;
 pub mod state;

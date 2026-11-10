@@ -38,6 +38,7 @@ mod plan;
 mod read_only;
 mod reading;
 mod scope;
+pub(crate) mod served;
 mod spend;
 mod tools;
 mod watcher;
@@ -598,11 +599,23 @@ impl CrewHub {
     /// Whether the overseer of `o`'s scope acts fully in the repository
     /// session `session` works in, now.
     pub(crate) fn ships_in(&self, session: uuid::Uuid, o: &Oversight) -> bool {
+        let boss = self
+            .overseer_for(&o.scope)
+            .map(|(s, _)| s.agent_id.as_str().to_string());
+        self.ships_in_for(session, o, boss.as_deref())
+    }
+
+    /// Whether `boss`, at `o`, acts fully in the repository session
+    /// `session` works in, now.
+    pub(crate) fn ships_in_for(
+        &self,
+        session: uuid::Uuid,
+        o: &Oversight,
+        boss: Option<&str>,
+    ) -> bool {
         o.level == Level::Full
-            && self.overseer_for(&o.scope).is_some_and(|(s, _)| {
-                let id = s.agent_id.as_str();
-                self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id)
-            })
+            && boss
+                .is_some_and(|id| self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id))
     }
 
     /// Reads what each overseer that chose Act fully has spent today (its
