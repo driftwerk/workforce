@@ -872,15 +872,19 @@ impl Desk {
         let old_board = self.board_of(before.ticket.board).await?;
         // A synced ticket's issue belongs to its board's link, in its
         // group: it never goes to another board.
-        // Refused before anything changes: a refused move keeps who has it.
+        // A client's synced ticket stays on its board, and never stays with
+        // a session that leaves for another group: it is released.
         if let Some(e) = &before.ticket.external {
+            self.leave_ticket(id, by).await?;
             return Err(DeskError::Conflict(format!(
-                "{} lives on {}'s {}. It stays there.",
+                "{} lives on {}'s {}. It stays there, unassigned.",
                 e.key,
                 old_board.name,
                 e.system.title()
             )));
         }
+        // Onto a synced board: refused before anything changes, so it keeps
+        // who has it.
         let to = self.board_of(board).await?;
         if let Some(sync) = &to.sync {
             return Err(DeskError::Conflict(format!(

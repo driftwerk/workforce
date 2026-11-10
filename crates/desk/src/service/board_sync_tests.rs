@@ -584,3 +584,40 @@ async fn a_create_held_a_day_stops_and_says_so() {
     })
     .await;
 }
+
+/// A session moving group never takes a client's synced ticket along, nor
+/// keeps it: the ticket stays on its board, released.
+#[tokio::test]
+async fn a_synced_ticket_is_released_when_its_session_moves_group() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        d.pull_board(b.id, &jira(1, &[])).await.unwrap();
+        let t = d
+            .tickets(b.id, &Default::default())
+            .await
+            .unwrap()
+            .remove(0)
+            .ticket
+            .id;
+        let other = d.plan_board(None).await.unwrap();
+        let c = d.0.store.pool().get().await.unwrap();
+        let agent = serde_json::to_value(crate::crew::Party::agent("atlas", "Atlas")).unwrap();
+        c.execute(
+            "UPDATE tickets SET assignee = $2, state = 'doing' WHERE id = $1",
+            &[&t, &agent],
+        )
+        .await
+        .unwrap();
+        drop(c);
+        assert!(matches!(
+            d.ticket_goes(t, other.id, &By::you()).await,
+            Err(DeskError::Conflict(_))
+        ));
+        let after = d.ticket(t).await.unwrap().ticket;
+        assert_eq!(after.board, b.id, "it stays on its board");
+        assert_eq!(after.assignee, None, "and no one in another group has it");
+    })
+    .await;
+}
