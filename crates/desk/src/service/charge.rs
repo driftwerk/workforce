@@ -190,6 +190,16 @@ impl Desk {
         st.charges.holds.get(boss).copied().unwrap_or(charge::HOLD)
     }
 
+    /// The person is writing to `id` in Desk's composer (a draft changed,
+    /// not yet sent): it counts as their input, as a keystroke in its
+    /// terminal does, so the boss doesn't answer underneath them. Desk's
+    /// window says so at most every [`charge::TYPING_EVERY`] while they type.
+    pub fn person_typing(&self, id: Uuid) -> Result<(), DeskError> {
+        self.view(id)?;
+        self.person_drove(id);
+        Ok(())
+    }
+
     /// The person gave `id` a prompt or wrote to it: they take its wheel.
     pub(super) fn person_drove(&self, id: Uuid) {
         self.0.state.lock().charges.driven.insert(id, Utc::now());
