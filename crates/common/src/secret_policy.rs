@@ -152,6 +152,11 @@ fn resolve_one(
         warn!(target: "sentinel.audit", "secret refused: egress host not allowed");
         return Err(eyre!("{SECRET_REFUSED}"));
     }
+    // A Desk link's token goes only where Desk's board sync sends it.
+    if vault_scope::is_desk_link(&marker.key) {
+        warn!(target: "sentinel.audit", "secret refused: a Desk link is never a workflow secret");
+        return Err(eyre!("{SECRET_REFUSED}"));
+    }
 
     let resolved = if is_per_user_scope(marker.scope) {
         // Resolve the owner's per-user secret by its explicit physical path at

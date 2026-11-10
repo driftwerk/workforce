@@ -8887,6 +8887,14 @@ pub struct RemoteMcpConfig {
     /// whose keepalives outlast a proxy's idle timeout.
     #[serde(default = "default_remote_mcp_chat_max_wait_secs")]
     pub chat_max_wait_secs: u64,
+    /// Whether a paired device (Desk) may mint a `wfr_` token for the person
+    /// it is linked to, with its device token
+    /// (`POST /api/me/remote-mcp-tokens/desk`). Off by default: a person then
+    /// makes the token on this hub themselves and pastes it once. A token a
+    /// device minted acts with a member's capabilities, never an admin's, and
+    /// stops working the moment its device is unpaired.
+    #[serde(default)]
+    pub allow_device_tokens: bool,
 }
 
 impl Default for RemoteMcpConfig {
@@ -8898,6 +8906,7 @@ impl Default for RemoteMcpConfig {
             tools_allow: default_remote_mcp_tools_allow(),
             chat_default_wait_secs: default_remote_mcp_chat_default_wait_secs(),
             chat_max_wait_secs: default_remote_mcp_chat_max_wait_secs(),
+            allow_device_tokens: false,
         }
     }
 }

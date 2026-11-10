@@ -1424,6 +1424,11 @@ impl ServiceHosts {
 }
 
 /// The running agent service — ties together identity, sessions, and the LLM.
+/// The late-bound remote MCP token store an agent's tools read.
+pub type RemoteMcpTokensHandle = Arc<
+    parking_lot::RwLock<Option<Arc<dyn workforce_identity::remote_mcp_token::RemoteMcpTokenStore>>>,
+>;
+
 pub struct AgentService {
     pub config: Arc<WorkforceConfig>,
     /// Path to the workforce.toml config file (for runtime config saves).
@@ -1593,11 +1598,7 @@ pub struct AgentService {
     pub team_store: crate::def_write_auth::TeamStoreHandle,
     /// Remote MCP token store, late-bound with the identity store it lives in
     /// (see [`Self::set_remote_mcp_token_store`]); `cmd: remote-mcp` reads it.
-    pub remote_mcp_tokens: Arc<
-        parking_lot::RwLock<
-            Option<Arc<dyn workforce_identity::remote_mcp_token::RemoteMcpTokenStore>>,
-        >,
-    >,
+    pub remote_mcp_tokens: RemoteMcpTokensHandle,
     /// Permission writer for runtime Always-* persistence. Late-bound
     /// (same lifecycle reason as `identity_store`): the
     /// `PermissionEvaluator` is built in `cli::main` after the

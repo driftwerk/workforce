@@ -154,3 +154,81 @@ pub(crate) fn bearer(token: &str) -> axum::http::HeaderMap {
     );
     headers
 }
+
+/// `fixture` with a pairing service, and remote MCP's device minting
+/// switched as `allow_device_tokens` says.
+pub(crate) fn fixture_with_devices(
+    allow_device_tokens: bool,
+) -> (Fixture, Arc<workforce_pairing::SqlitePairingStore>) {
+    let fx = fixture(true);
+    let devices = Arc::new(
+        workforce_pairing::SqlitePairingStore::in_memory().expect("in-memory pairing store"),
+    );
+    let pairing = Arc::new(workforce_pairing::DevicePairingService::new(
+        Arc::clone(&devices) as Arc<dyn workforce_pairing::PairingStore>,
+        workforce_pairing::types::PairingConfig::default(),
+    ));
+    let state = Arc::try_unwrap(fx.state)
+        .ok()
+        .expect("the fixture's only handle");
+    let state = Arc::new(GatewayState {
+        device_pairing: Some(Arc::clone(&pairing)),
+        remote_mcp: RemoteMcpConfig {
+            allow_device_tokens,
+            ..state.remote_mcp.clone()
+        },
+        ..state
+    });
+    (
+        Fixture {
+            state,
+            identities: fx.identities,
+            tokens: fx.tokens,
+        },
+        devices,
+    )
+}
+
+/// Pairs a desktop (Desk) device named `name` to `person` and returns it
+/// with its bearer.
+pub(crate) fn pair_device(
+    fixture: &Fixture,
+    devices: &workforce_pairing::SqlitePairingStore,
+    person: &mut Identity,
+    name: &str,
+) -> (workforce_pairing::ApprovedDevice, String) {
+    pair_device_as(fixture, devices, person, name, "desktop_device")
+}
+
+/// [`pair_device`] as a device of `kind`.
+pub(crate) fn pair_device_as(
+    fixture: &Fixture,
+    devices: &workforce_pairing::SqlitePairingStore,
+    person: &mut Identity,
+    name: &str,
+    kind: &str,
+) -> (workforce_pairing::ApprovedDevice, String) {
+    use workforce_identity::store::IdentityStore;
+    let bearer = format!("wfp_{}", uuid::Uuid::new_v4().simple());
+    let device = workforce_pairing::ApprovedDevice {
+        id: uuid::Uuid::new_v4().to_string(),
+        device_name: name.to_string(),
+        client_id: None,
+        scopes: vec![],
+        token_hash: blake3::hash(bearer.as_bytes()).to_hex().to_string(),
+        created_at: Utc::now(),
+        last_used: None,
+        revoked: false,
+        expires_at: None,
+    };
+    workforce_pairing::PairingStore::register_device(devices, &device).expect("device persists");
+    person.link_id(
+        crate::device_link::device_link_key(kind, &device.id),
+        &device.id,
+    );
+    fixture
+        .identities
+        .update(person)
+        .expect("identity links the device");
+    (device, bearer)
+}

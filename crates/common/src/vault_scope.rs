@@ -124,3 +124,53 @@ mod tests {
         assert!(!is_per_user_scope(VaultSource::Global));
     }
 }
+
+/// Where Desk keeps its links to other hubs, as a logical vault path (any
+/// `users/<uid>/` taken off): the `wfr_` tokens its board sync calls them
+/// with. Only the sync reads and writes them: no agent tool, and no secret
+/// marker, ever resolves one.
+pub const DESK_LINK_PREFIXES: [&str; 2] = ["desk/hubs", "desk/links"];
+
+/// Whether the vault path `path` (shared, or per-user under `users/<uid>/`)
+/// is a Desk link, matched without regard to case, doubled or trailing
+/// slashes, so no spelling of it slips by.
+pub fn is_desk_link(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let logical = match segments.first().map(String::as_str) {
+        Some("users") if segments.len() > 2 => &segments[2..],
+        _ => &segments[..],
+    };
+    DESK_LINK_PREFIXES.iter().any(|prefix| {
+        let want: Vec<&str> = prefix.split('/').collect();
+        logical.len() >= want.len() && logical.iter().zip(&want).all(|(a, b)| a == b)
+    })
+}
+
+#[cfg(test)]
+mod desk_link_tests {
+    use super::is_desk_link;
+
+    #[test]
+    fn a_desk_link_is_known_however_it_is_spelled() {
+        for p in [
+            "desk/hubs/atlas/remote_mcp",
+            "users/sam/desk/hubs/atlas/remote_mcp",
+            "Desk//Links/atlas",
+            "/desk/hubs",
+        ] {
+            assert!(is_desk_link(p), "{p}");
+        }
+        for p in [
+            "desk/notes",
+            "users/sam/desk/hubsx",
+            "skills/desk/hubs",
+            "users/desk/hubs",
+        ] {
+            assert!(!is_desk_link(p), "{p}");
+        }
+    }
+}
