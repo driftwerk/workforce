@@ -2177,6 +2177,10 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     // works outside threads).
     meta_lines.push("- Commands (tell users to prefix with `cmd:` — works in Slack threads too): `cmd: new`, `cmd: reset`, `cmd: status`, `cmd: compact`, `cmd: context`, `cmd: model`, `cmd: health`, `cmd: wake`, `cmd: heartbeat`, `cmd: help`".to_string());
 
+    if let Some(line) = works_in_line(&service.workspace) {
+        meta_lines.push(line);
+    }
+
     turn_context.push_str("\n\n");
     turn_context.push_str(&meta_lines.join("\n"));
 
@@ -2217,6 +2221,46 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         injected_lessons,
         lesson_events,
     }
+}
+
+/// The runtime line naming the folders the person gave this agent to work
+/// in (`[computer] works_in`), on a hub with `[desk]`, the only one that
+/// reads them; `None` with none.
+fn works_in_line(workspace: &std::path::Path) -> Option<String> {
+    if !crate::serve::computer_gates_installed() {
+        return None;
+    }
+    let config = workforce_common::settings::AgentWorkspaceConfig::load(workspace)
+        .ok()
+        .flatten()?;
+    let folders = config.works_in().ok()?;
+    let full = config
+        .computer()
+        .is_ok_and(|c| c.access == workforce_core::computer::Access::Full);
+    works_in_text(&folders, full)
+}
+
+/// [`works_in_line`]'s words for `folders`; `full` when the agent is at Full
+/// access, the only level that runs commands on this computer.
+fn works_in_text(folders: &[std::path::PathBuf], full: bool) -> Option<String> {
+    let first = folders.first()?;
+    let all: Vec<String> = folders
+        .iter()
+        .map(|f| format!("`{}`", f.display()))
+        .collect();
+    let first = first.display();
+    let start = match full {
+        true => format!(
+            "start coding work there: `code.*` with `repo` = `{first}` and `desk.start` sessions in `{first}` unless they say otherwise. Commands (`exec.run`) run only at Full access, which you have, and aren't confined to these folders: a command can reach anything you can"
+        ),
+        false => format!(
+            "read and change files there (`code.*` with `repo` = `{first}`). Commands and sessions run only at Full access, which the person sets; you don't have it"
+        ),
+    };
+    Some(format!(
+        "- Works in: {} (the person chose these beside your own workspace; {start}; deleting there asks them first)",
+        all.join(", ")
+    ))
 }
 
 /// Session-bound wrapper around [`fuse_recall_query`]. Returns `None`

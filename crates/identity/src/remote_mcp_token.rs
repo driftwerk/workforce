@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const TOKEN_PREFIX: &str = "wfr_";
+/// What a Desk boss link token starts with. A different prefix from
+/// [`TOKEN_PREFIX`], so the remote MCP routes, which take only `wfr_`, never
+/// look one up, and redaction knows it by sight.
+pub const DESK_BOSS_TOKEN_PREFIX: &str = "wfb_";
+/// The scope entry that names the paired device a token was minted by:
+/// `device:<device id>`. It binds the token to that device, and is not a
+/// kind of its own.
+pub const DEVICE_SCOPE_PREFIX: &str = "device:";
 const SECRET_BYTES: usize = 32;
 const FINGERPRINT_CONTEXT: &str = "workforce remote-mcp key fingerprint v1";
 const FINGERPRINT_HEX_CHARS: usize = 8;
@@ -28,6 +36,90 @@ pub struct RemoteMcpToken {
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// What a [`TokenScope::DeskBoss`] token links, and nothing for any
+    /// other kind.
+    pub desk_link: Option<DeskLink>,
+}
+
+/// What one token can be used for. A token is exactly one kind, read from
+/// its scopes by [`TokenScope::of`], which fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenScope {
+    /// The hub as an MCP server for the person's own clients (`/mcp`).
+    RemoteMcp,
+    /// One Desk boss link and nothing else: an engine's uplink to an agent
+    /// here that bosses one of the person's Desk groups. It reaches no
+    /// other route.
+    DeskBoss,
+}
+
+impl TokenScope {
+    pub const ALL: [TokenScope; 2] = [TokenScope::RemoteMcp, TokenScope::DeskBoss];
+
+    /// The scope entry stored for this kind.
+    pub fn key(self) -> &'static str {
+        match self {
+            TokenScope::RemoteMcp => "remote_mcp",
+            TokenScope::DeskBoss => "desk_boss",
+        }
+    }
+
+    /// The prefix a plaintext token of this kind starts with.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            TokenScope::RemoteMcp => TOKEN_PREFIX,
+            TokenScope::DeskBoss => DESK_BOSS_TOKEN_PREFIX,
+        }
+    }
+
+    /// The one kind `scopes` names, or `None`. Fails closed: exactly one
+    /// known kind, at most one `device:<id>` with a non-empty id, and
+    /// nothing else. A scope this hub doesn't know may be one meant to
+    /// narrow the token, so the token is refused rather than given
+    /// anything. A Desk boss token must name its device.
+    pub fn of(scopes: &[String]) -> Option<TokenScope> {
+        let (devices, kinds): (Vec<&String>, Vec<&String>) = scopes
+            .iter()
+            .partition(|s| s.starts_with(DEVICE_SCOPE_PREFIX));
+        if devices.len() > 1 || devices.iter().any(|d| d.len() == DEVICE_SCOPE_PREFIX.len()) {
+            return None;
+        }
+        let [kind] = kinds.as_slice() else {
+            return None;
+        };
+        let kind = TokenScope::ALL.into_iter().find(|k| k.key() == *kind)?;
+        match kind {
+            TokenScope::DeskBoss if devices.is_empty() => None,
+            kind => Some(kind),
+        }
+    }
+}
+
+/// What one Desk boss link token binds, beside its person and device: the
+/// agent here that bosses, the Desk group, and the engine (one running Desk
+/// backend) whose uplink carries it. `desk_group_key`, `group_name` and the
+/// engine's names are what the minting Desk says; the hub keeps them for
+/// display and never trusts them for authority. `group_key` is the hub's
+/// own, derived from the person, the device and `desk_group_key`, so two
+/// people's or two Desks' groups can never share one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskLink {
+    /// Stays the same across a renewal, so the link keeps its identity.
+    pub link_id: Uuid,
+    pub agent_id: String,
+    /// The hub's key for the group: see the type's docs.
+    pub group_key: String,
+    /// The group's key as the minting Desk named it.
+    #[serde(default)]
+    pub desk_group_key: String,
+    pub group_name: String,
+    pub engine_id: String,
+    pub engine_name: String,
+    /// The engine's Ed25519 public key, registered at mint:
+    /// `ed25519:<base64url, unpadded, of the 32 key bytes>`. The uplink
+    /// proves the private half on every connect.
+    pub engine_public_key: String,
 }
 
 /// Everything but the stored hash: a Debug line is a log line.
@@ -42,6 +134,7 @@ impl std::fmt::Debug for RemoteMcpToken {
             .field("expires_at", &self.expires_at)
             .field("last_used_at", &self.last_used_at)
             .field("revoked_at", &self.revoked_at)
+            .field("desk_link", &self.desk_link)
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +148,33 @@ impl RemoteMcpToken {
 
     pub fn is_live(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_none() && now < self.expires_at
+    }
+
+    /// This token's one kind, or `None` when it can't be told: its scopes
+    /// as [`TokenScope::of`] reads them, and a link exactly when it is a
+    /// Desk boss token.
+    pub fn scope(&self) -> Option<TokenScope> {
+        match (TokenScope::of(&self.scopes)?, &self.desk_link) {
+            (TokenScope::RemoteMcp, None) => Some(TokenScope::RemoteMcp),
+            (TokenScope::DeskBoss, Some(_)) => Some(TokenScope::DeskBoss),
+            _ => None,
+        }
+    }
+
+    /// The paired device its scopes say minted it.
+    pub fn minted_by_device(&self) -> Option<&str> {
+        minted_by_device(&self.scopes)
+    }
+}
+
+/// The device `scopes` say minted a token, when they name exactly one.
+pub fn minted_by_device(scopes: &[String]) -> Option<&str> {
+    let mut devices = scopes
+        .iter()
+        .filter_map(|s| s.strip_prefix(DEVICE_SCOPE_PREFIX));
+    match (devices.next(), devices.next()) {
+        (Some(d), None) if !d.is_empty() => Some(d),
+        _ => None,
     }
 }
 
@@ -74,10 +194,15 @@ impl std::fmt::Debug for MintedToken {
 }
 
 pub fn mint() -> MintedToken {
+    mint_as(TokenScope::RemoteMcp)
+}
+
+/// A fresh token of `kind`, starting with that kind's prefix.
+pub fn mint_as(kind: TokenScope) -> MintedToken {
     let mut secret = [0u8; SECRET_BYTES];
     rand::thread_rng().fill_bytes(&mut secret);
     let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
-    let plaintext = format!("{TOKEN_PREFIX}{body}");
+    let plaintext = format!("{}{body}", kind.prefix());
     MintedToken {
         hash: hash_token(&plaintext),
         plaintext,
@@ -136,6 +261,7 @@ mod tests {
             expires_at: now + Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         }
     }
 
@@ -204,5 +330,93 @@ mod tests {
             ..token(now)
         };
         assert!(!revoked.is_live(now));
+    }
+
+    fn scopes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn link() -> DeskLink {
+        DeskLink {
+            link_id: Uuid::new_v4(),
+            agent_id: "allan".into(),
+            group_key: "d-1/g-acme".into(),
+            desk_group_key: "d-1/g-acme".into(),
+            group_name: "Acme".into(),
+            engine_id: "devbox".into(),
+            engine_name: "devbox".into(),
+            engine_public_key: "ed25519:AAAA".into(),
+        }
+    }
+
+    #[test]
+    fn a_token_is_exactly_one_known_kind_or_none() {
+        let of = |list: &[&str]| TokenScope::of(&scopes(list));
+        assert_eq!(of(&["remote_mcp"]), Some(TokenScope::RemoteMcp));
+        assert_eq!(
+            of(&["remote_mcp", "device:d1"]),
+            Some(TokenScope::RemoteMcp)
+        );
+        assert_eq!(of(&["device:d1", "desk_boss"]), Some(TokenScope::DeskBoss));
+        for refused in [
+            &[][..],
+            &["desk_boss"][..],
+            &["remote_mcp", "desk_boss", "device:d1"][..],
+            &["remote_mcp", "remote_mcp"][..],
+            &["remote_mcp", "admin"][..],
+            &["Remote_MCP"][..],
+            &["remote_mcp", "device:"][..],
+            &["desk_boss", "device:"][..],
+            &["remote_mcp", "device:a", "device:b"][..],
+            &["desk_boss", "device:a", "device:b"][..],
+            &["device:a"][..],
+            &["*"][..],
+        ] {
+            assert_eq!(TokenScope::of(&scopes(refused)), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_desk_boss_token_needs_its_link_and_no_other_kind_has_one() {
+        let now = Utc::now();
+        let boss = RemoteMcpToken {
+            scopes: scopes(&["desk_boss", "device:d1"]),
+            desk_link: Some(link()),
+            ..token(now)
+        };
+        assert_eq!(boss.scope(), Some(TokenScope::DeskBoss));
+        assert_eq!(boss.minted_by_device(), Some("d1"));
+        let unlinked = RemoteMcpToken {
+            desk_link: None,
+            ..boss.clone()
+        };
+        assert_eq!(unlinked.scope(), None);
+        let mcp_with_link = RemoteMcpToken {
+            desk_link: Some(link()),
+            ..token(now)
+        };
+        assert_eq!(mcp_with_link.scope(), None);
+        assert_eq!(token(now).scope(), Some(TokenScope::RemoteMcp));
+    }
+
+    #[test]
+    fn each_kind_mints_with_its_own_prefix() {
+        let boss = mint_as(TokenScope::DeskBoss);
+        assert!(boss.plaintext.starts_with(DESK_BOSS_TOKEN_PREFIX));
+        assert!(!boss.plaintext.starts_with(TOKEN_PREFIX));
+        assert_eq!(boss.plaintext.len(), DESK_BOSS_TOKEN_PREFIX.len() + 43);
+        assert_eq!(boss.hash, hash_token(&boss.plaintext));
+        assert!(mint().plaintext.starts_with(TOKEN_PREFIX));
+    }
+
+    #[test]
+    fn minted_by_device_names_one_device_or_none() {
+        assert_eq!(
+            minted_by_device(&scopes(&["remote_mcp", "device:d1"])),
+            Some("d1")
+        );
+        assert_eq!(minted_by_device(&scopes(&["remote_mcp"])), None);
+        assert_eq!(minted_by_device(&scopes(&["device:"])), None);
+        assert_eq!(minted_by_device(&scopes(&["device:a", "device:b"])), None);
     }
 }

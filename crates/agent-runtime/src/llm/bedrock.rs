@@ -299,13 +299,21 @@ impl BedrockClient {
             .await
             .map_err(|e| eyre!("Bedrock HTTP request failed: {e}"))?;
         if !response.status().is_success() {
-            return Err(format_response_error(
+            let profile = self.resolver.profile();
+            let (error, expired) = format_response_error(
                 response,
                 model,
                 &self.region,
                 self.catalog.as_deref(),
+                profile,
             )
-            .await);
+            .await;
+            if expired {
+                // Held credentials AWS calls expired: the next call reads
+                // the profile again, after the person signs in.
+                self.resolver.forget().await;
+            }
+            return Err(error);
         }
         Ok(response)
     }
@@ -378,12 +386,16 @@ fn build_body_for(
     }
 }
 
+/// The error a failed answer makes, and whether it says the credentials of
+/// `profile` (the AWS CLI profile they come from, if one) expired: then it
+/// says to sign in again, never that a key is wrong.
 async fn format_response_error(
     response: reqwest::Response,
     model: &str,
     region: &str,
     catalog: Option<&BedrockCatalogStore>,
-) -> eyre::Report {
+    profile: Option<&str>,
+) -> (eyre::Report, bool) {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -396,6 +408,18 @@ async fn format_response_error(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let body_text = response.text().await.unwrap_or_default();
+    if let Some(profile) = profile.filter(|_| {
+        status == reqwest::StatusCode::FORBIDDEN
+            && super::bedrock_credentials::says_expired(&body_text)
+    }) {
+        return (
+            eyre!(
+                "{}",
+                super::bedrock_credentials::sso_expired_message(profile)
+            ),
+            true,
+        );
+    }
     let mut msg = format!("Bedrock API error ({status}): {body_text}");
     if let Some(rid) = amzn_request_id {
         msg.push_str(&format!(" [request-id: {rid}]"));
@@ -408,7 +432,7 @@ async fn format_response_error(
             msg.push_str(&suffix);
         }
     }
-    eyre!("{}", msg)
+    (eyre!("{}", msg), false)
 }
 
 fn looks_like_invalid_model_error(body: &str) -> bool {

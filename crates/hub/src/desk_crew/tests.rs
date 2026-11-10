@@ -220,6 +220,7 @@ async fn desk_running(
             account_keys: None,
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
+            bosses: Default::default(),
         },
         floor,
         CancellationToken::new(),
@@ -1229,7 +1230,8 @@ async fn the_overseer_only_suggests_what_it_would_have_an_agent_do() {
 
 /// With `message_agents` on, at level act, the overseer's nudges and tasks
 /// to agents go at once (the agent's turn is held to Desk at paired trust),
-/// but words that read as sending or pushing still only suggest. Sessions
+/// whatever their words (what the agent then posts or sends waits on the
+/// person, as at paired trust). Sessions
 /// started in another terminal are nudged on their own only with
 /// `message_terminal_sessions`, and are never resumed or restarted so.
 #[tokio::test(flavor = "multi_thread")]
@@ -1296,11 +1298,11 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
             .unwrap();
         assert!(assigned.output["done"].is_string(), "{assigned:?}");
         for message in ["Share it in #general", "Push the branch", "Open a PR for it"] {
-            let held = tool("crew.nudge")
+            let sent = tool("crew.nudge")
                 .execute(json!({"agent_id": "scout", "message": message, "reason": "Done."}))
                 .await
                 .unwrap();
-            assert!(held.output["suggested"].is_string(), "{message}: {held:?}");
+            assert!(sent.output["done"].is_string(), "{message}: {sent:?}");
         }
 
         let (_, mut o) = crew.overseer_service().unwrap();
@@ -2886,8 +2888,9 @@ async fn the_overseer_answers_which_session_spends_most_from_the_ledger_at_watch
 
 /// A session asks the overseer on its line: a routine question gets the
 /// overseer's answer as the session's tool result, and the DM a compact
-/// notice; one that reads as pushing comes to the person, with the
-/// overseer's reply as its draft, on the Floor and in the DM.
+/// notice; one that speaks of what no overseer does (a force push) comes
+/// to the person, with the overseer's reply as its draft, on the Floor and
+/// in the DM.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_the_rest() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -2933,7 +2936,7 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             .line_call(
                 s.id,
                 "ask",
-                &json!({"to": "desk", "text": "May I push to main?", "wait_seconds": 60}),
+                &json!({"to": "desk", "text": "May I force push to main?", "wait_seconds": 60}),
                 // Its call still waits, as between the plugin's polls.
                 Some(std::time::Duration::from_millis(10)),
             )
@@ -2944,7 +2947,7 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             d.line_needs().into_iter().find(|n| n.id == format!("line:{ask}"))
         })
         .await;
-        assert_eq!(need.ask, "May I push to main?");
+        assert_eq!(need.ask, "May I force push to main?");
         let given = d.store().line_message(ask).await.unwrap().unwrap();
         assert_eq!(given.asked, Some(workforce_desk::line::Asked::Escalated));
         assert_eq!(
@@ -2956,7 +2959,7 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap()?;
             dm.messages
                 .iter()
-                .find(|m| m.content.starts_with("acme-web asks: “May I push to main?”"))
+                .find(|m| m.content.starts_with("acme-web asks: “May I force push to main?”"))
                 .cloned()
         })
         .await;
@@ -3156,14 +3159,23 @@ async fn the_breakers_steer_of_a_session_a_boss_runs_is_told_to_the_boss() {
     .await;
 }
 
-/// A message to a session isn't outward for the session's own name, nor
-/// for a word it says not to do; what goes ahead and pushes still is.
+/// The note an overseer leaves a session for the night: keep going on
+/// safe work, stop before what reaches outside. Its words name production,
+/// publishing and deploys only as what not to do.
+pub(super) const OVERNIGHT_NOTE: &str = "Keep going on the safe work overnight: tests, \
+    refactors and docs in this repository. Stop before any production changes, tags or \
+    publishing, deploys, or anything using the person's keys, and leave those for the \
+    morning with a short note of where things stand.";
+
+/// What an overseer tells a session at `act` isn't read for pushing or
+/// sending: a message can't act, and what the session then does waits on
+/// its approvals. Only what no overseer does at any level still holds it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
+async fn a_message_runs_at_act_whatever_its_words() {
     use super::actions::{Action, Gate, Target};
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(
+        let (overseer, crew, d, _llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -3172,68 +3184,49 @@ async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
         )
         .await;
         let s = new_session(&d, dir.path(), "Acme Migration").await;
-        let deploy = new_session(&d, dir.path(), "Deploy").await;
-        let (_, o) = crew.overseer_service().unwrap();
-        let nudge = |to, message: &str| Action::Nudge {
-            to: Target::Session(to),
+        let (_, mut o) = crew.overseer_service().unwrap();
+        let nudge = |message: &str| Action::Nudge {
+            to: Target::Session(s.id),
             message: message.into(),
             reply_to: None,
         };
-        let status = "Acme Migration: please give me a plain-English status of where \
-            things stand. Make no production changes until the person replies.";
-        assert_eq!(crew.gate(&nudge(s.id, status), &o), Gate::Run);
-        assert_eq!(
-            crew.gate(&nudge(s.id, "Acme Migration, how is it going?"), &o),
-            Gate::Run,
-            "its name, as addressed"
-        );
-        assert!(
-            matches!(
-                crew.gate(&nudge(deploy.id, "Go ahead with Acme Migration"), &o),
-                Gate::Suggest(_)
-            ),
-            "a name with an outward word, not addressed"
-        );
         for message in [
+            OVERNIGHT_NOTE,
+            "Make no production changes until the person replies.",
             "Go ahead and deploy",
             "Push it",
             "Merge the PR",
-            "Delete the branch",
-            "Don't stop deploying",
         ] {
-            assert!(
-                matches!(crew.gate(&nudge(s.id, message), &o), Gate::Suggest(_)),
-                "{message}"
-            );
+            assert_eq!(crew.gate(&nudge(message), &o), Gate::Run, "{message}");
         }
-        assert!(
-            matches!(
-                crew.gate(&nudge(deploy.id, "Deploy now"), &o),
-                Gate::Suggest(_)
-            ),
-            "a name of outward words hides nothing"
-        );
-        // The question answered is read the same way.
-        let ask = uuid::Uuid::new_v4();
-        crew.questions.lock().insert(
-            ask,
-            "Acme Migration: shall I make no production changes for now?".into(),
-        );
-        let answer = Action::Nudge {
-            to: Target::Session(s.id),
-            message: "Yes".into(),
-            reply_to: Some(ask),
-        };
-        assert_eq!(crew.gate(&answer, &o), Gate::Run);
+        // The tool sends it, not a suggestion.
+        eventually("the overseer's tools", async || overseer.tools.has("crew.nudge").then_some(())).await;
+        let sent = overseer
+            .tools
+            .get("crew.nudge")
+            .unwrap()
+            .execute(json!({"session_id": s.id.to_string(), "message": OVERNIGHT_NOTE, "reason": "Overnight."}))
+            .await
+            .unwrap();
+        assert!(sent.output["done"].is_string(), "{sent:?}");
+        // What no overseer does at any level is still the person's.
+        assert!(matches!(
+            crew.gate(&nudge("Force push main when it's green"), &o),
+            Gate::Suggest(_)
+        ));
+        // Suggesting, it only ever suggests.
+        o.level = workforce_common::oversight::Level::Suggest;
+        assert!(matches!(crew.gate(&nudge(OVERNIGHT_NOTE), &o), Gate::Suggest(_)));
     })
     .await;
 }
 
 /// An answer to a session's question runs at `act` with `answer_sessions`
-/// on, unless the question or the answer reads as pushing, deleting or
-/// sending; giving a question to the person always runs.
+/// on, whatever the question or the answer says (an answer is a message;
+/// what it leads to waits on the session's approvals), unless it speaks of
+/// what no overseer does; giving a question to the person always runs.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
+async fn an_answer_is_gated_by_the_switch_and_by_what_no_overseer_does() {
     use super::actions::{Action, Gate, Target};
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -3247,11 +3240,14 @@ async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
         .await;
         let s = new_session(&d, dir.path(), "acme-web").await;
         let (_, mut o) = crew.overseer_service().unwrap();
-        let (routine, outward, unknown) = (
+        let (routine, outward, never) = (
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
         );
+        crew.questions
+            .lock()
+            .insert(never, "May I force push to main?".into());
         crew.questions
             .lock()
             .insert(routine, "Which port does the test database use?".into());
@@ -3264,17 +3260,14 @@ async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
             reply_to: Some(ask),
         };
         assert_eq!(crew.gate(&answer(routine, "5433"), &o), Gate::Run);
-        assert!(matches!(
+        assert_eq!(
             crew.gate(&answer(routine, "Push it when green"), &o),
-            Gate::Suggest(_)
-        ));
-        assert!(matches!(
-            crew.gate(&answer(outward, "Yes"), &o),
-            Gate::Suggest(_)
-        ));
+            Gate::Run
+        );
+        assert_eq!(crew.gate(&answer(outward, "Yes"), &o), Gate::Run);
         assert!(
-            matches!(crew.gate(&answer(unknown, "Yes"), &o), Gate::Suggest(_)),
-            "a question it can't read is the person's"
+            matches!(crew.gate(&answer(never, "Yes"), &o), Gate::Suggest(_)),
+            "what no overseer does stays the person's, asked or answered"
         );
         let escalate = Action::Escalate {
             message: routine,
@@ -4544,10 +4537,12 @@ mod board {
         .await;
     }
 
-    /// What a ticket says is judged as `crew.assign` judges its task: words
-    /// that push, deploy or send make a hand-out the person's call.
+    /// What a ticket says is a message to whoever takes it, so its words
+    /// don't hold the hand-out: one that says to deploy goes at once, to an
+    /// agent and to a session in another terminal alike, where the person
+    /// let it message them.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_ticket_that_says_to_deploy_is_handed_out_as_a_suggestion() {
+    async fn a_ticket_that_says_to_deploy_is_handed_out_like_any_other() {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let terminal = elsewhere(pool.clone(), dir.path()).await;
@@ -4583,16 +4578,12 @@ mod board {
             let assign = overseer.tools.get("crew.assign_ticket").unwrap();
             let to = |key: &str, to: Value| json!({"ticket": key, "to": to, "reason": "Next up."});
             let r = assign.execute(to("ACM-1", json!({"agent": "scout"}))).await.unwrap();
-            assert!(r.output["suggested"].is_string(), "{r:?}");
+            assert_eq!(r.output["done"], "gave ACM-1 to Scout", "{r:?}");
             let r = assign
-                .execute(to("ACM-1", json!({"session": terminal.to_string()})))
+                .execute(to("ACM-2", json!({"session": terminal.to_string()})))
                 .await
                 .unwrap();
-            assert!(r.output["suggested"].is_string(), "another terminal: {r:?}");
-            assert_eq!(state_of(&d, "ACM-1").await, (TicketState::Todo, None));
-            // Plain words go to the same agent at once.
-            let r = assign.execute(to("ACM-2", json!({"agent": "scout"}))).await.unwrap();
-            assert_eq!(r.output["done"], "gave ACM-2 to Scout", "{r:?}");
+            assert!(r.output["done"].is_string(), "another terminal: {r:?}");
         })
         .await;
     }

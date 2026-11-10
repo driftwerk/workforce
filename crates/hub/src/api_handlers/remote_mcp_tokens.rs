@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use workforce_identity::remote_mcp_token::RemoteMcpToken;
+use workforce_identity::remote_mcp_token::{RemoteMcpToken, TokenScope};
 
 use super::identity::{require_auth, require_roles_assign};
 use super::my_settings::enforce_action_rate_limit;
@@ -76,6 +76,31 @@ fn service(state: &GatewayState) -> Result<RemoteMcpTokenService, Rejection> {
         .ok_or_else(|| rejection(TokenError::Disabled))
 }
 
+/// The token service whether or not `[remote_mcp]` is on, and whether it
+/// is. A Desk boss link can always be listed and revoked by its person and
+/// an admin, whatever `[remote_mcp]` says; every other token only while it
+/// is on.
+fn any_service(state: &GatewayState) -> Result<(RemoteMcpTokenService, bool), Rejection> {
+    let service = RemoteMcpTokenService::for_gateway(state).ok_or_else(|| {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity store not configured",
+        )
+    })?;
+    let on = service.enabled();
+    Ok((service, on))
+}
+
+/// Whether `token` is shown and revocable here while `[remote_mcp]` is `on`
+/// or not.
+fn reachable_kind(on: bool, token: &RemoteMcpToken) -> bool {
+    on || token.scope() == Some(TokenScope::DeskBoss)
+}
+
+fn store_error(e: eyre::Report) -> Rejection {
+    rejection(TokenError::Store(e))
+}
+
 fn parse_id(id: &str) -> Result<Uuid, Rejection> {
     Uuid::parse_str(id).map_err(|_| err(StatusCode::NOT_FOUND, "Token not found"))
 }
@@ -99,11 +124,16 @@ pub struct TokenView {
     /// The paired device that minted it, when one did.
     #[serde(skip_serializing_if = "Option::is_none")]
     minted_by_device: Option<String>,
+    /// `remote_mcp`, `desk_boss` (a Desk boss link, which its label
+    /// names), or absent when its scopes can't be read as either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<TokenScope>,
 }
 
 impl TokenView {
     fn new(token: RemoteMcpToken, now: DateTime<Utc>) -> Self {
         Self {
+            kind: token.scope(),
             expired: is_expired(&token, now),
             minted_by_device: crate::remote_mcp::tokens::minted_by_device(&token.scopes)
                 .map(str::to_owned),
@@ -156,10 +186,13 @@ pub async fn list_my_tokens(
 ) -> ApiResult<TokenListResponse<TokenView>> {
     let identity_id = require_identity(&state, &headers)?;
     let now = Utc::now();
-    let tokens = service(&state)?
-        .list(identity_id)
-        .map_err(rejection)?
+    let (service, on) = any_service(&state)?;
+    let tokens = service
+        .store()
+        .list_tokens_for_identity(identity_id)
+        .map_err(store_error)?
         .into_iter()
+        .filter(|t| reachable_kind(on, t))
         .map(|t| TokenView::new(t, now))
         .collect();
     Ok(Json(TokenListResponse { tokens }))
@@ -193,7 +226,7 @@ pub async fn create_my_token(
 /// The paired device a request's bearer is, and the person it is linked
 /// to. Only a device token is taken here: a login or the hub's own token is
 /// refused, so this route is never a second way for a person to mint.
-async fn paired_device(
+pub(crate) async fn paired_device(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> Result<(workforce_pairing::ApprovedDevice, Uuid), Rejection> {
@@ -305,9 +338,33 @@ pub async fn revoke_my_token(
 ) -> Result<StatusCode, Rejection> {
     let identity = require_identity(&state, &headers)?;
     enforce_action_rate_limit(&state, &identity.to_string())?;
-    let done = service(&state)?
-        .revoke(identity, parse_id(&id)?)
-        .map_err(rejection)?;
+    let id = parse_id(&id)?;
+    let (service, on) = any_service(&state)?;
+    let Some(token) = service
+        .store()
+        .list_tokens_for_identity(identity)
+        .map_err(store_error)?
+        .into_iter()
+        .find(|t| t.id == id)
+    else {
+        return revoked(false);
+    };
+    if !reachable_kind(on, &token) {
+        return Err(rejection(TokenError::Disabled));
+    }
+    let done = service
+        .store()
+        .revoke_token(id, Some(identity), Utc::now())
+        .map_err(store_error)?;
+    if done {
+        tracing::info!(target: "sentinel.audit", identity_id = %identity, token_id = %id, "remote MCP token revoked");
+        crate::boss_links::audit_revoke(
+            state.telemetry_store.as_ref(),
+            &identity.to_string(),
+            &token,
+            "person",
+        );
+    }
     revoked(done)
 }
 
@@ -316,12 +373,14 @@ pub async fn list_all_tokens(
     headers: HeaderMap,
 ) -> ApiResult<TokenListResponse<AdminTokenView>> {
     require_roles_assign(&state, &headers).await?;
-    let service = service(&state)?;
+    let (service, on) = any_service(&state)?;
     let now = Utc::now();
     let tokens = service
-        .list_all()
-        .map_err(rejection)?
+        .store()
+        .list_all_tokens()
+        .map_err(store_error)?
         .into_iter()
+        .filter(|t| reachable_kind(on, t))
         .map(|t| AdminTokenView {
             identity_id: t.identity_id,
             display_name: service.display_name(t.identity_id),
@@ -336,10 +395,32 @@ pub async fn revoke_any_token(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Rejection> {
-    require_roles_assign(&state, &headers).await?;
-    let done = service(&state)?
-        .revoke_any(parse_id(&id)?)
-        .map_err(rejection)?;
+    let admin = require_roles_assign(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    let (service, on) = any_service(&state)?;
+    let Some(token) = service
+        .store()
+        .list_all_tokens()
+        .map_err(store_error)?
+        .into_iter()
+        .find(|t| t.id == id)
+    else {
+        return revoked(false);
+    };
+    if !reachable_kind(on, &token) {
+        return Err(rejection(TokenError::Disabled));
+    }
+    let done = service
+        .store()
+        .revoke_token(id, None, Utc::now())
+        .map_err(store_error)?;
+    if done {
+        tracing::info!(target: "sentinel.audit", token_id = %id, "remote MCP token revoked by admin");
+        let actor = admin
+            .identity_id
+            .map_or_else(|| "admin".to_string(), |id| id.to_string());
+        crate::boss_links::audit_revoke(state.telemetry_store.as_ref(), &actor, &token, "admin");
+    }
     revoked(done)
 }
 
@@ -375,6 +456,7 @@ mod tests {
             expires_at: now + chrono::Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         };
         let expected = token.fingerprint();
         let json = serde_json::to_value(TokenView::new(token, now)).unwrap();

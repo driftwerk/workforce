@@ -116,6 +116,16 @@ macro_rules! guarded {
     };
 }
 
+/// On a machine whose groups come from its grants, the sidebar's routes
+/// change nothing: its groups are the home's to say.
+macro_rules! granted_layout {
+    ($s:expr) => {
+        if let Some(e) = $s.desk.layout_refused() {
+            return e.into_response();
+        }
+    };
+}
+
 type S = State<Arc<ApiState>>;
 type Q = Query<TokenQuery>;
 
@@ -1148,6 +1158,7 @@ async fn replace_layout(
     Json(r): Json<ReplaceLayout>,
 ) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     s.desk
         .change_layout_by_person(|before| match &r.expected {
             Some(expected) if expected != before => Err(DeskError::Conflict(
@@ -1162,6 +1173,7 @@ async fn replace_layout(
 
 async fn import_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(i): Json<Import>) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     s.desk.import_layout(i).await.map(Json).into_response()
 }
 
@@ -1178,6 +1190,7 @@ struct NewGroup {
 
 async fn create_group(State(s): S, h: HeaderMap, Query(q): Q, Json(g): Json<NewGroup>) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     let id = g.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     s.desk
         .change_layout_by_person(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
@@ -1200,6 +1213,7 @@ async fn update_group(
     Json(p): Json<GroupPatch>,
 ) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     s.desk
         .change_layout(|l| l.edit(&id, p.name.as_deref(), p.collapsed))
         .await
@@ -1209,6 +1223,7 @@ async fn update_group(
 
 async fn delete_group(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     // Its boss is taken off first, so the group is no one's when it goes.
     if let Err(why) = s.desk.release_group(&id).await {
         return DeskError::Conflict(why).into_response();
@@ -1234,6 +1249,7 @@ async fn move_group(
     body: Option<Json<Before>>,
 ) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     let before = body.map(|Json(b)| b.before).unwrap_or_default();
     s.desk
         .change_layout(|l| l.move_group(&id, before.as_deref()))
@@ -1250,6 +1266,7 @@ async fn put_member(
     body: Option<Json<Before>>,
 ) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     let before = body.map(|Json(b)| b.before).unwrap_or_default();
     s.desk
         .change_layout_by_person(|l| l.put(&item, &id, before.as_deref()))
@@ -1265,6 +1282,7 @@ async fn remove_member(
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     s.desk
         .change_layout_by_person(|l| match l.group_of(&item) {
             Some(g) if g.id == id => l.remove(&item),
@@ -1285,6 +1303,7 @@ struct Order {
 /// since only Desk knows what shows there unlisted.
 async fn order_ungrouped(State(s): S, h: HeaderMap, Query(q): Q, Json(o): Json<Order>) -> Response {
     guarded!(s, h, q);
+    granted_layout!(s);
     s.desk
         .change_layout_by_person(|l| l.order_ungrouped(&o.items))
         .await
@@ -1926,7 +1945,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         ))
         .merge(crate::plan_api::api_routes(desk.clone(), Arc::clone(&auth)))
         .merge(crate::move_api::api_routes(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::board_api::api_routes(desk, auth))
+        .merge(crate::board_api::api_routes(
+            desk.clone(),
+            Arc::clone(&auth),
+        ))
+        .merge(crate::grant_api::api_routes(desk, auth))
 }
 
 pub fn router(

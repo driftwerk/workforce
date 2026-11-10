@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use workforce_common::settings::RemoteMcpConfig;
-use workforce_identity::remote_mcp_token::{self, RemoteMcpToken, RemoteMcpTokenStore};
+use workforce_identity::remote_mcp_token::{self, RemoteMcpToken, RemoteMcpTokenStore, TokenScope};
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::IdentityStatus;
 
@@ -17,11 +17,11 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 pub const TOKEN_SCOPE: &str = "remote_mcp";
-/// What a token a paired device minted carries beside [`TOKEN_SCOPE`]:
+/// What a token a paired device minted carries beside its kind:
 /// `device:<device id>`. Authentication then checks that device is still
-/// paired to the token's person, and the token acts with a member's
+/// paired to the token's person, and a remote MCP token acts with a member's
 /// capabilities only (`super::auth`).
-pub const DEVICE_SCOPE_PREFIX: &str = "device:";
+pub use workforce_identity::remote_mcp_token::DEVICE_SCOPE_PREFIX;
 
 /// Held while a device mints, so its old token is revoked and its new one
 /// made in one step.
@@ -29,10 +29,23 @@ static DEVICE_MINT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The device a token's scopes say minted it.
 pub fn minted_by_device(scopes: &[String]) -> Option<&str> {
-    scopes
+    workforce_identity::remote_mcp_token::minted_by_device(scopes)
+}
+
+/// Whether `token` is a remote MCP token the device `device_id` minted. A
+/// Desk boss link the same device minted is not: the remote MCP device
+/// routes never replace, count or revoke one.
+fn device_remote_mcp_token(token: &RemoteMcpToken, device_id: &str) -> bool {
+    token.scope() == Some(TokenScope::RemoteMcp) && token.minted_by_device() == Some(device_id)
+}
+
+/// Whether any of `token`'s scopes names the device `device_id`, however
+/// malformed the rest: what unpairing that device revokes.
+fn names_device(token: &RemoteMcpToken, device_id: &str) -> bool {
+    token
+        .scopes
         .iter()
-        .find_map(|s| s.strip_prefix(DEVICE_SCOPE_PREFIX))
-        .filter(|d| !d.is_empty())
+        .any(|s| s.strip_prefix(DEVICE_SCOPE_PREFIX) == Some(device_id))
 }
 const LABEL_MAX_CHARS: usize = 64;
 /// Stands in for `[hub].public_url` in any URL shown before an operator has
@@ -228,7 +241,7 @@ impl RemoteMcpTokenService {
         let _one = DEVICE_MINT.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         for old in self.store.list_tokens_for_identity(identity_id)? {
-            if minted_by_device(&old.scopes) == Some(device_id) {
+            if device_remote_mcp_token(&old, device_id) {
                 self.store.revoke_token(old.id, Some(identity_id), now)?;
             }
         }
@@ -258,11 +271,14 @@ impl RemoteMcpTokenService {
         }
         let now = Utc::now();
         let cap = self.config.max_tokens_per_user;
-        if self
+        // Remote MCP keys only: a Desk boss link has a cap of its own.
+        let held = self
             .store
-            .count_live_tokens_for_identity(identity_id, now)?
-            >= cap as usize
-        {
+            .list_tokens_for_identity(identity_id)?
+            .iter()
+            .filter(|t| t.is_live(now) && t.scope() == Some(TokenScope::RemoteMcp))
+            .count();
+        if held >= cap as usize {
             return Err(TokenError::TokenCap(cap));
         }
         let minted = remote_mcp_token::mint();
@@ -278,6 +294,7 @@ impl RemoteMcpTokenService {
             expires_at: now + Duration::days(i64::from(self.config.token_ttl_days)),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         };
         self.store.create_token(&record)?;
         tracing::info!(
@@ -330,9 +347,7 @@ impl RemoteMcpTokenService {
             .list_tokens_for_identity(identity_id)?
             .into_iter()
             .any(|t| {
-                t.id == id
-                    && t.revoked_at.is_none()
-                    && minted_by_device(&t.scopes) == Some(device_id)
+                t.id == id && t.revoked_at.is_none() && device_remote_mcp_token(&t, device_id)
             });
         if !its_own {
             return Ok(false);
@@ -368,9 +383,15 @@ impl RemoteMcpTokenService {
 }
 
 /// Revokes every live token the device `device_id` minted, once it is
-/// unpaired, so they leave the person's listing and cap too. Authentication
-/// refuses them anyway (`super::auth`); this keeps the rows true. How many.
-pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) -> usize {
+/// unpaired, so they leave the person's listing and cap too: its remote MCP
+/// token and every Desk boss link it made. Authentication refuses them
+/// anyway (`super::auth`, `crate::boss_links`); this keeps the rows true.
+/// How many.
+pub fn revoke_device_tokens(
+    store: &dyn RemoteMcpTokenStore,
+    device_id: &str,
+    telemetry: Option<&Arc<dyn workforce_common::telemetry::TelemetryStore>>,
+) -> usize {
     let now = Utc::now();
     let tokens = match store.list_all_tokens() {
         Ok(t) => t,
@@ -381,7 +402,7 @@ pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) ->
     };
     tokens
         .into_iter()
-        .filter(|t| minted_by_device(&t.scopes) == Some(device_id))
+        .filter(|t| names_device(t, device_id))
         .filter(|t| match store.revoke_token(t.id, None, now) {
             Ok(done) => done,
             Err(e) => {
@@ -391,6 +412,7 @@ pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) ->
         })
         .inspect(|t| {
             tracing::info!(target: "sentinel.audit", token_id = %t.id, device = %device_id, "remote MCP token revoked with its device");
+            crate::boss_links::audit_revoke(telemetry, "system", t, "unpaired");
         })
         .count()
 }
@@ -594,11 +616,11 @@ mod tests {
         assert_eq!(svc.list(me.id).unwrap().len(), 2);
         // Unpaired, the device's token leaves the listing and the cap; the
         // person's own stays.
-        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 1);
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1", None), 1);
         let left = svc.list(me.id).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].label, "laptop");
-        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 0);
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1", None), 0);
     }
 
     /// Links racing on one device leave it one live token.

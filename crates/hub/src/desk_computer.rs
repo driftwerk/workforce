@@ -83,6 +83,33 @@ fn read_access(subject: &ComputerSubject) -> ComputerAccess {
     }
 }
 
+/// The folders this agent works in (`[computer] works_in`), real, each one
+/// an agent may work in on this machine: one admission would refuse (a hand
+/// edit, or a home that moved) is left out, never widened to.
+fn works_in_of(subject: &ComputerSubject, config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
+    let folders = match AgentWorkspaceConfig::load(&subject.workspace) {
+        Ok(Some(c)) => c.works_in().unwrap_or_else(|e| {
+            warn!(agent = %subject.agent, error = %e, "[computer] works_in unreadable; none used");
+            Vec::new()
+        }),
+        _ => Vec::new(),
+    };
+    let withheld = withheld(config, home);
+    folders
+        .into_iter()
+        .filter(|folder| {
+            match workforce_common::computer_access::works_in_refusal(folder, home, &withheld) {
+                Some(why) => {
+                    warn!(agent = %subject.agent, folder = %folder.display(), why, "a folder it works in is left out");
+                    false
+                }
+                None => true,
+            }
+        })
+        .map(|folder| workforce_agent::tools::paths::resolve_real(&folder))
+        .collect()
+}
+
 /// This agent's `[skills]` binding, as the verdict reads it: `None` (every
 /// connector) where it names no `enabled` nor `read_only`. One that can't be
 /// read turns every connector off: admission refuses it before it is written.
@@ -175,7 +202,16 @@ impl HubComputerGate {
         config: &WorkforceConfig,
         subject: &ComputerSubject,
     ) -> Self {
-        let home = home();
+        Self::for_agent_at(computer, config, subject, home())
+    }
+
+    /// [`Self::for_agent`] on a machine whose home is `home`.
+    fn for_agent_at(
+        computer: Computer,
+        config: &WorkforceConfig,
+        subject: &ComputerSubject,
+        home: PathBuf,
+    ) -> Self {
         let own = crate::serve::tool_roots(config, &subject.workspace)
             .iter()
             .map(|root| workforce_agent::tools::paths::resolve_real(root))
@@ -191,6 +227,7 @@ impl HubComputerGate {
                     .unwrap_or_else(|| subject.agent.clone()),
                 access: access_of(subject),
                 own,
+                works_in: works_in_of(subject, config, &home),
                 withheld: withheld(config, &home),
                 config: own_config(&subject.workspace),
                 scratch: scratch(),
@@ -489,8 +526,28 @@ impl ComputerGate for HubComputerGate {
             }
             _ => false,
         };
-        reaches.then(|| workforce_agent::tools::paths::Reach {
-            withheld: self.policy.withheld.clone(),
+        if reaches {
+            return Some(workforce_agent::tools::paths::Reach {
+                withheld: self.policy.withheld.clone(),
+                only: Vec::new(),
+            });
+        }
+        // The folders it works in, at every level, for what touches them:
+        // the verdict has already held the call to its level.
+        let touches = matches!(
+            effect,
+            Effect::Read { .. }
+                | Effect::Write { .. }
+                | Effect::Delete { .. }
+                | Effect::Move { .. }
+                | Effect::Exec { .. }
+                | Effect::Session { .. }
+        );
+        (touches && !self.policy.works_in.is_empty()).then(|| {
+            workforce_agent::tools::paths::Reach {
+                withheld: self.policy.withheld.clone(),
+                only: self.policy.works_in.clone(),
+            }
         })
     }
 
@@ -1156,6 +1213,107 @@ mod tests {
             assert!(
                 !out.unwrap().contains("the readme text"),
                 "refused by the tool's roots"
+            );
+        })
+        .await;
+    }
+
+    /// A folder the person gave it to work in is read and changed at Own
+    /// folder as its own folder is; a folder beside it is not, and one in
+    /// Desk's data is left out however it got into the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_tools_reach_the_folders_it_works_in_at_every_level() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let data = Path::new(&hub.config.hub.data_dir).to_path_buf();
+            let desk = data.parent().unwrap().parent().unwrap().to_path_buf();
+            let repo = desk.parent().unwrap().join("dev/acme");
+            let file = repo.join("README.md");
+            let beside = desk.parent().unwrap().join("dev/other/notes.md");
+            for f in [&file, &beside] {
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, "words").unwrap();
+            }
+            let ben = data.join("agents/ben/notes.md");
+            std::fs::create_dir_all(ben.parent().unwrap()).unwrap();
+            std::fs::write(&ben, "ben's").unwrap();
+            let tools = tools(&hub.subject.workspace);
+            let read = |path: &Path| json!({"path": path.to_string_lossy()});
+            let config = format!(
+                "[computer]\naccess = \"own_folder\"\nworks_in = [\"{}\", \"{}\"]\n",
+                repo.display(),
+                ben.parent().unwrap().display()
+            );
+            std::fs::write(hub.subject.workspace.join("config.toml"), config).unwrap();
+            // The test's folders are in its own home.
+            let home = workforce_agent::tools::paths::resolve_real(desk.parent().unwrap());
+            let gate = HubComputerGate::for_agent_at(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+                home,
+            );
+            assert_eq!(
+                gate.policy.works_in,
+                [workforce_agent::tools::paths::resolve_real(&repo)],
+                "the folder in Desk's data is left out"
+            );
+            let gates = gates(Some(Arc::new(gate)));
+            let (ran, out) = run(&gates, &tools, "filesystem.read", read(&file)).await;
+            assert_eq!(ran, "run");
+            assert!(out.unwrap().contains("words"));
+            assert_eq!(
+                run(
+                    &gates,
+                    &tools,
+                    "filesystem.write",
+                    json!({"path": file.to_string_lossy(), "content": "changed"})
+                )
+                .await
+                .0,
+                "run"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed");
+            // `code.*` takes the folder's full path as its repo, and runs
+            // there; one beside it is no repo.
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+            tools.register(Arc::new(crate::code::CodeGitTool::new(vec![hub
+                .subject
+                .workspace
+                .clone()])));
+            let (ran, out) = run(
+                &gates,
+                &tools,
+                "code.git",
+                json!({"action": "status", "repo": repo.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(ran, "run");
+            let out = out.unwrap();
+            assert!(out.contains("README.md"), "{out}");
+            let (_, out) = run(
+                &gates,
+                &tools,
+                "code.git",
+                json!({"action": "status", "repo": beside.parent().unwrap().to_string_lossy()}),
+            )
+            .await;
+            assert!(!out.unwrap_or_default().contains("notes.md"));
+            assert_eq!(
+                run(&gates, &tools, "filesystem.read", read(&beside))
+                    .await
+                    .0,
+                "refused"
+            );
+            assert_eq!(
+                run(&gates, &tools, "filesystem.read", read(&ben)).await.0,
+                "refused"
             );
         })
         .await;

@@ -919,6 +919,7 @@ impl Tool for VaultMyCredentialsTool {
                     .into_iter()
                     .filter(|(p, _)| !p.starts_with("wasm-skills/"))
                     .filter(|(p, _)| !crate::vault_policy::is_desk_link(p))
+                    .filter(|(p, _)| !crate::vault_policy::is_llm_account(p))
                     .map(|(path, entry)| render_entry(path, entry, self.owner_resolver.as_ref()))
                     .collect();
                 (tier.label().to_string(), serde_json::Value::Array(entries))

@@ -131,8 +131,9 @@ pub fn validate_path(path: &Path, allowed_paths: &[PathBuf]) -> Result<PathBuf> 
 /// are, because agents learn repo names from the `repo.*` catalog and bring
 /// them here.
 pub const REPO_PARAM: &str = "A repo checked out in this workspace: `owner/repo`, or the repo \
-    name alone when only one checkout has it. A repo the hub has indexed but not checked out here \
-    is read with repo.grep, repo.glob and repo.read instead.";
+    name alone when only one checkout has it; or the full path of a folder you work in (Runtime: \
+    Works in). A repo the hub has indexed but not checked out here is read with repo.grep, \
+    repo.glob and repo.read instead.";
 
 /// Resolve the `repo` argument of a `code.*` tool to its directory.
 ///
@@ -148,6 +149,9 @@ pub const REPO_PARAM: &str = "A repo checked out in this workspace: `owner/repo`
 /// session without one would send the edit that follows to the shared
 /// checkout.
 pub fn resolve_repo_path(repo: &str, workspace: &Path) -> Result<PathBuf> {
+    if let Some(folder) = worked_in(repo) {
+        return Ok(folder);
+    }
     let session = WORKTREE_MANAGER.get().and_then(|mgr| {
         let key = workforce_agent::runner::CURRENT_SESSION_KEY
             .try_with(|k| k.clone())
@@ -156,6 +160,23 @@ pub fn resolve_repo_path(repo: &str, workspace: &Path) -> Result<PathBuf> {
     });
     let session = session.as_ref().map(|(mgr, key)| (*mgr, key.as_str()));
     resolve_repo_for(repo, workspace, session)
+}
+
+/// `repo` as the full path of a folder the person gave the agent to work in
+/// (`[computer] works_in`), real, when the call in scope reaches it: the
+/// computer gate lets a call reach those folders alone. The work there is the
+/// person's own checkout, used in place: no session worktree is made in it.
+fn worked_in(repo: &str) -> Option<PathBuf> {
+    let path = Path::new(repo.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    let real = workforce_agent::tools::paths::resolve_real(path);
+    workforce_agent::tools::paths::reached_folders()
+        .iter()
+        .map(|folder| workforce_agent::tools::paths::resolve_real(folder))
+        .any(|folder| real.starts_with(&folder))
+        .then_some(real)
 }
 
 /// [`resolve_repo_path`] for a given session: its worktree manager and session
@@ -358,6 +379,8 @@ pub fn detect_project_type(root: &Path) -> Option<&'static str> {
 pub(crate) fn effect_cwd(input: &serde_json::Value, allowed: &[PathBuf]) -> Option<PathBuf> {
     let base = allowed.first()?;
     let dir = match input["repo"].as_str().filter(|r| !r.trim().is_empty()) {
+        // A full path (a folder it works in) is judged where it is.
+        Some(repo) if Path::new(repo.trim()).is_absolute() => PathBuf::from(repo.trim()),
         Some(repo) => resolve_repo_path(repo, base).ok()?,
         None => base.clone(),
     };
@@ -820,5 +843,43 @@ mod tests {
         fs::write(temp.path().join("package.json"), "{}").unwrap();
 
         assert_eq!(detect_project_type(temp.path()), Some("node"));
+    }
+
+    #[tokio::test]
+    async fn a_folder_it_works_in_is_a_repo_by_its_full_path_only_when_reached() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("agent");
+        let repo = base.path().join("dev/acme");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let full = repo.display().to_string();
+        assert!(
+            resolve_repo_path(&full, &workspace).is_err(),
+            "no reach: a full path is no repo name"
+        );
+        let reach = workforce_agent::tools::paths::Reach {
+            withheld: vec![],
+            only: vec![repo.clone()],
+        };
+        let found = workforce_agent::tools::paths::REACH
+            .scope(reach.clone(), async {
+                resolve_repo_path(&full, &workspace)
+            })
+            .await
+            .unwrap();
+        assert_eq!(found, workforce_agent::tools::paths::resolve_real(&repo));
+        let beside = base.path().join("dev/other").display().to_string();
+        assert!(workforce_agent::tools::paths::REACH
+            .scope(reach, async { resolve_repo_path(&beside, &workspace) })
+            .await
+            .is_err());
+        assert_eq!(
+            effect_cwd(
+                &serde_json::json!({ "repo": full }),
+                std::slice::from_ref(&workspace)
+            ),
+            Some(workforce_agent::tools::paths::resolve_real(&repo)),
+            "the verdict judges the folder named"
+        );
     }
 }

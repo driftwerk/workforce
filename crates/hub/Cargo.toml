@@ -54,9 +54,6 @@ serde_json = "1"
 toml = { workspace = true }
 toml_edit = { workspace = true }
 # The overseer reads what it says past look-alike and hidden letters.
-unicode-normalization = { workspace = true }
-unicode-properties = { workspace = true }
-unicode-security = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -80,6 +77,8 @@ hmac = "0.12"
 sha2 = "0.10"
 subtle = "2.6"
 zeroize = "1"
+# Ed25519 for Desk boss links' engine keys; already in the tree through rustls.
+ring = "0.17"
 # Pure-Rust signing: no C toolchain, and the workspace already avoids aws-lc.
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 dashmap = "6"
@@ -190,6 +189,9 @@ postgres = [
 ]
 
 [dev-dependencies]
+# Cross-check the engine-key weak-key list; both already in the tree.
+ed25519-dalek = "2"
+curve25519-dalek = "4"
 workforce-hub-core = { path = "../hub-core", features = ["test-support"] }
 workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"] }
 tempfile = "3"

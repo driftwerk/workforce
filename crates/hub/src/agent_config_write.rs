@@ -94,6 +94,9 @@ async fn save_over(
     let was = config_files::read(&service.workspace.join(config_files::WORKSPACE_CONFIG))
         .ok()
         .flatten();
+    if let Some(why) = crate::boss_links::desk_boss_refused(was.as_deref(), body, edit.edited_via) {
+        return Err(Refused::Unloadable(ConfigRefusal::Said(why)));
+    }
     #[cfg(feature = "postgres")]
     if let Some(why) =
         crate::desk_crew::oversight_refused(service, was.as_deref(), body, edit.edited_via)

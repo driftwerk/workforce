@@ -344,8 +344,9 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
             .unwrap();
         publishing.await.unwrap();
 
-        // Answering in words: shipping in acme-web is its to say; a
-        // registry, secrets, a force push, or another repository aren't.
+        // Answering is a message, whatever it speaks of: the session's
+        // push, tag or delete is judged as it asks for it. What no overseer
+        // does (a registry, secrets, a force push) stays the person's.
         let answer = |session: uuid::Uuid, question: &str, message: &str| {
             let ask = uuid::Uuid::new_v4();
             crew.questions.lock().insert(ask, question.to_string());
@@ -358,25 +359,35 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         let ship = "Tests pass on feat/x. Shall I merge PR 42, tag v1.2.0 and promote it to staging?";
         assert_eq!(crew.gate(&answer(s.id, ship, "Yes: merge, tag and promote."), &o), Gate::Run);
         assert_eq!(crew.gate(&answer(other.id, ship, "Yes, merge it."), &o), Gate::Run);
+        assert_eq!(crew.gate(&answer(g.id, ship, "Yes, merge it."), &o), Gate::Run);
+        assert_eq!(
+            crew.gate(&answer(s.id, ship, "Yes, and delete the old staging data."), &o),
+            Gate::Run
+        );
         for (session, question, message) in [
             (s.id, "Shall I publish acme-core 1.2.0 to crates.io?", "Yes."),
             (s.id, "Can I source ~/.aws-creds to reach the bucket?", "Yes."),
             (s.id, "The branch diverged; may I force push to main?", "Yes."),
-            (s.id, ship, "Yes, and delete the old staging data."),
-            (g.id, ship, "Yes, merge it."),
         ] {
             assert!(
                 matches!(crew.gate(&answer(session, question, message), &o), Gate::Suggest(_)),
                 "{question} / {message}"
             );
         }
-        // At Act the same answer to ship is the person's.
+        // At Act the same answer runs too; the approval it leads to doesn't.
         let mut act = o.clone();
         act.level = Level::Act;
-        assert!(matches!(
+        assert_eq!(
             crew.gate(&answer(s.id, ship, "Yes: merge, tag and promote."), &act),
-            Gate::Suggest(_)
-        ));
+            Gate::Run
+        );
+        // The overnight note goes as a nudge acting fully.
+        let note = Action::Nudge {
+            to: Target::Session(s.id),
+            message: OVERNIGHT_NOTE.into(),
+            reply_to: None,
+        };
+        assert_eq!(crew.gate(&note, &o), Gate::Run);
     })
     .await;
 }
