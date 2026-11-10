@@ -386,6 +386,17 @@ pub const TYPED_INTO_PAGES: &[(&str, &str)] = &[
     ("obscura.type", "text"),
 ];
 
+/// Whether `field_path` is what `tool_name` types into a page.
+pub fn typed_into_page(tool_name: &str, field_path: &str) -> bool {
+    TYPED_INTO_PAGES
+        .iter()
+        .any(|(tool, field)| *tool == tool_name && *field == field_path)
+}
+
+/// The rules that read a credential in what is typed into a page: lifted
+/// there, and only there, for an unbound agent.
+pub const TYPED_CREDENTIAL_RULES: &[&str] = &["literal-secret-typed", "credential-in-param"];
+
 /// The rule a credential typed into a page as it is breaks.
 pub const LITERAL_SECRET_TYPED: &str = "literal-secret-typed";
 

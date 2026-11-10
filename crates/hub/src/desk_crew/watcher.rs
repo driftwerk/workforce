@@ -231,6 +231,8 @@ impl CrewHub {
                 for tool in CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch) {
                     s.tools.register(Arc::new(tool));
                 }
+                // An overseer has Desk's browser.
+                crate::desk_browser::equip(s);
                 tracing::info!(agent_id = %s.agent_id, group = o.scope.group().unwrap_or("ungrouped"), level = o.level.as_str(), "Oversees the crew");
             }
             *self.tooled.lock() = want;

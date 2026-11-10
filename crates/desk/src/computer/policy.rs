@@ -114,6 +114,41 @@ pub struct Connectors {
     pub read_only: Vec<String>,
 }
 
+/// Where the agent stands in a browser (`browser.*`): reading is free at
+/// every level; what changes a page asks first below unbound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Browsing {
+    /// Changing a page asks first, unless a session allowance for the site
+    /// or Full access that never asks covers it. Every agent but an
+    /// overseer, and an overseer at Act or Act fully short of unbound.
+    #[default]
+    Asks,
+    /// An overseer at Watch or Suggest: it only suggests what to do on a
+    /// page, so changing one is refused.
+    Suggests,
+    /// An unbound overseer (Act fully, anywhere, every switch on): it acts
+    /// on pages freely, recorded, until a page it reads turns hostile.
+    Unbound,
+}
+
+/// The agent's browser, as the gate found it for this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Browser {
+    pub browsing: Browsing,
+    /// A page its browser read scanned as hostile: it is back to asking,
+    /// once each time, whatever its standing or allowances.
+    pub hostile: bool,
+}
+
+/// The connector a browser write is kept under: `browser:<host>`, so "Allow
+/// for this session" holds for one site.
+pub fn browser_site(host: Option<&str>) -> String {
+    match host.filter(|h| !h.is_empty()) {
+        Some(h) => format!("browser:{h}"),
+        None => "browser".to_string(),
+    }
+}
+
 /// Everything the verdict knows about the agent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPolicy {
@@ -140,6 +175,8 @@ pub struct AgentPolicy {
     pub contained: bool,
     /// `None` keeps today's behaviour: every connector is on.
     pub connectors: Option<Connectors>,
+    /// Its browser: how far it acts on pages.
+    pub browser: Browser,
 }
 
 /// The job or workflow run a call is made in, for a grant held by one.
@@ -427,6 +464,10 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     if call.effect == Effect::None {
         return Verdict::Run { by: By::Rule };
     }
+    // A browser: its own rules, by where the agent stands.
+    if call.tool.starts_with("browser.") {
+        return browsing(p, grants, call);
+    }
     let connector = match &call.effect {
         Effect::Connector { connector, write } => Some((connector.as_str(), *write)),
         _ => None,
@@ -637,4 +678,46 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     }
     choices.push(Choice::Deny);
     ask(choices, why)
+}
+
+/// The verdict on a `browser.*` call. Reading (a snapshot, a screenshot, a
+/// navigation) runs. Changing a page (a click, typing, a key, a script, an
+/// upload) runs for an unbound overseer, is refused for one that only
+/// suggests, and otherwise asks, unless Full access that never asks or a
+/// session allowance for the site covers it. After a hostile page it asks
+/// every time, offering Allow once only.
+fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
+    let write = matches!(call.effect, Effect::Connector { write: true, .. });
+    if !write {
+        return Verdict::Run { by: By::Rule };
+    }
+    let hostile = p.browser.hostile;
+    match p.browser.browsing {
+        Browsing::Unbound if !hostile => return Verdict::Run { by: By::Rule },
+        Browsing::Suggests => {
+            return refuse(
+                Refused::OutsideLevel,
+                format!(
+                    "{} only suggests what to do on a page at its oversight level, so nothing was clicked or typed. Say what you would do instead.",
+                    p.name
+                ),
+            )
+        }
+        _ => {}
+    }
+    if hostile {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
+    }
+    if p.access.access == Access::Full && p.access.asks == Asking::Never {
+        return Verdict::Run { by: By::Rule };
+    }
+    if let Some(by) = granted(p, grants, call) {
+        return Verdict::Run { by };
+    }
+    let mut choices = vec![Choice::AllowOnce];
+    if call.session_id.is_some() {
+        choices.push(Choice::AllowSession);
+    }
+    choices.push(Choice::Deny);
+    ask(choices, Why::OnAPage)
 }

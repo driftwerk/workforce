@@ -333,6 +333,10 @@ pub enum Why {
     ConnectorWrite,
     /// The tool can't say what it changes.
     Unknown,
+    /// It acts on a web page: clicks, types, submits.
+    OnAPage,
+    /// The page it read tried to give it instructions.
+    HostilePage,
 }
 
 impl Why {
@@ -346,6 +350,8 @@ impl Why {
             Self::SendsToPeople => "Sends to other people",
             Self::ConnectorWrite => "Changes something in a connected service",
             Self::Unknown => "This tool can't say what it changes",
+            Self::OnAPage => "Acts on a web page",
+            Self::HostilePage => "The page it read tried to give it instructions",
         }
     }
 }

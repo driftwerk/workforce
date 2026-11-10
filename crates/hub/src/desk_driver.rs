@@ -817,6 +817,8 @@ pub async fn mount(
     desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
+    let browser_routes =
+        crate::desk_browser::install(state, config, computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
     desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
     // The Codex sessions an agent starts run as fast as it does.
@@ -844,6 +846,7 @@ pub async fn mount(
         config,
         desk.clone(),
     )));
+    let app = app.merge(crate::gateway::hardened(browser_routes));
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(board_sync_routes));

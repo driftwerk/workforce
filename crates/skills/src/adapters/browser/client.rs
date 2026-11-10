@@ -26,13 +26,16 @@ use tracing::{debug, warn};
 
 use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactDescriptor, ContentType};
-use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID, SYSTEM_USER_ID};
+use workforce_agent::runner::{
+    CURRENT_AGENT_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID, SYSTEM_USER_ID,
+};
 use workforce_agent::tools::image_gen::GENERATED_IMAGES_KEY;
 use workforce_common::settings::SecretStore;
 
 use crate::adapters::credential_resolver::resolve_vault_refs;
 
 use super::config::{BrowserSkillConfig, MAX_WAIT_MS};
+use super::hooks::{self, Done, OnPage};
 use super::untrusted::{self, Seen};
 
 const VAULT_PREFIX: &str = "browser_creds/";
@@ -56,6 +59,111 @@ fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
 const DEFAULT_AGENT: &str = "default";
 const PROFILE_ROOT_NAME: &str = "workforce-browser";
 const LEGACY_PROFILE_DIR: &str = "chromiumoxide-runner";
+
+/// Every browser client in this process, so Desk can see and stop them.
+static CLIENTS: std::sync::LazyLock<StdMutex<Vec<std::sync::Weak<BrowserClient>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keeps `client` where [`live`] and [`close`] find it.
+pub(super) fn register(client: &Arc<BrowserClient>) {
+    let mut clients = CLIENTS.lock().unwrap();
+    clients.retain(|c| c.strong_count() > 0);
+    clients.push(Arc::downgrade(client));
+}
+
+fn clients() -> Vec<Arc<BrowserClient>> {
+    CLIENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect()
+}
+
+/// A browser open now, as Desk's indicator shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Live {
+    pub agent: String,
+    pub user: String,
+    /// The conversation its last call came from.
+    pub session: Option<String>,
+    pub url: String,
+    pub host: Option<String>,
+    /// `desk` (Desk's own) or `chrome` (the person's).
+    pub backend: &'static str,
+    /// Seconds since its last call.
+    pub idle_secs: u64,
+}
+
+/// Every browser open now, most recently used first.
+pub async fn live() -> Vec<Live> {
+    let mut out = Vec::new();
+    for client in clients() {
+        let cells: Vec<Arc<SessionCell>> = client.sessions.lock().await.values().cloned().collect();
+        for cell in cells {
+            let open = match cell.inner.try_lock() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            };
+            if !open {
+                continue;
+            }
+            let url = untrusted::state(&cell.key)
+                .map(|s| s.url)
+                .unwrap_or_default();
+            out.push(Live {
+                agent: cell.agent.clone(),
+                user: cell.user.clone(),
+                session: cell.last_session.lock().unwrap().clone(),
+                host: host_of(&url).filter(|_| !url.starts_with("about:")),
+                url,
+                backend: "desk",
+                idle_secs: cell.last_used.lock().unwrap().elapsed().as_secs(),
+            });
+        }
+    }
+    out.sort_by_key(|l| l.idle_secs);
+    out
+}
+
+/// Which browsers [`close`] closes.
+#[derive(Debug, Clone, Copy)]
+pub enum Which<'a> {
+    All,
+    Agent(&'a str),
+    /// Those whose last call came from this conversation.
+    Session(&'a str),
+}
+
+/// Closes the browsers `which` names now, a call in flight included, and
+/// forgets what they read. How many were open.
+pub async fn close(which: Which<'_>) -> usize {
+    let mut closed = 0;
+    for client in clients() {
+        let taken: Vec<Arc<SessionCell>> = {
+            let mut sessions = client.sessions.lock().await;
+            let ids: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, cell)| match which {
+                    Which::All => true,
+                    Which::Agent(agent) => cell.agent == agent,
+                    Which::Session(session) => {
+                        cell.last_session.lock().unwrap().as_deref() == Some(session)
+                    }
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| sessions.remove(id)).collect()
+        };
+        for cell in taken {
+            if cell.inner.lock().await.take().is_some() {
+                closed += 1;
+            }
+            untrusted::forget(&cell.key);
+        }
+    }
+    closed
+}
 
 /// What the browser session of `agent` for `user` has read, if it has a
 /// page: the hub's gate reads it.
@@ -94,6 +202,12 @@ fn lower_hex(bytes: &[u8]) -> String {
 /// real users always carry a uid) and to a fixed agent segment outside an agent
 /// context (legacy construction, tests).
 fn current_session_id() -> SessionId {
+    let (agent, user) = current_identity();
+    SessionId::derive(&agent, &user)
+}
+
+/// The `(agent, user)` in scope, with the same fallbacks.
+fn current_identity() -> (String, String) {
     let agent = CURRENT_AGENT_ID
         .try_with(|a| a.clone())
         .ok()
@@ -104,7 +218,7 @@ fn current_session_id() -> SessionId {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| SYSTEM_USER_ID.to_string());
-    SessionId::derive(&agent, &user)
+    (agent, user)
 }
 
 /// Snapshot of a cell taken under the registry lock, fed to the pure eviction
@@ -197,6 +311,10 @@ struct SessionCell {
     config: Arc<BrowserSkillConfig>,
     /// Its [`SessionId`], which keys what it has read ([`untrusted`]).
     key: String,
+    agent: String,
+    user: String,
+    /// The conversation its last call came from, for a Stop there.
+    last_session: StdMutex<Option<String>>,
     profile_dir: PathBuf,
     inner: Mutex<Option<Active>>,
     respawn: Mutex<RespawnBudget>,
@@ -214,13 +332,16 @@ impl Drop for SessionCell {
 impl SessionCell {
     fn new(
         config: Arc<BrowserSkillConfig>,
-        key: String,
+        (key, agent, user): (String, String, String),
         profile_dir: PathBuf,
         now: Instant,
     ) -> Self {
         Self {
             config,
             key,
+            agent,
+            user,
+            last_session: StdMutex::new(None),
             profile_dir,
             inner: Mutex::new(None),
             respawn: Mutex::new(RespawnBudget::new(RESPAWN_WINDOW_MS, RESPAWN_LIMIT)),
@@ -245,6 +366,70 @@ impl SessionCell {
 
     fn touch(&self, now: Instant) {
         *self.last_used.lock().unwrap() = now;
+        if let Some(session) = CURRENT_SESSION_KEY
+            .try_with(|k| k.clone())
+            .ok()
+            .filter(|k| !k.is_empty())
+        {
+            *self.last_session.lock().unwrap() = Some(session);
+        }
+    }
+
+    /// Refuses what `tool` would do on the element `selector` names (the
+    /// focused one where none) when the hub says it is the person's: paying,
+    /// signing in or out, a credential's file. `form`: what submits its form
+    /// is read by the form's action too.
+    async fn hold(
+        &self,
+        page: &Page,
+        tool: &str,
+        target: Option<&str>,
+        selector: Option<&str>,
+        form: bool,
+        file: Option<&str>,
+    ) -> Result<()> {
+        let Some(hooks) = hooks::hooks() else {
+            return Ok(());
+        };
+        if hooks.unbound(&self.agent) {
+            return Ok(());
+        }
+        let shown = page
+            .evaluate(shown_expression(selector, form))
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .unwrap_or_default();
+        let what = OnPage {
+            tool: tool.to_string(),
+            url: self.current_url(page).await,
+            target: target.map(str::to_string),
+            shown,
+            file: file.map(str::to_string),
+        };
+        match hooks.holds(&self.agent, &what) {
+            Some(why) => Err(eyre!("{why}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Records what `tool` did, with the page as it looks now.
+    async fn done(&self, page: &Page, tool: &str, target: Option<&str>) {
+        let Some(hooks) = hooks::hooks() else {
+            return;
+        };
+        let url = self.current_url(page).await;
+        let screenshot = page.screenshot(ScreenshotParams::default()).await.ok();
+        hooks.record(Done {
+            agent: self.agent.clone(),
+            user: self.user.clone(),
+            session: self.last_session.lock().unwrap().clone(),
+            tool: tool.to_string(),
+            backend: "desk",
+            url,
+            target: target.map(str::to_string),
+            screenshot,
+        });
     }
 
     fn call_timeout(&self) -> Duration {
@@ -389,8 +574,9 @@ impl SessionCell {
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok())
                 .unwrap_or_default();
-            let final_url = page.url().await.ok().flatten().unwrap_or(url);
+            let final_url = page.url().await.ok().flatten().unwrap_or(url.clone());
             untrusted::on(&self.key, &final_url);
+            self.done(&page, "browser.navigate", Some(&url)).await;
             let mut seen = Seen::at(&final_url);
             let title = seen.text(&title);
             Ok(seen.into_output(&self.key, json!({ "url": final_url, "title": title })))
@@ -491,7 +677,17 @@ impl SessionCell {
                 .find_element(selector.as_str())
                 .await
                 .wrap_err_with(|| format!("element not found for selector `{selector}`"))?;
+            self.hold(
+                &page,
+                "browser.click",
+                Some(&selector),
+                Some(&selector),
+                true,
+                None,
+            )
+            .await?;
             element.click().await.wrap_err("click failed")?;
+            self.done(&page, "browser.click", Some(&selector)).await;
             Ok(json!({ "clicked": selector }))
         })
         .await
@@ -501,6 +697,8 @@ impl SessionCell {
         let key = key.to_string();
         let selector = selector.map(str::to_string);
         self.with_page(|page, _n, _c| async move {
+            self.hold(&page, "browser.press_key", Some(&key), selector.as_deref(), true, None)
+                .await?;
             match selector {
                 Some(sel) => {
                     let element = page
@@ -523,6 +721,7 @@ impl SessionCell {
                     .wrap_err("press_key (no selector) failed")?;
                 }
             }
+            self.done(&page, "browser.press_key", Some(&key)).await;
             Ok(json!({ "pressed": key }))
         })
         .await
@@ -530,7 +729,17 @@ impl SessionCell {
 
     async fn select_option(&self, selector: &str, value: &str) -> Result<Value> {
         let expr = select_option_expression(selector, value);
+        let selector = selector.to_string();
         self.with_page(|page, _n, _c| async move {
+            self.hold(
+                &page,
+                "browser.select_option",
+                Some(&selector),
+                Some(&selector),
+                false,
+                None,
+            )
+            .await?;
             let ok = page
                 .evaluate(expr)
                 .await
@@ -540,6 +749,8 @@ impl SessionCell {
             if !ok {
                 return Err(eyre!("element or option not found"));
             }
+            self.done(&page, "browser.select_option", Some(&selector))
+                .await;
             Ok(json!({ "selected": true }))
         })
         .await
@@ -553,6 +764,7 @@ impl SessionCell {
                 .await
                 .wrap_err("evaluate failed")?;
             let value = result.into_value::<Value>().unwrap_or(Value::Null);
+            self.done(&page, "browser.evaluate", None).await;
             let url = self.current_url(&page).await;
             let mut seen = Seen::at(&url);
             let value = seen.value(value);
@@ -742,9 +954,10 @@ impl BrowserClient {
             let cell = sessions
                 .entry(target.clone())
                 .or_insert_with(|| {
+                    let (agent, user) = current_identity();
                     Arc::new(SessionCell::new(
                         self.config.clone(),
-                        target.0.clone(),
+                        (target.0.clone(), agent, user),
                         self.profile_root.join(&target.0),
                         now,
                     ))
@@ -809,7 +1022,17 @@ impl BrowserClient {
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let value = value.to_string();
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.fill",
+                Some(&selector),
+                Some(&selector),
+                false,
+                None,
+            )
+            .await?;
             // Resolve the credential against the page we're about to fill, so the
             // egress allowlist is checked against the real destination host.
             let host = page.url().await.ok().flatten().and_then(|u| host_of(&u));
@@ -824,6 +1047,7 @@ impl BrowserClient {
             if !ok {
                 return Err(eyre!("element not found for selector"));
             }
+            on.done(&page, "browser.fill", Some(&selector)).await;
             Ok(json!({ "filled": true }))
         })
         .await
@@ -833,7 +1057,17 @@ impl BrowserClient {
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let text = text.to_string();
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.type",
+                Some(&selector),
+                Some(&selector),
+                false,
+                None,
+            )
+            .await?;
             let host = page.url().await.ok().flatten().and_then(|u| host_of(&u));
             let resolved = self.resolve_credential(&text, host.as_deref())?;
             let element = page
@@ -845,6 +1079,7 @@ impl BrowserClient {
                 .type_str(resolved.as_str())
                 .await
                 .wrap_err("type failed")?;
+            on.done(&page, "browser.type", Some(&selector)).await;
             Ok(json!({ "typed_chars": resolved.chars().count() }))
         })
         .await
@@ -913,7 +1148,17 @@ impl BrowserClient {
 
         let selector = selector.to_string();
         let cell = self.acquire().await?;
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.upload_file",
+                Some(&selector),
+                Some(&selector),
+                false,
+                Some(&name),
+            )
+            .await?;
             let element = page
                 .find_element(selector.as_str())
                 .await
@@ -926,6 +1171,7 @@ impl BrowserClient {
             page.execute(params)
                 .await
                 .wrap_err("setFileInputFiles failed (is the selector an <input type=\"file\">?)")?;
+            on.done(&page, "browser.upload_file", Some(&selector)).await;
             Ok(json!({ "uploaded": name, "selector": selector }))
         })
         .await
@@ -1260,6 +1506,30 @@ pub(super) fn host_of(url: &str) -> Option<String> {
     let host = authority.rsplit('@').next().unwrap_or(authority);
     let host = host.split(':').next().unwrap_or(host);
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// What the page shows of the element `selector` names (the focused one
+/// where none): its text, a button's value, its label, title, type, name,
+/// autocomplete hint and placeholder, and with `form` its form's action.
+/// Never what a field holds.
+fn shown_expression(selector: Option<&str>, form: bool) -> String {
+    let el = match selector {
+        Some(sel) => format!(
+            "document.querySelector({})",
+            serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".to_string())
+        ),
+        None => "document.activeElement".to_string(),
+    };
+    format!(
+        "(() => {{ const el = {el}; if (!el) return ''; \
+          const button = el.tagName === 'BUTTON' || (el.tagName === 'INPUT' && /^(submit|button|reset)$/i.test(el.type || '')); \
+          const label = el.labels && el.labels.length ? el.labels[0].innerText : ''; \
+          const form = {form} && el.form ? (el.form.getAttribute('action') || '') : ''; \
+          return [button || !('value' in el) ? (el.innerText || '') : '', button ? el.value : '', \
+            el.getAttribute('aria-label'), el.title, el.getAttribute('type'), el.getAttribute('name'), \
+            el.getAttribute('autocomplete'), el.getAttribute('placeholder'), label, form] \
+            .filter(Boolean).join(' ').slice(0, 500); }})()"
+    )
 }
 
 fn fill_expression(selector: &str, value: &str) -> String {

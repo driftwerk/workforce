@@ -291,6 +291,22 @@ impl DeskStore {
             .await?)
     }
 
+    /// Drops every "Allow for this session" a browser holds, for `agent` or
+    /// for every agent: the person pressed Stop on it.
+    pub async fn forget_browser_grants(&self, agent: Option<&str>) -> Result<u64> {
+        let client = self.pool().get().await?;
+        self.access_changed();
+        Ok(client
+            .execute(
+                "DELETE FROM access_grants
+                  WHERE session_id IS NOT NULL
+                    AND (connector = 'browser' OR connector LIKE 'browser:%')
+                    AND ($1::TEXT IS NULL OR agent = $1)",
+                &[&agent],
+            )
+            .await?)
+    }
+
     pub async fn record_activity(&self, a: &Activity) -> Result<Uuid> {
         let id = Uuid::new_v4();
         let client = self.pool().get().await?;
@@ -498,6 +514,51 @@ mod tests {
                     .unwrap(),
                 1
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stopping_the_browser_forgets_its_session_allowances_only() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let site = |agent: &str, connector: &str, session: Option<&str>| NewGrant {
+                ability: Ability::ConnectorWrite,
+                folder: None,
+                connector: Some(connector.into()),
+                ..new_grant(agent, session, Some(Utc::now() + Duration::hours(12)))
+            };
+            store
+                .add_grant(&site("allan", "browser:shop.example", Some("s1")))
+                .await
+                .unwrap();
+            store
+                .add_grant(&site("ben", "browser:docs.example", Some("s2")))
+                .await
+                .unwrap();
+            let linear = store
+                .add_grant(&site("allan", "linear", Some("s1")))
+                .await
+                .unwrap();
+            let standing = store
+                .add_grant(&new_grant("allan", None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(store.forget_browser_grants(Some("allan")).await.unwrap(), 1);
+            assert_eq!(store.forget_browser_grants(None).await.unwrap(), 1);
+            let mut left: Vec<Uuid> = store
+                .live_grants("local", "allan")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+            left.sort();
+            let mut kept = vec![linear.id, standing.id];
+            kept.sort();
+            assert_eq!(left, kept, "another connector and standing grants stay");
         })
         .await;
     }

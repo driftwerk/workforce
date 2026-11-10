@@ -11,6 +11,8 @@
 //! - [`path`]: a file a session asks to read or change, by its name.
 //! - [`said`]: what a session asks a boss, or the boss answers, in words.
 //!   The hub reads both before letting an answer go without the person.
+//! - [`on_page`]: what a browser call presses or types into on a web page,
+//!   by what the page shows of it (paying, signing in or out).
 //!
 //! Both only ever narrow what a boss does: what they flag goes to the
 //! person. They read loosely on purpose (a mention is enough), since the
@@ -1111,9 +1113,113 @@ pub fn said(text: &str) -> Option<Never> {
         .find_map(|l| command(l, &nowhere))
 }
 
+// ── Pages ────────────────────────────────────────────────────────────────
+
+/// What, on a web page, is the person's: the words on a button, a link or
+/// a field that pay, buy, or sign in or out.
+const ON_A_PAGE: &[(Never, &[&str])] = &[
+    (
+        Never::Money,
+        &[
+            "buy",
+            "pay",
+            "payment",
+            "purchase",
+            "checkout",
+            "check out",
+            "place order",
+            "place your order",
+            "order now",
+            "complete order",
+            "subscribe",
+            "upgrade",
+            "donate",
+            "transfer",
+            "send money",
+            "top up",
+            "add funds",
+            "refund",
+            "card number",
+            "cc-number",
+            "cc-csc",
+            "cc-exp",
+            "cvc",
+            "cvv",
+            "iban",
+        ],
+    ),
+    (
+        Never::Accounts,
+        &[
+            "sign in",
+            "sign-in",
+            "signin",
+            "sign out",
+            "sign-out",
+            "signout",
+            "log in",
+            "log-in",
+            "login",
+            "log out",
+            "log-out",
+            "logout",
+            "sign up",
+            "switch account",
+            "delete account",
+            "close account",
+            "deactivate",
+            "password",
+            "current-password",
+            "new-password",
+            "one-time-code",
+        ],
+    ),
+];
+
+/// What no overseer does on a web page, short of unbound, by what the
+/// page shows of it: the text, value, label or title of what a click
+/// presses, and the type, name, label or autocomplete hint of a field
+/// typed into (`password`, `cc-number`). Read loosely, like [`said`]: a
+/// false catch costs one question for the person.
+pub fn on_page(shown: &str) -> Option<Never> {
+    let lower = shown.to_lowercase();
+    ON_A_PAGE
+        .iter()
+        .find(|(_, words)| words.iter().any(|w| phrase_in(&lower, w)))
+        .map(|(n, _)| *n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_a_page_paying_and_signing_in_or_out_are_the_persons() {
+        for (shown, never) in [
+            ("Buy now", Never::Money),
+            ("Place your order", Never::Money),
+            ("Proceed to checkout", Never::Money),
+            (
+                "input type=text autocomplete=cc-number name=card",
+                Never::Money,
+            ),
+            ("Sign in", Never::Accounts),
+            ("Log out", Never::Accounts),
+            ("input type=password name=pw", Never::Accounts),
+        ] {
+            assert_eq!(on_page(shown), Some(never), "{shown}");
+        }
+        for shown in [
+            "Save",
+            "Next",
+            "Delete row",
+            "Search",
+            "input type=text name=q",
+            "Paypal-less export",
+        ] {
+            assert_eq!(on_page(shown), None, "{shown}");
+        }
+    }
 
     const HOME: &str = "/Users/sam";
     const OWN: &str = "/Users/sam/dev/acme-web";

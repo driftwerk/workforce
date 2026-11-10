@@ -14,6 +14,12 @@
 //!
 //! An agent with no `[computer]` is Full access, asking first; its own
 //! folder is the roots its tools already have (`tool_roots`).
+//!
+//! `browser.*` is decided too, by where the agent stands as an overseer
+//! ([`browsing_of`]): reading a page runs; changing one asks below unbound,
+//! "Allow for this session" holding for one site; after a page that scanned
+//! hostile it asks every time. Desk's browser hooks (`desk_browser`) record
+//! what it did, with a screenshot.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +33,9 @@ use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_core::computer::{By, ComputerAccess, Effect, Refusal, Refused, Verdict};
 use workforce_core::policy::PermissionChoice;
 use workforce_desk::computer::policy::{namespace, shown, Namespace};
-use workforce_desk::computer::{Activity, AgentPolicy, CallFacts, Computer, NewGrant};
+use workforce_desk::computer::{
+    browser_site, Activity, AgentPolicy, Browser, Browsing, CallFacts, Computer, NewGrant,
+};
 
 /// How long "Allow for this session" lasts at most.
 pub const SESSION_HOURS: i64 = 12;
@@ -38,6 +46,91 @@ use crate::serve::ComputerSubject;
 pub struct HubComputerGate {
     computer: Computer,
     policy: AgentPolicy,
+}
+
+/// The browser tools that only read: everything else in `browser.*`
+/// changes a page.
+pub const BROWSER_READS: &[&str] = &[
+    "browser.navigate",
+    "browser.snapshot",
+    "browser.screenshot",
+    "browser.pdf",
+    "browser.get_content",
+    "browser.console_messages",
+    "browser.network_requests",
+    "browser.wait",
+];
+
+/// Whether `tool` is a browser tool that changes a page.
+pub fn changes_a_page(tool: &str) -> bool {
+    tool.starts_with("browser.") && !BROWSER_READS.contains(&tool)
+}
+
+/// Whether an overseer is unbound: Act fully in force with every
+/// `[oversight.act]` switch on. A stand-in for `Oversight::unbound`, which
+/// the overseer's own change brings; this one goes when that lands.
+pub fn unbound(o: &workforce_common::oversight::Oversight) -> bool {
+    let a = &o.act;
+    o.enabled
+        && o.fully().is_ok()
+        && a.nudge
+        && a.resume_restart
+        && a.read_only_approvals
+        && a.hand_out_work
+        && a.interrupt
+        && a.message_agents
+        && a.message_terminal_sessions
+        && a.answer_sessions
+        && a.hand_off
+}
+
+/// Where an agent stands in a browser, by its `[oversight]`: an overseer
+/// at Watch or Suggest only suggests, an unbound one acts freely, and
+/// every other agent (and an overseer at Act short of unbound) asks first.
+pub fn browsing_of(o: &workforce_common::oversight::Oversight) -> Browsing {
+    use workforce_common::oversight::Level;
+    match o.level {
+        _ if !o.enabled => Browsing::Asks,
+        Level::Watch | Level::Suggest => Browsing::Suggests,
+        _ if unbound(o) => Browsing::Unbound,
+        _ => Browsing::Asks,
+    }
+}
+
+/// This agent's browser standing, read from its `config.toml`. One that
+/// can't be read asks first.
+fn browsing_for(subject: &ComputerSubject) -> Browsing {
+    match AgentWorkspaceConfig::load(&subject.workspace) {
+        Ok(Some(config)) => config
+            .oversight()
+            .map(|o| browsing_of(&o))
+            .unwrap_or_default(),
+        _ => Browsing::Asks,
+    }
+}
+
+/// The page `agent`'s browser is on for the person in scope, and whether
+/// a page it read scanned hostile.
+fn page_now(agent: &str) -> (Option<String>, bool) {
+    let user = CURRENT_USER_ID
+        .try_with(|u| u.clone())
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| workforce_agent::runner::SYSTEM_USER_ID.to_string());
+    match workforce_skills::adapters::browser::page_state(agent, &user) {
+        Some(page) => {
+            let host = page
+                .url
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .and_then(|rest| rest.split(['/', '?', '#']).next())
+                .map(|authority| authority.rsplit('@').next().unwrap_or(authority))
+                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+                .filter(|h| !h.is_empty());
+            (host, page.hostile)
+        }
+        None => (None, false),
+    }
 }
 
 /// Where the person's home is.
@@ -198,6 +291,10 @@ impl HubComputerGate {
                 // Commands can't be contained yet (AC5).
                 contained: false,
                 connectors: connectors_of(subject),
+                browser: Browser {
+                    browsing: browsing_for(subject),
+                    hostile: false,
+                },
             },
         }
     }
@@ -248,9 +345,11 @@ impl HubComputerGate {
             _ => None,
         });
         // A session allowance is scoped to the same folder an "always" would
-        // be: where no folder can be offered, neither can it.
+        // be: where no folder can be offered, neither can it. A browser's
+        // holds for its site, and no "always" is offered there.
+        let site = matches!(effect, Effect::Connector { connector, .. } if connector.starts_with("browser"));
         options.allow_session =
-            always.is_some() && choices.iter().any(|c| matches!(c, Choice::AllowSession));
+            (always.is_some() || site) && choices.iter().any(|c| matches!(c, Choice::AllowSession));
         options.allow_in_folder = always;
         options.facts = Some(Box::new(facts_of(effect, home, why)));
         options
@@ -460,13 +559,22 @@ impl ComputerGate for HubComputerGate {
         match namespace(tool) {
             Some(Namespace::Computer) => true,
             Some(Namespace::Connector) => {
-                workforce_common::connector_binding::connector_of(tool).is_some()
+                tool.starts_with("browser.")
+                    || workforce_common::connector_binding::connector_of(tool).is_some()
             }
             None => false,
         }
     }
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
+        // A browser call is kept under the site its page is on.
+        if tool.starts_with("browser.") {
+            let (host, _) = page_now(&self.policy.agent);
+            return Effect::Connector {
+                connector: browser_site(host.as_deref()),
+                write: changes_a_page(tool),
+            };
+        }
         match (
             effect,
             workforce_common::connector_binding::connector_of(tool),
@@ -584,6 +692,14 @@ impl ComputerGate for HubComputerGate {
         Ok(())
     }
 
+    fn unbound(&self) -> bool {
+        self.policy.browser.browsing == Browsing::Unbound
+    }
+
+    fn asks_unattended(&self, tool: &str) -> bool {
+        tool.starts_with("browser.")
+    }
+
     fn asks_nothing(&self) -> bool {
         self.policy.access.access == workforce_core::computer::Access::Full
             && self.policy.access.asks == workforce_core::computer::Asking::Never
@@ -605,9 +721,13 @@ impl ComputerGate for HubComputerGate {
         if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
             return self.unreachable();
         }
-        let reached = tokio::task::block_in_place(|| {
-            handle.block_on(self.computer.verdict(&self.policy, &facts))
-        });
+        // A browser call reads what its page scanned as, now.
+        let mut policy = std::borrow::Cow::Borrowed(&self.policy);
+        if tool.starts_with("browser.") {
+            policy.to_mut().browser.hostile = page_now(&self.policy.agent).1;
+        }
+        let reached =
+            tokio::task::block_in_place(|| handle.block_on(self.computer.verdict(&policy, &facts)));
         reached.unwrap_or_else(|e| {
             warn!(agent = %self.policy.agent, tool, error = %format!("{e:#}"), "computer verdict unreachable");
             self.unreachable()
@@ -615,6 +735,14 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn record(&self, record: Record) {
+        // What a browser read, or did on its own, Desk's browser hooks record
+        // as it is done, with its page and a screenshot; only what was asked
+        // or refused is recorded here.
+        if record.tool.starts_with("browser.")
+            && matches!(record.decision.verdict, Verdict::Run { by: By::Rule })
+        {
+            return;
+        }
         let activity = self.activity(&record);
         let computer = self.computer.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -789,6 +917,7 @@ mod tests {
             home,
             contained: false,
             connectors: None,
+            browser: Browser::default(),
         };
         let profile = root.join("0123abcd/Default/Cookies");
         for effect in [
@@ -988,6 +1117,94 @@ mod tests {
             // No binding: every connector, as before; a send still asks.
             assert_eq!(decide_with("", "jira.search").0, "run");
             assert_eq!(decide_with("", "slack.send").0, "asks once");
+        })
+        .await;
+    }
+
+    /// Every `[oversight.act]` switch on, Act fully in force.
+    const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
+        act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
+        interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
+        hand_off = true }\nfull = { repos = [\"acme/web\"], budget_usd_per_day = 20 }\n";
+
+    #[test]
+    fn unbound_is_act_fully_in_force_with_every_switch_on() {
+        let parse = |body: &str| {
+            let value: toml::Value = toml::from_str(body).unwrap();
+            workforce_common::oversight::Oversight::of(value.get("oversight")).unwrap()
+        };
+        assert_eq!(browsing_of(&parse(UNBOUND)), Browsing::Unbound);
+        let one_off = UNBOUND.replace("hand_off = true", "hand_off = false");
+        assert_eq!(
+            browsing_of(&parse(&one_off)),
+            Browsing::Asks,
+            "one switch off"
+        );
+        let no_budget = UNBOUND.replace(", budget_usd_per_day = 20", "");
+        assert_eq!(
+            browsing_of(&parse(&no_budget)),
+            Browsing::Asks,
+            "Act fully not in force"
+        );
+        let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+        assert_eq!(browsing_of(&parse(&act)), Browsing::Asks, "at Act");
+        let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
+        assert_eq!(browsing_of(&parse(&suggest)), Browsing::Suggests);
+        let off = UNBOUND.replace("enabled = true", "enabled = false");
+        assert_eq!(browsing_of(&parse(&off)), Browsing::Asks, "not an overseer");
+        assert_eq!(browsing_of(&parse("")), Browsing::Asks, "no [oversight]");
+    }
+
+    /// Browser calls through the gate, by the agent's standing: reading
+    /// runs at every level; changing a page asks an agent that isn't an
+    /// overseer and one at Act, is refused at Suggest and runs unbound.
+    /// With nobody to ask, a change to a page is refused, never run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_calls_follow_the_agents_standing() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let config = hub.subject.workspace.join("config.toml");
+            let tools = tools(&hub.subject.workspace);
+            for name in [
+                "browser.snapshot",
+                "browser.navigate",
+                "browser.click",
+                "browser.fill",
+            ] {
+                tools.register(Arc::new(Elsewhere(name)));
+            }
+            let decide_with = |body: &str, tool: &str| {
+                std::fs::write(&config, body).unwrap();
+                let gate: Arc<dyn ComputerGate> = Arc::new(HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                ));
+                let g = gates(Some(Arc::clone(&gate)));
+                let asked =
+                    as_sarah(|| kind(&gate_tool_call(&g, &policy(), &tools, tool, &json!({}))));
+                let unattended =
+                    as_sarah(|| unattended_refusal(Some(gate.as_ref()), &tools, tool, &json!({})));
+                (asked, unattended.is_none(), gate.unbound())
+            };
+            let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
+            let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+                for read in ["browser.snapshot", "browser.navigate"] {
+                    assert_eq!(decide_with(body, read).0, "run", "{read} in {body:?}");
+                }
+            }
+            for body in ["", act.as_str()] {
+                let (asked, ran_unattended, unbound) = decide_with(body, "browser.click");
+                assert!(asked.starts_with("asks"), "{asked} in {body:?}");
+                assert!(!ran_unattended, "a job never clicks without the person");
+                assert!(!unbound);
+            }
+            // One that only suggests is refused; an unbound one runs.
+            assert_eq!(decide_with(&suggest, "browser.click").0, "refused");
+            assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", true, true));
+            assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
         })
         .await;
     }

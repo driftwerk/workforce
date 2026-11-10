@@ -8,6 +8,7 @@
 
 mod client;
 mod config;
+mod hooks;
 mod tools;
 mod untrusted;
 
@@ -20,8 +21,9 @@ use workforce_agent::tools::Tool;
 
 use crate::definition::{SkillDefinition, SkillRequirements};
 
-pub use client::{page_state, BrowserClient};
+pub use client::{close, live, page_state, BrowserClient, Live, Which};
 pub use config::BrowserSkillConfig;
+pub use hooks::{install_hooks, BrowserHooks, Done, OnPage};
 pub use untrusted::PageState;
 
 pub struct BrowserSkill {
@@ -30,9 +32,9 @@ pub struct BrowserSkill {
 
 impl BrowserSkill {
     pub fn new(config: BrowserSkillConfig) -> eyre::Result<Self> {
-        Ok(Self {
-            client: Arc::new(BrowserClient::new(config)),
-        })
+        let client = Arc::new(BrowserClient::new(config));
+        client::register(&client);
+        Ok(Self { client })
     }
 
     /// Construct a skill whose `browser.fill.value` / `browser.type.text`
@@ -44,9 +46,9 @@ impl BrowserSkill {
         config: BrowserSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Ok(Self {
-            client: Arc::new(BrowserClient::with_store(config, store)),
-        })
+        let client = Arc::new(BrowserClient::with_store(config, store));
+        client::register(&client);
+        Ok(Self { client })
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -307,5 +309,127 @@ mod tests {
                 assert!(state.url.ends_with("/inject"), "{}", state.url);
             })
             .await;
+    }
+
+    /// What the test's hub holds back and keeps.
+    struct TestHooks {
+        done: std::sync::Mutex<Vec<Done>>,
+    }
+
+    impl BrowserHooks for TestHooks {
+        fn unbound(&self, agent: &str) -> bool {
+            agent == "unbound-agent"
+        }
+        fn holds(&self, _agent: &str, what: &OnPage) -> Option<String> {
+            let shown = what.shown.to_lowercase();
+            (shown.contains("buy") || shown.contains("password"))
+                .then(|| format!("That is the person's to do ({}).", what.tool))
+        }
+        fn record(&self, done: Done) {
+            self.done.lock().unwrap().push(done);
+        }
+    }
+
+    static TEST_HOOKS: std::sync::LazyLock<Arc<TestHooks>> = std::sync::LazyLock::new(|| {
+        Arc::new(TestHooks {
+            done: Default::default(),
+        })
+    });
+
+    /// End-to-end with the hub's hooks: below unbound a "Buy now" click and
+    /// typing into a password field go to the person; an unbound agent does
+    /// both. Every navigation and change is recorded with its page and a
+    /// screenshot. Closing an agent's browser closes it now. Gated on
+    /// `BROWSER_E2E`.
+    #[tokio::test]
+    #[ignore]
+    async fn browser_e2e_holds_the_persons_and_records_the_rest() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        install_hooks(TEST_HOOKS.clone());
+        let site = fixture::serve();
+        let dir = tempfile::tempdir().unwrap();
+        let skill = BrowserSkill::new(BrowserSkillConfig {
+            chrome_binary: std::env::var("BROWSER_E2E_CHROMIUM").ok(),
+            profile_root: Some(dir.path().display().to_string()),
+            ..BrowserSkillConfig::default()
+        })
+        .unwrap();
+        let tools = skill.tools();
+        let run = |name: &'static str, input: serde_json::Value| {
+            let tool = tools.iter().find(|t| t.name() == name).unwrap().clone();
+            async move { tool.execute(input).await.unwrap() }
+        };
+        let shop = site.url("/shop");
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("held-agent".into(), async {
+                assert!(
+                    run("browser.navigate", serde_json::json!({"url": shop}))
+                        .await
+                        .success
+                );
+                let buy = run("browser.click", serde_json::json!({"selector": "#buy"})).await;
+                assert!(!buy.success, "a Buy click below unbound must not run");
+                assert!(buy.error.unwrap_or_default().contains("person's"));
+                let pw = run(
+                    "browser.fill",
+                    serde_json::json!({"selector": "#pw", "value": "x"}),
+                )
+                .await;
+                assert!(!pw.success, "typing a password below unbound must not run");
+                assert!(
+                    run("browser.click", serde_json::json!({"selector": "#save"}))
+                        .await
+                        .success
+                );
+            })
+            .await;
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("unbound-agent".into(), async {
+                assert!(
+                    run("browser.navigate", serde_json::json!({"url": shop}))
+                        .await
+                        .success
+                );
+                assert!(
+                    run("browser.click", serde_json::json!({"selector": "#buy"}))
+                        .await
+                        .success
+                );
+            })
+            .await;
+
+        let done = TEST_HOOKS.done.lock().unwrap().clone();
+        let held: Vec<&Done> = done.iter().filter(|d| d.agent == "held-agent").collect();
+        let tools_done: Vec<&str> = held.iter().map(|d| d.tool.as_str()).collect();
+        assert_eq!(
+            tools_done,
+            ["browser.navigate", "browser.click"],
+            "only what ran is recorded"
+        );
+        for d in &held {
+            assert!(d.url.ends_with("/shop"), "{}", d.url);
+            assert_eq!(d.backend, "desk");
+            assert!(
+                d.screenshot.as_ref().is_some_and(|png| png.len() > 200),
+                "a screenshot"
+            );
+        }
+        assert_eq!(held[1].target.as_deref(), Some("#save"));
+
+        let open = live().await;
+        assert!(open
+            .iter()
+            .any(|l| l.agent == "held-agent" && l.host.as_deref() == Some("127.0.0.1")));
+        assert_eq!(close(Which::Agent("held-agent")).await, 1);
+        let open = live().await;
+        assert!(!open.iter().any(|l| l.agent == "held-agent"), "closed now");
+        assert!(
+            open.iter().any(|l| l.agent == "unbound-agent"),
+            "another agent's stays"
+        );
+        assert!(page_state("held-agent", workforce_agent::runner::SYSTEM_USER_ID).is_none());
+        close(Which::All).await;
     }
 }
