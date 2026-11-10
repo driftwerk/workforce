@@ -310,6 +310,40 @@ impl RemoteMcpTokenService {
         Ok(revoked)
     }
 
+    /// Revokes token `id` for the paired device `device_id`, linked to
+    /// `identity_id`, when `[remote_mcp] allow_device_tokens` lets devices
+    /// mint: only a live token that device minted for that person. Any other
+    /// token, or none, is `false`, and nothing says which.
+    pub fn revoke_for_device(
+        &self,
+        identity_id: Uuid,
+        device_id: &str,
+        id: Uuid,
+    ) -> Result<bool, TokenError> {
+        self.require_enabled()?;
+        if !self.config.allow_device_tokens {
+            return Err(TokenError::DevicesNotAllowed);
+        }
+        let now = Utc::now();
+        let its_own = self
+            .store
+            .list_tokens_for_identity(identity_id)?
+            .into_iter()
+            .any(|t| {
+                t.id == id
+                    && t.revoked_at.is_none()
+                    && minted_by_device(&t.scopes) == Some(device_id)
+            });
+        if !its_own {
+            return Ok(false);
+        }
+        let revoked = self.store.revoke_token(id, Some(identity_id), now)?;
+        if revoked {
+            tracing::info!(target: "sentinel.audit", identity_id = %identity_id, token_id = %id, device = %device_id, "remote MCP token revoked by the device that minted it");
+        }
+        Ok(revoked)
+    }
+
     pub fn list_all(&self) -> Result<Vec<RemoteMcpToken>, TokenError> {
         self.require_enabled()?;
         Ok(self.store.list_all_tokens()?)
