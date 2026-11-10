@@ -1413,7 +1413,7 @@ impl CrewHub {
                             .map_err(line)?;
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
-                                "told {name}; the person is driving it, so your message waits until they hand it back"
+                                "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
                             ));
                         }
                         Ok(match told.delivery {
