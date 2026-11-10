@@ -407,6 +407,19 @@ async fn a_grant_of_an_unknown_version_serves_nothing_and_keeps_its_members() {
         let e = d.put_grant(native(), "g-acme", v2).await.unwrap_err();
         assert!(e.to_string().contains("serves nothing"), "{e}");
         assert!(d.grant_live("g-acme").unwrap_err().contains("version"));
+        // No version, known or not, stores a revision past the cap.
+        for (version, revision) in [(2, i64::MAX), (2, 0), (1, crate::grant::MAX_REVISION + 1)] {
+            let mut b = body(1, "Acme", &[s]);
+            b["grantVersion"] = json!(version);
+            b["revision"] = json!(revision);
+            assert!(d.put_grant(native(), "g-acme", b).await.is_err());
+        }
+        assert_eq!(
+            d.grant_view(&native(), "g-acme").unwrap().grant.revision,
+            2,
+            "the copy keeps its own"
+        );
+        put(&d, "g-acme", body(3, "Acme", &[s])).await;
         assert_eq!(
             d.group_of_member(&session_item(s)).as_deref(),
             Some("g-acme")
@@ -693,7 +706,7 @@ async fn a_stop_racing_a_delete_or_ahead_of_any_grant_is_kept() {
 }
 
 #[tokio::test]
-async fn a_session_the_home_puts_in_ungrouped_is_restamped_out_of_its_old_group() {
+async fn a_session_the_home_puts_in_ungrouped_keeps_its_rows_where_they_were() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = engine(pool, dir.path(), true).await;
@@ -703,10 +716,15 @@ async fn a_session_the_home_puts_in_ungrouped_is_restamped_out_of_its_old_group(
         let mut ungrouped = body(1, "Ungrouped", &[s]);
         ungrouped["boss"] = json!("local:desk");
         let w = put(&d, UNGROUPED, ungrouped).await;
-        assert_eq!(w.restamped, 1);
-        assert_eq!(groups_of(&d, "ledger", s).await, [None]);
-        assert_eq!(groups_of(&d, "memory_exchanges", s).await, [None]);
+        // A restamp only narrows: its rows stay where they were written.
+        assert_eq!(w.restamped, 0);
+        assert_eq!(groups_of(&d, "ledger", s).await, [Some("old-acme".into())]);
+        assert_eq!(
+            groups_of(&d, "memory_exchanges", s).await,
+            [Some("old-acme".into())]
+        );
         assert_eq!(d.group_of_member(&session_item(s)), None);
+        assert_eq!(stamped_now(&d, s).await, None);
     })
     .await;
 }

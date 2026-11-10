@@ -390,7 +390,14 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
     let was: HashMap<String, String> =
         serde_json::from_value(r.try_get::<_, serde_json::Value>(1)?).unwrap_or_default();
     let ungrouped_boards = crate::service::put_layout_in(tx, p.layout, true).await?;
-    let (sessions, groups): (Vec<Uuid>, Vec<String>) = p.named.iter().cloned().unzip();
+    // Only into a group: a session the home put in Ungrouped keeps its
+    // rows where they are, since a restamp only ever narrows.
+    let (sessions, groups): (Vec<Uuid>, Vec<String>) = p
+        .named
+        .iter()
+        .filter(|(_, g)| g != UNGROUPED)
+        .cloned()
+        .unzip();
     let fresh: Vec<(Uuid, String)> = tx
         .query(
             "INSERT INTO boss_restamped (session, group_id, at) \
@@ -420,10 +427,9 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
     tx.execute("DELETE FROM group_moves WHERE item = ANY($1)", &[&items])
         .await?;
     tx.execute(
-        "UPDATE ledger l SET group_id = NULLIF(r.g, 'ungrouped') \
+        "UPDATE ledger l SET group_id = r.g \
          FROM UNNEST($1::uuid[], $2::text[]) AS r(s, g) \
          WHERE l.session = r.s AND l.at < $3 \
-           AND l.group_id IS DISTINCT FROM NULLIF(r.g, 'ungrouped') \
            AND (l.group_id IS NULL OR NOT l.group_id = ANY($4))",
         &[&ids, &to, &since, granted],
     )
@@ -498,8 +504,7 @@ async fn restamp_memory(
         format!(
             "SELECT m.id FROM {table} m JOIN UNNEST($1::uuid[], $4::text[]) AS r(s, g) \
                ON m.session = r.s \
-             WHERE m.{at} < $2 AND m.group_id IS DISTINCT FROM NULLIF(r.g, 'ungrouped') \
-               AND (m.group_id IS NULL OR NOT m.group_id = ANY($3))"
+             WHERE m.{at} < $2 AND (m.group_id IS NULL OR NOT m.group_id = ANY($3))"
         )
     };
     let moving = |table: &str| {
@@ -507,7 +512,7 @@ async fn restamp_memory(
             "WITH old AS (SELECT m.id, m.group_id AS was, r.g FROM {table} m \
                JOIN UNNEST($1::uuid[], $2::text[]) AS r(s, g) ON m.session = r.s \
                WHERE m.id = ANY($3)) \
-             UPDATE {table} m SET group_id = NULLIF(old.g, 'ungrouped'), indexed_at = NULL \
+             UPDATE {table} m SET group_id = old.g, indexed_at = NULL \
              FROM old \
              WHERE m.id = old.id RETURNING m.id, old.was"
         )

@@ -294,6 +294,16 @@ impl Desk {
                 return Err(why);
             }
         };
+        // Bounded before anything is kept of it, whatever its version: a
+        // revision past the cap would lock the group out for good.
+        if !(1..=grant::MAX_REVISION).contains(&envelope.revision) {
+            let why = DeskError::Invalid(format!(
+                "a grant's revision is 1 to {}",
+                grant::MAX_REVISION
+            ));
+            self.audit_refused(call, &why).await;
+            return Err(why);
+        }
         if envelope.grant_version != grant::GRANT_VERSION {
             // Its old copy stays the group's members, and serves nothing.
             let old = self.0.grants.lock().grants.get(group).cloned();
