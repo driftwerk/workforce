@@ -436,6 +436,12 @@ pub struct Facts {
     pub hooks: bool,
     /// The workflows the boss may run where it acts fully, by file name.
     pub workflows: Vec<String>,
+    /// `HEAD` is the commit `origin`'s default branch is at.
+    pub at_tip: bool,
+    /// The repository's branch names, local and `origin`'s.
+    pub branches: Vec<String>,
+    /// The tags at `origin`'s default branch's commit.
+    pub tip_tags: Vec<String>,
     pub what: What,
 }
 
@@ -539,6 +545,9 @@ pub fn facts_of(
         follow_tags: false,
         hooks: false,
         workflows: Vec::new(),
+        at_tip: false,
+        branches: Vec::new(),
+        tip_tags: Vec::new(),
         what,
     }
 }
@@ -619,6 +628,7 @@ pub fn answerable(
     facts: &Facts,
     bounds: &Bounds,
     real: &dyn Fn(&Path) -> Option<PathBuf>,
+    tracked: &dyn Fn(&Path) -> bool,
 ) -> Result<(), Irreversible> {
     let no = |why: String| Err(Irreversible(why));
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
@@ -651,6 +661,10 @@ pub fn answerable(
                 follow_tags: facts.follow_tags,
                 hooks: facts.hooks,
                 workflows: &facts.workflows,
+                at_tip: facts.at_tip,
+                branches: &facts.branches,
+                tip_tags: &facts.tip_tags,
+                tracked,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
@@ -1109,7 +1123,7 @@ mod tests {
         let mut facts = facts_of(engine, p, s, Path::new("/Users/sam"), moved);
         facts.branch = Some("feat/date-picker".into());
         facts.default_branch = Some("main".into());
-        answerable(&facts, &bounds(), &real).map_err(|e| e.to_string())
+        answerable(&facts, &bounds(), &real, &|_| false).map_err(|e| e.to_string())
     }
 
     fn judged(engine: Engine, p: &PendingApproval, s: &SessionView) -> Result<(), String> {

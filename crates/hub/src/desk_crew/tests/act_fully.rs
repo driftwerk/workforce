@@ -30,11 +30,11 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
-/// A checkout at `dir` on `feat/x`, its `origin` at `origin`, whose default
-/// branch is `main`, holding a deploy script as `main` has it.
+/// A checkout at `dir` on `main`, at the commit `origin`'s `main` is at
+/// (tagged v1.2.0 there), its `origin` at `origin`, holding a deploy script.
 fn repo(dir: &Path, origin: &str) {
     std::fs::create_dir_all(dir).unwrap();
-    git(dir, &["init", "-q", "-b", "feat/x"]);
+    git(dir, &["init", "-q", "-b", "main"]);
     std::fs::write(
         dir.join("package.json"),
         r#"{"scripts": {"deploy": "tsc -p . && wrangler deploy", "release": "npm publish"}}"#,
@@ -43,6 +43,7 @@ fn repo(dir: &Path, origin: &str) {
     git(dir, &["add", "package.json"]);
     git(dir, &["commit", "-q", "-m", "Scripts"]);
     git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(dir, &["tag", "v1.2.0"]);
     git(dir, &["remote", "add", "origin", origin]);
     git(
         dir,
@@ -123,7 +124,7 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         take(s.id).await;
         for command in [
             "gh pr merge 42 --squash",
-            "git tag -a v1.2.0 -m 'Date picker'",
+            "git tag -a v1.3.0 -m 'Date picker'",
             "git push origin v1.2.0",
             "gh workflow run promote.yml",
             "gh release create v1.2.0 --notes 'Date picker'",

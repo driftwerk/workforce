@@ -425,12 +425,20 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
             let mut out: Vec<String> = Vec::new();
             for item in items {
                 match item {
+                    // A plain file name: gh would read a path, or a number
+                    // as a workflow's id.
                     Value::String(w)
-                        if (w.ends_with(".yml") || w.ends_with(".yaml"))
-                            && w.len() <= 200
+                        if w.len() <= 200
                             && w.chars().all(|c| {
                                 c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
-                            }) =>
+                            })
+                            && w.strip_suffix(".yml")
+                                .or_else(|| w.strip_suffix(".yaml"))
+                                .is_some_and(|stem| {
+                                    !stem.is_empty()
+                                        && !stem.starts_with('.')
+                                        && !stem.chars().all(|c| c.is_ascii_digit())
+                                }) =>
                     {
                         if !out.contains(w) {
                             out.push(w.clone());
@@ -858,6 +866,10 @@ mod tests {
             "\".github/workflows/deploy.yml\"",
             "3",
             "\"a b.yml\"",
+            "\"123.yml\"",
+            "\".yml\"",
+            "\"..yml\"",
+            "\"deploy.yml.txt\"",
         ] {
             assert!(
                 parse(&format!("[oversight.full]\nworkflows = [{bad}]\n"))

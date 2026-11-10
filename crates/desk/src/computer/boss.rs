@@ -84,7 +84,23 @@ pub struct Here<'a> {
     /// The workflows the person listed for Act fully to run
     /// (`[oversight.full] workflows`), by their file names exactly.
     pub workflows: &'a [String],
+    /// `HEAD` is the commit `origin`'s default branch is at: a tag made
+    /// now tags what the default branch has.
+    pub at_tip: bool,
+    /// The repository's branch names, local and `origin`'s (without
+    /// `origin/`): no tag may be named as one.
+    pub branches: &'a [String],
+    /// The tags that point at `origin`'s default branch's commit: the only
+    /// ones a boss acting fully pushes, with any it tags in the command.
+    pub tip_tags: &'a [String],
+    /// Whether git tracks a file (a path, real): a release's asset is one,
+    /// or lies in a build output folder.
+    pub tracked: &'a dyn Fn(&Path) -> bool,
 }
+
+/// A file a boss acting fully may attach to a release: one git tracks
+/// that isn't on [`crate::never`]'s list, or a build's output.
+const BUILD_OUTPUT: &[&str] = &["dist", "build", "target", "out"];
 
 /// Why a deploy tool or a project's release, deploy or promote script is
 /// the person's where the boss acts fully: it ships only through a
@@ -621,6 +637,9 @@ struct Walk<'h, 'a> {
     cwd: Option<PathBuf>,
     /// An earlier command changed where, or on what, git works.
     moved: bool,
+    /// The tags an earlier command in it made, at the default branch's
+    /// commit.
+    made_tags: Vec<String>,
 }
 
 /// A word that names a path, by how it is written.
@@ -657,6 +676,39 @@ impl Walk<'_, '_> {
                 "the repository has git hooks, which run as it ships; that's the person's to allow",
             ),
         }
+    }
+
+    /// Whether `w`, a file a release or merge sends to GitHub (notes, a
+    /// message, an asset), may go: inside the folder, read like any read,
+    /// never a credentials file by its name, and an asset only one git
+    /// tracks or a build's output.
+    fn sends_file(&self, w: &Word, asset: bool) -> Judged {
+        let refused = |why: &str| no(format!("sends a file {why}; that's the person's to allow"));
+        self.reads(w)?;
+        self.own_code(w).map_err(|_| {
+            "sends a file from outside the folder; that's the person's to allow".to_string()
+        })?;
+        let Some(path) = self.resolve(w).and_then(|p| (self.here.real)(&p)) else {
+            return refused("Desk can't find");
+        };
+        if let Some(n) = crate::never::path(&path) {
+            return no(n.why());
+        }
+        if asset {
+            let built = self.here.own.is_some_and(|own| {
+                let own = (self.here.real)(own).unwrap_or_else(|| own.to_path_buf());
+                path.strip_prefix(&own)
+                    .ok()
+                    .and_then(|r| r.components().next())
+                    .is_some_and(|c| {
+                        BUILD_OUTPUT.contains(&c.as_os_str().to_string_lossy().as_ref())
+                    })
+            });
+            if !built && !(self.here.tracked)(&path) {
+                return refused("git doesn't track, outside a build folder");
+            }
+        }
+        Ok(())
     }
 
     /// What ships only through a named workflow at Act fully (a deploy
@@ -1099,7 +1151,12 @@ fn judge_from(command: &str, here: &Here<'_>, cwd: Option<PathBuf>, moved: bool)
     if cmds.is_empty() {
         return no(CANT_READ);
     }
-    let mut walk = Walk { here, cwd, moved };
+    let mut walk = Walk {
+        here,
+        cwd,
+        moved,
+        made_tags: Vec::new(),
+    };
     for (i, cmd) in cmds.iter().enumerate() {
         // A `cd` reaches only the command `&&` joins to it.
         let next = cmds.get(i + 1).map(|c| c.join);
@@ -2016,7 +2073,7 @@ fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
         {
             Ok(())
         }
-        "tag" if walk.here.ships => tag(rest),
+        "tag" if walk.here.ships => tag(walk, rest),
         "rebase" | "reset" | "restore" | "clean" | "update-ref" | "filter-branch"
         | "filter-repo" | "reflog" | "gc" | "prune" | "tag" | "replace" | "notes" => no(UNDONE),
         "push" => push(walk, rest),
@@ -2027,20 +2084,33 @@ fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
 /// A tag the boss may make where it acts fully: one new tag, by a name of
 /// plain characters, of `HEAD` or a named commit, annotated or not. Moving
 /// or deleting one goes to the person.
-fn tag(rest: &[Word]) -> Judged {
+fn tag(walk: &mut Walk<'_, '_>, rest: &[Word]) -> Judged {
     let spec = Spec {
-        short: "as",
+        short: "a",
         short_val: "m",
-        long: &["annotate", "sign"],
+        long: &["annotate"],
         long_val: &["message"],
         ..Spec::default()
     };
     let g = parse("git tag", &spec, rest, false)
-        .map_err(|_| "moves or deletes a tag; that's the person's to allow".to_string())?;
-    match g.operands.as_slice() {
-        [name] | [name, _] if tag_name(&name.text) && !name.glob => Ok(()),
-        _ => no(CANT_READ),
+        .map_err(|_| "moves, deletes or signs a tag; that's the person's to allow".to_string())?;
+    // Of `HEAD`, never a commit named: and `HEAD` must be what the default
+    // branch has on `origin`.
+    let [name] = g.operands.as_slice() else {
+        return no("tags a commit it names; that's the person's to allow");
+    };
+    let here = walk.here;
+    if name.glob || !tag_name(&name.text) || name.text.starts_with("refs/") {
+        return no(CANT_READ);
     }
+    if here.branches.contains(&name.text) {
+        return no("names a tag as a branch is named; that's the person's to allow");
+    }
+    if walk.moved || !here.at_tip || here.branch != here.default_branch {
+        return no("tags something other than the default branch as origin has it; that's the person's to allow");
+    }
+    walk.made_tags.push(name.text.clone());
+    Ok(())
 }
 
 /// Whether `name` reads as one tag's name: `v1.2.0`, `release-2026-11`.
@@ -2060,6 +2130,14 @@ fn tag_ref(refspec: &str) -> bool {
     }
     let version = refspec.strip_prefix('v').unwrap_or(refspec);
     version.starts_with(|c: char| c.is_ascii_digit()) && version.contains('.') && tag_name(refspec)
+}
+
+/// Whether the tag `refspec` (a name, or `refs/tags/<name>`) is one a boss
+/// acting fully may push: at the default branch's commit on `origin`, or
+/// tagged there earlier in the command.
+fn tag_at_tip(walk: &Walk<'_, '_>, refspec: &str) -> bool {
+    let name = refspec.strip_prefix("refs/tags/").unwrap_or(refspec);
+    walk.here.tip_tags.iter().any(|t| t == name) || walk.made_tags.iter().any(|t| t == name)
 }
 
 /// A push the boss may allow: the branch the folder is on, to a named
@@ -2104,13 +2182,21 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
         true => walk.ships_git(),
         false => no(PUBLISHES),
     };
+    // A tag ships only where it tags what `origin`'s default branch has.
+    let ships_tag = |remote: &str, name: &str| {
+        ships_to(remote)?;
+        match tag_at_tip(walk, name) {
+            true => Ok(()),
+            false => no("pushes a tag that isn't at the default branch's commit; that's the person's to allow"),
+        }
+    };
     let operands: Vec<&Word> = match g.operands.as_slice() {
         // `git push origin tag v1.2.0`.
         [remote, t, name] if t.text == "tag" => {
             if !tag_name(&name.text) || name.glob {
                 return no(CANT_READ);
             }
-            return ships_to(&remote.text);
+            return ships_tag(&remote.text, &name.text);
         }
         ops => ops.to_vec(),
     };
@@ -2126,19 +2212,25 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
         return no("Desk can't tell where this push goes");
     }
     if tag_ref(refspec) {
-        return ships_to(remote);
+        return ships_tag(remote, refspec);
     }
-    if is_default(branch, here) {
-        ships_to(remote)?;
+    // `src:dest`, or one name for both.
+    let (src, dest) = refspec.split_once(':').unwrap_or((refspec, refspec));
+    let own_branch = (src == "HEAD" || src == branch) && (dest == "HEAD" || dest == branch);
+    // From a branch that reads as a default one (`main`, `production`,
+    // `release-…`): only the default branch itself, to itself, ships.
+    // Feature work reaches the default branch through `gh pr merge`.
+    if is_default(branch, here) || is_default(dest, here) {
+        let exact = here.default_branch == Some(branch) && own_branch;
+        return match exact {
+            true => ships_to(remote),
+            false => no(PUBLISHES),
+        };
     }
-    let dest = refspec.strip_prefix("HEAD:").unwrap_or(refspec);
-    if refspec == "HEAD" || dest == branch {
-        return Ok(());
+    match own_branch {
+        true => Ok(()),
+        false => no("pushes something other than the branch it's on"),
     }
-    if is_default(dest, here) {
-        return ships_to(remote);
-    }
-    no("pushes something other than the branch it's on")
 }
 
 fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
@@ -2279,13 +2371,12 @@ fn release_create(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
         }
     }
     for f in g.values(&["-F", "--notes-file"]) {
-        walk.reads(f)?;
-        walk.own_code(f)?;
+        walk.sends_file(f, false)?;
     }
     let Some((tag, assets)) = g.operands.split_first() else {
         return no(CANT_READ);
     };
-    if tag.glob || !tag_name(&tag.text) {
+    if tag.glob || !tag_name(&tag.text) || tag.text.starts_with("refs/") {
         return no(CANT_READ);
     }
     for a in assets {
@@ -2294,9 +2385,7 @@ fn release_create(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
             text: a.text.split('#').next().unwrap_or_default().to_string(),
             glob: a.glob,
         };
-        walk.own_code(&file).map_err(|_| {
-            "uploads a file from outside the folder; that's the person's to allow".to_string()
-        })?;
+        walk.sends_file(&file, true)?;
     }
     Ok(())
 }
@@ -2347,15 +2436,18 @@ fn pr_merge(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
     };
     let g = parse("gh pr merge", &spec, args, false)?;
     for f in g.values(&["-F", "--body-file"]) {
-        walk.reads(f)?;
-        walk.own_code(f)?;
+        walk.sends_file(f, false)?;
     }
     match g.operands.as_slice() {
-        [] => walk.ships_gh(),
-        [n] if !n.glob && !n.text.is_empty() && n.text.chars().all(|c| c.is_ascii_digit()) => {
-            walk.ships_gh()
-        }
-        _ => no(PUBLISHES),
+        [] => {}
+        [n] if !n.glob && !n.text.is_empty() && n.text.chars().all(|c| c.is_ascii_digit()) => {}
+        _ => return no(PUBLISHES),
+    }
+    walk.ships_gh()?;
+    // Merging can update the checkout, and its hooks run then.
+    match walk.here.hooks {
+        false => Ok(()),
+        true => no("the repository has git hooks, which may run as it merges; that's the person's to allow"),
     }
 }
 
@@ -2876,6 +2968,10 @@ pub(crate) mod tests {
             follow_tags: false,
             hooks: false,
             workflows: &[],
+            at_tip: false,
+            branches: &[],
+            tip_tags: &[],
+            tracked: &|_| false,
         }
     }
 
@@ -2910,10 +3006,21 @@ pub(crate) mod tests {
         let withheld = [PathBuf::from("/Users/sam/Library/Application Support/Desk")];
         let real = fake_real;
         let workflows: Vec<String> = WORKFLOWS.iter().map(|w| w.to_string()).collect();
+        let branches: Vec<String> = ["main", "feat/date-picker", "production"]
+            .iter()
+            .map(|b| b.to_string())
+            .collect();
+        // v1.2.0 is at origin/main's commit; HEAD is too.
+        let tip_tags = vec!["v1.2.0".to_string()];
+        let tracked = |p: &Path| p.ends_with("docs/acme-guide.pdf");
         let mut here = here(home, own, &scratch, &withheld, &real, branch);
         here.ships = true;
         here.ships_gh = true;
         here.workflows = &workflows;
+        here.at_tip = true;
+        here.branches = &branches;
+        here.tip_tags = &tip_tags;
+        here.tracked = &tracked;
         tweak(&mut here);
         judge(command, &here)
     }
@@ -3033,6 +3140,7 @@ pub(crate) mod tests {
 
     #[test]
     fn acting_fully_ships_its_v1_set_and_nothing_past_the_hard_limits() {
+        // From a feature branch: merging, releasing, running listed workflows.
         for command in [
             "gh pr merge 42 --squash",
             "gh pr merge --squash --subject 'Fix: the date picker'",
@@ -3040,14 +3148,9 @@ pub(crate) mod tests {
             "gh release create v1.2.0 --notes 'Date picker'",
             "gh release create v1.2.0 --target main --generate-notes",
             "gh release create v1.2.0 dist/acme.tgz",
+            "gh release create v1.2.0 docs/acme-guide.pdf",
             "gh workflow run deploy.yml",
             "gh workflow run promote.yml --ref main",
-            "git tag v1.2.0",
-            "git tag -a v1.2.0 -m 'Date picker'",
-            "git push origin v1.2.0",
-            "git push origin refs/tags/v1.2.0",
-            "git push origin tag v1.2.0",
-            "git push origin HEAD:main",
         ] {
             assert!(judged(command).is_err(), "at Act: {command}");
             assert_eq!(
@@ -3056,8 +3159,22 @@ pub(crate) mod tests {
                 "{command}"
             );
         }
-        assert_eq!(judged_fully("git push origin main", "main"), Ok(()));
-        assert_eq!(judged_fully("git push -u origin HEAD", "main"), Ok(()));
+        // On the default branch, at origin's commit: tagging it, pushing it.
+        for command in [
+            "git tag v1.3.0",
+            "git tag -a v1.3.0 -m 'Date picker'",
+            "git push origin v1.2.0",
+            "git push origin refs/tags/v1.2.0",
+            "git push origin tag v1.2.0",
+            "git tag v1.3.0 && git push origin v1.3.0",
+            "git push origin main",
+            "git push origin HEAD",
+            "git push -u origin HEAD",
+            "git push origin HEAD:main",
+        ] {
+            assert!(judged_on(command, "main").is_err(), "at Act: {command}");
+            assert_eq!(judged_fully(command, "main"), Ok(()), "{command}");
+        }
         use crate::never::Never;
         let never = |n: Never| Err(n.why().to_string());
         for (command, why) in [
@@ -3092,11 +3209,11 @@ pub(crate) mod tests {
             ),
             (
                 "git tag -d v1.1.0",
-                Err("moves or deletes a tag; that's the person's to allow".into()),
+                Err("moves, deletes or signs a tag; that's the person's to allow".into()),
             ),
             (
                 "git tag -f v1.1.0",
-                Err("moves or deletes a tag; that's the person's to allow".into()),
+                Err("moves, deletes or signs a tag; that's the person's to allow".into()),
             ),
         ] {
             assert_eq!(judged_fully(command, "feat/date-picker"), why, "{command}");
@@ -3104,18 +3221,135 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn git_hooks_send_a_shipping_push_to_the_person() {
+    fn git_hooks_send_a_shipping_push_or_a_merge_to_the_person() {
         for command in [
             "git push origin main",
             "git push origin v1.2.0",
             "git push origin HEAD:main",
         ] {
-            let got = judged_fully_with(command, "feat/x", |h| h.hooks = true).unwrap_err();
+            let got = judged_fully_with(command, "main", |h| h.hooks = true).unwrap_err();
             assert!(got.contains("git hooks"), "{command}: {got}");
         }
-        assert_eq!(
-            judged_fully_with("gh pr merge 42", "feat/x", |h| h.hooks = true),
-            Ok(())
+        let got = judged_fully_with("gh pr merge 42", "feat/x", |h| h.hooks = true).unwrap_err();
+        assert!(got.contains("git hooks"), "{got}");
+    }
+
+    /// The final review's cases: tags only of what the default branch has
+    /// on origin, pushes only of the default branch to itself, and files
+    /// sent to GitHub kept to what is safe to send.
+    #[test]
+    fn tags_and_pushes_ship_only_the_default_branch_as_origin_has_it() {
+        let held = |command: &str, branch: &str, tweak: &dyn Fn(&mut Here<'_>), why: &str| {
+            let got = judged_fully_with(command, branch, tweak).expect_err(command);
+            assert!(got.contains(why), "{command} on {branch}: {got}");
+        };
+        let none = |_: &mut Here<'_>| {};
+        let secrets = crate::never::Never::Secrets.why();
+        // Tags.
+        held(
+            "git tag v1.3.0",
+            "feat/date-picker",
+            &none,
+            "default branch as origin has it",
+        );
+        held(
+            "git tag v1.3.0",
+            "main",
+            &|h| h.at_tip = false,
+            "default branch as origin has it",
+        );
+        held(
+            "git tag v1.3.0 abc1234",
+            "main",
+            &none,
+            "tags a commit it names",
+        );
+        held(
+            "git tag -a v1.3.0 -m x feat/date-picker",
+            "main",
+            &none,
+            "tags a commit it names",
+        );
+        held("git tag refs/heads/main", "main", &none, CANT_READ);
+        held("git tag production", "main", &none, "as a branch is named");
+        held("git tag -s v1.3.0", "main", &none, "signs");
+        held("git tag --sign v1.3.0", "main", &none, "signs");
+        held(
+            "git push origin v9.9.9",
+            "main",
+            &none,
+            "isn't at the default branch's commit",
+        );
+        held(
+            "git push origin tag v9.9.9",
+            "feat/date-picker",
+            &none,
+            "isn't at the default branch's commit",
+        );
+        // Pushes: only the default branch, to itself, from itself.
+        held(
+            "git push origin HEAD:main",
+            "feat/date-picker",
+            &none,
+            PUBLISHES,
+        );
+        held(
+            "git push origin feat/date-picker:main",
+            "feat/date-picker",
+            &none,
+            PUBLISHES,
+        );
+        held("git push origin HEAD:production", "main", &none, PUBLISHES);
+        held(
+            "git push origin HEAD:release-2026",
+            "main",
+            &none,
+            PUBLISHES,
+        );
+        held(
+            "git push origin HEAD:production",
+            "feat/date-picker",
+            &none,
+            PUBLISHES,
+        );
+        held("git push origin production", "production", &none, PUBLISHES);
+        held(
+            "git push origin main",
+            "main",
+            &|h| h.default_branch = None,
+            PUBLISHES,
+        );
+        // Files sent to GitHub.
+        held(
+            "gh release create v1.2.0 --notes-file .env",
+            "feat/x",
+            &none,
+            secrets,
+        );
+        held(
+            "gh release create v1.2.0 -F .env.production",
+            "feat/x",
+            &none,
+            secrets,
+        );
+        held(
+            "gh release create v1.2.0 config/credentials.json",
+            "feat/x",
+            &none,
+            secrets,
+        );
+        held(
+            "gh release create v1.2.0 scratch/notes.txt",
+            "feat/x",
+            &none,
+            "git doesn't track",
+        );
+        held("gh pr merge 42 -F .env", "feat/x", &none, secrets);
+        held(
+            "gh pr merge 42 --body-file ../acme-api/notes.md",
+            "feat/x",
+            &none,
+            "outside the folder",
         );
     }
 
@@ -3150,7 +3384,7 @@ pub(crate) mod tests {
             assert!(got.contains("push.followTags"), "{command}: {got}");
         }
         assert_eq!(
-            judged_fully_with("git push --no-follow-tags origin main", "feat/x", |h| h
+            judged_fully_with("git push --no-follow-tags origin main", "main", |h| h
                 .follow_tags =
                 true),
             Ok(())
@@ -3368,6 +3602,10 @@ pub(crate) mod tests {
             follow_tags: false,
             hooks: false,
             workflows: &[],
+            at_tip: false,
+            branches: &[],
+            tip_tags: &[],
+            tracked: &|_| false,
         };
         let desk = format!(
             "cat '{}/library/application support/desk/x'",

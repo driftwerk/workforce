@@ -333,6 +333,32 @@ impl Desk {
                     &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
                 )
                 .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+                if let Some(default) = facts.default_branch.clone() {
+                    let tip = format!("refs/remotes/origin/{default}");
+                    let head = git_line(&cwd, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
+                    let at = git_line(
+                        &cwd,
+                        &["rev-parse", "-q", "--verify", &format!("{tip}^{{commit}}")],
+                    );
+                    facts.at_tip = head.is_some() && head == at;
+                    facts.tip_tags = git_lines(&cwd, &["tag", "--points-at", &tip]);
+                }
+                facts.branches = git_lines(
+                    &cwd,
+                    &[
+                        "for-each-ref",
+                        "--format=%(refname:short)",
+                        "refs/heads",
+                        "refs/remotes",
+                    ],
+                )
+                .into_iter()
+                .map(|b| {
+                    b.split_once('/')
+                        .filter(|(r, _)| *r == "origin")
+                        .map_or(b.clone(), |(_, n)| n.to_string())
+                })
+                .collect();
                 let grant = self.full_of(boss);
                 let named = grant.repos;
                 facts.workflows = grant.workflows;
@@ -354,7 +380,29 @@ impl Desk {
                 }
             }
         }
-        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
+        let top = crate::computer::boss::resolve_real(&facts.own);
+        let tracked = |p: &std::path::Path| {
+            top.as_ref().is_some_and(|top| {
+                p.strip_prefix(top).is_ok_and(|rel| {
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(top)
+                        .args(["ls-files", "--error-unmatch", "--"])
+                        .arg(rel)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success())
+                })
+            })
+        };
+        charge::answerable(
+            &facts,
+            &bounds,
+            &crate::computer::boss::resolve_real,
+            &tracked,
+        )
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
