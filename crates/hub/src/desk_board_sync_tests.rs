@@ -173,6 +173,10 @@ impl Tool for FakeJiraTool {
                 json!({ "key": key, "transitioned": true })
             }
             "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
+            "jira.get_project" => json!({
+                "key": input["project_key"],
+                "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
+            }),
             other => json!({ "unexpected": other }),
         };
         Ok(ToolResult::success(out, 0))

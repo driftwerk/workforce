@@ -862,7 +862,12 @@ impl Desk {
 
     /// Ticket `id` goes to board `board`: a new key there, out of its plan,
     /// its history left with the old board's group.
-    async fn ticket_goes(&self, id: Uuid, board: Uuid, by: &By) -> Result<String, DeskError> {
+    pub(super) async fn ticket_goes(
+        &self,
+        id: Uuid,
+        board: Uuid,
+        by: &By,
+    ) -> Result<String, DeskError> {
         let before = self.ticket(id).await?;
         let old_board = self.board_of(before.ticket.board).await?;
         // A synced ticket's issue belongs to its board's link, in its
@@ -874,6 +879,16 @@ impl Desk {
                 e.key,
                 old_board.name,
                 e.system.title()
+            )));
+        }
+        let to = self.board_of(board).await?;
+        if let Some(sync) = &to.sync {
+            self.leave_ticket(id, by).await?;
+            return Err(DeskError::Conflict(format!(
+                "{} is synced with {} {}: a ticket from elsewhere doesn't go onto it. It stays where it was, unassigned.",
+                to.name,
+                sync.system.title(),
+                sync.target
             )));
         }
         let old_group = old_board.group;

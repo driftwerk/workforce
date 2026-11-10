@@ -518,7 +518,11 @@ impl Desk {
         // own changes don't go back.
         let pushes = b.as_ref().is_some_and(|b| b.sync.is_some())
             && !crate::board_sync::is_remote_party(&by.party)
-            && t.external.as_ref().is_none_or(|e| e.synced && !e.kept);
+            && match &t.external {
+                Some(e) => e.synced && !e.kept,
+                // Only what the person made here becomes an issue there.
+                None => t.created_by.kind == PartyKind::You,
+            };
         if pushes {
             if let Err(e) = self.0.store.queue_push(t.id, t.board, now()).await {
                 tracing::warn!(ticket = %t.id, error = format!("{e:#}"), "a synced ticket's change wasn't queued to go out");

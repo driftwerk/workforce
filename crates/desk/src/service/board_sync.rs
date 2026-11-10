@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{Desk, DeskError};
 use crate::board::{
@@ -1092,6 +1092,26 @@ pub struct Pushed {
     pub skipped: Option<String>,
 }
 
+/// What a create may have made already.
+enum Made {
+    Here((String, Option<String>, String)),
+    Elsewhere(String),
+    Nothing,
+}
+
+/// How long after a create was sent, with nothing found by its ref, before
+/// it may be sent again.
+const CREATE_SETTLES: chrono::Duration = chrono::Duration::minutes(10);
+
+/// A create made an issue outside the board's project: the board pauses,
+/// and it is never made again.
+fn made_elsewhere(s: &Sync, key: &str) -> RemoteError {
+    RemoteError::Refused(format!(
+        "a ticket's issue was made as {key}, outside {}; Desk won't make it again. Move the issue into {} or unlink the board.",
+        s.target, s.target
+    ))
+}
+
 /// How long a push the hub holds for the person's approval waits before
 /// it is sent again.
 const WAITING_RETRY: chrono::Duration = chrono::Duration::hours(1);
@@ -1197,6 +1217,9 @@ impl Desk {
             _ => return Ok(()),
         };
         let mut t = match &t.external {
+            // Only what the person made here becomes an issue there: never a
+            // session's, an agent's or a plan's words.
+            None if t.created_by.kind != crate::crew::PartyKind::You => return Ok(()),
             None => {
                 let made = self.create_issue(b, s, remote, budget, t, q).await?;
                 out.created += 1;
@@ -1416,52 +1439,63 @@ impl Desk {
     ) -> Result<Ticket, RemoteError> {
         let fail = |e: DeskError| RemoteError::Failed(e.to_string());
         let reference = crate::board_sync::desk_ref(t.id);
-        let found = match q.creating_at {
-            Some(_) => self.find_made(s, remote, budget, &reference).await?,
-            None => None,
-        };
+        let now = crate::crew::now();
+        // A create sent before, or held for the person's approval, is never
+        // sent again while it may have gone through: what it made is looked
+        // for by its ref, anywhere.
+        let mut found = None;
+        if q.creating_at.is_some() || q.waiting.is_some() {
+            match self.find_made(s, remote, budget, &reference).await? {
+                Made::Here(made) => found = Some(made),
+                Made::Elsewhere(key) => return Err(made_elsewhere(s, &key)),
+                Made::Nothing => {
+                    if let Some(request_id) = &q.waiting {
+                        return Err(RemoteError::Waiting {
+                            request_id: request_id.clone(),
+                        });
+                    }
+                    // A search may not see a new issue at once.
+                    if q.creating_at.is_some_and(|at| now - at < CREATE_SETTLES) {
+                        return Err(RemoteError::Failed(
+                            "waiting to see whether the last create went through".into(),
+                        ));
+                    }
+                }
+            }
+        }
         let (key, issue_id, url) = match found {
             Some(made) => made,
             None => {
+                let issue_type = match s.system {
+                    System::Jira => Some(self.issue_type(s, remote, budget).await?),
+                    System::Linear => None,
+                };
                 self.0
                     .store
-                    .creating(t.id, crate::crew::now())
+                    .creating(t.id, now)
                     .await
                     .map_err(|e| fail(internal(e)))?;
                 budget.take()?;
-                match s.system {
+                let (tool, args) = match s.system {
                     System::Jira => {
                         let mut labels = vec![reference.clone()];
                         if let Filter::Label(l) = &s.filter {
                             labels.push(l.trim().to_string());
                         }
-                        let made = crate::board_sync::call(
-                            remote,
-                            s.system,
+                        (
                             "jira.create_issue",
                             json!({
                                 "project_key": s.target,
                                 "summary": t.title,
-                                "issue_type": "Task",
+                                "issue_type": issue_type,
                                 "description": t.body,
                                 "labels": labels,
                             }),
                         )
-                        .await?;
-                        let key = made["key"]
-                            .as_str()
-                            .and_then(crate::board_sync::parse_issue_key)
-                            .filter(|k| crate::board_sync::key_in_target(k, &s.target))
-                            .ok_or_else(|| {
-                                RemoteError::Failed("Jira gave no key for the new issue".into())
-                            })?;
-                        (key, made["id"].as_str().map(str::to_string), String::new())
                     }
                     System::Linear => {
                         let body = format!("{}\n\n(Desk ref: {reference})", t.body.trim());
-                        let made = crate::board_sync::call(
-                            remote,
-                            s.system,
+                        (
                             "linear.issue_create",
                             json!({
                                 "title": t.title,
@@ -1469,20 +1503,45 @@ impl Desk {
                                 "team_id": s.target_id.clone().unwrap_or_default(),
                             }),
                         )
-                        .await?;
-                        let issue = made.get("issue").unwrap_or(&made);
-                        let key = issue["identifier"]
-                            .as_str()
-                            .and_then(crate::board_sync::parse_issue_key)
-                            .filter(|k| crate::board_sync::key_in_target(k, &s.target))
-                            .ok_or_else(|| {
-                                RemoteError::Failed("Linear gave no key for the new issue".into())
-                            })?;
-                        (
-                            key,
-                            issue["id"].as_str().map(str::to_string),
-                            issue["url"].as_str().unwrap_or_default().to_string(),
-                        )
+                    }
+                };
+                let made = match crate::board_sync::call(remote, s.system, tool, args).await {
+                    Ok(made) => made,
+                    // The project takes no such type: trying again won't help.
+                    Err(RemoteError::Failed(why))
+                        if why.to_ascii_lowercase().contains("issue type")
+                            || why.to_ascii_lowercase().contains("issuetype") =>
+                    {
+                        return Err(RemoteError::Refused(format!(
+                            "{} won't take a new issue of type {}: {why}",
+                            s.target,
+                            issue_type.unwrap_or_default()
+                        )))
+                    }
+                    Err(e) => return Err(e),
+                };
+                let issue = made.get("issue").unwrap_or(&made);
+                let said = issue
+                    .get("key")
+                    .or_else(|| issue.get("identifier"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match said.as_deref().and_then(crate::board_sync::parse_issue_key) {
+                    Some(key) if crate::board_sync::key_in_target(&key, &s.target) => (
+                        key,
+                        issue["id"].as_str().map(str::to_string),
+                        issue["url"].as_str().unwrap_or_default().to_string(),
+                    ),
+                    // It answered with a key, but not one of this project's:
+                    // made, so never made again.
+                    _ if said.is_some() => {
+                        return Err(made_elsewhere(s, said.as_deref().unwrap_or_default()))
+                    }
+                    _ => {
+                        return Err(RemoteError::Failed(format!(
+                            "{} gave no key for the new issue",
+                            s.system.title()
+                        )))
                     }
                 }
             }
@@ -1540,14 +1599,15 @@ impl Desk {
         Ok(t)
     }
 
-    /// An issue a create may have made already, found by its Desk ref.
+    /// What a create may have made already, found by its Desk ref
+    /// anywhere on that Jira or Linear.
     async fn find_made(
         &self,
         s: &Sync,
         remote: &dyn Remote,
         budget: &mut Budget,
         reference: &str,
-    ) -> Result<Option<(String, Option<String>, String)>, RemoteError> {
+    ) -> Result<Made, RemoteError> {
         budget.take()?;
         let found = match s.system {
             System::Jira => {
@@ -1555,7 +1615,7 @@ impl Desk {
                     remote,
                     s.system,
                     "jira.search",
-                    json!({ "jql": format!("project = \"{}\" AND labels = \"{reference}\"", s.target), "max_results": 2 }),
+                    json!({ "jql": format!("labels = \"{reference}\""), "max_results": 5 }),
                 )
                 .await?;
                 crate::board_sync::jira_search_issues(&answer, "").0
@@ -1574,10 +1634,44 @@ impl Desk {
                     .collect()
             }
         };
-        Ok(found
-            .into_iter()
+        if let Some(i) = found
+            .iter()
             .find(|i| crate::board_sync::key_in_target(&i.key, &s.target))
-            .map(|i| (i.key, i.id, i.url)))
+        {
+            return Ok(Made::Here((i.key.clone(), i.id.clone(), i.url.clone())));
+        }
+        Ok(match found.into_iter().next() {
+            Some(i) => Made::Elsewhere(i.key),
+            None => Made::Nothing,
+        })
+    }
+
+    /// The issue type a new Jira issue takes: Task when the project has it,
+    /// else its first that isn't a sub-task or an epic.
+    async fn issue_type(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+    ) -> Result<String, RemoteError> {
+        budget.take()?;
+        let p = crate::board_sync::call(
+            remote,
+            s.system,
+            "jira.get_project",
+            json!({ "project_key": s.target }),
+        )
+        .await?;
+        let names: Vec<String> = p["issue_types"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str())
+            .map(|n| crate::board_sync::unfence(n).0)
+            .collect();
+        crate::board_sync::pick_issue_type(&names).ok_or_else(|| {
+            RemoteError::Refused(format!("{} takes no issue type Desk can make", s.target))
+        })
     }
 }
 
