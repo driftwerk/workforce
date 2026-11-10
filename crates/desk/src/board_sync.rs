@@ -69,6 +69,14 @@ pub enum RemoteError {
     /// A tool the sync may not call.
     #[error("the sync never calls {0}")]
     NotAllowed(String),
+    /// The hub doesn't offer this tool (any more): the board pauses until
+    /// its admin adds it, rather than backing off for ever.
+    #[error("the hub doesn't offer {0}")]
+    Missing(String),
+    /// This ticket's push stops until the person acts on it (a create
+    /// held for their approval that was never given): said on the ticket.
+    #[error("{0}")]
+    Stuck(String),
     /// This pass has made all the calls it may: the rest wait for the
     /// next. Not a failure.
     #[error("this pass's calls are spent")]

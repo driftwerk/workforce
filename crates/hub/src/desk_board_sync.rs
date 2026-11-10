@@ -178,7 +178,11 @@ impl Remote for HubRemote {
         )
         .await
         .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
-        .map_err(mcp_error)?;
+        .map_err(|e| match e {
+            // An unknown tool (JSON-RPC "method not found"): not offered.
+            McpError::ServerError { code: -32601, .. } => RemoteError::Missing(tool.to_string()),
+            e => mcp_error(e),
+        })?;
         sync::mcp_answer(&result)
     }
 }
@@ -235,10 +239,7 @@ impl Remote for LocalRemote {
         let service = self.service()?;
         let surface = Arc::new(self.surface(&service));
         let Some(t) = surface.get(tool) else {
-            return Err(RemoteError::Refused(format!(
-                "this hub has no {tool}; connect {} here first",
-                self.system.title()
-            )));
+            return Err(RemoteError::Missing(tool.to_string()));
         };
         let ctx = crate::remote_mcp::session_context::session_context(&service, &self.person)
             .await
@@ -484,6 +485,9 @@ pub fn paused_by(e: &RemoteError) -> Paused {
         RemoteError::NoToken => Paused::NoToken,
         RemoteError::Refused(reason) => Paused::Refused {
             reason: reason.clone(),
+        },
+        RemoteError::Missing(tool) => Paused::Missing {
+            tools: vec![tool.clone()],
         },
         other => Paused::Refused {
             reason: other.to_string(),

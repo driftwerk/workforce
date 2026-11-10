@@ -242,6 +242,8 @@ struct WriteJira {
     types: Vec<&'static str>,
     /// An issue already carrying a ticket's ref, outside the project.
     stray: Option<String>,
+    /// A tool the hub doesn't offer.
+    missing: Option<&'static str>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -251,6 +253,7 @@ impl WriteJira {
             creates,
             types: vec!["Bug", "Task"],
             stray: None,
+            missing: None,
             calls: Mutex::new(vec![]),
         }
     }
@@ -289,6 +292,9 @@ impl Remote for WriteJira {
             .lock()
             .unwrap()
             .push((tool.to_string(), args.clone()));
+        if self.missing == Some(tool) {
+            return Err(RemoteError::Missing(tool.to_string()));
+        }
         match tool {
             "jira.search" => Ok(match (&self.stray, args["jql"].as_str()) {
                 (Some(stray), Some(jql)) if jql.contains("desk-") => json!({ "issues": [
@@ -448,11 +454,24 @@ async fn plans_and_moves_keep_off_a_synced_board() {
         assert_ne!(planned.id, synced_board.id);
         assert!(planned.sync.is_none());
         let t = made_here(&d, &planned, &By::you()).await;
+        // Someone has it: a refused move leaves them on it.
+        let c = d.0.store.pool().get().await.unwrap();
+        let agent = serde_json::to_value(crate::crew::Party::agent("atlas", "Atlas")).unwrap();
+        c.execute(
+            "UPDATE tickets SET assignee = $2, state = 'doing' WHERE id = $1",
+            &[&t, &agent],
+        )
+        .await
+        .unwrap();
+        drop(c);
         assert!(matches!(
             d.ticket_goes(t, synced_board.id, &By::you()).await,
             Err(DeskError::Conflict(_))
         ));
-        assert_eq!(d.ticket(t).await.unwrap().ticket.board, planned.id);
+        let after = d.ticket(t).await.unwrap().ticket;
+        assert_eq!(after.board, planned.id);
+        assert_eq!(after.assignee.map(|a| a.id).as_deref(), Some("atlas"));
+        assert_eq!(after.state, TicketState::Doing);
     })
     .await;
 }
@@ -491,6 +510,77 @@ async fn one_key_on_two_links_names_the_one_in_reach() {
             assert_eq!(t.ticket.board, board, "{group}");
         }
         assert_eq!(d.search_tickets("ACME-1").await.unwrap().len(), 2);
+    })
+    .await;
+}
+
+/// A tool the hub doesn't offer (a board linked before it was needed)
+/// pauses the board as missing it, rather than backing off for ever.
+#[tokio::test]
+async fn a_tool_the_hub_lacks_pauses_the_board_as_missing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        made_here(&d, &b, &By::you()).await;
+        let mut remote = WriteJira::new(Creates::InProject);
+        remote.missing = Some("jira.get_project");
+        d.push_board(b.id, &remote).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            s.paused,
+            Some(Paused::Missing {
+                tools: vec!["jira.get_project".into()]
+            })
+        );
+        assert_eq!(remote.count("jira.create_issue"), 0);
+    })
+    .await;
+}
+
+/// A create held a day without approval stops, said on the ticket, and is
+/// never sent again until the person changes the ticket.
+#[tokio::test]
+async fn a_create_held_a_day_stops_and_says_so() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let t = made_here(&d, &b, &By::you()).await;
+        let remote = WriteJira::new(Creates::Held);
+        d.push_board(b.id, &remote).await.unwrap();
+        let c = d.0.store.pool().get().await.unwrap();
+        c.execute(
+            "UPDATE board_outbox SET creating_at = now() - interval '25 hours', \
+             due_at = now() - interval '1 second' WHERE ticket = $1",
+            &[&t],
+        )
+        .await
+        .unwrap();
+        drop(c);
+        d.push_board(b.id, &remote).await.unwrap();
+        let v = d.ticket(t).await.unwrap();
+        assert!(
+            v.push_problem
+                .as_deref()
+                .is_some_and(|p| p.contains("wasn't approved")),
+            "{:?}",
+            v.push_problem
+        );
+        d.push_board(b.id, &remote).await.unwrap();
+        assert_eq!(remote.count("jira.create_issue"), 1);
+        // The person changes it: it may go again.
+        d.edit_ticket(
+            t,
+            crate::service::TicketPatch {
+                title: Some("Add a logout button, please".into()),
+                ..Default::default()
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d.ticket(t).await.unwrap().push_problem, None);
     })
     .await;
 }

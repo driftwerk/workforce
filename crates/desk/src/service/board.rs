@@ -43,6 +43,8 @@ pub struct TicketView {
     /// Its issue left the board's import filter: on the Left-the-filter
     /// shelf, for the person to keep or drop.
     pub left_filter: bool,
+    /// What stops its change going out to its issue, in plain words.
+    pub push_problem: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,10 +364,13 @@ impl Desk {
             .into_iter()
             .map(|b| (b.id, b))
             .collect();
+        let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
+        let mut problems = self.0.store.push_problems(&ids).await.map_err(internal)?;
         let at = now();
         Ok(tickets
             .into_iter()
             .map(|t| TicketView {
+                push_problem: problems.remove(&t.id),
                 key: boards.get(&t.board).and_then(|b| t.key(b)),
                 ready: board::ready(&t, &states),
                 blockers: board::blockers(&t, &states),

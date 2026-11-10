@@ -1110,3 +1110,21 @@ async fn a_linear_link_must_name_one_team_by_key_and_id() {
     })
     .await;
 }
+
+/// A tool a hub doesn't offer reads as missing, not as a failure to retry.
+#[tokio::test]
+async fn a_tool_a_hub_lacks_reads_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = remote_hub(dir.path(), &["jira.*"], &["jira.get_project"]).await;
+    let hub = HubRemote::new(
+        &remote.url,
+        &Secret::new(&remote.token).unwrap(),
+        Arc::new(reqwest::Client::new()),
+    )
+    .unwrap();
+    assert_eq!(
+        hub.call("jira.get_project", json!({ "project_key": "ACME" }))
+            .await,
+        Err(RemoteError::Missing("jira.get_project".into()))
+    );
+}

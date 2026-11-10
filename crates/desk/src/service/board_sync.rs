@@ -461,6 +461,9 @@ impl Desk {
                     },
                 }),
                 RemoteError::NoToken => Some(Paused::NoToken),
+                RemoteError::Missing(tool) => Some(Paused::Missing {
+                    tools: vec![tool.clone()],
+                }),
                 RemoteError::Refused(reason) => Some(Paused::Refused {
                     reason: reason.clone(),
                 }),
@@ -1099,6 +1102,12 @@ enum Made {
     Nothing,
 }
 
+/// How long a create held for the person's approval waits before it stops.
+const HELD_GIVES_UP: chrono::Duration = chrono::Duration::hours(24);
+
+/// How far off a stuck push is put: until the person changes the ticket.
+const STUCK: chrono::Duration = chrono::Duration::days(3650);
+
 /// How long after a create was sent, with nothing found by its ref, before
 /// it may be sent again.
 const CREATE_SETTLES: chrono::Duration = chrono::Duration::minutes(10);
@@ -1184,6 +1193,13 @@ impl Desk {
                 }
                 // Budget spent: the rest wait for the next pass.
                 Err(RemoteError::Spent) => break,
+                Err(RemoteError::Stuck(why)) => {
+                    self.0
+                        .store
+                        .push_failed(q.ticket, now + STUCK, Some(&why), None)
+                        .await
+                        .map_err(internal)?;
+                }
                 Err(e) => {
                     self.sync_failed(id, &e).await?;
                     out.skipped = Some(e.to_string());
@@ -1450,6 +1466,14 @@ impl Desk {
                 Made::Elsewhere(key) => return Err(made_elsewhere(s, &key)),
                 Made::Nothing => {
                     if let Some(request_id) = &q.waiting {
+                        // Denied, expired, or never answered: it stops here,
+                        // said on the ticket, until the person changes it.
+                        if q.creating_at.is_some_and(|at| now - at >= HELD_GIVES_UP) {
+                            return Err(RemoteError::Stuck(format!(
+                                "Creating this on {} waited a day for your approval there and wasn't approved. Approve it on the hub, or change the ticket to try again.",
+                                s.system.title()
+                            )));
+                        }
                         return Err(RemoteError::Waiting {
                             request_id: request_id.clone(),
                         });
