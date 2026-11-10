@@ -320,12 +320,25 @@ fn edits(a: &str, b: &str) -> usize {
     d[a.len()][b.len()]
 }
 
-/// The command `word` is a near miss of: one edit for a short word, two for
-/// a longer one.
+/// The command `word` is a near miss of: a word of four letters or more
+/// that starts as the command does (two letters at least), one edit away
+/// for a short word, two for a longer one.
 fn near_miss(word: &str) -> Option<&'static str> {
-    let allowed = if word.chars().count() <= 5 { 1 } else { 2 };
+    let length = word.chars().count();
+    // Three letters are too few to guess from: `/usr` is a path, not `/use`.
+    if length < 4 {
+        return None;
+    }
+    let allowed = if length <= 5 { 1 } else { 2 };
     KNOWN
         .iter()
+        .filter(|known| {
+            word.chars()
+                .zip(known.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+                >= 2
+        })
         .map(|known| (edits(word, known), *known))
         .filter(|(d, _)| *d <= allowed)
         .min_by_key(|(d, _)| *d)
@@ -3125,6 +3138,10 @@ mod tests {
             "/unknown",
             "/frobnicate",
             "/re_index",
+            "/usr",
+            "/sue",
+            "/nwe",
+            "/tsatus",
         ] {
             assert_eq!(parse_command(text), None, "{text}");
         }
