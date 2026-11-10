@@ -431,6 +431,17 @@ pub trait CodingEngine: Send + Sync {
         requested.map(str::to_string)
     }
 
+    /// For an engine that picks per agent: the kind and engine one call runs
+    /// on for `service`, `pinned` where its thread already runs on one.
+    /// `None` for an engine that is always itself.
+    fn pick(
+        &self,
+        _service: &AgentService,
+        _pinned: Option<CodingEngineKind>,
+    ) -> Option<(CodingEngineKind, Arc<dyn CodingEngine>)> {
+        None
+    }
+
     /// The health of the CLI this engine spawns on this host; `None` for an
     /// engine that spawns none.
     async fn cli_health(&self) -> Option<CliHealth> {
@@ -565,6 +576,20 @@ impl Engines {
     }
 }
 
+/// The engine one tool call runs on, resolved once for it: `engine`'s pick
+/// for `service` (`pinned`, else the agent's provider's) when it picks per
+/// agent, with the kind picked; else `engine` itself.
+pub fn picked(
+    engine: &Arc<dyn CodingEngine>,
+    service: &AgentService,
+    pinned: Option<CodingEngineKind>,
+) -> (Arc<dyn CodingEngine>, Option<CodingEngineKind>) {
+    match engine.pick(service, pinned) {
+        Some((kind, chosen)) => (chosen, Some(kind)),
+        None => (Arc::clone(engine), None),
+    }
+}
+
 /// The engine of the provider `kind`: Codex for a ChatGPT plan (or the
 /// Codex CLI), Claude Code for anything else.
 pub fn engine_of_provider(kind: ProviderKind) -> CodingEngineKind {
@@ -589,6 +614,20 @@ pub struct ProviderLed {
     service: std::sync::Weak<AgentService>,
     claude: Arc<dyn CodingEngine>,
     codex: Arc<dyn CodingEngine>,
+}
+
+/// Rounds led by `service`'s provider between `claude` and `codex`.
+#[cfg(test)]
+pub(crate) fn provider_led(
+    service: &Arc<AgentService>,
+    claude: Arc<dyn CodingEngine>,
+    codex: Arc<dyn CodingEngine>,
+) -> Arc<dyn CodingEngine> {
+    Arc::new(ProviderLed {
+        service: Arc::downgrade(service),
+        claude,
+        codex,
+    })
 }
 
 impl ProviderLed {
@@ -632,12 +671,29 @@ impl CodingEngine for ProviderLed {
         self.now().limit_reached(text)
     }
 
+    /// The provider's engine's models; either engine's efforts, since a
+    /// thread fixed to the other still takes its own (each clamps).
     fn model_choices(&self) -> ModelChoices {
-        self.now().model_choices()
+        ModelChoices {
+            efforts: workforce_common::settings::CODEX_EFFORTS,
+            ..self.now().model_choices()
+        }
     }
 
     fn model_for(&self, requested: Option<&str>, ctx: &RoundContext<'_>) -> Option<String> {
         self.for_service(ctx.service).model_for(requested, ctx)
+    }
+
+    fn pick(
+        &self,
+        service: &AgentService,
+        pinned: Option<CodingEngineKind>,
+    ) -> Option<(CodingEngineKind, Arc<dyn CodingEngine>)> {
+        let kind = match pinned {
+            Some(kind @ (CodingEngineKind::Codex | CodingEngineKind::ClaudeCode)) => kind,
+            _ => provider_engine(service),
+        };
+        Some((kind, Arc::clone(self.of(kind))))
     }
 
     async fn cli_health(&self) -> Option<CliHealth> {
