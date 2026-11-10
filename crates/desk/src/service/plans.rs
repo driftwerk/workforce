@@ -629,6 +629,14 @@ impl Desk {
                         "That board isn't in the group you run.".into(),
                     ));
                 }
+                if let Some(sync) = &b.sync {
+                    return Err(DeskError::Invalid(format!(
+                        "{} is synced with {} {}: a plan's tickets go on a board of Desk's own.",
+                        b.name,
+                        sync.system.title(),
+                        sync.target
+                    )));
+                }
                 b
             }
             None => self.plan_board(new.group.as_deref()).await?,
@@ -722,9 +730,13 @@ impl Desk {
 
     /// The board a plan in `group` goes on: the group's first, or one made
     /// for it.
-    async fn plan_board(&self, group: Option<&str>) -> Result<Board, DeskError> {
+    pub(super) async fn plan_board(&self, group: Option<&str>) -> Result<Board, DeskError> {
         let boards = self.boards().await?;
-        if let Some(b) = boards.into_iter().find(|b| b.group.as_deref() == group) {
+        // Never a synced board: a plan's words don't become a client's issues.
+        if let Some(b) = boards
+            .into_iter()
+            .find(|b| b.group.as_deref() == group && b.sync.is_none())
+        {
             return Ok(b);
         }
         let name = group
@@ -780,6 +792,12 @@ impl Desk {
         by: &By,
     ) -> Result<(), DeskError> {
         let b = self.board_of(p.board).await?;
+        if b.sync.is_some() && !after.added(before).is_empty() {
+            return Err(DeskError::Invalid(format!(
+                "{} is synced: a plan adds no tickets to it.",
+                b.name
+            )));
+        }
         let mut rank = self.end_rank(b.id, column, Uuid::nil()).await?;
         for t in after.added(before) {
             let at = crew::now();

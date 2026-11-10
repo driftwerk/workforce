@@ -43,6 +43,8 @@ pub struct TicketView {
     /// Its issue left the board's import filter: on the Left-the-filter
     /// shelf, for the person to keep or drop.
     pub left_filter: bool,
+    /// What stops its change going out to its issue, in plain words.
+    pub push_problem: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,10 +364,13 @@ impl Desk {
             .into_iter()
             .map(|b| (b.id, b))
             .collect();
+        let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
+        let mut problems = self.0.store.push_problems(&ids).await.map_err(internal)?;
         let at = now();
         Ok(tickets
             .into_iter()
             .map(|t| TicketView {
+                push_problem: problems.remove(&t.id),
                 key: boards.get(&t.board).and_then(|b| t.key(b)),
                 ready: board::ready(&t, &states),
                 blockers: board::blockers(&t, &states),
@@ -516,11 +521,26 @@ impl Desk {
         subject: Option<Party>,
         text: String,
     ) -> Result<TicketView, DeskError> {
-        let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
+        let b = self.board_of(t.board).await.ok();
+        let group = b.as_ref().and_then(|b| b.group.clone());
         self.note(
             by.event(kind, subject, text)
                 .about_ticket(t.id, group.as_deref()),
         );
+        // A change here on a synced board goes out to its issue; the pull's
+        // own changes don't go back.
+        let pushes = b.as_ref().is_some_and(|b| b.sync.is_some())
+            && !crate::board_sync::is_remote_party(&by.party)
+            && match &t.external {
+                Some(e) => e.synced && !e.kept,
+                // Only what the person made here becomes an issue there.
+                None => t.created_by.kind == PartyKind::You,
+            };
+        if pushes {
+            if let Err(e) = self.0.store.queue_push(t.id, t.board, now()).await {
+                tracing::warn!(ticket = %t.id, error = format!("{e:#}"), "a synced ticket's change wasn't queued to go out");
+            }
+        }
         let v = self.view_ticket(t).await?;
         self.announce(DeskEvent::Ticket {
             ticket: Box::new(v.clone()),
@@ -1563,6 +1583,15 @@ impl Desk {
                     ));
                 }
                 let b = self.board_for_new(caller, prefix.as_deref()).await?;
+                // A session's words never become an issue on someone's Jira.
+                if let Some(sync) = &b.sync {
+                    return Err(format!(
+                        "{} is synced with {} {}; tell the person what needs adding there.",
+                        b.name,
+                        sync.system.title(),
+                        sync.target
+                    ));
+                }
                 let v = self
                     .create_ticket(
                         NewTicket {

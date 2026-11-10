@@ -178,7 +178,11 @@ impl Remote for HubRemote {
         )
         .await
         .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
-        .map_err(mcp_error)?;
+        .map_err(|e| match e {
+            // An unknown tool (JSON-RPC "method not found"): not offered.
+            McpError::ServerError { code: -32601, .. } => RemoteError::Missing(tool.to_string()),
+            e => mcp_error(e),
+        })?;
         sync::mcp_answer(&result)
     }
 }
@@ -235,10 +239,7 @@ impl Remote for LocalRemote {
         let service = self.service()?;
         let surface = Arc::new(self.surface(&service));
         let Some(t) = surface.get(tool) else {
-            return Err(RemoteError::Refused(format!(
-                "this hub has no {tool}; connect {} here first",
-                self.system.title()
-            )));
+            return Err(RemoteError::Missing(tool.to_string()));
         };
         let ctx = crate::remote_mcp::session_context::session_context(&service, &self.person)
             .await
@@ -360,7 +361,8 @@ impl BoardSync {
         let due = s
             .pulled_at
             .is_none_or(|at| chrono::Utc::now() - at >= sync::PULL_EVERY);
-        if !(due || now) {
+        let queued = !self.desk.nothing_to_push(id).await?;
+        if !(due || now || queued) {
             return Ok(());
         }
         let remote = match self.remote(s.system, &s.via, &s.person).await {
@@ -372,6 +374,16 @@ impl BoardSync {
                 return Ok(());
             }
         };
+        // What changed here goes out first, so the pull that follows finds
+        // its own changes there and takes nothing back.
+        let pushed = self.desk.push_board(id, &*remote).await?;
+        if pushed.created + pushed.updated + pushed.waiting > 0 {
+            tracing::info!(board = %id, created = pushed.created, updated = pushed.updated,
+                commented = pushed.commented, waiting = pushed.waiting, "board pushed");
+        }
+        if !(due || now) {
+            return Ok(());
+        }
         let pulled = self.desk.pull_board(id, &*remote).await?;
         if pulled.imported + pulled.updated + pulled.detached + pulled.dropped > 0 {
             tracing::info!(board = %id, imported = pulled.imported, updated = pulled.updated,
@@ -473,6 +485,9 @@ pub fn paused_by(e: &RemoteError) -> Paused {
         RemoteError::NoToken => Paused::NoToken,
         RemoteError::Refused(reason) => Paused::Refused {
             reason: reason.clone(),
+        },
+        RemoteError::Missing(tool) => Paused::Missing {
+            tools: vec![tool.clone()],
         },
         other => Paused::Refused {
             reason: other.to_string(),

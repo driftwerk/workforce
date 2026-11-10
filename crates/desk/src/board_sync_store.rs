@@ -48,6 +48,7 @@ pub struct Queued {
     pub creating_at: Option<DateTime<Utc>>,
     pub waiting: Option<String>,
     pub error: Option<String>,
+    pub queued_at: DateTime<Utc>,
 }
 
 fn queued(row: &Row) -> Result<Queued> {
@@ -59,6 +60,7 @@ fn queued(row: &Row) -> Result<Queued> {
         creating_at: row.try_get("creating_at")?,
         waiting: row.try_get("waiting")?,
         error: row.try_get("error")?,
+        queued_at: row.try_get("queued_at")?,
     })
 }
 
@@ -230,8 +232,14 @@ impl DeskStore {
                 "INSERT INTO board_outbox (ticket, board, due_at, queued_at) VALUES ($1, $2, $3, $3) \
                  ON CONFLICT (ticket) DO UPDATE SET board = EXCLUDED.board, \
                  queued_at = GREATEST(board_outbox.queued_at, EXCLUDED.queued_at), \
-                 due_at = CASE WHEN board_outbox.tries > 0 OR board_outbox.waiting IS NOT NULL \
-                               THEN board_outbox.due_at ELSE LEAST(board_outbox.due_at, EXCLUDED.due_at) END",
+                 due_at = CASE WHEN board_outbox.due_at > EXCLUDED.due_at + interval '1 year' \
+                               THEN EXCLUDED.due_at \
+                               WHEN board_outbox.tries > 0 OR board_outbox.waiting IS NOT NULL \
+                               THEN board_outbox.due_at ELSE LEAST(board_outbox.due_at, EXCLUDED.due_at) END, \
+                 waiting = CASE WHEN board_outbox.due_at > EXCLUDED.due_at + interval '1 year' \
+                                THEN NULL ELSE board_outbox.waiting END, \
+                 error = CASE WHEN board_outbox.due_at > EXCLUDED.due_at + interval '1 year' \
+                              THEN NULL ELSE board_outbox.error END",
                 &[&ticket, &board, &at],
             )
             .await
@@ -256,6 +264,23 @@ impl DeskStore {
             .await?
             .iter()
             .map(queued)
+            .collect()
+    }
+
+    /// What stops each of `ids` going out, for those it stops.
+    pub async fn push_problems(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT ticket, error FROM board_outbox WHERE ticket = ANY($1) AND error IS NOT NULL",
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
             .collect()
     }
 
