@@ -1207,6 +1207,36 @@ mod tests {
                 "run"
             );
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed");
+            // `code.*` takes the folder's full path as its repo, and runs
+            // there; one beside it is no repo.
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+            tools.register(Arc::new(crate::code::CodeGitTool::new(vec![hub
+                .subject
+                .workspace
+                .clone()])));
+            let (ran, out) = run(
+                &gates,
+                &tools,
+                "code.git",
+                json!({"action": "status", "repo": repo.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(ran, "run");
+            let out = out.unwrap();
+            assert!(out.contains("README.md"), "{out}");
+            let (_, out) = run(
+                &gates,
+                &tools,
+                "code.git",
+                json!({"action": "status", "repo": beside.parent().unwrap().to_string_lossy()}),
+            )
+            .await;
+            assert!(!out.unwrap_or_default().contains("notes.md"));
             assert_eq!(
                 run(&gates, &tools, "filesystem.read", read(&beside))
                     .await

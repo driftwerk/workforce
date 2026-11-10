@@ -1189,6 +1189,21 @@ fn a_folder_it_works_in_never_carves_out_what_desk_withholds() {
 }
 
 #[test]
+fn commands_in_a_folder_it_works_in_follow_the_level() {
+    // Below Full access commands can't be contained on this computer yet.
+    let own = working_in_acme(Access::OwnFolder);
+    assert_eq!(
+        refused(&verdict(&own, false, &[], &call(exec("npm test", ACME)))).map(|r| r.0),
+        Some(Refused::OutsideLevel)
+    );
+    let full = working_in_acme(Access::Full);
+    assert_eq!(
+        verdict(&full, false, &[], &call(exec("npm test", ACME))),
+        run()
+    );
+}
+
+#[test]
 fn a_session_may_start_in_a_folder_it_works_in() {
     let pol = AgentPolicy {
         contained: true,

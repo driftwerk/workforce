@@ -126,9 +126,10 @@ pub struct AgentPolicy {
     /// Its workspace and project work trees, canonical.
     pub own: Vec<PathBuf>,
     /// The folders the person gave it to work in (`[computer] works_in`),
-    /// canonical: inside its folder for reading, changing and running, but
-    /// a delete or a command that can't be undone there still asks, and
-    /// nothing Desk withholds is carved out for them.
+    /// canonical: inside its folder for reading and changing at every level,
+    /// and for commands and sessions where its level runs them; a delete or
+    /// a command that can't be undone there still asks, and nothing Desk
+    /// withholds is carved out for them.
     pub works_in: Vec<PathBuf>,
     /// What no agent reaches at any level: Desk's data (other agents'
     /// folders and their config files with it), the keychains. The own

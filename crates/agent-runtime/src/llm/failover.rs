@@ -2208,6 +2208,15 @@ mod tests {
         assert_eq!(classify_error(rate_replay), ErrorKind::RateLimited);
     }
 
+    /// An expired AWS sign-in reaches the person in its own words: it is no
+    /// key the failover reads as wrong.
+    #[test]
+    fn an_expired_aws_sign_in_is_not_a_bad_key() {
+        let said = crate::llm::bedrock_credentials::sso_expired_message("work-sso");
+        assert_ne!(classify_error(&said), ErrorKind::Auth);
+        assert!(!auth_is_definitive(&said));
+    }
+
     #[test]
     fn auth_is_definitive_requires_structural_evidence() {
         assert!(auth_is_definitive("Anthropic API error (401): bad key"));

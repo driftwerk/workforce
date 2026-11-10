@@ -2230,25 +2230,36 @@ fn works_in_line(workspace: &std::path::Path) -> Option<String> {
     if !crate::serve::computer_gates_installed() {
         return None;
     }
-    let folders = workforce_common::settings::AgentWorkspaceConfig::load(workspace)
+    let config = workforce_common::settings::AgentWorkspaceConfig::load(workspace)
         .ok()
-        .flatten()?
-        .works_in()
-        .ok()?;
-    works_in_text(&folders)
+        .flatten()?;
+    let folders = config.works_in().ok()?;
+    let full = config
+        .computer()
+        .is_ok_and(|c| c.access == workforce_core::computer::Access::Full);
+    works_in_text(&folders, full)
 }
 
-/// [`works_in_line`]'s words for `folders`.
-fn works_in_text(folders: &[std::path::PathBuf]) -> Option<String> {
+/// [`works_in_line`]'s words for `folders`; `full` when the agent is at Full
+/// access, the only level that runs commands on this computer.
+fn works_in_text(folders: &[std::path::PathBuf], full: bool) -> Option<String> {
     let first = folders.first()?;
     let all: Vec<String> = folders
         .iter()
         .map(|f| format!("`{}`", f.display()))
         .collect();
+    let first = first.display();
+    let start = match full {
+        true => format!(
+            "start coding work there: `code.*` with `repo` = `{first}`, `exec.run` workdirs and `desk.start` sessions in `{first}` unless they say otherwise"
+        ),
+        false => format!(
+            "read and change files there (`code.*` with `repo` = `{first}`); commands and sessions need Full access, which the person sets"
+        ),
+    };
     Some(format!(
-        "- Works in: {} (the person chose these beside your own workspace; start coding work, `exec.run` workdirs and `desk.start` sessions in `{}` unless they say otherwise; deleting there asks them first)",
-        all.join(", "),
-        first.display()
+        "- Works in: {} (the person chose these beside your own workspace; {start}; deleting there asks them first)",
+        all.join(", ")
     ))
 }
 
