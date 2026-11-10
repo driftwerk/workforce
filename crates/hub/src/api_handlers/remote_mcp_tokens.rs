@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use workforce_identity::remote_mcp_token::RemoteMcpToken;
+use workforce_identity::remote_mcp_token::{RemoteMcpToken, TokenScope};
 
 use super::identity::{require_auth, require_roles_assign};
 use super::my_settings::enforce_action_rate_limit;
@@ -99,11 +99,16 @@ pub struct TokenView {
     /// The paired device that minted it, when one did.
     #[serde(skip_serializing_if = "Option::is_none")]
     minted_by_device: Option<String>,
+    /// `remote_mcp`, `desk_boss` (a Desk boss link, which its label
+    /// names), or absent when its scopes can't be read as either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<TokenScope>,
 }
 
 impl TokenView {
     fn new(token: RemoteMcpToken, now: DateTime<Utc>) -> Self {
         Self {
+            kind: token.scope(),
             expired: is_expired(&token, now),
             minted_by_device: crate::remote_mcp::tokens::minted_by_device(&token.scopes)
                 .map(str::to_owned),
@@ -193,7 +198,7 @@ pub async fn create_my_token(
 /// The paired device a request's bearer is, and the person it is linked
 /// to. Only a device token is taken here: a login or the hub's own token is
 /// refused, so this route is never a second way for a person to mint.
-async fn paired_device(
+pub(crate) async fn paired_device(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> Result<(workforce_pairing::ApprovedDevice, Uuid), Rejection> {
@@ -375,6 +380,7 @@ mod tests {
             expires_at: now + chrono::Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+            desk_link: None,
         };
         let expected = token.fingerprint();
         let json = serde_json::to_value(TokenView::new(token, now)).unwrap();

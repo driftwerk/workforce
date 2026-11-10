@@ -192,6 +192,9 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         oversight: _,
         computer: _,
         skills: _,
+        // Read from the agent's own file each time a Desk boss link is
+        // made or used.
+        desk_boss: _,
         // Read by the agent's heartbeat runner from its own file.
         heartbeat: _,
     } = workspace.clone().unwrap_or_default();

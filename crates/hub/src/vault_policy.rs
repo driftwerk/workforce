@@ -265,6 +265,9 @@ mod tests {
             "Desk/Hubs/atlas/remote_mcp",
             "users/sam/desk//hubs/atlas",
             "desk/hubs",
+            "desk/links/bosses/6f1c",
+            "users/sam/desk/links/bosses/6f1c",
+            workforce_common::vault_scope::DESK_ENGINE_KEY,
         ] {
             for who in [Some("sam"), Some("system"), None, Some("bob")] {
                 assert_eq!(

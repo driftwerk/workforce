@@ -15,16 +15,13 @@ use workforce_identity::types::{Identity, IdentityStatus};
 use crate::authz::Principal;
 use crate::gateway::GatewayState;
 
-use super::tokens::{minted_by_device, DEVICE_SCOPE_PREFIX, TOKEN_SCOPE};
+use workforce_identity::remote_mcp_token::TokenScope;
+
+use super::tokens::minted_by_device;
 
 /// `last_used_at` is refreshed at most this often, so a busy client does not
 /// turn every call into a store write.
 const LAST_USED_REFRESH: Duration = Duration::minutes(5);
-
-/// Every scope this hub can enforce. `remote_mcp` is the whole remote
-/// surface; `device:<id>` (one at most) marks a token a paired device minted,
-/// which acts as a member and lives only while that device is paired.
-const KNOWN_SCOPES: &[&str] = &[TOKEN_SCOPE];
 
 /// The user a remote MCP request acts as, resolved live on every request so a
 /// suspension or role change takes effect on the next call.
@@ -94,7 +91,7 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
         })?
         .filter(|t| t.is_live(now))
         .ok_or(AuthError::Unauthenticated)?;
-    if !covers_remote_surface(&token.scopes) {
+    if token.scope() != Some(TokenScope::RemoteMcp) {
         return Err(AuthError::OutOfScope);
     }
     let identity = identities
@@ -149,7 +146,7 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
 /// id) never revives a token minted before it. A token found dead is
 /// revoked on the spot, so it leaves the listing and the cap too. Fails
 /// closed when it can't be told.
-fn device_still_paired(
+pub(crate) fn device_still_paired(
     state: &GatewayState,
     device: &str,
     token: &RemoteMcpToken,
@@ -182,26 +179,20 @@ fn device_still_paired(
 }
 
 /// Whether a token with `scopes` may use the whole remote surface: it must
-/// carry `remote_mcp`, and nothing this hub doesn't know. A scope it doesn't
-/// know may be one meant to narrow the token, so the token is refused
-/// rather than given everything.
+/// be exactly a remote MCP token ([`TokenScope::of`]), with at most one
+/// `device:<id>` and nothing this hub doesn't know. A scope it doesn't know
+/// may be one meant to narrow the token, so the token is refused rather
+/// than given everything; a Desk boss link token is never one.
+#[cfg(test)]
 fn covers_remote_surface(scopes: &[String]) -> bool {
-    let devices = scopes
-        .iter()
-        .filter(|s| s.starts_with(DEVICE_SCOPE_PREFIX))
-        .count();
-    scopes.iter().any(|s| s == TOKEN_SCOPE)
-        && devices <= 1
-        && (devices == 0 || minted_by_device(scopes).is_some())
-        && scopes
-            .iter()
-            .all(|s| KNOWN_SCOPES.contains(&s.as_str()) || s.starts_with(DEVICE_SCOPE_PREFIX))
+    TokenScope::of(scopes) == Some(TokenScope::RemoteMcp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote_mcp::testing::{bearer, fixture, fixture_with, issue, TokenShape};
+    use crate::remote_mcp::tokens::{DEVICE_SCOPE_PREFIX, TOKEN_SCOPE};
     use workforce_identity::store::IdentityStore;
     use workforce_identity::types::IdentityRole;
 
@@ -463,6 +454,55 @@ mod tests {
         assert_eq!(caller.principal.role, IdentityRole::Member);
         assert_eq!(caller.principal.role_key, "member");
         assert_eq!(caller.principal.identity_id, Some(admin.id));
+    }
+
+    /// A Desk boss link token reaches no remote MCP route: by its prefix,
+    /// and by its kind were it ever stored under the other prefix.
+    #[test]
+    fn a_desk_boss_token_never_reaches_remote_mcp() {
+        let fx = fixture(true);
+        let who = active(&fx, IdentityRole::SystemAdmin);
+        let link = workforce_identity::remote_mcp_token::DeskLink {
+            link_id: uuid::Uuid::new_v4(),
+            agent_id: "allan".into(),
+            group_key: "d/g".into(),
+            group_name: "Acme".into(),
+            engine_id: "devbox".into(),
+            engine_name: "devbox".into(),
+            engine_public_key: "ed25519:k".into(),
+        };
+        for kind in TokenScope::ALL {
+            let minted = remote_mcp_token::mint_as(kind);
+            fx.tokens
+                .create_token(&RemoteMcpToken {
+                    id: uuid::Uuid::new_v4(),
+                    identity_id: who.id,
+                    label: "boss".into(),
+                    token_hash: minted.hash,
+                    scopes: vec!["desk_boss".into(), "device:d1".into()],
+                    created_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::days(30),
+                    last_used_at: None,
+                    revoked_at: None,
+                    desk_link: Some(link.clone()),
+                })
+                .unwrap();
+            let refused = authenticate(&fx.state, &bearer(&minted.plaintext)).err();
+            let want = match kind {
+                TokenScope::DeskBoss => AuthError::Unauthenticated,
+                TokenScope::RemoteMcp => AuthError::OutOfScope,
+            };
+            assert_eq!(refused, Some(want), "{kind:?}");
+        }
+        assert!(!covers_remote_surface(&[
+            "desk_boss".into(),
+            "device:d1".into()
+        ]));
+        assert!(!covers_remote_surface(&[
+            TOKEN_SCOPE.into(),
+            "desk_boss".into(),
+            "device:d1".into()
+        ]));
     }
 
     #[test]

@@ -236,11 +236,22 @@ async fn write_teams(pool: &PostgresPool, rows: Vec<TeamMigRow>) -> Result<usize
 }
 
 fn read_remote_mcp_tokens(sqlite: &Connection) -> Result<Vec<RemoteMcpToken>> {
-    let mut stmt = sqlite.prepare(
+    // A source an older release wrote has no `desk_link`: every key in it
+    // is a remote MCP key.
+    let has_link = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('remote_mcp_tokens') WHERE name = 'desk_link'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    let mut stmt = sqlite.prepare(&format!(
         "SELECT id, identity_id, label, token_hash, scopes,
-                created_at, expires_at, last_used_at, revoked_at
+                created_at, expires_at, last_used_at, revoked_at{}
          FROM remote_mcp_tokens",
-    )?;
+        if has_link { ", desk_link" } else { "" }
+    ))?;
     let rows = stmt
         .query_map([], parse_remote_mcp_token_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -254,11 +265,12 @@ async fn write_remote_mcp_tokens(pool: &PostgresPool, rows: Vec<RemoteMcpToken>)
     let conn = pool.get().await?;
     for t in &rows {
         let scopes = serde_json::to_value(&t.scopes)?;
+        let desk_link = t.desk_link.as_ref().map(serde_json::to_value).transpose()?;
         conn.execute(
             "INSERT INTO remote_mcp_tokens
              (id, identity_id, label, token_hash, scopes,
-              created_at, expires_at, last_used_at, revoked_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              created_at, expires_at, last_used_at, revoked_at, desk_link)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO NOTHING",
             &[
                 &t.id,
@@ -270,6 +282,7 @@ async fn write_remote_mcp_tokens(pool: &PostgresPool, rows: Vec<RemoteMcpToken>)
                 &t.expires_at,
                 &t.last_used_at,
                 &t.revoked_at,
+                &desk_link,
             ],
         )
         .await
@@ -360,6 +373,7 @@ mod tests {
                 expires_at: Utc::now() + chrono::Duration::days(90),
                 last_used_at: None,
                 revoked_at: None,
+                desk_link: None,
             };
             sqlite.create_token(&token).unwrap();
             let op = crate::lifecycle::contract::op(alice_id, Utc::now());

@@ -124,6 +124,9 @@ pub struct GatewayState {
         Option<Arc<dyn workforce_identity::remote_mcp_token::RemoteMcpTokenStore>>,
     /// `[remote_mcp]` — the hub-as-MCP-server surface and its token policy.
     pub remote_mcp: workforce_common::settings::RemoteMcpConfig,
+    /// `[desk_boss]` — whether a paired Desk may make this hub's agents a
+    /// boss of its person's groups, and the link tokens' limits.
+    pub desk_boss: workforce_common::settings::DeskBossConfig,
     /// Permission cascade evaluator — owns the rule store + LRU cache
     /// and is the single read/write entry point for `/api/permissions/*`
     /// endpoints plus the runner's Always-* persistence path. `None` when
@@ -1060,6 +1063,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
         .route("/api/me/remote-mcp-tokens/desk/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_device_token))
         .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
+        .route("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
+        .route("/api/me/desk-boss-links/{id}", axum::routing::delete(crate::api_handlers::desk_boss_links::revoke))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──

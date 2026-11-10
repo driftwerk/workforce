@@ -935,6 +935,7 @@ mod tests {
                 expires_at: now + chrono::Duration::days(90),
                 last_used_at: None,
                 revoked_at: None,
+                desk_link: None,
             })
             .unwrap();
         PairingRevokeTool::new(f.ctx.clone())

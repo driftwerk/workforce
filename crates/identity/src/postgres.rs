@@ -180,6 +180,9 @@ fn row_to_team(row: &Row) -> Result<Team> {
 
 fn row_to_remote_mcp_token(row: &Row) -> Result<RemoteMcpToken> {
     let scopes_json: serde_json::Value = row.try_get("scopes")?;
+    // Unreadable is no link, which a Desk boss token can't do without, so
+    // it fails closed.
+    let desk_link: Option<serde_json::Value> = row.try_get("desk_link")?;
     Ok(RemoteMcpToken {
         id: row.try_get("id")?,
         identity_id: row.try_get("identity_id")?,
@@ -190,11 +193,13 @@ fn row_to_remote_mcp_token(row: &Row) -> Result<RemoteMcpToken> {
         expires_at: row.try_get("expires_at")?,
         last_used_at: row.try_get("last_used_at")?,
         revoked_at: row.try_get("revoked_at")?,
+        desk_link: desk_link.and_then(|l| serde_json::from_value(l).ok()),
     })
 }
 
 const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, scopes, \
-                                        created_at, expires_at, last_used_at, revoked_at";
+                                        created_at, expires_at, last_used_at, revoked_at, \
+                                        desk_link";
 
 // ─── IdentityStore impl ────────────────────────────────────────────────
 
@@ -512,11 +517,16 @@ impl RemoteMcpTokenStore for PostgresIdentityStore {
         self.block_on(async move {
             let conn = self.pool.get().await?;
             let scopes = serde_json::to_value(&token.scopes)?;
+            let desk_link = token
+                .desk_link
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
             conn.execute(
                 "INSERT INTO remote_mcp_tokens
                  (id, identity_id, label, token_hash, scopes,
-                  created_at, expires_at, last_used_at, revoked_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  created_at, expires_at, last_used_at, revoked_at, desk_link)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &token.id,
                     &token.identity_id,
@@ -527,6 +537,7 @@ impl RemoteMcpTokenStore for PostgresIdentityStore {
                     &token.expires_at,
                     &token.last_used_at,
                     &token.revoked_at,
+                    &desk_link,
                 ],
             )
             .await
@@ -910,6 +921,7 @@ mod tests {
                     expires_at: Utc::now() + chrono::Duration::days(90),
                     last_used_at: None,
                     revoked_at: None,
+                    desk_link: None,
                 })
                 .unwrap();
             let stored: String = conn
@@ -1185,6 +1197,7 @@ mod tests {
                     expires_at: created_at + chrono::Duration::days(90),
                     last_used_at: None,
                     revoked_at: None,
+                    desk_link: None,
                 }
             };
             let older = mk("older", now - chrono::Duration::hours(1));

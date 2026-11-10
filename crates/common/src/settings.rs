@@ -500,6 +500,11 @@ pub struct WorkforceConfig {
     /// the hub as a client plus the session MCP for hub-spawned Claude Code.
     #[serde(default)]
     pub remote_mcp: RemoteMcpConfig,
+    /// `[desk_boss]`: whether a paired Desk may make this hub's agents the
+    /// boss of one of its person's groups, and the link tokens' limits.
+    /// Off by default.
+    #[serde(default)]
+    pub desk_boss: DeskBossConfig,
     /// OAuth pending-redirect state store. Default in-memory works
     /// for restart-stable flows; sqlite persists across restarts so a
     /// UI-initiated MCP install can complete its OAuth callback even
@@ -7698,6 +7703,11 @@ pub struct AgentWorkspaceConfig {
     /// which says what is wrong with it in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversight: Option<toml::Value>,
+    /// Per-agent `[desk_boss]`: whether a paired Desk may make this agent
+    /// the boss of one of its person's groups. Off when absent, so no
+    /// team agent is made anyone's boss without an admin's say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_boss: Option<AgentDeskBossConfig>,
     /// Per-agent `[computer]`: how far this agent reaches on this computer,
     /// read only on a hub with `[desk]`. Kept as written and read by
     /// [`crate::computer_access`], which says what is wrong with it in
@@ -7712,6 +7722,12 @@ pub struct AgentWorkspaceConfig {
 }
 
 impl AgentWorkspaceConfig {
+    /// Whether this agent accepts being a Desk group's boss: its
+    /// `[desk_boss] accept`, off when absent.
+    pub fn accepts_desk_boss(&self) -> bool {
+        self.desk_boss.as_ref().is_some_and(|d| d.accept)
+    }
+
     /// This agent's `[computer]`, Full access asking first where it has
     /// none, or what is wrong with it.
     pub fn computer(&self) -> Result<workforce_core::computer::ComputerAccess, String> {
@@ -8923,6 +8939,61 @@ impl Default for RemoteMcpConfig {
             allow_device_tokens: false,
         }
     }
+}
+
+/// `[desk_boss]` on a hub: a paired Desk making this hub's agents the boss of
+/// one of its person's groups, over link tokens only that Desk mints
+/// (`POST /api/me/desk-boss-links`). Each agent must also accept it in its
+/// own `[desk_boss] accept`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskBossConfig {
+    /// Off by default: the link routes answer 404 and every link is refused.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lifetime of a link token in days, 1–90. Desk renews it before then.
+    #[serde(default = "default_desk_boss_token_ttl_days")]
+    pub token_ttl_days: u32,
+    /// Live links one paired device may hold, at least 1.
+    #[serde(default = "default_desk_boss_max_links_per_device")]
+    pub max_links_per_device: u32,
+}
+
+impl Default for DeskBossConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_ttl_days: default_desk_boss_token_ttl_days(),
+            max_links_per_device: default_desk_boss_max_links_per_device(),
+        }
+    }
+}
+
+impl DeskBossConfig {
+    /// [`Self::token_ttl_days`] held to 1–90.
+    pub fn ttl_days(&self) -> u32 {
+        self.token_ttl_days.clamp(1, 90)
+    }
+
+    /// [`Self::max_links_per_device`], at least 1.
+    pub fn link_cap(&self) -> usize {
+        self.max_links_per_device.max(1) as usize
+    }
+}
+
+fn default_desk_boss_token_ttl_days() -> u32 {
+    30
+}
+
+fn default_desk_boss_max_links_per_device() -> u32 {
+    16
+}
+
+/// An agent's own `[desk_boss]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDeskBossConfig {
+    /// Whether this agent may be a Desk group's boss. Off by default.
+    #[serde(default)]
+    pub accept: bool,
 }
 
 impl RemoteMcpConfig {
