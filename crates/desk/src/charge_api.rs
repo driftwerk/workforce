@@ -125,6 +125,17 @@ async fn wheel(
     }
 }
 
+/// The person is typing in the session's composer: a draft changed, not
+/// sent. It keeps the session theirs as a keystroke in its terminal does;
+/// Desk's window sends it at most every 20 seconds while they type.
+async fn typing(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    match s.desk.person_typing(id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// The person's charge routes.
 pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -133,5 +144,6 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/sessions/{id}/charge",
             post(hand).delete(release).patch(wheel),
         )
+        .route("/api/desk/sessions/{id}/typing", post(typing))
         .with_state(Arc::new(Api { desk, auth }))
 }
