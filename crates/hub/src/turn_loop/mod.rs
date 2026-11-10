@@ -2251,10 +2251,10 @@ fn works_in_text(folders: &[std::path::PathBuf], full: bool) -> Option<String> {
     let first = first.display();
     let start = match full {
         true => format!(
-            "start coding work there: `code.*` with `repo` = `{first}`, `exec.run` workdirs and `desk.start` sessions in `{first}` unless they say otherwise"
+            "start coding work there: `code.*` with `repo` = `{first}` and `desk.start` sessions in `{first}` unless they say otherwise. Commands (`exec.run`) run only at Full access, which you have, and aren't confined to these folders: a command can reach anything you can"
         ),
         false => format!(
-            "read and change files there (`code.*` with `repo` = `{first}`); commands and sessions need Full access, which the person sets"
+            "read and change files there (`code.*` with `repo` = `{first}`). Commands and sessions run only at Full access, which the person sets; you don't have it"
         ),
     };
     Some(format!(

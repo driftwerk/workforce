@@ -2153,13 +2153,18 @@ fn the_folders_it_works_in_are_named_with_the_first_as_where_coding_starts() {
         "{line}"
     );
     assert!(line.contains("deleting there asks"), "{line}");
+    // Commands are never said to be confined there.
+    assert!(line.contains("run only at Full access"), "{line}");
+    assert!(line.contains("aren't confined to these folders"), "{line}");
+    assert!(!line.contains("`exec.run` workdirs"), "{line}");
     // Below Full access it never sends the agent to run what is refused.
     let lower = super::works_in_text(&folders, false).unwrap();
     assert!(
         !lower.contains("exec.run") && !lower.contains("desk.start"),
         "{lower}"
     );
-    assert!(lower.contains("need Full access"), "{lower}");
+    assert!(lower.contains("run only at Full access"), "{lower}");
+}
 
 fn invocation(
     tool: &str,
