@@ -395,3 +395,100 @@ async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_a
     })
     .await;
 }
+
+/// A mode is set between turns: a session waiting on an answer keeps its
+/// request, and Claude Code is never put past auto.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mode_waits_for_the_turn_and_claude_code_is_never_set_to_bypass() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.set_mode").then_some(())
+        })
+        .await;
+        let s = new_session(&d, &base, "acme-web").await;
+        let url = hook_url(&base, s.id).await;
+        let tool = overseer.tools.get("crew.set_mode").unwrap();
+        let set = |mode: &str| json!({"session_id": s.id.to_string(), "mode": mode, "reason": "Routine."});
+        let bypass = tool.execute(set("bypassPermissions")).await.unwrap();
+        assert!(bypass.output["done"].is_null(), "{bypass:?}");
+        let asked = ask(&url, "npm test");
+        let a = pending(&d, s.id, "npm test").await;
+        let held = tool.execute(set("auto")).await.unwrap();
+        assert!(held.output["done"].is_null(), "{held:?}");
+        assert_eq!(d.view(s.id).unwrap().pending.map(|p| p.id), Some(a), "its request stays");
+        overseer
+            .tools
+            .get("crew.deny")
+            .unwrap()
+            .execute(approve(s.id, a))
+            .await
+            .unwrap();
+        asked.await.unwrap();
+    })
+    .await;
+}
+
+/// Act fully anywhere, but not unbound: it ships in a repository nobody
+/// named and runs a workflow nobody listed, and what no overseer does
+/// stays the person's.
+#[tokio::test(flavor = "multi_thread")]
+async fn anywhere_ships_in_any_repository_and_the_hard_limits_still_hold() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let globex = base.join("globex-api");
+        repo(&globex, "git@github.com:globex/globex-api.git");
+        let (overseer, crew, d, _llm) = overseeing(
+            &base,
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"full\"\n[oversight.full]\nanywhere = true\n",
+            &[],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.approve").then_some(())
+        })
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let (_, o) = crew.overseer_service().unwrap();
+        assert!(!crew.unbound(&o));
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let s = new_session(&d, &globex, "globex-api").await;
+        let url = hook_url(&base, s.id).await;
+        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        eventually("Desk to know it acts anywhere", async || {
+            d.acts_fully_in(s.id, "desk").then_some(())
+        })
+        .await;
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        for command in ["gh workflow run cleanup.yml", "gh pr merge 42 --squash"] {
+            let asked = ask(&url, command);
+            let a = pending(&d, s.id, command).await;
+            let done = tool("crew.approve")
+                .execute(approve(s.id, a))
+                .await
+                .unwrap();
+            assert!(done.output["done"].is_string(), "{command}: {done:?}");
+            assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
+        }
+        let asked = ask(&url, "cargo publish");
+        let a = pending(&d, s.id, "cargo publish").await;
+        let held = tool("crew.approve")
+            .execute(approve(s.id, a))
+            .await
+            .unwrap();
+        assert!(held.output["suggested"].is_string(), "{held:?}");
+        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+        assert_eq!(decided(asked.await.unwrap()), "deny");
+    })
+    .await;
+}

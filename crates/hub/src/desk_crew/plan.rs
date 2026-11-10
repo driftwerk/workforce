@@ -414,28 +414,6 @@ impl CrewHub {
             };
             self.post_plan(&b.service, p, &text).await;
         }
-        // Unbound, a change waiting on the person is its own to approve.
-        if !changed.applied && self.unbound_given(&b.service, o) {
-            let by = self.by_at_level(
-                self.by_boss(&b.service, "It approved its own change to the plan."),
-                o,
-            );
-            let approved = self
-                .desk
-                .approve_plan(
-                    changed.plan.summary.plan.id,
-                    changed.plan.summary.plan.revision,
-                    &by,
-                )
-                .await
-                .map_err(plain)?;
-            return Ok(json!({
-                "plan": plan_out(&approved),
-                "change": changed.change.map(|c| c.as_str()),
-                "applied": true,
-                "note": "You are unbound, so it applies now.",
-            }));
-        }
         Ok(json!({
             "plan": plan_out(&changed.plan),
             "change": changed.change.map(|c| c.as_str()),
@@ -600,7 +578,10 @@ impl CrewHub {
         let by = By::manager(
             &boss.id,
             &boss.name,
-            "The person approved the plan; Desk starts its ready tickets.",
+            match self.unbound(&o) {
+                true => "Its plan is approved, and it is unbound: Desk starts its ready tickets.",
+                false => "The person approved the plan; Desk starts its ready tickets.",
+            },
         );
         // Counting and starting are one step, with every other start.
         let _one = self.starting.lock().await;

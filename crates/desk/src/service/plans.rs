@@ -1049,7 +1049,10 @@ impl Desk {
         }
         let kind = change.unwrap_or(Change::Minor);
         let person = by.party.kind == PartyKind::You;
-        let waits = p.approved_revision.is_some() && !person && (asks || kind == Change::Scope);
+        // An unbound boss's change applies as the person's would.
+        let unbound = by.party.kind == PartyKind::Manager && self.full_of(&by.party.id).unbound;
+        let waits =
+            p.approved_revision.is_some() && !person && !unbound && (asks || kind == Change::Scope);
         let n = p.revision + 1;
         self.add_revision(&p, n, by, kind, &summary, &next).await?;
         p.revision = n;

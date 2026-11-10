@@ -534,9 +534,9 @@ impl CrewHub {
              question or an approval, answer or approve it; finished with an obvious next step from \
              its goal, plan or ticket, nudge it on; stuck or errored, resume or restart it; and \
              while the plan's next tickets are free and fewer than {} sessions are working, start \
-             sessions for them (crew.start_session or crew.assign_ticket). Put a session in auto \
-             mode for routine work with crew.set_mode, and back to default when an approval needs \
-             your judgement. Nothing should sit idle. Give a reason each time; the person reads them in Activity.",
+             sessions for them (crew.start_session or crew.assign_ticket). Between turns, set a \
+             session's mode with crew.set_mode: auto before routine work, default before work that \
+             will need your judgement. Nothing should sit idle. Give a reason each time; the person reads them in Activity.",
             o.work.parallel, o.work.parallel
         )
     }

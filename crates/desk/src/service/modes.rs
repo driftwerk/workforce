@@ -69,6 +69,23 @@ impl Desk {
                     .into(),
             ));
         }
+        // Claude Code's bypass needs a session started to allow it, which
+        // Desk never starts: an accept dialog would hold it in no known
+        // mode.
+        if mode == Mode::BypassPermissions && r.engine == Engine::Claude {
+            return Err(DeskError::Invalid(
+                "Desk doesn't start Claude Code sessions able to bypass permissions; auto is the most it sets"
+                    .into(),
+            ));
+        }
+        // Started again mid-turn, its turn and what it asks would be lost.
+        use crate::model::SessionState as S;
+        if view.pending.is_some() || matches!(view.state, S::Working | S::Blocked | S::Asking) {
+            return Err(DeskError::Conflict(
+                "it's working or waiting on an answer: set its mode between turns, once it has finished"
+                    .into(),
+            ));
+        }
         self.boss_holds(id, Some(&by))?;
         self.breaker_refuses_prompt(id, Some(&by))?;
         let mut modes = self.kept_modes().await;
