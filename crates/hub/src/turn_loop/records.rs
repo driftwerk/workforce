@@ -307,7 +307,7 @@ fn advice_of(
         (None, Some(why)) => (why, true),
         (None, None) => (i.error.clone()?, true),
     };
-    let redact = crate::redact::redact_secrets;
+    let redact = crate::redact::hide_secrets;
     // Past the message's room, the question alone.
     let (answer, room) = match room {
         0 => (

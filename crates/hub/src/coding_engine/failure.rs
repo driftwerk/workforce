@@ -56,7 +56,7 @@ const TAIL_LINE_CHARS: usize = 300;
 /// The last lines of `stderr`, secrets hidden first so no cut leaves part
 /// of one a pattern no longer finds.
 fn last_lines(stderr: &str) -> String {
-    let redacted = crate::redact::redact_secrets(stderr);
+    let redacted = crate::redact::hide_secrets(stderr);
     let lines: Vec<&str> = redacted
         .lines()
         .map(str::trim_end)

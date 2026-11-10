@@ -108,9 +108,91 @@ pub fn redact_secrets(text: &str) -> String {
     out
 }
 
+/// `text` with every secret the hub's list or the shared catalogue knows
+/// replaced whole by `[REDACTED <LABEL>]`: nothing of it kept, no prefix,
+/// no suffix, no preview, and a secret marker (`[[secret:…]]`) removed with
+/// its preview. All patterns are matched over the original text and
+/// overlapping matches merged, so a shorter pattern never leaves a longer
+/// secret's tail behind. For text a person reads back later: a step's
+/// advice, a failed CLI's last lines.
+pub fn hide_secrets(text: &str) -> String {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    let marker = MARKER.get_or_init(|| Regex::new(r"\[\[secret:[^\]]*\]\]").expect("marker regex"));
+    let mut found: Vec<(usize, usize, &'static str)> = marker
+        .find_iter(text)
+        .map(|m| (m.start(), m.end(), "SECRET"))
+        .collect();
+    for (label, regex) in labelled_patterns().chain(workforce_common::redact::labelled_patterns()) {
+        for m in regex.find_iter(text) {
+            if !workforce_common::redact::is_public(m.as_str()) {
+                found.push((m.start(), m.end(), label));
+            }
+        }
+    }
+    if found.is_empty() {
+        return text.to_string();
+    }
+    // By start; at one start, the earlier pattern's label wins.
+    found.sort_by_key(|(start, _, _)| *start);
+    let mut merged: Vec<(usize, usize, &'static str)> = Vec::new();
+    for (start, end, label) in found {
+        match merged.last_mut() {
+            Some((_, last_end, _)) if start < *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end, label)),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end, label) in merged {
+        out.push_str(&text[at..start]);
+        out.push_str(&format!("[REDACTED {label}]"));
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_secrets_keep_nothing_of_themselves() {
+        let jwt = concat!(
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9",
+            ".dGhpcyBpcyBub3QganNvbiBidXQgYSBwYXlsb2Fk",
+            ".c2lnbmF0dXJlLWJ5dGVzLWhlcmUtMTIzNDU2"
+        );
+        let code = "4/0AVG7fiQ1example_Authorization-Code_value";
+        let key = format!("sk-proj-{}", "Ab12Cd34".repeat(4));
+        let marker = "[[secret:ab12:sk-pr...wXyZ]]";
+        let text = format!(
+            "jwt {jwt}\nredirect https://app.test/cb?code={code}&state=xyz\nkey {key} {marker} exit code=1"
+        );
+        let hidden = hide_secrets(&text);
+        for secret in [
+            jwt,
+            code,
+            key.as_str(),
+            "sk-pr...wXyZ",
+            "Ab12Cd34",
+            "4/0AVG",
+        ] {
+            assert!(!hidden.contains(secret), "{secret} in {hidden}");
+        }
+        assert!(hidden.contains("jwt [REDACTED JWT]"), "{hidden}");
+        assert!(
+            hidden.contains("cb?[REDACTED OAUTH_CODE]&state=xyz"),
+            "{hidden}"
+        );
+        assert!(hidden.contains("[REDACTED OPENAI_PROJECT_KEY]"), "{hidden}");
+        assert!(hidden.contains("[REDACTED SECRET]"), "{hidden}");
+        assert!(
+            hidden.ends_with("exit code=1"),
+            "a short code is no secret: {hidden}"
+        );
+        assert_eq!(hide_secrets("nothing here"), "nothing here");
+    }
 
     #[test]
     fn redacts_github_classic_pat() {
