@@ -451,8 +451,38 @@ fn one(words: &[String], at: &Where<'_>, depth: usize) -> Option<Never> {
         return Some(Never::Secrets);
     }
 
-    // Registries.
+    // Registries, and the release tools that publish to them.
     let publishes = |w: &&str| w.to_lowercase().contains("publish");
+    let releaser = |p: &str, rest: &[&str]| match p {
+        "release-it" | "np" | "goreleaser" | "jreleaser" | "semantic-release" => true,
+        "vsce" | "ovsx" => rest.first() == Some(&"publish"),
+        "nx" => rest.first() == Some(&"release"),
+        "changeset" | "changesets" => rest.first() == Some(&"publish"),
+        "lerna" => rest.first() == Some(&"publish"),
+        _ => false,
+    };
+    if releaser(prog, &subs) {
+        return Some(Never::Registry);
+    }
+    // Run through a package runner: `npx release-it`, `pnpm dlx np`.
+    let runner = match (prog, subs.first()) {
+        ("npx" | "pnpx" | "bunx", _) => Some(&subs[..]),
+        ("pnpm" | "yarn" | "bun", Some(&("dlx" | "exec" | "x"))) => Some(&subs[1..]),
+        ("npm", Some(&("exec" | "x"))) => Some(&subs[1..]),
+        _ => None,
+    };
+    if let Some([tool, rest @ ..]) = runner {
+        if releaser(program(tool), rest) {
+            return Some(Never::Registry);
+        }
+    }
+    if prog == "cargo"
+        && (sub == Some("release")
+            || subs.starts_with(&["workspaces", "publish"])
+            || subs.starts_with(&["ws", "publish"]))
+    {
+        return Some(Never::Registry);
+    }
     match prog {
         "cargo" if matches!(sub, Some("publish" | "yank" | "owner")) => {
             return Some(Never::Registry)
@@ -809,17 +839,6 @@ const PROGRAMS: &[&str] = &[
     "lerna",
     "changeset",
 ];
-
-/// The commands of `command`, each from its program on (assignments and
-/// wrappers such as `sudo` and `env A=b` skipped), quotes taken off: what
-/// a script's line runs, for following the scripts it calls.
-pub(crate) fn programs(command: &str) -> Vec<Vec<String>> {
-    commands(command)
-        .iter()
-        .map(|w| from_program(w).to_vec())
-        .filter(|w| !w.is_empty())
-        .collect()
-}
 
 /// The hard limit `command`, a shell command a session asks to run, runs
 /// into; `None` when it runs into none of them (which doesn't make it safe:
@@ -1256,6 +1275,21 @@ mod tests {
             "make publish",
             "./scripts/publish.sh",
             "cd crates/core && cargo publish",
+            "cargo release patch --execute",
+            "cargo workspaces publish --yes",
+            "release-it --ci",
+            "npx release-it",
+            "np patch",
+            "pnpm dlx np",
+            "goreleaser release --clean",
+            "jreleaser full-release",
+            "vsce publish",
+            "ovsx publish -p x",
+            "npx nx release",
+            "nx release --skip-publish=false",
+            "changeset publish",
+            "semantic-release",
+            "lerna publish from-git",
         ] {
             assert_eq!(run(c), Some(Never::Registry), "{c}");
         }

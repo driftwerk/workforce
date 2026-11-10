@@ -331,9 +331,19 @@ impl Desk {
                 let named = self.full_repos(boss);
                 if let Some(repo) = repo_of_own(&facts.own) {
                     facts.follow_tags = repo.follow_tags;
+                    facts.hooks = repo.hooks;
                     facts.ships = !named.is_empty() && repo.named(&named, &bounds.home);
+                    // gh acts on what its remotes and `set-default` say, or
+                    // on GH_REPO and GH_HOST in the environment sessions
+                    // start with (Desk's own); set in a command, the
+                    // allowlist refuses them.
+                    let gh_env = ["GH_REPO", "GH_HOST"]
+                        .iter()
+                        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
                     facts.ships_gh = facts.ships
-                        && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes);
+                        && !gh_env
+                        && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes)
+                        && charge::gh_resolved_named(repo.origin.as_deref(), &repo.gh_resolved);
                 }
             }
         }
@@ -342,6 +352,7 @@ impl Desk {
         let reader = crate::computer::scripts::Reader {
             top: crate::computer::boss::resolve_real(&facts.own).unwrap_or_default(),
             default_branch: facts.default_branch.clone(),
+            home: bounds.home.clone(),
         };
         let scripts = |s: &crate::computer::boss::Script| match facts.ships {
             true => reader.read(s),
@@ -869,6 +880,11 @@ struct OwnRepo {
     remotes: Vec<String>,
     /// It says `push.followTags`.
     follow_tags: bool,
+    /// What `gh repo set-default` wrote: each `remote.*.gh-resolved`.
+    gh_resolved: Vec<String>,
+    /// It has git hooks: a file in its hooks folder (`core.hooksPath`'s,
+    /// when set) that isn't one of git's samples.
+    hooks: bool,
 }
 
 impl OwnRepo {
@@ -932,7 +948,35 @@ fn repo_of_own(own: &std::path::Path) -> Option<OwnRepo> {
         remotes,
         follow_tags: git_line(own, &["config", "--bool", "--get", "push.followTags"])
             .is_some_and(|v| v == "true"),
+        gh_resolved: git_lines(
+            own,
+            &["config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
+        )
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .collect(),
+        hooks: has_hooks(own),
     })
+}
+
+/// Whether the repository at `own` has git hooks: anything in the folder
+/// git runs them from that isn't one of its samples. One it can't read
+/// counts as having them.
+fn has_hooks(own: &std::path::Path) -> bool {
+    let Some(dir) = git_line(
+        own,
+        &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    ) else {
+        return true;
+    };
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.flatten().any(|e| {
+            !e.file_name().to_string_lossy().ends_with(".sample")
+                && e.file_type().is_ok_and(|t| !t.is_dir())
+        }),
+        // No hooks folder: none.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Every line git prints in `dir`; none when it can't say.

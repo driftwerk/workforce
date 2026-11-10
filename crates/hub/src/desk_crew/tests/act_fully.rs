@@ -34,7 +34,7 @@ fn repo(dir: &Path, origin: &str) {
     git(dir, &["init", "-q", "-b", "feat/x"]);
     std::fs::write(
         dir.join("package.json"),
-        r#"{"scripts": {"deploy": "vite build && wrangler deploy", "release": "npm publish"}}"#,
+        r#"{"scripts": {"deploy": "tsc -p . && wrangler deploy", "release": "npm publish"}}"#,
     )
     .unwrap();
     git(dir, &["add", "package.json"]);
@@ -220,6 +220,25 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         asked.await.unwrap();
         git(&acme, &["config", "--unset", "push.followTags"]);
         git(&acme, &["remote", "remove", "upstream"]);
+        // `gh repo set-default` pointed at the parent, origin alone: gh
+        // would merge there. The person's.
+        git(&acme, &["config", "remote.origin.gh-resolved", "globex/acme-web"]);
+        let asked = ask(&url, "gh pr merge 45 --squash");
+        let a = pending(s.id, "gh pr merge 45 --squash").await;
+        let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
+        assert!(held.output["note"].as_str().unwrap().contains("another repository"), "{held:?}");
+        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+        asked.await.unwrap();
+        git(&acme, &["config", "--unset", "remote.origin.gh-resolved"]);
+        // A git hook in the repository runs as it pushes: the person's.
+        std::fs::write(acme.join(".git/hooks/pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+        let asked = ask(&url, "git push origin HEAD:main");
+        let a = pending(s.id, "git push origin HEAD:main").await;
+        let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
+        assert!(held.output["note"].as_str().unwrap().contains("git hooks"), "{held:?}");
+        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
+        asked.await.unwrap();
+        std::fs::remove_file(acme.join(".git/hooks/pre-push")).unwrap();
 
         // A repository not named: shipping is a suggestion.
         let g = new_session(&d, &globex, "globex-api").await;

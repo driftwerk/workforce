@@ -198,9 +198,32 @@ pub fn shell_lines(body: &str) -> Read {
 
 /// Reads scripts in the repository at `top`, only as `origin`'s
 /// `default_branch` has them, unchanged.
+///
+/// That is a speed bump, not a guard: it stops a session editing a script
+/// and then asking to run it, but the default branch is whatever was
+/// pushed to it. What a script runs is still judged line by line.
 pub struct Reader {
     pub top: PathBuf,
     pub default_branch: Option<String>,
+    /// The person's home: their own `.npmrc` counts too.
+    pub home: PathBuf,
+}
+
+/// Whether npm or yarn settings `body` choose the shell scripts run in
+/// (`script-shell`, yarn's `scriptShell`): then a script isn't run as
+/// Desk read it.
+pub fn sets_script_shell(body: &str) -> bool {
+    body.lines().any(|l| {
+        let k = l
+            .trim()
+            .split(['=', ':', ' '])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        matches!(k.as_str(), "script-shell" | "scriptshell" | "script_shell")
+    })
 }
 
 impl Reader {
@@ -243,6 +266,19 @@ impl Reader {
     pub fn read(&self, script: &Script) -> Read {
         match script {
             Script::Package { dir, name } => {
+                for rc in [".npmrc", ".yarnrc", ".yarnrc.yml"] {
+                    for at in [dir.as_path(), self.top.as_path(), self.home.as_path()] {
+                        if std::fs::read_to_string(at.join(rc)).is_ok_and(|b| sets_script_shell(&b))
+                        {
+                            return Err(format!(
+                                "its {rc} chooses the shell scripts run in; that's the person's to allow"
+                            ));
+                        }
+                    }
+                }
+                if std::env::var_os("npm_config_script_shell").is_some() {
+                    return Err("npm is set to run scripts in another shell".into());
+                }
                 let body = self.unchanged(&dir.join("package.json"))?;
                 package_scripts(&body, name.as_deref())
             }
@@ -297,9 +333,11 @@ mod tests {
         git(&top, &["add", "."]);
         git(&top, &["commit", "-q", "-m", "Scripts"]);
         git(&top, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let home = tempfile::tempdir().unwrap();
         let reader = Reader {
             top: top.clone(),
             default_branch: Some("main".into()),
+            home: home.path().to_path_buf(),
         };
         let deploy = Script::Package {
             dir: top.clone(),
@@ -343,6 +381,7 @@ mod tests {
         let blind = Reader {
             top: top.clone(),
             default_branch: None,
+            home: home.path().to_path_buf(),
         };
         assert!(blind.read(&release).is_err());
         // Outside the repository.
@@ -352,6 +391,20 @@ mod tests {
             path: outside.path().join("x.sh"),
         };
         assert!(reader.read(&elsewhere).is_err());
+
+        // A project's or the person's npm settings choosing the shell:
+        // the person's.
+        git(&top, &["checkout", "-q", "--", "package.json"]);
+        git(&top, &["reset", "-q", "--hard", "origin/main"]);
+        assert!(reader.read(&deploy).is_ok());
+        std::fs::write(home.path().join(".npmrc"), "script-shell=/tmp/sh\n").unwrap();
+        assert!(reader.read(&deploy).unwrap_err().contains(".npmrc"));
+        std::fs::remove_file(home.path().join(".npmrc")).unwrap();
+        std::fs::write(top.join(".yarnrc.yml"), "scriptShell: /tmp/sh\n").unwrap();
+        assert!(reader.read(&deploy).unwrap_err().contains(".yarnrc.yml"));
+        assert!(!sets_script_shell(
+            "registry=https://registry.example.com/\n"
+        ));
     }
 
     #[test]

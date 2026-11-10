@@ -344,6 +344,26 @@ pub fn remotes_one_repo(origin: Option<&str>, remotes: &[String]) -> bool {
             .all(|r| repo_name(r).is_some_and(|r| same_repo(&r, &origin)))
 }
 
+/// Whether what `gh repo set-default` wrote (`remote.<name>.gh-resolved`:
+/// `base`, that remote, or an `owner/name`) is the repository at `origin`:
+/// each value `base` (its remote is checked with the rest) or that one.
+pub fn gh_resolved_named(origin: Option<&str>, resolved: &[String]) -> bool {
+    let Some(origin) = origin.and_then(repo_name) else {
+        return false;
+    };
+    resolved.iter().all(|v| {
+        v == "base"
+            || repo_name(v).is_some_and(|r| {
+                // `owner/name` alone is on origin's host.
+                let r = RepoName {
+                    host: r.host.or_else(|| origin.host.clone()),
+                    path: r.path,
+                };
+                same_repo(&r, &origin)
+            })
+    })
+}
+
 // ── What a boss answers for ─────────────────────────────────────────────
 
 /// Where a boss's answers for its sessions are judged: the person's home,
@@ -403,6 +423,8 @@ pub struct Facts {
     pub ships_gh: bool,
     /// The repository says `push.followTags`.
     pub follow_tags: bool,
+    /// The repository has git hooks.
+    pub hooks: bool,
     pub what: What,
 }
 
@@ -504,6 +526,7 @@ pub fn facts_of(
         ships: false,
         ships_gh: false,
         follow_tags: false,
+        hooks: false,
         what,
     }
 }
@@ -615,6 +638,7 @@ pub fn answerable(
                 ships: facts.ships,
                 ships_gh: facts.ships_gh,
                 follow_tags: facts.follow_tags,
+                hooks: facts.hooks,
                 scripts,
             };
             boss::judge(command, &here).map_err(Irreversible)
@@ -956,6 +980,15 @@ mod tests {
             ])
         ));
         assert!(!remotes_one_repo(fork, &[]));
+        // `gh repo set-default` pointed at the parent: not the one named.
+        assert!(gh_resolved_named(fork, &urls(&["base"])));
+        assert!(gh_resolved_named(fork, &urls(&["acme/acme-web"])));
+        assert!(gh_resolved_named(fork, &[]));
+        assert!(!gh_resolved_named(fork, &urls(&["globex/acme-web"])));
+        assert!(!gh_resolved_named(
+            fork,
+            &urls(&["base", "globex/acme-web"])
+        ));
         assert!(!remotes_one_repo(
             None,
             &urls(&["git@github.com:acme/acme-web.git"])
