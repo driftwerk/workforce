@@ -2133,6 +2133,39 @@ async fn completions(server: &wiremock::MockServer) -> usize {
         .count()
 }
 
+#[test]
+fn the_folders_it_works_in_are_named_with_the_first_as_where_coding_starts() {
+    assert_eq!(super::works_in_text(&[], true), None);
+    let folders = [
+        std::path::PathBuf::from("/Users/sarah/dev/acme-web"),
+        std::path::PathBuf::from("/Users/sarah/dev/acme-api"),
+    ];
+    let line = super::works_in_text(&folders, true).unwrap();
+    assert!(
+        line.starts_with("- Works in: `/Users/sarah/dev/acme-web`, `/Users/sarah/dev/acme-api`")
+    );
+    assert!(
+        line.contains("`desk.start` sessions in `/Users/sarah/dev/acme-web`"),
+        "{line}"
+    );
+    assert!(
+        line.contains("`repo` = `/Users/sarah/dev/acme-web`"),
+        "{line}"
+    );
+    assert!(line.contains("deleting there asks"), "{line}");
+    // Commands are never said to be confined there.
+    assert!(line.contains("run only at Full access"), "{line}");
+    assert!(line.contains("aren't confined to these folders"), "{line}");
+    assert!(!line.contains("`exec.run` workdirs"), "{line}");
+    // Below Full access it never sends the agent to run what is refused.
+    let lower = super::works_in_text(&folders, false).unwrap();
+    assert!(
+        !lower.contains("exec.run") && !lower.contains("desk.start"),
+        "{lower}"
+    );
+    assert!(lower.contains("run only at Full access"), "{lower}");
+}
+
 fn invocation(
     tool: &str,
     input: serde_json::Value,
