@@ -157,34 +157,70 @@ pub fn works_in(value: Option<&Value>) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
+/// Under home, what no folder an agent works in may be, sit in or hold,
+/// beside the secret and start-file folders a boss never touches: the rest
+/// of the person's own configuration, and the engines' sign-ins.
+const KEPT_IN_HOME: &[&str] = &[
+    ".config",
+    ".claude",
+    ".claude.json",
+    ".local/share/keyrings",
+];
+
 /// Why the agent may not work in `folder` on a machine whose home is `home`
-/// and that keeps `withheld` (Desk's data, the keychains) from every agent:
-/// `/`, a volume, home or above it, inside what is withheld, or holding it.
-/// Checked as written and with its links followed. `None` when it may.
+/// and that keeps `withheld` (Desk's data, the keychains) from every agent;
+/// `None` when it may. It must be inside home, and not home itself; never a
+/// secret or start-file folder (`~/.ssh`, `~/.aws`, `~/.config`, shell rc
+/// files, `~/Library/LaunchAgents`, …) nor inside or holding one; never
+/// inside or holding what is withheld. Checked as written and with its links
+/// followed, names compared as a case-insensitive disk (APFS) compares them.
 pub fn works_in_refusal(folder: &Path, home: &Path, withheld: &[PathBuf]) -> Option<String> {
+    use workforce_core::home_secrets::{fold, SECRET_DIRS, START_FILES};
     let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
     let home_real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let shown = folder.display();
-    for path in [folder, real.as_path()] {
-        let depth = path
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_)))
-            .count();
-        let volume = path.starts_with("/Volumes") && depth <= 2;
-        if depth == 0 || volume || home.starts_with(path) || home_real.starts_with(path) {
+    let homes = [fold(home), fold(&home_real)];
+    let kept: Vec<PathBuf> = SECRET_DIRS
+        .iter()
+        .chain(START_FILES)
+        .chain(KEPT_IN_HOME)
+        .map(|k| fold(Path::new(k)))
+        .collect();
+    let withheld: Vec<PathBuf> = withheld
+        .iter()
+        .flat_map(|w| {
+            [
+                fold(w),
+                fold(&std::fs::canonicalize(w).unwrap_or_else(|_| w.clone())),
+            ]
+        })
+        .collect();
+    for path in [fold(folder), fold(&real)] {
+        // Inside home, below it.
+        let Some(rest) = homes.iter().find_map(|h| {
+            path.strip_prefix(h)
+                .ok()
+                .filter(|rest| !rest.as_os_str().is_empty())
+        }) else {
             return Some(format!(
-                "{shown} is too wide to work in: choose a folder inside your home, not your home itself or above it."
+                "{shown} isn't inside your home folder: choose a folder inside it, not your home itself or anything outside it."
+            ));
+        };
+        if kept
+            .iter()
+            .any(|k| rest.starts_with(k) || k.starts_with(rest))
+        {
+            return Some(format!(
+                "{shown} is or holds where your keys, sign-ins or shell settings are kept, which no agent works in."
             ));
         }
-        for kept in withheld {
-            let kept_real = std::fs::canonicalize(kept).unwrap_or_else(|_| kept.clone());
-            for k in [kept.as_path(), kept_real.as_path()] {
-                if path.starts_with(k) || k.starts_with(path) {
-                    return Some(format!(
-                        "{shown} holds Desk's own data or your keychains, which no agent works in."
-                    ));
-                }
-            }
+        if withheld
+            .iter()
+            .any(|k| path.starts_with(k) || k.starts_with(&path))
+        {
+            return Some(format!(
+                "{shown} holds Desk's own data or your keychains, which no agent works in."
+            ));
         }
     }
     None
@@ -376,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn works_in_is_never_home_or_above_or_what_desk_keeps() {
+    fn works_in_is_inside_home_and_never_what_desk_or_the_person_keeps() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("sarah");
         let data = home.join("Library/Application Support/Desk/hub/data");
@@ -385,19 +421,57 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let withheld = withheld_on(&data, &home);
         assert!(works_in_refusal(&repo, &home, &withheld).is_none());
+        assert!(works_in_refusal(&home.join("Dev/Acme"), &home, &withheld).is_none());
+        // Home itself, above it, and anywhere outside it.
         for wide in [
             PathBuf::from("/"),
             home.clone(),
             tmp.path().to_path_buf(),
             PathBuf::from("/Volumes/Backup"),
+            PathBuf::from("/srv/repo"),
+            PathBuf::from("/tmp/acme"),
         ] {
             let e = works_in_refusal(&wide, &home, &withheld).expect("refused");
-            assert!(e.contains("too wide"), "{} → {e}", wide.display());
+            assert!(
+                e.contains("isn't inside your home"),
+                "{} → {e}",
+                wide.display()
+            );
         }
+        // The secret and start-file folders, inside them, holding them, in
+        // any case.
+        for kept in [
+            ".ssh",
+            ".ssh/keys",
+            ".SSH",
+            ".aws",
+            ".Aws/sso/cache",
+            ".config",
+            ".config/gh",
+            ".Config/anything",
+            ".gnupg",
+            ".kube",
+            ".docker",
+            ".zshrc",
+            ".bashrc",
+            ".gitconfig",
+            ".claude",
+            ".cargo",
+            "Library",
+            "Library/LaunchAgents",
+        ] {
+            let e = works_in_refusal(&home.join(kept), &home, &withheld)
+                .unwrap_or_else(|| panic!("{kept} admitted"));
+            assert!(
+                e.contains("keys, sign-ins or shell settings") || e.contains("Desk's own data"),
+                "{kept} → {e}"
+            );
+        }
+        // What Desk withholds, and what holds it.
         for kept in [
             home.join("Library/Application Support/Desk/hub/data/agents/ben"),
             home.join("Library/Application Support"),
-            home.join("Library/Keychains"),
+            home.join("library/application support/desk"),
         ] {
             let e = works_in_refusal(&kept, &home, &withheld).expect("refused");
             assert!(e.contains("Desk's own data"), "{} → {e}", kept.display());
@@ -408,6 +482,11 @@ mod tests {
             let link = home.join("dev/sneaky");
             std::os::unix::fs::symlink(&data, &link).unwrap();
             assert!(works_in_refusal(&link, &home, &withheld).is_some());
+            let ssh = home.join(".ssh");
+            std::fs::create_dir_all(&ssh).unwrap();
+            let to_ssh = home.join("dev/keys");
+            std::os::unix::fs::symlink(&ssh, &to_ssh).unwrap();
+            assert!(works_in_refusal(&to_ssh, &home, &withheld).is_some());
         }
     }
 }

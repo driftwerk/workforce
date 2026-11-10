@@ -296,7 +296,10 @@ mod tests {
             let e = admission
                 .review_toml(&format!("[computer]\nworks_in = [\"{wide}\"]\n"))
                 .unwrap_err();
-            assert!(e.to_string().contains("too wide"), "{wide} → {e}");
+            assert!(
+                e.to_string().contains("isn't inside your home"),
+                "{wide} → {e}"
+            );
         }
         let desk = data.path().join("Desk/hub/data/agents/ben");
         let e = admission
@@ -305,7 +308,16 @@ mod tests {
                 desk.display()
             ))
             .unwrap_err();
-        assert!(e.to_string().contains("Desk's own data"), "{e}");
+        // Outside home here; inside it, what Desk keeps is refused too
+        // (`computer_access`'s own tests).
+        assert!(
+            e.to_string().contains("Desk's own data") || e.to_string().contains("inside your home"),
+            "{e}"
+        );
+        let e = admission
+            .review_toml(&format!("[computer]\nworks_in = [\"{home}/.ssh\"]\n"))
+            .unwrap_err();
+        assert!(e.to_string().contains("keys, sign-ins"), "{e}");
         let e = admission
             .review_toml("[computer]\nworks_in = [\"dev/acme\"]\n")
             .unwrap_err();

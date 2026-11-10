@@ -207,7 +207,16 @@ impl HubComputerGate {
         config: &WorkforceConfig,
         subject: &ComputerSubject,
     ) -> Self {
-        let home = home();
+        Self::for_agent_at(computer, config, subject, home())
+    }
+
+    /// [`Self::for_agent`] on a machine whose home is `home`.
+    fn for_agent_at(
+        computer: Computer,
+        config: &WorkforceConfig,
+        subject: &ComputerSubject,
+        home: PathBuf,
+    ) -> Self {
         let own = crate::serve::tool_roots(config, &subject.workspace)
             .iter()
             .map(|root| workforce_agent::tools::paths::resolve_real(root))
@@ -1181,10 +1190,13 @@ mod tests {
                 ben.parent().unwrap().display()
             );
             std::fs::write(hub.subject.workspace.join("config.toml"), config).unwrap();
-            let gate = HubComputerGate::for_agent(
+            // The test's folders are in its own home.
+            let home = workforce_agent::tools::paths::resolve_real(desk.parent().unwrap());
+            let gate = HubComputerGate::for_agent_at(
                 Computer::new(Arc::clone(&store)),
                 &hub.config,
                 &hub.subject,
+                home,
             );
             assert_eq!(
                 gate.policy.works_in,

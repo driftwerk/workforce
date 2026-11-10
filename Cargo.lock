@@ -11905,6 +11905,7 @@ dependencies = [
  "strum_macros 0.26.4",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 
