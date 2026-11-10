@@ -112,6 +112,17 @@ fn vault_beats_env(kind: ProviderKind) -> bool {
     )
 }
 
+/// Whether a vault account for `kind` is a Bedrock account on an AWS CLI
+/// profile: the one the person chose, which beats keys the hub's environment
+/// happens to hold.
+fn names_a_profile(kind: ProviderKind, extras: &AccountExtras) -> bool {
+    kind == ProviderKind::Bedrock
+        && extras
+            .profile
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+}
+
 /// Where a metered provider's credential comes from, in the order
 /// [`AgentProviders::metered_key`] looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -193,9 +204,17 @@ impl AgentProviders {
             }
         };
         let env = || env.as_ref().map(|_| KeySource::Env);
+        // As [`Self::metered_account_with`] looks: a Bedrock account on an
+        // AWS CLI profile before the environment.
+        let chosen_profile = || {
+            vault().filter(|_| {
+                self.metered_account_with(kind, None)
+                    .is_some_and(|(_, extras)| names_a_profile(kind, &extras))
+            })
+        };
         match vault_beats_env(kind) {
             true => vault().or_else(env),
-            false => env().or_else(vault),
+            false => chosen_profile().or_else(env).or_else(vault),
         }
         .or_else(|| provider_env_key(kind).map(|_| KeySource::Env))
         .or_else(|| chain_credential_fallback(kind).map(|_| KeySource::ProviderChain))
@@ -232,9 +251,12 @@ impl AgentProviders {
             let extras = serde_json::from_value(record).unwrap_or_default();
             Some((key, extras))
         };
+        // A Bedrock account on an AWS CLI profile is the one the person
+        // chose: it beats keys the hub's environment happens to hold.
+        let chosen_profile = || vault().filter(|(_, extras)| names_a_profile(kind, extras));
         match vault_beats_env(kind) {
             true => vault().or_else(env),
-            false => env().or_else(vault),
+            false => chosen_profile().or_else(env).or_else(vault),
         }
         .or_else(|| provider_env_key(kind).map(|key| (key, AccountExtras::default())))
         .or_else(|| chain_credential_fallback(kind).map(|key| (key, AccountExtras::default())))
@@ -503,6 +525,55 @@ mod tests {
                 .0,
             "env-key",
             "a key provider's environment still comes first"
+        );
+    }
+
+    #[test]
+    fn a_bedrock_profile_account_beats_the_environments_keys_and_a_keyed_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(&dir.path().join("global.enc"), "test-key").unwrap());
+        let providers = AgentProviders::new(
+            None,
+            Some(Arc::clone(&vault)),
+            system_plans(&WorkforceConfig::default(), &vault),
+        );
+        let env = || Some("ENV_AKID".to_string());
+        vault
+            .set(
+                "llm/accounts/bedrock",
+                &serde_json::json!({
+                    "provider": "bedrock", "api_key": "AKID:SECRET", "region": "eu-west-2",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            providers
+                .metered_account_with(ProviderKind::Bedrock, env())
+                .unwrap()
+                .0,
+            "ENV_AKID",
+            "keys in the vault still come after the environment's, as before"
+        );
+        vault
+            .set(
+                "llm/accounts/bedrock",
+                &serde_json::json!({
+                    "provider": "bedrock", "api_key": "none", "region": "eu-west-2",
+                    "profile": "work-sso",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let (key, extras) = providers
+            .metered_account_with(ProviderKind::Bedrock, env())
+            .unwrap();
+        assert_eq!(key, "none");
+        assert_eq!(extras.profile.as_deref(), Some("work-sso"));
+        assert_eq!(extras.region.as_deref(), Some("eu-west-2"));
+        assert_eq!(
+            providers.metered_key_source_with(ProviderKind::Bedrock, env()),
+            Some(KeySource::GlobalVault)
         );
     }
 

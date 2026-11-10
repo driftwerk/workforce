@@ -96,6 +96,11 @@ pub enum AgentReadDenial {
     /// sync calls that hub with as the person. Only the sync reads it, never
     /// an agent, the overseer included.
     DeskLink,
+    /// The path is a model account (`llm/accounts/...`, shared or per-user):
+    /// which key or AWS profile pays for the agent's thinking. The person
+    /// sets it, in Desk or with the account tools; an agent never reads or
+    /// writes it through the vault tools.
+    LlmAccount,
     /// No `CURRENT_USER_ID` is in scope but the path is per-user. System
     /// jobs must opt into a synthetic identity via
     /// `workforce_agent::runner::with_system_identity` rather than read
@@ -145,6 +150,12 @@ impl std::fmt::Display for AgentReadDenial {
                 f,
                 "vault path holds a Desk link to another hub and is not \
                  accessible from the agent vault tool"
+            ),
+            AgentReadDenial::LlmAccount => write!(
+                f,
+                "vault path holds a model account, which says what pays for the \
+                 agent's thinking, and is the person's to set, in Desk or with \
+                 system.add_account; it is not read or written from the agent vault tool"
             ),
             AgentReadDenial::NoUserIdentity => write!(
                 f,
@@ -202,6 +213,9 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
     if is_desk_link(path) {
         return Err(AgentReadDenial::DeskLink);
     }
+    if is_llm_account(path) {
+        return Err(AgentReadDenial::LlmAccount);
+    }
     if let Some(rest) = path.strip_prefix("users/") {
         let uid = rest.split('/').next().unwrap_or("");
         if uid.is_empty() {
@@ -221,6 +235,22 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
 }
 
 pub use workforce_common::vault_scope::{is_desk_link, DESK_LINK_PREFIXES};
+
+/// Whether `path` is a model account, `llm/accounts/...` shared or under
+/// `users/{uid}/`, however its case or slashes are spelled.
+pub fn is_llm_account(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let logical = match segments.first().map(String::as_str) {
+        Some("users") => segments.get(2..).unwrap_or_default(),
+        _ => &segments[..],
+    };
+    logical.first().map(String::as_str) == Some("llm")
+        && logical.get(1).map(String::as_str) == Some("accounts")
+}
 
 /// [`agent_can_read`] for a tool that hands the value back: never a
 /// subscription login's, whatever the redaction policy, since its token is
@@ -255,6 +285,31 @@ mod tests {
 
     /// Desk's links to other hubs are no agent's to read, list, write or
     /// move, shared or per-user, under any identity, `system` included.
+    /// Which key or AWS profile pays is the person's: no agent reads,
+    /// lists, writes or moves a model account through the vault tools.
+    #[test]
+    fn a_model_account_is_refused_to_every_agent() {
+        for path in [
+            "llm/accounts/bedrock",
+            "llm/accounts/",
+            "llm/accounts",
+            "LLM/Accounts/bedrock",
+            "llm//accounts/anthropic",
+            "users/sam/llm/accounts/bedrock",
+        ] {
+            for who in [Some("sam"), Some("system"), None, Some("bob")] {
+                assert_eq!(
+                    agent_can_read(path, who),
+                    Err(AgentReadDenial::LlmAccount),
+                    "{path} as {who:?}"
+                );
+            }
+        }
+        for path in ["llm/accountsx", "llm/notes", "skills/llm/accounts"] {
+            assert!(!is_llm_account(path), "{path}");
+        }
+    }
+
     #[test]
     fn a_desk_link_is_refused_to_every_agent() {
         for path in [

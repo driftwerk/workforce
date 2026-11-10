@@ -3,6 +3,7 @@ pub mod budget;
 pub mod code_citation;
 pub mod computer;
 pub mod desk;
+pub mod home_secrets;
 pub mod message;
 pub mod participant;
 pub mod policy;

@@ -125,6 +125,12 @@ pub struct AgentPolicy {
     pub access: ComputerAccess,
     /// Its workspace and project work trees, canonical.
     pub own: Vec<PathBuf>,
+    /// The folders the person gave it to work in (`[computer] works_in`),
+    /// canonical: inside its folder for reading and changing at every level,
+    /// and for commands and sessions where its level runs them; a delete or
+    /// a command that can't be undone there still asks, and nothing Desk
+    /// withholds is carved out for them.
+    pub works_in: Vec<PathBuf>,
     /// What no agent reaches at any level: Desk's data (other agents'
     /// folders and their config files with it), the keychains. The own
     /// folder is carved out of it: it may lie inside Desk's data.
@@ -185,8 +191,9 @@ enum Change<'a> {
     Unnamed,
 }
 
-/// What a write or a move's destination replaces outside the own folder
-/// and scratch: files there already. `None` when it replaces none.
+/// What a write or a move's destination replaces outside the own folder,
+/// the folders it works in and scratch: files there already. `None` when it
+/// replaces none.
 fn replaced(p: &AgentPolicy, effect: &Effect, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
     let targets: Vec<&PathBuf> = match effect {
         Effect::Write { .. } => paths.iter().collect(),
@@ -195,7 +202,7 @@ fn replaced(p: &AgentPolicy, effect: &Effect, paths: &[PathBuf]) -> Option<Vec<P
     };
     let over: Vec<PathBuf> = targets
         .into_iter()
-        .filter(|t| !p.deletable(t) && std::fs::symlink_metadata(t).is_ok())
+        .filter(|t| !p.overwritable(t) && std::fs::symlink_metadata(t).is_ok())
         .cloned()
         .collect();
     (!over.is_empty()).then_some(over)
@@ -227,25 +234,42 @@ fn under(path: &Path, root: &Path) -> bool {
 }
 
 impl AgentPolicy {
-    fn inside(&self, path: &Path) -> bool {
+    /// Inside its own folder: its workspace and work trees.
+    fn in_own(&self, path: &Path) -> bool {
         self.own.iter().any(|root| under(path, root))
     }
 
-    /// Inside the own folder or scratch space, for a delete; never a
-    /// scratch root itself.
+    /// Inside its own folder or a folder it works in: where it reads,
+    /// changes and runs at every level.
+    fn inside(&self, path: &Path) -> bool {
+        self.in_own(path) || self.works_in.iter().any(|root| under(path, root))
+    }
+
+    /// Inside scratch space; never a scratch root itself.
+    fn in_scratch(&self, path: &Path) -> bool {
+        self.scratch
+            .iter()
+            .any(|t| under(path, t) && fold(path) != fold(t))
+    }
+
+    /// Inside the own folder or scratch space, for a delete. A folder it
+    /// works in is the person's own work: deleting there asks.
     fn deletable(&self, path: &Path) -> bool {
-        self.inside(path)
-            || self
-                .scratch
-                .iter()
-                .any(|t| under(path, t) && fold(path) != fold(t))
+        self.in_own(path) || self.in_scratch(path)
+    }
+
+    /// Where writing over a file loses nothing the person keeps elsewhere:
+    /// its own folder, a folder it works in (a change there is its work),
+    /// scratch.
+    fn overwritable(&self, path: &Path) -> bool {
+        self.inside(path) || self.in_scratch(path)
     }
 
     /// Whether `path` is kept from the agent; `change` when the call would
-    /// change it.
+    /// change it. Only its own folder is carved out of the withheld set.
     fn withheld(&self, path: &Path, change: bool) -> bool {
         (change && self.config.iter().any(|c| under(path, c)))
-            || (self.withheld.iter().any(|w| under(path, w)) && !self.inside(path))
+            || (self.withheld.iter().any(|w| under(path, w)) && !self.in_own(path))
     }
 
     fn shown(&self, path: &Path) -> String {

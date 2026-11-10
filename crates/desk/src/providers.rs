@@ -43,6 +43,10 @@ pub struct Field {
     /// Long enough to want a text area (a pasted key file).
     pub multiline: bool,
     pub placeholder: &'static str,
+    /// What the field starts with, when that is what most people want
+    /// (the `default` AWS profile).
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub initial: &'static str,
 }
 
 impl Field {
@@ -54,6 +58,7 @@ impl Field {
             required: true,
             multiline: false,
             placeholder: "",
+            initial: "",
         }
     }
 
@@ -73,15 +78,35 @@ impl Field {
             required: true,
             multiline: false,
             placeholder,
+            initial: "",
         }
     }
+
+    const fn starting_at(self, initial: &'static str) -> Self {
+        Self { initial, ..self }
+    }
+}
+
+/// One of the ways a provider connects, when it has more than one: the
+/// person picks one, and only its fields are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Way {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub fields: &'static [Field],
+    pub hint: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Connect {
     pub kind: ConnectKind,
+    /// The fields, or with [`Self::ways`] the first way's (what a Desk that
+    /// knows no ways shows).
     pub fields: &'static [Field],
     pub hint: &'static str,
+    /// The ways to choose between, when there is more than one.
+    #[serde(skip_serializing_if = "<[Way]>::is_empty")]
+    pub ways: &'static [Way],
 }
 
 /// A model a provider offers, as the picker names it. An agent runs on it
@@ -194,11 +219,21 @@ impl Spec {
 
 const API_KEY: Field = Field::secret("api_key", "API key");
 
+const BEDROCK_REGION: Field = Field::plain("region", "Region", "us-east-1").optional("us-east-1");
+const BEDROCK_KEYS: &[Field] = &[
+    Field::secret("access_key_id", "Access key ID"),
+    Field::secret("secret_access_key", "Secret access key"),
+    BEDROCK_REGION,
+];
+const BEDROCK_KEYS_HINT: &str =
+    "An IAM user's access key allowed to invoke Bedrock models in the region";
+
 const fn keyed(hint: &'static str) -> Connect {
     Connect {
         kind: ConnectKind::Fields,
         fields: &[API_KEY],
         hint,
+        ways: &[],
     }
 }
 
@@ -207,6 +242,7 @@ const fn login(hint: &'static str) -> Connect {
         kind: ConnectKind::Login,
         fields: &[],
         hint,
+        ways: &[],
     }
 }
 
@@ -286,12 +322,27 @@ pub const PROVIDERS: &[Spec] = &[
         description: "Claude and open models on your AWS account",
         connect: Connect {
             kind: ConnectKind::Fields,
-            fields: &[
-                Field::secret("access_key_id", "Access key ID"),
-                Field::secret("secret_access_key", "Secret access key"),
-                Field::plain("region", "Region", "us-east-1").optional("us-east-1"),
+            fields: BEDROCK_KEYS,
+            hint: BEDROCK_KEYS_HINT,
+            ways: &[
+                Way {
+                    id: "keys",
+                    label: "Keys",
+                    fields: BEDROCK_KEYS,
+                    hint: BEDROCK_KEYS_HINT,
+                },
+                Way {
+                    id: "profile",
+                    label: "AWS profile",
+                    fields: &[
+                        Field::plain("profile", "Profile", "default").starting_at("default"),
+                        BEDROCK_REGION,
+                    ],
+                    hint: "A profile in ~/.aws/config on this computer: keys, SSO after \
+                           aws sso login, or a credential process. Desk refreshes it as it \
+                           expires",
+                },
             ],
-            hint: "An IAM user's access key allowed to invoke Bedrock models in the region",
         },
         models: &[
             (
@@ -352,6 +403,7 @@ pub const PROVIDERS: &[Spec] = &[
                    Project ID; you may need to run gcloud auth application-default login \
                    first. Or paste a service account key with the Vertex AI User role, from \
                    IAM in the Google Cloud console.",
+            ways: &[],
         },
         models: &[
             (("claude-opus-5-5", "Claude Opus 5.5", OPUS), false),
@@ -505,6 +557,7 @@ pub const PROVIDERS: &[Spec] = &[
             fields: &[Field::plain("url", "Server URL", "http://localhost:11434")],
             hint: "Install Ollama from ollama.com and pull a model; Desk finds it on its \
                    usual port",
+            ways: &[],
         },
         models: &[],
     },
@@ -520,6 +573,7 @@ pub const PROVIDERS: &[Spec] = &[
                 API_KEY.optional("Only if the server asks for one"),
             ],
             hint: "The address of an OpenAI-compatible vLLM server",
+            ways: &[],
         },
         models: &[],
     },
@@ -784,23 +838,39 @@ pub fn checked(spec: &Spec, fields: Fields) -> Result<Fields, AccountError> {
             spec.name
         )));
     }
+    let ways: Vec<&[Field]> = match spec.connect.ways {
+        [] => vec![spec.connect.fields],
+        ways => ways.iter().map(|w| w.fields).collect(),
+    };
+    let takes = |way: &[Field], name: &str| way.iter().any(|f| f.name == name);
     if let Some(unknown) = fields
         .keys()
-        .find(|name| !spec.connect.fields.iter().any(|f| f.name == name.as_str()))
+        .find(|name| !ways.iter().any(|way| takes(way, name)))
     {
         return Err(AccountError::Invalid(format!(
             "{} takes no field named {unknown:?}",
             spec.name
         )));
     }
+    // The first way that takes every field given.
+    let Some(way) = ways
+        .iter()
+        .copied()
+        .find(|way| fields.keys().all(|name| takes(way, name)))
+    else {
+        let labels: Vec<&str> = spec.connect.ways.iter().map(|w| w.label).collect();
+        return Err(AccountError::Invalid(format!(
+            "{} connects one way at a time: {}",
+            spec.name,
+            labels.join(" or ")
+        )));
+    };
     let given: Fields = fields
         .into_iter()
         .map(|(name, value)| (name, value.trim().to_string()))
         .filter(|(_, value)| !value.is_empty())
         .collect();
-    let missing: Vec<&str> = spec
-        .connect
-        .fields
+    let missing: Vec<&str> = way
         .iter()
         .filter(|f| f.required && !given.contains_key(f.name))
         .map(|f| f.label)
@@ -980,6 +1050,54 @@ mod tests {
             "vertex:anthropic"
         );
         assert_eq!(route("ollama", "llama4:8b"), "ollama");
+    }
+
+    #[test]
+    fn bedrock_connects_with_keys_or_an_aws_profile_one_at_a_time() {
+        let bedrock = spec("bedrock").unwrap();
+        let fields = |pairs: &[(&str, &str)]| -> Fields {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let ways: Vec<&str> = bedrock.connect.ways.iter().map(|w| w.id).collect();
+        assert_eq!(ways, ["keys", "profile"]);
+        assert_eq!(
+            bedrock.connect.fields, bedrock.connect.ways[0].fields,
+            "a Desk that knows no ways still shows the keys"
+        );
+        let profile = &bedrock.connect.ways[1].fields[0];
+        assert_eq!((profile.name, profile.initial), ("profile", "default"));
+        assert!(!profile.secret, "a profile name is not a secret");
+        assert_eq!(
+            checked(
+                bedrock,
+                fields(&[("profile", " work-sso "), ("region", "eu-west-2")])
+            )
+            .unwrap(),
+            fields(&[("profile", "work-sso"), ("region", "eu-west-2")])
+        );
+        assert_eq!(
+            checked(bedrock, fields(&[("profile", " ")])).unwrap_err(),
+            AccountError::Invalid("Amazon Bedrock needs Profile".into())
+        );
+        assert_eq!(
+            checked(
+                bedrock,
+                fields(&[("profile", "work"), ("access_key_id", "AKIA")])
+            )
+            .unwrap_err(),
+            AccountError::Invalid(
+                "Amazon Bedrock connects one way at a time: Keys or AWS profile".into()
+            )
+        );
+        let json = serde_json::to_value(bedrock.connect).unwrap();
+        assert_eq!(json["ways"][1]["label"], "AWS profile");
+        assert_eq!(json["ways"][1]["fields"][0]["initial"], "default");
+        assert!(json["fields"][0].get("initial").is_none());
+        let anthropic = serde_json::to_value(spec("anthropic").unwrap().connect).unwrap();
+        assert!(anthropic.get("ways").is_none(), "one way says none");
     }
 
     #[test]
