@@ -69,6 +69,14 @@ pub enum RemoteError {
     /// A tool the sync may not call.
     #[error("the sync never calls {0}")]
     NotAllowed(String),
+    /// The hub doesn't offer this tool (any more): the board pauses until
+    /// its admin adds it, rather than backing off for ever.
+    #[error("the hub doesn't offer {0}")]
+    Missing(String),
+    /// This ticket's push stops until the person acts on it (a create
+    /// held for their approval that was never given): said on the ticket.
+    #[error("{0}")]
+    Stuck(String),
     /// This pass has made all the calls it may: the rest wait for the
     /// next. Not a failure.
     #[error("this pass's calls are spent")]
@@ -694,6 +702,21 @@ pub fn push_of(t: &Ticket, needs: &[String]) -> Push {
     }
 }
 
+/// The type a new issue takes from a project's `types`: Task when it has
+/// it, else its first that is neither a sub-task nor an epic.
+pub fn pick_issue_type(types: &[String]) -> Option<String> {
+    types
+        .iter()
+        .find(|t| t.eq_ignore_ascii_case("task"))
+        .or_else(|| {
+            types.iter().find(|t| {
+                let t = t.to_ascii_lowercase();
+                !t.contains("sub") && t != "epic"
+            })
+        })
+        .cloned()
+}
+
 /// The ref a ticket made in Desk carries on its issue (a Jira label, a
 /// line of a Linear description), by which a create that may have gone
 /// through is found again before it is tried a second time.
@@ -702,8 +725,8 @@ pub fn desk_ref(ticket: Uuid) -> String {
 }
 
 /// The comment a move earns on the remote issue, if any: one per change
-/// into Doing (naming the session or agent that has it) or Review (with
-/// its pull request, when it has one), and none for a repeat. Posted with
+/// into Doing (naming the session or agent that has it) or Review, and none
+/// for a repeat. A pull request's link is never posted. Posted with
 /// the person's token, it says Desk wrote it on their behalf.
 pub fn note_for(
     t: &Ticket,
@@ -724,10 +747,12 @@ pub fn note_for(
             };
             format!("Being worked on in Desk by {what}.")
         }
-        TicketState::Review => match pr {
-            Some(url) => format!("Ready for review: {url}."),
-            None => "Ready for review.".to_string(),
-        },
+        // A pull request's address may be private to the person: never
+        // posted to teammates.
+        TicketState::Review => {
+            let _ = pr;
+            "Ready for review.".to_string()
+        }
         _ => return None,
     };
     Some(format!("Desk, on my behalf: {said}"))
@@ -798,6 +823,11 @@ pub fn spoken_title(t: &Ticket) -> String {
         ),
         None => t.title.clone(),
     }
+}
+
+/// Whether `p` is a remote ([`remote_party`]): its changes came from there.
+pub fn is_remote_party(p: &Party) -> bool {
+    p.kind == PartyKind::Desk && (p.id.starts_with("jira:") || p.id.starts_with("linear:"))
 }
 
 /// The party a pulled change is by: the remote, never the person.

@@ -701,6 +701,7 @@ pub const BOARD_SYNC_JIRA_TOOLS: &[&str] = &[
     "jira.list_transitions",
     "jira.transition_issue",
     "jira.add_comment",
+    "jira.get_project",
 ];
 
 /// The Linear tools a Desk board's sync may call on a hub.

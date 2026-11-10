@@ -316,7 +316,8 @@ fn a_move_earns_one_comment_into_doing_or_review() {
             Some("https://example.com/pull/41")
         )
         .as_deref(),
-        Some("Desk, on my behalf: Ready for review: https://example.com/pull/41.")
+        Some("Desk, on my behalf: Ready for review."),
+        "a pull request's link is never posted"
     );
     assert_eq!(
         note_for(&t, TicketState::Review, None, None).as_deref(),
@@ -440,4 +441,18 @@ fn a_synced_ticket_s_key_is_its_issue_s() {
         None,
         "waiting to be created"
     );
+}
+
+#[test]
+fn a_new_issue_is_a_task_or_the_first_plain_type() {
+    let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        pick_issue_type(&t(&["Bug", "Task", "Sub-task"])).as_deref(),
+        Some("Task")
+    );
+    assert_eq!(
+        pick_issue_type(&t(&["Sub-task", "Epic", "Story"])).as_deref(),
+        Some("Story")
+    );
+    assert_eq!(pick_issue_type(&t(&["Subtask", "Epic"])), None);
 }
