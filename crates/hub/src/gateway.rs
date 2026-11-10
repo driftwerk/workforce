@@ -1058,6 +1058,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/subscriptions/chatgpt/device/{flow_id}", get(crate::api_handlers::subscriptions::get_device_login).delete(crate::api_handlers::subscriptions::cancel_device_login))
         .route("/api/me/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_my_tokens).post(crate::api_handlers::remote_mcp_tokens::create_my_token))
         .route("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
+        .route("/api/me/remote-mcp-tokens/desk/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_device_token))
         .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
