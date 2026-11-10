@@ -840,6 +840,7 @@ mod tests {
             name: "Allan".into(),
             access: ComputerAccess::default(),
             own: vec![hub.subject.workspace.clone()],
+            works_in: Vec::new(),
             withheld: withheld(&hub.config, &home),
             config: own_config(&hub.subject.workspace),
             scratch: scratch(),
