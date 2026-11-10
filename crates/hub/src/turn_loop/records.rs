@@ -261,17 +261,68 @@ pub(crate) fn carry_turn(
 }
 
 /// The steps a turn's tool runs make, at most
-/// [`workforce_common::channels::desk::MAX_STEPS`] of them, the first kept.
+/// [`workforce_common::channels::desk::MAX_STEPS`] of them, the first kept;
+/// an advisor call's with what it was asked and said.
 pub(crate) fn steps_of(
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) -> Vec<workforce_common::channels::desk::DeskStep> {
+    use workforce_common::channels::desk::{DeskStep, ADVICE_MESSAGE_CHARS, MAX_STEPS};
+    let mut room = ADVICE_MESSAGE_CHARS;
     invocations
         .iter()
-        .take(workforce_common::channels::desk::MAX_STEPS)
+        .take(MAX_STEPS)
         .map(|i| {
-            workforce_common::channels::desk::DeskStep::of(&i.tool_name, i.success, i.duration_ms)
+            let step = DeskStep::of(&i.tool_name, i.success, i.duration_ms);
+            match advice_of(i, room) {
+                Some(advice) => {
+                    room = room.saturating_sub(advice.answer.chars().count());
+                    step.with_advice(advice)
+                }
+                None => step,
+            }
         })
         .collect()
+}
+
+/// What an advisor call asked and was told, secrets hidden and then
+/// clipped (so no cut leaves part of one a pattern can't find), its answer
+/// to at most `room` characters; `None` for any other tool's call.
+fn advice_of(
+    i: &workforce_agent::runner::ToolInvocation,
+    room: usize,
+) -> Option<workforce_common::channels::desk::DeskAdvice> {
+    if i.tool_name != crate::advisor::AdvisorTool::NAME {
+        return None;
+    }
+    let text = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let (answer, unavailable) = match (
+        text(&i.output, "advice"),
+        text(&i.output, "advisor_unavailable"),
+    ) {
+        (Some(advice), _) => (advice, false),
+        (None, Some(why)) => (why, true),
+        (None, None) => (i.error.clone()?, true),
+    };
+    let redact = crate::redact::redact_secrets;
+    // Past the message's room, the question alone.
+    let (answer, room) = match room {
+        0 => (
+            "This answer is past what one message keeps; the agent has it whole.".to_string(),
+            usize::MAX,
+        ),
+        _ => (redact(&answer), room),
+    };
+    Some(workforce_common::channels::desk::DeskAdvice::new(
+        &redact(&text(&i.input, "question").unwrap_or_default()),
+        &answer,
+        text(&i.output, "model").map(|m| redact(&m)).as_deref(),
+        unavailable,
+        room,
+    ))
 }
 
 /// The id and Desk mark a turn's answer in a session on `channel` is saved

@@ -538,6 +538,8 @@ pub fn steps_refused(steps: &[Step], turn: bool) -> Option<String> {
         Some(format!(
             "a step's tool is named in at most {STEP_TOOL_CHARS} characters"
         ))
+    } else if !steps.iter().all(Step::advice_fits) {
+        Some("a step's advice is longer than a step keeps".into())
     } else {
         None
     }
@@ -1193,8 +1195,26 @@ pub(crate) mod tests {
             tool: "x".repeat(STEP_TOOL_CHARS + 1),
             ok: true,
             ms: 1,
+            advice: None,
         };
         assert!(steps_refused(&[long], true).is_some());
+        let advised = |answer: String| {
+            let mut s = step("advisor");
+            s.advice = Some(workforce_core::desk::DeskAdvice {
+                question: "Am I missing a constraint?".into(),
+                answer,
+                model: Some("opus".into()),
+                unavailable: false,
+                clipped: false,
+            });
+            s
+        };
+        assert_eq!(
+            steps_refused(&[advised("Check the index.".into())], true),
+            None
+        );
+        let over = "x".repeat(workforce_core::desk::ADVICE_ANSWER_CHARS + 1);
+        assert!(steps_refused(&[advised(over)], true).is_some());
     }
 
     #[tokio::test]
