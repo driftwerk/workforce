@@ -162,6 +162,22 @@ impl DeskSurface {
     }
 }
 
+/// A line of the room with nothing in it, to build a note on.
+fn empty_line(target: &DeskTarget, view: &RoomView) -> ChannelMessage {
+    ChannelMessage {
+        channel: target.channel.clone(),
+        message_id: String::new(),
+        user: String::new(),
+        user_name: None,
+        channel_name: Some(format!("room \"{}\"", view.name)),
+        text: String::new(),
+        timestamp: String::new(),
+        thread_id: None,
+        files: Vec::new(),
+        bot_id: None,
+    }
+}
+
 /// The room's newest `limit` lines, as messages.
 fn lines_of(target: &DeskTarget, view: &RoomView, limit: usize) -> Vec<ChannelMessage> {
     let skip = view.lines.len().saturating_sub(limit);
@@ -217,6 +233,8 @@ impl ChannelSurface for DeskSurface {
         Ok(lines_of(&target, &view, limit))
     }
 
+    /// The lines this turn's room carried, whatever thread is named: Desk
+    /// keeps no thread history on the hub, and the first message says so.
     async fn read_thread(
         &self,
         channel: &str,
@@ -224,7 +242,18 @@ impl ChannelSurface for DeskSurface {
         limit: usize,
     ) -> Result<Vec<ChannelMessage>> {
         let (target, view) = self.room_here(channel)?;
-        Ok(lines_of(&target, &view, limit))
+        let note = ChannelMessage {
+            text: "These are the recent lines Desk sent with this turn, for the room or thread \
+                   it is in. Desk keeps no other thread history here: thread_ts is not used."
+                .to_string(),
+            message_id: "note".to_string(),
+            user: "Desk".to_string(),
+            user_name: Some("Desk".to_string()),
+            ..empty_line(&target, &view)
+        };
+        Ok(std::iter::once(note)
+            .chain(lines_of(&target, &view, limit))
+            .collect())
     }
 
     async fn member_info(&self, user_id: &str) -> Result<MemberInfo> {

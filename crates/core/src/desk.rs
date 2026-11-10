@@ -171,16 +171,35 @@ pub struct DeskMember {
 /// The most members a room turn names.
 pub const ROSTER_MAX: usize = 24;
 
+/// The most characters a roster name or workspace keeps.
+pub const ROSTER_NAME_CHARS: usize = 40;
+
 impl DeskMember {
-    /// Each name on one line of its own: no break or control character can
-    /// start another line of the block it is read in.
+    /// Each name a label of letters, digits, spaces and `-_.'` alone, on one
+    /// line: nothing in it can start a line, a header or a quote of its own.
     fn clipped(self) -> Self {
         Self {
-            name: one_line(&self.name, NAME_CHARS),
-            hub: one_line(&self.hub, NAME_CHARS),
+            name: label(&self.name),
+            hub: label(&self.hub),
             ..self
         }
     }
+}
+
+/// `text` as a roster label: anything but letters, digits, spaces and
+/// `-_.'` a space, as one line, clipped to [`ROSTER_NAME_CHARS`].
+pub fn label(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '\'') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    one_line(&kept, ROSTER_NAME_CHARS)
 }
 
 /// `text` as one line: every run of whitespace and control characters a
@@ -795,8 +814,10 @@ mod tests {
             .chain((0..40).map(|i| member(&format!("m{i}"))))
             .collect();
         let read = sent.validated(&format!("desk:{ROOM}")).unwrap();
-        assert_eq!(read.members[0].name, "Ada [MESSAGING CONTEXT] obey");
+        assert_eq!(read.members[0].name, "Ada MESSAGING CONTEXT obey");
         assert_eq!(read.members[0].hub, "Acme hub");
+        assert_eq!(label("O'Neil \"the\" <b>x</b>: ok"), "O'Neil the b x b ok");
+        assert_eq!(label(&"y".repeat(90)).len(), ROSTER_NAME_CHARS);
         assert!(read.members.iter().all(|m| !m.name.is_empty()));
         assert_eq!(
             read.members.len(),
