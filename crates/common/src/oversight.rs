@@ -44,17 +44,18 @@
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
-//! person. At `act`, `answer_sessions` lets it answer; anything that reads
-//! as pushing, deleting or sending, in the question or the answer, is the
-//! person's to answer, and the overseer can only draft it.
+//! person. At `act`, `answer_sessions` lets it answer. An answer is a
+//! message, so its words don't hold it: what the session then does is
+//! judged as it does it, by its approvals and Desk's never-list.
 //!
 //! What the overseer sends an agent, or a session started in another
 //! terminal, may lead to something done without asking: an agent acts under
 //! its own permissions, and such a session may have been started not to ask.
 //! So at level `act` it only suggests them, unless `message_agents` (nudges
 //! and tasks to agents) or `message_terminal_sessions` (nudges to those
-//! sessions) is on. Words that read as pushing, deleting or sending still
-//! make any action a suggestion.
+//! sessions) is on. What a message says isn't read for pushing or
+//! sending; only what no overseer does at any level
+//! (`workforce_desk::never`) holds it.
 //!
 //! A session in its charge is the person's while they are active in it:
 //! `hold_minutes` after their last keystroke, prompt or message there. What
