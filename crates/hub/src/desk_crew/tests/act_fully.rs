@@ -55,6 +55,15 @@ fn repo(dir: &Path, origin: &str) {
     );
 }
 
+/// [`FULL`], naming `site`, a checkout whose `origin` is a folder, too.
+fn full_with(site: &Path) -> String {
+    format!(
+        "[oversight]\nenabled = true\nlevel = \"full\"\n\
+         [oversight.full]\nrepos = [\"acme/acme-web\", \"{}\"]\nworkflows = [\"deploy.yml\", \"promote.yml\"]\nbudget_usd_per_day = 25\n",
+        site.display()
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limits() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -64,7 +73,15 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         let globex = base.join("globex-api");
         repo(&acme, "git@github.com:acme/acme-web.git");
         repo(&globex, "git@github.com:globex/globex-api.git");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        // A checkout whose origin answers (a folder): tags and pushes are
+        // judged against what origin says now.
+        let site = base.join("acme-site");
+        let site_origin = base.join("acme-site.git");
+        repo(&site, "placeholder");
+        git(&base, &["clone", "-q", "--bare", "acme-site", "acme-site.git"]);
+        git(&site, &["remote", "set-url", "origin", &site_origin.to_string_lossy()]);
+        let (overseer, crew, d, _llm) =
+            overseeing(&base, pool, "ok", &full_with(&site), &[]).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.approve").then_some(())
         })
@@ -124,11 +141,8 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
         take(s.id).await;
         for command in [
             "gh pr merge 42 --squash",
-            "git tag -a v1.3.0 -m 'Date picker'",
-            "git push origin v1.2.0",
             "gh workflow run promote.yml",
             "gh release create v1.2.0 --notes 'Date picker'",
-            "git push origin HEAD:main",
             "gh workflow run deploy.yml --ref main",
         ] {
             let asked = ask(&url, command);
@@ -136,6 +150,46 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
             let done = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
             assert!(done.output["done"].is_string(), "{command}: {done:?}");
             assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
+        }
+        // In acme-site, whose origin answers: tagging main as origin has it,
+        // pushing that tag, and a push of main that sends nothing new.
+        let site_session = new_session(&d, &site, "acme-site").await;
+        let site_url = hook_url(&base, site_session.id).await;
+        take(site_session.id).await;
+        for command in [
+            "git tag -a v1.3.0 -m 'Date picker'",
+            "git push origin v1.2.0",
+            "git push origin main",
+        ] {
+            let asked = ask(&site_url, command);
+            let a = pending(site_session.id, command).await;
+            let done = tool("crew.approve")
+                .execute(approve(site_session.id, a))
+                .await
+                .unwrap();
+            assert!(done.output["done"].is_string(), "{command}: {done:?}");
+            assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
+        }
+        // A commit before the tag, or one main hasn't on origin: the
+        // person's. So is tagging where origin can't be asked (acme-web's
+        // origin is on GitHub, out of reach here).
+        std::fs::write(site.join("CHANGELOG.md"), "1.3.0\n").unwrap();
+        git(&site, &["add", "CHANGELOG.md"]);
+        git(&site, &["commit", "-q", "-m", "Changelog"]);
+        for (session, at, command, why) in [
+            (site_session.id, &site_url, "git commit -am x && git tag v1.3.0", "may move HEAD"),
+            (site_session.id, &site_url, "git push origin main", "haven't been through a pull request"),
+            (site_session.id, &site_url, "git tag v1.3.0", "default branch as origin has it"),
+            (s.id, &url, "git tag v1.3.0", "default branch as origin has it"),
+            (s.id, &url, "git push origin v1.2.0", "isn't at the default branch's commit"),
+        ] {
+            let asked = ask(at, command);
+            let a = pending(session, command).await;
+            let held = tool("crew.approve").execute(approve(session, a)).await.unwrap();
+            let note = held.output["note"].as_str().unwrap_or_default().to_string();
+            assert!(note.contains(why), "{command}: {held:?}");
+            tool("crew.deny").execute(approve(session, a)).await.unwrap();
+            asked.await.unwrap();
         }
         // Said in Activity as done at Act fully.
         eventually("at Act fully in Activity", async || {

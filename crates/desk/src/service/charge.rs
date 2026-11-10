@@ -342,6 +342,9 @@ impl Desk {
                     );
                     facts.at_tip = head.is_some() && head == at;
                     facts.tip_tags = git_lines(&cwd, &["tag", "--points-at", &tip]);
+                    facts.unpushed =
+                        git_line(&cwd, &["rev-list", "--count", &format!("{tip}..HEAD")])
+                            .is_none_or(|n| n != "0");
                 }
                 facts.branches = git_lines(
                     &cwd,
@@ -377,6 +380,34 @@ impl Desk {
                         && !gh_env
                         && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes)
                         && charge::gh_resolved_named(repo.origin.as_deref(), &repo.gh_resolved);
+                    // What `origin/<default>` says is only as fresh as the
+                    // last fetch: `origin` itself must say the same, now,
+                    // before a tag or a push is judged by it.
+                    if facts.ships {
+                        let fresh = facts.default_branch.as_deref().is_some_and(|d| {
+                            let remote = git_line_within(
+                                &cwd,
+                                &["ls-remote", "origin", &format!("refs/heads/{d}")],
+                                LS_REMOTE_WITHIN,
+                            )
+                            .and_then(|l| l.split_whitespace().next().map(str::to_string));
+                            let local = git_line(
+                                &cwd,
+                                &[
+                                    "rev-parse",
+                                    "-q",
+                                    "--verify",
+                                    &format!("refs/remotes/origin/{d}"),
+                                ],
+                            );
+                            remote.is_some() && remote == local
+                        });
+                        if !fresh {
+                            facts.at_tip = false;
+                            facts.tip_tags.clear();
+                            facts.unpushed = true;
+                        }
+                    }
                 }
             }
         }
@@ -1016,6 +1047,51 @@ fn has_hooks(own: &std::path::Path) -> bool {
         // No hooks folder: none.
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+/// How long `origin` has to say where its default branch is.
+const LS_REMOTE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`git_line`], given `within` to answer, never asking for a password or
+/// a passphrase; `None` when it doesn't answer in time.
+fn git_line_within(
+    dir: &std::path::Path,
+    args: &[&str],
+    within: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read;
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5",
+        );
+    }
+    let mut child = cmd.spawn().ok()?;
+    let until = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if std::time::Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let line = out.lines().next().unwrap_or_default().trim().to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 /// Every line git prints in `dir`; none when it can't say.

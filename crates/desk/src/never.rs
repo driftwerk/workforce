@@ -260,6 +260,20 @@ fn secret_file(name: &str) -> bool {
         || base.starts_with("id_ecdsa")
         || base.ends_with(".pem")
         || base.ends_with(".p12")
+        || [
+            ".key",
+            ".pfx",
+            ".jks",
+            ".keystore",
+            ".p8",
+            ".kdbx",
+            ".tfstate",
+            ".tfstate.backup",
+        ]
+        .iter()
+        .any(|e| base.ends_with(e))
+        || (base.contains("service-account") && base.ends_with(".json"))
+        || base == ".htpasswd"
         || base.ends_with(".keychain")
         || base.ends_with(".keychain-db")
         || lower.contains(".aws/")
@@ -1209,12 +1223,26 @@ mod tests {
             "/Users/sam/dev/acme-web/.env",
             "/Users/sam/.aws-creds",
             "/srv/acme/.env.production",
+            "/Users/sam/dev/acme-web/certs/server.key",
+            "/Users/sam/dev/acme-web/certs/acme.pfx",
+            "/Users/sam/dev/acme-web/certs/acme.p12",
+            "/Users/sam/dev/acme-web/android/release.jks",
+            "/Users/sam/dev/acme-web/android/acme.keystore",
+            "/Users/sam/dev/acme-web/AuthKey_ABC123.p8",
+            "/Users/sam/vault.kdbx",
+            "/Users/sam/dev/acme-web/gcp-service-account.json",
+            "/Users/sam/dev/acme-web/infra/terraform.tfstate",
+            "/Users/sam/dev/acme-web/infra/terraform.tfstate.backup",
+            "/Users/sam/dev/acme-web/.htpasswd",
         ] {
             assert_eq!(path(Path::new(p)), Some(Never::Secrets), "{p}");
         }
         for p in [
             "/Users/sam/dev/acme-web/.env.example",
             "/Users/sam/dev/acme-web/src/credentials.rs",
+            "/Users/sam/dev/acme-web/src/keyboard.ts",
+            "/Users/sam/dev/acme-web/infra/main.tf",
+            "/Users/sam/dev/acme-web/package.json",
         ] {
             assert_eq!(path(Path::new(p)), None, "{p}");
         }

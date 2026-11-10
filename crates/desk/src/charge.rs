@@ -438,6 +438,9 @@ pub struct Facts {
     pub workflows: Vec<String>,
     /// `HEAD` is the commit `origin`'s default branch is at.
     pub at_tip: bool,
+    /// `HEAD` has commits `origin`'s default branch hasn't, or Desk can't
+    /// tell.
+    pub unpushed: bool,
     /// The repository's branch names, local and `origin`'s.
     pub branches: Vec<String>,
     /// The tags at `origin`'s default branch's commit.
@@ -546,6 +549,7 @@ pub fn facts_of(
         hooks: false,
         workflows: Vec::new(),
         at_tip: false,
+        unpushed: true,
         branches: Vec::new(),
         tip_tags: Vec::new(),
         what,
@@ -662,6 +666,7 @@ pub fn answerable(
                 hooks: facts.hooks,
                 workflows: &facts.workflows,
                 at_tip: facts.at_tip,
+                unpushed: facts.unpushed,
                 branches: &facts.branches,
                 tip_tags: &facts.tip_tags,
                 tracked,

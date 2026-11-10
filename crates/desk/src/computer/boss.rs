@@ -84,9 +84,12 @@ pub struct Here<'a> {
     /// The workflows the person listed for Act fully to run
     /// (`[oversight.full] workflows`), by their file names exactly.
     pub workflows: &'a [String],
-    /// `HEAD` is the commit `origin`'s default branch is at: a tag made
-    /// now tags what the default branch has.
+    /// `HEAD` is the commit `origin`'s default branch is at, as `origin`
+    /// itself says now: a tag made now tags what the default branch has.
     pub at_tip: bool,
+    /// `HEAD` has commits `origin`'s default branch hasn't, or Desk can't
+    /// tell: pushing the default branch would ship them without a review.
+    pub unpushed: bool,
     /// The repository's branch names, local and `origin`'s (without
     /// `origin/`): no tag may be named as one.
     pub branches: &'a [String],
@@ -640,6 +643,44 @@ struct Walk<'h, 'a> {
     /// The tags an earlier command in it made, at the default branch's
     /// commit.
     made_tags: Vec<String>,
+    /// An earlier command in it may have moved `HEAD` or what `origin`'s
+    /// branches say: anything but a git command that only reads, tags or
+    /// pushes.
+    unsettled: bool,
+}
+
+/// The git commands that leave `HEAD` and the remote branches as they are.
+const HEAD_KEPT: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "rev-parse",
+    "ls-files",
+    "blame",
+    "describe",
+    "grep",
+    "shortlog",
+    "cat-file",
+    "ls-tree",
+    "rev-list",
+    "show-ref",
+    "for-each-ref",
+    "name-rev",
+    "merge-base",
+    "tag",
+    "push",
+];
+
+/// Whether `cmd` leaves `HEAD` and the remote branches as they are: a git
+/// command of [`HEAD_KEPT`], with no flags before it.
+fn keeps_head(cmd: &Cmd) -> bool {
+    match cmd.words.as_slice() {
+        [git, sub, ..] => {
+            git.text.rsplit('/').next() == Some("git") && HEAD_KEPT.contains(&sub.text.as_str())
+        }
+        _ => false,
+    }
 }
 
 /// A word that names a path, by how it is written.
@@ -1156,11 +1197,13 @@ fn judge_from(command: &str, here: &Here<'_>, cwd: Option<PathBuf>, moved: bool)
         cwd,
         moved,
         made_tags: Vec::new(),
+        unsettled: false,
     };
     for (i, cmd) in cmds.iter().enumerate() {
         // A `cd` reaches only the command `&&` joins to it.
         let next = cmds.get(i + 1).map(|c| c.join);
         one(&mut walk, cmd, next)?;
+        walk.unsettled |= !keeps_head(cmd);
     }
     Ok(())
 }
@@ -2106,7 +2149,10 @@ fn tag(walk: &mut Walk<'_, '_>, rest: &[Word]) -> Judged {
     if here.branches.contains(&name.text) {
         return no("names a tag as a branch is named; that's the person's to allow");
     }
-    if walk.moved || !here.at_tip || here.branch != here.default_branch {
+    if walk.moved || walk.unsettled {
+        return no("tags after a command that may move HEAD; that's the person's to allow");
+    }
+    if !here.at_tip || here.branch != here.default_branch {
         return no("tags something other than the default branch as origin has it; that's the person's to allow");
     }
     walk.made_tags.push(name.text.clone());
@@ -2222,10 +2268,16 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
     // Feature work reaches the default branch through `gh pr merge`.
     if is_default(branch, here) || is_default(dest, here) {
         let exact = here.default_branch == Some(branch) && own_branch;
-        return match exact {
-            true => ships_to(remote),
-            false => no(PUBLISHES),
-        };
+        if !exact {
+            return no(PUBLISHES);
+        }
+        ships_to(remote)?;
+        // Only a push that sends nothing new: reviewed work reaches the
+        // default branch through `gh pr merge`.
+        if here.unpushed || walk.unsettled {
+            return no("pushes commits to the default branch that haven't been through a pull request; that's the person's to allow");
+        }
+        return Ok(());
     }
     match own_branch {
         true => Ok(()),
@@ -2969,6 +3021,7 @@ pub(crate) mod tests {
             hooks: false,
             workflows: &[],
             at_tip: false,
+            unpushed: true,
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
@@ -3018,6 +3071,7 @@ pub(crate) mod tests {
         here.ships_gh = true;
         here.workflows = &workflows;
         here.at_tip = true;
+        here.unpushed = false;
         here.branches = &branches;
         here.tip_tags = &tip_tags;
         here.tracked = &tracked;
@@ -3319,6 +3373,56 @@ pub(crate) mod tests {
             &|h| h.default_branch = None,
             PUBLISHES,
         );
+        // A command that may move HEAD earlier in the line: no tag after.
+        for line in [
+            "git commit -am x && git tag v1.3.0 && git push origin v1.3.0",
+            "git merge --ff-only origin/main && git tag v1.3.0",
+            "git cherry-pick abc1234 && git tag v1.3.0",
+            "git revert --no-edit abc1234 && git tag v1.3.0",
+            "git pull && git tag v1.3.0",
+            "git stash pop && git tag v1.3.0",
+            "git switch main && git tag v1.3.0",
+            "git fetch origin && git tag v1.3.0",
+            "make build && git tag v1.3.0",
+        ] {
+            let got = judged_fully(line, "main").expect_err(line);
+            assert!(
+                got.contains("may move HEAD") || got.contains("person's"),
+                "{line}: {got}"
+            );
+        }
+        held(
+            "git commit -am x && git tag v1.3.0",
+            "main",
+            &none,
+            "may move HEAD",
+        );
+        held(
+            "git status && git tag v1.3.0 && git push origin v1.3.0",
+            "main",
+            &|h| h.at_tip = false,
+            "default branch as origin has it",
+        );
+        assert_eq!(
+            judged_fully(
+                "git status && git tag v1.3.0 && git push origin v1.3.0",
+                "main"
+            ),
+            Ok(())
+        );
+        // Pushing the default branch only when it sends nothing new.
+        held(
+            "git push origin main",
+            "main",
+            &|h| h.unpushed = true,
+            "haven't been through a pull request",
+        );
+        held(
+            "git commit -am x && git push origin main",
+            "main",
+            &none,
+            "haven't been through a pull request",
+        );
         // Files sent to GitHub.
         held(
             "gh release create v1.2.0 --notes-file .env",
@@ -3603,6 +3707,7 @@ pub(crate) mod tests {
             hooks: false,
             workflows: &[],
             at_tip: false,
+            unpushed: true,
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
