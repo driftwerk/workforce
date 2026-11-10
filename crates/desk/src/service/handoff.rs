@@ -867,6 +867,7 @@ impl Desk {
             prompt: Some(brief::short_prompt(r.engine, named(r), false, tools)),
             approvals: None,
             approve_for_me: false,
+            fast: false,
             account: c.ask.account,
             env: Default::default(),
             group: c.facts.source_group.clone(),

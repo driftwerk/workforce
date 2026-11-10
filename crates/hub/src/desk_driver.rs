@@ -216,9 +216,47 @@ struct HubAccounts {
     /// Where the person's Google login (Application Default Credentials) is
     /// on this machine, if they have one.
     google_login: GoogleLogin,
+    /// Where a plan is asked which models it lists now.
+    plans: Option<PlanSource>,
 }
 
 type GoogleLogin = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
+/// How Desk asks a plan which models it lists: on the hub's shared
+/// subscriptions, with the login the hub's own work would run on (the one
+/// Desk's sign-in stores).
+#[derive(Clone)]
+struct PlanSource {
+    shared: crate::subscription::SharedSubscriptions,
+    scope: crate::subscription::CredentialScope,
+}
+
+impl PlanSource {
+    async fn listed(
+        &self,
+        kind: SubscriptionKind,
+    ) -> Option<Vec<workforce_desk::providers::Listed>> {
+        use crate::subscription::catalog;
+        let models = match kind {
+            SubscriptionKind::ChatGpt => catalog::chatgpt_models(&self.shared, &self.scope).await,
+            SubscriptionKind::Claude => catalog::claude_models(&self.shared, &self.scope).await,
+        }?;
+        Some(
+            models
+                .iter()
+                .map(|m| workforce_desk::providers::Listed {
+                    id: m.id.clone(),
+                    resolves_to: m.resolves_to.clone(),
+                    name: m.name.clone(),
+                    description: m.description.clone(),
+                    efforts: m.efforts.clone(),
+                    default_effort: m.default_effort.clone(),
+                    fast: m.fast.clone(),
+                })
+                .collect(),
+        )
+    }
+}
 
 /// The subscription a plan provider signs in to.
 fn plan(spec: &Spec) -> Option<SubscriptionKind> {
@@ -418,11 +456,17 @@ impl Accounts for HubAccounts {
             return Standing::default();
         };
         if let Some(kind) = plan(spec) {
+            let connected = vault
+                .get(kind.vault_key())
+                .is_some_and(|v| !v.trim().is_empty());
+            let listed = match (&self.plans, connected) {
+                (Some(plans), true) => plans.listed(kind).await,
+                _ => None,
+            };
             return Standing {
-                connected: vault
-                    .get(kind.vault_key())
-                    .is_some_and(|v| !v.trim().is_empty()),
+                connected,
                 installed: Vec::new(),
+                listed,
             };
         }
         let Ok((kind, name)) = metered(spec) else {
@@ -433,6 +477,7 @@ impl Accounts for HubAccounts {
             return Standing {
                 connected: vault.find_account(name).is_some(),
                 installed: Vec::new(),
+                listed: None,
             };
         }
         if spec.group != Group::Local {
@@ -441,6 +486,7 @@ impl Accounts for HubAccounts {
                     .find_account_api_key(name)
                     .is_some_and(|key| !key.trim().is_empty()),
                 installed: Vec::new(),
+                listed: None,
             };
         }
         let (Some(server), Some((url, token))) = (Server::of(spec.id), self.endpoint(kind)) else {
@@ -452,6 +498,7 @@ impl Accounts for HubAccounts {
             // Ollama is connected when it answers; vLLM when it has an address.
             connected: installed.is_some() || server == Server::Vllm,
             installed: installed.unwrap_or_default(),
+            listed: None,
         }
     }
 
@@ -799,6 +846,17 @@ pub async fn mount(
                 Arc::new(move || crate::gateway::login_vaults(&state))
             },
             google_login: Arc::new(adc_file),
+            plans: state
+                .registry
+                .host()
+                .zip(state.vault.clone())
+                .map(|(host, vault)| PlanSource {
+                    shared: host.subscriptions().clone(),
+                    scope: crate::subscription::CredentialScope::system(
+                        vault,
+                        &config.subscription,
+                    ),
+                }),
         }),
         crew,
     )))
@@ -1113,6 +1171,7 @@ mod tests {
                 vault: Some(Arc::clone(vault)),
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             }
         }
 
@@ -1475,6 +1534,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             }
             .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
             .await
@@ -1506,6 +1566,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             };
             for spec in PROVIDERS {
                 let models: Vec<&str> = match spec.lists_installed() {
@@ -1561,6 +1622,7 @@ mod tests {
                 vault: None,
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
+                plans: None,
             };
             let bedrock = spec("bedrock").unwrap();
             let unhonoured: Vec<&str> = bedrock

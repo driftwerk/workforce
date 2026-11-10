@@ -87,6 +87,7 @@ fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
         prompt: None,
         approvals: None,
         approve_for_me,
+        fast: false,
         account: None,
         env: Default::default(),
         group: None,
@@ -250,6 +251,50 @@ async fn approve_for_me_starts_codex_with_its_reviewer_and_stays_on() {
             "{args}"
         );
         assert!(store.get(s.id).await.unwrap().unwrap().approve_for_me, "kept, for its resume");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fast_mode_starts_codex_on_the_priority_tier_and_stays_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let claude = NewSession {
+            engine: Engine::Claude,
+            fast: true,
+            ..codex_session(dir.path(), false)
+        };
+        assert!(
+            matches!(d.create(claude, None).await, Err(DeskError::Invalid(_))),
+            "Codex's alone"
+        );
+        let server = serve(dir.path());
+        let fast = NewSession {
+            fast: true,
+            ..codex_session(dir.path(), false)
+        };
+        let s = d.create(fast, None).await.unwrap();
+        let _ws = server.await.unwrap();
+        assert!(s.fast, "the session says it is on");
+        assert!(s.caps.fast, "Codex can");
+        let args = dir.path().join("tui-args");
+        until(|| std::fs::read_to_string(&args).is_ok_and(|a| a.ends_with('\n'))).await;
+        let args = std::fs::read_to_string(&args).unwrap();
+        assert!(args.contains("-c service_tier=\"priority\""), "{args}");
+        assert!(
+            store.get(s.id).await.unwrap().unwrap().fast,
+            "kept, for its resume"
+        );
     })
     .await;
 }

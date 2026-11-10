@@ -250,6 +250,7 @@ impl DeskTool {
                             prompt: i.prompt,
                             approvals: None,
                             approve_for_me: false,
+                            fast: false,
                             account,
                             env: Default::default(),
                             // In the caller's group when that is a boundary.

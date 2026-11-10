@@ -369,16 +369,23 @@ fn describe(misses: &[RouteMiss]) -> String {
 
 impl TurnChain {
     /// Run a turn on the chain's routes in order, until one serves it, at
-    /// the agent's `[llm] effort` as its live config says it now.
+    /// the agent's `[llm] effort` and `[llm] fast` as its live config says
+    /// them now.
     pub(crate) async fn run(
         &self,
         service: &AgentService,
         turn: TurnRun<'_>,
     ) -> Result<ChainOutcome> {
-        let effort = service.resolved.snapshot().effort_level();
+        let (effort, fast) = {
+            let resolved = service.resolved.snapshot();
+            (resolved.effort_level(), resolved.fast)
+        };
         workforce_agent::llm::provider::with_effort_override(
             effort,
-            Box::pin(self.run_routes(service, turn)),
+            workforce_agent::llm::provider::with_fast_mode(
+                fast,
+                Box::pin(self.run_routes(service, turn)),
+            ),
         )
         .await
     }

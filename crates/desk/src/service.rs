@@ -2783,6 +2783,11 @@ impl Desk {
                 "only Codex sessions can approve for you".into(),
             ));
         }
+        if new.fast && new.engine != Engine::Codex {
+            return Err(DeskError::Invalid(
+                "only Codex sessions run in Fast mode".into(),
+            ));
+        }
         let account = self.account_for(new.engine, new.account)?;
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
@@ -2810,6 +2815,7 @@ impl Desk {
             view,
             engine_version: self.version_of(new.engine),
             approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
+            fast: new.fast && new.engine == Engine::Codex,
             account,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
@@ -4202,6 +4208,7 @@ impl Desk {
                     },
                     prompt,
                     approve_for_me: r.approve_for_me,
+                    fast: r.fast,
                     env: &env,
                 });
                 let link =
@@ -6070,6 +6077,7 @@ impl Desk {
                         view: View::Terminal,
                         engine_version: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         name: ext
                             .name
@@ -6392,6 +6400,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                fast: false,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -6937,6 +6946,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                fast: false,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -7100,6 +7110,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                         group: None,
@@ -7157,6 +7168,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                         group: None,
@@ -7207,6 +7219,7 @@ mod tests {
                     prompt: None,
                     approvals: None,
                     approve_for_me: false,
+                    fast: false,
                     account: None,
                     env: added.clone(),
                     group: None,
@@ -7639,6 +7652,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        fast: false,
                         account: None,
                         env: Default::default(),
                         group: None,

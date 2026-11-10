@@ -32,6 +32,7 @@ async fn session(d: &Desk, dir: &Path, name: &str, goal: &str) -> SessionView {
             prompt: None,
             approvals: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             env: Default::default(),
             group: None,

@@ -1281,7 +1281,12 @@ pub fn register_coding_session_tool(
         Arc::clone(&engine),
     ));
     fanout.host();
-    service.tools.register(fanout);
+    service
+        .tools
+        .register(crate::sessions_only::SessionsOnly::wrap(
+            fanout,
+            &service.workspace,
+        ));
     let tool = crate::coding_session_tool::CodingSessionTool::new(
         Arc::clone(service),
         project_store,
@@ -1294,7 +1299,12 @@ pub fn register_coding_session_tool(
         launcher,
         engine,
     );
-    service.tools.register(Arc::new(tool));
+    service
+        .tools
+        .register(crate::sessions_only::SessionsOnly::wrap(
+            Arc::new(tool),
+            &service.workspace,
+        ));
     info!(
         target: "coding_session",
         agent = %service.agent_id,
@@ -1328,10 +1338,13 @@ pub fn register_claude_code_tool(service: &Arc<AgentService>) {
     ];
     service
         .tools
-        .register(Arc::new(crate::claude_code_tool::ClaudeCodeTool::new(
-            Arc::clone(service),
-            paths,
-        )));
+        .register(crate::sessions_only::SessionsOnly::wrap(
+            Arc::new(crate::claude_code_tool::ClaudeCodeTool::new(
+                Arc::clone(service),
+                paths,
+            )),
+            &service.workspace,
+        ));
     info!(agent = %service.agent_id, "Claude Code tool registered (coding.claude)");
 }
 
@@ -2675,17 +2688,21 @@ fn register_code_tools(
         tools,
         ..
     } = toolbox;
-    // Register native coding tools
+    // Register native coding tools, each held to "always work in real
+    // sessions" (`crate::sessions_only`).
+    let register = |tool: Arc<dyn workforce_agent::tools::Tool>| {
+        tools.register(crate::sessions_only::SessionsOnly::wrap(tool, workspace));
+    };
     // Include worktrees dir so code tools can access workflow worktree files.
     let mut allowed_paths = vec![workspace.clone()];
     allowed_paths.push(worktrees_dir.clone());
-    tools.register(Arc::new(crate::code::CodeReadTool::new(
+    register(Arc::new(crate::code::CodeReadTool::new(
         allowed_paths.clone(),
     )));
-    tools.register(Arc::new(crate::code::CodeEditTool::new(
+    register(Arc::new(crate::code::CodeEditTool::new(
         allowed_paths.clone(),
     )));
-    tools.register(Arc::new(crate::code::CodeSearchTool::new(
+    register(Arc::new(crate::code::CodeSearchTool::new(
         allowed_paths.clone(),
     )));
     // Code tools that spawn git/cargo route their child processes through
@@ -2696,34 +2713,34 @@ fn register_code_tools(
     // status`/`git diff`, which honour agent-planted fsmonitor/external-diff
     // drivers, so they must run as the agent in agent-writable trees.
     let code_runner = runner.clone();
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeTreeTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(crate::code::CodeSymbolsTool::new(
+    register(Arc::new(crate::code::CodeSymbolsTool::new(
         allowed_paths.clone(),
     )));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeDiffTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeTestTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeLintTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeBuildTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeGitTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
-    tools.register(Arc::new(crate::code::CodeFindReplaceTool::new(
+    register(Arc::new(crate::code::CodeFindReplaceTool::new(
         allowed_paths.clone(),
     )));
-    tools.register(Arc::new(crate::code::CodeFindTool::new(
+    register(Arc::new(crate::code::CodeFindTool::new(
         allowed_paths.clone(),
     )));
-    tools.register(Arc::new(
+    register(Arc::new(
         crate::code::CodeCargoTool::new(allowed_paths.clone()).with_runner(code_runner.clone()),
     ));
     // `code.refactor`: registered unless the install turns it off;
@@ -2732,7 +2749,7 @@ fn register_code_tools(
     if config.tools.refactor.mode != workforce_common::settings::ProgramsMode::Off {
         let install = config.tools.refactor.clone();
         let cell = resolved.clone();
-        tools.register(Arc::new(crate::code::CodeRefactorTool::new(
+        register(Arc::new(crate::code::CodeRefactorTool::new(
             allowed_paths.clone(),
             Arc::new(move || install.for_agent(cell.snapshot().refactor.as_ref())),
             &config.tools.refactor,

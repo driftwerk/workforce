@@ -284,6 +284,7 @@ pub mod sqlite_memory_move;
 pub(crate) use hub_core::standing;
 pub mod state;
 pub use hub_core::stop_registry;
+pub mod sessions_only;
 pub mod subagent_tool;
 pub mod subscription;
 pub mod system_tool;

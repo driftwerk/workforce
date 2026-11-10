@@ -5,6 +5,7 @@
 //! `claude-code` completions ([`completion`]).
 
 pub use crate::hub_core::logins::chatgpt_auth;
+pub mod catalog;
 mod cli_kind;
 pub mod completion;
 pub use crate::hub_core::logins::cooldown;

@@ -1768,6 +1768,7 @@ impl Desk {
             prompt: Some(board::handed_text(&key, t, &needs)),
             approvals: None,
             approve_for_me: false,
+            fast: false,
             account: None,
             env: BTreeMap::new(),
             group,

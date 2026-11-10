@@ -100,6 +100,10 @@ pub struct Model {
     /// empty list is no effort control.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub efforts: Option<Efforts>,
+    /// How the plan words the model's faster tier ("2x speed, increased
+    /// usage"), when it has one an agent or session can ask for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<String>,
 }
 
 /// Effort levels, lowest first, and the one to start at (none without any).
@@ -182,6 +186,7 @@ impl Spec {
                 default,
                 provider: route(self.id, id),
                 efforts: None,
+                fast: None,
             })
             .collect()
     }
@@ -536,6 +541,26 @@ pub struct Standing {
     pub connected: bool,
     /// The models a local server has installed, when it answered.
     pub installed: Vec<String>,
+    /// The models a plan lists for its login now, when it could be asked:
+    /// what Desk offers in place of (or beside) its own table, so a model
+    /// released since Desk was shows up.
+    pub listed: Option<Vec<Listed>>,
+}
+
+/// A model a plan lists, as its service words it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub id: String,
+    /// The model an alias runs now (`sonnet` → `claude-sonnet-5-5`).
+    pub resolves_to: Option<String>,
+    pub name: String,
+    pub description: String,
+    /// The effort levels the plan lists for it; only those the hub honours
+    /// on the provider are offered.
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+    /// How the plan words its faster tier, when it has one.
+    pub fast: Option<String>,
 }
 
 /// The fields a connect request carries, by name.
@@ -591,21 +616,26 @@ pub(crate) struct Entry {
 impl Entry {
     pub(crate) async fn of(spec: &'static Spec, accounts: &dyn Accounts) -> Self {
         let standing = accounts.standing(spec).await;
-        let mut models = if spec.lists_installed() {
-            installed(spec.id, standing.installed)
-        } else {
-            spec.curated()
+        let honoured = accounts.efforts(spec.id);
+        let mut models = match (spec.lists_installed(), standing.listed) {
+            (true, _) => installed(spec.id, standing.installed),
+            (false, Some(listed)) if !listed.is_empty() => with_listed(spec, listed, &honoured),
+            (false, _) => spec.curated(),
         };
+        let provider_efforts = Efforts::of(honoured);
+        for model in &mut models {
+            let own = match model.efforts.take() {
+                Some(listed) => listed,
+                None => Efforts::of(accounts.model_efforts(spec.id, &model.id)),
+            };
+            if own != provider_efforts {
+                model.efforts = Some(own);
+            }
+        }
         let Efforts {
             efforts,
             default_effort,
-        } = Efforts::of(accounts.efforts(spec.id));
-        for model in &mut models {
-            let own = accounts.model_efforts(spec.id, &model.id);
-            if own != efforts {
-                model.efforts = Some(Efforts::of(own));
-            }
-        }
+        } = provider_efforts;
         Self {
             id: spec.id,
             name: spec.name,
@@ -620,6 +650,93 @@ impl Entry {
     }
 }
 
+/// `spec`'s models with what its plan lists now. A ChatGPT plan's list is
+/// the one it serves: Desk's table only words the models it knows, and its
+/// default stays the default while listed. A Claude plan's aliases always
+/// run (each names the newest of its line), so they stay first, named as
+/// the plan names them, and every model the plan lists that no alias
+/// already offers follows them by its full name.
+fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> Vec<Model> {
+    let curated = spec.curated();
+    let entry = |l: &Listed, default: bool| Model {
+        id: l.id.clone(),
+        name: l.name.clone(),
+        description: l.description.clone(),
+        default,
+        provider: route(spec.id, &l.id),
+        efforts: Some(listed_efforts(l, honoured)),
+        fast: l.fast.clone(),
+    };
+    if spec.id == "claude-code" {
+        let reached: Vec<&str> = curated
+            .iter()
+            .filter_map(|c| listed.iter().find(|l| l.id == c.id))
+            .map(|l| l.resolves_to.as_deref().unwrap_or(&l.id))
+            .collect();
+        let mut models: Vec<Model> = curated
+            .iter()
+            .map(|c| match listed.iter().find(|l| l.id == c.id) {
+                Some(l) => Model {
+                    description: c.description.clone(),
+                    ..entry(l, c.default)
+                },
+                None => c.clone(),
+            })
+            .collect();
+        for l in &listed {
+            let offered = models.iter().any(|m| m.id == l.id || m.name == l.name)
+                || reached.contains(&l.id.as_str());
+            if !offered {
+                models.push(entry(l, false));
+            }
+        }
+        return models;
+    }
+    let default = curated
+        .iter()
+        .find(|c| c.default && listed.iter().any(|l| l.id == c.id))
+        .map(|c| c.id.clone())
+        .or_else(|| listed.first().map(|l| l.id.clone()));
+    listed
+        .iter()
+        .map(|l| {
+            let model = entry(l, default.as_deref() == Some(l.id.as_str()));
+            match curated.iter().find(|c| c.id == l.id) {
+                Some(c) => Model {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    ..model
+                },
+                None => model,
+            }
+        })
+        .collect()
+}
+
+/// The efforts `listed` takes that the hub honours on its provider, when
+/// the plan says which it takes; the one it starts at, when it says that
+/// too.
+fn listed_efforts(listed: &Listed, honoured: &[&'static str]) -> Efforts {
+    if listed.efforts.is_empty() {
+        // A plan lists no levels for a model that takes none.
+        return Efforts::of(Vec::new());
+    }
+    let efforts: Vec<&'static str> = honoured
+        .iter()
+        .copied()
+        .filter(|e| listed.efforts.iter().any(|l| l == e))
+        .collect();
+    let mut chosen = Efforts::of(efforts);
+    if let Some(own) = listed
+        .default_effort
+        .as_deref()
+        .and_then(|d| chosen.efforts.iter().copied().find(|e| *e == d))
+    {
+        chosen.default_effort = Some(own);
+    }
+    chosen
+}
+
 /// A local server's models, the first the default.
 fn installed(provider: &str, models: Vec<String>) -> Vec<Model> {
     models
@@ -631,6 +748,7 @@ fn installed(provider: &str, models: Vec<String>) -> Vec<Model> {
             default: i == 0,
             provider: provider.into(),
             efforts: None,
+            fast: None,
             id,
         })
         .collect()
@@ -723,6 +841,7 @@ mod tests {
                     "ollama" => vec!["llama4:8b".into(), "qwen3.8:27b".into()],
                     _ => Vec::new(),
                 },
+                listed: None,
             }
         }
 
@@ -901,6 +1020,186 @@ mod tests {
         );
         let err = checked(spec("claude-code").unwrap(), Fields::new()).unwrap_err();
         assert!(err.to_string().contains("signing in"), "{err}");
+    }
+
+    /// A hub whose plans list their models now.
+    struct Listing;
+
+    fn listed(id: &str, name: &str, efforts: &[&str], fast: Option<&str>) -> Listed {
+        Listed {
+            id: id.into(),
+            name: name.into(),
+            description: format!("{name} as the plan says"),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            fast: fast.map(str::to_string),
+            ..Listed::default()
+        }
+    }
+
+    #[async_trait]
+    impl Accounts for Listing {
+        async fn standing(&self, spec: &Spec) -> Standing {
+            let all = ["low", "medium", "high", "xhigh", "max", "ultra"];
+            let listed = match spec.id {
+                "chatgpt" => Some(vec![
+                    Listed {
+                        default_effort: Some("low".into()),
+                        ..listed(
+                            "gpt-6.1-sol",
+                            "GPT-6.1-Sol",
+                            &all,
+                            Some("2x speed, increased usage"),
+                        )
+                    },
+                    listed(
+                        "gpt-6-astra",
+                        "GPT-6-Astra",
+                        &all,
+                        Some("2x speed, increased usage"),
+                    ),
+                    listed(
+                        "gpt-6.2-nova",
+                        "GPT-6.2-Nova",
+                        &["low", "medium"],
+                        Some("1.5x speed"),
+                    ),
+                    listed("gpt-6-luna", "GPT-6-Luna", &["low", "medium"], None),
+                ]),
+                "claude-code" => Some(vec![
+                    Listed {
+                        resolves_to: Some("claude-opus-5-5".into()),
+                        ..listed("opus", "Opus 5.5", &all, None)
+                    },
+                    listed("claude-fable-5-1", "Fable 5.1", &all, None),
+                    Listed {
+                        resolves_to: Some("claude-sonnet-5-5".into()),
+                        ..listed("sonnet", "Sonnet 5.5", &all, None)
+                    },
+                    listed("claude-sonnet-5-5", "Sonnet 5.5", &all, None),
+                    listed("claude-fable-5-2", "Fable 5.2", &all, None),
+                    listed("claude-haiku-4-5-20251001", "Haiku 4.5", &[], None),
+                ]),
+                _ => None,
+            };
+            Standing {
+                connected: true,
+                installed: Vec::new(),
+                listed,
+            }
+        }
+
+        fn efforts(&self, provider: &str) -> Vec<&'static str> {
+            match provider {
+                "claude-code" => vec!["low", "medium", "high", "max"],
+                "chatgpt" => vec!["low", "medium", "high", "xhigh"],
+                _ => Vec::new(),
+            }
+        }
+
+        async fn connect(&self, _: &Spec, _: &Fields) -> Result<(), AccountError> {
+            Ok(())
+        }
+
+        async fn disconnect(&self, _: &Spec) -> Result<(), AccountError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_plan_offers_what_it_lists_now_worded_as_desk_knows_it() {
+        let entry = Entry::of(spec("chatgpt").unwrap(), &Listing).await;
+        let shown: Vec<(&str, &str, bool, Option<&str>)> = entry
+            .models
+            .iter()
+            .map(|m| (m.id.as_str(), m.name.as_str(), m.default, m.fast.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "gpt-6.1-sol",
+                    "GPT-6.1 Sol",
+                    true,
+                    Some("2x speed, increased usage")
+                ),
+                (
+                    "gpt-6-astra",
+                    "GPT-6 Astra",
+                    false,
+                    Some("2x speed, increased usage")
+                ),
+                ("gpt-6.2-nova", "GPT-6.2-Nova", false, Some("1.5x speed")),
+                ("gpt-6-luna", "GPT-6 Luna", false, None),
+            ],
+            "gpt-6-sol, no longer listed, is gone; a new model is offered"
+        );
+        let nova = &entry.models[2];
+        assert_eq!(nova.provider, "chatgpt");
+        assert_eq!(nova.description, "GPT-6.2-Nova as the plan says");
+        assert_eq!(
+            nova.efforts,
+            Some(Efforts {
+                efforts: vec!["low", "medium"],
+                default_effort: Some("medium"),
+            })
+        );
+        // Its own default, and only the levels the hub sends.
+        assert_eq!(
+            entry.models[0].efforts,
+            Some(Efforts {
+                efforts: vec!["low", "medium", "high", "xhigh"],
+                default_effort: Some("low"),
+            })
+        );
+        assert_eq!(entry.models[1].efforts, None, "the provider's own levels");
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["models"][2]["fast"], "1.5x speed");
+        assert!(json["models"][3].get("fast").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_claude_plan_keeps_its_aliases_and_adds_what_no_alias_offers() {
+        let entry = Entry::of(spec("claude-code").unwrap(), &Listing).await;
+        let shown: Vec<(&str, &str, bool)> = entry
+            .models
+            .iter()
+            .map(|m| (m.id.as_str(), m.name.as_str(), m.default))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("fable", "Fable 5.1", false),
+                ("opus", "Opus 5.5", false),
+                ("sonnet", "Sonnet 5.5", true),
+                ("haiku", "Haiku 5.5", false),
+                ("claude-fable-5-2", "Fable 5.2", false),
+                ("claude-haiku-4-5-20251001", "Haiku 4.5", false),
+            ]
+        );
+        assert_eq!(entry.models[2].description, SONNET, "Desk's words kept");
+        assert_eq!(
+            entry.models[5].efforts,
+            Some(Efforts {
+                efforts: Vec::new(),
+                default_effort: None,
+            }),
+            "a model that takes no effort has none"
+        );
+        assert_eq!(
+            entry.models[4].efforts, None,
+            "the plan's levels the hub takes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_couldnt_be_asked_offers_desks_own_table() {
+        let entry = Entry::of(spec("chatgpt").unwrap(), &Held::default()).await;
+        let ids: Vec<&str> = entry.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
+        );
+        assert!(entry.models.iter().all(|m| m.fast.is_none()));
     }
 
     #[tokio::test]

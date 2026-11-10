@@ -847,6 +847,7 @@ impl Desk {
                     prompt: Some(prompt),
                     approvals: None,
                     approve_for_me: false,
+                    fast: false,
                     account: None,
                     env: BTreeMap::new(),
                     group,

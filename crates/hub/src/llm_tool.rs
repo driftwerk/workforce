@@ -994,21 +994,34 @@ impl SystemListModelsTool {
     }
 
     /// The models a subscription provider runs: what the ChatGPT backend
-    /// serves, and for the CLIs the models the agent's tiers name.
+    /// serves (its live catalogue once read, then the built-in models it
+    /// doesn't list), and for the CLIs the models the agent's tiers name,
+    /// then for Claude Code those its CLI last listed
+    /// ([`crate::subscription::catalog`]).
     fn subscription_models(&self, kind: ProviderKind) -> Vec<ModelInfo> {
-        let ids = match kind {
-            ProviderKind::ChatGpt => ChatGptModel::ALL
-                .iter()
-                .map(|model| model.id().to_string())
-                .collect(),
-            kind => crate::hub_core::subscriptions::tier_models(kind, &self.ctx.tier_registry()),
+        let info = |id: String, display_name: Option<String>| ModelInfo { id, display_name };
+        if kind == ProviderKind::ChatGpt {
+            return ChatGptModel::known()
+                .into_iter()
+                .map(|model| info(model.id().to_string(), None))
+                .collect();
+        }
+        let mut models: Vec<ModelInfo> =
+            crate::hub_core::subscriptions::tier_models(kind, &self.ctx.tier_registry())
+                .into_iter()
+                .map(|id| info(id, None))
+                .collect();
+        let listed = match kind {
+            ProviderKind::ClaudeCode => crate::subscription::catalog::PlanCatalog::global()
+                .last(workforce_common::subscription::SubscriptionKind::Claude),
+            _ => None,
         };
-        ids.into_iter()
-            .map(|id| ModelInfo {
-                id,
-                display_name: None,
-            })
-            .collect()
+        for model in listed.iter().flat_map(|l| l.iter()) {
+            if !models.iter().any(|m| m.id == model.id) {
+                models.push(info(model.id.clone(), Some(model.name.clone())));
+            }
+        }
+        models
     }
 
     /// Fetch models from the Anthropic API.
@@ -3664,18 +3677,23 @@ mod tests {
             listed(ProviderKind::Codex).await,
             ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
         );
-        assert_eq!(
-            listed(ProviderKind::ChatGpt).await,
-            [
-                "gpt-6.1-sol",
-                "gpt-6-astra",
-                "gpt-6-sol",
-                "gpt-6-luna",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna"
-            ]
-        );
+        // The live catalogue comes first once read (another test may have
+        // had it read); every built-in model stays listed either way.
+        let chatgpt = listed(ProviderKind::ChatGpt).await;
+        for built_in in [
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(
+                chatgpt.iter().any(|id| id == built_in),
+                "{built_in}: {chatgpt:?}"
+            );
+        }
     }
 
     #[tokio::test]

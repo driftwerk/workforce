@@ -48,6 +48,9 @@ pub struct ResolvedConfig {
     /// `voice_model`. Read every turn ([`Self::effort_level`]), so not
     /// structural; admission refuses a level the provider does not take.
     pub effort: Option<String>,
+    /// `[llm] fast`, resolved workspace → agent section like `effort` and
+    /// read every turn.
+    pub fast: bool,
     /// `[aws_s3]` — surfaced here only so [`Self::structural_diff`] can
     /// report when an edit needs a restart. The hub doesn't read this
     /// per-turn (tools take their config at registration time); a
@@ -197,6 +200,10 @@ impl ResolvedConfig {
             .and_then(|llm| llm.effort.clone())
             .or_else(|| agent_llm.and_then(|llm| llm.effort.clone()))
             .filter(|effort| !effort.trim().is_empty());
+        let fast = workspace_llm
+            .and_then(|llm| llm.fast)
+            .or_else(|| agent_llm.and_then(|llm| llm.fast))
+            .unwrap_or(false);
 
         // Per-agent workspace `config.toml` override → global default. (The
         // workspace file is the fs-watched, hot-reloadable per-agent config.)
@@ -244,6 +251,7 @@ impl ResolvedConfig {
             voice_model,
             voice_thinking_budget_tokens,
             effort,
+            fast,
             aws_s3: global.aws_s3.clone(),
             worker_read_sources_enabled,
             self_learning,
@@ -409,6 +417,7 @@ mod tests {
             voice_model: None,
             voice_thinking_budget_tokens: None,
             effort: None,
+            fast: false,
             aws_s3: AwsS3Config::default(),
             worker_read_sources_enabled: false,
             self_learning: workforce_common::settings::SelfLearningConfig::default(),

@@ -39,8 +39,17 @@ pub struct CodexSpawn<'a> {
     pub prompt: Option<&'a str>,
     /// Codex's own reviewer answers its approvals.
     pub approve_for_me: bool,
+    /// Fast mode: Codex asks the ChatGPT backend's faster tier.
+    pub fast: bool,
     pub env: &'a BTreeMap<String, String>,
 }
+
+/// What Fast mode sets: Codex's `service_tier`, which it sends to a model
+/// its catalogue lists with the tier (and drops for one it doesn't). Its
+/// `fast_mode` feature, on by default since 0.16x, must stay on for it to
+/// apply. Given to the TUI like [`APPROVE_FOR_ME`], whose settings start
+/// its thread.
+pub const FAST: &str = "service_tier=\"priority\"";
 
 /// What `--approve-for-me` sets, as settings: approvals go to Codex's
 /// automatic reviewer, in the workspace-write sandbox. Given to the TUI,
@@ -70,6 +79,9 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
                 .iter()
                 .flat_map(|c| ["-c".to_string(), c.to_string()]),
         );
+    }
+    if s.fast {
+        args.extend(["-c".to_string(), FAST.to_string()]);
     }
     args.extend(s.prompt.map(str::to_string));
     Spawn {
@@ -1261,6 +1273,7 @@ pub(crate) mod tests {
             launch: Launch::Resume { thread_id: "t1" },
             prompt: None,
             approve_for_me: false,
+            fast: false,
             env: &env,
         });
         assert_eq!(
@@ -1287,6 +1300,7 @@ pub(crate) mod tests {
                 launch,
                 prompt: Some("go"),
                 approve_for_me: true,
+                fast: false,
                 env: &env,
             });
             let tail: Vec<&str> = s
@@ -1309,6 +1323,35 @@ pub(crate) mod tests {
                     "go"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn fast_mode_asks_the_priority_tier_on_every_launch_and_resume() {
+        let env = BTreeMap::new();
+        for launch in [Launch::New, Launch::Resume { thread_id: "t1" }] {
+            let fast = |fast| {
+                spawn(&CodexSpawn {
+                    program: Path::new("/bin/codex"),
+                    cwd: Path::new("/repo"),
+                    socket: Path::new("/run/s.sock"),
+                    launch: match launch {
+                        Launch::New => Launch::New,
+                        Launch::Resume { thread_id } => Launch::Resume { thread_id },
+                    },
+                    prompt: Some("go"),
+                    approve_for_me: false,
+                    fast,
+                    env: &env,
+                })
+                .args
+            };
+            let on = fast(true);
+            assert_eq!(
+                &on[on.len() - 3..],
+                ["-c", "service_tier=\"priority\"", "go"]
+            );
+            assert!(!fast(false).iter().any(|a| a.contains("service_tier")));
         }
     }
 

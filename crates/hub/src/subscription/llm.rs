@@ -46,7 +46,7 @@ const REFRESH_HORIZON: TimeDelta = TimeDelta::minutes(5);
 /// The longest throttle waited out inside the provider before the login
 /// cools and the chain moves on.
 const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(20);
-const DEFAULT_MODEL: ChatGptModel = ChatGptModel::Gpt61Sol;
+const DEFAULT_MODEL: ChatGptModel = ChatGptModel::GPT_6_1_SOL;
 const RELAY_CAPACITY: usize = 128;
 /// Who the hub's own calls are made for, in cache keys and limit reports.
 const SYSTEM_CALLER: &str = "system";
@@ -239,6 +239,21 @@ impl SubscriptionProvider {
                     detail: refused.to_string(),
                 }
             })
+    }
+
+    /// The model a call runs on, the backend's live catalogue read first
+    /// when the hub hasn't yet and the call needs it: for a model the
+    /// built-in list doesn't know (one released since), or to know whether
+    /// the model takes the faster tier the turn asks for.
+    async fn chosen(&self, requested: Option<&str>) -> Result<ChatGptModel, SubscriptionError> {
+        let unknown = requested.or(self.model.as_deref()).is_some_and(|name| {
+            matches!(ChatGptModel::parse(name), Err(UnsupportedModel::Unknown(_)))
+        });
+        if !ChatGptModel::learned() && (unknown || workforce_agent::llm::provider::fast_mode()) {
+            super::catalog::chatgpt_models(self.plans.subscriptions.shared(), &self.plans.scope)
+                .await;
+        }
+        self.model(requested)
     }
 
     /// The session's id, so the backend's prompt cache follows the
@@ -478,7 +493,7 @@ impl LlmProvider for SubscriptionProvider {
         _max_tokens: Option<u32>,
         _enable_cache: bool,
     ) -> Result<LlmResponse> {
-        let model = self.model(model)?;
+        let model = self.chosen(model).await?;
         let (tx, rx) = mpsc::channel(RELAY_CAPACITY);
         let (served, collected) = tokio::join!(
             self.serve(system_prompt, messages, tools, model, tx),
@@ -505,7 +520,7 @@ impl LlmProvider for SubscriptionProvider {
         _enable_cache: bool,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let model = self.model(model)?;
+        let model = self.chosen(model).await?;
         note_served(
             self.serve(system_prompt, messages, tools, model, tx)
                 .await?,
@@ -1130,6 +1145,84 @@ mod tests {
         assert_eq!(response.text().as_deref(), Some("metered"));
         assert_eq!(*metered.0.lock(), ["backup-model"]);
         assert!(hub.server.received_requests().await.unwrap().is_empty());
+    }
+
+    const LIVE_CATALOG: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../agent-runtime/src/llm/testdata/chatgpt/models_live.json"
+    ));
+
+    /// The backend lists a model this hub wasn't built with: a call for it
+    /// reads the catalogue first and then runs on it, at the faster tier the
+    /// turn asks for because the catalogue says the model takes it.
+    #[tokio::test]
+    async fn a_model_released_since_runs_once_the_catalogue_lists_it() {
+        let hub = Harness::new(true).await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(LIVE_CATALOG, "application/json"))
+            .mount(&hub.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(recorded(TEXT))
+            .mount(&hub.server)
+            .await;
+        let response = workforce_agent::llm::provider::with_fast_mode(
+            true,
+            hub.provider.create_message(
+                None,
+                &[LlmMessage::user("hi")],
+                &[],
+                Some("gpt-6.2-nova"),
+                None,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text().as_deref(), Some(SKY));
+        let calls = hub.requests("/responses").await;
+        assert_eq!(calls.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&calls[0].body).unwrap();
+        assert_eq!(body["model"], "gpt-6.2-nova");
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(
+            hub.provider.context_floor("gpt-6.2-nova").await,
+            Some(400_000)
+        );
+        // Learned once: other calls don't read it again.
+        assert!(hub.requests("/models").await.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn without_fast_mode_no_tier_is_asked() {
+        let hub = Harness::new(true).await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(LIVE_CATALOG, "application/json"))
+            .mount(&hub.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(recorded(TEXT))
+            .mount(&hub.server)
+            .await;
+        hub.provider
+            .create_message(
+                None,
+                &[LlmMessage::user("hi")],
+                &[],
+                Some("gpt-6.2-nova"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let calls = hub.requests("/responses").await;
+        let body: serde_json::Value = serde_json::from_slice(&calls[0].body).unwrap();
+        assert_eq!(body["model"], "gpt-6.2-nova");
+        assert!(body.get("service_tier").is_none(), "{body}");
     }
 
     #[tokio::test]

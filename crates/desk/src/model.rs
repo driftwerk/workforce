@@ -55,6 +55,8 @@ pub struct SessionRecord {
     pub engine_version: Option<String>,
     /// Codex's own reviewer answers its approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// Codex asks the ChatGPT backend's faster tier ("Fast mode").
+    pub fast: bool,
     /// The person's account it runs on ([`crate::engine_accounts`]); none:
     /// the CLI's own sign-in on this computer.
     pub account: Option<Uuid>,
@@ -203,6 +205,8 @@ pub struct SessionView {
     pub approvals: Approvals,
     /// Codex's own reviewer answers its approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// Codex asks the ChatGPT backend's faster tier ("Fast mode").
+    pub fast: bool,
     /// The person's account it runs on; none: the CLI's own sign-in.
     pub account: Option<crate::engine_accounts::AccountRef>,
     /// The account it moves to once its turn ends, when a switch waits.
@@ -312,6 +316,7 @@ impl SessionView {
             pending,
             approvals: r.approvals,
             approve_for_me: r.approve_for_me,
+            fast: r.fast,
             account: None,
             switching_to: None,
             terminal_id: r.terminal_id,
@@ -470,6 +475,10 @@ pub struct NewSession {
     /// Codex only: its own reviewer answers its approvals.
     #[serde(default)]
     pub approve_for_me: bool,
+    /// Codex only: it asks the ChatGPT backend's faster tier ("Fast mode"),
+    /// which can use the plan's limits sooner.
+    #[serde(default)]
+    pub fast: bool,
     /// The person's account it runs on: absent, the engine's default
     /// account; `null`, the CLI's own sign-in on this computer.
     #[serde(default, deserialize_with = "present")]
