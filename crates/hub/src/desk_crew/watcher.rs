@@ -198,6 +198,10 @@ impl CrewHub {
             self.read.lock().clear();
         }
         let current = self.overseers();
+        // Act fully holds only under its budget: today's spend, read now,
+        // and Desk told again what each may ship in.
+        self.read_spent_today(&current).await;
+        let current = self.overseers();
         let want: HashMap<String, (Scope, String)> = current
             .iter()
             .map(|(s, o)| {
@@ -472,6 +476,7 @@ impl CrewHub {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
             Level::Act => "You may act with the crew.* tools within what the person allowed; anything else becomes a suggestion they can do or dismiss. Give a reason each time.",
+            Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's. Give a reason each time.",
         }
     }
 
@@ -488,13 +493,15 @@ impl CrewHub {
             return;
         };
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
+        let (level, why) = self.level_now(service.agent_id.as_str(), &o);
         let prompt = format!(
             "{CHECK_IN} Here is what happened on the crew since you last looked (you oversee it at level {}):\n{}\n\n\
              Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
-             them first. Name sessions and agents as above. {}",
-            o.level.as_str(),
+             them first. Name sessions and agents as above. {}{}",
+            level.as_str(),
             reported(&lines.join("\n"), "the crew's sessions and agents"),
-            Self::level_hint(o.level),
+            Self::level_hint(level),
+            why.map(|w| format!(" {w} Tell the person once if it matters.")).unwrap_or_default(),
         );
         let hop = triggers.iter().map(|t| t.hop).max().unwrap_or(0);
         let approvals: Vec<MentionedApproval> =
@@ -604,7 +611,7 @@ impl CrewHub {
             } else {
                 reported(&lines.join("\n"), "the crew's activity")
             },
-            Self::level_hint(o.level),
+            Self::level_hint(self.level_now(service.agent_id.as_str(), &o).0),
         );
         let reply = self
             .check_in(service, &owner, which, &prompt, 0, None)

@@ -404,6 +404,7 @@ impl CrewTool {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }
             Gate::Run => {
+                let by = crew.by_at_level(by, oversight);
                 let done = crew.perform(&action, by).await?;
                 Ok(json!({ "done": done }))
             }

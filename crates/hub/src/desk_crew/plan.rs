@@ -575,7 +575,7 @@ impl CrewHub {
         };
         let limit = o.work.parallel as usize;
         match o.level {
-            Level::Act => {
+            Level::Act | Level::Full => {
                 // A ticket that failed to start waits longer each time, and
                 // is tried afresh once the plan changes.
                 let mut rows = tickets.clone();
@@ -793,7 +793,7 @@ impl CrewHub {
                 let boss = plan
                     .as_ref()
                     .and_then(|p| self.boss_of_plan(p))
-                    .filter(|(_, o)| o.level == Level::Act);
+                    .filter(|(_, o)| o.level.acts());
                 let Some((service, _)) = boss else {
                     // No boss may start it now: the ticket waits in To do.
                     let by = By::desk("No boss may start it now.");

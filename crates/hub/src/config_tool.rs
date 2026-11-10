@@ -433,6 +433,11 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             "oversight",
             "oversight.group",
             "oversight.act.hand_out_work",
+            // Its own limits at Act fully: never its to change.
+            "oversight.level",
+            "oversight.full.repos",
+            "oversight.full.budget_usd_per_day",
+            "oversight.wake.hold_minutes",
         ] {
             assert!(
                 human_only(&key_path(key).unwrap()).is_err(),

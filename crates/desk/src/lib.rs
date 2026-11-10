@@ -53,6 +53,7 @@ pub mod model;
 mod move_api;
 pub mod move_store;
 pub mod moves;
+pub mod never;
 pub mod overview;
 pub mod plan;
 mod plan_api;

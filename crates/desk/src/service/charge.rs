@@ -38,6 +38,14 @@ pub(crate) struct Charges {
     /// How long the person's input holds each boss's sessions, by agent
     /// id, as its settings say; [`charge::HOLD`] for one not said.
     holds: HashMap<String, chrono::Duration>,
+    /// The repositories each boss acting fully may ship in, by agent id:
+    /// only those whose Act fully is in force (named repositories, a
+    /// budget not yet spent), as the hub says.
+    full: HashMap<String, charge::FullGrant>,
+    /// Every agent's own settings files (its `config.toml` and the like),
+    /// as the hub says: withheld from what a boss answers for, as Desk's
+    /// data is, so no boss allows a change to its own limits.
+    agent_settings: Vec<std::path::PathBuf>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -132,6 +140,48 @@ impl Desk {
     /// for [`charge::HOLD`].
     pub fn set_holds(&self, holds: HashMap<String, chrono::Duration>) {
         self.0.state.lock().charges.holds = holds;
+    }
+
+    /// The repositories each boss acting fully may ship in, by its agent
+    /// id, as the hub reads their settings and spend: a boss left out
+    /// doesn't act fully anywhere.
+    pub fn set_full(&self, full: HashMap<String, charge::FullGrant>) {
+        self.0.state.lock().charges.full = full;
+    }
+
+    /// Where `boss` acts fully now; nowhere when it doesn't.
+    fn full_of(&self, boss: &str) -> charge::FullGrant {
+        self.0
+            .state
+            .lock()
+            .charges
+            .full
+            .get(boss)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The repositories `boss` acts fully in now; none when it doesn't.
+    fn full_repos(&self, boss: &str) -> Vec<String> {
+        self.full_of(boss).repos
+    }
+
+    /// Whether `boss` acts fully in the repository session `id` works in:
+    /// its own folder's, named in `[oversight.full] repos`.
+    pub fn acts_fully_in(&self, id: Uuid, boss: &str) -> bool {
+        let named = self.full_repos(boss);
+        if named.is_empty() {
+            return false;
+        }
+        let Ok(view) = self.view(id) else {
+            return false;
+        };
+        let home = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone());
+        let Some(home) = home else {
+            return false;
+        };
+        let own = charge::own_folder(std::path::Path::new(&view.cwd));
+        repo_of_own(&own).is_some_and(|r| r.named(&named, &home))
     }
 
     /// How long the person's input holds a session `boss` runs, as the hub
@@ -234,13 +284,27 @@ impl Desk {
         *self.0.boss_bounds.lock() = Some(bounds);
     }
 
-    /// Whether the boss running `id` may answer its open request
-    /// `approval` itself; why not, in the person's words, when it may not.
-    pub fn boss_answerable(&self, id: Uuid, approval: Uuid) -> Result<(), charge::Irreversible> {
+    /// Every agent's own settings files, as the hub serves them now: no
+    /// boss allows a session to read or change them, wherever they are.
+    pub fn withhold_agent_settings(&self, paths: Vec<std::path::PathBuf>) {
+        self.0.state.lock().charges.agent_settings = paths;
+    }
+
+    /// Whether `boss` may answer `id`'s open request `approval` itself; why
+    /// not, in the person's words, when it may not. Where it acts fully,
+    /// what ships is its to allow too.
+    pub fn boss_answerable(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        boss: &str,
+    ) -> Result<(), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
-        let Some(bounds) = self.0.boss_bounds.lock().clone() else {
+        let Some(mut bounds) = self.0.boss_bounds.lock().clone() else {
             return no("Desk can't judge requests for a boss yet");
         };
+        let settings = self.0.state.lock().charges.agent_settings.clone();
+        bounds.withheld.extend(settings);
         let Ok(view) = self.view(id) else {
             return no("that session isn't there any more");
         };
@@ -269,9 +333,107 @@ impl Desk {
                     &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
                 )
                 .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+                if let Some(default) = facts.default_branch.clone() {
+                    let tip = format!("refs/remotes/origin/{default}");
+                    let head = git_line(&cwd, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
+                    let at = git_line(
+                        &cwd,
+                        &["rev-parse", "-q", "--verify", &format!("{tip}^{{commit}}")],
+                    );
+                    facts.at_tip = head.is_some() && head == at;
+                    facts.tip_tags = git_lines(&cwd, &["tag", "--points-at", &tip]);
+                    facts.unpushed =
+                        git_line(&cwd, &["rev-list", "--count", &format!("{tip}..HEAD")])
+                            .is_none_or(|n| n != "0");
+                }
+                facts.branches = git_lines(
+                    &cwd,
+                    &[
+                        "for-each-ref",
+                        "--format=%(refname:short)",
+                        "refs/heads",
+                        "refs/remotes",
+                    ],
+                )
+                .into_iter()
+                .map(|b| {
+                    b.split_once('/')
+                        .filter(|(r, _)| *r == "origin")
+                        .map_or(b.clone(), |(_, n)| n.to_string())
+                })
+                .collect();
+                let grant = self.full_of(boss);
+                let named = grant.repos;
+                facts.workflows = grant.workflows;
+                if let Some(repo) = repo_of_own(&facts.own) {
+                    facts.follow_tags = repo.follow_tags;
+                    facts.hooks = repo.hooks;
+                    facts.ships = !named.is_empty() && repo.named(&named, &bounds.home);
+                    // gh acts on what its remotes and `set-default` say, or
+                    // on GH_REPO and GH_HOST in the environment sessions
+                    // start with (Desk's own); set in a command, the
+                    // allowlist refuses them.
+                    let gh_env = ["GH_REPO", "GH_HOST"]
+                        .iter()
+                        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+                    facts.ships_gh = facts.ships
+                        && !gh_env
+                        && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes)
+                        && charge::gh_resolved_named(repo.origin.as_deref(), &repo.gh_resolved);
+                    // What `origin/<default>` says is only as fresh as the
+                    // last fetch: `origin` itself must say the same, now,
+                    // before a tag or a push is judged by it.
+                    if facts.ships {
+                        let fresh = facts.default_branch.as_deref().is_some_and(|d| {
+                            let remote = git_line_within(
+                                &cwd,
+                                &["ls-remote", "origin", &format!("refs/heads/{d}")],
+                                LS_REMOTE_WITHIN,
+                            )
+                            .and_then(|l| l.split_whitespace().next().map(str::to_string));
+                            let local = git_line(
+                                &cwd,
+                                &[
+                                    "rev-parse",
+                                    "-q",
+                                    "--verify",
+                                    &format!("refs/remotes/origin/{d}"),
+                                ],
+                            );
+                            remote.is_some() && remote == local
+                        });
+                        if !fresh {
+                            facts.at_tip = false;
+                            facts.tip_tags.clear();
+                            facts.unpushed = true;
+                        }
+                    }
+                }
             }
         }
-        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
+        let top = crate::computer::boss::resolve_real(&facts.own);
+        let tracked = |p: &std::path::Path| {
+            top.as_ref().is_some_and(|top| {
+                p.strip_prefix(top).is_ok_and(|rel| {
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(top)
+                        .args(["ls-files", "--error-unmatch", "--"])
+                        .arg(rel)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success())
+                })
+            })
+        };
+        charge::answerable(
+            &facts,
+            &bounds,
+            &crate::computer::boss::resolve_real,
+            &tracked,
+        )
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
@@ -344,7 +506,7 @@ impl Desk {
         match decision {
             Decision::Deny | Decision::Cancel => Ok(()),
             Decision::Allow => self
-                .boss_answerable(id, approval)
+                .boss_answerable(id, approval, &boss.party.id)
                 .map_err(|why| DeskError::Conflict(format!("{why}: it's the person's to allow"))),
             Decision::AllowForSession | Decision::Terminal => Err(DeskError::Invalid(
                 "only the person answers for the rest of a session".into(),
@@ -777,6 +939,180 @@ fn quiet_for(hold: chrono::Duration) -> String {
         1 => "1 quiet minute".into(),
         n => format!("{n} quiet minutes"),
     }
+}
+
+/// The repository a session's own folder is: its `origin`'s address and
+/// its checkouts (the folder itself and, for a worktree, the main one).
+struct OwnRepo {
+    origin: Option<String>,
+    checkouts: Vec<std::path::PathBuf>,
+    /// Every remote's every address, fetch and push, as git uses them.
+    remotes: Vec<String>,
+    /// It says `push.followTags`.
+    follow_tags: bool,
+    /// What `gh repo set-default` wrote: each `remote.*.gh-resolved`.
+    gh_resolved: Vec<String>,
+    /// It has git hooks: a file in its hooks folder (`core.hooksPath`'s,
+    /// when set) that isn't one of git's samples.
+    hooks: bool,
+}
+
+impl OwnRepo {
+    fn named(&self, named: &[String], home: &std::path::Path) -> bool {
+        charge::repo_named(
+            self.origin.as_deref(),
+            &self.checkouts,
+            named,
+            home,
+            &crate::computer::boss::resolve_real,
+        )
+    }
+}
+
+/// The repository whose top is `own`, a session's own folder; `None` when
+/// it is no repository's top (a nested folder, no repository at all).
+fn repo_of_own(own: &std::path::Path) -> Option<OwnRepo> {
+    use crate::computer::boss::resolve_real;
+    let own_real = resolve_real(own)?;
+    let top = git_line(own, &["rev-parse", "--show-toplevel"])
+        .and_then(|t| resolve_real(std::path::Path::new(&t)))?;
+    if top != own_real {
+        return None;
+    }
+    let mut checkouts = vec![top];
+    // A worktree's main checkout holds the repository it shares.
+    if let Some(common) = git_line(
+        own,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        let common = std::path::PathBuf::from(common);
+        if let Some(main) = common
+            .file_name()
+            .filter(|n| *n == ".git")
+            .and_then(|_| common.parent())
+            .and_then(resolve_real)
+        {
+            if !checkouts.contains(&main) {
+                checkouts.push(main);
+            }
+        }
+    }
+    let mut remotes: Vec<String> = git_lines(own, &["remote", "-v"])
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+    remotes.extend(
+        git_lines(
+            own,
+            &["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"],
+        )
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string)),
+    );
+    remotes.sort();
+    remotes.dedup();
+    Some(OwnRepo {
+        // Where a push to it goes: its push address, when it has one.
+        origin: git_line(own, &["remote", "get-url", "--push", "origin"]),
+        checkouts,
+        remotes,
+        follow_tags: git_line(own, &["config", "--bool", "--get", "push.followTags"])
+            .is_some_and(|v| v == "true"),
+        gh_resolved: git_lines(
+            own,
+            &["config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
+        )
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .collect(),
+        hooks: has_hooks(own),
+    })
+}
+
+/// Whether the repository at `own` has git hooks: anything in the folder
+/// git runs them from that isn't one of its samples. One it can't read
+/// counts as having them.
+fn has_hooks(own: &std::path::Path) -> bool {
+    let Some(dir) = git_line(
+        own,
+        &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    ) else {
+        return true;
+    };
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.flatten().any(|e| {
+            !e.file_name().to_string_lossy().ends_with(".sample")
+                && e.file_type().is_ok_and(|t| !t.is_dir())
+        }),
+        // No hooks folder: none.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// How long `origin` has to say where its default branch is.
+const LS_REMOTE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`git_line`], given `within` to answer, never asking for a password or
+/// a passphrase; `None` when it doesn't answer in time.
+fn git_line_within(
+    dir: &std::path::Path,
+    args: &[&str],
+    within: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read;
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5",
+        );
+    }
+    let mut child = cmd.spawn().ok()?;
+    let until = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if std::time::Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let line = out.lines().next().unwrap_or_default().trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Every line git prints in `dir`; none when it can't say.
+fn git_lines(dir: &std::path::Path, args: &[&str]) -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One line git prints in `dir`, or `None` when it can't say.
