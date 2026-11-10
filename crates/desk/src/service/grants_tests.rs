@@ -527,3 +527,58 @@ async fn only_the_hubs_own_token_in_its_header_writes_or_reads_grants() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn grants_that_cant_be_read_pause_the_bosses_and_take_no_new_one() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let first = engine(pool.clone(), dir.path(), true).await;
+        sql(&first, "DROP TABLE boss_grants", &[]).await;
+        let d = engine(pool, dir.path(), true).await;
+        assert!(d.bosses_paused());
+        // Its sidebar stays closed, as a granted machine's.
+        assert!(d.stamps_from_grants());
+        assert!(d.layout_refused().is_some());
+        let e = d
+            .put_grant(native(), "g-acme", body(1, "Acme", &[Uuid::new_v4()]))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("can't read the grants"), "{e}");
+        assert!(d.clear_bosses_pause(native()).await.is_err());
+        assert!(d.bosses_paused());
+        // A stop still works.
+        d.stop_bosses(native(), None, StoppedFrom::Machine)
+            .await
+            .unwrap();
+        assert!(d.bosses_paused());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn on_a_granted_machine_only_a_grant_moves_a_session_between_groups() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let s = super::tests::new_session(&d, dir.path()).await.id;
+        put(&d, "g-acme", body(1, "Acme", &[s])).await;
+        put(&d, "g-globex", body(1, "Globex", &[])).await;
+        let item = session_item(s);
+        for change in [
+            Box::new(|l: &Layout| l.put(&item, "g-globex", None))
+                as Box<dyn FnOnce(&Layout) -> Result<Layout, DeskError> + Send>,
+            Box::new(|l: &Layout| l.remove(&item)),
+        ] {
+            let e = d.change_layout(change).await.unwrap_err();
+            assert!(matches!(e, DeskError::Conflict(_)), "{e}");
+        }
+        assert_eq!(d.group_of_member(&item).as_deref(), Some("g-acme"));
+        // Showing a group folded changes no one's group.
+        d.change_layout(|l| l.edit("g-acme", None, Some(true)))
+            .await
+            .unwrap();
+        // Ungrouped is where a session starts with no grant to say otherwise.
+        assert!(!d.born_in(Uuid::new_v4(), UNGROUPED).await.unwrap());
+    })
+    .await;
+}

@@ -674,6 +674,17 @@ impl Desk {
         if after == before {
             return Ok(after);
         }
+        // On a machine whose groups are its grants, no change but a grant
+        // puts a session of its in another group, or out of one.
+        if self.stamps_from_grants() {
+            let ids: Vec<Uuid> = self.0.state.lock().records.keys().copied().collect();
+            for id in ids {
+                let item = session_item(id);
+                if before.group_of(&item).map(|g| &g.id) != after.group_of(&item).map(|g| &g.id) {
+                    return Err(self.layout_refused().unwrap_or(DeskError::CrossesBoss));
+                }
+            }
+        }
         // A group id is never used twice: rows stamped with a deleted
         // group must never become another group's.
         let new: Vec<String> = after

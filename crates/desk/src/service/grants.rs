@@ -50,6 +50,9 @@ pub(crate) struct GrantsRun {
     paused: Option<Paused>,
     /// When this machine began taking its sessions' groups from grants.
     since: Option<DateTime<Utc>>,
+    /// Whether the kept grants were read. Until they are, nothing is
+    /// written over them, and a machine's sidebar stays closed.
+    loaded: bool,
 }
 
 /// A grant as the routes show it: whether it serves its boss now, and why
@@ -120,40 +123,55 @@ impl Desk {
     /// Reads the grants and the pause kept across restarts. One that can't
     /// be read pauses every boss: the person clears it in Desk.
     pub(super) async fn grants_load(&self) {
-        let grants = self.0.store.boss_grants().await;
-        let engine = self.0.store.boss_engine().await;
-        let mut run = self.0.grants.lock();
-        match (grants, engine) {
-            (Ok(grants), Ok(engine)) => {
-                run.grants = grants.into_iter().map(|g| (g.group.clone(), g)).collect();
-                run.paused = engine.paused.then(|| Paused {
-                    at: engine.paused_at.unwrap_or_else(Utc::now),
-                    from: engine.paused_from.unwrap_or_else(|| "desk".into()),
-                });
-                run.since = engine.grants_since;
-            }
-            (grants, engine) => {
-                let error = grants
-                    .err()
-                    .or(engine.err())
-                    .map(|e| format!("{e:#}"))
-                    .unwrap_or_default();
-                tracing::error!(
-                    error,
-                    "the grants couldn't be read: every boss here is paused until Desk clears it"
-                );
-                run.paused = Some(Paused {
-                    at: Utc::now(),
-                    from: "engine".into(),
-                });
-            }
+        if let Err(e) = self.grants_read().await {
+            tracing::error!(
+                error = format!("{e:#}"),
+                "the grants couldn't be read: every boss here is paused until Desk clears it"
+            );
+            self.0.grants.lock().paused.get_or_insert_with(|| Paused {
+                at: Utc::now(),
+                from: "engine".into(),
+            });
         }
+    }
+
+    async fn grants_read(&self) -> eyre::Result<()> {
+        let grants = self.0.store.boss_grants().await?;
+        let engine = self.0.store.boss_engine().await?;
+        let mut run = self.0.grants.lock();
+        run.grants = grants.into_iter().map(|g| (g.group.clone(), g)).collect();
+        if engine.paused {
+            run.paused.get_or_insert_with(|| Paused {
+                at: engine.paused_at.unwrap_or_else(Utc::now),
+                from: engine.paused_from.unwrap_or_else(|| "desk".into()),
+            });
+        }
+        run.since = engine.grants_since;
+        run.loaded = true;
+        Ok(())
+    }
+
+    /// Before a write over the kept grants: they were read, or are read now.
+    async fn grants_loaded(&self) -> Result<(), DeskError> {
+        if self.0.grants.lock().loaded {
+            return Ok(());
+        }
+        self.grants_read().await.map_err(|e| {
+            tracing::error!(error = format!("{e:#}"), "the grants still can't be read");
+            DeskError::Conflict(
+                "This engine can't read the grants it keeps, so it takes no new one: its bosses \
+                 stay paused."
+                    .into(),
+            )
+        })
     }
 
     /// Whether this machine's sessions' groups come from its grants: on a
     /// machine (as its helper said) once it was first granted any.
     pub fn stamps_from_grants(&self) -> bool {
-        self.0.opts.bosses.machine && self.0.grants.lock().since.is_some()
+        let run = self.0.grants.lock();
+        // One whose grants couldn't be read is taken to have some.
+        self.0.opts.bosses.machine && (run.since.is_some() || !run.loaded)
     }
 
     /// Why the sidebar can't be changed here, when it can't: on a machine
@@ -248,6 +266,7 @@ impl Desk {
         body: serde_json::Value,
     ) -> Result<GrantWritten, DeskError> {
         let _one = self.0.grant_write.lock().await;
+        self.grants_loaded().await?;
         let mut call = CallRow {
             caller: "desk".into(),
             boss: None,
@@ -344,6 +363,7 @@ impl Desk {
     /// here (on a machine), and it serves no one.
     pub async fn delete_grant(&self, _: Native, group: &str) -> Result<(), DeskError> {
         let _one = self.0.grant_write.lock().await;
+        self.grants_loaded().await?;
         let call = CallRow {
             caller: "desk".into(),
             boss: None,
@@ -394,6 +414,9 @@ impl Desk {
             }
         }
         let _one = self.0.grant_write.lock().await;
+        // Grants that couldn't be read at the start are read now if they
+        // can be, so a stop finds them; if not, the pause still holds.
+        let _ = self.grants_loaded().await;
         let call = CallRow {
             caller: from.as_str().into(),
             boss: None,
@@ -449,6 +472,8 @@ impl Desk {
     /// before it is in force.
     pub async fn clear_bosses_pause(&self, _: Native) -> Result<GrantsView, DeskError> {
         let _one = self.0.grant_write.lock().await;
+        // Never while the grants it would let go on can't be read.
+        self.grants_loaded().await?;
         let call = CallRow {
             caller: "desk".into(),
             boss: None,
@@ -468,10 +493,12 @@ impl Desk {
     /// Puts `id`, about to start here, in `group` by its grant: born in it.
     /// False where the grants don't say this engine's groups.
     pub(super) async fn born_in(&self, id: Uuid, group: &str) -> Result<bool, DeskError> {
-        if !self.stamps_from_grants() {
+        // Ungrouped is where a session is with no grant to say otherwise.
+        if !self.stamps_from_grants() || group == UNGROUPED {
             return Ok(false);
         }
         let _one = self.0.grant_write.lock().await;
+        self.grants_loaded().await?;
         let Some(g) = self.0.grants.lock().grants.get(group).cloned() else {
             return Err(DeskError::NotFound);
         };
