@@ -895,3 +895,159 @@ async fn an_approval_decision_is_a_persons_for_a_request_that_exists() {
     assert_eq!(decide(crate::support::GATEWAY_TOKEN.to_string()).await, 403);
     assert_eq!(decide("not-a-token".to_string()).await, 401);
 }
+
+/// A command Desk sends is answered by the hub itself and kept nowhere: its
+/// turn ends saying it was a command and naming no saved reply, so the Desk
+/// settles it there rather than wait for a kept copy. Unknown commands are
+/// answered at once like any other; a plain message's end says no such thing.
+#[tokio::test]
+async fn a_command_ends_its_desk_turn_as_one_kept_nowhere() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let session = connected["session_id"].as_str().unwrap().to_string();
+    let dm = |content: &str, turn: &str| {
+        json!({"type": "chat", "content": content, "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"},
+                        "message": uuid::Uuid::new_v4()}})
+    };
+
+    for (i, (content, says)) in [
+        ("cmd: status", "Model"),
+        ("/status", "Model"),
+        ("/help", "cmd: skills"),
+        ("/clear", ""),
+        ("/skills", ""),
+        ("/new", ""),
+        ("/compact", ""),
+        ("/model", "Current"),
+        (
+            "/stauts",
+            "Unknown command. Did you mean `/status`? Type `/help`",
+        ),
+        ("/sitrep", "Model"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let turn = format!("ref-cmd-{i}");
+        send(&mut desk, dm(content, &turn)).await;
+        let frames = frames_until(&mut desk, "turn_end").await;
+        let end = frames.last().unwrap();
+        assert_eq!(
+            (&end["turn_ref"], &end["command"]),
+            (&json!(turn), &json!(true)),
+            "{content}: {frames:?}"
+        );
+        assert!(end.get("id").is_none(), "{content} saved nothing: {end}");
+        let reply = frames
+            .iter()
+            .find(|f| f["type"] == "message")
+            .unwrap_or_else(|| panic!("{content} is answered: {frames:?}"));
+        assert_eq!(reply["turn_ref"], json!(turn), "{content}: {reply}");
+        let text = reply["content"].as_str().unwrap();
+        assert!(!text.is_empty() && text.contains(says), "{content}: {text}");
+    }
+    let kept = service
+        .sessions
+        .get(&session)
+        .unwrap()
+        .map(|s| s.messages.len())
+        .unwrap_or(0);
+    assert_eq!(kept, 0, "no command, nor its answer, is kept");
+
+    send(&mut desk, dm("hello there", "ref-plain")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let end = frames.last().unwrap();
+    assert!(end.get("command").is_none(), "{end}");
+    assert!(
+        end["id"].is_string(),
+        "a plain turn names its saved reply: {end}"
+    );
+
+    // What Desk's `/` menu offers: every command with its one line.
+    let listed = call(addr, &token, reqwest::Method::GET, "/api/commands", None).await;
+    let status = listed["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "status")
+        .expect("status is listed");
+    assert_eq!(status["aliases"], json!(["s"]), "{status}");
+    assert!(status["summary"].as_str().is_some_and(|s| !s.is_empty()));
+    let refused = reqwest::Client::new()
+        .get(format!("http://{addr}/api/commands"))
+        .bearer_auth("not-a-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let anonymous = reqwest::get(format!("http://{addr}/api/commands"))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // A path-like word near no command is the agent's to read, kept as asked.
+    send(&mut desk, dm("/tmp", "ref-path")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let end = frames.last().unwrap();
+    assert!(
+        end.get("command").is_none() && end["id"].is_string(),
+        "{end}"
+    );
+}
+
+/// The same DM message sent again under its own id (Desk's Retry) is not
+/// asked twice once its turn answered it: the second turn just ends, and
+/// the model is not asked again.
+#[tokio::test]
+async fn a_dm_message_sent_again_under_its_id_is_asked_once() {
+    let data = tempfile::tempdir().unwrap();
+    let (_service, llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", _service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, _) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let id = uuid::Uuid::new_v4();
+    let dm = |turn: &str| {
+        json!({"type": "chat", "content": "deploy it", "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "message": id}})
+    };
+    send(&mut desk, dm("ref-1")).await;
+    let first = frames_until(&mut desk, "turn_end").await;
+    assert!(first.last().unwrap()["id"].is_string(), "{first:?}");
+    let asked = llm.received_requests().await.unwrap().len();
+    send(&mut desk, dm("ref-2")).await;
+    let again = frames_until(&mut desk, "turn_end").await;
+    assert_eq!(again.len(), 1, "only its end: {again:?}");
+    assert_eq!(again[0]["turn_ref"], "ref-2");
+    assert_eq!(llm.received_requests().await.unwrap().len(), asked);
+}
+
+/// A follow-up taken into the running turn is said to be, under its own
+/// turn's ref, so the Desk that sent it knows it got there.
+#[tokio::test]
+async fn a_follow_up_taken_into_the_running_turn_is_named_by_its_turn() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        crate::support::agent_on_slow_mock_llm(data.path(), std::time::Duration::from_secs(2))
+            .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, _) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let dm = |content: &str, turn: &str| {
+        json!({"type": "chat", "content": content, "turn_ref": turn,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"},
+                        "message": uuid::Uuid::new_v4()}})
+    };
+    send(&mut desk, dm("deploy it", "ref-a")).await;
+    let typing = next_frame(&mut desk).await;
+    assert_eq!(typing["turn_ref"], "ref-a", "{typing}");
+    send(&mut desk, dm("and tag it", "ref-b")).await;
+    let frames = frames_until(&mut desk, "injected").await;
+    assert_eq!(frames.last().unwrap()["turn_ref"], "ref-b", "{frames:?}");
+}

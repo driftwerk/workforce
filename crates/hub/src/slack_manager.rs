@@ -2559,7 +2559,7 @@ pub fn spawn_slack_dispatch_loop(
 
                     // Slash commands are parsed before tokenization so a
                     // future `/secret <path> <value>` can receive cleartext.
-                    let is_slash_command = crate::commands::parse_command(&text).is_some();
+                    let is_slash_command = crate::commands::runs_raw(&text);
 
                     // Tokenize before any dispatch route so the cc, claude-chat,
                     // and agent paths all see the same marker-substituted text.
@@ -3404,7 +3404,7 @@ pub fn spawn_slack_dispatch_loop(
                             // attribution and trust) — both interrupt instead.
                             if held.pending
                                 && held.user_id == user
-                                && crate::commands::parse_command(&text).is_none()
+                                && !crate::commands::runs_raw(&text)
                             {
                                 // Same defence-in-depth the primary path gets in
                                 // `process_message_with_progress`: never let a

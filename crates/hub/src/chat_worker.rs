@@ -167,9 +167,17 @@ async fn process_chat_request(
 ) {
     let progress_subject = workforce_nats::subjects::agent_progress(agent_id, &request.session_id);
     let desk = request.desk.clone();
+    let asked = request.content.clone();
     let (session_id, tail, live) = run_chat_turn(&nats, &progress_subject, &service, request).await;
+    // A turn refused as busy ran nothing, so it was no command.
+    let ran = live.as_ref().map(|_| asked.as_str());
     let end = desk.as_ref().map(|desk| {
-        ChatProgress::TurnEnd(crate::desk_surface::turn_end(&service, &session_id, desk))
+        ChatProgress::TurnEnd(crate::desk_surface::turn_end(
+            &service,
+            &session_id,
+            desk,
+            ran,
+        ))
     });
     for progress in closing(tail, end, session_id) {
         publish_progress(&nats, &progress_subject, progress).await;
@@ -651,6 +659,7 @@ mod after_answer_tests {
         let end = ChatProgress::TurnEnd(workforce_common::channels::desk::TurnEnd {
             turn_ref: Some("ref-1".into()),
             reply_id: None,
+            command: false,
         });
         assert_eq!(
             kinds(closing(Vec::new(), Some(end), "s-1".into())),
