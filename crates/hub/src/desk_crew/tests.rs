@@ -220,6 +220,7 @@ async fn desk_running(
             account_keys: None,
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
+            bosses: Default::default(),
         },
         floor,
         CancellationToken::new(),

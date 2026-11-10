@@ -640,7 +640,19 @@ fn options(config: &WorkforceConfig) -> Options {
             machine: may_be_machine(desk),
             brief_max_tokens: desk.memory.brief_max_tokens,
         },
+        bosses: workforce_desk::grant::BossOptions {
+            machine: is_machine(desk),
+            grant_hours: desk.bosses.grant_hours,
+        },
     }
+}
+
+/// Whether Desk's helper said this hub is a machine's (`[desk] machine =
+/// true`), which is when its grants say its sessions' groups. Unlike
+/// [`may_be_machine`], unset is not a machine here: a grant must never
+/// rewrite the person's own sidebar.
+fn is_machine(desk: &workforce_common::settings::DeskConfig) -> bool {
+    desk.machine == Some(true)
 }
 
 /// Whether this hub might be a machine's: unless Desk's helper said it is
@@ -916,6 +928,26 @@ mod tests {
         for (toml, machine) in cases {
             assert_eq!(super::may_be_machine(&parse(toml)), machine, "{toml}");
         }
+    }
+
+    /// Grants say a hub's sessions' groups only where the helper wrote
+    /// `machine = true`: an unknown hub keeps its own sidebar.
+    #[test]
+    fn grants_say_the_groups_only_of_a_hub_the_helper_said_is_a_machine() {
+        let options = |toml: &str| {
+            super::options(
+                &toml::from_str::<workforce_common::settings::WorkforceConfig>(toml).unwrap(),
+            )
+            .bosses
+        };
+        assert!(options("[desk]\nmachine = true\n").machine);
+        assert!(!options("[desk]\nmachine = false\n").machine);
+        assert!(!options("[desk]\n").machine, "unset is not a machine here");
+        assert_eq!(options("[desk]\n").grant_hours, 72);
+        assert_eq!(
+            options("[desk.bosses]\ngrant_hours = 336\n").grant_hours,
+            336
+        );
     }
 
     /// Moves (preview and commit) are the hub holder's alone: an
