@@ -8,7 +8,7 @@ use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::grant::{BossRef, Grant, Level, Sees, Stopped, StoppedFrom};
+use crate::grant::{BossRef, Floor, Grant, Level, Sees, Stopped, StoppedFrom};
 use crate::service::{Layout, UNGROUPED};
 use crate::store::DeskStore;
 
@@ -46,6 +46,9 @@ pub struct CallRow {
 pub struct Projection<'a> {
     pub layout: &'a Layout,
     pub named: Vec<(Uuid, String)>,
+    /// Every session the grants name after the write, with its group: where
+    /// an old group's budgets go.
+    pub all: Vec<(Uuid, String)>,
     /// Every grant's group after the write: rows already in one are never
     /// restamped.
     pub granted: Vec<String>,
@@ -122,7 +125,8 @@ async fn upsert(tx: &tokio_postgres::Transaction<'_>, g: &Grant) -> Result<()> {
                recall = EXCLUDED.recall, folders = EXCLUDED.folders, repos = EXCLUDED.repos, \
                members = EXCLUDED.members, born = EXCLUDED.born, act = EXCLUDED.act, \
                stopped_at = EXCLUDED.stopped_at, stopped_from = EXCLUDED.stopped_from, \
-               issued_at = EXCLUDED.issued_at, expires_at = EXCLUDED.expires_at"
+               issued_at = EXCLUDED.issued_at, expires_at = EXCLUDED.expires_at, \
+               deleted_at = NULL"
         ),
         &[
             &g.group,
@@ -177,7 +181,9 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                &format!("SELECT {COLUMNS} FROM boss_grants ORDER BY group_id"),
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_grants WHERE deleted_at IS NULL ORDER BY group_id"
+                ),
                 &[],
             )
             .await
@@ -185,6 +191,70 @@ impl DeskStore {
             .iter()
             .map(grant_of)
             .collect()
+    }
+
+    /// What deleted grants (and stops of groups with no grant) left: each
+    /// group's revision and stop.
+    pub async fn boss_grant_floors(&self) -> Result<Vec<(String, Floor)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT group_id, revision, stopped_at, stopped_from FROM boss_grants \
+                 WHERE deleted_at IS NOT NULL",
+                &[],
+            )
+            .await
+            .context("reading the deleted grants")?
+            .iter()
+            .map(|r| {
+                let at: Option<DateTime<Utc>> = r.try_get(2)?;
+                let from: Option<String> = r.try_get(3)?;
+                Ok((
+                    r.try_get(0)?,
+                    Floor {
+                        revision: r.try_get(1)?,
+                        stopped: at.map(|at| Stopped {
+                            at,
+                            from: from
+                                .as_deref()
+                                .and_then(StoppedFrom::parse)
+                                .unwrap_or(StoppedFrom::Machine),
+                        }),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Stops each group's grant, or, for a group with none, leaves a stop a
+    /// later grant of it keeps; a grant stopped already keeps its first
+    /// stop. With `call`'s audit when given, even when nothing changed.
+    pub async fn stop_grants(
+        &self,
+        stops: &[(String, Stopped)],
+        call: Option<&CallRow>,
+    ) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        for (group, s) in stops {
+            tx.execute(
+                "INSERT INTO boss_grants (group_id, name, revision, grant_version, level, sees, \
+                   stopped_at, stopped_from, issued_at, expires_at, deleted_at) \
+                 VALUES ($1, $1, 0, 1, 'watch', 'status', $2, $3, $2, $2, $2) \
+                 ON CONFLICT (group_id) DO UPDATE SET \
+                   stopped_from = CASE WHEN boss_grants.stopped_at IS NULL \
+                     THEN EXCLUDED.stopped_from ELSE boss_grants.stopped_from END, \
+                   stopped_at = COALESCE(boss_grants.stopped_at, EXCLUDED.stopped_at)",
+                &[group, &s.at, &s.from.as_str()],
+            )
+            .await
+            .context("keeping a stop")?;
+        }
+        if let Some(call) = call {
+            audit(&tx, call).await?;
+        }
+        tx.commit().await.context("keeping the stops")?;
+        Ok(())
     }
 
     /// The engine's switches for bosses.
@@ -211,7 +281,7 @@ impl DeskStore {
     pub async fn write_grants(
         &self,
         put: &[Grant],
-        delete: Option<&str>,
+        delete: Option<(&str, Option<Stopped>)>,
         projection: Option<Projection<'_>>,
         call: &CallRow,
     ) -> Result<Written> {
@@ -220,10 +290,19 @@ impl DeskStore {
         for g in put {
             upsert(&tx, g).await?;
         }
-        if let Some(group) = delete {
-            tx.execute("DELETE FROM boss_grants WHERE group_id = $1", &[&group])
-                .await
-                .context("deleting a grant")?;
+        if let Some((group, stopped)) = delete {
+            // What is left keeps its revision and its stop.
+            let at = stopped.map(|s| s.at);
+            let from = stopped.map(|s| s.from.as_str());
+            tx.execute(
+                "UPDATE boss_grants SET deleted_at = now(), members = '{}', born = '{}', \
+                   stopped_from = CASE WHEN stopped_at IS NULL THEN $3 ELSE stopped_from END, \
+                   stopped_at = COALESCE(stopped_at, $2) \
+                 WHERE group_id = $1",
+                &[&group, &at, &from],
+            )
+            .await
+            .context("deleting a grant")?;
         }
         let mut written = Written::default();
         if let Some(p) = projection {
@@ -311,12 +390,7 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
     let was: HashMap<String, String> =
         serde_json::from_value(r.try_get::<_, serde_json::Value>(1)?).unwrap_or_default();
     let ungrouped_boards = crate::service::put_layout_in(tx, p.layout, true).await?;
-    let (sessions, groups): (Vec<Uuid>, Vec<String>) = p
-        .named
-        .iter()
-        .filter(|(_, g)| g != UNGROUPED)
-        .cloned()
-        .unzip();
+    let (sessions, groups): (Vec<Uuid>, Vec<String>) = p.named.iter().cloned().unzip();
     let fresh: Vec<(Uuid, String)> = tx
         .query(
             "INSERT INTO boss_restamped (session, group_id, at) \
@@ -346,38 +420,60 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
     tx.execute("DELETE FROM group_moves WHERE item = ANY($1)", &[&items])
         .await?;
     tx.execute(
-        "UPDATE ledger l SET group_id = r.g FROM UNNEST($1::uuid[], $2::text[]) AS r(s, g) \
+        "UPDATE ledger l SET group_id = NULLIF(r.g, 'ungrouped') \
+         FROM UNNEST($1::uuid[], $2::text[]) AS r(s, g) \
          WHERE l.session = r.s AND l.at < $3 \
+           AND l.group_id IS DISTINCT FROM NULLIF(r.g, 'ungrouped') \
            AND (l.group_id IS NULL OR NOT l.group_id = ANY($4))",
         &[&ids, &to, &since, granted],
     )
     .await
     .context("restamping the ledger")?;
     restamp_memory(tx, &ids, &to, since, granted).await?;
-    // Each old group's budgets go along to every group its sessions went
-    // to, the tighter kept where one is there already: a limit is never
-    // lost on the way.
-    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
-    for (s, g) in &fresh {
-        if let Some(x) = was.get(&crate::service::session_item(*s)) {
-            if x != g && !granted.contains(x) {
-                pairs.insert((x.clone(), g.clone()));
-            }
+    // Each old group's budgets go along to the groups its sessions are in
+    // now, split between them, the stricter kept where one is there
+    // already: a limit is never lost or doubled on the way. A session the
+    // home put in Ungrouped counts toward Desk's own budgets there.
+    let olds: BTreeSet<&String> = fresh
+        .iter()
+        .filter_map(|(s, _)| was.get(&crate::service::session_item(*s)))
+        .filter(|x| !granted.contains(*x))
+        .collect();
+    let (mut xs, mut gs, mut ns) = (Vec::new(), Vec::new(), Vec::new());
+    for x in olds {
+        let to: BTreeSet<&String> = p
+            .all
+            .iter()
+            .filter(|(s, g)| {
+                g != UNGROUPED && g != x && was.get(&crate::service::session_item(*s)) == Some(x)
+            })
+            .map(|(_, g)| g)
+            .collect();
+        let n = to.len() as f64;
+        for g in to {
+            xs.push(x.clone());
+            gs.push(g.clone());
+            ns.push(n);
         }
     }
-    if !pairs.is_empty() {
-        let (xs, gs): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
+    if !xs.is_empty() {
         tx.execute(
             "INSERT INTO budgets (id, scope, group_id, period, unit, amount, warn_at, \
                on_exceed, updated_at) \
-             SELECT DISTINCT ON (p.g, b.scope, b.period, b.unit) gen_random_uuid(), b.scope, \
-               p.g, b.period, b.unit, b.amount, b.warn_at, b.on_exceed, now() \
-             FROM budgets b JOIN UNNEST($1::text[], $2::text[]) AS p(x, g) ON b.group_id = p.x \
-             ORDER BY p.g, b.scope, b.period, b.unit, b.amount \
+             SELECT gen_random_uuid(), b.scope, p.g, b.period, b.unit, MIN(b.amount / p.n), \
+               MIN(b.warn_at), \
+               CASE WHEN bool_or(b.on_exceed = 'pause') THEN 'pause' ELSE MIN(b.on_exceed) END, \
+               now() \
+             FROM budgets b JOIN UNNEST($1::text[], $2::text[], $3::float8[]) AS p(x, g, n) \
+               ON b.group_id = p.x \
+             GROUP BY p.g, b.scope, b.period, b.unit \
              ON CONFLICT ((COALESCE(group_id, '')), scope, period, unit) DO UPDATE SET \
                amount = LEAST(budgets.amount, EXCLUDED.amount), \
-               warn_at = LEAST(budgets.warn_at, EXCLUDED.warn_at), updated_at = now()",
-            &[&xs, &gs],
+               warn_at = LEAST(budgets.warn_at, EXCLUDED.warn_at), \
+               on_exceed = CASE WHEN 'pause' IN (budgets.on_exceed, EXCLUDED.on_exceed) \
+                 THEN 'pause' ELSE budgets.on_exceed END, \
+               updated_at = now()",
+            &[&xs, &gs, &ns],
         )
         .await
         .context("taking the old groups' budgets along")?;
@@ -400,8 +496,10 @@ async fn restamp_memory(
 ) -> Result<()> {
     let pick = |table: &str, at: &str| {
         format!(
-            "SELECT m.id FROM {table} m JOIN UNNEST($1::uuid[]) AS r(s) ON m.session = r.s \
-             WHERE m.{at} < $2 AND (m.group_id IS NULL OR NOT m.group_id = ANY($3))"
+            "SELECT m.id FROM {table} m JOIN UNNEST($1::uuid[], $4::text[]) AS r(s, g) \
+               ON m.session = r.s \
+             WHERE m.{at} < $2 AND m.group_id IS DISTINCT FROM NULLIF(r.g, 'ungrouped') \
+               AND (m.group_id IS NULL OR NOT m.group_id = ANY($3))"
         )
     };
     let moving = |table: &str| {
@@ -409,7 +507,8 @@ async fn restamp_memory(
             "WITH old AS (SELECT m.id, m.group_id AS was, r.g FROM {table} m \
                JOIN UNNEST($1::uuid[], $2::text[]) AS r(s, g) ON m.session = r.s \
                WHERE m.id = ANY($3)) \
-             UPDATE {table} m SET group_id = old.g, indexed_at = NULL FROM old \
+             UPDATE {table} m SET group_id = NULLIF(old.g, 'ungrouped'), indexed_at = NULL \
+             FROM old \
              WHERE m.id = old.id RETURNING m.id, old.was"
         )
     };
@@ -427,7 +526,7 @@ async fn restamp_memory(
         ),
     ] {
         let rows: Vec<Uuid> = tx
-            .query(&pick(table, at), &[&ids, &since, &granted])
+            .query(&pick(table, at), &[&ids, &since, &granted, &to])
             .await
             .with_context(|| format!("finding {table} to restamp"))?
             .iter()
@@ -454,9 +553,11 @@ async fn restamp_memory(
     // session's least read old one was, so nothing is noted twice there.
     tx.execute(
         "INSERT INTO memory_derive_reads (session, group_key, derived_to) \
-         SELECT r.s, r.g, MIN(d.derived_to) FROM UNNEST($1::uuid[], $2::text[]) AS r(s, g) \
-         JOIN memory_derive_reads d ON d.session = r.s AND d.group_key <> r.g \
-         GROUP BY r.s, r.g \
+         SELECT r.s, r.k, MIN(d.derived_to) FROM (SELECT s, \
+             CASE WHEN g = 'ungrouped' THEN '' ELSE g END AS k \
+             FROM UNNEST($1::uuid[], $2::text[]) AS u(s, g)) r \
+         JOIN memory_derive_reads d ON d.session = r.s AND d.group_key <> r.k \
+         GROUP BY r.s, r.k \
          ON CONFLICT (session, group_key) DO UPDATE \
            SET derived_to = GREATEST(memory_derive_reads.derived_to, EXCLUDED.derived_to)",
         &[&ids, &to],

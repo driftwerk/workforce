@@ -26,7 +26,11 @@ CREATE TABLE boss_grants (
     stopped_at    TIMESTAMPTZ,
     stopped_from  TEXT,                   -- desk | machine
     issued_at     TIMESTAMPTZ NOT NULL,
-    expires_at    TIMESTAMPTZ NOT NULL
+    expires_at    TIMESTAMPTZ NOT NULL,
+    -- Set when the home deleted it (or a stop came for a group with no
+    -- grant): what is left holds its revision and its stop, which a new
+    -- grant of the group must pass and keeps.
+    deleted_at    TIMESTAMPTZ
 );
 
 -- Each session whose rows were restamped from a machine's old layout to its

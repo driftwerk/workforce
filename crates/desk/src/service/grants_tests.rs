@@ -164,6 +164,14 @@ async fn a_machines_rows_follow_its_grants_and_the_first_restamps_them_once() {
             &[],
         )
         .await;
+        // Acme had a looser budget of its own here already.
+        sql(
+            &d,
+            "INSERT INTO budgets (id, scope, group_id, period, unit, amount, on_exceed, updated_at) \
+             VALUES (gen_random_uuid(), 'desk', 'g-acme', 'day', 'usd', 100, 'warn', now())",
+            &[],
+        )
+        .await;
         // Before any grant, the machine is as it was.
         assert!(!d.stamps_from_grants());
 
@@ -227,7 +235,8 @@ async fn a_machines_rows_follow_its_grants_and_the_first_restamps_them_once() {
             .await
             .unwrap()
             .query_one(
-                "SELECT COUNT(*) FROM budgets WHERE group_id = 'g-acme' AND amount = 25",
+                "SELECT COUNT(*) FROM budgets WHERE group_id = 'g-acme' AND amount = 25 \
+                 AND on_exceed = 'pause'",
                 &[],
             )
             .await
@@ -251,6 +260,29 @@ async fn a_machines_rows_follow_its_grants_and_the_first_restamps_them_once() {
         assert_eq!(
             groups_of(&d, "ledger", loose).await,
             [Some("g-globex".into())]
+        );
+
+        // Old Acme's sessions are in two groups now: its budget is split
+        // between them, never doubled.
+        let amounts: Vec<(String, f64)> = d
+            .store()
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query(
+                "SELECT group_id, amount FROM budgets WHERE group_id IN ('g-acme', 'g-globex') \
+                 ORDER BY group_id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(
+            amounts,
+            [("g-acme".to_string(), 12.5), ("g-globex".to_string(), 12.5)]
         );
 
         // Taken out of every grant, nothing written before goes anywhere.
@@ -546,7 +578,10 @@ async fn grants_that_cant_be_read_pause_the_bosses_and_take_no_new_one() {
         assert!(e.to_string().contains("can't read the grants"), "{e}");
         assert!(d.clear_bosses_pause(native()).await.is_err());
         assert!(d.bosses_paused());
-        // A stop still works.
+        // A stop still works, one group's too: kept as the pause.
+        d.stop_bosses(native(), Some("g-acme"), StoppedFrom::Machine)
+            .await
+            .unwrap();
         d.stop_bosses(native(), None, StoppedFrom::Machine)
             .await
             .unwrap();
@@ -579,6 +614,119 @@ async fn on_a_granted_machine_only_a_grant_moves_a_session_between_groups() {
             .unwrap();
         // Ungrouped is where a session starts with no grant to say otherwise.
         assert!(!d.born_in(Uuid::new_v4(), UNGROUPED).await.unwrap());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_deleted_grant_keeps_its_revision_and_its_stop() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool.clone(), dir.path(), true).await;
+        let s = Uuid::new_v4();
+        put(&d, "g-acme", body(3, "Acme", &[s])).await;
+        d.stop_bosses(native(), Some("g-acme"), StoppedFrom::Machine)
+            .await
+            .unwrap();
+        d.delete_grant(native(), "g-acme").await.unwrap();
+        // No way back to it at its revision or below, after a restart too.
+        let d = engine(pool, dir.path(), true).await;
+        for rev in [1, 3] {
+            let e = d
+                .put_grant(native(), "g-acme", body(rev, "Acme", &[s]))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, DeskError::Conflict(_)), "{e}");
+        }
+        // A newer one keeps the stop until Desk resumes it.
+        put(&d, "g-acme", body(4, "Acme", &[s])).await;
+        assert!(d
+            .grant_live("g-acme")
+            .unwrap_err()
+            .contains("stopped on this machine"));
+        let mut resume = body(5, "Acme", &[s]);
+        resume["resume"] = json!(true);
+        put(&d, "g-acme", resume).await;
+        assert!(d.grant_live("g-acme").is_ok());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_racing_a_delete_or_ahead_of_any_grant_is_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        put(&d, "g-acme", body(1, "Acme", &[])).await;
+        // A stop in force but not yet written when the delete runs.
+        let stop = crate::grant::Stopped {
+            at: Utc::now(),
+            from: StoppedFrom::Machine,
+        };
+        d.0.grants.lock().stopping.insert("g-acme".into(), stop);
+        d.delete_grant(native(), "g-acme").await.unwrap();
+        put(&d, "g-acme", body(2, "Acme", &[])).await;
+        assert!(d.grant_live("g-acme").is_err(), "the stop came along");
+
+        // A stop of a group with no grant waits for its first.
+        let view = d
+            .stop_bosses(native(), Some("g-globex"), StoppedFrom::Desk)
+            .await
+            .unwrap();
+        assert!(view.left["g-globex"].stopped.is_some());
+        put(&d, "g-globex", body(1, "Globex", &[])).await;
+        assert!(d
+            .grant_live("g-globex")
+            .unwrap_err()
+            .contains("stopped in Desk"));
+
+        // Stopping what is stopped already is still audited.
+        let before = d.store().boss_calls_latest(100).await.unwrap();
+        d.stop_bosses(native(), Some("g-globex"), StoppedFrom::Desk)
+            .await
+            .unwrap();
+        let after = d.store().boss_calls_latest(100).await.unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(after[0].0, "bosses.stop");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_the_home_puts_in_ungrouped_is_restamped_out_of_its_old_group() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let s = Uuid::new_v4();
+        old_layout(&d, &[s]).await;
+        rows_of(&d, s, "old-acme", "k-1").await;
+        let mut ungrouped = body(1, "Ungrouped", &[s]);
+        ungrouped["boss"] = json!("local:desk");
+        let w = put(&d, UNGROUPED, ungrouped).await;
+        assert_eq!(w.restamped, 1);
+        assert_eq!(groups_of(&d, "ledger", s).await, [None]);
+        assert_eq!(groups_of(&d, "memory_exchanges", s).await, [None]);
+        assert_eq!(d.group_of_member(&session_item(s)), None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_that_didnt_start_is_born_in_no_grant() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        put(&d, "g-acme", body(1, "Acme", &[])).await;
+        let s = Uuid::new_v4();
+        assert!(d.born_in(s, "g-acme").await.unwrap());
+        d.born_undo(s).await;
+        assert!(d
+            .grant_view(&native(), "g-acme")
+            .unwrap()
+            .grant
+            .born
+            .is_empty());
+        assert_eq!(d.group_of_member(&session_item(s)), None);
     })
     .await;
 }

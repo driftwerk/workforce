@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{session_item, Desk, DeskError, UNGROUPED};
 use crate::grant::{
-    self, Change, Envelope, Grant, GrantPut, NotLive, Refusal, Stopped, StoppedFrom,
+    self, Change, Envelope, Floor, Grant, GrantPut, NotLive, Refusal, Stopped, StoppedFrom,
 };
 use crate::grant_store::{CallRow, Projection};
 use crate::model::DeskEvent;
@@ -43,10 +43,12 @@ pub struct Paused {
 /// The grants as this engine holds them.
 #[derive(Debug, Default)]
 pub(crate) struct GrantsRun {
-    grants: BTreeMap<String, Grant>,
+    pub(super) grants: BTreeMap<String, Grant>,
+    /// What deleted grants, and stops of groups with no grant, left.
+    pub(super) floors: BTreeMap<String, Floor>,
     /// Stops in force before they are written (they are, under the write
     /// lock, at once).
-    stopping: BTreeMap<String, Stopped>,
+    pub(super) stopping: BTreeMap<String, Stopped>,
     paused: Option<Paused>,
     /// When this machine began taking its sessions' groups from grants.
     since: Option<DateTime<Utc>>,
@@ -74,6 +76,9 @@ pub struct GrantsView {
     /// Whether this machine's sessions' groups come from its grants.
     pub stamps_from_grants: bool,
     pub grants: Vec<GrantView>,
+    /// Groups whose grant was deleted, or that were stopped with none:
+    /// the revision a new grant must pass, and the stop it keeps.
+    pub left: BTreeMap<String, Floor>,
 }
 
 /// What a write of a grant did.
@@ -137,9 +142,11 @@ impl Desk {
 
     async fn grants_read(&self) -> eyre::Result<()> {
         let grants = self.0.store.boss_grants().await?;
+        let floors = self.0.store.boss_grant_floors().await?;
         let engine = self.0.store.boss_engine().await?;
         let mut run = self.0.grants.lock();
         run.grants = grants.into_iter().map(|g| (g.group.clone(), g)).collect();
+        run.floors = floors.into_iter().collect();
         if engine.paused {
             run.paused.get_or_insert_with(|| Paused {
                 at: engine.paused_at.unwrap_or_else(Utc::now),
@@ -226,6 +233,7 @@ impl Desk {
         let run = self.0.grants.lock();
         let now = Utc::now();
         GrantsView {
+            left: run.floors.clone(),
             paused: run.paused.clone(),
             stamps_from_grants: stamps,
             grants: run
@@ -318,6 +326,7 @@ impl Desk {
             let others: Vec<&Grant> = run.grants.values().collect();
             grant::accept(
                 run.grants.get(group),
+                run.floors.get(group),
                 &put,
                 group,
                 &others,
@@ -380,33 +389,47 @@ impl Desk {
             self.audit_refused(call, &why).await;
             return Err(why);
         }
-        self.commit_grants(Vec::new(), Some(group), call).await?;
+        // A stop in force, written or not, stays with what is left.
+        let stopped = {
+            let run = self.0.grants.lock();
+            run.grants
+                .get(group)
+                .and_then(|g| g.stopped)
+                .or_else(|| run.stopping.get(group).copied())
+        };
+        self.commit_grants(Vec::new(), Some((group, stopped)), call)
+            .await?;
         self.0.grants.lock().stopping.remove(group);
         Ok(())
     }
 
     /// Stops `group`'s boss, or with none every boss here and pauses the
     /// engine: in force at once, then written. Nothing the home sends later
-    /// undoes it; only Desk resumes a grant or clears the pause.
+    /// undoes it; only Desk resumes a grant or clears the pause. A group
+    /// with no grant keeps the stop for when it gets one. Where the grants
+    /// can't be read, the stop is kept as the engine's pause.
     pub async fn stop_bosses(
         &self,
         _: Native,
         group: Option<&str>,
         from: StoppedFrom,
     ) -> Result<GrantsView, DeskError> {
+        if group.is_some_and(|g| !grant::group_id_ok(g)) {
+            return Err(DeskError::Invalid("that can't be a group's id".into()));
+        }
         let now = Utc::now();
         let stop = Stopped { at: now, from };
+        let paused = Paused {
+            at: now,
+            from: from.as_str().into(),
+        };
         {
             let mut run = self.0.grants.lock();
-            if group.is_none() && run.paused.is_none() {
-                run.paused = Some(Paused {
-                    at: now,
-                    from: from.as_str().into(),
-                });
+            if group.is_none() {
+                run.paused.get_or_insert_with(|| paused.clone());
             }
             let groups: Vec<String> = match group {
-                Some(g) if run.grants.contains_key(g) => vec![g.to_string()],
-                Some(_) => Vec::new(),
+                Some(g) => vec![g.to_string()],
                 None => run.grants.keys().cloned().collect(),
             };
             for g in groups {
@@ -415,8 +438,8 @@ impl Desk {
         }
         let _one = self.0.grant_write.lock().await;
         // Grants that couldn't be read at the start are read now if they
-        // can be, so a stop finds them; if not, the pause still holds.
-        let _ = self.grants_loaded().await;
+        // can be, so a stop finds them; if not, the pause holds it.
+        let loaded = self.grants_loaded().await.is_ok();
         let call = CallRow {
             caller: from.as_str().into(),
             boss: None,
@@ -426,43 +449,69 @@ impl Desk {
             input_hash: hash(group.unwrap_or("").as_bytes()),
             outcome: "ok",
             said: None,
-            result: serde_json::json!({}),
+            result: serde_json::json!({"loaded": loaded}),
         };
-        if let Some(g) = group {
-            if !self.0.grants.lock().grants.contains_key(g) {
-                let why = DeskError::NotFound;
-                self.audit_refused(call, &why).await;
-                return Err(why);
-            }
-        }
-        if group.is_none() {
+        let pausing = group.is_none() || !loaded;
+        if pausing {
+            self.0
+                .grants
+                .lock()
+                .paused
+                .get_or_insert_with(|| paused.clone());
             self.0
                 .store
                 .put_bosses_paused(true, Some(from.as_str()), &call)
                 .await?;
+            // A clear that ran meanwhile can't leave it let go here while it
+            // is kept paused.
+            self.0.grants.lock().paused.get_or_insert(paused);
         }
-        let writes: Vec<Grant> = {
+        let stops: Vec<(String, Stopped)> = {
             let run = self.0.grants.lock();
-            run.grants
-                .values()
-                .filter(|g| group.is_none_or(|one| g.group == one))
-                .filter(|g| g.stopped.is_none())
-                .map(|g| grant::stopped(g, run.stopping.get(&g.group).map_or(now, |s| s.at), from))
-                .collect()
+            match group {
+                Some(g) => vec![(g.to_string(), run.stopping.get(g).copied().unwrap_or(stop))],
+                None => run
+                    .grants
+                    .keys()
+                    .map(|g| (g.clone(), run.stopping.get(g).copied().unwrap_or(stop)))
+                    .collect(),
+            }
         };
-        if !writes.is_empty() {
-            self.commit_grants(writes, None, call).await?;
+        let kept = self
+            .0
+            .store
+            .stop_grants(&stops, (!pausing).then_some(&call))
+            .await;
+        if let Err(e) = kept {
+            // The pause, kept, holds what couldn't be written.
+            if pausing {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "a stop is kept as the engine's pause"
+                );
+                return Ok(self.grants_view(&Native::routes()));
+            }
+            return Err(e.into());
         }
         {
             let mut run = self.0.grants.lock();
-            let done: Vec<String> = run
-                .stopping
-                .keys()
-                .filter(|g| run.grants.get(*g).is_none_or(|x| x.stopped.is_some()))
-                .cloned()
-                .collect();
-            for g in done {
-                run.stopping.remove(&g);
+            for (g, s) in &stops {
+                match run.grants.get_mut(g) {
+                    Some(x) => {
+                        x.stopped.get_or_insert(*s);
+                    }
+                    None => {
+                        run.floors
+                            .entry(g.clone())
+                            .or_insert(Floor {
+                                revision: 0,
+                                stopped: None,
+                            })
+                            .stopped
+                            .get_or_insert(*s);
+                    }
+                }
+                run.stopping.remove(g);
             }
         }
         Ok(self.grants_view(&Native::routes()))
@@ -518,34 +567,86 @@ impl Desk {
         Ok(true)
     }
 
+    /// `id` didn't start: it is born in no grant.
+    pub(super) async fn born_undo(&self, id: Uuid) {
+        if !self.0.opts.bosses.machine {
+            return;
+        }
+        let _one = self.0.grant_write.lock().await;
+        let Some(mut g) = self
+            .0
+            .grants
+            .lock()
+            .grants
+            .values()
+            .find(|g| g.born.contains(&id))
+            .cloned()
+        else {
+            return;
+        };
+        g.born.remove(&id);
+        let call = CallRow {
+            caller: "engine".into(),
+            boss: None,
+            group: Some(g.group.clone()),
+            tool: "grant.unborn",
+            input: "{}".into(),
+            input_hash: hash(id.as_bytes()),
+            outcome: "ok",
+            said: None,
+            result: serde_json::json!({}),
+        };
+        if let Err(e) = self.commit_grants(vec![g], None, call).await {
+            tracing::warn!(%id, error = %e, "a session that didn't start stays born in its grant");
+        }
+    }
+
     /// Writes `writes` and `delete` with `call`'s audit; on a machine, with
     /// the sidebar its grants now make and each newly named session's first
     /// restamp. How many sessions were restamped.
     async fn commit_grants(
         &self,
         writes: Vec<Grant>,
-        delete: Option<&str>,
+        delete: Option<(&str, Option<Stopped>)>,
         call: CallRow,
     ) -> Result<usize, DeskError> {
         let mut next = self.0.grants.lock().grants.clone();
         for g in &writes {
             next.insert(g.group.clone(), g.clone());
         }
-        if let Some(d) = delete {
-            next.remove(d);
-        }
+        let floor = delete.and_then(|(d, stopped)| {
+            next.remove(d).map(|g| {
+                (
+                    d.to_string(),
+                    Floor {
+                        revision: g.revision,
+                        stopped: g.stopped.or(stopped),
+                    },
+                )
+            })
+        });
+        let keep = |run: &mut GrantsRun, next: BTreeMap<String, Grant>| {
+            for g in &writes {
+                run.floors.remove(&g.group);
+            }
+            if let Some((d, f)) = &floor {
+                run.floors.insert(d.clone(), *f);
+            }
+            run.grants = next;
+        };
         if !self.0.opts.bosses.machine {
             self.0
                 .store
                 .write_grants(&writes, delete, None, &call)
                 .await?;
-            self.0.grants.lock().grants = next;
+            keep(&mut self.0.grants.lock(), next);
             return Ok(0);
         }
         let one = self.0.layout_write.lock().await;
         let before = self.layout();
         let layout = grant::layout_of(next.values(), &before).checked_except(&Default::default())?;
         let named: Vec<(Uuid, String)> = grant::membership(writes.iter()).into_iter().collect();
+        let all: Vec<(Uuid, String)> = grant::membership(next.values()).into_iter().collect();
         let granted: Vec<String> = next.keys().filter(|g| *g != UNGROUPED).cloned().collect();
         let written = self
             .0
@@ -556,6 +657,7 @@ impl Desk {
                 Some(Projection {
                     layout: &layout,
                     named,
+                    all,
                     granted,
                 }),
                 &call,
@@ -563,7 +665,7 @@ impl Desk {
             .await?;
         {
             let mut run = self.0.grants.lock();
-            run.grants = next;
+            keep(&mut run, next);
             run.since.get_or_insert_with(Utc::now);
         }
         self.0.state.lock().layout = layout.clone();

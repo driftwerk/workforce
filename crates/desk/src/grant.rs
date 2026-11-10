@@ -30,6 +30,9 @@ pub const GRANT_VERSION: u32 = 1;
 pub const DEFAULT_HOURS: u32 = 72;
 /// The longest a grant may last: 14 days.
 pub const MAX_HOURS: u32 = 336;
+/// The highest revision a grant may have: what a JavaScript number holds
+/// exactly, so Desk and the engine never disagree on one.
+pub const MAX_REVISION: i64 = 1 << 53;
 /// The most sessions one grant may name.
 pub const MAX_MEMBERS: usize = 5000;
 const MAX_NAME: usize = 200;
@@ -351,6 +354,11 @@ impl GrantPut {
         if self.revision < 1 {
             return Err(invalid("a grant's revision starts at 1"));
         }
+        if self.revision > MAX_REVISION {
+            return Err(invalid(format!(
+                "a grant's revision is at most {MAX_REVISION}"
+            )));
+        }
         let name = self.name.trim();
         if name.is_empty() || name.len() > MAX_NAME {
             return Err(invalid("a grant needs its group's name"));
@@ -370,8 +378,10 @@ impl GrantPut {
             ));
         }
         check_list("folders", &self.folders)?;
-        if let Some(f) = self.folders.iter().find(|f| !f.starts_with('/')) {
-            return Err(invalid(format!("{f:?} isn't a whole path")));
+        if let Some(f) = self.folders.iter().find(|f| !canonical(f)) {
+            return Err(invalid(format!(
+                "{f:?} isn't a whole path written plainly (no `.`, `..`, `//` or trailing `/`)"
+            )));
         }
         check_list("repositories", &self.repos)?;
         if !self.act.is_object() {
@@ -412,16 +422,40 @@ impl GrantPut {
     }
 }
 
-/// How many hours `asked` gives, or why it can't.
-pub fn hours_of(asked: Option<u32>, default: u32) -> Result<u32, Refusal> {
-    let h = asked.unwrap_or(default);
-    if (1..=MAX_HOURS).contains(&h) {
+/// Whether `f` is a whole path written plainly: from `/`, with no `.` or
+/// `..` part, no empty part and no trailing `/`, so a folder names one
+/// place however it is compared.
+pub fn canonical(f: &str) -> bool {
+    f.starts_with('/')
+        && f.len() > 1
+        && f[1..]
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// How many hours `asked` gives, or why it can't: the engine's own
+/// `grant_hours` is both what it gives unasked and the most it gives.
+pub fn hours_of(asked: Option<u32>, ceiling: u32) -> Result<u32, Refusal> {
+    let ceiling = ceiling.clamp(1, MAX_HOURS);
+    let h = asked.unwrap_or(ceiling);
+    if (1..=ceiling).contains(&h) {
         Ok(h)
     } else {
         Err(invalid(format!(
-            "a grant lasts 1 to {MAX_HOURS} hours (14 days), not {h}"
+            "this engine lets a grant last 1 to {ceiling} hours, not {h}: its [desk.bosses] \
+             grant_hours says so (at most {MAX_HOURS}, 14 days)"
         )))
     }
+}
+
+/// What a deleted grant leaves behind: its revision, which a new grant of
+/// the group must pass, and its stop, which a new grant keeps unless it
+/// says `resume`. A stop of a group with no grant leaves one too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Floor {
+    pub revision: i64,
+    pub stopped: Option<Stopped>,
 }
 
 /// What the home's write `put` for `group` makes of `old`, this engine's
@@ -431,17 +465,18 @@ pub fn hours_of(asked: Option<u32>, default: u32) -> Result<u32, Refusal> {
 /// stop holds until `resume`, and nothing here clears the engine's pause.
 pub fn accept(
     old: Option<&Grant>,
+    floor: Option<&Floor>,
     put: &GrantPut,
     group: &str,
     others: &[&Grant],
     now: DateTime<Utc>,
-    default_hours: u32,
+    ceiling_hours: u32,
 ) -> Result<Accepted, Refusal> {
     if put.grant_version != GRANT_VERSION {
         return Err(invalid(unknown_version(put.grant_version)));
     }
     let boss = put.check(group)?;
-    let hours = hours_of(put.hours, default_hours)?;
+    let hours = hours_of(put.hours, ceiling_hours)?;
     let expires_at = now + Duration::hours(i64::from(hours));
     let members: BTreeSet<Uuid> = put.members.iter().copied().collect();
     let mut taken = Vec::new();
@@ -457,6 +492,17 @@ pub fn accept(
         }
     }
     let Some(old) = old else {
+        // A grant deleted before (or stopped before it was granted) is no
+        // way back to an older one, nor out of its stop.
+        if let Some(f) = floor {
+            if put.revision <= f.revision {
+                return Err(Refusal::Stale { have: f.revision });
+            }
+        }
+        let stopped = match put.resume {
+            true => None,
+            false => floor.and_then(|f| f.stopped),
+        };
         return Ok(Accepted {
             grant: Grant {
                 group: group.into(),
@@ -472,7 +518,7 @@ pub fn accept(
                 members,
                 born: BTreeSet::new(),
                 act: put.act.clone(),
-                stopped: None,
+                stopped,
                 issued_at: now,
                 expires_at,
             },
@@ -713,7 +759,7 @@ mod tests {
     }
 
     fn take(old: Option<&Grant>, p: &GrantPut, now: DateTime<Utc>) -> Result<Accepted, Refusal> {
-        accept(old, p, "g-acme", &[], now, DEFAULT_HOURS)
+        accept(old, None, p, "g-acme", &[], now, DEFAULT_HOURS)
     }
 
     #[test]
@@ -736,7 +782,8 @@ mod tests {
     fn hours_go_to_14_days_and_no_further() {
         let mut p = put(1, &[1]);
         p.hours = Some(336);
-        assert_eq!(take(None, &p, at(0)).unwrap().grant.expires_at, at(336));
+        let g = accept(None, None, &p, "g-acme", &[], at(0), MAX_HOURS).unwrap();
+        assert_eq!(g.grant.expires_at, at(336));
         for bad in [0, 337, u32::MAX] {
             p.hours = Some(bad);
             assert!(
@@ -796,17 +843,85 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_in_one_grant_at_most() {
-        let globex = accept(None, &put(1, &[7]), "g-globex", &[], at(0), 72)
+    fn a_deleted_grant_is_no_way_back_to_an_older_one_nor_out_of_its_stop() {
+        let stop = Stopped {
+            at: at(1),
+            from: StoppedFrom::Desk,
+        };
+        let floor = Floor {
+            revision: 4,
+            stopped: Some(stop),
+        };
+        for rev in [1, 4] {
+            assert_eq!(
+                accept(
+                    None,
+                    Some(&floor),
+                    &put(rev, &[1]),
+                    "g-acme",
+                    &[],
+                    at(2),
+                    72
+                ),
+                Err(Refusal::Stale { have: 4 })
+            );
+        }
+        let g = accept(None, Some(&floor), &put(5, &[1]), "g-acme", &[], at(2), 72)
             .unwrap()
             .grant;
-        let refused = accept(None, &put(1, &[1, 7]), "g-acme", &[&globex], at(0), 72);
+        assert_eq!(g.stopped, Some(stop));
+        let mut resume = put(5, &[1]);
+        resume.resume = true;
+        let g = accept(None, Some(&floor), &resume, "g-acme", &[], at(2), 72)
+            .unwrap()
+            .grant;
+        assert_eq!(live(&g, at(3), false), Ok(()));
+    }
+
+    #[test]
+    fn revisions_folders_and_hours_are_bounded() {
+        let mut p = put(MAX_REVISION + 1, &[1]);
+        assert!(take(None, &p, at(0)).is_err());
+        p.revision = MAX_REVISION;
+        assert!(take(None, &p, at(0)).is_ok());
+        for bad in [
+            "/src/../etc",
+            "/src/./acme",
+            "/src//acme",
+            "/src/acme/",
+            "/",
+            "src",
+        ] {
+            p.folders = vec![bad.into()];
+            assert!(take(None, &p, at(0)).is_err(), "{bad}");
+        }
+        p.folders = vec!["/home/sam/src/acme-api".into()];
+        // The engine's grant_hours is the most it gives.
+        p.hours = Some(100);
+        assert!(accept(None, None, &p, "g-acme", &[], at(0), 72).is_err());
+        assert!(accept(None, None, &p, "g-acme", &[], at(0), 336).is_ok());
+    }
+
+    #[test]
+    fn a_session_is_in_one_grant_at_most() {
+        let globex = accept(None, None, &put(1, &[7]), "g-globex", &[], at(0), 72)
+            .unwrap()
+            .grant;
+        let refused = accept(
+            None,
+            None,
+            &put(1, &[1, 7]),
+            "g-acme",
+            &[&globex],
+            at(0),
+            72,
+        );
         assert!(matches!(refused, Err(Refusal::Conflict(_))), "{refused:?}");
         // One only born there is the home's to place: it moves.
         let mut born = globex.clone();
         born.members.clear();
         born.born.insert(id(7));
-        let a = accept(None, &put(1, &[1, 7]), "g-acme", &[&born], at(0), 72).unwrap();
+        let a = accept(None, None, &put(1, &[1, 7]), "g-acme", &[&born], at(0), 72).unwrap();
         assert_eq!(a.taken, [("g-globex".to_string(), id(7))]);
     }
 
@@ -845,12 +960,12 @@ mod tests {
         assert!(bad(|p| p.boss = Some("allan".into())).is_err());
         assert!(bad(|p| p.boss = Some("remote:driftwerk/".into())).is_err());
         assert!(bad(|p| p.act = serde_json::json!([1])).is_err());
-        assert!(accept(None, &put(1, &[1]), "devbox/g", &[], at(0), 72).is_err());
+        assert!(accept(None, None, &put(1, &[1]), "devbox/g", &[], at(0), 72).is_err());
         let mut remote_ungrouped = put(1, &[1]);
         remote_ungrouped.name = "Ungrouped".into();
-        assert!(accept(None, &remote_ungrouped, UNGROUPED, &[], at(0), 72).is_err());
+        assert!(accept(None, None, &remote_ungrouped, UNGROUPED, &[], at(0), 72).is_err());
         remote_ungrouped.boss = Some("local:desk".into());
-        assert!(accept(None, &remote_ungrouped, UNGROUPED, &[], at(0), 72).is_ok());
+        assert!(accept(None, None, &remote_ungrouped, UNGROUPED, &[], at(0), 72).is_ok());
     }
 
     #[test]
@@ -908,13 +1023,13 @@ mod tests {
     #[test]
     fn a_machines_layout_is_its_grants_and_nothing_of_its_old_groups() {
         let acme = take(None, &put(1, &[1, 2]), at(0)).unwrap().grant;
-        let mut globex = accept(None, &put(1, &[3]), "g-globex", &[], at(0), 72)
+        let mut globex = accept(None, None, &put(1, &[3]), "g-globex", &[], at(0), 72)
             .unwrap()
             .grant;
         globex.name = "Globex".into();
         let mut desk = put(1, &[4]);
         desk.boss = None;
-        let ungrouped = accept(None, &desk, UNGROUPED, &[], at(0), 72)
+        let ungrouped = accept(None, None, &desk, UNGROUPED, &[], at(0), 72)
             .unwrap()
             .grant;
         let before = Layout {

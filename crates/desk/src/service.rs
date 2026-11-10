@@ -2965,6 +2965,7 @@ impl Desk {
             }
         }
         if grouped {
+            self.born_undo(id).await;
             self.drop_from_layout(id).await;
         }
     }
