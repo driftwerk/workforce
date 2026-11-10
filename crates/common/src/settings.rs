@@ -7718,6 +7718,12 @@ impl AgentWorkspaceConfig {
         crate::computer_access::of(self.computer.as_ref())
     }
 
+    /// The folders this agent works in beside its own (`[computer]
+    /// works_in`), or what is wrong with them as written.
+    pub fn works_in(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        crate::computer_access::works_in(self.computer.as_ref())
+    }
+
     /// This agent's connectors, every one where it has no `[skills]`, or
     /// what is wrong with it.
     pub fn connectors(&self) -> Result<crate::connector_binding::ConnectorBinding, String> {

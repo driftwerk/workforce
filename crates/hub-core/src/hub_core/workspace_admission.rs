@@ -130,6 +130,7 @@ impl WorkspaceAdmission {
     fn review(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
         workspace.oversight().map_err(ConfigRefusal::Said)?;
         workspace.computer().map_err(ConfigRefusal::Said)?;
+        self.works_in(workspace)?;
         let connectors = self.connectors(workspace)?;
         let prospective = self
             .prospective(Some(workspace))
@@ -144,6 +145,28 @@ impl WorkspaceAdmission {
             Err(ConfigRefusal::Refused(findings))
         } else {
             Ok(findings)
+        }
+    }
+
+    /// The folders the agent works in, each where an agent may: never `/`,
+    /// a volume, home or above it, nor what is kept from every agent.
+    fn works_in(&self, workspace: &AgentWorkspaceConfig) -> Result<(), ConfigRefusal> {
+        let folders = workspace.works_in().map_err(ConfigRefusal::Said)?;
+        if folders.is_empty() {
+            return Ok(());
+        }
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let withheld = workforce_common::computer_access::withheld_on(
+            std::path::Path::new(&self.config.hub.data_dir),
+            &home,
+        );
+        match folders.iter().find_map(|folder| {
+            workforce_common::computer_access::works_in_refusal(folder, &home, &withheld)
+        }) {
+            Some(refusal) => Err(ConfigRefusal::Said(refusal)),
+            None => Ok(()),
         }
     }
 
@@ -251,6 +274,42 @@ mod tests {
         let unchanged: AgentWorkspaceConfig = AgentWorkspaceConfig::parse("").unwrap();
         assert!(unchanged.computer.is_none());
         assert!(!toml::to_string(&unchanged).unwrap().contains("computer"));
+    }
+
+    #[test]
+    fn works_in_is_admitted_inside_home_and_refused_above_it() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = WorkforceConfig::default();
+        config.hub.data_dir = data.path().join("Desk/hub/data").display().to_string();
+        let admission = WorkspaceAdmission::new(
+            Arc::new(config),
+            "allan",
+            Arc::new(parking_lot::RwLock::new("anthropic".to_string())),
+        );
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let inside = format!("{home}/dev/acme-web");
+        assert!(admission
+            .review_toml(&format!("[computer]\nworks_in = [\"{inside}\"]\n"))
+            .unwrap()
+            .is_empty());
+        for wide in ["/".to_string(), home.clone()] {
+            let e = admission
+                .review_toml(&format!("[computer]\nworks_in = [\"{wide}\"]\n"))
+                .unwrap_err();
+            assert!(e.to_string().contains("too wide"), "{wide} → {e}");
+        }
+        let desk = data.path().join("Desk/hub/data/agents/ben");
+        let e = admission
+            .review_toml(&format!(
+                "[computer]\nworks_in = [\"{}\"]\n",
+                desk.display()
+            ))
+            .unwrap_err();
+        assert!(e.to_string().contains("Desk's own data"), "{e}");
+        let e = admission
+            .review_toml("[computer]\nworks_in = [\"dev/acme\"]\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("full folder path"), "{e}");
     }
 
     /// `[skills]` is checked only where it is read: a `[desk]` hub refuses a

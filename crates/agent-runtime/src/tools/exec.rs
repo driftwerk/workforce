@@ -276,10 +276,18 @@ impl Tool for ExecCommand {
             ));
         }
 
+        // The folders the person gave the agent to work in, when the
+        // computer gate lets this call reach them. No list is no limit, and
+        // stays none.
+        let mut allowed_workdirs = self.allowed_workdirs.clone();
+        if !allowed_workdirs.is_empty() {
+            allowed_workdirs.extend(crate::tools::paths::reached_folders());
+        }
+
         // Tool-layer workdir validation (fast local reject / defence in depth);
         // the daemon is the authoritative enforcer when dispatching.
         if let Some(ref workdir) = input.workdir {
-            if let Err(reason) = validate_workdir(workdir, &self.allowed_workdirs) {
+            if let Err(reason) = validate_workdir(workdir, &allowed_workdirs) {
                 warn!(workdir = %workdir, "Blocked workdir outside allowed paths");
                 return Ok(ToolResult::failure(
                     reason,
@@ -318,7 +326,7 @@ impl Tool for ExecCommand {
             },
             LocalEnv::Allowlisted => EnvMode::Allowlisted,
         };
-        match run_or_dispatch(self.runner.as_ref(), req, &self.allowed_workdirs, local_env).await {
+        match run_or_dispatch(self.runner.as_ref(), req, &allowed_workdirs, local_env).await {
             Ok(outcome) => Ok(assemble_result(outcome, requested_timeout, start)),
             Err(e) => Ok(ToolResult::failure(
                 e.to_string(),
@@ -501,6 +509,44 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("outside allowed"));
+    }
+
+    #[tokio::test]
+    async fn exec_runs_in_a_folder_the_agent_works_in_only_when_reached() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("agent");
+        let repo = base.path().join("acme");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let tool = ExecCommand::default().with_workspace(workspace);
+        let input = serde_json::json!({ "command": "pwd", "workdir": repo.display().to_string() });
+        let refused = tool.execute(input.clone()).await.unwrap();
+        assert!(refused.error.unwrap().contains("outside allowed"));
+        let reach = crate::tools::paths::Reach {
+            withheld: vec![],
+            only: vec![repo.clone()],
+        };
+        let ran = crate::tools::paths::REACH
+            .scope(reach, tool.execute(input))
+            .await
+            .unwrap();
+        assert!(ran.success, "{:?}", ran.error);
+        let other = base.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let reach = crate::tools::paths::Reach {
+            withheld: vec![],
+            only: vec![repo],
+        };
+        let elsewhere = crate::tools::paths::REACH
+            .scope(
+                reach,
+                tool.execute(
+                    serde_json::json!({ "command": "pwd", "workdir": other.display().to_string() }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(elsewhere.error.unwrap().contains("outside allowed"));
     }
 
     #[tokio::test]

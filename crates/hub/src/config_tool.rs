@@ -204,10 +204,16 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
 }
 
 /// Refuse the settings only a human changes: the agent's environments decide
-/// which instances it may reach, and `[oversight]` what it oversees and may
-/// do there, so it never edits them itself.
+/// which instances it may reach, `[oversight]` what it oversees and may do
+/// there, and `[computer]` how far it reaches on the person's computer and
+/// the folders it works in, so it never edits them itself.
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
+        Some(&"computer") => Err(
+            "computer is human-only: the person sets how far an agent reaches on this computer, \
+             and the folders it works in, in Desk"
+                .to_string(),
+        ),
         Some(&"oversight") => Err(
             "oversight is human-only: the person sets what an agent oversees in Desk".to_string(),
         ),
@@ -438,6 +444,11 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             "oversight.full.repos",
             "oversight.full.budget_usd_per_day",
             "oversight.wake.hold_minutes",
+            // How far it reaches, and where it works.
+            "computer",
+            "computer.access",
+            "computer.asks",
+            "computer.works_in",
         ] {
             assert!(
                 human_only(&key_path(key).unwrap()).is_err(),

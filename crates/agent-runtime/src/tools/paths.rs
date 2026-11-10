@@ -89,17 +89,28 @@ tokio::task_local! {
     pub static REACH: Reach;
 }
 
-/// A call's reach beyond its tool's roots: anywhere, except `withheld` (Desk's
+/// A call's reach beyond its tool's roots: anywhere, or only `only` when it
+/// names folders (the ones its agent works in), except `withheld` (Desk's
 /// data, the keychains). The tool's own roots are never withheld, so its own
 /// folder stays its own inside Desk's data.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Reach {
     pub withheld: Vec<PathBuf>,
+    /// The folders the call reaches past its roots; empty is anywhere.
+    pub only: Vec<PathBuf>,
 }
 
 /// The reach in scope, if any.
 fn reach() -> Option<Reach> {
     REACH.try_with(Clone::clone).ok()
+}
+
+/// The folders the call in scope reaches past its tool's roots by name (the
+/// ones its agent works in), for a tool that keeps its own list of where it
+/// may run (`exec.run`'s working directories). Empty without a reach, or
+/// with one that reaches anywhere: that one is for files, never commands.
+pub fn reached_folders() -> Vec<PathBuf> {
+    reach().map(|r| r.only).unwrap_or_default()
 }
 
 /// Why a write to `real` is refused for a hard link: a file outside the
@@ -163,7 +174,10 @@ impl CanonicalRoots {
         // No roots is already unrestricted; a reach widens only a set.
         let reach = reach().filter(|_| !real.is_empty()).map(|reach| {
             let own = real.clone();
-            real.push(PathBuf::from("/"));
+            match reach.only.is_empty() {
+                true => real.push(PathBuf::from("/")),
+                false => real.extend(reach.only.iter().map(|folder| resolve_real(folder))),
+            }
             let withheld = reach.withheld.iter().map(|w| resolve_real(w)).collect();
             (own, withheld)
         });
@@ -347,6 +361,7 @@ mod tests {
         assert!(narrow.resolve(&elsewhere).is_none());
         let reach = Reach {
             withheld: vec![data.clone()],
+            only: vec![],
         };
         let wide = REACH
             .scope(reach.clone(), async {
@@ -369,6 +384,37 @@ mod tests {
         // No roots stays unrestricted, reach or not.
         let open = REACH.scope(reach, async { CanonicalRoots::new(&[]) }).await;
         assert!(!open.reaches());
+    }
+
+    /// A reach that names folders widens the roots by those alone, still
+    /// short of what is withheld.
+    #[tokio::test]
+    async fn a_reach_to_named_folders_widens_by_those_alone() {
+        let (_tmp, base) = workspace();
+        let own = base.join("Desk/hub/data/agents/allan");
+        let repo = base.join("dev/acme");
+        let sibling = base.join("dev/other/a.rs");
+        for dir in [&own, &repo, &sibling.parent().unwrap().to_path_buf()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let reach = Reach {
+            withheld: vec![base.join("Desk")],
+            only: vec![repo.clone()],
+        };
+        let roots = REACH
+            .scope(reach.clone(), async {
+                CanonicalRoots::new(std::slice::from_ref(&own))
+            })
+            .await;
+        assert!(roots.reaches());
+        assert_eq!(roots.workspace(), Some(own.as_path()));
+        assert!(roots.resolve(&repo.join("src/main.rs")).is_some());
+        assert!(roots.resolve(&own.join("notes.md")).is_some());
+        assert!(roots.resolve(&sibling).is_none(), "only the named folder");
+        assert!(roots.resolve(Path::new("/etc/hosts")).is_none());
+        let named = REACH.scope(reach, async { reached_folders() }).await;
+        assert_eq!(named, [repo]);
+        assert!(reached_folders().is_empty(), "no reach, no folders");
     }
 
     #[tokio::test]

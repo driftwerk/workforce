@@ -2132,3 +2132,21 @@ async fn completions(server: &wiremock::MockServer) -> usize {
         .filter(|r| r.url.path() == "/v1/chat/completions")
         .count()
 }
+
+#[test]
+fn the_folders_it_works_in_are_named_with_the_first_as_where_coding_starts() {
+    assert_eq!(super::works_in_text(&[]), None);
+    let line = super::works_in_text(&[
+        std::path::PathBuf::from("/Users/sarah/dev/acme-web"),
+        std::path::PathBuf::from("/Users/sarah/dev/acme-api"),
+    ])
+    .unwrap();
+    assert!(
+        line.starts_with("- Works in: `/Users/sarah/dev/acme-web`, `/Users/sarah/dev/acme-api`")
+    );
+    assert!(
+        line.contains("`desk.start` sessions in `/Users/sarah/dev/acme-web`"),
+        "{line}"
+    );
+    assert!(line.contains("deleting there asks"), "{line}");
+}

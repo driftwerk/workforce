@@ -7,7 +7,15 @@
 //! asks = "irreversible"      # at full: irreversible (the default) | never
 //! ask_in_own_folder = false  # true: changes in its own folder ask too
 //! unattended = "run"         # at full, with nobody to ask: run | refuse
+//! works_in = ["/Users/sarah/dev/acme-web"]  # folders it works in too
 //! ```
+//!
+//! `works_in` names folders (a repo cloned into one, say) the agent reads,
+//! changes and runs in beside its own, at every level, and starts coding
+//! work in. Only the person sets it: the agent's own config file is never
+//! changed by its tools. Never `/`, a volume, the home folder or anything
+//! above it, nor anything Desk keeps from every agent; deleting there still
+//! asks.
 //!
 //! An agent with no `[computer]` is at Full access and asks only before what
 //! can't be undone (the always-asks list): everything else it did before
@@ -17,6 +25,8 @@
 //! The table is kept as a raw value and checked here, so what is wrong with
 //! it is said in plain words, without key names: Desk shows the refusal to
 //! the person as it is. Keys this hub does not know are ignored.
+
+use std::path::{Component, Path, PathBuf};
 
 use toml::Value;
 use workforce_core::computer::{Access, Asking, ComputerAccess, Unattended};
@@ -102,6 +112,96 @@ pub fn to_value(access: &ComputerAccess) -> Value {
     );
     t.insert("asks".into(), Value::String(access.asks.as_str().into()));
     Value::Table(t)
+}
+
+const WORKS_IN: &str = "The folders the agent works in must be a list of full folder paths.";
+
+/// The most folders an agent works in.
+pub const MAX_WORKS_IN: usize = 16;
+
+/// `[computer] works_in` as written: full paths, none twice, at most
+/// [`MAX_WORKS_IN`], or what is wrong with it. Where each may be is
+/// [`works_in_refusal`]'s to say: that needs the machine's home and what is
+/// withheld on it.
+pub fn works_in(value: Option<&Value>) -> Result<Vec<PathBuf>, String> {
+    let Some(Value::Table(t)) = value else {
+        return Ok(Vec::new());
+    };
+    let list = match t.get("works_in") {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(WORKS_IN.into()),
+    };
+    if list.len() > MAX_WORKS_IN {
+        return Err(format!("An agent works in at most {MAX_WORKS_IN} folders."));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in list {
+        let Value::String(raw) = entry else {
+            return Err(WORKS_IN.into());
+        };
+        let path = PathBuf::from(raw.trim());
+        let plain = path
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        if !path.is_absolute() || !plain {
+            return Err(format!(
+                "{} isn't a full folder path: start it at / and leave out . and ..",
+                raw.trim()
+            ));
+        }
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// Why the agent may not work in `folder` on a machine whose home is `home`
+/// and that keeps `withheld` (Desk's data, the keychains) from every agent:
+/// `/`, a volume, home or above it, inside what is withheld, or holding it.
+/// Checked as written and with its links followed. `None` when it may.
+pub fn works_in_refusal(folder: &Path, home: &Path, withheld: &[PathBuf]) -> Option<String> {
+    let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+    let home_real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let shown = folder.display();
+    for path in [folder, real.as_path()] {
+        let depth = path
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+        let volume = path.starts_with("/Volumes") && depth <= 2;
+        if depth == 0 || volume || home.starts_with(path) || home_real.starts_with(path) {
+            return Some(format!(
+                "{shown} is too wide to work in: choose a folder inside your home, not your home itself or above it."
+            ));
+        }
+        for kept in withheld {
+            let kept_real = std::fs::canonicalize(kept).unwrap_or_else(|_| kept.clone());
+            for k in [kept.as_path(), kept_real.as_path()] {
+                if path.starts_with(k) || k.starts_with(path) {
+                    return Some(format!(
+                        "{shown} holds Desk's own data or your keychains, which no agent works in."
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What no agent reaches on a machine whose hub keeps its data in
+/// `data_dir`: Desk's data (on Desk the hub's data is `…/Desk/hub/data`, so
+/// Desk's folder is two up; elsewhere the hub's data folder alone) and the
+/// keychains. Paths as given; callers resolve them as they compare.
+pub fn withheld_on(data_dir: &Path, home: &Path) -> Vec<PathBuf> {
+    let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let desk = data
+        .parent()
+        .filter(|hub| hub.file_name().is_some_and(|n| n == "hub"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    vec![desk.unwrap_or(data), home.join("Library/Keychains")]
 }
 
 #[cfg(test)]
@@ -221,6 +321,93 @@ mod tests {
             ] {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
+        }
+    }
+
+    fn folders(source: &str) -> Result<Vec<PathBuf>, String> {
+        let doc: Table = toml::from_str(source).unwrap();
+        works_in(doc.get("computer"))
+    }
+
+    #[test]
+    fn works_in_reads_full_paths_once_each() {
+        assert!(folders("").unwrap().is_empty());
+        assert!(folders("[computer]\naccess = \"full\"\n")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            folders(
+                "[computer]\nworks_in = [\"/Users/sarah/dev/acme\", \" /Users/sarah/dev/acme \", \"/srv/repo\"]\n"
+            )
+            .unwrap(),
+            [PathBuf::from("/Users/sarah/dev/acme"), PathBuf::from("/srv/repo")]
+        );
+        for (source, says) in [
+            (
+                "[computer]\nworks_in = \"/srv\"\n",
+                "list of full folder paths",
+            ),
+            ("[computer]\nworks_in = [3]\n", "list of full folder paths"),
+            (
+                "[computer]\nworks_in = [\"dev/acme\"]\n",
+                "isn't a full folder path",
+            ),
+            (
+                "[computer]\nworks_in = [\"~/dev/acme\"]\n",
+                "isn't a full folder path",
+            ),
+            (
+                "[computer]\nworks_in = [\"/Users/sarah/dev/../..\"]\n",
+                "isn't a full folder path",
+            ),
+        ] {
+            let e = folders(source).unwrap_err();
+            assert!(e.contains(says), "{source} → {e}");
+            assert!(!e.contains("works_in"), "{e} names the key");
+        }
+        let many: Vec<String> = (0..=MAX_WORKS_IN)
+            .map(|i| format!("\"/srv/r{i}\""))
+            .collect();
+        assert!(
+            folders(&format!("[computer]\nworks_in = [{}]\n", many.join(",")))
+                .unwrap_err()
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn works_in_is_never_home_or_above_or_what_desk_keeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("sarah");
+        let data = home.join("Library/Application Support/Desk/hub/data");
+        let repo = home.join("dev/acme");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let withheld = withheld_on(&data, &home);
+        assert!(works_in_refusal(&repo, &home, &withheld).is_none());
+        for wide in [
+            PathBuf::from("/"),
+            home.clone(),
+            tmp.path().to_path_buf(),
+            PathBuf::from("/Volumes/Backup"),
+        ] {
+            let e = works_in_refusal(&wide, &home, &withheld).expect("refused");
+            assert!(e.contains("too wide"), "{} → {e}", wide.display());
+        }
+        for kept in [
+            home.join("Library/Application Support/Desk/hub/data/agents/ben"),
+            home.join("Library/Application Support"),
+            home.join("Library/Keychains"),
+        ] {
+            let e = works_in_refusal(&kept, &home, &withheld).expect("refused");
+            assert!(e.contains("Desk's own data"), "{} → {e}", kept.display());
+        }
+        // A link into what is kept is followed.
+        #[cfg(unix)]
+        {
+            let link = home.join("dev/sneaky");
+            std::os::unix::fs::symlink(&data, &link).unwrap();
+            assert!(works_in_refusal(&link, &home, &withheld).is_some());
         }
     }
 }

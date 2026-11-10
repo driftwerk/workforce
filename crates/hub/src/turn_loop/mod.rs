@@ -2177,6 +2177,10 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     // works outside threads).
     meta_lines.push("- Commands (tell users to prefix with `cmd:` — works in Slack threads too): `cmd: new`, `cmd: reset`, `cmd: status`, `cmd: compact`, `cmd: context`, `cmd: model`, `cmd: health`, `cmd: wake`, `cmd: heartbeat`, `cmd: help`".to_string());
 
+    if let Some(line) = works_in_line(&service.workspace) {
+        meta_lines.push(line);
+    }
+
     turn_context.push_str("\n\n");
     turn_context.push_str(&meta_lines.join("\n"));
 
@@ -2217,6 +2221,35 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         injected_lessons,
         lesson_events,
     }
+}
+
+/// The runtime line naming the folders the person gave this agent to work
+/// in (`[computer] works_in`), on a hub with `[desk]`, the only one that
+/// reads them; `None` with none.
+fn works_in_line(workspace: &std::path::Path) -> Option<String> {
+    if !crate::serve::computer_gates_installed() {
+        return None;
+    }
+    let folders = workforce_common::settings::AgentWorkspaceConfig::load(workspace)
+        .ok()
+        .flatten()?
+        .works_in()
+        .ok()?;
+    works_in_text(&folders)
+}
+
+/// [`works_in_line`]'s words for `folders`.
+fn works_in_text(folders: &[std::path::PathBuf]) -> Option<String> {
+    let first = folders.first()?;
+    let all: Vec<String> = folders
+        .iter()
+        .map(|f| format!("`{}`", f.display()))
+        .collect();
+    Some(format!(
+        "- Works in: {} (the person chose these beside your own workspace; start coding work, `exec.run` workdirs and `desk.start` sessions in `{}` unless they say otherwise; deleting there asks them first)",
+        all.join(", "),
+        first.display()
+    ))
 }
 
 /// Session-bound wrapper around [`fuse_recall_query`]. Returns `None`
