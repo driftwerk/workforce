@@ -164,10 +164,13 @@ impl Desk {
         let b = self.board_of(id).await?;
         check_target(link.system, &link.target).map_err(DeskError::Invalid)?;
         check_filter(link.system, &link.filter, link.me.as_deref()).map_err(DeskError::Invalid)?;
-        if link.system == System::Linear && link.target_id.as_deref().is_none_or(str::is_empty) {
-            return Err(DeskError::Invalid(
-                "Say which Linear team, by its id from the hub's list of teams.".into(),
-            ));
+        if link.system == System::Linear {
+            let id = link.target_id.as_deref().ok_or_else(|| {
+                DeskError::Invalid(
+                    "Say which Linear team, by its id from the hub's list of teams.".into(),
+                )
+            })?;
+            crate::board_sync::check_linear_id(id).map_err(DeskError::Invalid)?;
         }
         if let Via::Hub { hub } = &link.via {
             check_hub_id(hub)?;

@@ -1890,6 +1890,40 @@ mod tests {
         assert_eq!(out["value"], "alic…xxxx");
     }
 
+    /// A Desk link's token is no agent's: `vault.get` refuses it as its
+    /// own person, and `vault.list` never names it.
+    #[tokio::test]
+    async fn a_desk_link_is_neither_read_nor_listed() {
+        let v = new_vault();
+        let token = concat!("wfr_", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG");
+        v.set("users/alice/desk/hubs/atlas/remote_mcp", token)
+            .unwrap();
+        for path in [
+            "users/alice/desk/hubs/atlas/remote_mcp",
+            "desk/hubs/atlas/remote_mcp",
+        ] {
+            let res = CURRENT_USER_ID
+                .scope("alice".to_string(), async {
+                    run_get(Arc::clone(&v), path, RedactionPolicy::off()).await
+                })
+                .await;
+            assert!(!res.success, "{path}");
+            assert!(res.error.unwrap().contains("Desk link"));
+        }
+        let tool = VaultListTool::new(single_vault_store(Arc::clone(&v)));
+        let res = CURRENT_USER_ID
+            .scope("alice".to_string(), async {
+                tool.execute(serde_json::json!({})).await.unwrap()
+            })
+            .await;
+        assert!(
+            !res.output.to_string().contains("desk/hubs"),
+            "{}",
+            res.output
+        );
+        assert!(!res.output.to_string().contains("wfr_"));
+    }
+
     #[tokio::test]
     async fn vault_list_returns_logical_paths_filtered_by_identity() {
         // The layered store returns logical paths (with the per-user

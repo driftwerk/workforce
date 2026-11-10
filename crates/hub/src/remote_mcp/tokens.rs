@@ -326,6 +326,34 @@ impl RemoteMcpTokenService {
     }
 }
 
+/// Revokes every live token the device `device_id` minted, once it is
+/// unpaired, so they leave the person's listing and cap too. Authentication
+/// refuses them anyway (`super::auth`); this keeps the rows true. How many.
+pub fn revoke_device_tokens(store: &dyn RemoteMcpTokenStore, device_id: &str) -> usize {
+    let now = Utc::now();
+    let tokens = match store.list_all_tokens() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "an unpaired device's remote MCP tokens weren't listed");
+            return 0;
+        }
+    };
+    tokens
+        .into_iter()
+        .filter(|t| minted_by_device(&t.scopes) == Some(device_id))
+        .filter(|t| match store.revoke_token(t.id, None, now) {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!(error = %e, token_id = %t.id, "an unpaired device's token wasn't revoked");
+                false
+            }
+        })
+        .inspect(|t| {
+            tracing::info!(target: "sentinel.audit", token_id = %t.id, device = %device_id, "remote MCP token revoked with its device");
+        })
+        .count()
+}
+
 pub fn is_expired(token: &RemoteMcpToken, now: DateTime<Utc>) -> bool {
     now >= token.expires_at
 }
@@ -523,6 +551,13 @@ mod tests {
         svc.mint(me.id, "laptop").unwrap();
         svc.mint_for_device(me.id, "dev-1", "Mac").unwrap();
         assert_eq!(svc.list(me.id).unwrap().len(), 2);
+        // Unpaired, the device's token leaves the listing and the cap; the
+        // person's own stays.
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 1);
+        let left = svc.list(me.id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].label, "laptop");
+        assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 0);
     }
 
     #[test]

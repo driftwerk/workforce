@@ -219,6 +219,15 @@ pub fn check_filter(system: System, f: &Filter, me: Option<&str>) -> Result<(), 
     }
 }
 
+/// Whether `id` can be a Linear team's (or member's) id: what the hub's
+/// Linear tools put in their queries as it is.
+pub fn check_linear_id(id: &str) -> Result<(), String> {
+    match uuid_like(id) {
+        true => Ok(()),
+        false => Err(format!("{id:?} isn't a Linear id.")),
+    }
+}
+
 fn uuid_like(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }

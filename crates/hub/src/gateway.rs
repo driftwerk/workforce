@@ -8519,6 +8519,9 @@ async fn pair_revoke_device(
         .unwrap_or_else(|| device_id.clone());
     match pairing.revoke_async(device_id.clone()).await {
         Ok(()) => {
+            if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
+                crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device_id);
+            }
             retarget_device(&state, &owner, &device_id).await;
             state.local_agents.forget_desk(&device_id).await;
             Ok(Json(serde_json::json!({ "revoked": true })))
@@ -8556,6 +8559,9 @@ async fn pair_device_revoke_self(
         warn!("Device self-revocation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
+        crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device.id);
+    }
     retarget_device(&state, &owner, &device.id).await;
     state.local_agents.forget_desk(&device.id).await;
     Ok(Json(serde_json::json!({ "revoked": true })))

@@ -199,7 +199,7 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
     }
     // Before the per-user branch, so no identity (`system` included) reads
     // a Desk link.
-    if is_desk_link(logical) {
+    if is_desk_link(path) {
         return Err(AgentReadDenial::DeskLink);
     }
     if let Some(rest) = path.strip_prefix("users/") {
@@ -220,23 +220,7 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
     }
 }
 
-/// Where Desk keeps its links to other hubs, as a logical path (any
-/// `users/<uid>/` taken off): only `desk_board_sync` reads and writes them.
-pub const DESK_LINK_PREFIXES: [&str; 2] = ["desk/hubs", "desk/links"];
-
-/// Whether the logical vault path `logical` is a Desk link, matched without
-/// regard to case, doubled or trailing slashes, so no spelling of it slips by.
-pub fn is_desk_link(logical: &str) -> bool {
-    let segments: Vec<String> = logical
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    DESK_LINK_PREFIXES.iter().any(|prefix| {
-        let want: Vec<&str> = prefix.split('/').collect();
-        segments.len() >= want.len() && segments.iter().zip(&want).all(|(a, b)| a == b)
-    })
-}
+pub use workforce_common::vault_scope::{is_desk_link, DESK_LINK_PREFIXES};
 
 /// [`agent_can_read`] for a tool that hands the value back: never a
 /// subscription login's, whatever the redaction policy, since its token is

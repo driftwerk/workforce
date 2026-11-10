@@ -644,6 +644,16 @@ async fn a_board_pauses_when_its_hub_is_forgotten() {
         local.link_atlas(&remote).await;
         let paused = desk.board_sync(b.id).await.unwrap().unwrap().1.paused;
         assert_eq!(paused, None);
+        // With a hub that has Jira, this computer's own keys aren't used.
+        let other = board(&desk, "Other").await;
+        let mut body = link_body(Filter::AssignedToMe);
+        body["via"] = json!({ "kind": "thisHub" });
+        body["target"] = json!("OTHER");
+        let (status, said) = local
+            .send("PUT", &format!("/api/desk/boards/{}/link", other.id), body)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{said}");
+        assert!(said["error"].as_str().unwrap().contains("Atlas has Jira"));
         let _ = Uuid::nil();
     })
     .await;

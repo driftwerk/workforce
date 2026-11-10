@@ -212,7 +212,10 @@ async fn serve(
             return (StatusCode::INTERNAL_SERVER_ERROR, "session unavailable").into_response();
         }
     };
-    let surface = remote.surface_for(&service);
+    let mut surface = remote.surface_for(&service);
+    if caller.as_member {
+        surface = Arc::new(device_surface(&surface));
+    }
     let mut gates = service.tool_gates(crate::desk_surface::allows());
     if caller.as_member {
         held_to_member(&mut gates);
@@ -263,6 +266,18 @@ async fn serve(
             .into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+/// What a token a paired device minted may call: what Desk's board sync
+/// needs, within what the hub exposes anyway. Never `agent.*` (a delegated
+/// turn runs with the person's own role), `approval.*`, `vault.*` or the
+/// rest.
+pub const DEVICE_SURFACE: &[&str] = &["jira.*", "linear.*", "help", "identity.whoami"];
+
+/// `surface` narrowed to [`DEVICE_SURFACE`].
+fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
+    let patterns: Vec<String> = DEVICE_SURFACE.iter().map(|p| p.to_string()).collect();
+    build_mcp_registry(surface, &patterns)
 }
 
 /// `gates` for a token a paired device minted: scored as a member whatever
@@ -965,6 +980,27 @@ mod tests {
         held_to_member(&mut exec.site.gates);
         let (is_error, _) = text_of(&call(&surface, exec, "agent_create").await);
         assert!(is_error);
+    }
+
+    /// A device's token sees only the board sync's tools: no `agent.*`
+    /// (whose turns run with the person's own role), approvals or vault.
+    #[test]
+    fn a_device_minted_token_sees_only_the_sync_tools() {
+        let source = registry(&[
+            "jira.search",
+            "linear.issue_list",
+            "vault.get",
+            "workflow",
+            "help",
+        ]);
+        let extra: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Named("agent.chat")),
+            Arc::new(Named("approval.decide")),
+        ];
+        let full = curated_surface(&source, &extra, &["*".to_string()]);
+        let mut names = device_surface(&full).names();
+        names.sort();
+        assert_eq!(names, ["help", "jira.search", "linear.issue_list"]);
     }
 
     #[tokio::test]

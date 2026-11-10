@@ -342,6 +342,19 @@ impl BoardSync {
         }
     }
 
+    /// The linked hub that offers `system`'s tools to `person`, if any: a
+    /// board then syncs through it rather than with this computer's own
+    /// keys. A hub that can't be reached now is passed over.
+    pub async fn hub_offering(&self, system: System, person: &str) -> Option<String> {
+        for h in self.desk.sync_hubs().await.ok()? {
+            let via = Via::Hub { hub: h.id.clone() };
+            if self.offered(system, &via, person).await.is_ok() {
+                return Some(h.name);
+            }
+        }
+        None
+    }
+
     /// The name a board's hub goes by, for what the board says.
     pub async fn hub_name(&self, via: &Via) -> String {
         match via {
@@ -644,6 +657,11 @@ async fn check_link(
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
+    if let Some(id) = body.target_id.as_deref() {
+        if let Err(e) = sync::check_linear_id(id) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     let hub = r.sync.hub_name(&body.via).await;
     let remote = match r.sync.offered(body.system, &body.via, &person).await {
         Ok(remote) => remote,
@@ -829,6 +847,18 @@ async fn link_board(
     Json(link): Json<LinkBoard>,
 ) -> Response {
     let person = person!(r, h, q);
+    if link.via == Via::ThisHub {
+        if let Some(name) = r.sync.hub_offering(link.system, &person).await {
+            return refusal(
+                StatusCode::CONFLICT,
+                &format!(
+                    "{name} has {}: link through it, so this computer keeps no {} keys of its own.",
+                    link.system.title(),
+                    link.system.title()
+                ),
+            );
+        }
+    }
     let hub = r.sync.hub_name(&link.via).await;
     if let Err(p) = r.sync.offered(link.system, &link.via, &person).await {
         return (

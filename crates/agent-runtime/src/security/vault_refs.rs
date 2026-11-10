@@ -91,6 +91,10 @@ pub(crate) fn lookup_vault_key(
         return Err(eyre!("{GENERIC_RESOLUTION_ERROR}"));
     }
     let path = format!("{vault_prefix}{key}");
+    if workforce_common::vault_scope::is_desk_link(&path) {
+        warn!(target: "sentinel.audit", "vault marker rejected: a Desk link");
+        return Err(eyre!("{GENERIC_RESOLUTION_ERROR}"));
+    }
     store.get(&path).ok_or_else(|| {
         warn!(
             target: "sentinel.audit",
