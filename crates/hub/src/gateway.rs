@@ -8806,6 +8806,7 @@ async fn vault_list(
         .list(query.prefix.as_deref())
         .into_iter()
         .filter(|path| !crate::hub_core::logins::device_login::is_record(path))
+        .filter(|path| !crate::vault_policy::is_desk_link(path))
         .collect();
     let resolve_display = crate::vault_view::actor_display(state.identity_store.clone());
     let entries = global_vault_entries_for_admin(vault, query.prefix.as_deref(), &resolve_display);
@@ -8829,6 +8830,7 @@ fn global_vault_entries_for_admin(
         .into_iter()
         .filter(|p| !p.starts_with("wasm-skills/"))
         .filter(|p| !crate::hub_core::logins::device_login::is_record(p))
+        .filter(|p| !crate::vault_policy::is_desk_link(p))
         .filter_map(|raw| {
             let entry = vault.get_entry(&raw)?;
             let (logical_path, tier) = if let Some(rest) = raw.strip_prefix("users/") {
@@ -8871,6 +8873,8 @@ async fn vault_get(
     match vault
         .get(&path)
         .filter(|_| !crate::hub_core::logins::device_login::is_record(&path))
+        // A Desk link's token is read only by Desk's board sync.
+        .filter(|_| !crate::vault_policy::is_desk_link(&path))
     {
         Some(value) => Ok(Json(serde_json::json!({ "path": path, "value": value }))),
         None => Err(StatusCode::NOT_FOUND),
@@ -17355,5 +17359,52 @@ mod fallback_tests {
         }
         let (status, _, _) = call(Method::POST, "/agents/allan").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+#[cfg(test)]
+mod desk_link_vault_tests {
+    use super::*;
+
+    /// The owner's own vault routes never show a Desk link's token: not by
+    /// path, not in a listing.
+    #[tokio::test]
+    async fn the_vault_routes_never_show_a_desk_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::open(&dir.path().join("v"), "test-key").unwrap());
+        vault
+            .set("users/sam/desk/hubs/atlas/remote_mcp", "the-token")
+            .unwrap();
+        vault.set("skills/jira/site", "acme").unwrap();
+        let fx = crate::remote_mcp::testing::fixture(false);
+        let state = Arc::try_unwrap(fx.state)
+            .ok()
+            .expect("the fixture's only handle");
+        let state = Arc::new(GatewayState {
+            vault: Some(vault),
+            ..state
+        });
+        let headers = crate::remote_mcp::testing::bearer("gateway-token");
+        let got = vault_get(
+            Path("users/sam/desk/hubs/atlas/remote_mcp".to_string()),
+            Query(serde_json::from_value::<WsQuery>(serde_json::json!({})).unwrap()),
+            headers.clone(),
+            State(Arc::clone(&state)),
+        )
+        .await;
+        assert_eq!(got.err(), Some(StatusCode::NOT_FOUND));
+        let listed = vault_list(
+            Query(VaultListQuery {
+                token: None,
+                prefix: None,
+            }),
+            headers,
+            State(state),
+        )
+        .await
+        .unwrap();
+        let said = listed.0.to_string();
+        assert!(said.contains("skills/jira/site"), "{said}");
+        assert!(!said.contains("desk/hubs"), "{said}");
     }
 }

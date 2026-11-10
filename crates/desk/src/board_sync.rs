@@ -21,26 +21,8 @@ use crate::crew::{Party, PartyKind};
 
 /// The tools a board's sync may call, and nothing else: no raw API, no
 /// delete, no reassigning.
-pub const JIRA_TOOLS: &[&str] = &[
-    "jira.search",
-    "jira.get_issue",
-    "jira.create_issue",
-    "jira.update_issue",
-    "jira.list_transitions",
-    "jira.transition_issue",
-    "jira.add_comment",
-];
-pub const LINEAR_TOOLS: &[&str] = &[
-    "linear.issue_list",
-    "linear.issue_get",
-    "linear.issue_search",
-    "linear.issue_create",
-    "linear.issue_update",
-    "linear.issue_link",
-    "linear.comment_add",
-    "linear.states_list",
-    "linear.teams_list",
-];
+pub const JIRA_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS;
+pub const LINEAR_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS;
 
 /// The tools `system`'s sync needs a hub to offer.
 pub fn tools_of(system: System) -> &'static [&'static str] {
@@ -87,6 +69,10 @@ pub enum RemoteError {
     /// A tool the sync may not call.
     #[error("the sync never calls {0}")]
     NotAllowed(String),
+    /// This pass has made all the calls it may: the rest wait for the
+    /// next. Not a failure.
+    #[error("this pass's calls are spent")]
+    Spent,
 }
 
 /// A Jira or Linear reached one way or another, as the person.
@@ -203,8 +189,10 @@ pub fn key_in_target(key: &str, target: &str) -> bool {
 /// that is a JSON object of the keys its tool takes, a label that is one.
 pub fn check_filter(system: System, f: &Filter, me: Option<&str>) -> Result<(), String> {
     match (system, f) {
-        (_, Filter::Label(l)) if l.trim().is_empty() || l.contains('"') || l.len() > 100 => {
-            Err("A label is a word or two, without quotes.".into())
+        (_, Filter::Label(l))
+            if l.trim().is_empty() || l.contains('"') || l.contains('\\') || l.len() > 100 =>
+        {
+            Err("A label is a word or two, without quotes or backslashes.".into())
         }
         (System::Jira, Filter::Query(q)) => check_jql(q),
         (System::Linear, Filter::Query(q)) => linear_query(q).map(|_| ()),

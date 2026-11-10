@@ -235,6 +235,17 @@ async fn paired_device(
                 "This device isn't linked to a person here, so it can't act for anyone",
             )
         })?;
+    // Only Desk on a computer mints: not a phone, a voice box or the rest.
+    let desktop = state
+        .identity_store
+        .as_ref()
+        .is_some_and(|store| crate::device_link::is_desktop_device(store.as_ref(), &device.id));
+    if !desktop {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "Only Desk on a computer makes its own token here",
+        ));
+    }
     Ok((device, person))
 }
 
@@ -398,6 +409,18 @@ mod tests {
             assert_eq!(
                 crate::remote_mcp::tokens::minted_by_device(&caller.token.scopes),
                 Some(device.id.as_str())
+            );
+            // A phone paired to the same person doesn't mint.
+            let (_, phone) = crate::remote_mcp::testing::pair_device_as(
+                &fx,
+                &devices,
+                &mut me,
+                "Sam's phone",
+                "ios_device",
+            );
+            assert_eq!(
+                mint_as(&fx.state, &phone).await.unwrap_err(),
+                StatusCode::FORBIDDEN
             );
             for not_a_device in ["gateway-token", "eyJhbGciOi.not.a.jwt"] {
                 assert_eq!(

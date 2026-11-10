@@ -199,6 +199,19 @@ pub struct Sync {
     /// What it last couldn't do, in the hub's words.
     #[serde(default)]
     pub problem: Option<String>,
+    /// Issues a pull couldn't take in, tried again on their own back-off
+    /// while the cursor goes on past them.
+    #[serde(default)]
+    pub retry: BTreeMap<String, Retry>,
+}
+
+/// An issue a pull couldn't take in, and when it is tried again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Retry {
+    pub tries: u32,
+    pub next_at: DateTime<Utc>,
+    pub problem: String,
 }
 
 /// What a synced ticket's issue said when last pulled or pushed: what the

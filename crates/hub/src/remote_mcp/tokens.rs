@@ -23,6 +23,10 @@ pub const TOKEN_SCOPE: &str = "remote_mcp";
 /// capabilities only (`super::auth`).
 pub const DEVICE_SCOPE_PREFIX: &str = "device:";
 
+/// Held while a device mints, so its old token is revoked and its new one
+/// made in one step.
+static DEVICE_MINT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The device a token's scopes say minted it.
 pub fn minted_by_device(scopes: &[String]) -> Option<&str> {
     scopes
@@ -219,6 +223,9 @@ impl RemoteMcpTokenService {
             return Err(TokenError::DevicesNotAllowed);
         }
         self.require_active(identity_id)?;
+        // One mint at a time, so a device holds one live token however many
+        // links race.
+        let _one = DEVICE_MINT.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         for old in self.store.list_tokens_for_identity(identity_id)? {
             if minted_by_device(&old.scopes) == Some(device_id) {
@@ -558,6 +565,29 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].label, "laptop");
         assert_eq!(revoke_device_tokens(svc.store().as_ref(), "dev-1"), 0);
+    }
+
+    /// Links racing on one device leave it one live token.
+    #[test]
+    fn racing_device_mints_leave_one_live_token() {
+        let config = RemoteMcpConfig {
+            allow_device_tokens: true,
+            ..enabled_config()
+        };
+        let (svc, store) = service(config, None);
+        let me = identity(IdentityStatus::Active);
+        store.create(&me).unwrap();
+        let svc = Arc::new(svc);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let svc = Arc::clone(&svc);
+                std::thread::spawn(move || svc.mint_for_device(me.id, "dev-1", "Mac").unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(svc.list(me.id).unwrap().len(), 1);
     }
 
     #[test]

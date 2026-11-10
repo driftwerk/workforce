@@ -114,6 +114,17 @@ pub(crate) fn identity_for_device(store: &dyn IdentityStore, device_id: &str) ->
     holder_of(store, device_id).map(|identity| identity.id.to_string())
 }
 
+/// Whether `device_id` was paired as a desktop (Desk) device to the person
+/// holding it.
+pub(crate) fn is_desktop_device(store: &dyn IdentityStore, device_id: &str) -> bool {
+    holder_of(store, device_id).is_some_and(|identity| {
+        identity
+            .linked_ids
+            .get(&device_link_key("desktop_device", device_id))
+            .is_some_and(|id| id == device_id)
+    })
+}
+
 /// The identity holding `device_id`, for listing who each device belongs to.
 pub(crate) fn device_owner(store: &dyn IdentityStore, device_id: &str) -> Option<Identity> {
     holder_of(store, device_id)

@@ -4676,6 +4676,7 @@ rules:
                         is_admin: workforce_hub::authz::make_admin_policy(Arc::clone(
                             &service.identity_store,
                         )),
+                        remote_mcp_tokens: Arc::clone(&service.remote_mcp_tokens),
                     };
                     for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx) {
                         service.tools.register(tool);

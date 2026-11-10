@@ -189,12 +189,24 @@ pub(crate) fn fixture_with_devices(
     )
 }
 
-/// Pairs a device named `name` to `person` and returns it with its bearer.
+/// Pairs a desktop (Desk) device named `name` to `person` and returns it
+/// with its bearer.
 pub(crate) fn pair_device(
     fixture: &Fixture,
     devices: &workforce_pairing::SqlitePairingStore,
     person: &mut Identity,
     name: &str,
+) -> (workforce_pairing::ApprovedDevice, String) {
+    pair_device_as(fixture, devices, person, name, "desktop_device")
+}
+
+/// [`pair_device`] as a device of `kind`.
+pub(crate) fn pair_device_as(
+    fixture: &Fixture,
+    devices: &workforce_pairing::SqlitePairingStore,
+    person: &mut Identity,
+    name: &str,
+    kind: &str,
 ) -> (workforce_pairing::ApprovedDevice, String) {
     use workforce_identity::store::IdentityStore;
     let bearer = format!("wfp_{}", uuid::Uuid::new_v4().simple());
@@ -211,10 +223,7 @@ pub(crate) fn pair_device(
     };
     workforce_pairing::PairingStore::register_device(devices, &device).expect("device persists");
     person.link_id(
-        crate::device_link::device_link_key(
-            workforce_pairing::types::DEFAULT_DEVICE_KIND,
-            &device.id,
-        ),
+        crate::device_link::device_link_key(kind, &device.id),
         &device.id,
     );
     fixture
