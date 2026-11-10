@@ -16,6 +16,7 @@ strum_macros = { workspace = true }
 eyre = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -262,6 +262,7 @@ pub(crate) async fn remote_hub(
             tools_allow: allow.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         },
+        desk_boss: Default::default(),
         ..state
     });
     let fx = crate::remote_mcp::testing::Fixture {

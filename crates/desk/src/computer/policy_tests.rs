@@ -31,6 +31,7 @@ fn policy(access: Access) -> AgentPolicy {
             asks: Default::default(),
         },
         own: vec![p(OWN)],
+        works_in: vec![],
         withheld: vec![p(DATA), p("/Users/sarah/Library/Keychains")],
         config: vec![
             p(&format!("{OWN}/config.toml")),
@@ -1058,4 +1059,163 @@ fn writing_over_a_file_outside_the_folder_asks_at_full_access() {
         &call(write(&base.join("own/a.txt").display().to_string())),
     );
     assert!(matches!(v, Verdict::Run { .. }), "{v:?}");
+}
+
+/// An agent at Own folder given `ACME` to work in.
+fn working_in_acme(access: Access) -> AgentPolicy {
+    AgentPolicy {
+        works_in: vec![p(ACME)],
+        ..policy(access)
+    }
+}
+
+#[test]
+fn a_folder_it_works_in_reads_and_changes_as_its_own_at_every_level() {
+    for access in [Access::OwnFolder, Access::ReadAnywhere, Access::Full] {
+        let pol = working_in_acme(access);
+        let file = format!("{ACME}/src/app.ts");
+        assert_eq!(
+            verdict(&pol, false, &[], &call(read(&file))),
+            run(),
+            "{access:?}"
+        );
+        assert_eq!(
+            verdict(&pol, false, &[], &call(write(&file))),
+            run(),
+            "{access:?}"
+        );
+        // Without it, Own folder reaches none of it.
+        let without = policy(access);
+        if access == Access::OwnFolder {
+            assert_eq!(
+                refused(&verdict(&without, false, &[], &call(read(&file)))).map(|r| r.0),
+                Some(Refused::OutsideLevel)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_folder_it_works_in_sits_beside_its_own_never_in_place_of_it() {
+    let pol = working_in_acme(Access::OwnFolder);
+    assert_eq!(
+        verdict(&pol, false, &[], &call(write(&format!("{OWN}/notes.md")))),
+        run()
+    );
+    assert_eq!(
+        refused(&verdict(
+            &pol,
+            false,
+            &[],
+            &call(read("/Users/sarah/dev/other/a.rs"))
+        ))
+        .map(|r| r.0),
+        Some(Refused::OutsideLevel),
+        "a sibling folder stays outside"
+    );
+    assert_eq!(
+        refused(&verdict(
+            &pol,
+            false,
+            &[],
+            &call(read("/Users/sarah/dev/acme-web-old/a.rs"))
+        ))
+        .map(|r| r.0),
+        Some(Refused::OutsideLevel),
+        "a folder whose name starts the same is not inside"
+    );
+}
+
+#[test]
+fn deleting_in_a_folder_it_works_in_still_asks() {
+    let pol = working_in_acme(Access::Full);
+    let file = format!("{ACME}/src/old.ts");
+    assert!(
+        matches!(
+            verdict(&pol, false, &[], &call(delete(&file))),
+            Verdict::Ask {
+                why: Why::CantBeUndone,
+                ..
+            }
+        ),
+        "the person's own work: a delete there can't be undone"
+    );
+    assert!(matches!(
+        verdict(&pol, false, &[], &call(exec("rm -rf src", ACME))),
+        Verdict::Ask {
+            why: Why::CantBeUndone,
+            ..
+        }
+    ));
+    // In its own folder a delete runs, as before.
+    assert_eq!(
+        verdict(
+            &pol,
+            false,
+            &[],
+            &call(delete(&format!("{OWN}/scratch.md")))
+        ),
+        run()
+    );
+}
+
+#[test]
+fn a_folder_it_works_in_never_carves_out_what_desk_withholds() {
+    // Even were one given above Desk's data, the withheld set stands.
+    let pol = AgentPolicy {
+        works_in: vec![p("/Users/sarah/Library")],
+        ..policy(Access::Full)
+    };
+    assert_eq!(
+        refused(&verdict(
+            &pol,
+            false,
+            &[],
+            &call(read("/Users/sarah/Library/Keychains/login.keychain-db"))
+        ))
+        .map(|r| r.0),
+        Some(Refused::Withheld)
+    );
+    assert_eq!(
+        refused(&verdict(
+            &pol,
+            false,
+            &[],
+            &call(read(&format!("{DATA}/hub/data/vault.db")))
+        ))
+        .map(|r| r.0),
+        Some(Refused::Withheld)
+    );
+}
+
+#[test]
+fn commands_in_a_folder_it_works_in_follow_the_level() {
+    // Below Full access commands can't be contained on this computer yet.
+    let own = working_in_acme(Access::OwnFolder);
+    assert_eq!(
+        refused(&verdict(&own, false, &[], &call(exec("npm test", ACME)))).map(|r| r.0),
+        Some(Refused::OutsideLevel)
+    );
+    let full = working_in_acme(Access::Full);
+    assert_eq!(
+        verdict(&full, false, &[], &call(exec("npm test", ACME))),
+        run()
+    );
+}
+
+#[test]
+fn a_session_may_start_in_a_folder_it_works_in() {
+    let pol = AgentPolicy {
+        contained: true,
+        ..working_in_acme(Access::OwnFolder)
+    };
+    assert_eq!(
+        verdict(
+            &pol,
+            false,
+            &[],
+            &call(Effect::Session { cwd: Some(p(ACME)) })
+        ),
+        run()
+    );
 }

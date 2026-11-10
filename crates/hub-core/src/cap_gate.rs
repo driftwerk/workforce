@@ -149,6 +149,7 @@ fn action(cap: Capability) -> &'static str {
         Capability::AgentExport => "export agents and their data",
         Capability::AgentImport => "import agents and their data",
         Capability::CrossuserRead => "read another user's data",
+        Capability::DeskBoss => "make an agent here a boss of their Desk groups",
         Capability::OwnDataRw | Capability::OwnDataDestructive => "perform this action",
     }
 }

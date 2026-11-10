@@ -1231,6 +1231,11 @@ pub struct AccountExtras {
     /// The bearer key of an Ollama or vLLM server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The AWS CLI profile a Bedrock account signs in with (`~/.aws/config`:
+    /// keys, SSO, `credential_process`), in place of keys in the vault. A
+    /// name, not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl std::fmt::Debug for AccountExtras {
@@ -1240,6 +1245,7 @@ impl std::fmt::Debug for AccountExtras {
             .field("project", &self.project)
             .field("location", &self.location)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("profile", &self.profile)
             .finish()
     }
 }
@@ -1361,7 +1367,10 @@ pub fn create_provider_with(
             Box::new(client)
         }
         ProviderKind::Bedrock => {
-            let resolver = CredentialResolver::from_packed(api_key);
+            let resolver = match AccountExtras::given(&extras.profile) {
+                Some(profile) => CredentialResolver::from_profile(profile),
+                None => CredentialResolver::from_packed(api_key),
+            };
             let region = bedrock::resolve_region(AccountExtras::given(&extras.region));
             let client = BedrockClient::new(resolver, region).with_catalog(bedrock_catalog());
             let client = model.into_iter().fold(client, |c, m| c.with_model(m));

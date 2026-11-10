@@ -3135,6 +3135,8 @@ impl workforce_hub::mcp_servers::callback::ManagerLookup for McpManagerMap {
 /// runtime — mirrors the startup wiring (workflow runtime injection, advisor,
 /// coding.session, MCP manager, image broadcast, NATS chat) exactly.
 struct OverlayWatcherCtx {
+    /// `[desk_boss]` as the gateway reads it, replaced on each overlay change.
+    desk_boss: workforce_hub::boss_links::LiveConfig,
     registry: Arc<workforce_hub::agent_registry::AgentRegistry>,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -3225,6 +3227,7 @@ fn spawn_overlay_agent_watcher(ctx: OverlayWatcherCtx) {
                     continue;
                 }
             };
+            ctx.desk_boss.set(new_config.desk_boss.clone());
             let default_id = ctx.registry.default_id().to_string();
             let desired: std::collections::HashMap<
                 String,
@@ -4576,6 +4579,10 @@ rules:
             // changed agents are respawned. The default agent is never torn
             // down live — changes to it still need a restart.
             let overlay_kick = Arc::new(tokio::sync::Notify::new());
+            // `[desk_boss]`, shared by the gateway and the overlay watcher,
+            // so an admin turning it on or off takes effect without a restart.
+            let desk_boss_live =
+                workforce_hub::boss_links::LiveConfig::new(wf_config.desk_boss.clone());
             // Late-bound cells: the identity store + capability gate are built
             // below (after this watcher spawns); the boot path fills these and
             // `spawn_and_wire_agent` reads them so live-spawned agents are
@@ -4614,6 +4621,7 @@ rules:
                     capability_gate: Arc::clone(&watcher_capability_gate),
                     slack: Arc::clone(&slack_slot),
                     kick: Arc::clone(&overlay_kick),
+                    desk_boss: desk_boss_live.clone(),
                 });
             }
 
@@ -4677,6 +4685,7 @@ rules:
                             &service.identity_store,
                         )),
                         remote_mcp_tokens: Arc::clone(&service.remote_mcp_tokens),
+                        telemetry: Some(Arc::clone(&service.telemetry_store)),
                     };
                     for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx) {
                         service.tools.register(tool);
@@ -5182,6 +5191,7 @@ rules:
                     .clone()
                     .map(|s| s.as_remote_mcp_token_store()),
                 remote_mcp: wf_config.remote_mcp.clone(),
+                desk_boss: desk_boss_live.clone(),
                 permission_evaluator: permission_evaluator.clone(),
                 // The live `@destructive → Ask` baseline is in effect only when
                 // the cascade is wired (evaluator present ⇔ `[permissions]
