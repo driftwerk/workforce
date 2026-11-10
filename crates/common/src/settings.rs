@@ -9725,6 +9725,25 @@ impl CodingEngineKind {
             _ => CLAUDE_CODE_EFFORTS,
         }
     }
+
+    /// `effort` as this engine's CLI takes it: as it is where it accepts
+    /// it, else the nearest level it has (`xhigh` is Claude Code's `max`).
+    pub fn clamp_effort(self, effort: &str) -> String {
+        if self
+            .efforts()
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(effort))
+        {
+            return effort.to_string();
+        }
+        match effort.to_ascii_lowercase().as_str() {
+            "xhigh" | "max" => "max",
+            "minimal" | "low" => "low",
+            "medium" => "medium",
+            _ => "high",
+        }
+        .to_string()
+    }
 }
 
 /// What makes a round move on to the next entry of the fallback chain.
@@ -9839,6 +9858,23 @@ impl CodingEngineConfig {
                     .map(|e| e.kind),
             )
             .collect()
+    }
+
+    /// The effort levels a round may ask for: the set engine's, or, unset,
+    /// those of either engine that may lead (each clamps to its own at run
+    /// time, see [`CodingEngineKind::clamp_effort`]).
+    pub fn efforts(&self) -> Vec<&'static str> {
+        let leaders = match self.kind {
+            Some(kind) => vec![kind],
+            None => vec![CodingEngineKind::ClaudeCode, CodingEngineKind::Codex],
+        };
+        let mut all: Vec<&'static str> = Vec::new();
+        for effort in leaders.into_iter().flat_map(CodingEngineKind::efforts) {
+            if !all.contains(effort) {
+                all.push(effort);
+            }
+        }
+        all
     }
 
     /// Whether every engine in the chain runs on a person's subscription
@@ -11503,8 +11539,8 @@ impl WorkforceConfig {
                 "coding_session timeout_secs must be 0 (default) or at least {MIN_DRIVER_TIMEOUT_SECS}"
             ));
         }
-        // Unset, Claude Code's efforts: Codex takes every one of them too.
-        let efforts = self.coding_session.engine.primary().efforts();
+        // Unset, either engine's: each clamps to its own when it runs.
+        let efforts = self.coding_session.engine.efforts();
         if let Some(effort) = self
             .coding_session
             .effort
@@ -12246,12 +12282,17 @@ oauth_system_prefix = ""
         assert_eq!(set.kinds(), [CodingEngineKind::ClaudeCode]);
         // Written back as it was read.
         assert!(!toml::to_string(&unset).unwrap().contains("kind"));
-        // An effort Claude Code takes is fine unset; one only Codex takes isn't.
+        // Unset, either engine's effort is fine: each clamps to its own.
         let mut wf = WorkforceConfig::default();
-        wf.coding_session.effort = Some("high".into());
-        assert!(wf.validate().is_ok());
+        assert_eq!(unset.efforts(), ["low", "medium", "high", "max", "xhigh"]);
         wf.coding_session.effort = Some("xhigh".into());
+        assert!(wf.validate().is_ok());
+        wf.coding_session.effort = Some("ultra".into());
         assert!(wf.validate().is_err());
+        assert_eq!(CodingEngineKind::ClaudeCode.clamp_effort("xhigh"), "max");
+        assert_eq!(CodingEngineKind::ClaudeCode.clamp_effort("high"), "high");
+        assert_eq!(CodingEngineKind::Codex.clamp_effort("xhigh"), "xhigh");
+        assert_eq!(CodingEngineKind::Codex.clamp_effort("max"), "max");
     }
 
     #[test]
