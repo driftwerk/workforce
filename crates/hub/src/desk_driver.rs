@@ -308,6 +308,23 @@ fn account(
     };
     let mut extras = AccountExtras::default();
     let api_key = match kind {
+        ProviderKind::Bedrock if field(fields, "profile").is_some() => {
+            let profile = required("profile")?;
+            if !profile
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.@+".contains(c))
+            {
+                return Err(AccountError::Invalid(
+                    "an AWS profile name is letters, digits and - _ . @ +, as in ~/.aws/config"
+                        .into(),
+                ));
+            }
+            extras.region = field(fields, "region").map(str::to_string);
+            extras.profile = Some(profile);
+            // The profile, not the hub's environment or default chain, is
+            // where its credentials come from.
+            workforce_agent::llm::bedrock_credentials::CHAIN_SENTINEL.to_string()
+        }
         ProviderKind::Bedrock => {
             extras.region = field(fields, "region").map(str::to_string);
             format!(
@@ -1271,6 +1288,57 @@ mod tests {
                 accounts.disconnect(spec).await.unwrap();
                 assert!(global.list(Some("llm/accounts/")).is_empty(), "{}", spec.id);
             }
+        }
+
+        #[tokio::test]
+        async fn bedrock_on_an_aws_profile_keeps_its_name_and_region_and_no_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let bedrock = spec("bedrock").unwrap();
+            let given = workforce_desk::providers::checked(
+                bedrock,
+                fields(&[("profile", "work-sso"), ("region", "eu-west-2")]),
+            )
+            .unwrap();
+            accounts.connect(bedrock, &given).await.unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(&global.get("llm/accounts/bedrock").unwrap()).unwrap();
+            assert_eq!(
+                record,
+                serde_json::json!({
+                    "provider": "bedrock",
+                    "api_key": "none",
+                    "region": "eu-west-2",
+                    "profile": "work-sso",
+                })
+            );
+            assert!(accounts.standing(bedrock).await.connected);
+            let providers = agent_providers(&global);
+            providers
+                .provider(
+                    ProviderKind::Bedrock,
+                    Some("anthropic.claude-sonnet-5-5"),
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("builds without reaching AWS");
+            // Keys still connect as before, over the profile.
+            accounts
+                .connect(bedrock, &connect_fields("bedrock"))
+                .await
+                .unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(&global.get("llm/accounts/bedrock").unwrap()).unwrap();
+            assert_eq!(record["api_key"], "AKIADESK:desk/secret+key");
+            assert!(record.get("profile").is_none());
+            let err = accounts
+                .connect(bedrock, &fields(&[("profile", "work sso]")]))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("AWS profile name"), "{err}");
         }
 
         #[tokio::test]

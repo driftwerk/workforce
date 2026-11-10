@@ -1,8 +1,11 @@
 //! Credential sourcing for the Bedrock provider. Resolves to a per-request
-//! snapshot from either a static packed string or the AWS default credential
-//! chain (env, shared config, ECS task role, IRSA, IMDS). The chain variant
-//! caches resolved credentials and refreshes them just before STS expiry, so
-//! the signed-request hot path never re-walks the chain or re-hits IMDS.
+//! snapshot from a static packed string, the AWS default credential chain
+//! (env, shared config, ECS task role, IRSA, IMDS), or one named profile of
+//! the person's AWS CLI config (`~/.aws/config` and `credentials`: keys, SSO
+//! after `aws sso login`, `credential_process`, an assumed role). The chain
+//! and profile variants cache resolved credentials and refresh them just
+//! before they expire, so the signed-request hot path never re-walks the
+//! chain or re-hits IMDS.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -91,6 +94,9 @@ pub enum CredentialResolver {
 pub struct ChainState {
     provider: OnceCell<SharedCredentialsProvider>,
     cached: Mutex<Option<CachedCreds>>,
+    /// The AWS CLI profile the credentials come from; `None` is the default
+    /// chain.
+    profile: Option<String>,
 }
 
 struct CachedCreds {
@@ -112,7 +118,34 @@ impl CredentialResolver {
     {
         match BedrockCredentials::resolve(packed, env) {
             Ok(creds) => Self::Static(creds),
-            Err(_) => Self::Chain(Arc::new(ChainState::new(OnceCell::new()))),
+            Err(_) => Self::Chain(Arc::new(ChainState::new(OnceCell::new(), None))),
+        }
+    }
+
+    /// Credentials from the AWS CLI profile `profile` alone, as `aws` reads
+    /// it: never the environment's keys, the default profile, or the
+    /// machine's role. Refreshed as they expire, so an SSO sign-in lasts as
+    /// long as `aws sso login` keeps it.
+    pub fn from_profile(profile: &str) -> Self {
+        Self::Chain(Arc::new(ChainState::new(
+            OnceCell::new(),
+            Some(profile.trim().to_string()),
+        )))
+    }
+
+    /// The AWS CLI profile these credentials come from, if one.
+    pub fn profile(&self) -> Option<&str> {
+        match self {
+            Self::Chain(state) => state.profile.as_deref(),
+            Self::Static(_) => None,
+        }
+    }
+
+    /// Forgets the credentials held, so the next call resolves them again:
+    /// for an AWS answer that says they expired before their time.
+    pub async fn forget(&self) {
+        if let Self::Chain(state) = self {
+            *state.cached.lock().await = None;
         }
     }
 
@@ -141,17 +174,34 @@ impl CredentialResolver {
 
     #[cfg(test)]
     fn from_provider(provider: SharedCredentialsProvider) -> Self {
-        Self::Chain(Arc::new(ChainState::new(OnceCell::new_with(Some(
-            provider,
-        )))))
+        Self::Chain(Arc::new(ChainState::new(
+            OnceCell::new_with(Some(provider)),
+            None,
+        )))
+    }
+
+    #[cfg(test)]
+    fn from_profile_provider(profile: &str, provider: SharedCredentialsProvider) -> Self {
+        Self::Chain(Arc::new(ChainState::new(
+            OnceCell::new_with(Some(provider)),
+            Some(profile.to_string()),
+        )))
     }
 }
 
 impl ChainState {
-    fn new(provider: OnceCell<SharedCredentialsProvider>) -> Self {
+    fn new(provider: OnceCell<SharedCredentialsProvider>, profile: Option<String>) -> Self {
         Self {
             provider,
             cached: Mutex::new(None),
+            profile,
+        }
+    }
+
+    async fn load(&self) -> Result<SharedCredentialsProvider> {
+        match &self.profile {
+            Some(profile) => Ok(profile_provider(profile)),
+            None => load_default_chain().await,
         }
     }
 
@@ -162,11 +212,14 @@ impl ChainState {
                 return Ok(entry.creds.clone());
             }
         }
-        let provider = self.provider.get_or_try_init(load_default_chain).await?;
+        let provider = self.provider.get_or_try_init(|| self.load()).await?;
         let aws_creds = provider
             .provide_credentials()
             .await
-            .map_err(|e| eyre!("AWS credential chain failed: {e}"))?;
+            .map_err(|e| match &self.profile {
+                Some(profile) => eyre!("{}", profile_failure(profile, &e)),
+                None => eyre!("AWS credential chain failed: {e}"),
+            })?;
         let creds = BedrockCredentials {
             access_key_id: aws_creds.access_key_id().to_string(),
             secret_access_key: aws_creds.secret_access_key().to_string(),
@@ -180,11 +233,72 @@ impl ChainState {
     }
 
     async fn shared_provider(&self) -> Result<SharedCredentialsProvider> {
-        self.provider
-            .get_or_try_init(load_default_chain)
-            .await
-            .cloned()
+        self.provider.get_or_try_init(|| self.load()).await.cloned()
     }
+}
+
+/// The provider for the AWS CLI profile `profile`, from the usual config and
+/// credentials files (or where `AWS_CONFIG_FILE` and
+/// `AWS_SHARED_CREDENTIALS_FILE` say they are).
+fn profile_provider(profile: &str) -> SharedCredentialsProvider {
+    SharedCredentialsProvider::new(
+        aws_config::profile::ProfileFileCredentialsProvider::builder()
+            .profile_name(profile)
+            .build(),
+    )
+}
+
+/// Every message along `error`'s chain of causes, lower case: the SDK puts
+/// what went wrong in a source, not in the top-level message.
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        next = cause.source();
+    }
+    out.to_lowercase()
+}
+
+/// Whether a failure to load `profile` is its SSO sign-in having run out:
+/// the cached token expired or gone, or AWS refusing it.
+fn sso_expired(causes: &str) -> bool {
+    let sso = causes.contains("sso");
+    sso && (causes.contains("expired")
+        || causes.contains("sso/cache")
+        || causes.contains("cached sso token")
+        || causes.contains("unauthorized")
+        || causes.contains("refresh"))
+}
+
+/// What the person reads when `profile` signed in with SSO and the sign-in
+/// has run out.
+pub fn sso_expired_message(profile: &str) -> String {
+    format!("Your AWS sign-in for profile {profile} has expired. Run `aws sso login --profile {profile}`.")
+}
+
+/// Why `profile` gave no credentials, in words the person can act on: never
+/// "invalid key" for a sign-in that ran out.
+fn profile_failure(
+    profile: &str,
+    error: &aws_credential_types::provider::error::CredentialsError,
+) -> String {
+    let causes = causes(error);
+    if sso_expired(&causes) {
+        return sso_expired_message(profile);
+    }
+    if causes.contains("was not defined") || causes.contains("no profiles were defined") {
+        return format!("There is no AWS profile named {profile} in ~/.aws/config on the machine the hub runs on.");
+    }
+    format!("AWS gave no credentials for profile {profile}: {causes}")
+}
+
+/// Whether an AWS answer says the signing credentials have expired.
+pub fn says_expired(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("expiredtoken")
+        || lower.contains("security token included in the request is expired")
 }
 
 fn is_expiring_soon(expiry: Option<SystemTime>, now: SystemTime) -> bool {
@@ -417,6 +531,159 @@ mod tests {
             err.contains("AWS credential chain failed"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A provider that fails as `message` says, the way the SDK's do: the
+    /// words in a source, under a generic top line.
+    #[derive(Debug)]
+    struct FailsWith(&'static str);
+    impl ProvideCredentials for FailsWith {
+        fn provide_credentials<'a>(&'a self) -> ProvideCredsFut<'a>
+        where
+            Self: 'a,
+        {
+            ProvideCredsFut::ready(Err(
+                aws_credential_types::provider::error::CredentialsError::provider_error(
+                    std::io::Error::other(self.0),
+                ),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_profile_resolver_names_its_profile_and_keys_name_none() {
+        let profile = CredentialResolver::from_profile(" work-sso ");
+        assert_eq!(profile.profile(), Some("work-sso"));
+        assert!(matches!(profile, CredentialResolver::Chain(_)));
+        let keys = CredentialResolver::from_packed_with_env("AKID:SECRET", empty_env);
+        assert_eq!(keys.profile(), None);
+        let chain = CredentialResolver::from_packed_with_env(CHAIN_SENTINEL, empty_env);
+        assert_eq!(chain.profile(), None);
+    }
+
+    #[tokio::test]
+    async fn a_chosen_profile_resolves_from_its_own_section_and_nothing_else() {
+        let files = aws_runtime::env_config::file::EnvConfigFiles::builder()
+            .include_default_config_file(false)
+            .include_default_credentials_file(false)
+            .with_contents(
+                aws_runtime::env_config::file::EnvConfigFileKind::Config,
+                "[default]\naws_access_key_id = DEFAULT_AKID\naws_secret_access_key = d\n\
+                 [profile work]\naws_access_key_id = WORK_AKID\naws_secret_access_key = w\n",
+            )
+            .build();
+        let provider = aws_config::profile::ProfileFileCredentialsProvider::builder()
+            .profile_name("work")
+            .profile_files(files)
+            .build();
+        let resolver = CredentialResolver::from_profile_provider(
+            "work",
+            SharedCredentialsProvider::new(provider),
+        );
+        let creds = resolver.resolve().await.unwrap();
+        assert_eq!(creds.access_key_id, "WORK_AKID");
+        assert_eq!(creds.secret_access_key, "w");
+    }
+
+    #[tokio::test]
+    async fn a_profile_that_is_not_there_is_named_as_missing() {
+        let files = aws_runtime::env_config::file::EnvConfigFiles::builder()
+            .include_default_config_file(false)
+            .include_default_credentials_file(false)
+            .with_contents(
+                aws_runtime::env_config::file::EnvConfigFileKind::Config,
+                "[profile other]\naws_access_key_id = A\naws_secret_access_key = s\n",
+            )
+            .build();
+        let provider = aws_config::profile::ProfileFileCredentialsProvider::builder()
+            .profile_name("work")
+            .profile_files(files)
+            .build();
+        let resolver = CredentialResolver::from_profile_provider(
+            "work",
+            SharedCredentialsProvider::new(provider),
+        );
+        let err = resolver.resolve().await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "There is no AWS profile named work in ~/.aws/config on the machine the hub runs on."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_sso_sign_in_says_to_sign_in_again_never_invalid_key() {
+        for failure in [
+            "the SSO token has expired and cannot be refreshed",
+            "failed to read `/Users/someone/.aws/sso/cache/0123abcd.json`",
+            "UnauthorizedException: Session token not found or invalid (SSO)",
+        ] {
+            let resolver = CredentialResolver::from_profile_provider(
+                "work",
+                SharedCredentialsProvider::new(FailsWith(failure)),
+            );
+            let err = resolver.resolve().await.unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "Your AWS sign-in for profile work has expired. Run `aws sso login --profile work`.",
+                "{failure}"
+            );
+            assert!(!err.to_lowercase().contains("invalid"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn another_profile_failure_says_what_aws_said() {
+        let resolver = CredentialResolver::from_profile_provider(
+            "work",
+            SharedCredentialsProvider::new(FailsWith("credential_process exited with 1")),
+        );
+        let err = resolver.resolve().await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("AWS gave no credentials for profile work: "),
+            "{err}"
+        );
+        assert!(err.contains("credential_process exited with 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn forgetting_resolves_again() {
+        #[derive(Debug)]
+        struct Counting(Arc<AtomicUsize>);
+        impl ProvideCredentials for Counting {
+            fn provide_credentials<'a>(&'a self) -> ProvideCredsFut<'a>
+            where
+                Self: 'a,
+            {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                ProvideCredsFut::ready(Ok(Credentials::new(
+                    format!("AKID_{n}"),
+                    "SECRET",
+                    None,
+                    None,
+                    "counting",
+                )))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = CredentialResolver::from_profile_provider(
+            "work",
+            SharedCredentialsProvider::new(Counting(calls.clone())),
+        );
+        assert_eq!(resolver.resolve().await.unwrap().access_key_id, "AKID_0");
+        assert_eq!(resolver.resolve().await.unwrap().access_key_id, "AKID_0");
+        resolver.forget().await;
+        assert_eq!(resolver.resolve().await.unwrap().access_key_id, "AKID_1");
+    }
+
+    #[test]
+    fn an_expired_token_answer_is_told_apart() {
+        assert!(says_expired(
+            r#"{"message":"The security token included in the request is expired"}"#
+        ));
+        assert!(says_expired(r#"{"__type":"ExpiredTokenException"}"#));
+        assert!(!says_expired(
+            r#"{"message":"The security token included in the request is invalid."}"#
+        ));
     }
 
     #[tokio::test]
