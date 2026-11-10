@@ -104,7 +104,7 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             v.key.as_deref().unwrap_or("-"),
-            cell(&v.ticket.title),
+            cell(&v.ticket.said_title()),
             c.word(),
             cell(&holder(v)),
             cell(&waiting),
@@ -281,7 +281,7 @@ impl CrewHub {
                 line: format!(
                     "{} “{}” is ready on the board and has no one on it yet",
                     v.key.as_deref().unwrap_or("A ticket"),
-                    crew::one_line(&v.ticket.title, 80),
+                    crew::one_line(&v.ticket.said_title(), 80),
                 ),
                 approvals: Vec::new(),
                 hop: 0,

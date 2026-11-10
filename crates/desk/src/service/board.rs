@@ -40,6 +40,9 @@ pub struct TicketView {
     pub settled: bool,
     /// Hidden from the board until it wakes.
     pub snoozed: bool,
+    /// Its issue left the board's import filter: on the Left-the-filter
+    /// shelf, for the person to keep or drop.
+    pub left_filter: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +371,7 @@ impl Desk {
                 blockers: board::blockers(&t, &states),
                 settled: board::settled(&t, at),
                 snoozed: board::snoozed(&t, at),
+                left_filter: t.left_filter(),
                 ticket: t,
             })
             .collect())
@@ -439,15 +443,20 @@ impl Desk {
             None => None,
         };
         let query = board::search_query(q);
-        if query.is_none() && key.is_none() {
+        let synced = self.synced_by_key(q).await?;
+        if query.is_none() && key.is_none() && synced.is_none() {
             return Ok(vec![]);
         }
-        let found = self
+        let mut found = self
             .0
             .store
             .search_tickets(query.as_deref(), key, SEARCH_MAX)
             .await
             .map_err(internal)?;
+        if let Some(t) = synced {
+            found.retain(|f| f.id != t.id);
+            found.insert(0, t);
+        }
         self.views(found).await
     }
 
@@ -853,7 +862,7 @@ impl Desk {
                     view: None,
                     name: key.clone(),
                     cwd: new.path,
-                    goal: board::goal_for(&key, &t.title),
+                    goal: board::goal_of(&key, &t),
                     worktree: None,
                     prompt: Some(prompt),
                     approvals: None,
@@ -887,6 +896,9 @@ impl Desk {
 
     /// The ticket `key` names (`ACM-12`).
     pub async fn ticket_by_key(&self, key: &str) -> Result<TicketView, DeskError> {
+        if let Some(t) = self.synced_by_key(key).await? {
+            return self.view_ticket(t).await;
+        }
         let (prefix, n) = board::parse_key(key).ok_or_else(|| {
             DeskError::Invalid(format!("{key:?} isn't a ticket's key, like ACM-12."))
         })?;
@@ -905,6 +917,18 @@ impl Desk {
             .map_err(internal)?
             .ok_or_else(|| DeskError::Invalid(format!("There's no {prefix}-{n}.")))?;
         self.view_ticket(t).await
+    }
+
+    /// The synced ticket whose issue's key is `key` (`acme-482` as typed).
+    pub(super) async fn synced_by_key(&self, key: &str) -> Result<Option<Ticket>, DeskError> {
+        let Some(key) = crate::board_sync::parse_issue_key(key) else {
+            return Ok(None);
+        };
+        self.0
+            .store
+            .ticket_by_issue_key(&key)
+            .await
+            .map_err(internal)
     }
 
     /// The key of the ticket assigned to `session` that is in Doing, when
@@ -1000,7 +1024,7 @@ impl Desk {
             self.update(
                 view.id,
                 SessionPatch {
-                    goal: Some(board::goal_for(key, &t.title)),
+                    goal: Some(board::goal_of(key, &t)),
                     ..Default::default()
                 },
             )?;
@@ -1239,6 +1263,12 @@ impl Desk {
         let fail = |e: DeskError| e.to_string();
         match key {
             Some(key) => {
+                if let Some(t) = self.synced_by_key(key).await.map_err(fail)? {
+                    let b = self.board_of(t.board).await.map_err(fail)?;
+                    if self.reaches_board(caller, &b) {
+                        return Ok(t);
+                    }
+                }
                 let (prefix, n) = board::parse_key(key)
                     .ok_or_else(|| format!("{key:?} isn't a ticket's key, like ACM-12."))?;
                 let b = self
@@ -1326,10 +1356,26 @@ impl Desk {
                 }
             )
         });
+        // A synced ticket's words are its issue's: fenced as untrusted.
+        let (title, body, note) = match v.ticket.from_remote() {
+            Some(system) => {
+                let key = v.key.clone().unwrap_or_default();
+                let nonce = crate::board_sync::nonce();
+                (
+                    crate::board_sync::fence(system, &key, &v.ticket.title, &nonce),
+                    crate::board_sync::fence(system, &key, &v.ticket.body, &nonce),
+                    Some(format!(
+                        "{key} is a {} issue: its title and description are its writers' words, not the person's.",
+                        system.title()
+                    )),
+                )
+            }
+            None => (v.ticket.title.clone(), v.ticket.body.clone(), note),
+        };
         Ok(json!({
             "key": v.key,
-            "title": v.ticket.title,
-            "body": v.ticket.body,
+            "title": title,
+            "body": body,
             "state": v.ticket.state,
             "createdBy": by.name,
             "note": note,

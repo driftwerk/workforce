@@ -1763,7 +1763,15 @@ impl CrewHub {
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
                 }
-                *text = format!("{}\n{}", t.ticket.title, t.ticket.body);
+                *text = match t.ticket.from_remote() {
+                    Some(system) => workforce_desk::board_sync::fence(
+                        system,
+                        t.key.as_deref().unwrap_or_default(),
+                        &format!("{}\n{}", t.ticket.title, t.ticket.body),
+                        &workforce_desk::board_sync::nonce(),
+                    ),
+                    None => format!("{}\n{}", t.ticket.title, t.ticket.body),
+                };
             }
             Action::MoveTicket {
                 ticket,

@@ -864,7 +864,19 @@ impl Desk {
     /// its history left with the old board's group.
     async fn ticket_goes(&self, id: Uuid, board: Uuid, by: &By) -> Result<String, DeskError> {
         let before = self.ticket(id).await?;
-        let old_group = self.board_of(before.ticket.board).await?.group;
+        let old_board = self.board_of(before.ticket.board).await?;
+        // A synced ticket's issue belongs to its board's link, in its
+        // group: it never goes to another board.
+        if let Some(e) = &before.ticket.external {
+            self.leave_ticket(id, by).await?;
+            return Err(DeskError::Conflict(format!(
+                "{} lives on {}'s {}. It stays there, unassigned.",
+                e.key,
+                old_board.name,
+                e.system.title()
+            )));
+        }
+        let old_group = old_board.group;
         let moved = self
             .0
             .store

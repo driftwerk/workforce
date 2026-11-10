@@ -799,17 +799,16 @@ pub fn nonce() -> String {
     Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
-/// A synced ticket's title on one line, for a list a model reads: its words
-/// defanged and marked as the issue's.
+/// A ticket's title for a list a model reads: a synced one's on one line,
+/// defanged and marked as its issue's words; anyone else's as it is.
 pub fn spoken_title(t: &Ticket) -> String {
-    let one = crate::crew::one_line(&t.title, 120);
     match t.from_remote() {
         Some(system) => format!(
             "«{}» ({} issue's own words)",
-            crate::memory::render::defanged(&one),
+            crate::memory::render::defanged(&crate::crew::one_line(&t.title, 120)),
             system.title()
         ),
-        None => one,
+        None => t.title.clone(),
     }
 }
 
