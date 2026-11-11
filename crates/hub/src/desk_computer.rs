@@ -612,6 +612,7 @@ impl ComputerGate for HubComputerGate {
             Some(Namespace::Computer) => true,
             Some(Namespace::Connector) => {
                 tool.starts_with("browser.")
+                    || tool.starts_with("connections.")
                     || workforce_common::connector_binding::connector_of(tool).is_some()
             }
             // Its own `[skills]`: a change that widens what it reaches.

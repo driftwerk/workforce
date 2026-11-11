@@ -78,6 +78,9 @@ pub const NAMESPACES: &[(&str, Namespace)] = &[
     ("obscura", Namespace::Connector),
     ("email", Namespace::Connector),
     ("slack", Namespace::Connector),
+    // An agent setting a connection up itself (`connections.*`): keeping a
+    // key it made, turning a connection on.
+    ("connections", Namespace::Connector),
 ];
 
 /// The namespace `tool` (`filesystem.read`) is in, if the verdict decides it.
