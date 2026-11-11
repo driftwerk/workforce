@@ -334,6 +334,15 @@ pub async fn stop_session_turn(
     )
     .await
     .applied();
+    // Stop closes the browser that turn was using, now, and drops what was
+    // allowed for it in this conversation.
+    #[cfg(feature = "postgres")]
+    crate::desk_browser::stopped(&session_id).await;
+    #[cfg(not(feature = "postgres"))]
+    workforce_skills::adapters::browser::close(
+        workforce_skills::adapters::browser::Which::Session(&session_id),
+    )
+    .await;
     info!(session_id = %session_id, stopped, "Turn stop requested via API");
     Json(serde_json::json!({
         "session_id": session_id,

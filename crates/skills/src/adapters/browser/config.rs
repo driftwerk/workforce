@@ -78,6 +78,11 @@ pub struct BrowserSkillConfig {
     /// profile the person signed in to by hand stays signed in.
     #[serde(default)]
     pub keep_profiles: bool,
+    /// Run Chrome without its sandbox. Only where the sandbox can't start
+    /// (a build box without user namespaces); as root in a container it is
+    /// off already.
+    #[serde(default)]
+    pub no_sandbox: bool,
 }
 
 impl Default for BrowserSkillConfig {
@@ -98,6 +103,7 @@ impl Default for BrowserSkillConfig {
             reap_interval_ms: default_reap_interval_ms(),
             show: false,
             keep_profiles: false,
+            no_sandbox: false,
         }
     }
 }

@@ -41,6 +41,7 @@ fn policy(access: Access) -> AgentPolicy {
         home: p("/Users/sarah"),
         contained: false,
         connectors: None,
+        browser: Browser::default(),
     }
 }
 
@@ -1061,6 +1062,242 @@ fn writing_over_a_file_outside_the_folder_asks_at_full_access() {
     assert!(matches!(v, Verdict::Run { .. }), "{v:?}");
 }
 
+// ── The browser ──────────────────────────────────────────────────────────
+
+/// Tools that only read a page, and tools that change one.
+const BROWSER_READS: &[&str] = &[
+    "browser.navigate",
+    "browser.snapshot",
+    "browser.screenshot",
+    "browser.pdf",
+    "browser.get_content",
+    "browser.console_messages",
+    "browser.network_requests",
+    "browser.wait",
+];
+const BROWSER_WRITES: &[&str] = &[
+    "browser.click",
+    "browser.fill",
+    "browser.type",
+    "browser.press_key",
+    "browser.select_option",
+    "browser.evaluate",
+    "browser.upload_file",
+];
+
+fn on_page(tool: &str, write: bool) -> CallFacts {
+    CallFacts {
+        tool: tool.into(),
+        ..call(Effect::Connector {
+            connector: browser_site(Some("https://shop.example")),
+            write,
+        })
+    }
+}
+
+fn browsing_as(browsing: Browsing, access: Access, hostile: bool) -> AgentPolicy {
+    let mut p_ = policy(access);
+    p_.browser = Browser { browsing, hostile };
+    p_
+}
+
+fn page_ask(session: bool) -> Verdict {
+    let mut choices = vec![Choice::AllowOnce];
+    if session {
+        choices.push(Choice::AllowSession);
+    }
+    choices.push(Choice::Deny);
+    Verdict::Ask {
+        choices,
+        why: Why::OnAPage,
+    }
+}
+
+/// The verdict table: each standing (unbound, an overseer at Act short of
+/// unbound and every other agent, one that only suggests) by each tool.
+#[test]
+fn browser_verdicts_by_standing_and_tool() {
+    let run = Verdict::Run { by: By::Rule };
+    for access in [Access::Full, Access::ReadAnywhere, Access::OwnFolder] {
+        for tool in BROWSER_READS {
+            for browsing in [Browsing::Unbound, Browsing::Asks, Browsing::Suggests] {
+                for hostile in [false, true] {
+                    let v = verdict(
+                        &browsing_as(browsing, access, hostile),
+                        false,
+                        &[],
+                        &on_page(tool, false),
+                    );
+                    if hostile && *tool == "browser.navigate" {
+                        assert_eq!(
+                            v,
+                            Verdict::Ask {
+                                choices: vec![Choice::AllowOnce, Choice::Deny],
+                                why: Why::HostilePage
+                            },
+                            "after a hostile page, going on asks at {browsing:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            v, run,
+                            "{tool} reads at {browsing:?} {access:?} hostile={hostile}"
+                        );
+                    }
+                }
+            }
+        }
+        for tool in BROWSER_WRITES {
+            let write = on_page(tool, true);
+            assert_eq!(
+                verdict(
+                    &browsing_as(Browsing::Unbound, access, false),
+                    false,
+                    &[],
+                    &write
+                ),
+                run,
+                "unbound {tool}"
+            );
+            let asked = verdict(
+                &browsing_as(Browsing::Asks, access, false),
+                false,
+                &[],
+                &write,
+            );
+            if *tool == "browser.evaluate" {
+                assert!(
+                    matches!(
+                        asked,
+                        Verdict::Ask {
+                            why: Why::Unclear,
+                            ..
+                        }
+                    ),
+                    "{asked:?}"
+                );
+            } else {
+                assert_eq!(asked, page_ask(true), "asks {tool} at {access:?}");
+            }
+            let suggests = verdict(
+                &browsing_as(Browsing::Suggests, access, false),
+                false,
+                &[],
+                &write,
+            );
+            assert!(
+                matches!(&suggests, Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel && refusal.sentence.contains("only suggests")),
+                "suggests {tool}: {suggests:?}"
+            );
+        }
+    }
+}
+
+/// Neither the computer's kill switch nor the agent's level holds the
+/// browser: it has its own off switch in Desk's settings.
+#[test]
+fn the_computer_kill_switch_and_level_leave_the_browser_to_its_own_rules() {
+    let p_ = browsing_as(Browsing::Unbound, Access::OwnFolder, false);
+    assert_eq!(
+        verdict(&p_, true, &[], &on_page("browser.click", true)),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
+/// A hostile page puts even an unbound overseer back to asking, once at a
+/// time: no allowance, standing or Full access covers it.
+#[test]
+fn a_hostile_page_asks_every_time_whatever_covers_the_call() {
+    let hostile_ask = Verdict::Ask {
+        choices: vec![Choice::AllowOnce, Choice::Deny],
+        why: Why::HostilePage,
+    };
+    let allowance = site_allowance("shop.example", "s1");
+    for browsing in [Browsing::Unbound, Browsing::Asks] {
+        let mut p_ = browsing_as(browsing, Access::Full, true);
+        p_.access.asks = Asking::Never;
+        assert_eq!(
+            verdict(
+                &p_,
+                false,
+                std::slice::from_ref(&allowance),
+                &on_page("browser.click", true)
+            ),
+            hostile_ask,
+            "{browsing:?}"
+        );
+    }
+}
+
+fn site_allowance(host: &str, session: &str) -> Grant {
+    Grant {
+        id: Uuid::from_u128(7),
+        hub: "local".into(),
+        agent: "allan".into(),
+        person: "sarah".into(),
+        ability: Ability::ConnectorWrite,
+        folder: None,
+        connector: Some(browser_site(Some(&format!("https://{host}")))),
+        session_id: Some(session.into()),
+        run: None,
+    }
+}
+
+/// "Allow for this session" holds for its site and its session only.
+#[test]
+fn a_session_allowance_covers_its_site_in_its_session() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let click = on_page("browser.click", true);
+    assert_eq!(
+        verdict(&p_, false, &[site_allowance("shop.example", "s1")], &click),
+        Verdict::Run {
+            by: By::Session(Uuid::from_u128(7))
+        }
+    );
+    assert_eq!(
+        verdict(&p_, false, &[site_allowance("other.example", "s1")], &click),
+        page_ask(true),
+        "another site"
+    );
+    assert_eq!(
+        verdict(&p_, false, &[site_allowance("shop.example", "s2")], &click),
+        page_ask(true),
+        "another session"
+    );
+}
+
+/// An agent at Full access that never asks ("do anything") changes pages
+/// as it does everything else; one that asks is asked.
+#[test]
+fn full_access_that_never_asks_acts_on_pages() {
+    let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    p_.access.asks = Asking::Never;
+    assert_eq!(
+        verdict(&p_, false, &[], &on_page("browser.fill", true)),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
+/// A call with no session offers no session allowance.
+#[test]
+fn a_browser_ask_outside_a_session_offers_allow_once_only() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let click = CallFacts {
+        session_id: None,
+        ..on_page("browser.click", true)
+    };
+    assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
+}
+
+#[test]
+fn a_browser_site_is_kept_by_its_host() {
+    assert_eq!(
+        browser_site(Some("https://shop.example")),
+        "browser:https://shop.example"
+    );
+    assert_eq!(browser_site(None), "browser");
+    assert_eq!(browser_site(Some("")), "browser");
+}
+
 /// An agent at Own folder given `ACME` to work in.
 fn working_in_acme(access: Access) -> AgentPolicy {
     AgentPolicy {
@@ -1218,4 +1455,95 @@ fn a_session_may_start_in_a_folder_it_works_in() {
         ),
         run()
     );
+}
+
+/// A script on a page asks each time below unbound: no site allowance
+/// covers it, since it can press what the never-list reads.
+#[test]
+fn a_script_on_a_page_asks_each_time_below_unbound() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let script = on_page("browser.evaluate", true);
+    let once = Verdict::Ask {
+        choices: vec![Choice::AllowOnce, Choice::Deny],
+        why: Why::Unclear,
+    };
+    assert_eq!(verdict(&p_, false, &[], &script), once);
+    assert_eq!(
+        verdict(&p_, false, &[site_allowance("shop.example", "s1")], &script),
+        once,
+        "an allowance for the site doesn't cover a script"
+    );
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Unbound, Access::Full, false),
+            false,
+            &[],
+            &script
+        ),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
+/// A browser opening a file reads it: Desk's data is withheld, and below
+/// Read anywhere only the own folder is read.
+#[test]
+fn a_browser_opening_a_file_is_held_as_a_read() {
+    for (access, path, refused) in [
+        (
+            Access::Full,
+            format!("{DATA}/hub/data/vault.enc"),
+            Some(Refused::Withheld),
+        ),
+        (
+            Access::OwnFolder,
+            "/Users/sarah/.ssh/id_rsa".to_string(),
+            Some(Refused::OutsideLevel),
+        ),
+        (Access::OwnFolder, format!("{OWN}/report.html"), None),
+    ] {
+        let mut p_ = browsing_as(Browsing::Unbound, access, false);
+        p_.browser.browsing = Browsing::Unbound;
+        let call = CallFacts {
+            tool: "browser.navigate".into(),
+            ..call(read(&path))
+        };
+        let v = verdict(&p_, false, &[], &call);
+        match refused {
+            Some(rule) => assert!(
+                matches!(&v, Verdict::Refuse { refusal } if refusal.rule == rule),
+                "{path}: {v:?}"
+            ),
+            None => assert_eq!(v, Verdict::Run { by: By::Rule }, "{path}"),
+        }
+    }
+}
+
+/// Below unbound a script asks each time, Full access that never asks
+/// included: it can press what the never-list reads.
+#[test]
+fn a_script_asks_even_where_everything_else_runs() {
+    let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    p_.access.asks = Asking::Never;
+    assert!(matches!(
+        verdict(&p_, false, &[], &on_page("browser.evaluate", true)),
+        Verdict::Ask {
+            why: Why::Unclear,
+            ..
+        }
+    ));
+}
+
+/// A page with no origin of its own (blank, inline, a file) is asked about
+/// once at a time: no allowance is shared for it.
+#[test]
+fn a_page_with_no_origin_offers_no_session_allowance() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let click = CallFacts {
+        tool: "browser.click".into(),
+        ..call(Effect::Connector {
+            connector: browser_site(None),
+            write: true,
+        })
+    };
+    assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
 }
