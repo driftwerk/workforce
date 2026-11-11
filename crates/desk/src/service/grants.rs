@@ -155,6 +155,9 @@ impl Desk {
         }
         run.since = engine.grants_since;
         run.loaded = true;
+        let granted = Self::granted_groups(&run.grants);
+        drop(run);
+        self.0.scopes.lock().granted = granted;
         Ok(())
     }
 
@@ -210,6 +213,28 @@ impl Desk {
         }
         grant::live(&g, Utc::now(), run.paused.is_some()).map_err(|why| why.say(&g.name))?;
         Ok(g)
+    }
+
+    /// The groups grants name a boss for: bossed, whatever state each
+    /// grant is in, until it is deleted.
+    fn granted_groups(grants: &BTreeMap<String, Grant>) -> std::collections::HashSet<String> {
+        grants
+            .values()
+            .filter(|g| g.boss.is_some() && g.group != UNGROUPED)
+            .map(|g| g.group.clone())
+            .collect()
+    }
+
+    /// The group whose grant names `id` (as a member or born), when one
+    /// does.
+    pub fn grant_group_of(&self, id: Uuid) -> Option<String> {
+        self.0
+            .grants
+            .lock()
+            .grants
+            .values()
+            .find(|g| g.members.contains(&id) || g.born.contains(&id))
+            .map(|g| g.group.clone())
     }
 
     fn grant_view_of(run: &GrantsRun, g: &Grant, now: DateTime<Utc>) -> GrantView {
@@ -368,6 +393,8 @@ impl Desk {
         }
         call.result = serde_json::json!({"change": accepted.change});
         let restamped = self.commit_grants(writes, None, call).await?;
+        drop(_one);
+        self.served_settle().await;
         let grant = self
             .grant_view(&Native::routes(), group)
             .ok_or(DeskError::NotFound)?;
@@ -410,6 +437,8 @@ impl Desk {
         self.commit_grants(Vec::new(), Some((group, stopped)), call)
             .await?;
         self.0.grants.lock().stopping.remove(group);
+        drop(_one);
+        self.served_settle().await;
         Ok(())
     }
 
@@ -524,7 +553,40 @@ impl Desk {
                 run.stopping.remove(g);
             }
         }
+        drop(_one);
+        self.served_settle().await;
         Ok(self.grants_view(&Native::routes()))
+    }
+
+    /// Lets go, at once, of every session a boss served from a grant runs
+    /// whose grant no longer lets it: stopped, paused, expired, deleted, or
+    /// no longer naming the session or the boss. Its turn is ended and what
+    /// the boss queued for it withdrawn ([`Desk::release`]). The hub's
+    /// crew does the same on its tick, for expiry.
+    pub async fn served_settle(&self) {
+        let charges: Vec<(Uuid, String)> = self
+            .charges()
+            .into_iter()
+            .filter(|c| grant::is_served(&c.boss))
+            .map(|c| (c.session, c.boss))
+            .collect();
+        for (id, boss) in charges {
+            let live = self.grant_group_of(id).is_some_and(|g| {
+                self.grant_live(&g)
+                    .is_ok_and(|x| x.boss.is_some_and(|b| b.party_id() == boss))
+            });
+            if !live {
+                if let Err(e) = self
+                    .release(
+                        id,
+                        &crate::crew::By::desk("Its boss's grant is no longer live."),
+                    )
+                    .await
+                {
+                    tracing::info!(%id, error = %e, "a session wasn't let go by its served boss");
+                }
+            }
+        }
     }
 
     /// Lets the bosses here go on: only Desk on the Mac asks it. Written
@@ -561,6 +623,9 @@ impl Desk {
         let Some(g) = self.0.grants.lock().grants.get(group).cloned() else {
             return Err(DeskError::NotFound);
         };
+        if g.born.contains(&id) {
+            return Ok(true);
+        }
         let call = CallRow {
             caller: "engine".into(),
             boss: None,
@@ -577,11 +642,43 @@ impl Desk {
         Ok(true)
     }
 
+    /// Puts `id`, about to start for the boss of `group`'s grant, in that
+    /// grant as born, on any engine.
+    pub(super) async fn served_born(
+        &self,
+        id: Uuid,
+        group: &str,
+        boss: &str,
+    ) -> Result<(), DeskError> {
+        let _one = self.0.grant_write.lock().await;
+        self.grants_loaded().await?;
+        // Checked again here, under the write lock: a stop, a pause or a
+        // new boss since the call was decided leaves nothing born.
+        let g = self.grant_live(group).map_err(DeskError::Conflict)?;
+        if g.boss.as_ref().map(grant::BossRef::party_id).as_deref() != Some(boss) {
+            return Err(DeskError::Conflict(crate::scope::not_ours(None)));
+        }
+        if g.born.contains(&id) || g.members.contains(&id) {
+            return Ok(());
+        }
+        let call = CallRow {
+            caller: "engine".into(),
+            boss: g.boss.as_ref().map(grant::BossRef::key),
+            group: Some(group.into()),
+            tool: "grant.born",
+            input: "{}".into(),
+            input_hash: hash(id.as_bytes()),
+            outcome: "ok",
+            said: None,
+            result: serde_json::json!({}),
+        };
+        self.commit_grants(vec![grant::with_born(&g, id)], None, call)
+            .await
+            .map(drop)
+    }
+
     /// `id` didn't start: it is born in no grant.
     pub(super) async fn born_undo(&self, id: Uuid) {
-        if !self.0.opts.bosses.machine {
-            return;
-        }
         let _one = self.0.grant_write.lock().await;
         let Some(mut g) = self
             .0
@@ -649,7 +746,9 @@ impl Desk {
                 .store
                 .write_grants(&writes, delete, None, &call)
                 .await?;
+            let granted = Self::granted_groups(&next);
             keep(&mut self.0.grants.lock(), next);
+            self.0.scopes.lock().granted = granted;
             return Ok(0);
         }
         let one = self.0.layout_write.lock().await;
@@ -674,9 +773,12 @@ impl Desk {
             )
             .await?;
         {
+            let granted = Self::granted_groups(&next);
             let mut run = self.0.grants.lock();
             keep(&mut run, next);
             run.since.get_or_insert_with(Utc::now);
+            drop(run);
+            self.0.scopes.lock().granted = granted;
         }
         self.0.state.lock().layout = layout.clone();
         self.scopes_follow(&layout);

@@ -312,6 +312,10 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "session_id": s, "engine": "codex", "reason": r }),
             true,
         )],
+        "crew.set_mode" => vec![(
+            json!({ "session_id": s, "mode": "plan", "reason": r }),
+            true,
+        )],
         "crew.resume" | "crew.restart" => {
             vec![(
                 json!({ "session_id": s, "prompt": "Carry on.", "reason": r }),

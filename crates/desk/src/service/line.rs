@@ -731,6 +731,7 @@ impl Desk {
             {
                 if let Some(asker) = question.from_session() {
                     self.boss_holds(asker, Some(b))?;
+                    self.mode_lets(asker, Some(b))?;
                 }
                 b.party.clone()
             }
@@ -1262,6 +1263,12 @@ impl Desk {
         if self.breaker_refuses_prompt(view.id, None).is_err() {
             return Some(Wait::Paused);
         }
+        // Still in a mode that doesn't ask, from a boss no longer unbound
+        // over it: nothing but the person's goes in until Desk has started
+        // it again in its own mode.
+        if self.mode_ending(view.id) {
+            return Some(Wait::ModeEnding);
+        }
         if m.from.kind == PartyKind::Manager
             && m.kind == LineKind::Tell
             && self.person_driving(view.id)
@@ -1470,6 +1477,12 @@ impl Desk {
                 }
                 ev = rx.recv() => match ev {
                     Ok(DeskEvent::Session { session }) => {
+                        // Its turn ended in a mode that is ending: it goes
+                        // back to its own first, and what waits for it after.
+                        if self.mode_ending(session.id) {
+                            self.modes_changed();
+                            continue;
+                        }
                         let waits = self.0.state.lock().lines.pending.contains(&session.id);
                         if waits && matches!(
                             session.state,

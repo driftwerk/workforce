@@ -160,6 +160,37 @@ impl BossRef {
             Self::Remote { hub, agent } => format!("remote:{hub}/{agent}"),
         }
     }
+    /// The id it acts under on this engine, as a party, a charge's boss
+    /// and every key a boss is known by: `<hub>/<agent>`, with `home` for
+    /// a boss on the home's own hub. A local agent's id never has a `/` in
+    /// it (it is the name of its folder), so a served boss is never taken
+    /// for one of this hub's agents.
+    pub fn party_id(&self) -> String {
+        match self {
+            Self::Local { agent } => format!("{HOME_HUB}/{agent}"),
+            Self::Remote { hub, agent } => format!("{hub}/{agent}"),
+        }
+    }
+
+    /// Whether it can be served at all: a hub on another computer may not
+    /// take a name this engine gives its own bosses.
+    pub fn servable(&self) -> bool {
+        match self {
+            Self::Local { .. } => true,
+            Self::Remote { hub, .. } => !RESERVED_HUBS.iter().any(|r| r.eq_ignore_ascii_case(hub)),
+        }
+    }
+}
+
+/// What a boss on the home's own hub is known by here.
+pub const HOME_HUB: &str = "home";
+/// Hub names no boss on another hub may have.
+pub const RESERVED_HUBS: [&str; 2] = [HOME_HUB, "local"];
+
+/// Whether `party` is the id of a boss served from a grant
+/// ([`BossRef::party_id`]) rather than one of this hub's agents.
+pub fn is_served(party: &str) -> bool {
+    party.contains('/')
 }
 
 /// Who stopped a grant.

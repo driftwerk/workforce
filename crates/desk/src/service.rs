@@ -94,6 +94,7 @@ mod memory_line;
 #[cfg(test)]
 mod memory_line_tests;
 mod memory_recall;
+mod modes;
 mod moves;
 #[cfg(test)]
 mod moves_tests;
@@ -235,6 +236,10 @@ pub(crate) struct Live {
     denials: Vec<Denied>,
     /// Tool calls the person allowed for the rest of the session.
     allowed: HashSet<Call>,
+    /// Its CLI was launched with the pre-tool hook that fails closed
+    /// ([`claude::hook_settings_for`]): only then may a boss served from a
+    /// grant run it.
+    fail_closed: bool,
     /// Its turn was ended from Desk (Esc), which Claude Code reports no
     /// hook for.
     interrupted: bool,
@@ -599,6 +604,12 @@ impl Drop for CodexLink {
 
 #[derive(Default)]
 struct State {
+    /// The permission mode each Claude Code session last said it runs in
+    /// ([`crate::mode`]).
+    modes_seen: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode that doesn't ask each session was last started in, as a
+    /// boss kept it ([`SessionView::mode`]).
+    modes_started: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -901,6 +912,13 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while the modes Desk keeps are read and written
+    /// ([`crate::mode`]).
+    modes_write: tokio::sync::Mutex<()>,
+    /// Held while sessions are put back in their own modes.
+    modes_restoring: tokio::sync::Mutex<()>,
+    /// Something changed that may end a mode since the restore last looked.
+    modes_dirty: std::sync::atomic::AtomicBool,
     /// Held while a move is made: two previews of one item never both go
     /// through, the second finding what it does changed.
     move_write: tokio::sync::Mutex<()>,
@@ -1554,6 +1572,9 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            modes_write: tokio::sync::Mutex::new(()),
+            modes_restoring: tokio::sync::Mutex::new(()),
+            modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
             grants: Mutex::default(),
@@ -1783,6 +1804,7 @@ impl Desk {
                 Live {
                     pty: Arc::new(pty),
                     token: h.meta["token"].as_str().unwrap_or_default().to_string(),
+                    fail_closed: h.meta["failClosed"].as_bool().unwrap_or(false),
                     current_tool: None,
                     // What it asked is shown again once every session is
                     // back (`carry_asks`): its terminal's to answer now.
@@ -1887,6 +1909,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.mode = live.and(state.modes_started.get(&r.id).copied());
         view
     }
 
@@ -2937,6 +2960,14 @@ impl Desk {
         group: Option<&str>,
         boss: Option<&Party>,
     ) -> Result<(), DeskError> {
+        // A session a boss served from a grant starts is born in that
+        // grant first, whichever engine this is: it is the boss's only while
+        // its grant names it.
+        if let (Some(g), Some(b)) = (group, boss) {
+            if crate::grant::is_served(&b.id) {
+                self.served_born(id, g, &b.id).await?;
+            }
+        }
         if let Some(boss) = boss {
             self.charge_started(id, boss, group).await?;
         }
@@ -3094,6 +3125,8 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.mode_lets(id, by.as_ref())?;
+        self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -3216,8 +3249,10 @@ impl Desk {
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
         self.boss_holds(id, Some(&by))?;
+        self.mode_lets(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
+        self.person_resumes(id, Some(&by)).await;
         let running = self.0.state.lock().live.contains_key(&id);
         if running {
             self.0.state.lock().acted.insert(id);
@@ -3381,6 +3416,11 @@ impl Desk {
         {
             self.boss_decides(id, approval, decision, boss)?;
         }
+        // Allowing what it asks drives it: in a mode that doesn't ask, only
+        // the person's or its unbound boss's.
+        if decision != Decision::Deny && decision != Decision::Cancel {
+            self.mode_lets_anyone(id, by.as_ref())?;
+        }
         let codex = self
             .0
             .state
@@ -3466,12 +3506,14 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        // The boss of a session it runs, checked in `decide`.
+        // The boss of a session it runs, checked in `decide`; an unbound
+        // boss answers Codex too, wherever it asks.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
-                && self
-                    .charge_of(id)
-                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
         };
         let by = by
             .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
@@ -3551,6 +3593,7 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.mode_lets_anyone(id, by.as_ref())?;
         let view = self.type_prompt(id, text, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(
@@ -4214,6 +4257,19 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
+        // The mode Desk keeps for it, as an overseer set it; one that
+        // doesn't ask is shown on its card while it runs in it.
+        let mode = self.mode_to_start(r.id).await;
+        {
+            let mut st = self.0.state.lock();
+            match mode.filter(|m| !m.asks()) {
+                Some(m) => st.modes_started.insert(r.id, m),
+                None => st.modes_started.remove(&r.id),
+            };
+        }
+        // A boss served from a grant runs it: Desk's check of each call fails
+        // closed. Kept with its process, so a hub that takes it back knows.
+        let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {
@@ -4241,6 +4297,8 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
+                    mode,
+                    fail_closed,
                 });
                 (spec, None)
             }
@@ -4264,6 +4322,7 @@ impl Desk {
                     prompt,
                     approve_for_me: r.approve_for_me,
                     fast: r.fast,
+                    mode,
                     env: &env,
                 });
                 let link =
@@ -4293,6 +4352,7 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
             "startedAt": started_at,
+            "failClosed": fail_closed,
         });
         let spec = match account_token {
             Some(account_token) => {
@@ -4324,6 +4384,7 @@ impl Desk {
             Live {
                 pty: Arc::new(pty),
                 token,
+                fail_closed,
                 current_tool: None,
                 pending: None,
                 answer: None,
@@ -4560,6 +4621,9 @@ impl Desk {
         if !authorised {
             return None;
         }
+        if let Some(mode) = crate::mode::of_hook(body) {
+            self.0.state.lock().modes_seen.insert(id, mode);
+        }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,
             Err(e) => {
@@ -4645,10 +4709,21 @@ impl Desk {
             Hook::ToolStart { tool, .. } => self.breaker_tool(id, tool),
             _ => None,
         };
-        let answer = move || match (held, allowed) {
-            (Some(why), _) => claude::deny_call(&why),
-            (None, true) => claude::allow_call(),
-            (None, false) => empty(),
+        // A session a boss served from a grant runs: every call Desk doesn't
+        // judge safe for that boss is refused before it runs, the person's
+        // own allow rules notwithstanding, unless the person allowed it in
+        // Desk. Sub-agents' calls too.
+        let served = match (&hook, held.is_some() || allowed) {
+            (Hook::ToolStart { call, input, .. }, false) => {
+                self.served_refuses(id, &call.tool, input, None)
+            }
+            _ => None,
+        };
+        let answer = move || match (held, allowed, served) {
+            (Some(why), ..) => claude::deny_call(&why),
+            (None, true, _) => claude::allow_call(),
+            (None, false, Some(why)) => claude::deny_call(&why),
+            (None, false, None) => empty(),
         };
         // A steer waiting for this tool call's result goes with it.
         let steer = |desk: &Desk, event: &str| {

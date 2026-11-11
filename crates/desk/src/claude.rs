@@ -33,6 +33,11 @@ pub struct ClaudeSpawn<'a> {
     /// terminal, [`crate::first_run::claude_follows_terminal`]); none keeps
     /// the person's.
     pub theme: Option<&'a str>,
+    /// The permission mode to start in ([`crate::mode`]); none, its own.
+    pub mode: Option<crate::mode::Mode>,
+    /// A boss served from a grant runs it: its pre-tool hook fails closed
+    /// ([`hook_settings_for`]).
+    pub fail_closed: bool,
 }
 
 const TOOL_EVENTS: [&str; 5] = [
@@ -62,7 +67,20 @@ fn http_hook(url: &str, timeout_secs: u64) -> Value {
     json!({ "type": "http", "url": url, "timeout": timeout_secs })
 }
 
+#[cfg(test)]
 pub fn hook_settings(hook_url: &str, approval_timeout_secs: u64) -> Value {
+    hook_settings_for(hook_url, approval_timeout_secs, false)
+}
+
+/// What a session that refuses a tool call Desk couldn't check is told.
+pub const UNREACHED: &str = "Desk could not be reached to check this tool call, so it was refused.";
+
+/// The hooks a session runs with; with `fail_closed`, its pre-tool hook is
+/// a command that refuses the call (exit 2, Claude Code's blocking error)
+/// whenever Desk doesn't answer it: a session a boss on another hub runs
+/// never goes on unchecked because the hub was down or slow. An HTTP hook
+/// that fails lets the call go on.
+pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed: bool) -> Value {
     let mut hooks = serde_json::Map::new();
     let post = format!(
         "curl -s --max-time 5 -X POST -H 'Content-Type: application/json' --data-binary @- '{hook_url}'"
@@ -77,10 +95,18 @@ pub fn hook_settings(hook_url: &str, approval_timeout_secs: u64) -> Value {
         } else {
             10
         };
-        hooks.insert(
-            event.into(),
-            json!([{ "matcher": "*", "hooks": [http_hook(hook_url, timeout)] }]),
-        );
+        let hook = match (fail_closed, event) {
+            (true, "PreToolUse") => json!({
+                "type": "command",
+                "command": format!(
+                    "curl -sf --max-time {timeout} -X POST -H 'Content-Type: application/json' \
+                     --data-binary @- '{hook_url}' || {{ echo '{UNREACHED}' >&2; exit 2; }}"
+                ),
+                "timeout": timeout + 5,
+            }),
+            _ => http_hook(hook_url, timeout),
+        };
+        hooks.insert(event.into(), json!([{ "matcher": "*", "hooks": [hook] }]));
     }
     for event in PLAIN_EVENTS {
         hooks.insert(
@@ -102,7 +128,7 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         Launch::New { session_id } => vec!["--session-id".to_string(), session_id.to_string()],
         Launch::Resume { session_id } => vec!["--resume".to_string(), session_id.to_string()],
     };
-    let mut settings = hook_settings(s.hook_url, s.approval_timeout_secs);
+    let mut settings = hook_settings_for(s.hook_url, s.approval_timeout_secs, s.fail_closed);
     if let Some(theme) = s.theme {
         settings["theme"] = Value::String(theme.into());
     }
@@ -112,7 +138,19 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         "--settings".to_string(),
         settings.to_string(),
     ]);
-    args.extend(s.prompt.map(str::to_string));
+    args.extend(s.mode.into_iter().flat_map(crate::mode::Mode::claude_args));
+    // A session a boss served from a grant runs reads the person's own
+    // settings and Desk's alone: none its repository brings (a pull or a
+    // merge can add `.claude/settings.json`), which could switch hooks off
+    // or allow what the boss may not.
+    if s.fail_closed {
+        args.extend(["--setting-sources".to_string(), "user".to_string()]);
+    }
+    // Its prompt is a prompt whatever it says: after `--`, nothing in it is
+    // read as an option (`--settings …` would be).
+    if let Some(p) = s.prompt {
+        args.extend(["--".to_string(), p.to_string()]);
+    }
     let mut env = s.env.clone();
     env.insert(USAGE_URL.into(), s.hook_url.to_string());
     Spawn {
@@ -607,6 +645,8 @@ pub(crate) mod tests {
             approval_timeout_secs: 60,
             env: &env,
             theme: None,
+            mode: None,
+            fail_closed: false,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
@@ -618,6 +658,110 @@ pub(crate) mod tests {
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
+    }
+
+    /// The pre-tool hook of a session a served boss runs: Desk's answer
+    /// goes through as it is, and when Desk doesn't answer, the call is
+    /// refused (exit 2), never let go on. Only that hook changes.
+    /// A prompt that looks like an option is still the prompt, and a served
+    /// boss's session reads no settings its repository brings.
+    #[test]
+    fn a_prompt_is_never_an_option_and_a_served_session_reads_no_project_settings() {
+        let env = BTreeMap::new();
+        let args = |fail_closed: bool| {
+            spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: Some("--settings={\"disableAllHooks\":true}"),
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme: None,
+                mode: None,
+                fail_closed,
+            })
+            .args
+        };
+        for fail_closed in [false, true] {
+            let a = args(fail_closed);
+            let n = a.len();
+            assert_eq!(a[n - 2], "--", "{a:?}");
+            assert_eq!(a[n - 1], "--settings={\"disableAllHooks\":true}");
+            assert_eq!(a.iter().filter(|x| *x == "--settings").count(), 1);
+        }
+        let served = args(true);
+        let at = served
+            .iter()
+            .position(|x| x == "--setting-sources")
+            .unwrap();
+        assert_eq!(served[at + 1], "user");
+        assert!(at < served.iter().position(|x| x == "--").unwrap());
+        assert!(!args(false).iter().any(|x| x == "--setting-sources"));
+    }
+
+    #[test]
+    fn a_served_bosss_session_refuses_a_call_desk_doesnt_answer() {
+        use std::io::{Read, Write};
+        let run = |url: &str| {
+            let s = hook_settings_for(url, 3, true);
+            let hook = &s["hooks"]["PreToolUse"][0]["hooks"][0];
+            assert_eq!(hook["type"], "command");
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(hook["command"].as_str().unwrap())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#)
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        // Nothing listens there: refused.
+        let out = run("http://127.0.0.1:9/hook/a/b");
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(UNREACHED));
+        // Desk answers: its answer is the hook's.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answer = deny_call("not judged safe").to_string();
+        let served = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            c.write_all(reply.as_bytes()).unwrap();
+        });
+        let out = run(&format!("http://127.0.0.1:{port}/hook/a/b"));
+        served.join().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(said["hookSpecificOutput"]["permissionDecision"], "deny");
+        // Every other hook is as for any session.
+        let s = hook_settings_for("http://h", 60, true);
+        for e in TOOL_EVENTS.iter().chain(PLAIN_EVENTS.iter()) {
+            let kind = if *e == "PreToolUse" {
+                "command"
+            } else {
+                "http"
+            };
+            assert_eq!(s["hooks"][e][0]["hooks"][0]["type"], kind, "{e}");
+        }
+        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
+        assert_eq!(
+            hook_settings("http://h", 60),
+            hook_settings_for("http://h", 60, false)
+        );
     }
 
     #[test]
@@ -634,6 +778,8 @@ pub(crate) mod tests {
                 approval_timeout_secs: 60,
                 env: &env,
                 theme,
+                mode: None,
+                fail_closed: false,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();
             serde_json::from_str::<Value>(&s.args[at + 1]).unwrap()

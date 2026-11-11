@@ -128,6 +128,8 @@ pub struct GatewayState {
     /// boss of its person's groups, and the link tokens' limits. Live: the
     /// config overlay watcher replaces it when the overlay changes.
     pub desk_boss: crate::boss_links::LiveConfig,
+    /// Every engine's uplink to this hub, as a boss hub (RB5).
+    pub uplinks: Arc<crate::boss_links::uplink::Uplinks>,
     /// Permission cascade evaluator — owns the rule store + LRU cache
     /// and is the single read/write entry point for `/api/permissions/*`
     /// endpoints plus the runner's Always-* persistence path. `None` when
@@ -374,6 +376,9 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
         .route("/ws/agent", get(ws_local_agent_handler))
+        // An engine's uplink to this hub as a boss hub: it checks its own
+        // link tokens, so nothing before it does.
+        .route("/ws/desk-boss", get(crate::boss_links::uplink::handler))
         .route("/api/chat", post(chat_handler))
         .route("/api/evals/grade", post(crate::api_handlers::evals::grade))
         .route(

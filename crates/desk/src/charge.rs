@@ -243,6 +243,13 @@ pub struct FullGrant {
     pub repos: Vec<String>,
     /// Workflow file names, matched exactly (`deploy.yml`).
     pub workflows: Vec<String>,
+    /// `[oversight.full] anywhere`: no list limits it. It acts fully in
+    /// every repository and runs any workflow; the repository checks of
+    /// `repos` (its remotes, what `gh` resolves) are skipped.
+    pub anywhere: bool,
+    /// The boss is unbound ([`workforce_common::oversight::Oversight::unbound`]):
+    /// it allows whatever its sessions ask, but for its own settings.
+    pub unbound: bool,
 }
 
 /// A repository as a remote's address names it: its host, when said, and
@@ -436,6 +443,8 @@ pub struct Facts {
     pub hooks: bool,
     /// The workflows the boss may run where it acts fully, by file name.
     pub workflows: Vec<String>,
+    /// Any workflow is the boss's to run where it acts fully (anywhere).
+    pub any_workflow: bool,
     /// `HEAD` is the commit `origin`'s default branch is at.
     pub at_tip: bool,
     /// `HEAD` has commits `origin`'s default branch hasn't, or Desk can't
@@ -548,6 +557,7 @@ pub fn facts_of(
         follow_tags: false,
         hooks: false,
         workflows: Vec::new(),
+        any_workflow: false,
         at_tip: false,
         unpushed: true,
         branches: Vec::new(),
@@ -665,6 +675,7 @@ pub fn answerable(
                 follow_tags: facts.follow_tags,
                 hooks: facts.hooks,
                 workflows: &facts.workflows,
+                any_workflow: facts.any_workflow,
                 at_tip: facts.at_tip,
                 unpushed: facts.unpushed,
                 branches: &facts.branches,
