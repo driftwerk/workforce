@@ -16,6 +16,7 @@
 # Haiku 5.5 doubles to $0.50/$2.50 above 100K prompt tokens; the table holds
 # one rate, so long prompts on it are understated.
 "claude-fable-5-1"            = { input = 10.00, output = 50.00, cache_read = 0.25, cache_write = 12.50 }
+"claude-fable-5-2"            = { input = 8.00, output = 40.00, cache_read = 0.20, cache_write = 10.00 }
 "claude-opus-5-5"             = { input = 4.00, output = 20.00, cache_read = 0.20, cache_write = 5.00 }
 "claude-sonnet-5-5"           = { input = 2.00, output = 10.00, cache_read = 0.10, cache_write = 2.50 }
 "claude-haiku-5-5"            = { input = 0.10, output = 0.50,  cache_read = 0.01, cache_write = 0.125 }
@@ -144,6 +145,7 @@
 
 [bedrock.anthropic]
 "anthropic.claude-fable-5-1"                      = { input = 10.00, output = 50.00, cache_read = 0.25, cache_write = 12.50 }
+"anthropic.claude-fable-5-2"                      = { input = 8.00, output = 40.00, cache_read = 0.20, cache_write = 10.00 }
 "anthropic.claude-opus-5-5"                       = { input = 4.00, output = 20.00, cache_read = 0.20, cache_write = 5.00 }
 "anthropic.claude-sonnet-5-5"                     = { input = 2.00, output = 10.00, cache_read = 0.10, cache_write = 2.50 }
 "anthropic.claude-haiku-5-5"                      = { input = 0.10, output = 0.50,  cache_read = 0.01, cache_write = 0.125 }
@@ -185,6 +187,7 @@
 "us.anthropic.claude-haiku-4-5"                   = { input = 1.00, output = 5.00,  cache_read = 0.10, cache_write = 1.25 }
 "us.anthropic.claude-haiku-4-5-20251001-v1:0"     = { input = 1.00, output = 5.00,  cache_read = 0.10, cache_write = 1.25 }
 "global.anthropic.claude-fable-5-1"               = { input = 10.00, output = 50.00, cache_read = 0.25, cache_write = 12.50 }
+"global.anthropic.claude-fable-5-2"               = { input = 8.00, output = 40.00, cache_read = 0.20, cache_write = 10.00 }
 "global.anthropic.claude-opus-5-5"                = { input = 4.00, output = 20.00, cache_read = 0.20, cache_write = 5.00 }
 "global.anthropic.claude-sonnet-5-5"              = { input = 2.00, output = 10.00, cache_read = 0.10, cache_write = 2.50 }
 "global.anthropic.claude-haiku-5-5"               = { input = 0.10, output = 0.50,  cache_read = 0.01, cache_write = 0.125 }
@@ -249,6 +252,7 @@
 
 ["claude-code:bedrock"]
 "claude-code:bedrock:anthropic.claude-fable-5-1"  = { input = 10.00, output = 50.00, cache_read = 0.25, cache_write = 12.50 }
+"claude-code:bedrock:anthropic.claude-fable-5-2"  = { input = 8.00, output = 40.00, cache_read = 0.20, cache_write = 10.00 }
 "claude-code:bedrock:anthropic.claude-opus-5-5"   = { input = 4.00, output = 20.00, cache_read = 0.20, cache_write = 5.00 }
 "claude-code:bedrock:anthropic.claude-sonnet-5-5" = { input = 2.00, output = 10.00, cache_read = 0.10, cache_write = 2.50 }
 "claude-code:bedrock:anthropic.claude-haiku-5-5"  = { input = 0.10, output = 0.50,  cache_read = 0.01, cache_write = 0.125 }

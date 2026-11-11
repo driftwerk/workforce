@@ -56,6 +56,34 @@ mod toml_smoke_tests {
         let _: toml::Table = DEFAULT_TRANSCRIPTION_PRICING_TOML.parse().unwrap();
     }
 
+    /// Fable 5.2 on every platform Desk reaches it by: $8 / $40 per MTok,
+    /// cache reads at 2.5% (platform.claude.com models overview, 2026-11).
+    #[test]
+    fn fable_5_2_is_priced_by_every_id_it_runs_under() {
+        let table: toml::Table = DEFAULT_PRICING_TOML.parse().unwrap();
+        let find = |key: &str| -> toml::Value {
+            fn walk(t: &toml::Table, key: &str) -> Option<toml::Value> {
+                t.iter().find_map(|(k, v)| match v {
+                    toml::Value::Table(inner) if k != key => walk(inner, key),
+                    _ if k == key => Some(v.clone()),
+                    _ => None,
+                })
+            }
+            walk(&table, key).unwrap_or_else(|| panic!("{key} is priced"))
+        };
+        for key in [
+            "claude-fable-5-2",
+            "anthropic.claude-fable-5-2",
+            "global.anthropic.claude-fable-5-2",
+            "claude-code:bedrock:anthropic.claude-fable-5-2",
+        ] {
+            let price = find(key);
+            assert_eq!(price["input"].as_float(), Some(8.0), "{key}");
+            assert_eq!(price["output"].as_float(), Some(40.0), "{key}");
+            assert_eq!(price["cache_read"].as_float(), Some(0.20), "{key}");
+        }
+    }
+
     fn collect_bedrock_pricing_keys() -> Vec<String> {
         let table: toml::Table = DEFAULT_PRICING_TOML.parse().unwrap();
         let bedrock = match table.get("bedrock") {
