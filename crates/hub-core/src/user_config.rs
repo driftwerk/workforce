@@ -918,6 +918,53 @@ mod layered_tests {
         );
     }
 
+    /// A listing open to a tier (a connector's instances) holds only the
+    /// paths whose own pin admits that tier: an instance the agent doesn't
+    /// use is never listed, at a person's tier or a shared one.
+    #[tokio::test]
+    async fn a_listing_holds_only_the_paths_their_own_pin_admits() {
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin};
+        struct OnlyAcme;
+        impl PinSource for OnlyAcme {
+            fn pin(&self, path: &str) -> TierPin {
+                match path.strip_prefix("skills/google/workspaces/") {
+                    Some("") | None => TierPin::All,
+                    Some(rest) if rest.starts_with("acme/") => TierPin::All,
+                    Some(_) => TierPin::Nothing,
+                }
+            }
+        }
+        let agent = new_vault();
+        let global = new_vault();
+        for ws in ["acme", "globex"] {
+            global
+                .set(
+                    &format!("users/kings/skills/google/workspaces/{ws}/refresh_token"),
+                    "t",
+                )
+                .unwrap();
+            agent
+                .set(&format!("skills/google/workspaces/{ws}/email"), "e")
+                .unwrap();
+        }
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(OnlyAcme));
+        let store = LayeredUserVault::new(agent, Some(global)).with_pins(pins);
+        CURRENT_USER_ID
+            .scope("kings".to_string(), async move {
+                let mut listed = store.list(Some("skills/google/workspaces/"));
+                listed.sort();
+                assert_eq!(
+                    listed,
+                    [
+                        "skills/google/workspaces/acme/email",
+                        "skills/google/workspaces/acme/refresh_token"
+                    ]
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn global_user_overlay_wins_over_agent_shared() {
         let agent = new_vault();
