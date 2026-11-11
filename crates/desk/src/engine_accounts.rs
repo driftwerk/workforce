@@ -387,6 +387,27 @@ impl std::fmt::Debug for NewAccount {
     }
 }
 
+/// What the person asks for to sign an account in again: a pasted token,
+/// or none to sign in through the engine's own command; `remote` as for
+/// [`NewAccount`]. Its `Debug` leaves out the token.
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignInAgain {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub remote: bool,
+}
+
+impl std::fmt::Debug for SignInAgain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInAgain")
+            .field("token", &self.token.as_ref().map(|_| "…"))
+            .field("remote", &self.remote)
+            .finish()
+    }
+}
+
 /// A change to an account.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
