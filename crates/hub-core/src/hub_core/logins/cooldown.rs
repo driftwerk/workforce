@@ -54,10 +54,27 @@ impl CooldownStore {
         if signal.status != LimitStatus::Rejected {
             return;
         }
-        let until = signal
-            .resets_at
-            .filter(|reset| *reset > now)
-            .unwrap_or(now + UNKNOWN_RESET_COOLDOWN);
+        use workforce_common::usage::{window_reach, Reach};
+        let until = match window_reach(signal.window.as_deref()) {
+            // One model's weekly window spent: the login serves the others.
+            Reach::Model(_) => {
+                tracing::info!(
+                    kind = key.kind.label(),
+                    window = signal.window.as_deref().unwrap_or("unknown"),
+                    "one model's weekly limit is spent; the login stays in use"
+                );
+                return;
+            }
+            // Extra usage spent: never until the credit's own reset (the
+            // month's). A report that finds a plan window spent is
+            // re-read as that window's stop ([`super::limits`]); any other
+            // cools the login briefly.
+            Reach::Credit => now + UNKNOWN_RESET_COOLDOWN,
+            Reach::Plan => signal
+                .resets_at
+                .filter(|reset| *reset > now)
+                .unwrap_or(now + UNKNOWN_RESET_COOLDOWN),
+        };
         let mut cooling = self.cooling.write();
         let entry = cooling.entry(key.clone()).or_insert(until);
         *entry = (*entry).max(until);
@@ -136,6 +153,33 @@ mod tests {
             store.cooling.read().is_empty(),
             "expired entries are pruned"
         );
+    }
+
+    #[test]
+    fn extra_usage_cools_briefly_never_to_its_own_reset_and_one_models_limit_cools_nothing() {
+        let store = CooldownStore::default();
+        let now = Utc::now();
+        let december = now + TimeDelta::days(20);
+        let signal = |window: &str| LimitSignal {
+            status: LimitStatus::Rejected,
+            resets_at: Some(december),
+            window: Some(window.into()),
+        };
+        store.note(&key("model"), &signal("seven_day_opus"), now);
+        assert_eq!(store.until(&key("model"), now), None);
+        store.note(&key("credit"), &signal("overage"), now);
+        assert_eq!(
+            store.until(&key("credit"), now),
+            Some(now + UNKNOWN_RESET_COOLDOWN),
+            "not December"
+        );
+        let weekly = LimitSignal {
+            status: LimitStatus::Rejected,
+            resets_at: Some(now + TimeDelta::days(2)),
+            window: Some("seven_day".into()),
+        };
+        store.note(&key("plan"), &weekly, now);
+        assert_eq!(store.until(&key("plan"), now), weekly.resets_at);
     }
 
     #[test]

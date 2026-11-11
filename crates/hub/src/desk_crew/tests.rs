@@ -4154,6 +4154,9 @@ mod board {
             let r = tool("crew.assign_ticket").execute(assign("ACM-1")).await.unwrap();
             assert!(r.success, "{r:?}");
             assert_eq!(r.output["suggested"], "Give ACM-1 to acme-web", "{r:?}");
+            // The overseer is told which switch would let it, to tell the person.
+            let note = r.output["note"].as_str().unwrap_or_default();
+            assert!(note.contains("turning “Hand out work” on"), "{note}");
             let r = tool("crew.move_ticket").execute(mv("acm-2", "doing")).await.unwrap();
             assert_eq!(r.output["suggested"], "Move ACM-2 to Doing", "{r:?}");
             assert_eq!(state_of(&d, "ACM-1").await, (TicketState::Todo, None));
@@ -4892,6 +4895,11 @@ mod board {
             watching.level = workforce_common::oversight::Level::Watch;
             ticket(&d, b, "Tidy the footer", TicketState::Todo, &[]).await;
             assert!(crew.ready_unhanded(&mut seen, |_| Some(watching.clone())).await.is_empty());
+            // At Suggest, Hand out work on by default doesn't wake it either.
+            let mut suggesting = on.clone();
+            suggesting.level = workforce_common::oversight::Level::Suggest;
+            ticket(&d, b, "Name the release", TicketState::Todo, &[]).await;
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(suggesting.clone())).await.is_empty());
         })
         .await;
     }
@@ -5060,5 +5068,78 @@ mod board {
             assert!(woke.content.contains("; ACM-1 is still Doing"), "{}", woke.content);
         })
         .await;
+    }
+}
+
+/// At Act, the check-in tells the overseer to act, and names the switches
+/// that are off so it can tell the person which to turn on.
+#[test]
+fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
+    use workforce_common::oversight::{switch, Act, Level, Oversight};
+    let o = Oversight::default();
+    let hint = CrewHub::level_hint(Level::Act, &o);
+    assert!(hint.starts_with("You act: "), "{hint}");
+    assert!(!hint.contains(switch::HAND_OUT_WORK), "{hint}");
+    assert!(hint.contains(switch::INTERRUPT), "{hint}");
+    let off = Oversight {
+        act: Act {
+            hand_out_work: false,
+            ..o.act
+        },
+        ..o.clone()
+    };
+    assert!(CrewHub::level_hint(Level::Act, &off).contains("“Hand out work”"));
+    assert!(!CrewHub::level_hint(Level::Suggest, &off).contains("Hand out work"));
+}
+
+/// The person's own turns in the overseer's DM carry its level and the
+/// switches that are off, in a line, so it acts within them from the first
+/// request; an agent that doesn't oversee carries nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dm_turn_is_told_its_level_and_the_switches_that_are_off() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (helper, _llm) = agent(dir.path(), "scout", "ok").await;
+        let (overseer, _crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n",
+            std::slice::from_ref(&helper),
+        )
+        .await;
+        let hint = eventually("the overseer to be known", async || {
+            super::dm_oversight_hint(&overseer)
+        })
+        .await;
+        assert!(hint.starts_with("You oversee the crew at Act: do the work yourself"), "{hint}");
+        assert!(hint.contains("“Hand out work”"), "{hint}");
+        assert!(hint.len() < 600, "kept short: {hint}");
+        assert_eq!(super::dm_oversight_hint(&helper), None);
+    })
+    .await;
+}
+
+/// A boss served from a grant is never told to turn on a switch in Desk:
+/// what a grant could give is the hub's person's to grant, and what no
+/// grant gives is theirs alone.
+#[test]
+fn a_served_boss_is_told_whose_switch_it_is() {
+    use workforce_common::oversight::switch;
+    let local = CrewHub::switch_off(switch::HAND_OUT_WORK, false);
+    assert!(local.contains("turning “Hand out work” on"), "{local}");
+    let granted = CrewHub::switch_off(switch::HAND_OUT_WORK, true);
+    assert!(
+        granted.contains("hasn't granted you “Hand out work”"),
+        "{granted}"
+    );
+    for pinned in [
+        switch::MESSAGE_AGENTS,
+        switch::MESSAGE_TERMINAL_SESSIONS,
+        switch::SET_MODE,
+    ] {
+        let why = CrewHub::switch_off(pinned, true);
+        assert!(why.contains("never a remote boss's"), "{why}");
+        assert!(!why.contains("Desk"), "{why}");
     }
 }

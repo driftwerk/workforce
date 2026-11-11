@@ -91,12 +91,36 @@ pub fn claude_rate_limit_event(event: &Value) -> Option<LimitSignal> {
         },
         _ => return None,
     };
+    let epoch = |v: Option<&Value>| {
+        v.and_then(Value::as_i64)
+            .and_then(|at| DateTime::from_timestamp(at, 0))
+    };
+    let mut resets_at = epoch(info.get("resetsAt"));
+    let mut window = window;
+    // Extra usage spent: the plan is full only if a plan window of the same
+    // report is. Then it is that window's stop, to its reset; else the
+    // credit's own (the month's) reset is never used.
+    if status == LimitStatus::Rejected
+        && usage::window_reach(window.as_deref()) == usage::Reach::Credit
+    {
+        let spent = ["five_hour", "seven_day"]
+            .into_iter()
+            .filter_map(|name| {
+                let w = info.get("unifiedWindows")?.get(name)?;
+                (w.get("utilization")?.as_f64()? >= 1.0).then(|| (name, epoch(w.get("resetsAt"))))
+            })
+            .max_by_key(|(_, at)| *at);
+        match spent {
+            Some((name, at)) => {
+                window = Some(name.to_string());
+                resets_at = at;
+            }
+            None => resets_at = None,
+        }
+    }
     Some(LimitSignal {
         status,
-        resets_at: info
-            .get("resetsAt")
-            .and_then(Value::as_i64)
-            .and_then(|at| DateTime::from_timestamp(at, 0)),
+        resets_at,
         window,
     })
 }
@@ -231,8 +255,12 @@ pub fn claude_limit_text(text: &str, now: DateTime<Utc>) -> Option<LimitSignal> 
                 _ => next_at(time, &tz, now),
             }
         }),
-        window: None,
+        window: notice_window(text).map(str::to_string),
     })
+}
+
+fn notice_window(text: &str) -> Option<&'static str> {
+    usage::claude_notice_window(text)
 }
 
 /// A Codex CLI limit failure (`codex exec --json` reports only text):
@@ -533,6 +561,23 @@ mod tests {
                 minutes: 300
             }]
         );
+    }
+
+    #[test]
+    fn an_overage_stop_is_the_plans_only_when_a_plan_window_of_the_report_is_spent() {
+        let report = |five: f64| {
+            serde_json::json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": 1_795_996_800_i64, "rateLimitType": "overage",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": five, "resetsAt": 1_790_676_600_i64},
+                    "seven_day": {"utilization": 0.4, "resetsAt": 1_790_956_800_i64}}}})
+        };
+        let spent = claude_rate_limit_event(&report(1.0)).unwrap();
+        assert_eq!(spent.window.as_deref(), Some("five_hour"));
+        assert_eq!(spent.resets_at, epoch(1_790_676_600));
+        let room = claude_rate_limit_event(&report(0.34)).unwrap();
+        assert_eq!(room.window.as_deref(), Some("overage"));
+        assert_eq!(room.resets_at, None, "never the credit's own reset");
     }
 
     #[test]

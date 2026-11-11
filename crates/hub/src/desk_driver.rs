@@ -637,6 +637,9 @@ fn run_dir_in(temp: &Path, uid: u32, private: impl Fn(&Path) -> eyre::Result<()>
 
 fn options(config: &WorkforceConfig) -> Options {
     let desk = &config.desk;
+    // The Claude Code the hub's own work runs (a plan's model list among it)
+    // is the one Desk's sessions run.
+    crate::claude_code::use_program_named(&desk.claude);
     Options {
         programs: programs(desk),
         env: std::env::vars().collect(),
