@@ -21,7 +21,7 @@ pub enum FolderError {
     NotFound,
     #[error("that is not a folder")]
     NotAFolder,
-    #[error("the hub has no home folder to start from")]
+    #[error("Desk has no home folder to start from")]
     NoHome,
     #[error("the folder could not be read")]
     Unreadable,

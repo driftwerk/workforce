@@ -709,7 +709,7 @@ pub trait Crew: Send + Sync {
         _to: Option<&str>,
         _replace: bool,
     ) -> Result<(), String> {
-        Err("Desk can't move a boss on this hub.".into())
+        Err("Desk can't move a boss here.".into())
     }
 
     /// `assign`, as `by`: the overseer handing out a ticket is the overseer

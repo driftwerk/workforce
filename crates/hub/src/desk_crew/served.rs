@@ -392,7 +392,7 @@ impl CrewHub {
         // is served here.
         if self.overseer_for(&o.scope).is_some() {
             return refused(format!(
-                "{} has a boss on this hub already, so no other is served for it.",
+                "{} already has a boss here, so no other is served for it.",
                 grant.name
             ));
         }

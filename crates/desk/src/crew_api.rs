@@ -35,7 +35,7 @@ fn failed(e: eyre::Report) -> Response {
     tracing::error!(error = %e, "desk crew request failed");
     error(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "the hub could not read the crew",
+        "Desk could not read the crew",
     )
 }
 
