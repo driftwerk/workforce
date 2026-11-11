@@ -786,18 +786,34 @@ pub struct DeskBossesConfig {
     /// boss is served nothing. Default: 72.
     #[serde(default = "default_desk_bosses_grant_hours")]
     pub grant_hours: u32,
+    /// The most crew calls one boss link may make here a minute. Default: 60.
+    #[serde(default = "default_desk_bosses_calls_per_minute")]
+    pub calls_per_minute: u32,
+    /// The most sessions one boss link may start here an hour. Default: 6.
+    #[serde(default = "default_desk_bosses_starts_per_hour")]
+    pub starts_per_hour: u32,
 }
 
 impl Default for DeskBossesConfig {
     fn default() -> Self {
         Self {
             grant_hours: default_desk_bosses_grant_hours(),
+            calls_per_minute: default_desk_bosses_calls_per_minute(),
+            starts_per_hour: default_desk_bosses_starts_per_hour(),
         }
     }
 }
 
 fn default_desk_bosses_grant_hours() -> u32 {
     72
+}
+
+fn default_desk_bosses_calls_per_minute() -> u32 {
+    60
+}
+
+fn default_desk_bosses_starts_per_hour() -> u32 {
+    6
 }
 
 impl DeskBossesConfig {
@@ -808,6 +824,12 @@ impl DeskBossesConfig {
                 "[desk.bosses] grant_hours must be 1 to 336 (14 days), not {}.",
                 self.grant_hours
             );
+        }
+        if !(1..=600).contains(&self.calls_per_minute) {
+            eyre::bail!("[desk.bosses] calls_per_minute must be 1 to 600.");
+        }
+        if !(1..=60).contains(&self.starts_per_hour) {
+            eyre::bail!("[desk.bosses] starts_per_hour must be 1 to 60.");
         }
         Ok(())
     }
@@ -822,13 +844,23 @@ mod desk_bosses_tests {
         assert_eq!(DeskBossesConfig::default().grant_hours, 72);
         for ok in [1, 72, 336] {
             assert!(
-                DeskBossesConfig { grant_hours: ok }.validate().is_ok(),
+                DeskBossesConfig {
+                    grant_hours: ok,
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
                 "{ok}"
             );
         }
         for bad in [0, 337] {
             assert!(
-                DeskBossesConfig { grant_hours: bad }.validate().is_err(),
+                DeskBossesConfig {
+                    grant_hours: bad,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err(),
                 "{bad}"
             );
         }

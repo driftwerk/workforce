@@ -121,6 +121,8 @@ pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
+#[cfg(feature = "postgres")]
+pub mod desk_uplink;
 pub(crate) mod device_link;
 pub mod games_driver;
 pub mod gateway;
