@@ -43,7 +43,40 @@ pub enum TurnFailure {
     Failed(String),
 }
 
+/// What a limit window stops: the shared rule of the hub and Desk.
+pub use workforce_common::usage::Reach;
+
+/// What the window Claude Code names stops. None named (only the message
+/// was seen), and any name not known, is the plan's.
+pub fn reach_of(window: Option<&str>) -> Reach {
+    workforce_common::usage::window_reach(window)
+}
+
+/// The non-plan window a limit message names, from its opening only.
+pub fn window_in_words(said: &str) -> Option<&'static str> {
+    workforce_common::usage::claude_notice_window(said)
+}
+
+/// Whether a message says extra usage (pay-as-you-go credits) is spent.
+pub fn says_extra_usage(said: &str) -> bool {
+    window_in_words(said) == Some("overage")
+}
+
 impl LimitHit {
+    /// What this limit stops.
+    pub fn reach(&self) -> Reach {
+        reach_of(self.window.as_deref())
+    }
+
+    /// The limit a message names: its window when it is not the plan's, and
+    /// no reset (words give none that is read).
+    pub fn in_words(said: &str) -> LimitHit {
+        LimitHit {
+            window: window_in_words(said).map(str::to_string),
+            resets_at: None,
+        }
+    }
+
     /// Its window's length in minutes, as the plan readings say it: the
     /// plan's own 5-hour and weekly windows only. A model's own weekly
     /// limit (`seven_day_opus`, `seven_day_sonnet`) isn't the plan's weekly
@@ -69,10 +102,9 @@ impl TurnFailure {
 /// What a `StopFailure` says: its `error`, and the message it showed.
 pub fn of_stop_failure(error: &str, said: Option<&str>) -> TurnFailure {
     match error {
-        "rate_limit" if said.is_some_and(says_plan_limit) => TurnFailure::Limit(LimitHit {
-            window: None,
-            resets_at: None,
-        }),
+        "rate_limit" if said.is_some_and(|s| says_plan_limit(s) || says_extra_usage(s)) => {
+            TurnFailure::Limit(LimitHit::in_words(said.unwrap_or_default()))
+        }
         _ => TurnFailure::Failed(error.to_string()),
     }
 }
@@ -90,7 +122,6 @@ pub fn says_plan_limit(said: &str) -> bool {
         || s.contains("limit · resets")
         // Older wordings: "5-hour limit reached ∙ resets 3pm".
         || s.contains("limit reached ∙ resets")
-        || s.contains("out of extra usage")
 }
 
 /// How a turn ended as one transcript line says, when the line is Claude
@@ -177,6 +208,74 @@ mod tests {
             of_stop_failure("overloaded", Some("You've hit your limit")),
             TurnFailure::Failed("overloaded".into())
         );
+    }
+
+    #[test]
+    fn only_the_plans_own_windows_stop_the_plan() {
+        assert_eq!(reach_of(None), Reach::Plan);
+        assert_eq!(reach_of(Some("five_hour")), Reach::Plan);
+        assert_eq!(reach_of(Some("seven_day")), Reach::Plan);
+        assert_eq!(reach_of(Some("seven_day_opus")), Reach::Model("opus"));
+        assert_eq!(reach_of(Some("seven_day_sonnet")), Reach::Model("sonnet"));
+        for credit in ["overage", "extra_usage", "monthly", "spend_limit"] {
+            assert_eq!(reach_of(Some(credit)), Reach::Credit, "{credit}");
+        }
+        // Not known: the plan's, fail closed.
+        for unknown in ["seven_day_haiku", "weekly", "something_new"] {
+            assert_eq!(reach_of(Some(unknown)), Reach::Plan, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn a_limit_message_names_the_window_when_it_is_not_the_plans() {
+        let words = |said: &str| of_stop_failure("rate_limit", Some(said));
+        let window = |f: TurnFailure| f.limit().and_then(|l| l.window.clone());
+        assert_eq!(
+            window(words(
+                "You're out of extra usage · resets Dec 1, 12am (UTC)"
+            )),
+            Some("overage".into())
+        );
+        assert_eq!(
+            window(words("You've hit your Opus limit · resets Nov 16, 9am")),
+            Some("seven_day_opus".into())
+        );
+        assert_eq!(
+            window(words("You've hit your session limit · resets 9am")),
+            None
+        );
+        assert_eq!(window(words("You've hit your weekly limit")), None);
+        // A plan limit that mentions extra usage as an option is the plan's.
+        assert_eq!(
+            window(words(
+                "You've hit your session limit · resets 9am · /extra-usage to keep going"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn a_transcript_stop_on_extra_usage_is_not_the_plans() {
+        // As Claude Code writes a refusal once the plan's windows are
+        // spent and the month's extra usage with them: reset on 1 Dec.
+        let line: Value = serde_json::from_str(
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached",
+            "apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1795996800,
+            "rateLimitType":"overage","overageStatus":"rejected","isUsingOverage":true}},
+            "quotaLimits":{"status":"rejected","resetsAt":1795996800,"rateLimitType":"overage"},
+            "error":"rate_limit"}"#,
+        )
+        .unwrap();
+        let hit = in_transcript_line(&line).unwrap().limit().cloned().unwrap();
+        assert_eq!(hit.resets_at, DateTime::from_timestamp(1_795_996_800, 0));
+        assert_eq!(hit.reach(), Reach::Credit);
+        let opus: Value = serde_json::from_str(
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached",
+            "quotaLimits":{"status":"rejected","resetsAt":1794000000,"rateLimitType":"seven_day_opus"}}"#,
+        )
+        .unwrap();
+        let hit = in_transcript_line(&opus).unwrap().limit().cloned().unwrap();
+        assert_eq!(hit.reach(), Reach::Model("opus"));
     }
 
     #[test]
