@@ -24,13 +24,13 @@ use workforce_agent::tools::Tool;
 
 use crate::definition::{SkillDefinition, SkillRequirements};
 
-pub use address::{host_of, origin_of};
+pub use address::{host_of, origin_of, shows_keys};
 pub use chrome::{
     available as chrome_available, default_user_data_dir as chrome_user_data_dir, MIN_CHROME,
 };
 pub use client::{
-    capture, close, close_backend, forget_decision, live, page_state, stop_session, turn_ended,
-    Backend, BrowserClient, Capture, Live, Which,
+    capture, close, close_backend, forget_decision, live, page_state, show, stop_session,
+    turn_ended, Backend, BrowserClient, Capture, Live, Which,
 };
 pub use config::BrowserSkillConfig;
 pub use hooks::{install_hooks, BrowserHooks, Done, OnPage, Settings, Sites, Uses};
@@ -214,6 +214,74 @@ mod tests {
         assert!(shot.success);
         assert_eq!(shot.output["format"], "png");
         assert!(shot.output["size_bytes"].as_u64().unwrap_or(0) > 100);
+    }
+
+    /// `capture` reads a key a page shows once in Desk's own world: it
+    /// presses Create, waits for the key, reads it, presses Done; never a
+    /// password field, never on another origin; and the key is gone from
+    /// the page after. Gated on `BROWSER_E2E`, as the fixture test below.
+    #[tokio::test]
+    #[ignore]
+    async fn browser_e2e_capture_reads_a_key_once_and_never_a_password() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        let site = fixture::serve();
+        let dir = tempfile::tempdir().unwrap();
+        let skill = BrowserSkill::new(BrowserSkillConfig {
+            chrome_binary: std::env::var("BROWSER_E2E_CHROMIUM").ok(),
+            no_sandbox: std::env::var("BROWSER_E2E_NO_SANDBOX").is_ok(),
+            profile_root: Some(dir.path().display().to_string()),
+            ..BrowserSkillConfig::default()
+        })
+        .unwrap();
+        let tools = skill.tools();
+        let navigate = tools
+            .iter()
+            .find(|t| t.name() == "browser.navigate")
+            .unwrap()
+            .clone();
+        let origin = address::origin_of(&site.url("/")).unwrap();
+        let ask = |selector: &str, origins: Vec<String>| Capture {
+            selector: selector.into(),
+            reveal: None,
+            dismiss: None,
+            origins,
+            wait_ms: 3000,
+        };
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("fixture-agent".into(), async {
+                let out = navigate
+                    .execute(serde_json::json!({ "url": site.url("/keys") }))
+                    .await
+                    .unwrap();
+                assert!(out.success, "{:?}", out.error);
+                let key = capture(&Capture {
+                    reveal: Some("#create".into()),
+                    dismiss: Some("#done".into()),
+                    ..ask("#key", vec![origin.clone()])
+                })
+                .await
+                .unwrap();
+                assert_eq!(key.expose_secret(), fixture::KEY);
+                let password = capture(&ask("#pw", vec![origin.clone()]))
+                    .await
+                    .unwrap_err();
+                assert!(format!("{password:#}").contains("password"), "{password:#}");
+                let elsewhere = capture(&ask("#pw", vec!["https://elsewhere.example".into()]))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{elsewhere:#}").contains("service's own"),
+                    "{elsewhere:#}"
+                );
+                // Dismissed: nothing left to read.
+                let gone = capture(&ask("#key", vec![origin.clone()]))
+                    .await
+                    .unwrap_err();
+                assert!(format!("{gone:#}").contains("Nothing showed"), "{gone:#}");
+            })
+            .await;
     }
 
     /// End-to-end over a local fixture site (`fixture`): a form filled and

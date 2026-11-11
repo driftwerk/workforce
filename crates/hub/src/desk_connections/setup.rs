@@ -440,7 +440,14 @@ impl Setups {
                 (Level::Agent(agent.clone()), Some(agent))
             }
         };
-        let name = Connections::name(c, name)
+        // A name an agent chose reaches other agents' words about their
+        // connections: plain characters only.
+        let name: Option<String> = name.map(|n| {
+            n.chars()
+                .filter(|ch| ch.is_alphanumeric() || " .-_'&()@".contains(*ch))
+                .collect::<String>()
+        });
+        let name = Connections::name(c, name.as_deref())
             .map_err(refused)?
             .unwrap_or_else(|| c.name.to_string());
         self.connections.migrate(&caller.person).await;
@@ -1316,13 +1323,21 @@ impl Tool for SetupTool {
     /// Listing, and marking a card's step, touch nothing. Keeping a key,
     /// reading one off a page, and turning a connection on change what the
     /// agent can reach: Desk's gate decides them as it does a page change.
-    fn effect(&self, _input: &Value) -> Effect {
+    ///
+    /// Turning one on for another agent is `connections:other`: Desk's gate
+    /// asks about it each time below unbound, never for the session.
+    fn effect(&self, input: &Value) -> Effect {
+        let other = self.name == "connections.use"
+            && text(input, "agent").is_some_and(|a| a != "me" && a != self.agent);
         match self.name {
             "connections.list" | "connections.step" | "connections.setup" | "connections.keep" => {
                 Effect::None
             }
             _ => Effect::Connector {
-                connector: "connections".into(),
+                connector: match other {
+                    true => "connections:other".into(),
+                    false => "connections".into(),
+                },
                 write: true,
             },
         }

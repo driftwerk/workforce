@@ -441,7 +441,12 @@ impl BrowserHooks for DeskHooks {
         let computer = self.computer.clone();
         let shots = self.shots.clone();
         handle.spawn(async move {
-            let shot = match done.screenshot.as_deref() {
+            // No picture of a page that shows a service's keys is kept.
+            let shown = done
+                .screenshot
+                .as_deref()
+                .filter(|_| !browser::shows_keys(&done.url));
+            let shot = match shown {
                 Some(png) => match keep_shot(&shots, png) {
                     Ok(name) => Some(name),
                     Err(e) => {
@@ -566,6 +571,11 @@ struct StopBody {
     agent: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ShowBody {
+    agent: String,
+}
+
 fn refusal(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
@@ -609,6 +619,25 @@ macro_rules! holder {
 async fn list(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
     holder!(r, h, q);
     Json(json!({ "live": browser::live().await })).into_response()
+}
+
+/// Brings `agent`'s page in Desk's own browser to the front of the screen,
+/// for the person to sign in there: `{shown}`, false when Desk's browser
+/// isn't on screen or the agent has no page open in it.
+async fn show(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<ShowBody>,
+) -> Response {
+    holder!(r, h, q);
+    let caller = resolve_caller_context(&r.state, &h, q.token.as_deref()).await;
+    let Some(person) = caller.identity_id else {
+        return refusal(StatusCode::FORBIDDEN, "Ask as yourself");
+    };
+    let on_screen = r.settings.get().show.unwrap_or(true);
+    let shown = on_screen && browser::show(&body.agent, &person).await;
+    Json(json!({ "shown": shown })).into_response()
 }
 
 /// Stop: the turns using the browser end, the browser closes now, and
@@ -847,6 +876,7 @@ pub fn install(
     Router::new()
         .route("/api/desk/browser", get(list))
         .route("/api/desk/browser/stop", post(stop))
+        .route("/api/desk/browser/show", post(show))
         .route("/api/desk/browser/shots/{file}", get(shot))
         .route(
             "/api/desk/browser/settings",

@@ -337,6 +337,23 @@ pub async fn capture(c: &Capture) -> Result<workforce_common::secret::Secret<Str
     ))
 }
 
+/// Brings the page of `agent`'s browser for `user`, in Desk's own browser,
+/// to the front of the screen, so the person can sign in there. False when
+/// it has no page open.
+pub async fn show(agent: &str, user: &str) -> bool {
+    let id = SessionId::derive(agent, user);
+    for client in clients() {
+        let cell = client.sessions.lock().await.get(&id).cloned();
+        if let Some(cell) = cell {
+            let page = cell.inner.lock().await.as_ref().map(|a| a.page.clone());
+            if let Some(page) = page {
+                return page.bring_to_front().await.is_ok();
+            }
+        }
+    }
+    false
+}
+
 /// What [`capture`] reads of the element `selector` names, in Desk's own
 /// world: its value or its text, unless it is a field a password is typed
 /// into.
@@ -986,7 +1003,10 @@ impl SessionCell {
             return;
         };
         let url = self.current_url(page).await;
-        let typed = matches!(tool, "browser.fill" | "browser.type");
+        // Never a picture of what was just typed (a credential, perhaps),
+        // nor of a page that shows keys.
+        let typed =
+            matches!(tool, "browser.fill" | "browser.type") || super::address::shows_keys(&url);
         let screenshot = match typed {
             true => None,
             false => timeout(
@@ -1791,14 +1811,41 @@ impl BrowserClient {
         self.acquire().await?.navigate(url).await
     }
 
-    pub(super) async fn snapshot(&self) -> Result<Value> {
-        if self.on_chrome() {
-            return self.chrome().await?.snapshot().await;
+    /// Whether the page the identity in scope is on now shows a service's
+    /// keys ([`super::address::shows_keys`]).
+    fn on_key_page(&self) -> bool {
+        untrusted::state(&backend_id(current_backend()).0)
+            .is_some_and(|s| super::address::shows_keys(&s.url))
+    }
+
+    /// No picture of a page that shows keys: a key made there would be in it.
+    fn no_picture(&self) -> Result<()> {
+        match self.on_key_page() {
+            true => Err(eyre!(
+                "This page shows keys, so Desk takes no picture of it. Read it with browser.snapshot (keys in it are hidden); a key you made is read with connections.capture."
+            )),
+            false => Ok(()),
         }
-        self.acquire().await?.snapshot().await
+    }
+
+    /// What was read off a page that shows keys, with them hidden.
+    fn keys_hidden(&self, read: Value) -> Value {
+        match self.on_key_page() {
+            true => super::address::without_keys(read),
+            false => read,
+        }
+    }
+
+    pub(super) async fn snapshot(&self) -> Result<Value> {
+        let read = match self.on_chrome() {
+            true => self.chrome().await?.snapshot().await?,
+            false => self.acquire().await?.snapshot().await?,
+        };
+        Ok(self.keys_hidden(read))
     }
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
+        self.no_picture()?;
         if self.on_chrome() {
             return self.chrome().await?.screenshot().await;
         }
@@ -1806,6 +1853,7 @@ impl BrowserClient {
     }
 
     pub(super) async fn pdf(&self, filename: &str) -> Result<Value> {
+        self.no_picture()?;
         if self.on_chrome() {
             return Err(eyre!(
                 "The person's Chrome can't render a PDF for Desk; use Desk's own browser (`browser: \"desk\"`)."
@@ -1937,10 +1985,11 @@ impl BrowserClient {
     }
 
     pub(super) async fn get_content(&self, format: &str) -> Result<Value> {
-        if self.on_chrome() {
-            return self.chrome().await?.get_content(format).await;
-        }
-        self.acquire().await?.get_content(format).await
+        let read = match self.on_chrome() {
+            true => self.chrome().await?.get_content(format).await?,
+            false => self.acquire().await?.get_content(format).await?,
+        };
+        Ok(self.keys_hidden(read))
     }
 
     pub(super) async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<Value> {
