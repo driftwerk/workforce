@@ -496,7 +496,7 @@ mod tests {
     fn a_spoken_turn_is_kept_without_its_directions() {
         let spoken =
             session(serde_json::json!({ "voice_turn": true, "tts_provider": "fish_audio" }));
-        assert_eq!(spoken_with(&spoken), Some(Markup::FishS1));
+        assert_eq!(spoken_with(&spoken), Some(Markup::FishS2));
         assert_eq!(
             kept_answer(&spoken, "(excited) Yes.").as_deref(),
             Some("Yes.")

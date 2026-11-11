@@ -263,6 +263,14 @@ mod tests {
             provider_from_config(&fish, Path::new("/tmp"), no_key)
                 .unwrap()
                 .markup(),
+            Markup::FishS2,
+            "no model: the free S2"
+        );
+        fish.model = Some("s1".into());
+        assert_eq!(
+            provider_from_config(&fish, Path::new("/tmp"), no_key)
+                .unwrap()
+                .markup(),
             Markup::FishS1
         );
         fish.model = Some("s2-pro".into());

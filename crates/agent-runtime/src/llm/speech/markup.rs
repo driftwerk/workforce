@@ -272,8 +272,8 @@ const MAX_CHARS: usize = 48;
 
 impl Markup {
     /// The markup of `provider` (any spelling [`super::canonical_speech_provider`]
-    /// takes) speaking with `model`. Fish without a model is `s1`, the
-    /// hub's and the mobile app's default. A Fish model this table doesn't
+    /// takes) speaking with `model`. Fish without a model is the free S2
+    /// model, the hub's default. A Fish model this table doesn't
     /// know is [`Markup::Plain`]: stripping a direction it would have
     /// performed costs some expression, keeping one it would read costs the
     /// listener a word in brackets.
@@ -283,7 +283,8 @@ impl Markup {
         }
         let model = model.map(|m| m.trim().to_ascii_lowercase());
         match model.as_deref() {
-            None | Some("") | Some("s1") => Self::FishS1,
+            Some("s1") => Self::FishS1,
+            None | Some("") => Self::FishS2,
             Some(m) if m.starts_with("s2") => Self::FishS2,
             Some(_) => Self::Plain,
         }
@@ -809,9 +810,9 @@ mod tests {
 
     #[test]
     fn the_model_picks_the_markup() {
-        assert_eq!(Markup::of("fish_audio", None), Markup::FishS1);
+        assert_eq!(Markup::of("fish_audio", None), Markup::FishS2);
         assert_eq!(Markup::of("fishaudio", Some("S1")), Markup::FishS1);
-        assert_eq!(Markup::of("fish_audio", Some(" ")), Markup::FishS1);
+        assert_eq!(Markup::of("fish_audio", Some(" ")), Markup::FishS2);
         assert_eq!(Markup::of("fish_audio", Some("s2-pro")), Markup::FishS2);
         assert_eq!(Markup::of("fish", Some("s2.1-pro-free")), Markup::FishS2);
         assert_eq!(Markup::of("fish_audio", Some("s3")), Markup::Plain);
