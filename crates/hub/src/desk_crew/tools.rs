@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde_json::{json, Value};
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_common::oversight::{Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_desk::charge::Wheel;
 use workforce_desk::crew::{self, Item, ItemState};
 use workforce_desk::scope::Seen;
@@ -33,7 +33,7 @@ pub const READ: [&str; 5] = [
     super::spend::NAME,
     super::board::NAME,
 ];
-pub const ACT: [&str; 18] = [
+pub const ACT: [&str; 19] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -52,6 +52,7 @@ pub const ACT: [&str; 18] = [
     super::plan::UPDATE,
     super::handover::NAME,
     "crew.handoff",
+    "crew.set_mode",
 ];
 
 pub struct CrewTool {
@@ -401,9 +402,15 @@ impl CrewTool {
         let by = crew.by_boss(&b.service, reason);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
-            Gate::Refuse => {
-                Err("You only watch the crew: tell the person what you would do instead.".into())
-            }
+            Gate::Refuse => match &action {
+                Action::SetMode { mode, .. } if !mode.asks() && b.oversight.level != Level::Watch => {
+                    Err(format!(
+                        "Only an unbound overseer puts a session in {} mode, so Desk won't do it or suggest it; tell the person what you'd want instead.",
+                        mode.title()
+                    ))
+                }
+                _ => Err("You only watch the crew: tell the person what you would do instead.".into()),
+            },
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
                 let done = crew.perform(&action, by).await?;
@@ -599,6 +606,7 @@ impl Tool for CrewTool {
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it; it is theirs while they are active there (a couple of minutes after their last input, unless they pin it), and your messages wait until then.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
+            "crew.set_mode" => "Change a Desk session's permission mode (session_id, mode): default (manual: it asks), acceptEdits, plan, auto (it decides what is safe) or bypassPermissions (it asks for nothing). Desk starts it again in place in that mode, its conversation kept, and says the mode it now runs in. Set it between turns, never while it works or waits on an answer: auto before routine work, default before work that will need your judgement. auto and bypassPermissions are for an unbound overseer only, on a session it runs (take it on first), and end with unbound: once you aren't unbound or don't run it, it starts in its own mode again, as it does when the person resumes it. Below unbound, only default, acceptEdits and plan, where the person switched it on.",
             "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
             _ => "",
         }
@@ -662,6 +670,13 @@ impl Tool for CrewTool {
                     "prompt": { "type": "string" }
                 })),
                 &["session_id"],
+            ),
+            "crew.set_mode" => act(
+                props(json!({
+                    "session_id": session_schema(),
+                    "mode": { "type": "string", "enum": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"], "description": "The mode to run in" }
+                })),
+                &["session_id", "mode"],
             ),
             "crew.handoff" => act(
                 props(json!({

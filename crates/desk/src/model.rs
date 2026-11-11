@@ -244,6 +244,10 @@ pub struct SessionView {
     /// asked again.
     #[serde(skip)]
     pub failure: Option<crate::limit::TurnFailure>,
+    /// The mode that doesn't ask (auto, bypass) an unbound boss started it
+    /// in, while it runs in it: shown on its card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::mode::Mode>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -328,6 +332,7 @@ impl SessionView {
             prompts: 0,
             interrupted: false,
             reading: false,
+            mode: None,
             failure: None,
             created_at: r.created_at,
             updated_at: r.updated_at,

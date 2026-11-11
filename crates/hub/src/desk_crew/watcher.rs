@@ -45,6 +45,44 @@ const RAISED_FOR: chrono::TimeDelta = chrono::TimeDelta::days(1);
 /// The most check-in lines held while check-ins are spent; older go.
 const MAX_HELD: usize = 30;
 
+/// The check-ins an unbound overseer may take in an hour, and in a day: a
+/// ceiling against a loop that runs away, not a limit on the work.
+pub(super) const UNBOUND_CHECKINS_PER_HOUR: u32 = 240;
+pub(super) const UNBOUND_CHECKINS_PER_DAY: u32 = 3000;
+/// How soon, in minutes, a session waiting on a question or an approval,
+/// and one gone quiet, wakes an unbound overseer, unless the person set
+/// sooner.
+const UNBOUND_WAITING_MINUTES: u32 = 1;
+const UNBOUND_QUIET_MINUTES: u32 = 3;
+/// How often, in minutes, an unbound overseer sweeps its scope while it
+/// has anything in it.
+const UNBOUND_SWEEP_MINUTES: u32 = 2;
+/// What a check-in tried again is marked with: tried again once only.
+const RETRIED: &str = "(again, as the last check-in didn't run) ";
+
+/// What a sweep wakes an unbound overseer with.
+pub(super) const SWEEP: &str = "Regular sweep: nothing may sit idle. Look over every session \
+    and ticket in your scope with crew.overview and keep everything moving.";
+
+/// `o` as an unbound overseer runs it: woken soon for what waits and what
+/// goes quiet (sooner only if the person said so), for every turn's end
+/// and failure, and checking in as often as the work needs, under a
+/// ceiling against runaway loops.
+pub(super) fn unbound_timings(o: &Oversight) -> Oversight {
+    let soon = |set: u32, unbound: u32| match set {
+        0 => unbound,
+        n => n.min(unbound),
+    };
+    let mut o = o.clone();
+    o.wake.waiting_minutes = soon(o.wake.waiting_minutes, UNBOUND_WAITING_MINUTES);
+    o.wake.quiet_minutes = soon(o.wake.quiet_minutes, UNBOUND_QUIET_MINUTES);
+    o.wake.on_finish = true;
+    o.wake.on_failure = true;
+    o.max_checkins_per_hour = UNBOUND_CHECKINS_PER_HOUR;
+    o.max_checkins_per_day = UNBOUND_CHECKINS_PER_DAY;
+    o
+}
+
 /// One thing worth waking the overseer for.
 #[derive(Debug, Clone)]
 pub(super) struct Trigger {
@@ -325,19 +363,28 @@ impl CrewHub {
         if event.kind == Kind::Finished && o.level != Level::Watch && runs() {
             return None;
         }
+        let unbound = self.unbound(o);
         let wanted = match event.kind {
-            Kind::Finished | Kind::Question => o.wake.on_finish,
-            Kind::Failed | Kind::Limit => o.wake.on_failure,
+            Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
+            Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
+            // Unbound, what waits on an answer wakes it at once.
+            Kind::NeedsYou => unbound,
             _ => false,
         };
-        let about = (event.kind == Kind::Question).then(|| {
-            let asked = event
-                .detail
-                .as_ref()
-                .and_then(|d| d.pointer("/question/text"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(&event.text);
-            question_key(&subject.id, "asked", asked)
+        let about = match event.kind {
+            Kind::NeedsYou => Some(question_key(&subject.id, "needs", &event.text)),
+            _ => None,
+        };
+        let about = about.or_else(|| {
+            (event.kind == Kind::Question).then(|| {
+                let asked = event
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.pointer("/question/text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&event.text);
+                question_key(&subject.id, "asked", asked)
+            })
         });
         wanted.then(|| Trigger {
             line: format!("{} {}", who(subject), event.text),
@@ -359,6 +406,13 @@ impl CrewHub {
         o: &Oversight,
         noted: &mut HashSet<String>,
     ) -> Vec<Trigger> {
+        let fast;
+        let o = if self.unbound(o) {
+            fast = unbound_timings(o);
+            &fast
+        } else {
+            o
+        };
         let seen = self.desk.seen_by(&o.scope);
         let Ok(overview) = self.desk.overview_for(self, None, Some(&seen)).await else {
             return Vec::new();
@@ -471,6 +525,32 @@ impl CrewHub {
         out
     }
 
+    /// What an unbound overseer is told each time it wakes: be the boss.
+    pub(super) fn boss_hint(o: &Oversight) -> String {
+        format!(
+            "You are unbound: no limits but the person's budget, their Stop, and their hold while \
+             they type. Be the boss, keep everything moving, spawn sessions for open work up to the \
+             parallel limit ({}). For every session in your scope (crew.overview): waiting on a \
+             question or an approval, answer or approve it; finished with an obvious next step from \
+             its goal, plan or ticket, nudge it on; stuck or errored, resume or restart it; and \
+             while the plan's next tickets are free and fewer than {} sessions are working, start \
+             sessions for them (crew.start_session or crew.assign_ticket). Between turns, set a \
+             session's mode with crew.set_mode: auto before routine work, default before work that \
+             will need your judgement. Nothing should sit idle. Give a reason each time; the person reads them in Activity.",
+            o.work.parallel, o.work.parallel
+        )
+    }
+
+    /// Whether the overseer `overseer`'s scope has a session or an agent
+    /// in it but itself.
+    pub(super) async fn has_work(&self, overseer: &str, o: &Oversight) -> bool {
+        let seen = self.desk.seen_by(&o.scope);
+        self.desk
+            .overview_for(self, None, Some(&seen))
+            .await
+            .is_ok_and(|v| v.items.iter().any(|i| i.id != overseer))
+    }
+
     fn level_hint(level: Level) -> &'static str {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
@@ -482,32 +562,38 @@ impl CrewHub {
 
     /// Wakes the overseer `service` with `triggers`, as one check-in: each
     /// in its scope, as it was routed.
+    /// Whether its turn ran.
     pub(super) async fn wake(
         &self,
         service: Arc<AgentService>,
         o: Oversight,
         triggers: Vec<Trigger>,
-    ) {
+    ) -> bool {
         let Some(owner) = self.person(Some(&service)) else {
             tracing::info!("the overseer has no Desk conversation to check in on yet");
-            return;
+            return false;
         };
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
+        let hint = match self.unbound_given(&service, &o) {
+            true => Self::boss_hint(&o),
+            false => Self::level_hint(level).to_string(),
+        };
         let prompt = format!(
             "{CHECK_IN} Here is what happened on the crew since you last looked (you oversee it at level {}):\n{}\n\n\
              Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
              them first. Name sessions and agents as above. {}{}",
             level.as_str(),
             reported(&lines.join("\n"), "the crew's sessions and agents"),
-            Self::level_hint(level),
+            hint,
             why.map(|w| format!(" {w} Tell the person once if it matters.")).unwrap_or_default(),
         );
         let hop = triggers.iter().map(|t| t.hop).max().unwrap_or(0);
         let approvals: Vec<MentionedApproval> =
             triggers.into_iter().flat_map(|t| t.approvals).collect();
         self.check_in(&service, &owner, "wake", &prompt, hop, Some(approvals))
-            .await;
+            .await
+            .is_some()
     }
 
     /// Puts what `service`'s own scheduled check-in (its heartbeat) found
@@ -657,6 +743,13 @@ impl CrewHub {
     /// What the overseer `agent` may spend on check-ins now: each
     /// overseer's are its own.
     pub(super) async fn budget(&self, agent: &str, o: &Oversight) -> eyre::Result<Budget> {
+        let fast;
+        let o = if self.unbound(o) {
+            fast = unbound_timings(o);
+            &fast
+        } else {
+            o
+        };
         let now = Utc::now();
         let midnight = self.midnight();
         let wakes = self
@@ -743,6 +836,8 @@ struct Waking {
     firing: Option<tokio::task::JoinHandle<()>>,
     held_until: Option<DateTime<Utc>>,
     told: Option<DateTime<Utc>>,
+    /// When it, unbound, last swept its scope.
+    swept: Option<Instant>,
 }
 
 /// Turns what happens into the overseers' check-ins: each event, and each
@@ -754,6 +849,9 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut waking: HashMap<String, Waking> = HashMap::new();
     let mut raised = crew.raised().await;
+    // A check-in whose turn didn't run comes back here, to be tried again
+    // once: none is dropped without a word.
+    let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
     let mut ready_dirty = false;
@@ -783,6 +881,13 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
+            Some((id, again)) = retried.recv() => {
+                tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
+                // Held again as it was: what it asks was raised already.
+                let w = waking.entry(id).or_default();
+                w.window.get_or_insert_with(Instant::now);
+                hold(&mut w.pending, again);
+            }
             _ = tick.tick() => {
                 let overseers = crew.overseers();
                 // Kept up to date with no overseer too, so that one set up
@@ -800,8 +905,25 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     let w = waking.entry(id.clone()).or_default();
                     let mut noted = std::mem::take(&mut w.noted);
                     let at = crew.thresholds(&id, o, &mut noted).await;
-                    waking.entry(id.clone()).or_default().noted = noted;
+                    let w = waking.entry(id.clone()).or_default();
+                    w.noted = noted;
                     found.extend(at.into_iter().map(|t| (id.clone(), t)));
+                    // Unbound, it sweeps its scope every few minutes while
+                    // there is anything in it, whatever else woke it.
+                    let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
+                    let due = w.swept.is_none_or(|at| at.elapsed() >= every);
+                    if due && crew.unbound(o) && crew.has_work(&id, o).await {
+                        if let Some(w) = waking.get_mut(&id) {
+                            w.swept = Some(Instant::now());
+                        }
+                        found.push((id.clone(), Trigger {
+                            line: SWEEP.into(),
+                            approvals: Vec::new(),
+                            hop: 0,
+                            about: None,
+                            group: None,
+                        }));
+                    }
                 }
                 // An overseer gone has nothing waiting.
                 waking.retain(|id, _| overseers.iter().any(|(s, _)| s.agent_id.as_str() == id));
@@ -889,8 +1011,19 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 crew.keep_raised(&raised).await;
             }
             let crew = Arc::clone(&crew);
+            let retry = retry.clone();
+            let again: Vec<Trigger> = triggers
+                .iter()
+                .filter(|t| !t.line.starts_with(RETRIED))
+                .map(|t| Trigger {
+                    line: format!("{RETRIED}{}", t.line),
+                    ..t.clone()
+                })
+                .collect();
             w.firing = Some(tokio::spawn(async move {
-                crew.wake(service, o, triggers).await
+                if !crew.wake(service, o, triggers).await && !again.is_empty() {
+                    let _ = retry.send((id, again));
+                }
             }));
         }
     }
@@ -949,6 +1082,41 @@ mod budget_tests {
             Budget::Open,
             "yesterday's check-ins are not today's"
         );
+    }
+
+    #[test]
+    fn unbound_wakes_soon_and_is_capped_only_against_a_runaway_loop() {
+        let o = Oversight::default();
+        let fast = unbound_timings(&o);
+        assert_eq!(
+            (fast.wake.waiting_minutes, fast.wake.quiet_minutes),
+            (1, 3),
+            "from the defaults of {} and {}",
+            o.wake.waiting_minutes,
+            o.wake.quiet_minutes
+        );
+        assert!(fast.wake.on_finish && fast.wake.on_failure);
+        // The person's sooner setting stands.
+        let mut sooner = o.clone();
+        sooner.wake.quiet_minutes = 2;
+        assert_eq!(unbound_timings(&sooner).wake.quiet_minutes, 2);
+        // A busy night: 100 check-ins in the last hour.
+        let now = Utc::now();
+        let hour = TimeDelta::hours(1);
+        let day = (now - TimeDelta::hours(10), now + TimeDelta::hours(14));
+        let wakes: Vec<_> = (0..100).map(|i| now - TimeDelta::seconds(30 * i)).collect();
+        assert!(matches!(
+            budget(&o, &wakes, now, hour, day),
+            Budget::Spent { .. }
+        ));
+        assert_eq!(budget(&fast, &wakes, now, hour, day), Budget::Open);
+        let runaway: Vec<_> = (0..UNBOUND_CHECKINS_PER_HOUR as i64)
+            .map(|i| now - TimeDelta::seconds(i))
+            .collect();
+        assert!(matches!(
+            budget(&fast, &runaway, now, hour, day),
+            Budget::Spent { .. }
+        ));
     }
 
     fn asking(about: &str) -> Trigger {
