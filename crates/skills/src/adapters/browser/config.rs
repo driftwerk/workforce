@@ -70,6 +70,14 @@ pub struct BrowserSkillConfig {
     pub profile_retention_ms: u64,
     #[serde(default = "default_reap_interval_ms")]
     pub reap_interval_ms: u64,
+    /// Show the browser's window on screen instead of running it headless,
+    /// so the person can watch it and sign in by hand.
+    #[serde(default)]
+    pub show: bool,
+    /// Keep every profile under `profile_root`: the reaper never runs, so a
+    /// profile the person signed in to by hand stays signed in.
+    #[serde(default)]
+    pub keep_profiles: bool,
 }
 
 impl Default for BrowserSkillConfig {
@@ -88,6 +96,8 @@ impl Default for BrowserSkillConfig {
             session_idle_ttl_ms: default_session_idle_ttl_ms(),
             profile_retention_ms: default_profile_retention_ms(),
             reap_interval_ms: default_reap_interval_ms(),
+            show: false,
+            keep_profiles: false,
         }
     }
 }
@@ -108,6 +118,8 @@ max_live_sessions = 6
 session_idle_ttl_ms = 600000
 profile_retention_ms = 604800000
 reap_interval_ms = 3600000
+# show = false            # true: a visible window instead of headless
+# keep_profiles = false   # true: profiles are never reaped
 "#
         .to_string()
     }
@@ -131,6 +143,8 @@ mod tests {
         assert_eq!(cfg.session_idle_ttl_ms, def.session_idle_ttl_ms);
         assert_eq!(cfg.profile_retention_ms, def.profile_retention_ms);
         assert_eq!(cfg.reap_interval_ms, def.reap_interval_ms);
+        assert!(!cfg.show, "headless unless asked");
+        assert!(!cfg.keep_profiles, "reaped unless asked");
     }
 
     #[test]
@@ -183,6 +197,8 @@ mod tests {
             "session_idle_ttl_ms",
             "profile_retention_ms",
             "reap_interval_ms",
+            "show",
+            "keep_profiles",
         ] {
             assert!(toml.contains(key), "missing key in default_toml: {key}");
         }

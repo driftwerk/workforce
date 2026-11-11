@@ -375,6 +375,44 @@ fn in_prose_field(tool_name: &str, field_path: &str) -> bool {
         })
 }
 
+/// The fields a browser types into a page, by tool. A credential reaches a
+/// page only as a marker (`[[vault:…]]`, `[[secret:…]]`) resolved at the
+/// tool's boundary, so the model never holds it: one written there as it is
+/// is refused. Markers are checked here before they resolve.
+pub const TYPED_INTO_PAGES: &[(&str, &str)] = &[
+    ("browser.fill", "value"),
+    ("browser.type", "text"),
+    ("obscura.fill", "value"),
+    ("obscura.type", "text"),
+];
+
+/// The rule a credential typed into a page as it is breaks.
+pub const LITERAL_SECRET_TYPED: &str = "literal-secret-typed";
+
+static MARKER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[\[(?:secret|vault):[^\]]*\]\]").expect("marker pattern"));
+
+/// A credential written as it is into what `tool_name` types into a page.
+fn typed_secret(tool_name: &str, input: &serde_json::Value) -> Option<ParameterFinding> {
+    let field = TYPED_INTO_PAGES
+        .iter()
+        .find(|(tool, _)| *tool == tool_name)
+        .map(|(_, field)| *field)?;
+    let text = input.get(field)?.as_str()?;
+    let bare = MARKER.replace_all(text, " ");
+    crate::redact::contains_secret(&bare).then(|| ParameterFinding {
+        rule: LITERAL_SECRET_TYPED,
+        description: "A credential typed into a page as it is",
+        severity: Severity::Critical,
+        field_path: field.to_string(),
+        matches: Vec::new(),
+        remedy: Some(
+            "Type a [[vault:<key>]] or [[secret:<name>]] marker in its place, or ask the person \
+             to sign in by hand in the browser.",
+        ),
+    })
+}
+
 /// Scan tool parameters for credential exfiltration patterns.
 ///
 /// Recursively walks the JSON value and checks every string against the
@@ -390,6 +428,7 @@ pub fn scan_parameters(tool_name: &str, input: &serde_json::Value) -> Vec<Parame
     }
     findings
         .retain(|f| !(f.rule == "env-var-reference" && in_prose_field(tool_name, &f.field_path)));
+    findings.extend(typed_secret(tool_name, input));
 
     findings
 }
@@ -1023,5 +1062,52 @@ mod tests {
             "123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUv"
         )));
         assert!(!contains_credentials("Hello, how are you?"));
+    }
+
+    fn typed_block(tool: &str, field: &str, text: &str) -> Option<ParameterBlock> {
+        parameter_block(&scan_parameters(
+            tool,
+            &serde_json::json!({ "selector": "#password", field: text }),
+        ))
+    }
+
+    #[test]
+    fn a_credential_typed_into_a_page_as_it_is_is_refused() {
+        let token = format!("lin_api_{}", "a1".repeat(15));
+        for (tool, field) in TYPED_INTO_PAGES {
+            let block = typed_block(tool, field, &format!("my key is {token}"))
+                .unwrap_or_else(|| panic!("{tool}.{field} took a literal credential"));
+            assert!(
+                block.reason.contains("typed into a page"),
+                "{}",
+                block.reason
+            );
+            assert!(block.message.contains("[[vault:"), "{}", block.message);
+            assert!(
+                !block.message.contains(&token),
+                "the credential is not repeated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_typed_into_a_page_passes() {
+        for (tool, field) in TYPED_INTO_PAGES {
+            assert!(typed_block(tool, field, "[[vault:site_password]]").is_none());
+            assert!(
+                typed_block(tool, field, "[[secret:7f3a type=password preview=hu…]]").is_none()
+            );
+            assert!(typed_block(tool, field, "Sam Smith").is_none());
+        }
+    }
+
+    #[test]
+    fn the_selector_and_other_tools_are_not_read_as_typed() {
+        let token = format!("lin_api_{}", "a1".repeat(15));
+        let findings = scan_parameters(
+            "browser.click",
+            &serde_json::json!({ "selector": format!("#{token}") }),
+        );
+        assert!(findings.iter().all(|f| f.rule != LITERAL_SECRET_TYPED));
     }
 }

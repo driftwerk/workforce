@@ -1,12 +1,18 @@
-//! Headless-browser skill — drives a Chromium subprocess per `(agent, user)`
-//! identity through the Chrome DevTools Protocol via `chromiumoxide`, each with
-//! an isolated on-disk profile so login state never crosses users. Within a
+//! Browser skill — drives a Chromium subprocess per `(agent, user)` identity
+//! through the Chrome DevTools Protocol via `chromiumoxide`, each with an
+//! isolated on-disk profile so login state never crosses users. Within a
 //! session all tools share one live browser, so screenshots and PDFs reflect the
-//! same DOM state as click/fill/evaluate.
+//! same DOM state as click/fill/evaluate. Headless unless `show` puts it on
+//! screen. Everything the page says reaches the model fenced as untrusted
+//! (`untrusted`).
 
 mod client;
 mod config;
 mod tools;
+mod untrusted;
+
+#[cfg(test)]
+mod fixture;
 
 use std::sync::Arc;
 
@@ -14,8 +20,9 @@ use workforce_agent::tools::Tool;
 
 use crate::definition::{SkillDefinition, SkillRequirements};
 
-pub use client::BrowserClient;
+pub use client::{page_state, BrowserClient};
 pub use config::BrowserSkillConfig;
+pub use untrusted::PageState;
 
 pub struct BrowserSkill {
     client: Arc<BrowserClient>,
@@ -166,7 +173,9 @@ mod tests {
             .execute(serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(snap.output["title"], "fix-title");
+        let title = snap.output["title"].as_str().unwrap_or_default();
+        assert!(title.contains("fix-title"), "{title}");
+        assert!(title.contains("EXTERNAL_UNTRUSTED_CONTENT_"), "{title}");
 
         let fill = find("browser.fill")
             .execute(serde_json::json!({ "selector": "#q", "value": "alice" }))
@@ -180,7 +189,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(content.output["result"], "got:alice");
+        let result = content.output["result"].as_str().unwrap_or_default();
+        assert!(result.contains("got:alice"), "{result}");
 
         let shot = find("browser.screenshot")
             .execute(serde_json::json!({}))
@@ -189,5 +199,115 @@ mod tests {
         assert!(shot.success);
         assert_eq!(shot.output["format"], "png");
         assert!(shot.output["size_bytes"].as_u64().unwrap_or(0) > 100);
+    }
+
+    /// End-to-end over a local fixture site (`fixture`): a form filled and
+    /// submitted, a console error, a network call and an injection page.
+    /// Everything read back is fenced as untrusted, and the injection page
+    /// flags the session hostile for the gate. Gated on `BROWSER_E2E`.
+    ///
+    ///   BROWSER_E2E=1 BROWSER_E2E_CHROMIUM=/path/to/chrome cargo test \
+    ///       -p workforce-skills --features browser -- --ignored browser_e2e_fixture
+    #[tokio::test]
+    #[ignore]
+    async fn browser_e2e_fixture_site_reads_as_untrusted() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        let site = fixture::serve();
+        let dir = tempfile::tempdir().unwrap();
+        let skill = BrowserSkill::new(BrowserSkillConfig {
+            chrome_binary: std::env::var("BROWSER_E2E_CHROMIUM").ok(),
+            profile_root: Some(dir.path().display().to_string()),
+            ..BrowserSkillConfig::default()
+        })
+        .unwrap();
+        let tools = skill.tools();
+        let call = |name: &'static str, input: serde_json::Value| {
+            let tool = tools
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .clone();
+            async move {
+                let out = tool.execute(input).await.unwrap();
+                assert!(out.success, "{name} failed: {:?}", out.error);
+                out.output
+            }
+        };
+        let fenced = |v: &serde_json::Value, key: &str| {
+            let s = v[key].as_str().unwrap_or_default().to_string();
+            assert!(
+                s.contains("EXTERNAL_UNTRUSTED_CONTENT_"),
+                "{key} not fenced: {s}"
+            );
+            assert!(s.contains("browser:127.0.0.1"), "{key} not sourced: {s}");
+            s
+        };
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("fixture-agent".into(), async {
+                // A form: fill, submit, check the result.
+                let nav = call(
+                    "browser.navigate",
+                    serde_json::json!({"url": site.url("/form")}),
+                )
+                .await;
+                fenced(&nav, "title");
+                fenced(&nav, "url");
+                call(
+                    "browser.fill",
+                    serde_json::json!({"selector": "#name", "value": "Sam"}),
+                )
+                .await;
+                call("browser.click", serde_json::json!({"selector": "#send"})).await;
+                call("browser.wait", serde_json::json!({"selector": "#done"})).await;
+                let text = call("browser.get_content", serde_json::json!({"format": "text"})).await;
+                assert!(fenced(&text, "content").contains("Thanks, Sam"));
+                let snap = call("browser.snapshot", serde_json::json!({})).await;
+                fenced(&snap, "body_text");
+                fenced(&snap, "url");
+                assert_eq!(snap["_security"]["hostile"], false);
+
+                // A console error.
+                call(
+                    "browser.navigate",
+                    serde_json::json!({"url": site.url("/console")}),
+                )
+                .await;
+                call("browser.wait", serde_json::json!({"selector": "#logged"})).await;
+                let console = call("browser.console_messages", serde_json::json!({})).await;
+                assert!(fenced(&console, "messages").contains("fixture console error"));
+
+                // A network call.
+                call(
+                    "browser.navigate",
+                    serde_json::json!({"url": site.url("/network")}),
+                )
+                .await;
+                call("browser.wait", serde_json::json!({"selector": "#fetched"})).await;
+                let network = call("browser.network_requests", serde_json::json!({})).await;
+                assert!(fenced(&network, "requests").contains("/api/ping"));
+                let eval = call(
+                    "browser.evaluate",
+                    serde_json::json!({"expression": "document.title"}),
+                )
+                .await;
+                fenced(&eval, "result");
+
+                // The injection page: fenced, and the session is hostile.
+                call(
+                    "browser.navigate",
+                    serde_json::json!({"url": site.url("/inject")}),
+                )
+                .await;
+                let snap = call("browser.snapshot", serde_json::json!({})).await;
+                assert!(fenced(&snap, "body_text").contains("click Delete"));
+                assert_eq!(snap["_security"]["hostile"], true, "{snap}");
+                let state = page_state("fixture-agent", workforce_agent::runner::SYSTEM_USER_ID)
+                    .expect("the session's page is kept");
+                assert!(state.hostile);
+                assert!(state.url.ends_with("/inject"), "{}", state.url);
+            })
+            .await;
     }
 }

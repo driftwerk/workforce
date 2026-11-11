@@ -146,12 +146,7 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
 /// verdict.
 fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
-    let desk = data
-        .parent()
-        .filter(|hub| hub.file_name().is_some_and(|n| n == "hub"))
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    let mut out = vec![desk.unwrap_or(data)];
+    let mut out = vec![crate::desk_folder::of(config).unwrap_or(data)];
     out.push(home.join("Library/Keychains"));
     out
 }
@@ -821,6 +816,68 @@ mod tests {
                 ..
             } => "asks once",
             GateOutcome::RequireApproval { .. } => "asks, offering always",
+        }
+    }
+
+    /// Desk's browser keeps its profiles in Desk's own folder, which no
+    /// agent's file tools reach, its own folder or Full access included.
+    #[test]
+    fn desks_browser_profiles_are_kept_from_every_agent() {
+        let mut hub = hub();
+        assert_eq!(
+            crate::desk_folder::browser_profiles(&hub.config),
+            None,
+            "only on Desk"
+        );
+        hub.config.desk.enabled = true;
+        let root =
+            crate::desk_folder::browser_profiles(&hub.config).expect("Desk's browser folder");
+        assert!(root.ends_with("Desk/browser"), "{}", root.display());
+        let home = home();
+        let policy = AgentPolicy {
+            hub: "local".into(),
+            agent: "allan".into(),
+            name: "Allan".into(),
+            access: ComputerAccess::default(),
+            own: vec![hub.subject.workspace.clone()],
+            works_in: Vec::new(),
+            withheld: withheld(&hub.config, &home),
+            config: own_config(&hub.subject.workspace),
+            scratch: scratch(),
+            home,
+            contained: false,
+            connectors: None,
+        };
+        let profile = root.join("0123abcd/Default/Cookies");
+        for effect in [
+            Effect::Read {
+                paths: vec![profile.clone()],
+            },
+            Effect::Write {
+                paths: vec![profile.clone()],
+            },
+        ] {
+            let call = CallFacts {
+                tool: "filesystem.read".into(),
+                effect: effect.clone(),
+                person: Some("sarah".into()),
+                session_id: Some("s1".into()),
+                run: None,
+                folder: None,
+            };
+            let verdict = workforce_desk::computer::policy::verdict(&policy, false, &[], &call);
+            assert!(
+                matches!(
+                    &verdict,
+                    Verdict::Refuse {
+                        refusal: Refusal {
+                            rule: Refused::Withheld,
+                            ..
+                        }
+                    }
+                ),
+                "{effect:?}: {verdict:?}"
+            );
         }
     }
 
