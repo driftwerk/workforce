@@ -235,19 +235,8 @@ pub fn claude_limit_text(text: &str, now: DateTime<Utc>) -> Option<LimitSignal> 
     })
 }
 
-/// The window a Claude Code notice names when it is not the plan's own:
-/// "You're out of extra usage" (credits), "You've hit your Opus limit".
 fn notice_window(text: &str) -> Option<&'static str> {
-    let s = normalise_notice(text);
-    if s.contains("extra usage") || s.contains("usage credits") || s.contains("spend limit") {
-        Some("overage")
-    } else if s.contains("opus limit") {
-        Some("seven_day_opus")
-    } else if s.contains("sonnet limit") {
-        Some("seven_day_sonnet")
-    } else {
-        None
-    }
+    usage::claude_notice_window(text)
 }
 
 /// A Codex CLI limit failure (`codex exec --json` reports only text):

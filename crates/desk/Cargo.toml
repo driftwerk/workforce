@@ -39,6 +39,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 vt100 = "0.18.1"
+workforce-common = { workspace = true }
 workforce-core = { workspace = true }
 workforce-postgres = { path = "../postgres", features = ["postgres"] }
 

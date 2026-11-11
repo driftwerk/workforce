@@ -43,60 +43,23 @@ pub enum TurnFailure {
     Failed(String),
 }
 
-/// What a limit window stops. Claude Code names the window it stopped on
-/// (`rateLimitType`): `five_hour` and `seven_day` are the plan's own, which
-/// stop every session on the account; `seven_day_opus` and
-/// `seven_day_sonnet` stop that model's sessions only; anything else
-/// (`overage`, extra usage, monthly credits, a spend cap) is pay-as-you-go
-/// being used up, which stops no plan session. Keep in step with
-/// `workforce_common::usage::claude_reach`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reach {
-    /// The plan: every session on the account.
-    Plan,
-    /// One model's weekly window (`opus`, `sonnet`).
-    Model(String),
-    /// Extra usage or credits: no plan session.
-    Credit,
-}
+/// What a limit window stops: the shared rule of the hub and Desk.
+pub use workforce_common::usage::Reach;
 
 /// What the window Claude Code names stops. None named (only the message
-/// was seen) is the plan's, as before.
+/// was seen), and any name not known, is the plan's.
 pub fn reach_of(window: Option<&str>) -> Reach {
-    match window {
-        None | Some("five_hour" | "seven_day") => Reach::Plan,
-        Some(w) => match w.strip_prefix("seven_day_") {
-            Some(model) if !model.is_empty() => Reach::Model(model.to_lowercase()),
-            _ => Reach::Credit,
-        },
-    }
+    workforce_common::usage::window_reach(window)
 }
 
-/// The window a limit message names when it is not the plan's own:
-/// "You're out of extra usage · resets Dec 1" (credits), "You've hit your
-/// Opus limit" (that model's weekly window). None for the plan's own
-/// wording ("session limit", "weekly limit", "5-hour limit").
+/// The non-plan window a limit message names, from its opening only.
 pub fn window_in_words(said: &str) -> Option<&'static str> {
-    let s = said.trim().to_lowercase().replace('’', "'");
-    if says_extra_usage(&s) {
-        Some("overage")
-    } else if s.contains("opus limit") || s.contains("opus weekly") {
-        Some("seven_day_opus")
-    } else if s.contains("sonnet limit") || s.contains("sonnet weekly") {
-        Some("seven_day_sonnet")
-    } else {
-        None
-    }
+    workforce_common::usage::claude_notice_window(said)
 }
 
 /// Whether a message says extra usage (pay-as-you-go credits) is spent.
 pub fn says_extra_usage(said: &str) -> bool {
-    let s = said.to_lowercase().replace('’', "'");
-    s.contains("out of extra usage")
-        || s.contains("out of usage credits")
-        || s.contains("extra usage limit")
-        || s.contains("monthly spend limit")
-        || s.contains("spend limit")
+    window_in_words(said) == Some("overage")
 }
 
 impl LimitHit {
@@ -263,6 +226,10 @@ mod tests {
         for credit in ["overage", "extra_usage", "monthly", "spend_limit"] {
             assert_eq!(reach_of(Some(credit)), Reach::Credit, "{credit}");
         }
+        // Not known: the plan's, fail closed.
+        for unknown in ["seven_day_haiku", "weekly", "something_new"] {
+            assert_eq!(reach_of(Some(unknown)), Reach::Plan, "{unknown}");
+        }
     }
 
     #[test]
@@ -284,6 +251,13 @@ mod tests {
             None
         );
         assert_eq!(window(words("You've hit your weekly limit")), None);
+        // A plan limit that mentions extra usage as an option is the plan's.
+        assert_eq!(
+            window(words(
+                "You've hit your session limit · resets 9am · /extra-usage to keep going"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -307,7 +281,7 @@ mod tests {
         )
         .unwrap();
         let hit = in_transcript_line(&opus).unwrap().limit().cloned().unwrap();
-        assert_eq!(hit.reach(), Reach::Model("opus".into()));
+        assert_eq!(hit.reach(), Reach::Model("opus"));
     }
 
     #[test]

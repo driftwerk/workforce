@@ -5403,24 +5403,36 @@ impl Desk {
         // Only the plan's own window fills the account. A model's weekly
         // window holds that model alone; extra usage or credits spent stops
         // no plan session.
+        let mut crossed = None;
         match hit.map(|h| h.reach()) {
             Some(crate::limit::Reach::Credit) => {
-                tracing::info!(session = %id, window = hit.and_then(|h| h.window.as_deref()), "a session stopped on extra usage; the plan isn't full");
-                return None;
+                // Extra usage is spent only once the plan's own windows are
+                // too: if the last reading shows one at 100%, the account is
+                // full on it; else (or no reading) it isn't.
+                let full = Self::standing_mut(st, raw).plan_window_full(now);
+                let Some(full) = full else {
+                    tracing::info!(session = %id, window = hit.and_then(|h| h.window.as_deref()), "a session stopped on extra usage; no plan window reads full");
+                    return None;
+                };
+                tracing::info!(session = %id, "a session stopped on extra usage with a plan window full: the account is full");
+                let kind = match full.minutes {
+                    Some(300) => "five_hour",
+                    _ => "seven_day",
+                };
+                crossed = Some(crate::limit::LimitHit {
+                    window: Some(kind.into()),
+                    resets_at: full.until,
+                });
             }
             Some(crate::limit::Reach::Model(model)) => {
-                let until = hit
-                    .and_then(|h| h.resets_at)
-                    .unwrap_or(now + chrono::Duration::hours(5));
-                tracing::info!(session = %id, %model, %until, "a session stopped on one model's weekly limit; the account isn't full");
-                let standing = Self::standing_mut(st, raw);
-                let held = standing.model_holds.entry(model).or_insert(until);
-                *held = (*held).max(until);
-                Self::wrote_hit(st, raw, identities::Writer::Session(id));
+                // Desk has no model of its own per session to hold, and the
+                // plan has room for the others.
+                tracing::info!(session = %id, %model, "a session stopped on one model's weekly limit; the account isn't full");
                 return None;
             }
             _ => {}
         }
+        let hit = crossed.as_ref().or(hit);
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit

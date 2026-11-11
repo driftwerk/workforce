@@ -55,25 +55,82 @@ pub fn claude_window(kind: &str) -> Option<u32> {
     }
 }
 
-/// Whether a limit window, by the name its provider gives it, stops the
-/// whole plan. Claude's `five_hour` and `seven_day` do. Its per-model weekly
-/// windows (`seven_day_opus`, `seven_day_sonnet`) stop that model only, and
-/// `overage` (extra usage, monthly credits, a spend cap) is pay-as-you-go
-/// being used up: neither stops a plan session. Codex's `primary` and
-/// `secondary`, and an unnamed window, are the plan's. Keep in step with
-/// `workforce_desk::limit::reach_of`.
-pub fn window_stops_plan(name: Option<&str>) -> bool {
-    match name {
-        None | Some("five_hour" | "seven_day" | "primary" | "secondary") => true,
-        Some(other) => {
-            !(other.starts_with("seven_day_")
-                || other.contains("overage")
-                || other.contains("extra")
-                || other.contains("credit")
-                || other.contains("month")
-                || other.contains("spend"))
-        }
+/// What a limit window stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The plan: every session on the account.
+    Plan,
+    /// One model's own weekly window (`opus`, `sonnet`): that model only.
+    Model(&'static str),
+    /// Extra usage, monthly credits or a spend cap: pay-as-you-go used up,
+    /// which stops no plan session.
+    Credit,
+}
+
+/// Windows that are pay-as-you-go, not the plan's: a closed list, so a name
+/// not known here fails closed as the plan's.
+const CREDIT_WINDOWS: &[&str] = &["overage", "extra_usage", "monthly", "spend_limit"];
+
+/// The models that have a weekly window of their own.
+const MODEL_WINDOWS: &[&str] = &["opus", "sonnet"];
+
+/// What the window a provider names stops. `five_hour`, `seven_day`, Codex's
+/// `primary`/`secondary`, an unnamed window and any name not known here are
+/// the plan's. Shared by the hub and Desk.
+pub fn window_reach(name: Option<&str>) -> Reach {
+    let Some(name) = name else {
+        return Reach::Plan;
+    };
+    if CREDIT_WINDOWS.contains(&name) {
+        return Reach::Credit;
     }
+    match name.strip_prefix("seven_day_") {
+        Some(model) => MODEL_WINDOWS
+            .iter()
+            .find(|m| **m == model)
+            .map_or(Reach::Plan, |m| Reach::Model(m)),
+        None => Reach::Plan,
+    }
+}
+
+/// Whether a limit window, by name, stops the whole plan.
+pub fn window_stops_plan(name: Option<&str>) -> bool {
+    window_reach(name) == Reach::Plan
+}
+
+/// The non-plan window a Claude Code limit notice names, read only from the
+/// notice's own opening (a line that starts "You're out of extra usage",
+/// "You're out of usage credits", "You've hit your Opus limit"): a plan
+/// limit that merely mentions extra usage ("… /extra-usage to keep going")
+/// or a model anywhere in its text is the plan's.
+pub fn claude_notice_window(text: &str) -> Option<&'static str> {
+    let normal = text.replace(['\u{2018}', '\u{2019}'], "'").to_lowercase();
+    normal.lines().find_map(|line| {
+        let line = line
+            .trim()
+            .trim_start_matches('…')
+            .trim_start_matches("> ")
+            .trim_start();
+        let line = line
+            .strip_prefix("api error:")
+            .map_or(line, str::trim_start);
+        if line.starts_with("you're out of extra usage")
+            || line.starts_with("you're out of usage credits")
+        {
+            return Some("overage");
+        }
+        let rest = line
+            .strip_prefix("you've hit your ")
+            .or_else(|| line.strip_prefix("you've reached your "))?;
+        MODEL_WINDOWS.iter().find_map(|m| {
+            let tail = rest.strip_prefix(m)?;
+            let tail = tail.trim_start();
+            (tail.starts_with("limit") || tail.starts_with("weekly limit")).then_some(match *m {
+                "opus" => "seven_day_opus",
+                _ => "seven_day_sonnet",
+            })
+        })
+    })
 }
 
 /// `windows`, shortest first.

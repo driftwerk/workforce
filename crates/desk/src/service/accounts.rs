@@ -477,6 +477,10 @@ impl Desk {
     /// full from here on.
     pub(super) fn started_on(&self, account: Option<Uuid>) {
         let mut st = self.0.state.lock();
+        // A start pinned to an account known to be full says nothing of it.
+        if Self::full_now(&st, account).is_some() {
+            return;
+        }
         let raw = Self::raw_of(&st, account);
         Self::standing_mut(&mut st, &raw).started_at = Some(Utc::now());
     }

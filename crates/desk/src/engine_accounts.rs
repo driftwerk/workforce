@@ -651,9 +651,6 @@ pub struct Standing {
     pub hit_until: Option<DateTime<Utc>>,
     /// The length of the window it stopped on, in minutes, when said.
     pub hit_window: Option<u32>,
-    /// Models whose own weekly window stopped a session, and until when:
-    /// such a stop holds that model only, never the account.
-    pub model_holds: std::collections::BTreeMap<String, DateTime<Utc>>,
     /// When a session was last started on the account. A reading taken
     /// before it can't alone say the account is full now.
     pub started_at: Option<DateTime<Utc>>,
@@ -698,12 +695,8 @@ impl Standing {
         self
     }
 
-    /// The model holds and last start `other` knows, where later.
+    /// The last start `other` knows, where later.
     fn take_holds(&mut self, other: &Standing) {
-        for (model, until) in &other.model_holds {
-            let held = self.model_holds.entry(model.clone()).or_insert(*until);
-            *held = (*held).max(*until);
-        }
         self.started_at = self.started_at.max(other.started_at);
     }
 }
@@ -718,10 +711,28 @@ impl Standing {
         self.full_by(now).map(|f| f.until)
     }
 
+    /// The plan window the readings show at 100% and not yet reset,
+    /// whatever started since: what a stop on extra usage is checked against.
+    pub fn plan_window_full(&self, now: DateTime<Utc>) -> Option<Full> {
+        self.windows
+            .iter()
+            .filter(|w| {
+                w.minutes <= PLAN_WINDOW_MAX
+                    && w.used_percent >= 100.0
+                    && w.resets_at.is_some_and(|r| r > now)
+            })
+            .max_by_key(|w| w.resets_at)
+            .map(|w| Full {
+                until: w.resets_at,
+                minutes: Some(w.minutes),
+            })
+    }
+
     /// [`Self::full`], with the window it is full on. Only the plan's own
     /// windows (5-hour, weekly) count: a longer one is extra usage, and a
-    /// model's own weekly stop ([`Self::model_holds`]) holds that model
-    /// alone ([`Self::full_for`]).
+    /// model's own weekly stop holds that model alone, which
+    /// Desk can't tell at a start (a session has no model of its own here),
+    /// so it fills nothing.
     pub fn full_by(&self, now: DateTime<Utc>) -> Option<Full> {
         // A reading taken before the last session started here can't say
         // alone that the account is full now.
@@ -775,34 +786,6 @@ impl Standing {
             minutes: None,
         })
     }
-
-    /// Whether a session on `model` (as its name says: "opus", "claude-opus-5")
-    /// can't run now: the account is full, or that model's own weekly
-    /// window is spent. Another model on the account still runs.
-    pub fn full_for(
-        &self,
-        model: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Option<Option<DateTime<Utc>>> {
-        if let Some(f) = self.full(now) {
-            return Some(f);
-        }
-        let model = model?.to_lowercase();
-        self.model_holds
-            .iter()
-            .filter(|(m, until)| **until > now && model.contains(m.as_str()))
-            .map(|(_, until)| Some(*until))
-            .max()
-    }
-
-    /// Models held until after `now`, with when each ends.
-    pub fn held_models(&self, now: DateTime<Utc>) -> Vec<(&str, DateTime<Utc>)> {
-        self.model_holds
-            .iter()
-            .filter(|(_, until)| **until > now)
-            .map(|(m, until)| (m.as_str(), *until))
-            .collect()
-    }
 }
 
 /// One account's standing as another of the person's computers knew it:
@@ -831,7 +814,10 @@ impl Standing {
         let mut s = self.clone();
         s.read_at = shift(s.read_at);
         s.hit_at = shift(s.hit_at);
+        s.started_at = shift(s.started_at);
         let soon = now + chrono::Duration::minutes(2);
+        // A start in the future can only be a wrong clock: not kept.
+        s.started_at = s.started_at.filter(|t| *t <= soon);
         if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
             return None;
         }
@@ -1404,26 +1390,15 @@ mod tests {
     }
 
     #[test]
-    fn a_models_weekly_stop_holds_that_model_only() {
+    fn a_start_in_the_future_or_on_another_clock_is_shifted_or_dropped() {
         let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
         let mut s = plan_with(None);
-        s.model_holds.insert("opus".into(), at(9_000));
-        assert_eq!(s.full(at(200)), None, "the account has room");
-        assert_eq!(
-            s.full_for(Some("claude-opus-5"), at(200)),
-            Some(Some(at(9_000)))
-        );
-        assert_eq!(s.full_for(Some("claude-sonnet-5"), at(200)), None);
-        assert_eq!(s.full_for(None, at(200)), None);
-        assert_eq!(s.full_for(Some("claude-opus-5"), at(9_001)), None, "reset");
-        assert_eq!(s.held_models(at(200)), vec![("opus", at(9_000))]);
-        // What another computer knew is taken where later.
-        let mut other = Standing::default();
-        other.model_holds.insert("opus".into(), at(9_500));
-        other.model_holds.insert("sonnet".into(), at(300));
-        assert!(s.learn(&other));
-        assert_eq!(s.model_holds["opus"], at(9_500));
-        assert_eq!(s.model_holds["sonnet"], at(300));
+        s.started_at = Some(at(90));
+        let seen = s.as_seen(chrono::Duration::minutes(5), at(200)).unwrap();
+        assert_eq!(seen.started_at, Some(at(95)));
+        s.started_at = Some(at(500));
+        let seen = s.as_seen(chrono::Duration::zero(), at(200)).unwrap();
+        assert_eq!(seen.started_at, None, "later than now: a wrong clock");
     }
 
     #[test]
