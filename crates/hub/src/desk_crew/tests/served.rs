@@ -153,6 +153,40 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
         .await;
         assert_eq!(code, StatusCode::OK, "{out}");
 
+        // What a session did in another group before it came stays that
+        // group's; what it did here is the boss's to read.
+        let about = workforce_desk::crew::Party::session(&mine);
+        for (who, group) in [("Globexbot", "globex"), ("Acmebot", "acme")] {
+            let mut e = workforce_desk::crew::Event::new(
+                Kind::Nudged,
+                workforce_desk::crew::Party::agent(&who.to_lowercase(), who),
+                Some(about.clone()),
+                "a note",
+            );
+            e.detail = Some(json!({ "inGroup": group }));
+            d.note(e);
+        }
+        let activity = eventually("the activity", async || {
+            let r = serve(&crew, allan(), "crew.activity", json!({})).await;
+            let text = r.body["events"].as_str().unwrap_or_default().to_string();
+            text.contains("Acmebot").then_some(text)
+        })
+        .await;
+        assert!(!activity.contains("Globexbot"), "{activity}");
+
+        // The group is bossed now: the main overseer here sees nothing in it.
+        let seen = _desk
+            .tools
+            .get("crew.overview")
+            .unwrap()
+            .execute(json!({}))
+            .await
+            .unwrap();
+        assert!(
+            !seen.output.to_string().contains(&mine.id.to_string()),
+            "{seen:?}"
+        );
+
         // Only the grant's boss is served, and only while it is live.
         let bob = BossRef::Remote {
             hub: "driftwerk".into(),
@@ -384,6 +418,62 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             .iter()
             .any(|c| c.0 == "crew.start_session" && c.1 == "refused"));
         assert!(calls.iter().all(|c| c.1 != "pending"), "{calls:?}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        eventually("Acme's local boss", async || {
+            crew.overseer_for(&workforce_common::oversight::Scope::Group("acme".into()))
+                .map(drop)
+        })
+        .await;
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(&[mine.id], dir.path(), "act", "replies"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let r = serve(&crew, allan(), "crew.overview", json!({})).await;
+        assert_eq!(r.status, ServedStatus::Refused, "{:?}", r.body);
+        assert!(r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("boss on this hub"));
+        // A call id sent again by another boss says nothing of the first.
+        let call = |boss| ServedCall {
+            tool: "crew.overview".into(),
+            input: json!({}),
+            boss,
+            link_id: Some("link-acme".into()),
+            call_id: Some("call-1".into()),
+        };
+        crew.serve_crew(call(allan()), "acme").await;
+        let bob = BossRef::Remote {
+            hub: "driftwerk".into(),
+            agent: "bob".into(),
+        };
+        let r = crew.serve_crew(call(bob), "acme").await;
+        assert_eq!(r.status, ServedStatus::Refused);
+        assert!(r.body.get("said").is_none(), "{:?}", r.body);
     })
     .await;
 }

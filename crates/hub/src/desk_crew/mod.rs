@@ -493,6 +493,12 @@ impl CrewHub {
             tokio::spawn(async move { desk.keep_boundaries().await });
         }
         for s in self.services() {
+            // A `/` is how a boss served from a grant is known
+            // (`<hub>/<agent>`): no agent of this hub is ever taken for one,
+            // nor oversees under such an id.
+            if workforce_desk::grant::is_served(s.agent_id.as_str()) {
+                continue;
+            }
             let o = self.oversight_of(&s);
             if !o.enabled {
                 continue;

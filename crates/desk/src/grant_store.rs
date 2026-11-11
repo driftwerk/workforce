@@ -183,6 +183,8 @@ pub enum Begun {
     /// The same `(link_id, call_id)` came before: its outcome and what was
     /// said, never acted on again.
     Again {
+        /// The boss that sent it first (its key).
+        boss: Option<String>,
         outcome: String,
         said: Option<String>,
     },
@@ -224,7 +226,7 @@ impl DeskStore {
         }
         let r = client
             .query_one(
-                "SELECT outcome, said FROM boss_calls WHERE link_id = $1 AND call_id = $2",
+                "SELECT outcome, said, boss FROM boss_calls WHERE link_id = $1 AND call_id = $2",
                 &[&link_id, &call_id],
             )
             .await
@@ -232,6 +234,7 @@ impl DeskStore {
         Ok(Begun::Again {
             outcome: r.try_get(0)?,
             said: r.try_get(1)?,
+            boss: r.try_get(2)?,
         })
     }
 

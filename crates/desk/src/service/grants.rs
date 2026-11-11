@@ -155,6 +155,9 @@ impl Desk {
         }
         run.since = engine.grants_since;
         run.loaded = true;
+        let granted = Self::granted_groups(&run.grants);
+        drop(run);
+        self.0.scopes.lock().granted = granted;
         Ok(())
     }
 
@@ -210,6 +213,16 @@ impl Desk {
         }
         grant::live(&g, Utc::now(), run.paused.is_some()).map_err(|why| why.say(&g.name))?;
         Ok(g)
+    }
+
+    /// The groups grants name a boss for: bossed, whatever state each
+    /// grant is in, until it is deleted.
+    fn granted_groups(grants: &BTreeMap<String, Grant>) -> std::collections::HashSet<String> {
+        grants
+            .values()
+            .filter(|g| g.boss.is_some() && g.group != UNGROUPED)
+            .map(|g| g.group.clone())
+            .collect()
     }
 
     /// The group whose grant names `id` (as a member or born), when one
@@ -688,7 +701,9 @@ impl Desk {
                 .store
                 .write_grants(&writes, delete, None, &call)
                 .await?;
+            let granted = Self::granted_groups(&next);
             keep(&mut self.0.grants.lock(), next);
+            self.0.scopes.lock().granted = granted;
             return Ok(0);
         }
         let one = self.0.layout_write.lock().await;
@@ -713,9 +728,12 @@ impl Desk {
             )
             .await?;
         {
+            let granted = Self::granted_groups(&next);
             let mut run = self.0.grants.lock();
             keep(&mut run, next);
             run.since.get_or_insert_with(Utc::now);
+            drop(run);
+            self.0.scopes.lock().granted = granted;
         }
         self.0.state.lock().layout = layout.clone();
         self.scopes_follow(&layout);

@@ -43,6 +43,10 @@ pub(crate) struct Scopes {
     /// When each group that was a boundary stopped being one: the main
     /// overseer sees its rows from then on, never its past. Kept too.
     opened: HashMap<String, DateTime<Utc>>,
+    /// Groups a grant here names a boss for, stopped or expired included,
+    /// until the grant is deleted: no other boss, the main overseer
+    /// included, sees inside them.
+    pub(crate) granted: HashSet<String>,
     /// Sessions being put in their group as they start: not a move.
     pub(crate) placing: HashSet<uuid::Uuid>,
     /// Sessions a confirmed move is moving: it does what the move does,
@@ -133,6 +137,7 @@ impl Scopes {
             .flatten()
             .filter_map(|b| b.scope.group().map(str::to_string))
             .chain(self.bounded.iter().cloned())
+            .chain(self.granted.iter().cloned())
             .collect()
     }
 }

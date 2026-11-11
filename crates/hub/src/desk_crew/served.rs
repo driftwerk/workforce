@@ -162,16 +162,20 @@ pub fn served_oversight(g: &Grant) -> Oversight {
 /// Whether `folder`, said plainly, is inside one of `allowed` on this
 /// computer: each read where it really leads, compared part by part, so
 /// `/src/acme-evil` is not inside `/src/acme` and a link doesn't lead out.
-pub fn folder_inside(folder: &str, allowed: &[String]) -> bool {
+pub fn folder_inside(folder: &str, allowed: &[String]) -> Option<std::path::PathBuf> {
     if !grant::canonical(folder) {
-        return false;
+        return None;
     }
-    let Ok(real) = std::fs::canonicalize(folder) else {
-        return false;
-    };
+    let real = std::fs::canonicalize(folder).ok()?;
     allowed
         .iter()
         .any(|a| grant::canonical(a) && std::fs::canonicalize(a).is_ok_and(|a| real.starts_with(a)))
+        .then_some(real)
+}
+
+/// The group rows of `g`'s sessions are stamped with: none for Ungrouped.
+fn stamped_as(g: &Grant) -> Option<&str> {
+    (g.group != workforce_desk::UNGROUPED).then_some(g.group.as_str())
 }
 
 /// Every string of `v`, secrets hidden whole and each capped: how many
@@ -224,7 +228,15 @@ impl CrewHub {
             .await;
         let audit = match begun {
             Ok(Begun::New(id)) => id,
-            Ok(Begun::Again { outcome, said }) => {
+            Ok(Begun::Again { boss, .. }) if boss.as_deref() != Some(call.boss.key().as_str()) => {
+                // Another boss's call id: nothing of it is said.
+                return Served {
+                    status: ServedStatus::Refused,
+                    body: json!({ "error": workforce_desk::scope::not_ours(None) }),
+                    audit: None,
+                };
+            }
+            Ok(Begun::Again { outcome, said, .. }) => {
                 // Sent again: never acted on twice; what came of it, said.
                 return Served {
                     status: match outcome.as_str() {
@@ -296,6 +308,14 @@ impl CrewHub {
         }
         let boss = call.boss.party_id();
         let o = served_oversight(&grant);
+        // One boss per group: a local overseer of it means no grant's boss
+        // is served here.
+        if self.overseer_for(&o.scope).is_some() {
+            return refused(format!(
+                "{} has a boss on this hub already, so no other is served for it.",
+                grant.name
+            ));
+        }
         let result = if SERVED_READ.contains(&tool) {
             self.served_read(tool, &call.input, &grant, &boss)
                 .await
@@ -377,11 +397,15 @@ impl CrewHub {
                     .map_err(internal)?;
                 let lines: Vec<String> = page
                     .iter()
+                    // About one of the grant's sessions, and written while it
+                    // was in the grant's group: what it did in another group
+                    // before it came stays that group's.
                     .filter(|e| {
                         e.subject
                             .as_ref()
                             .and_then(|s| s.id.parse().ok())
                             .is_some_and(|id| self.in_grant(g, id))
+                            && e.group.as_deref() == stamped_as(g)
                     })
                     .take(limit as usize)
                     .map(|e| {
@@ -599,12 +623,14 @@ impl CrewHub {
                     .into(),
             );
         }
-        if !folder_inside(folder, &g.folders) {
+        let Some(folder) = folder_inside(folder, &g.folders) else {
             return Err(format!(
                 "{folder} isn't one of {}'s folders here: start it in one of those.",
                 g.name
             ));
-        }
+        };
+        // Started where it was checked, as the disk spells it.
+        let folder = &folder.to_string_lossy().into_owned();
         let engine = engine.unwrap_or(Engine::Claude);
         if !workforce_desk::engine::boss_safe(engine) {
             return Err(format!(
