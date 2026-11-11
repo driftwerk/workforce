@@ -16,7 +16,7 @@ use super::tests::options;
 use super::{Added, Desk, DeskError, Options};
 use crate::engine::Engine;
 use crate::engine_accounts::{
-    AccountPatch, Keys, MemoryKeys, NewAccount, SignInState, CLAUDE_TOKEN_ENV,
+    AccountPatch, Keys, MemoryKeys, NewAccount, SignInAgain, SignInState, CLAUDE_TOKEN_ENV,
 };
 use crate::model::{NewSession, SessionState};
 use crate::store::{build_pool, DeskStore};
@@ -688,7 +688,7 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .create(session(dir.path(), Some(Some(work))), None)
             .await
             .unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         let work_view = d.accounts().into_iter().find(|a| a.id == work).unwrap();
         assert!(
             !work_view.signed_in,
@@ -1529,7 +1529,7 @@ async fn an_accounts_sign_in_is_handed_over_whole_and_said_nowhere_else() {
         // Gone from the store: said, never an empty token.
         keys.delete(personal).unwrap();
         let gone = d.hand_over_account(personal).await.unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         // No such account.
         assert!(d.hand_over_account(Uuid::new_v4()).await.is_err());
     })
@@ -3592,6 +3592,109 @@ async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_curre
         d.read_engine_now(Engine::Claude).await;
         assert!(d.0.state.lock().own_read);
         assert!(d.current_plan_keys().is_some(), "the filter is on");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_whose_sign_in_is_gone_is_signed_in_again_and_keeps_everything_else() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        // Its sign-in goes from the store: Desk finds out when it reads it.
+        keys.delete(work).unwrap();
+        d.change(s.id, |r, _| r.state = SessionState::Idle);
+        assert!(d.switch_account(s.id, Some(work), None).await.is_err());
+        assert_eq!(d.sign_in_problems().len(), 1);
+        assert!(!d.accounts()[0].signed_in);
+
+        // Through the engine's own sign-in: its token goes to the same account.
+        let Added::SignIn { sign_in } = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: None,
+                    remote: false,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("no token: it signs in");
+        };
+        assert_eq!(sign_in.name, "Work");
+        let state = || {
+            d.account_sign_ins()
+                .into_iter()
+                .find(|x| x.id == sign_in.id)
+                .map(|x| x.state)
+        };
+        for _ in 0..200 {
+            if matches!(state(), Some(SignInState::Code { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        d.sign_in_code(sign_in.id, "c0de").unwrap();
+        for _ in 0..200 {
+            if matches!(state(), Some(SignInState::Done { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(state(), Some(SignInState::Done { account: work }));
+        let views = d.accounts();
+        assert_eq!(views.len(), 1, "no new account");
+        assert!(
+            views[0].id == work
+                && views[0].name == "Work"
+                && views[0].is_default
+                && views[0].signed_in
+        );
+        assert!(d.sign_in_problems().is_empty());
+        assert_eq!(
+            keys.get(work).unwrap().map(|t| t.expose().to_string()),
+            Some("sk-ant-oat01-good-c0de-0123456789012345678901234567890123".to_string())
+        );
+
+        // By a pasted token: checked, then kept for it.
+        let refused = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: Some("sk-ant-oat01-bad".into()),
+                    remote: false,
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        let Added::Account { account } = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: Some(OTHER.into()),
+                    remote: false,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a pasted token signs in at once");
+        };
+        assert_eq!((account.id, account.name.as_str()), (work, "Work"));
+        assert_eq!(
+            keys.get(work).unwrap().map(|t| t.expose().to_string()),
+            Some(OTHER.to_string())
+        );
+        assert!(matches!(
+            d.sign_in_again(Uuid::new_v4(), SignInAgain::default())
+                .await,
+            Err(DeskError::Invalid(_))
+        ));
     })
     .await;
 }
