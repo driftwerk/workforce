@@ -1067,6 +1067,7 @@ fn writing_over_a_file_outside_the_folder_asks_at_full_access() {
 /// Tools that only read a page, and tools that change one.
 const BROWSER_READS: &[&str] = &[
     "browser.navigate",
+    "browser.sign_in",
     "browser.snapshot",
     "browser.screenshot",
     "browser.pdf",
@@ -1128,7 +1129,7 @@ fn browser_verdicts_by_standing_and_tool() {
                         &[],
                         &on_page(tool, false),
                     );
-                    if hostile && *tool == "browser.navigate" {
+                    if hostile && workforce_core::computer::navigates(tool) {
                         assert_eq!(
                             v,
                             Verdict::Ask {
@@ -1190,6 +1191,30 @@ fn browser_verdicts_by_standing_and_tool() {
             );
         }
     }
+}
+
+/// After a hostile page, opening a site to sign in to asks like any other
+/// navigation, unbound included: the page may be sending the person there.
+#[test]
+fn after_a_hostile_page_opening_a_sign_in_page_asks() {
+    for browsing in [Browsing::Unbound, Browsing::Asks, Browsing::Suggests] {
+        let v = verdict(
+            &browsing_as(browsing, Access::Full, true),
+            false,
+            &[],
+            &on_page("browser.sign_in", false),
+        );
+        assert_eq!(
+            v,
+            Verdict::Ask {
+                choices: vec![Choice::AllowOnce, Choice::Deny],
+                why: Why::HostilePage
+            },
+            "{browsing:?}"
+        );
+    }
+    assert!(workforce_core::computer::navigates("browser.sign_in"));
+    assert!(!workforce_core::computer::navigates("browser.signed_in"));
 }
 
 /// Neither the computer's kill switch nor the agent's level holds the

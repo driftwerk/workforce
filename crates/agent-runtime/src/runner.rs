@@ -1916,6 +1916,10 @@ pub fn route_approval(
     reason: &str,
     input: &serde_json::Value,
 ) -> RouteResolution {
+    // A card only the person in Desk answers is never routed to approvers.
+    if workforce_core::computer::person_only(tool_name) {
+        return RouteResolution::SelfServe;
+    }
     let (Some(router), Some((requester, session_key))) = (router, routing_scope()) else {
         return RouteResolution::SelfServe;
     };
@@ -9052,6 +9056,32 @@ mod tests {
             route_in_scope(&runner).await,
             RouteResolution::SelfServe
         ));
+    }
+
+    /// The sign-in card is the person's in Desk: never routed to approvers,
+    /// however the router would route it, and nothing is deferred.
+    #[tokio::test]
+    async fn the_sign_in_card_is_never_routed() {
+        let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = runner_with_router(Arc::new(StubRouter {
+            decision: StubDecision::Routed(vec!["bob".to_string()], false),
+            deferred: Arc::clone(&deferred),
+        }));
+        let routed = CURRENT_USER_ID
+            .scope(
+                "alice".to_string(),
+                CURRENT_SESSION_KEY.scope("desk:allan".to_string(), async {
+                    route_for(
+                        &runner,
+                        workforce_core::computer::SIGNED_IN,
+                        "Waits while you sign in",
+                        &serde_json::json!({}),
+                    )
+                }),
+            )
+            .await;
+        assert!(matches!(routed, RouteResolution::SelfServe), "{routed:?}");
+        assert!(deferred.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

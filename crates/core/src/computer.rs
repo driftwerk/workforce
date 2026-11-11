@@ -313,6 +313,23 @@ pub struct ComputerFacts {
     pub why: String,
 }
 
+/// "Sign in for me": the call that opens a site for the person to sign in
+/// to, and the call that waits on their card while they do.
+pub const SIGN_IN: &str = "browser.sign_in";
+pub const SIGNED_IN: &str = "browser.signed_in";
+
+/// Whether a browser call goes to an address: a navigation, or opening a
+/// site to sign in to. After a hostile page, going anywhere asks.
+pub fn navigates(tool: &str) -> bool {
+    matches!(tool, "browser.navigate" | SIGN_IN)
+}
+
+/// Whether only the person in Desk may answer this call's card: never an
+/// approver it is routed to, nor a client answering for them.
+pub fn person_only(tool: &str) -> bool {
+    tool == SIGNED_IN
+}
+
 /// Why a card asks, as its one "why" line says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

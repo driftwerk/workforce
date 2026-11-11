@@ -29,8 +29,8 @@ pub use chrome::{
     available as chrome_available, default_user_data_dir as chrome_user_data_dir, MIN_CHROME,
 };
 pub use client::{
-    close, close_backend, forget_decision, live, page_state, stop_session, turn_ended, Backend,
-    BrowserClient, Live, Which,
+    close, close_backend, forget_decision, live, page_state, sign_in_ended, stop_session,
+    turn_ended, Backend, BrowserClient, Live, Which,
 };
 pub use config::BrowserSkillConfig;
 pub use hooks::{install_hooks, BrowserHooks, Done, OnPage, Settings, Sites, Uses};

@@ -51,7 +51,7 @@ impl Tool for BrowserTool {
     /// call then acts on, or not at all ([`super::client::expect_origin`]).
     fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
         use workforce_core::computer::Effect;
-        let navigating = matches!(self.spec.name, "browser.navigate" | "browser.sign_in");
+        let navigating = workforce_core::computer::navigates(self.spec.name);
         let target = input["url"].as_str().unwrap_or_default();
         use super::client::{call_key, expect, Decided};
         let key = call_key(self.spec.name, input);
@@ -73,6 +73,9 @@ impl Tool for BrowserTool {
             false => super::client::origin_now(backend),
         };
         let decision = match (backend, navigating) {
+            // The wait for the person's sign-in acts on no page: where it
+            // ends up (an SSO hop included) is read after they answer.
+            _ if self.spec.name == workforce_core::computer::SIGNED_IN => None,
             (_, false) => Some(Decided::Origin(origin.clone())),
             (super::client::Backend::Chrome, true) => Some(Decided::Visit(origin.clone())),
             (super::client::Backend::Desk, true) => None,
@@ -97,11 +100,19 @@ impl Tool for BrowserTool {
         if let Err(e) = super::client::pick(input["browser"].as_str(), false) {
             return Ok(ToolResult::failure(e.to_string(), elapsed(start)));
         }
+        // While the person signs in, the browser waits for them.
+        if held_by_sign_in(self.spec.name) {
+            return Ok(ToolResult::failure(
+                super::client::SIGNING_IN_NOW.to_string(),
+                elapsed(start),
+            ));
+        }
         // This call takes what was decided for it, and nothing decided for
         // another call made alongside it.
         let call = super::client::Call {
             key: super::client::call_key(self.spec.name, &input),
-            write: !READS.contains(&self.spec.name),
+            write: !READS.contains(&self.spec.name)
+                && self.spec.name != workforce_core::computer::SIGNED_IN,
         };
         let ran = super::client::CALL_KEY
             .scope(call, (self.spec.handler)(self.client.clone(), input))
@@ -114,6 +125,12 @@ impl Tool for BrowserTool {
             }
         }
     }
+}
+
+/// Whether `tool` waits because the person in scope is signing in: every
+/// browser call does but the wait for them.
+fn held_by_sign_in(tool: &str) -> bool {
+    tool != workforce_core::computer::SIGNED_IN && super::client::signing_now()
 }
 
 /// The tools that only read a page; the rest change one.
@@ -666,6 +683,47 @@ mod tests {
             "chrome-visit:https://a.test"
         );
         assert_eq!(site_key(Backend::Chrome, true, None), "chrome");
+    }
+
+    /// While the person signs in, every other browser call on that session
+    /// is refused, screenshots and snapshots included; the wait isn't.
+    #[tokio::test]
+    async fn while_the_person_signs_in_the_browser_takes_no_other_call() {
+        use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID};
+        let skill =
+            super::super::BrowserSkill::new(super::super::BrowserSkillConfig::default()).unwrap();
+        let tools = skill.tools();
+        let run = |name: &'static str| {
+            let tool = tools.iter().find(|t| t.name() == name).unwrap().clone();
+            CURRENT_AGENT_ID.scope(
+                "agent".to_string(),
+                CURRENT_USER_ID.scope("signing-person".to_string(), async move {
+                    tool.execute(json!({})).await.unwrap()
+                }),
+            )
+        };
+        super::super::client::start_signing_for_test("agent", "signing-person");
+        for name in [
+            "browser.screenshot",
+            "browser.snapshot",
+            "browser.click",
+            "browser.sign_in",
+        ] {
+            let out = run(name).await;
+            assert!(!out.success, "{name}");
+            assert_eq!(
+                out.error.as_deref(),
+                Some(super::super::client::SIGNING_IN_NOW),
+                "{name}"
+            );
+        }
+        let wait_held = CURRENT_AGENT_ID.sync_scope("agent".to_string(), || {
+            CURRENT_USER_ID.sync_scope("signing-person".to_string(), || {
+                held_by_sign_in("browser.signed_in")
+            })
+        });
+        assert!(!wait_held, "the wait itself is let through");
+        super::super::client::sign_in_ended("agent", "signing-person");
     }
 
     #[test]

@@ -768,7 +768,7 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
     let hostile = p.browser.hostile;
     // After a hostile page, going anywhere new asks too: the page may be
     // sending it there. Allow once only, unbound included.
-    if hostile && (write || call.tool == "browser.navigate") {
+    if hostile && (write || workforce_core::computer::navigates(&call.tool)) {
         return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
     }
     match p.browser.browsing {

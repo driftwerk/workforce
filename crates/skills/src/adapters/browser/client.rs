@@ -664,6 +664,72 @@ struct Active {
     shown: bool,
 }
 
+use workforce_core::computer::{SIGNED_IN, SIGN_IN};
+
+/// "Sign in for me": the sessions whose person is signing in to a site in
+/// Desk's own browser now, and since when. While one is, the browser shows,
+/// isn't reaped as idle, and takes no other call; it ends when they say
+/// they signed in, decline, or the card's wait is long over.
+static SIGNING: std::sync::LazyLock<StdMutex<HashMap<SessionId, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// How long a sign-in holds the browser at most: the card's five minutes,
+/// and a margin.
+const SIGN_IN_HOLD: Duration = Duration::from_secs(6 * 60);
+
+/// Whether the person is signing in in session `id` now.
+fn signing(id: &SessionId) -> bool {
+    let mut held = SIGNING.lock().unwrap();
+    match held.get(id) {
+        Some(since) if since.elapsed() < SIGN_IN_HOLD => true,
+        Some(_) => {
+            held.remove(id);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether the person is signing in in the session in scope.
+pub(super) fn signing_now() -> bool {
+    signing(&current_session_id())
+}
+
+/// The person declined the sign-in card of `agent`'s session for `user`,
+/// or nobody answered it: the browser takes calls again, and opens hidden
+/// again as the settings say from its next start.
+pub fn sign_in_ended(agent: &str, user: &str) {
+    SIGNING
+        .lock()
+        .unwrap()
+        .remove(&SessionId::derive(agent, user));
+}
+
+/// Marks `agent`'s session for `user` as signing in, for tests.
+#[cfg(test)]
+pub(super) fn start_signing_for_test(agent: &str, user: &str) {
+    SIGNING
+        .lock()
+        .unwrap()
+        .insert(SessionId::derive(agent, user), Instant::now());
+}
+
+/// What a call made while the person is signing in is told.
+pub const SIGNING_IN_NOW: &str = "The person is signing in to a site in Desk's browser, so nothing else is done in the browser until they finish. Call browser.signed_in to wait for them.";
+
+/// `url`'s origin and path, without its query or fragment, which may carry
+/// a sign-in's codes.
+pub(super) fn path_only(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) if matches!(u.scheme(), "http" | "https") => {
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        _ => super::address::origin_of(url).unwrap_or_default(),
+    }
+}
+
 /// What `browser.sign_in` tells the model to do next.
 pub const SIGN_IN_NEXT: &str = "The page is open on the person's screen in Desk's browser. Call browser.signed_in now: it shows the person a card and waits while they sign in themselves, then says where the page is. Never ask for or type their password.";
 
@@ -698,10 +764,6 @@ struct SessionCell {
     inflight: AtomicUsize,
     last_used: StdMutex<Instant>,
     consecutive_timeouts: AtomicUsize,
-    /// Set once the person signed in to a site here: the browser shows from
-    /// then on, and isn't relaunched hidden, which would drop the sign-in's
-    /// session cookies.
-    on_screen: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for SessionCell {
@@ -731,11 +793,11 @@ impl SessionCell {
             inflight: AtomicUsize::new(0),
             last_used: StdMutex::new(now),
             consecutive_timeouts: AtomicUsize::new(0),
-            on_screen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn stat(&self, id: SessionId) -> CellStat {
+        let signing_in = signing(&id);
         let (live, busy) = match self.inner.try_lock() {
             Ok(guard) => (guard.is_some(), false),
             Err(_) => (true, true),
@@ -744,7 +806,11 @@ impl SessionCell {
             id,
             live,
             inflight: busy || self.inflight.load(Ordering::Relaxed) > 0,
-            last_used: *self.last_used.lock().unwrap(),
+            // A person signing in here is using it, however long they take.
+            last_used: match signing_in {
+                true => Instant::now(),
+                false => *self.last_used.lock().unwrap(),
+            },
         }
     }
 
@@ -948,6 +1014,11 @@ impl SessionCell {
             return;
         };
         let url = self.current_url(page).await;
+        let signing_in = matches!(tool, SIGN_IN | SIGNED_IN);
+        let (url, target) = match signing_in {
+            true => (path_only(&url), target.map(path_only)),
+            false => (url, target.map(str::to_string)),
+        };
         let typed = no_screenshot(tool);
         let screenshot = match typed {
             true => None,
@@ -966,7 +1037,7 @@ impl SessionCell {
             tool: tool.to_string(),
             backend: "desk",
             url,
-            target: target.map(str::to_string),
+            target,
             screenshot,
         });
     }
@@ -999,7 +1070,7 @@ impl SessionCell {
     async fn start(&self) -> Result<Active> {
         ensure_profile_dir(&self.profile_dir)?;
         // On screen as the person's settings say, else as configured.
-        let show = self.on_screen.load(Ordering::Relaxed)
+        let show = signing(&SessionId(self.key.clone()))
             || hooks::settings().show.unwrap_or(self.config.show);
         let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir, show).await?;
 
@@ -1172,46 +1243,73 @@ impl SessionCell {
         .await
     }
 
-    /// Opens `url` on screen for the person to sign in themselves: a
-    /// browser running hidden closes and opens again on screen (the sign-in
-    /// is the person's, so nothing of theirs is lost: a hidden browser has
-    /// no window they used), and it stays on screen from then on.
+    /// Opens `url` on screen for the person to sign in themselves. A
+    /// browser running hidden closes and opens again on screen (unless a
+    /// call is in flight on it), and shows until the person says they
+    /// signed in or declines. Only where Desk's hooks are installed: a hub
+    /// with no screen keeps its browser hidden and opens nothing.
     async fn sign_in(&self, url: &str) -> Result<Value> {
-        self.on_screen.store(true, Ordering::Relaxed);
+        if hooks::hooks().is_none() {
+            return Err(eyre!(
+                "Signing in needs Desk on the person's computer, where they can see its browser; this browser has no screen, so nothing was opened. Ask the person to sign in to the site themselves."
+            ));
+        }
+        let id = SessionId(self.key.clone());
         {
             let mut guard = self.inner.lock().await;
             if guard.as_ref().is_some_and(|active| !active.shown) {
+                if self.inflight.load(Ordering::Relaxed) > 0 {
+                    return Err(eyre!(
+                        "Desk's browser is in the middle of another call, so it wasn't reopened on screen. Call browser.sign_in again in a moment."
+                    ));
+                }
                 *guard = None;
             }
+            SIGNING.lock().unwrap().insert(id.clone(), Instant::now());
         }
         let url = url.to_string();
-        self.with_page(|page, _n, _c| async move {
-            page.goto(url.as_str())
-                .await
-                .wrap_err("opening the sign-in page failed")?;
-            let (final_url, title) = self.where_now(&page).await;
-            self.done(&page, "browser.sign_in", Some(&url)).await;
-            let mut seen = Seen::at(&final_url);
-            let (shown_url, title) = (seen.text(&final_url), seen.text(&title));
-            Ok(seen.into_output(
-                &self.key,
-                json!({ "url": shown_url, "title": title, "next": SIGN_IN_NEXT }),
-            ))
-        })
-        .await
+        let opened = self
+            .with_page(|page, _n, _c| async move {
+                page.goto(url.as_str())
+                    .await
+                    .wrap_err("opening the sign-in page failed")?;
+                let (final_url, title) = self.where_now(&page).await;
+                self.done(&page, SIGN_IN, Some(&url)).await;
+                let mut seen = Seen::at(&final_url);
+                let (shown_url, title) = (seen.text(&path_only(&final_url)), seen.text(&title));
+                Ok(seen.into_output(
+                    &self.key,
+                    json!({ "url": shown_url, "title": title, "next": SIGN_IN_NEXT }),
+                ))
+            })
+            .await;
+        if opened.is_err() {
+            SIGNING.lock().unwrap().remove(&id);
+        }
+        opened
     }
 
-    /// Where the page is once the person said they signed in: its address
-    /// and title, nothing of what they typed, and no screenshot.
+    /// Where the page is once the person said they signed in: its origin
+    /// and path, never its query or fragment, nothing of what they typed,
+    /// and no screenshot. Ends the sign-in.
     async fn signed_in(&self) -> Result<Value> {
-        self.with_page(|page, _n, _c| async move {
-            let (url, title) = self.where_now(&page).await;
-            self.done(&page, "browser.signed_in", None).await;
-            let mut seen = Seen::at(&url);
-            let (url, title) = (seen.text(&url), seen.text(&title));
-            Ok(seen.into_output(&self.key, json!({ "url": url, "title": title })))
-        })
-        .await
+        let id = SessionId(self.key.clone());
+        if !signing(&id) {
+            return Err(eyre!(
+                "No sign-in is open in Desk's browser: call browser.sign_in first."
+            ));
+        }
+        let read = self
+            .with_page(|page, _n, _c| async move {
+                let (url, title) = self.where_now(&page).await;
+                self.done(&page, SIGNED_IN, None).await;
+                let mut seen = Seen::at(&url);
+                let (url, title) = (seen.text(&path_only(&url)), seen.text(&title));
+                Ok(seen.into_output(&self.key, json!({ "url": url, "title": title })))
+            })
+            .await;
+        SIGNING.lock().unwrap().remove(&id);
+        read
     }
 
     /// The page's address and title now.
@@ -2961,6 +3059,76 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// A sign-in records and returns a page's origin and path only: a
+    /// query or fragment may carry a sign-in's codes.
+    #[test]
+    fn a_sign_ins_address_keeps_its_origin_and_path_only() {
+        assert_eq!(
+            path_only("https://login.example/oauth/callback?code=s3cret&state=x#token=t"),
+            "https://login.example/oauth/callback"
+        );
+        assert_eq!(path_only("https://shop.example"), "https://shop.example/");
+        assert_eq!(path_only("about:blank"), "");
+        assert_eq!(path_only("data:text/html,hi"), "");
+    }
+
+    /// While the person signs in, the session counts as in use, so idle
+    /// eviction leaves it; it ends when they finish or decline, and on its
+    /// own once the card's wait is long over.
+    #[tokio::test]
+    async fn a_sign_in_keeps_its_browser_from_idle_eviction_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_client(dir.path(), 600_000);
+        let cell = acquire_as(&client, "signer").await;
+        let id = SessionId::derive("agent", "signer");
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap();
+        *cell.last_used.lock().unwrap() = old;
+        let idle_ttl = Duration::from_secs(60);
+        assert_eq!(
+            select_idle_evictions(&[cell.stat(id.clone())], Instant::now(), idle_ttl),
+            vec![id.clone()]
+        );
+        SIGNING.lock().unwrap().insert(id.clone(), Instant::now());
+        assert!(signing(&id));
+        assert!(
+            select_idle_evictions(&[cell.stat(id.clone())], Instant::now(), idle_ttl).is_empty(),
+            "a sign-in in progress is never idle"
+        );
+        sign_in_ended("agent", "signer");
+        assert!(!signing(&id));
+        SIGNING.lock().unwrap().insert(
+            id.clone(),
+            Instant::now().checked_sub(SIGN_IN_HOLD).unwrap(),
+        );
+        assert!(!signing(&id), "a sign-in long past its card ends");
+        assert!(SIGNING.lock().unwrap().get(&id).is_none());
+    }
+
+    /// Where Desk's hooks aren't installed (a hub with no screen), nothing
+    /// is opened to sign in to and the browser isn't shown.
+    #[tokio::test]
+    async fn without_desk_nothing_is_opened_to_sign_in_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_client(dir.path(), 600_000);
+        let cell = acquire_as(&client, "nodesk").await;
+        if hooks::hooks().is_some() {
+            return;
+        }
+        let err = cell
+            .sign_in("https://shop.example/login")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no screen"), "{err}");
+        assert!(!signing(&SessionId::derive("agent", "nodesk")));
+        let err = cell.signed_in().await.unwrap_err();
+        assert!(
+            err.to_string().contains("call browser.sign_in first"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

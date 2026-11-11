@@ -141,10 +141,6 @@ fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
-/// "Sign in for me": the call that waits, on a card, while the person signs
-/// in to a site in Desk's own browser.
-const SIGNED_IN: &str = "browser.signed_in";
-
 /// Where the person's home is.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -824,7 +820,8 @@ impl ComputerGate for HubComputerGate {
             Effect::Connector { connector, write } => *write || connector.starts_with("chrome"),
             _ => false,
         };
-        if tool == SIGNED_IN {
+        if tool == workforce_core::computer::SIGN_IN || tool == workforce_core::computer::SIGNED_IN
+        {
             return Some(format!(
                 "{} needs you to sign in to that site yourself, and you weren't there for this job. Ask it in Desk.",
                 self.policy.name
@@ -849,8 +846,24 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict {
-        // "Sign in for me": the card is the wait while the person signs
-        // in, so it is put to them at every level, acting fully included.
+        use workforce_core::computer::{SIGNED_IN, SIGN_IN};
+        // "Sign in for me" is for the person in Desk on this computer, who
+        // can see Desk's browser: never a turn in Slack or another client.
+        if (tool == SIGN_IN || tool == SIGNED_IN)
+            && workforce_agent::runner::current_desk().is_none()
+        {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: format!(
+                        "{} signs you in to a site only from Desk on your computer, where you can see its browser. Ask it there, or sign in to the site yourself.",
+                        self.policy.name
+                    ),
+                },
+            };
+        }
+        // The card is the wait while the person signs in, so it is put to
+        // them at every level, acting fully included.
         if tool == SIGNED_IN {
             return Verdict::Ask {
                 choices: vec![
@@ -907,6 +920,14 @@ impl ComputerGate for HubComputerGate {
                 Outcome::Refused | Outcome::Declined | Outcome::NotAnswered | Outcome::Unattended
             )
         {
+            // A sign-in the person declined, or left, ends: the browser
+            // takes calls again.
+            if record.tool == workforce_core::computer::SIGNED_IN {
+                workforce_skills::adapters::browser::sign_in_ended(
+                    &self.policy.agent,
+                    &current_user(),
+                );
+            }
             workforce_skills::adapters::browser::forget_decision(
                 &self.policy.agent,
                 &current_user(),
@@ -1040,6 +1061,18 @@ mod tests {
             },
             _dir: dir,
         }
+    }
+
+    /// In sarah's Desk conversation, as a turn there is.
+    fn in_desk<T>(f: impl FnOnce() -> T) -> T {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+            relayed: false,
+            owner: "sarah".into(),
+        };
+        workforce_agent::runner::CURRENT_DESK.sync_scope(Some(scope), f)
     }
 
     fn as_sarah<T>(f: impl FnOnce() -> T) -> T {
@@ -1397,10 +1430,27 @@ mod tests {
             // person is put to them at every level, acting fully too, and a
             // job is refused it.
             for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
-                assert_eq!(decide_with(body, "browser.sign_in").0, "run", "{body:?}");
-                let (asked, ran_unattended, _) = decide_with(body, "browser.signed_in");
+                let (opened, opened_unattended, _) =
+                    in_desk(|| decide_with(body, "browser.sign_in"));
+                assert_eq!(opened, "run", "{body:?}");
+                assert!(
+                    !opened_unattended,
+                    "nothing is opened to sign in to for a job"
+                );
+                let (asked, ran_unattended, _) = in_desk(|| decide_with(body, "browser.signed_in"));
                 assert_eq!(asked, "asks once", "{body:?}");
                 assert!(!ran_unattended, "nobody signs in for a job");
+                // Outside Desk (Slack, a client's turn) neither is done.
+                assert_eq!(
+                    decide_with(body, "browser.sign_in").0,
+                    "refused",
+                    "{body:?}"
+                );
+                assert_eq!(
+                    decide_with(body, "browser.signed_in").0,
+                    "refused",
+                    "{body:?}"
+                );
             }
             // A judged-out turn (a job's, another person's, a spent budget)
             // is not unbound however the settings read.
@@ -1430,7 +1480,7 @@ mod tests {
                 connector: "browser:https://shop.example".into(),
                 write: true,
             };
-            let verdict = gate.verdict("browser.signed_in", &site);
+            let verdict = in_desk(|| gate.verdict("browser.signed_in", &site));
             let card = gate.card(&site, &verdict);
             let facts = card.facts.as_deref().unwrap();
             assert_eq!(facts.effect, "sign_in");
