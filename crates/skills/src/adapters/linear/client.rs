@@ -57,6 +57,18 @@ impl LinearClient {
         })
     }
 
+    /// Whether the key a call is made with now is the caller's own (a
+    /// per-user tier of the vault): only then does `viewer` say who the
+    /// caller is, not whoever the shared key belongs to.
+    pub fn key_is_personal(&self) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let path = format!("skills/linear/workspaces/{}/api_key", self.workspace);
+        crate::adapters::auth::resolve_credential(store.as_ref(), &path, "skills/linear/api_key")
+            .is_some_and(|r| r.per_user)
+    }
+
     fn resolve_auth(&self) -> Result<HeaderValue> {
         if let Some(ref auth) = self.static_auth {
             return Ok(auth.clone());
