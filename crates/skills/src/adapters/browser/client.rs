@@ -660,6 +660,20 @@ struct Active {
     console_log: Arc<Mutex<VecDeque<Value>>>,
     call_lock: Arc<Mutex<()>>,
     last_screenshot_size: Arc<Mutex<Option<usize>>>,
+    /// Whether it was launched on screen.
+    shown: bool,
+}
+
+/// What `browser.sign_in` tells the model to do next.
+pub const SIGN_IN_NEXT: &str = "The page is open on the person's screen in Desk's browser. Call browser.signed_in now: it shows the person a card and waits while they sign in themselves, then says where the page is. Never ask for or type their password.";
+
+/// Whether a call's activity row keeps no screenshot: what was typed, and
+/// a page the person signs in to.
+pub(super) fn no_screenshot(tool: &str) -> bool {
+    matches!(
+        tool,
+        "browser.fill" | "browser.type" | "browser.sign_in" | "browser.signed_in"
+    )
 }
 
 /// Lazy, drop-safe handle to one user's headless-Chromium session: a single
@@ -684,6 +698,10 @@ struct SessionCell {
     inflight: AtomicUsize,
     last_used: StdMutex<Instant>,
     consecutive_timeouts: AtomicUsize,
+    /// Set once the person signed in to a site here: the browser shows from
+    /// then on, and isn't relaunched hidden, which would drop the sign-in's
+    /// session cookies.
+    on_screen: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for SessionCell {
@@ -713,6 +731,7 @@ impl SessionCell {
             inflight: AtomicUsize::new(0),
             last_used: StdMutex::new(now),
             consecutive_timeouts: AtomicUsize::new(0),
+            on_screen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -929,7 +948,7 @@ impl SessionCell {
             return;
         };
         let url = self.current_url(page).await;
-        let typed = matches!(tool, "browser.fill" | "browser.type");
+        let typed = no_screenshot(tool);
         let screenshot = match typed {
             true => None,
             false => timeout(
@@ -980,7 +999,8 @@ impl SessionCell {
     async fn start(&self) -> Result<Active> {
         ensure_profile_dir(&self.profile_dir)?;
         // On screen as the person's settings say, else as configured.
-        let show = hooks::settings().show.unwrap_or(self.config.show);
+        let show = self.on_screen.load(Ordering::Relaxed)
+            || hooks::settings().show.unwrap_or(self.config.show);
         let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir, show).await?;
 
         let handler_task = tokio::spawn(async move {
@@ -1051,6 +1071,7 @@ impl SessionCell {
             console_log,
             call_lock: Arc::new(Mutex::new(())),
             last_screenshot_size: Arc::new(Mutex::new(None)),
+            shown: show,
         })
     }
 
@@ -1149,6 +1170,59 @@ impl SessionCell {
             Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
         })
         .await
+    }
+
+    /// Opens `url` on screen for the person to sign in themselves: a
+    /// browser running hidden closes and opens again on screen (the sign-in
+    /// is the person's, so nothing of theirs is lost: a hidden browser has
+    /// no window they used), and it stays on screen from then on.
+    async fn sign_in(&self, url: &str) -> Result<Value> {
+        self.on_screen.store(true, Ordering::Relaxed);
+        {
+            let mut guard = self.inner.lock().await;
+            if guard.as_ref().is_some_and(|active| !active.shown) {
+                *guard = None;
+            }
+        }
+        let url = url.to_string();
+        self.with_page(|page, _n, _c| async move {
+            page.goto(url.as_str())
+                .await
+                .wrap_err("opening the sign-in page failed")?;
+            let (final_url, title) = self.where_now(&page).await;
+            self.done(&page, "browser.sign_in", Some(&url)).await;
+            let mut seen = Seen::at(&final_url);
+            let (shown_url, title) = (seen.text(&final_url), seen.text(&title));
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "url": shown_url, "title": title, "next": SIGN_IN_NEXT }),
+            ))
+        })
+        .await
+    }
+
+    /// Where the page is once the person said they signed in: its address
+    /// and title, nothing of what they typed, and no screenshot.
+    async fn signed_in(&self) -> Result<Value> {
+        self.with_page(|page, _n, _c| async move {
+            let (url, title) = self.where_now(&page).await;
+            self.done(&page, "browser.signed_in", None).await;
+            let mut seen = Seen::at(&url);
+            let (url, title) = (seen.text(&url), seen.text(&title));
+            Ok(seen.into_output(&self.key, json!({ "url": url, "title": title })))
+        })
+        .await
+    }
+
+    /// The page's address and title now.
+    async fn where_now(&self, page: &Page) -> (String, String) {
+        let title = page
+            .evaluate("document.title")
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .unwrap_or_default();
+        (self.current_url(page).await, title)
     }
 
     /// The page's address as the browser has it now, noted for the gate.
@@ -1637,6 +1711,25 @@ impl BrowserClient {
             return self.chrome().await?.navigate(url).await;
         }
         self.acquire().await?.navigate(url).await
+    }
+
+    /// Opens a site in Desk's own browser, on screen, for the person to sign
+    /// in to themselves. The person's Chrome is theirs to sign in to.
+    pub(super) async fn sign_in(&self, url: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return Err(eyre!(
+                "Your Chrome is already signed in as you; Desk signs in only in its own browser. Call browser.sign_in with `browser: \"desk\"`, or ask the person to sign in to it in their Chrome."
+            ));
+        }
+        self.acquire().await?.sign_in(url).await
+    }
+
+    /// Where Desk's own browser is once the person signed in.
+    pub(super) async fn signed_in(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return Err(eyre!("Desk signs in only in its own browser."));
+        }
+        self.acquire().await?.signed_in().await
     }
 
     pub(super) async fn snapshot(&self) -> Result<Value> {

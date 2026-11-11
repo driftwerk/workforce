@@ -51,7 +51,7 @@ impl Tool for BrowserTool {
     /// call then acts on, or not at all ([`super::client::expect_origin`]).
     fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
         use workforce_core::computer::Effect;
-        let navigating = self.spec.name == "browser.navigate";
+        let navigating = matches!(self.spec.name, "browser.navigate" | "browser.sign_in");
         let target = input["url"].as_str().unwrap_or_default();
         use super::client::{call_key, expect, Decided};
         let key = call_key(self.spec.name, input);
@@ -119,6 +119,7 @@ impl Tool for BrowserTool {
 /// The tools that only read a page; the rest change one.
 pub const READS: &[&str] = &[
     "browser.navigate",
+    "browser.sign_in",
     "browser.snapshot",
     "browser.screenshot",
     "browser.pdf",
@@ -224,6 +225,35 @@ fn specs() -> Vec<ToolSpec> {
                 }
                 .boxed()
             }),
+        },
+        ToolSpec {
+            name: "browser.sign_in",
+            description:
+                "Sign in for me: when a site needs the person's password, a code or a passkey, open its sign-in page here on the person's screen, in Desk's own browser, for them to sign in themselves. Then call browser.signed_in, which waits for them. Never ask for, read or type their password.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The site's sign-in page (https)" }
+                },
+                "required": ["url"]
+            }),
+            handler: handler(|c, input| {
+                async move {
+                    let url = require_str(&input, "url")?;
+                    if !matches!(super::address::kind(url), super::address::Kind::Web) {
+                        return Err(eyre!("A sign-in page is a web page (https://…)."));
+                    }
+                    c.sign_in(url).await
+                }
+                .boxed()
+            }),
+        },
+        ToolSpec {
+            name: "browser.signed_in",
+            description:
+                "After browser.sign_in: shows the person a card and waits while they sign in in Desk's browser. Returns where the page is once they say they're done; if they cancel or don't answer, tell them it wasn't done.",
+            schema: json!({ "type": "object", "properties": {} }),
+            handler: handler(|c, _input| async move { c.signed_in().await }.boxed()),
         },
         ToolSpec {
             name: "browser.snapshot",
@@ -522,6 +552,27 @@ pub(super) fn skill_tools_and_policies() -> (Vec<SkillTool>, Vec<SkillPolicy>) {
 mod tests {
     use super::*;
 
+    /// "Sign in for me" is two calls: opening the page only reads, and the
+    /// wait for the person is a call the gate puts to them. Neither keeps a
+    /// screenshot of the page the person signs in to.
+    #[test]
+    fn sign_in_opens_as_a_read_and_waits_as_a_call_the_person_answers() {
+        let names: Vec<&str> = specs().iter().map(|s| s.name).collect();
+        assert!(names.contains(&"browser.sign_in") && names.contains(&"browser.signed_in"));
+        assert!(READS.contains(&"browser.sign_in"));
+        assert!(!READS.contains(&"browser.signed_in"));
+        for tool in [
+            "browser.sign_in",
+            "browser.signed_in",
+            "browser.fill",
+            "browser.type",
+        ] {
+            assert!(super::super::client::no_screenshot(tool), "{tool}");
+        }
+        assert!(!super::super::client::no_screenshot("browser.click"));
+        assert!(super::super::client::SIGN_IN_NEXT.contains("browser.signed_in"));
+    }
+
     #[test]
     fn tool_names_are_unique_and_browser_prefixed() {
         let names = tool_names();
@@ -636,7 +687,8 @@ mod tests {
         for r in READS {
             assert!(names.contains(r), "{r}");
         }
-        assert_eq!(READS.len() + 7, names.len());
+        // The seven that change a page, and the sign-in card's wait.
+        assert_eq!(READS.len() + 8, names.len());
     }
 
     #[test]

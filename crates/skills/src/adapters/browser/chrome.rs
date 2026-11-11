@@ -202,7 +202,7 @@ impl MyChrome {
     ) -> Result<Self> {
         let file = std::fs::read_to_string(dir.join("DevToolsActivePort")).map_err(|_| {
             eyre!(
-                "Your Chrome isn't open to Desk. In Chrome, open chrome://inspect/#remote-debugging and turn remote debugging on, then try again."
+                "Your Chrome isn't connected to Desk yet. In Desk, open Settings → Browser and press Connect my Chrome (two clicks in Chrome, once), then try again."
             )
         })?;
         let socket =

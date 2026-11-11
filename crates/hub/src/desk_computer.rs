@@ -141,6 +141,10 @@ fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
+/// "Sign in for me": the call that waits, on a card, while the person signs
+/// in to a site in Desk's own browser.
+const SIGNED_IN: &str = "browser.signed_in";
+
 /// Where the person's home is.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -397,7 +401,19 @@ impl HubComputerGate {
         options.allow_session =
             (always.is_some() || site) && choices.iter().any(|c| matches!(c, Choice::AllowSession));
         options.allow_in_folder = always;
-        options.facts = Some(Box::new(facts_of(effect, home, why)));
+        let mut facts = facts_of(effect, home, why);
+        if matches!(
+            verdict,
+            Verdict::Ask {
+                why: workforce_core::computer::Why::SignIn,
+                ..
+            }
+        ) {
+            facts.effect = "sign_in".into();
+            options.allow_session = false;
+            options.allow_in_folder = None;
+        }
+        options.facts = Some(Box::new(facts));
         options
     }
 }
@@ -808,6 +824,12 @@ impl ComputerGate for HubComputerGate {
             Effect::Connector { connector, write } => *write || connector.starts_with("chrome"),
             _ => false,
         };
+        if tool == SIGNED_IN {
+            return Some(format!(
+                "{} needs you to sign in to that site yourself, and you weren't there for this job. Ask it in Desk.",
+                self.policy.name
+            ));
+        }
         (tool.starts_with("browser.") && acts).then(|| {
             format!(
                 "{} changes a page only in a turn you're in, so this job didn't. Ask it in Desk.",
@@ -827,6 +849,17 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict {
+        // "Sign in for me": the card is the wait while the person signs
+        // in, so it is put to them at every level, acting fully included.
+        if tool == SIGNED_IN {
+            return Verdict::Ask {
+                choices: vec![
+                    workforce_core::computer::Choice::AllowOnce,
+                    workforce_core::computer::Choice::Deny,
+                ],
+                why: workforce_core::computer::Why::SignIn,
+            };
+        }
         let facts = self.facts(tool, effect);
         // The dispatch gate is synchronous; the hub runs on a multi-thread
         // runtime, as the surface allow list's lookup relies on too. Anywhere
@@ -1313,6 +1346,8 @@ mod tests {
                 "browser.navigate",
                 "browser.click",
                 "browser.fill",
+                "browser.sign_in",
+                "browser.signed_in",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1358,12 +1393,60 @@ mod tests {
             }));
             assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
+            // "Sign in for me": opening the page reads; the wait for the
+            // person is put to them at every level, acting fully too, and a
+            // job is refused it.
+            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+                assert_eq!(decide_with(body, "browser.sign_in").0, "run", "{body:?}");
+                let (asked, ran_unattended, _) = decide_with(body, "browser.signed_in");
+                assert_eq!(asked, "asks once", "{body:?}");
+                assert!(!ran_unattended, "nobody signs in for a job");
+            }
             // A judged-out turn (a job's, another person's, a spent budget)
             // is not unbound however the settings read.
             JUDGED_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
             let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
             assert!(asked.starts_with("asks"), "{asked}");
             assert!(!unbound);
+        })
+        .await;
+    }
+
+    /// The sign-in card offers "I'm signed in" and "Cancel" (Allow once and
+    /// Deny, as Desk labels them for `sign_in`), names the site, never a
+    /// session or an "always", and says Desk never sees the password; a
+    /// job is told it needs the person.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sign_in_card_waits_for_the_person_and_offers_nothing_to_keep() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let site = Effect::Connector {
+                connector: "browser:https://shop.example".into(),
+                write: true,
+            };
+            let verdict = gate.verdict("browser.signed_in", &site);
+            let card = gate.card(&site, &verdict);
+            let facts = card.facts.as_deref().unwrap();
+            assert_eq!(facts.effect, "sign_in");
+            assert_eq!(
+                facts.connector.as_deref(),
+                Some("browser:https://shop.example")
+            );
+            assert!(
+                facts.why.contains("never sees your password"),
+                "{}",
+                facts.why
+            );
+            assert!(card.allow_once && card.deny_once);
+            assert!(!card.allow_session && card.allow_in_folder.is_none() && !card.allow_always);
+            let refused = gate.refuses_unattended("browser.signed_in", &site).unwrap();
+            assert!(refused.contains("needs you to sign in"), "{refused}");
         })
         .await;
     }

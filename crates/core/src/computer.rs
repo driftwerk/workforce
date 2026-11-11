@@ -341,6 +341,8 @@ pub enum Why {
     TheirChrome,
     /// It would open a site in the person's Chrome it hasn't this session.
     NewSite,
+    /// It waits while the person signs in to a site themselves.
+    SignIn,
 }
 
 impl Why {
@@ -358,6 +360,7 @@ impl Why {
             Self::HostilePage => "The page it read tried to give it instructions",
             Self::TheirChrome => "Uses your own Chrome, signed in as you",
             Self::NewSite => "Opens a new site in your Chrome",
+            Self::SignIn => "Waits while you sign in. Desk never sees your password",
         }
     }
 }

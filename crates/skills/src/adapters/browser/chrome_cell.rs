@@ -275,9 +275,9 @@ impl ChromeCell {
             return;
         };
         let url = self.url_of(c).await;
-        let screenshot = match tool {
-            "browser.fill" | "browser.type" => None,
-            _ => c.screenshot().await.ok(),
+        let screenshot = match super::client::no_screenshot(tool) {
+            true => None,
+            false => c.screenshot().await.ok(),
         };
         hooks.record(Done {
             agent: self.agent.clone(),
