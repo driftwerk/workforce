@@ -325,6 +325,22 @@ impl CrewHub {
             self.plan_lines(&p)
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
+        // Unbound, it approves its own plan, and Desk starts it.
+        if self.unbound_given(&b.service, &b.oversight) {
+            let by = self.by_at_level(
+                self.by_boss(&b.service, "It approved its own plan."),
+                &b.oversight,
+            );
+            let approved = self
+                .desk
+                .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
+                .await
+                .map_err(plain)?;
+            return Ok(json!({
+                "proposed": plan_out(&approved),
+                "note": "You are unbound, so it is approved and Desk starts its ready tickets; the person sees it as a plan card in your DM and on the Floor.",
+            }));
+        }
         Ok(json!({
             "proposed": plan_out(&p),
             "note": "The person sees it as a plan card in your DM and on the Floor, and approves or edits it there. Nothing of it runs until they approve it; say so briefly.",
@@ -562,7 +578,10 @@ impl CrewHub {
         let by = By::manager(
             &boss.id,
             &boss.name,
-            "The person approved the plan; Desk starts its ready tickets.",
+            match self.unbound(&o) {
+                true => "Its plan is approved, and it is unbound: Desk starts its ready tickets.",
+                false => "The person approved the plan; Desk starts its ready tickets.",
+            },
         );
         // Counting and starting are one step, with every other start.
         let _one = self.starting.lock().await;

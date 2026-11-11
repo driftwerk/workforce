@@ -40,12 +40,73 @@ impl Tool for BrowserTool {
     }
 
     fn input_schema(&self) -> Value {
-        self.spec.schema.clone()
+        with_browser(self.spec.schema.clone())
+    }
+
+    /// A browser call, as Desk's gate keeps it. Opening a file reads it,
+    /// as a file tool would, so the gate holds it to the agent's level and
+    /// what Desk withholds. Any other call is kept under the origin it acts
+    /// on (`browser:https://shop.example`), the one the page is on now or,
+    /// for a navigation, the one it goes to; and that origin is what the
+    /// call then acts on, or not at all ([`super::client::expect_origin`]).
+    fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
+        use workforce_core::computer::Effect;
+        let navigating = self.spec.name == "browser.navigate";
+        let target = input["url"].as_str().unwrap_or_default();
+        use super::client::{call_key, expect, Decided};
+        let key = call_key(self.spec.name, input);
+        if navigating {
+            if let super::address::Kind::File(path) = super::address::kind(target) {
+                let real = workforce_agent::tools::paths::resolve_real(&path);
+                expect(
+                    super::client::Backend::Desk,
+                    &key,
+                    Some(Decided::File(real.clone())),
+                );
+                return Effect::Read { paths: vec![real] };
+            }
+        }
+        let backend = super::client::pick(input["browser"].as_str(), true)
+            .unwrap_or(super::client::Backend::Desk);
+        let origin = match navigating {
+            true => super::address::origin_of(target),
+            false => super::client::origin_now(backend),
+        };
+        let decision = match (backend, navigating) {
+            (_, false) => Some(Decided::Origin(origin.clone())),
+            (super::client::Backend::Chrome, true) => Some(Decided::Visit(origin.clone())),
+            (super::client::Backend::Desk, true) => None,
+        };
+        expect(backend, &key, decision);
+        Effect::Connector {
+            connector: site_key(backend, navigating, origin.as_deref()),
+            write: !READS.contains(&self.spec.name),
+        }
+    }
+
+    /// What an approval card shows of a fill: the field and what goes in
+    /// it, as the model wrote it (a credential stays its `[[secret:…]]` or
+    /// `[[vault:…]]` marker; anything that reads as one is redacted),
+    /// capped, so two fills can be told apart.
+    fn approval_summary(&self, input: &Value) -> Option<String> {
+        (self.spec.name == "browser.fill").then(|| fill_summary(input))
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        match (self.spec.handler)(self.client.clone(), input).await {
+        if let Err(e) = super::client::pick(input["browser"].as_str(), false) {
+            return Ok(ToolResult::failure(e.to_string(), elapsed(start)));
+        }
+        // This call takes what was decided for it, and nothing decided for
+        // another call made alongside it.
+        let call = super::client::Call {
+            key: super::client::call_key(self.spec.name, &input),
+            write: !READS.contains(&self.spec.name),
+        };
+        let ran = super::client::CALL_KEY
+            .scope(call, (self.spec.handler)(self.client.clone(), input))
+            .await;
+        match ran {
             Ok(output) => Ok(ToolResult::success(output, elapsed(start))),
             Err(e) => {
                 warn!(target: "browser", tool = self.spec.name, error = %e, "tool call failed");
@@ -53,6 +114,66 @@ impl Tool for BrowserTool {
             }
         }
     }
+}
+
+/// The tools that only read a page; the rest change one.
+pub const READS: &[&str] = &[
+    "browser.navigate",
+    "browser.snapshot",
+    "browser.screenshot",
+    "browser.pdf",
+    "browser.get_content",
+    "browser.console_messages",
+    "browser.network_requests",
+    "browser.wait",
+];
+
+/// What Desk's gate keeps a browser call under: `browser:<origin>` in
+/// Desk's own browser; in the person's Chrome `chrome:<origin>`, and for
+/// opening a site there `chrome-visit:<origin>`. A page with no origin of
+/// its own (blank, inline, a file) is kept under the browser alone, which
+/// no allowance is shared for.
+pub fn site_key(backend: super::client::Backend, navigating: bool, origin: Option<&str>) -> String {
+    use super::client::Backend;
+    let kind = match (backend, navigating) {
+        (Backend::Desk, _) => "browser",
+        (Backend::Chrome, true) => "chrome-visit",
+        (Backend::Chrome, false) => "chrome",
+    };
+    match origin.filter(|o| !o.is_empty()) {
+        Some(o) => format!("{kind}:{o}"),
+        None if backend == Backend::Chrome => "chrome".into(),
+        None => kind.into(),
+    }
+}
+
+/// Every tool's `browser`: which browser it works in.
+fn with_browser(mut schema: Value) -> Value {
+    if let Some(props) = schema["properties"].as_object_mut() {
+        props.insert(
+            "browser".into(),
+            json!({
+                "type": "string",
+                "enum": ["desk", "chrome"],
+                "description": "Which browser: `desk` (Desk's own, which the person signs in to by hand) or `chrome` (the person's own Chrome, signed in as them, where Desk works in a window of its own). Leave it out to carry on in the one used last."
+            }),
+        );
+    }
+    schema
+}
+
+/// The most of a fill's value an approval card shows.
+const SHOWN_VALUE: usize = 200;
+
+fn fill_summary(input: &Value) -> String {
+    let selector = input["selector"].as_str().unwrap_or_default();
+    let value =
+        workforce_common::redact::redact_secrets(input["value"].as_str().unwrap_or_default());
+    let shown = match value.char_indices().nth(SHOWN_VALUE) {
+        Some((at, _)) => format!("{}…", &value[..at]),
+        None => value,
+    };
+    format!("Fill {selector} with: {shown}")
 }
 
 fn elapsed(start: std::time::Instant) -> u64 {
@@ -89,6 +210,16 @@ fn specs() -> Vec<ToolSpec> {
             handler: handler(|c, input| {
                 async move {
                     let url = require_str(&input, "url")?;
+                    let kind = super::address::kind(url);
+                    if !super::address::openable(&kind, super::address::In::Desk) {
+                        let what = match kind {
+                            super::address::Kind::Other(what) => what,
+                            _ => "that".into(),
+                        };
+                        return Err(eyre!(
+                            "The browser opens web pages, about:blank, an inline page or a file on this computer, not {what}."
+                        ));
+                    }
                     c.navigate(url).await
                 }
                 .boxed()
@@ -376,7 +507,7 @@ pub(super) fn skill_tools_and_policies() -> (Vec<SkillTool>, Vec<SkillPolicy>) {
                 SkillTool {
                     name: spec.name.to_string(),
                     description: spec.description.to_string(),
-                    input_schema: spec.schema,
+                    input_schema: with_browser(spec.schema),
                 },
                 SkillPolicy {
                     tool: spec.name.to_string(),
@@ -424,5 +555,129 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn opening_a_file_is_a_read_of_it_and_any_other_call_is_kept_by_origin() {
+        let skill =
+            super::super::BrowserSkill::new(super::super::BrowserSkillConfig::default()).unwrap();
+        let nav = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.navigate")
+            .unwrap();
+        for url in [
+            "file:///etc/hosts",
+            "FILE:///etc/hosts",
+            "file:/etc/hosts",
+            "file://localhost/etc/hosts",
+        ] {
+            let effect = nav.effect(&json!({ "url": url }));
+            assert!(
+                matches!(effect, workforce_core::computer::Effect::Read { ref paths } if paths.len() == 1),
+                "{url}: {effect:?}"
+            );
+        }
+        assert_eq!(
+            nav.effect(&json!({ "url": "https://A.test:8443/x" })),
+            workforce_core::computer::Effect::Connector {
+                connector: "browser:https://a.test:8443".into(),
+                write: false
+            }
+        );
+        assert_eq!(
+            nav.effect(&json!({ "url": "about:blank" })),
+            workforce_core::computer::Effect::Connector {
+                connector: "browser".into(),
+                write: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_site_is_kept_by_its_browser_and_origin_and_a_page_with_none_shares_nothing() {
+        use super::super::client::Backend;
+        assert_eq!(
+            site_key(Backend::Desk, false, Some("https://a.test")),
+            "browser:https://a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Desk, true, Some("https://a.test")),
+            "browser:https://a.test"
+        );
+        assert_eq!(site_key(Backend::Desk, false, None), "browser");
+        assert_eq!(
+            site_key(Backend::Chrome, false, Some("https://a.test")),
+            "chrome:https://a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Chrome, true, Some("https://a.test")),
+            "chrome-visit:https://a.test"
+        );
+        assert_eq!(site_key(Backend::Chrome, true, None), "chrome");
+    }
+
+    #[test]
+    fn every_tool_names_its_browser() {
+        for spec in specs() {
+            let schema = with_browser(spec.schema);
+            assert_eq!(
+                schema["properties"]["browser"]["enum"],
+                json!(["desk", "chrome"]),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn reads_are_every_tool_that_changes_no_page() {
+        let names = tool_names();
+        for r in READS {
+            assert!(names.contains(r), "{r}");
+        }
+        assert_eq!(READS.len() + 7, names.len());
+    }
+
+    #[test]
+    fn a_fills_card_shows_the_field_and_the_value_as_written() {
+        let skill =
+            super::super::BrowserSkill::new(super::super::BrowserSkillConfig::default()).unwrap();
+        let fill = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.fill")
+            .unwrap();
+        assert_eq!(
+            fill.approval_summary(&json!({"selector": "#name", "value": "Sam"}))
+                .as_deref(),
+            Some("Fill #name with: Sam")
+        );
+        let marker = "[[secret:7f3a type=password preview=hu…]]";
+        assert_eq!(
+            fill.approval_summary(&json!({"selector": "#pw", "value": marker})),
+            Some(format!("Fill #pw with: {marker}"))
+        );
+        let vault = "[[vault:agent:site_password]]";
+        assert!(fill
+            .approval_summary(&json!({"selector": "#pw", "value": vault}))
+            .unwrap()
+            .ends_with(vault));
+        let token = format!("lin_api_{}", "a1".repeat(15));
+        let shown = fill
+            .approval_summary(&json!({"selector": "#k", "value": token}))
+            .unwrap();
+        assert!(!shown.contains(&token), "{shown}");
+        let long = "x".repeat(500);
+        let shown = fill
+            .approval_summary(&json!({"selector": "#a", "value": long}))
+            .unwrap();
+        assert!(shown.ends_with('…') && shown.chars().filter(|c| *c == 'x').count() == 200);
+        let click = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.click")
+            .unwrap();
+        assert_eq!(click.approval_summary(&json!({"selector": "#a"})), None);
     }
 }

@@ -146,11 +146,20 @@ impl Desk {
     /// id, as the hub reads their settings and spend: a boss left out
     /// doesn't act fully anywhere.
     pub fn set_full(&self, full: HashMap<String, charge::FullGrant>) {
-        self.0.state.lock().charges.full = full;
+        let changed = {
+            let mut st = self.0.state.lock();
+            let changed = st.charges.full != full;
+            st.charges.full = full;
+            changed
+        };
+        // A boss no longer unbound: its sessions go back to their own modes.
+        if changed {
+            self.modes_changed();
+        }
     }
 
     /// Where `boss` acts fully now; nowhere when it doesn't.
-    fn full_of(&self, boss: &str) -> charge::FullGrant {
+    pub(crate) fn full_of(&self, boss: &str) -> charge::FullGrant {
         self.0
             .state
             .lock()
@@ -161,21 +170,21 @@ impl Desk {
             .unwrap_or_default()
     }
 
-    /// The repositories `boss` acts fully in now; none when it doesn't.
-    fn full_repos(&self, boss: &str) -> Vec<String> {
-        self.full_of(boss).repos
-    }
-
     /// Whether `boss` acts fully in the repository session `id` works in:
     /// its own folder's, named in `[oversight.full] repos`.
     pub fn acts_fully_in(&self, id: Uuid, boss: &str) -> bool {
-        let named = self.full_repos(boss);
-        if named.is_empty() {
-            return false;
-        }
+        let grant = self.full_of(boss);
         let Ok(view) = self.view(id) else {
             return false;
         };
+        // Anywhere, every session's folder is its to ship in.
+        if grant.anywhere {
+            return true;
+        }
+        let named = grant.repos;
+        if named.is_empty() {
+            return false;
+        }
         let home = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone());
         let Some(home) = home else {
             return false;
@@ -440,10 +449,12 @@ impl Desk {
                 let grant = self.full_of(boss);
                 let named = grant.repos;
                 facts.workflows = grant.workflows;
+                facts.any_workflow = grant.anywhere;
                 if let Some(repo) = repo_of_own(&facts.own) {
                     facts.follow_tags = repo.follow_tags;
                     facts.hooks = repo.hooks;
-                    facts.ships = !named.is_empty() && repo.named(&named, &bounds.home);
+                    facts.ships =
+                        grant.anywhere || (!named.is_empty() && repo.named(&named, &bounds.home));
                     // gh acts on what its remotes and `set-default` say, or
                     // on GH_REPO and GH_HOST in the environment sessions
                     // start with (Desk's own); set in a command, the
@@ -451,10 +462,19 @@ impl Desk {
                     let gh_env = ["GH_REPO", "GH_HOST"]
                         .iter()
                         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+                    // Anywhere, whichever repository `gh` resolves is one
+                    // it may ship in: the checks of the named one fall away.
                     facts.ships_gh = facts.ships
-                        && !gh_env
-                        && charge::remotes_one_repo(repo.origin.as_deref(), &repo.remotes)
-                        && charge::gh_resolved_named(repo.origin.as_deref(), &repo.gh_resolved);
+                        && (grant.anywhere
+                            || (!gh_env
+                                && charge::remotes_one_repo(
+                                    repo.origin.as_deref(),
+                                    &repo.remotes,
+                                )
+                                && charge::gh_resolved_named(
+                                    repo.origin.as_deref(),
+                                    &repo.gh_resolved,
+                                )));
                     // What `origin/<default>` says is only as fresh as the
                     // last fetch: `origin` itself must say the same, now,
                     // before a tag or a push is judged by it.
@@ -509,6 +529,45 @@ impl Desk {
             &crate::computer::boss::resolve_real,
             &tracked,
         )
+    }
+
+    /// Whether `id`'s open request `approval` would read or change an
+    /// agent's own settings (its config, where its budget and limits are),
+    /// as far as Desk can tell: a file it names, or a command that names
+    /// one of those files' folders. What Desk can't read counts as not.
+    fn touches_agent_settings(&self, id: Uuid, approval: Uuid) -> bool {
+        let settings = self.0.state.lock().charges.agent_settings.clone();
+        if settings.is_empty() {
+            return false;
+        }
+        let Some(pending) = self.pending_of(id, approval) else {
+            return false;
+        };
+        let Some(home) = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone()) else {
+            return false;
+        };
+        let Ok(view) = self.view(id) else {
+            return false;
+        };
+        let facts = charge::facts_of(view.engine, &pending, &view, &home, false);
+        let named = |p: &std::path::Path| {
+            let p = crate::computer::boss::resolve_real(p).unwrap_or_else(|| p.to_path_buf());
+            settings.iter().any(|s| p.starts_with(s))
+        };
+        match &facts.what {
+            charge::What::Change(paths) | charge::What::Read(paths) => {
+                paths.iter().any(|p| named(p))
+            }
+            charge::What::Command(command) => settings.iter().any(|s| {
+                let shown = s.display().to_string();
+                let tilde = s
+                    .strip_prefix(&home)
+                    .map(|rest| format!("~/{}", rest.display()))
+                    .unwrap_or_default();
+                command.contains(&shown) || (!tilde.is_empty() && command.contains(&tilde))
+            }),
+            _ => false,
+        }
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
@@ -570,13 +629,31 @@ impl Desk {
                     .into(),
             ));
         }
+        // Unbound, it allows what it is asked, on any session, but never
+        // what reads or changes an agent's own settings: its budget and
+        // limits stay the person's.
+        let unbound = self.full_of(&boss.party.id).unbound;
+        if unbound && decision == Decision::Allow && self.touches_agent_settings(id, approval) {
+            return Err(DeskError::Conflict(
+                "it reads or changes an agent's own settings, where its budget and limits are: \
+                 it's the person's to allow"
+                    .into(),
+            ));
+        }
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
         }
         self.boss_holds(id, Some(boss))?;
         self.breaker_refuses_prompt(id, Some(boss))?;
+        // Allowing what it asks drives it; denying makes nothing happen.
+        if decision == Decision::Allow {
+            self.mode_lets(id, Some(boss))?;
+        }
         if self.pending_of(id, approval).is_none() {
             return Err(DeskError::Conflict("already answered".into()));
+        }
+        if unbound && decision == Decision::Allow {
+            return Ok(());
         }
         match decision {
             Decision::Deny | Decision::Cancel => Ok(()),
@@ -615,6 +692,8 @@ impl Desk {
             .charges
             .rows
             .insert(c.session, c.clone());
+        // Released, or another boss's: a mode the last one kept it in ends.
+        self.modes_changed();
         let view = self.charge_view(&c, wheel);
         let _ = self.0.events.send(DeskEvent::Charge {
             charge: Box::new(view.clone()),

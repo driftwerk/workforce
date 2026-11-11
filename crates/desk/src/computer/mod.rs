@@ -19,7 +19,8 @@ use workforce_core::computer::Verdict;
 use crate::store::DeskStore;
 
 pub use policy::{
-    verdict, AgentPolicy, CallFacts, Connectors, Grant, Namespace, RunOf, NAMESPACES,
+    browser_site, verdict, AgentPolicy, Browser, Browsing, CallFacts, Connectors, Grant, Namespace,
+    RunOf, NAMESPACES,
 };
 pub use store::{
     Activity, ActivityFilter, ActivityRow, KeptGrant, NewGrant, ACTIVITY_KEPT_DAYS, PAGE,

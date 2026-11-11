@@ -41,6 +41,9 @@ pub struct CodexSpawn<'a> {
     pub approve_for_me: bool,
     /// Fast mode: Codex asks the ChatGPT backend's faster tier.
     pub fast: bool,
+    /// The permission mode to start in ([`crate::mode`]), over Approve for
+    /// me's; none, its own.
+    pub mode: Option<crate::mode::Mode>,
     pub env: &'a BTreeMap<String, String>,
 }
 
@@ -82,6 +85,14 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     }
     if s.fast {
         args.extend(["-c".to_string(), FAST.to_string()]);
+    }
+    // Later settings win: the mode Desk keeps for it over Approve for me's.
+    if let Some(mode) = s.mode {
+        args.extend(
+            mode.codex_settings()
+                .iter()
+                .flat_map(|c| ["-c".to_string(), c.to_string()]),
+        );
     }
     // Its prompt is a prompt whatever it says: nothing after `--` is read
     // as an option.
@@ -1306,6 +1317,7 @@ pub(crate) mod tests {
             prompt: None,
             approve_for_me: false,
             fast: false,
+            mode: None,
             env: &env,
         });
         assert_eq!(
@@ -1333,6 +1345,7 @@ pub(crate) mod tests {
                 prompt: Some("go"),
                 approve_for_me: true,
                 fast: false,
+                mode: None,
                 env: &env,
             });
             let tail: Vec<&str> = s
@@ -1375,6 +1388,7 @@ pub(crate) mod tests {
                     prompt: Some("go"),
                     approve_for_me: false,
                     fast,
+                    mode: None,
                     env: &env,
                 })
                 .args

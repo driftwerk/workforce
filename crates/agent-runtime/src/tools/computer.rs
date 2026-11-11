@@ -100,6 +100,18 @@ pub trait ComputerGate: Send + Sync {
     fn unattended_runs(&self) -> bool {
         false
     }
+    /// Whether what `tool` would ask stays an ask where nobody can be
+    /// asked, whatever [`Self::unattended_runs`] says: a browser's change to
+    /// a page below unbound is the person's, in a job too.
+    fn asks_unattended(&self, _tool: &str) -> bool {
+        false
+    }
+    /// Why `tool`, doing `effect`, is refused where nobody can be asked,
+    /// whatever its verdict would be: a browser changing a page (or using
+    /// the person's own Chrome) only ever acts in a turn the person is in.
+    fn refuses_unattended(&self, _tool: &str, _effect: &Effect) -> Option<String> {
+        None
+    }
     /// How far a call with `effect` reaches past its tool's own roots, at
     /// the agent's level: reads anywhere but the withheld set from Read
     /// anywhere up, changes anywhere at Full access. `None` keeps the tool's
@@ -111,6 +123,12 @@ pub trait ComputerGate: Send + Sync {
     /// session", "always in this folder") and the facts it shows.
     fn prompt(&self, _decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
         once_or_deny()
+    }
+    /// Whether the agent is unbound (an overseer at Act fully, anywhere,
+    /// every switch on): what Desk holds back below that, it does, a
+    /// credential typed into a page as it is included.
+    fn unbound(&self) -> bool {
+        false
     }
     /// Keeps a session or folder answer as Desk's grant.
     fn keep(
@@ -132,8 +150,17 @@ pub fn decide_unattended(
     input: &Value,
 ) -> Option<Decision> {
     let mut decision = decide(gate, tools, tool_name, input)?;
+    if let Some(sentence) = gate.and_then(|g| g.refuses_unattended(tool_name, &decision.effect)) {
+        decision.verdict = Verdict::Refuse {
+            refusal: workforce_core::computer::Refusal {
+                rule: workforce_core::computer::Refused::OutsideLevel,
+                sentence,
+            },
+        };
+        return Some(decision);
+    }
     let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
-    if asks && gate.is_some_and(|g| g.unattended_runs()) {
+    if asks && gate.is_some_and(|g| g.unattended_runs() && !g.asks_unattended(tool_name)) {
         decision.verdict = Verdict::Run {
             by: workforce_core::computer::By::Unattended,
         };

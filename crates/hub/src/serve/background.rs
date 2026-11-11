@@ -36,6 +36,9 @@ pub(super) async fn start_sweeps(service: &Arc<AgentService>) {
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "Config hot-reload failed"),
                         }
+                        // Desk hears of an overseer's new settings at once:
+                        // what it may do (unbound or not) changes now.
+                        crate::desk_crew::config_saved(&svc);
                     })
                 },
             ));
