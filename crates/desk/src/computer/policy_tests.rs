@@ -1272,6 +1272,8 @@ fn a_browser_site_is_kept_by_its_host() {
     assert_eq!(browser_site(Some("shop.example")), "browser:shop.example");
     assert_eq!(browser_site(None), "browser");
     assert_eq!(browser_site(Some("")), "browser");
+}
+
 /// An agent at Own folder given `ACME` to work in.
 fn working_in_acme(access: Access) -> AgentPolicy {
     AgentPolicy {
