@@ -204,22 +204,47 @@ static EXPECTED: std::sync::LazyLock<StdMutex<HashMap<(SessionId, String), Decid
 
 tokio::task_local! {
     /// The call being made ([`call_key`]), for the length of its tool's run.
-    pub(super) static CALL_KEY: String;
+    pub(super) static CALL_KEY: Call;
 }
+
+/// The call being made: its key, and whether it changes the page.
+#[derive(Debug, Clone)]
+pub(super) struct Call {
+    pub(super) key: String,
+    pub(super) write: bool,
+}
+
+/// The fields of a call's input that name what it acts on: the gate and
+/// the call read them alike. What is typed (`value`, `text`) is left out,
+/// since a credential may be put in for it between the two.
+const KEYED: &[&str] = &[
+    "url",
+    "selector",
+    "key",
+    "expression",
+    "artifact_id",
+    "filename",
+    "format",
+    "browser",
+    "timeout_ms",
+];
 
 /// Which call this is, as both the gate's decision and the call itself
 /// name it: the tool and its input, less what a credential may be put in
 /// for between the two (`value`, `text`).
 pub(super) fn call_key(tool: &str, input: &Value) -> String {
-    let mut bare = input.clone();
-    if let Value::Object(map) = &mut bare {
-        map.remove("value");
-        map.remove("text");
-    }
     let mut hasher = Sha256::new();
     hasher.update(tool.as_bytes());
-    hasher.update([0x1f]);
-    hasher.update(bare.to_string().as_bytes());
+    for field in KEYED {
+        hasher.update([0x1f]);
+        hasher.update(field.as_bytes());
+        hasher.update([0x1e]);
+        match &input[field] {
+            Value::Null => {}
+            Value::String(v) => hasher.update(v.as_bytes()),
+            other => hasher.update(other.to_string().as_bytes()),
+        }
+    }
     lower_hex(&hasher.finalize())
 }
 
@@ -234,9 +259,22 @@ pub(super) fn expect(key: &str, decided: Option<Decided>) {
     };
 }
 
+/// Where Desk's gate decides every browser call, a write it decided nothing
+/// for isn't made: the page or the call changed since.
+pub(super) fn undecided_write(decided: &Option<Decided>) -> Result<()> {
+    let gated = hooks::hooks().is_some_and(|h| h.gate_decides());
+    let write = CALL_KEY.try_with(|c| c.write).unwrap_or(false);
+    match (gated, write, decided) {
+        (true, true, None) => Err(eyre!(
+            "The page or the call changed since this was decided, so nothing was done. Call again."
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Takes what the call in scope was decided for, if it was.
 fn take_decided(id: SessionId) -> Option<Decided> {
-    let key = CALL_KEY.try_with(Clone::clone).ok()?;
+    let key = CALL_KEY.try_with(|c| c.key.clone()).ok()?;
     EXPECTED.lock().unwrap().remove(&(id, key))
 }
 
@@ -809,6 +847,7 @@ impl SessionCell {
         };
         let _serial = call_lock.lock().await;
         let decided = take_decided(current_session_id());
+        undecided_write(&decided)?;
         self.keep_page(&page, decided.clone()).await?;
         // The file the person allowed this very call to open may load
         // while it opens it, and no longer unless it did.
@@ -817,9 +856,10 @@ impl SessionCell {
             _ => None,
         };
         self.files.lock().unwrap().pending = opening;
+        // Cleared however the call ends: done, failed, cancelled or panicked.
+        let _pending = PendingFile(&self.files);
         let after = page.clone();
         let ran = timeout(timeout_dur, op(page, network_log, console_log)).await;
-        self.files.lock().unwrap().pending = None;
         match ran {
             Ok(Ok(v)) => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
@@ -864,7 +904,8 @@ impl SessionCell {
             // Opened, by this call the person allowed, exactly the file it
             // was allowed to: it may stay.
             let landed = page.url().await.ok().flatten();
-            self.files.lock().unwrap().opened_now(landed.as_deref());
+            let by = CURRENT_SESSION_KEY.try_with(Clone::clone).ok();
+            self.files.lock().unwrap().opened_now(landed.as_deref(), by);
             let title = page
                 .evaluate("document.title")
                 .await
@@ -1620,6 +1661,17 @@ struct Probe {
     shown: String,
 }
 
+/// Clears the file a call was opening when the call ends, any way it ends.
+struct PendingFile<'a>(&'a StdMutex<FileAllowance>);
+
+impl Drop for PendingFile<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut files) = self.0.lock() {
+            files.pending = None;
+        }
+    }
+}
+
 /// What files a page may have without the gate allowing them again.
 #[derive(Debug, Default)]
 struct FileAllowance {
@@ -1627,6 +1679,9 @@ struct FileAllowance {
     opened: Option<PathBuf>,
     /// The file the call being made now was allowed to open.
     pending: Option<PathBuf>,
+    /// The conversation whose call opened `opened`: what pulls in more
+    /// files is asked about as that conversation's.
+    key: Option<String>,
 }
 
 impl FileAllowance {
@@ -1638,12 +1693,13 @@ impl FileAllowance {
     fn keep_only(&mut self, file: Option<&Path>) {
         if self.opened.as_deref() != file {
             self.opened = None;
+            self.key = None;
         }
     }
 
     /// The navigation made by the call allowed to open `pending` landed on
     /// `url`: exactly that file, and it stays allowed.
-    fn opened_now(&mut self, url: Option<&str>) {
+    fn opened_now(&mut self, url: Option<&str>, key: Option<String>) {
         let landed = match url.map(super::address::kind) {
             Some(super::address::Kind::File(p)) => {
                 Some(workforce_agent::tools::paths::resolve_real(&p))
@@ -1652,6 +1708,7 @@ impl FileAllowance {
         };
         if landed.is_some() && landed == self.pending {
             self.opened = landed;
+            self.key = key;
         }
     }
 }
@@ -1677,7 +1734,11 @@ fn file_refusal(
         return None;
     }
     let hooks = hooks::hooks()?;
-    let key = scope.key.lock().unwrap().clone().unwrap_or_default();
+    // Pinned to the conversation that opened the file, else the last one.
+    let pinned = files.lock().unwrap().key.clone();
+    let key = pinned
+        .or_else(|| scope.key.lock().unwrap().clone())
+        .unwrap_or_default();
     CURRENT_USER_ID.sync_scope(scope.user.clone(), || {
         CURRENT_SESSION_KEY.sync_scope(key, || hooks.may_open_file(agent, real).err())
     })

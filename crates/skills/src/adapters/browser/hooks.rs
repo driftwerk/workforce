@@ -55,6 +55,11 @@ pub trait BrowserHooks: Send + Sync {
     fn may_open_file(&self, _agent: &str, _path: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
+    /// Whether the hub's gate decides every browser call before it is made
+    /// (Desk's does): a write it decided nothing for is then refused.
+    fn gate_decides(&self) -> bool {
+        false
+    }
 }
 
 static HOOKS: OnceLock<Arc<dyn BrowserHooks>> = OnceLock::new();

@@ -77,9 +77,12 @@ impl Tool for BrowserTool {
         let start = std::time::Instant::now();
         // This call takes what was decided for it, and nothing decided for
         // another call made alongside it.
-        let key = super::client::call_key(self.spec.name, &input);
+        let call = super::client::Call {
+            key: super::client::call_key(self.spec.name, &input),
+            write: !READS.contains(&self.spec.name),
+        };
         let ran = super::client::CALL_KEY
-            .scope(key, (self.spec.handler)(self.client.clone(), input))
+            .scope(call, (self.spec.handler)(self.client.clone(), input))
             .await;
         match ran {
             Ok(output) => Ok(ToolResult::success(output, elapsed(start))),
