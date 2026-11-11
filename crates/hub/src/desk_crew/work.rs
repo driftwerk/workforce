@@ -258,6 +258,26 @@ impl CrewHub {
                 .view(c.session)
                 .ok()
                 .and_then(|v| v.group.map(|g| g.id));
+            // A boss served from a grant runs it while its grant for the
+            // session's group is live and names it; stopped, expired,
+            // paused or gone, the session is the person's again.
+            if workforce_desk::grant::is_served(&c.boss) {
+                let live = self.desk.grant_group_of(c.session).is_some_and(|g| {
+                    self.desk.grant_live(&g).is_ok_and(|grant| {
+                        grant.boss.is_some_and(|b| b.party_id() == c.boss)
+                            && (grant.members.contains(&c.session)
+                                || grant.born.contains(&c.session))
+                    })
+                });
+                if !live {
+                    let by =
+                        By::manager(&c.boss, &c.boss_name, "Its boss's grant is no longer live.");
+                    if let Err(e) = self.desk.release(c.session, &by).await {
+                        tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
+                    }
+                }
+                continue;
+            }
             let its = overseers
                 .iter()
                 .find(|(_, o)| workforce_desk::scope::sees(&o.scope, group.as_deref(), &bossed));

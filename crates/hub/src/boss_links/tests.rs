@@ -1130,3 +1130,437 @@ fn only_a_person_changes_an_agents_desk_boss() {
     )
     .is_none());
 }
+
+// ── The uplink (RB5a) ───────────────────────────────────────────────────
+
+mod uplink_tests {
+    use super::*;
+    use crate::boss_links::uplink::{Timing, MAX_FRAME, PROTOCOL_HEADER};
+    use base64::Engine as _;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    type Stream = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// The uplink route on a port of its own, over `hub`'s state.
+    async fn serve(hub: &Hub) -> std::net::SocketAddr {
+        *hub.fx.state.uplinks.hub.lock() = Some(HUB.into());
+        hub.fx.state.uplinks.set_timing(Timing {
+            hello_within: std::time::Duration::from_millis(500),
+            call_within: std::time::Duration::from_secs(5),
+            ping_every: std::time::Duration::from_secs(30),
+            resend_within: std::time::Duration::from_secs(30),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/ws/desk-boss",
+                axum::routing::get(crate::boss_links::uplink::handler),
+            )
+            .with_state(Arc::clone(&hub.fx.state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// Connects with `bearer` (and the protocol header unless `bare`), or
+    /// the status it was refused with.
+    async fn connect(
+        addr: std::net::SocketAddr,
+        query: &str,
+        bearer: &str,
+        protocol: Option<&str>,
+    ) -> Result<Stream, u16> {
+        let mut req = format!("ws://{addr}/ws/desk-boss{query}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        if let Some(p) = protocol {
+            req.headers_mut()
+                .insert(PROTOCOL_HEADER, p.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((s, _)) => Ok(s),
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    async fn next(s: &mut Stream) -> Option<Value> {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), s.next()).await {
+                Ok(Some(Ok(Ws::Text(t)))) => return serde_json::from_str(&t).ok(),
+                Ok(Some(Ok(Ws::Ping(_) | Ws::Pong(_)))) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    /// A link as the engine holds it: its token and key.
+    struct Held<'a> {
+        token: &'a str,
+        token_id: Uuid,
+        key: &'a EngineKey,
+        engine_id: &'a str,
+    }
+
+    /// The hello for `links`, each signed over `challenge` as the hub it
+    /// names (`canonical_hub` of the address the engine dialed).
+    fn hello(challenge: &Value, engine_id: &str, links: &[Held<'_>]) -> Value {
+        let nonce: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(challenge["nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let hub = crate::boss_links::engine_key::canonical_hub(HUB).unwrap();
+        let links: Vec<Value> = links
+            .iter()
+            .map(|l| {
+                let sig = l
+                    .key
+                    .sign_challenge(Challenge {
+                        nonce: &nonce,
+                        token_id: l.token_id,
+                        hub: &hub,
+                        engine_id: l.engine_id,
+                    })
+                    .unwrap();
+                json!({"token": l.token, "signature": b64(&sig)})
+            })
+            .collect();
+        json!({"type": "hello", "protocol": 1,
+               "engine": {"id": engine_id, "name": engine_id, "version": "test"},
+               "links": links, "tools": ["crew.overview", "crew.nudge", "rm -rf", "exec.run"]})
+    }
+
+    async fn send(s: &mut Stream, v: Value) {
+        s.send(Ws::Text(v.to_string().into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_engine_proves_each_link_and_answers_only_its_own_calls() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let other_key = key();
+        let mac = key();
+        let mint = |group: &str, k: &EngineKey, engine: &str| {
+            links::mint(hub.state(), sam.id, &device.id, &request(k, group, engine)).unwrap()
+        };
+        let acme = mint("acme", &devbox, "devbox");
+        let globex = mint("globex", &devbox, "devbox");
+        let mac_acme = mint("acme", &mac, "mac");
+        let addr = serve(&hub).await;
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let ch = next(&mut s).await.unwrap();
+        assert_eq!(ch["type"], "challenge");
+        assert_eq!(ch["hub"], HUB);
+        let held = [
+            Held {
+                token: &acme.plaintext,
+                token_id: acme.record.id,
+                key: &devbox,
+                engine_id: "devbox",
+            },
+            // Signed with a key that isn't the one registered.
+            Held {
+                token: &globex.plaintext,
+                token_id: globex.record.id,
+                key: &other_key,
+                engine_id: "devbox",
+            },
+            // Another engine's link.
+            Held {
+                token: &mac_acme.plaintext,
+                token_id: mac_acme.record.id,
+                key: &mac,
+                engine_id: "mac",
+            },
+        ];
+        send(&mut s, hello(&ch, "devbox", &held)).await;
+        let ready = next(&mut s).await.unwrap();
+        assert_eq!(ready["type"], "ready", "{ready}");
+        assert_eq!(ready["links"].as_array().unwrap().len(), 1, "{ready}");
+        assert_eq!(ready["links"][0]["linkId"], json!(acme.link.link_id));
+        assert_eq!(ready["refused"].as_array().unwrap().len(), 2, "{ready}");
+        let ups = &hub.fx.state.uplinks;
+        assert!(ups.connected(acme.link.link_id));
+        assert!(!ups.connected(globex.link.link_id));
+        assert_eq!(
+            ups.links_of_group(&acme.link.group_key),
+            [acme.link.link_id]
+        );
+        assert_eq!(
+            ups.tools_of(acme.link.link_id),
+            ["crew.overview", "crew.nudge"]
+        );
+        let audited = hub.audited();
+        assert!(
+            audited.iter().any(|(a, _)| a == "desk_boss.uplink.connect"),
+            "{audited:?}"
+        );
+        assert!(
+            audited.iter().any(|(a, _)| a == "desk_boss.uplink.refused"),
+            "{audited:?}"
+        );
+
+        // A call goes down; a result for another call, or twice, is dropped.
+        let state = Arc::clone(&hub.fx.state);
+        let link = acme.link.link_id;
+        let called = tokio::spawn(async move {
+            state
+                .uplinks
+                .call(&state, link, "crew.overview", json!({}))
+                .await
+        });
+        let call = next(&mut s).await.unwrap();
+        assert_eq!(call["type"], "call");
+        assert_eq!(call["seq"], 1);
+        assert_eq!(call["linkId"], json!(link));
+        assert_eq!(call["tool"], "crew.overview");
+        send(
+            &mut s,
+            json!({"type": "result", "callId": Uuid::new_v4(), "status": "ok", "body": {}}),
+        )
+        .await;
+        send(
+            &mut s,
+            json!({"type": "result", "callId": call["callId"], "status": "ok",
+                            "body": {"sessions": "[]"}}),
+        )
+        .await;
+        send(
+            &mut s,
+            json!({"type": "result", "callId": call["callId"], "status": "refused",
+                            "body": {"error": "late"}}),
+        )
+        .await;
+        let got = called.await.unwrap().unwrap();
+        assert_eq!(got["status"], "ok");
+        assert_eq!(got["body"]["sessions"], "[]");
+
+        // A second socket for the link takes it from the first.
+        let mut s2 = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let ch2 = next(&mut s2).await.unwrap();
+        send(&mut s2, hello(&ch2, "devbox", &held[..1])).await;
+        assert_eq!(next(&mut s2).await.unwrap()["type"], "ready");
+        let told = next(&mut s).await.unwrap();
+        assert_eq!(told["state"], "replaced", "{told}");
+        assert!(next(&mut s).await.is_none(), "the first socket closed");
+
+        // Revoked, the link is stopped at its next call, and its socket
+        // closes with no link left.
+        assert!(links::revoke(hub.state(), sam.id, &device.id, acme.record.id).unwrap());
+        let refused = hub
+            .fx
+            .state
+            .uplinks
+            .call(&hub.fx.state, link, "crew.overview", json!({}))
+            .await;
+        assert!(refused.is_err());
+        assert!(!hub.fx.state.uplinks.connected(link));
+        let stopped = next(&mut s2).await.unwrap();
+        assert_eq!(stopped["state"], "stopped", "{stopped}");
+    }
+
+    #[tokio::test]
+    async fn an_uplink_is_refused_unless_it_says_and_proves_everything() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let globex = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "globex", "devbox"),
+        )
+        .unwrap();
+        let addr = serve(&hub).await;
+        assert_eq!(
+            connect(
+                addr,
+                &format!("?token={}", acme.plaintext),
+                &acme.plaintext,
+                Some("1")
+            )
+            .await
+            .err(),
+            Some(400)
+        );
+        assert_eq!(
+            connect(addr, "", &acme.plaintext, None).await.err(),
+            Some(426)
+        );
+        assert_eq!(
+            connect(addr, "", &acme.plaintext, Some("2")).await.err(),
+            Some(426)
+        );
+        assert_eq!(
+            connect(addr, "", "wfb_nothing", Some("1")).await.err(),
+            Some(401)
+        );
+
+        let acme_held = Held {
+            token: &acme.plaintext,
+            token_id: acme.record.id,
+            key: &devbox,
+            engine_id: "devbox",
+        };
+        let globex_held = Held {
+            token: &globex.plaintext,
+            token_id: globex.record.id,
+            key: &devbox,
+            engine_id: "devbox",
+        };
+        // No hello in time: closed.
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        next(&mut s).await.unwrap();
+        let said = next(&mut s).await;
+        assert!(
+            said.as_ref().is_none_or(|v| v["type"] == "error"),
+            "{said:?}"
+        );
+        // Another engine's id in the hello.
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let ch = next(&mut s).await.unwrap();
+        send(&mut s, hello(&ch, "mac", std::slice::from_ref(&acme_held))).await;
+        assert_eq!(next(&mut s).await.unwrap()["type"], "error");
+        // The link it opened with isn't among those it proves.
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let ch = next(&mut s).await.unwrap();
+        send(
+            &mut s,
+            hello(&ch, "devbox", std::slice::from_ref(&globex_held)),
+        )
+        .await;
+        assert_eq!(next(&mut s).await.unwrap()["type"], "error");
+        assert!(!hub.fx.state.uplinks.connected(globex.link.link_id));
+        // Signed for another hub than this one.
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let mut ch = next(&mut s).await.unwrap();
+        ch["hub"] = json!("https://elsewhere.example.com");
+        let nonce: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(ch["nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sig = devbox
+            .sign_challenge(Challenge {
+                nonce: &nonce,
+                token_id: acme.record.id,
+                hub: "https://elsewhere.example.com",
+                engine_id: "devbox",
+            })
+            .unwrap();
+        send(
+            &mut s,
+            json!({"type": "hello", "protocol": 1, "engine": {"id": "devbox"},
+                            "links": [{"token": acme.plaintext, "signature": b64(&sig)}]}),
+        )
+        .await;
+        assert_eq!(next(&mut s).await.unwrap()["type"], "error");
+        // A frame past the limit closes it.
+        let mut s = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let ch = next(&mut s).await.unwrap();
+        send(
+            &mut s,
+            hello(&ch, "devbox", std::slice::from_ref(&acme_held)),
+        )
+        .await;
+        assert_eq!(next(&mut s).await.unwrap()["type"], "ready");
+        let _ = s.send(Ws::Text("x".repeat(MAX_FRAME + 1).into())).await;
+        assert!(next(&mut s).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_engine_cant_take_every_place_or_every_socket() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let addr = serve(&hub).await;
+        let held = Held {
+            token: &acme.plaintext,
+            token_id: acme.record.id,
+            key: &devbox,
+            engine_id: "devbox",
+        };
+
+        // Two sockets still proving themselves are as many as a token has.
+        let mut a = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let mut b = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        assert_eq!(
+            connect(addr, "", &acme.plaintext, Some("1")).await.err(),
+            Some(429)
+        );
+        let ch = next(&mut a).await.unwrap();
+        send(&mut a, hello(&ch, "devbox", std::slice::from_ref(&held))).await;
+        assert_eq!(next(&mut a).await.unwrap()["type"], "ready");
+        next(&mut b).await.unwrap();
+        drop(b);
+
+        // At most 16 calls of one link wait at once.
+        let state = Arc::clone(&hub.fx.state);
+        let link = acme.link.link_id;
+        let mut waiting = Vec::new();
+        for _ in 0..16 {
+            let state = Arc::clone(&state);
+            waiting.push(tokio::spawn(async move {
+                state
+                    .uplinks
+                    .call(&state, link, "crew.overview", json!({}))
+                    .await
+            }));
+        }
+        for _ in 0..16 {
+            assert_eq!(next(&mut a).await.unwrap()["type"], "call");
+        }
+        let over = state
+            .uplinks
+            .call(&state, link, "crew.overview", json!({}))
+            .await;
+        assert!(over.unwrap_err().contains("Too many calls"));
+        for w in waiting {
+            w.abort();
+        }
+
+        // Frames it can't use, past a few, close the socket.
+        for _ in 0..25 {
+            let _ = a.send(Ws::Text("not json".into())).await;
+        }
+        let mut closed = false;
+        for _ in 0..40 {
+            if next(&mut a).await.is_none() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed);
+        assert!(hub
+            .audited()
+            .iter()
+            .any(|(a, h)| a == "desk_boss.uplink.refused" && h == "too many unproved sockets"));
+    }
+}

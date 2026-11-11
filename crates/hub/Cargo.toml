@@ -66,6 +66,9 @@ vellev-core = { workspace = true }
 workforce-vellev = { workspace = true }
 libc = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
+# The engine's uplink to a boss hub (`desk_uplink`), on rustls with the
+# system's roots, as the hub's own clients.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 blake3 = { workspace = true }
 base64 = { workspace = true }
 aes-gcm = { workspace = true }
@@ -197,7 +200,6 @@ workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"]
 tempfile = "3"
 tower = "0.5"
 wiremock = "0.6"
-tokio-tungstenite = "0.28"
 serde_yaml = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 workforce-postgres = { workspace = true, features = ["test-support"] }

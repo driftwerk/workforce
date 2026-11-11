@@ -71,6 +71,7 @@ pub(crate) fn fixture_with(enabled: bool, bind_tokens: bool) -> Fixture {
             ..Default::default()
         },
         desk_boss: Default::default(),
+        uplinks: Default::default(),
         permission_evaluator: None,
         destructive_baseline_active: false,
         telemetry_store: None,

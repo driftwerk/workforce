@@ -5192,6 +5192,7 @@ rules:
                     .map(|s| s.as_remote_mcp_token_store()),
                 remote_mcp: wf_config.remote_mcp.clone(),
                 desk_boss: desk_boss_live.clone(),
+                uplinks: Default::default(),
                 permission_evaluator: permission_evaluator.clone(),
                 // The live `@destructive → Ask` baseline is in effect only when
                 // the cascade is wired (evaluator present ⇔ `[permissions]

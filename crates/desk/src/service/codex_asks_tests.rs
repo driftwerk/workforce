@@ -158,6 +158,15 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
             "the Floor's need carries what Codex offers"
         );
         let you = || Some(By::you());
+        // Acting fully anywhere but not unbound, a boss still never answers
+        // Codex.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                ..Default::default()
+            },
+        )]));
         for agent in [None, Some(By::manager("crew", "Crew", "it only reads"))] {
             assert!(
                 matches!(d.decide(s.id, p.id, Decision::Allow, agent), Err(DeskError::Invalid(_))),
