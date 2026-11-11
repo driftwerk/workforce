@@ -70,6 +70,32 @@ pub struct BrowserSkillConfig {
     pub profile_retention_ms: u64,
     #[serde(default = "default_reap_interval_ms")]
     pub reap_interval_ms: u64,
+    /// Show the browser's window on screen instead of running it headless,
+    /// so the person can watch it and sign in by hand.
+    #[serde(default)]
+    pub show: bool,
+    /// Keep every profile under `profile_root`: the reaper never runs, so a
+    /// profile the person signed in to by hand stays signed in.
+    #[serde(default)]
+    pub keep_profiles: bool,
+    /// The person's Chrome's user data folder, where it writes
+    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
+    /// own for this platform.
+    #[serde(default)]
+    pub chrome_user_data_dir: Option<String>,
+    /// How long attaching to the person's Chrome waits for them to allow
+    /// it in Chrome's own prompt.
+    #[serde(default = "default_chrome_connect_timeout_ms")]
+    pub chrome_connect_timeout_ms: u64,
+    /// Run Chrome without its sandbox. Only where the sandbox can't start
+    /// (a build box without user namespaces); as root in a container it is
+    /// off already.
+    #[serde(default)]
+    pub no_sandbox: bool,
+}
+
+fn default_chrome_connect_timeout_ms() -> u64 {
+    60_000
 }
 
 impl Default for BrowserSkillConfig {
@@ -88,6 +114,11 @@ impl Default for BrowserSkillConfig {
             session_idle_ttl_ms: default_session_idle_ttl_ms(),
             profile_retention_ms: default_profile_retention_ms(),
             reap_interval_ms: default_reap_interval_ms(),
+            show: false,
+            keep_profiles: false,
+            chrome_user_data_dir: None,
+            chrome_connect_timeout_ms: default_chrome_connect_timeout_ms(),
+            no_sandbox: false,
         }
     }
 }
@@ -108,6 +139,8 @@ max_live_sessions = 6
 session_idle_ttl_ms = 600000
 profile_retention_ms = 604800000
 reap_interval_ms = 3600000
+# show = false            # true: a visible window instead of headless
+# keep_profiles = false   # true: profiles are never reaped
 "#
         .to_string()
     }
@@ -131,6 +164,8 @@ mod tests {
         assert_eq!(cfg.session_idle_ttl_ms, def.session_idle_ttl_ms);
         assert_eq!(cfg.profile_retention_ms, def.profile_retention_ms);
         assert_eq!(cfg.reap_interval_ms, def.reap_interval_ms);
+        assert!(!cfg.show, "headless unless asked");
+        assert!(!cfg.keep_profiles, "reaped unless asked");
     }
 
     #[test]
@@ -183,6 +218,8 @@ mod tests {
             "session_idle_ttl_ms",
             "profile_retention_ms",
             "reap_interval_ms",
+            "show",
+            "keep_profiles",
         ] {
             assert!(toml.contains(key), "missing key in default_toml: {key}");
         }

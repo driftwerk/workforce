@@ -24,9 +24,16 @@
 //! - `POST /api/desk/boards/link/check` `{system, via, target?, filter?, me?}`:
 //!   what the link dialog needs: whether the hub offers the tools (and if
 //!   not, what its admin must add), the teams, the states with the map
-//!   prefilled, and how many issues the filter matches.
+//!   prefilled, who the person is there (`linear.viewer`, `jira.myself`),
+//!   and how many issues the filter matches, counted page by page up to
+//!   [`sync::MATCH_CEILING`] (past it, "or more").
 //! - `PUT|DELETE /api/desk/boards/{id}/link`: links or unlinks a board.
 //! - `POST /api/desk/boards/{id}/pause` `{paused}`: pauses or resumes it.
+//! - `POST /api/desk/boards/{id}/me`: asks the hub again who the person
+//!   is there, and keeps its answer.
+//! - `POST /api/desk/tickets/{id}/take`: Take it. The ticket's issue, no
+//!   one's there, is assigned to the person, as themselves, through the
+//!   route the board syncs by.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,7 +225,7 @@ impl LocalRemote {
         &self,
         service: &crate::serve::AgentService,
     ) -> workforce_agent::tools::registry::ToolRegistry {
-        let patterns: Vec<String> = sync::tools_of(self.system)
+        let patterns: Vec<String> = sync::callable(self.system)
             .iter()
             .map(|t| t.to_string())
             .collect();
@@ -582,6 +589,8 @@ pub fn router(sync: Arc<BoardSync>) -> Router {
         )
         .route("/api/desk/boards/{id}/pause", post(pause_board))
         .route("/api/desk/boards/{id}/sync", post(sync_board))
+        .route("/api/desk/tickets/{id}/take", post(take_ticket))
+        .route("/api/desk/boards/{id}/me", post(recheck_me))
         .with_state(Arc::new(Routes { sync }))
 }
 
@@ -764,8 +773,76 @@ struct CheckBody {
     me: Option<String>,
 }
 
-/// How many issues a filter's first page matched, at most.
-const MATCH_PAGE: u64 = 100;
+/// How many of `target`'s issues `filter` matches, read page by page up to
+/// [`sync::MATCH_CEILING`]; and whether there may be more than that.
+async fn count_matches(
+    remote: &dyn Remote,
+    system: System,
+    target: &str,
+    target_id: Option<&str>,
+    filter: &Filter,
+    me: Option<&str>,
+) -> Result<(usize, bool), RemoteError> {
+    let mut n = 0usize;
+    let pages = sync::MATCH_CEILING.div_ceil(sync::PAGE);
+    let mut page: Option<String> = None;
+    for _ in 0..pages {
+        let (found, next) = match system {
+            System::Jira => {
+                let mut args = json!({ "jql": sync::jql(target, filter, None), "max_results": sync::PAGE, "fields": ["summary"] });
+                if let Some(p) = &page {
+                    args["next_page_token"] = json!(p);
+                }
+                let a = sync::call(remote, system, "jira.search", args).await?;
+                let (issues, next) = sync::jira_search_issues(&a, "");
+                let found = issues
+                    .into_iter()
+                    .filter(|i| sync::key_in_target(&i.key, target))
+                    .count();
+                (found, next)
+            }
+            System::Linear => {
+                let team = target_id.unwrap_or_default();
+                let a = sync::call(
+                    remote,
+                    system,
+                    "linear.issue_list",
+                    sync::linear_args(team, filter, me, None, page.as_deref()),
+                )
+                .await?;
+                let issues = sync::linear_issues(&a);
+                let paged = sync::linear_pages(&a);
+                // A hub whose tool doesn't page answers one page: past a
+                // full one there may be more.
+                let more = match paged {
+                    true => sync::linear_next_page(&a),
+                    false if issues.len() >= sync::PAGE => Some(String::new()),
+                    false => None,
+                };
+                let found = issues
+                    .into_iter()
+                    .filter(|i| sync::key_in_target(&i.key, target))
+                    .filter(|i| match filter {
+                        Filter::Label(l) => i.labels.iter().any(|x| x.eq_ignore_ascii_case(l)),
+                        // What a hub that can't filter by state answered.
+                        Filter::All { .. } if !paged => !i.is_closed(&Default::default()),
+                        _ => true,
+                    })
+                    .count();
+                if !paged {
+                    return Ok((found, more.is_some()));
+                }
+                (found, more)
+            }
+        };
+        n += found;
+        match next {
+            Some(p) => page = Some(p),
+            None => return Ok((n, false)),
+        }
+    }
+    Ok((n, true))
+}
 
 async fn check_link(
     State(r): S,
@@ -779,8 +856,19 @@ async fn check_link(
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
+    // A filter is checked before any call; Linear's "assigned to me" once
+    // the hub has said who the person is there.
     if let Some(filter) = &body.filter {
-        if let Err(e) = sync::check_filter(body.system, filter, body.me.as_deref()) {
+        let asks_me =
+            body.system == System::Linear && *filter == Filter::AssignedToMe && body.me.is_none();
+        if !asks_me {
+            if let Err(e) = sync::check_filter(body.system, filter, body.me.as_deref()) {
+                return refusal(StatusCode::BAD_REQUEST, &e);
+            }
+        }
+    }
+    if let Some(me) = body.me.as_deref() {
+        if let Err(e) = sync::check_me(body.system, me) {
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
@@ -824,47 +912,48 @@ async fn check_link(
     };
     out["states"] = json!(states.iter().map(|s| &s.name).collect::<Vec<_>>());
     out["prefill"] = json!(sync::prefill_states(&states));
-    if let Some(filter) = &body.filter {
-        let matched = match body.system {
-            System::Jira => sync::call(
-                &*remote,
-                body.system,
-                "jira.search",
-                json!({ "jql": sync::jql(target, filter, None), "max_results": MATCH_PAGE, "fields": ["summary"] }),
-            )
-            .await
-            .map(|a| {
-                sync::jira_search_issues(&a, "")
-                    .0
-                    .into_iter()
-                    .filter(|i| sync::key_in_target(&i.key, target))
-                    .count()
-            }),
-            System::Linear => {
-                let team = body.target_id.as_deref().unwrap_or_default();
-                sync::call(
-                    &*remote,
-                    body.system,
-                    "linear.issue_list",
-                    sync::linear_args(team, filter, body.me.as_deref()),
-                )
-                .await
-                .map(|a| {
-                    sync::linear_issues(&a)
-                        .into_iter()
-                        .filter(|i| sync::key_in_target(&i.key, target))
-                        .filter(|i| match filter {
-                            Filter::Label(l) => i.labels.iter().any(|x| x.eq_ignore_ascii_case(l)),
-                            _ => true,
-                        })
-                        .count()
-                })
+    // Who the person is there, when the hub can say: "assigned to me" then
+    // needs no id typed in.
+    // Only the person's own key vouches for them: a shared one says who
+    // owns it, so then no one is named, and the dialog says why.
+    let me = match body.me.as_deref() {
+        Some(id) => Some(workforce_desk::board::Assignee {
+            id: id.to_string(),
+            name: "You".into(),
+        }),
+        None => match sync::identify(&*remote, body.system).await {
+            Ok(sync::Who::Person(me)) => Some(me),
+            Ok(other) => {
+                out["meWhy"] = json!(other.why_not(&hub, body.system));
+                None
             }
-        };
+            Err(e) => return said(e),
+        },
+    };
+    out["me"] = json!(me);
+    if let Some(filter) = &body.filter {
+        // A filter that can't be counted yet (Linear's "assigned to me"
+        // on a hub that can't say who the person is) says why, beside what
+        // was found, so the dialog can ask for the missing id.
+        if let Err(e) = sync::check_filter(body.system, filter, me.as_ref().map(|m| m.id.as_str()))
+        {
+            out["filterError"] = json!(e);
+            return Json(out).into_response();
+        }
+        let matched = count_matches(
+            &*remote,
+            body.system,
+            target,
+            body.target_id.as_deref(),
+            filter,
+            me.as_ref().map(|m| m.id.as_str()),
+        )
+        .await;
         match matched {
-            Ok(n) => {
+            Ok((n, more)) => {
                 out["matches"] = json!(n);
-                out["matchesAtLeast"] = json!(n as u64 >= MATCH_PAGE);
+                out["matchesAtLeast"] = json!(more);
+                out["ceiling"] = json!(sync::MATCH_CEILING);
             }
             Err(e) => return said(e),
         }
@@ -971,7 +1060,7 @@ async fn link_board(
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
     Path(id): Path<Uuid>,
-    Json(link): Json<LinkBoard>,
+    Json(mut link): Json<LinkBoard>,
 ) -> Response {
     let person = person!(r, h, q);
     if link.via == Via::ThisHub {
@@ -987,25 +1076,43 @@ async fn link_board(
         }
     }
     let hub = r.sync.hub_name(&link.via).await;
-    if let Err(p) = r.sync.offered(link.system, &link.via, &person).await {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": paused_words(&hub, link.system, &p), "paused": p })),
-        )
-            .into_response();
+    let remote = match r.sync.offered(link.system, &link.via, &person).await {
+        Ok(remote) => remote,
+        Err(p) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": paused_words(&hub, link.system, &p), "paused": p })),
+            )
+                .into_response();
+        }
+    };
+    // Who the person is there, kept on the link for "assigned to me",
+    // Mine and Take it; an id they typed is theirs to keep.
+    match &link.me {
+        _ if link.not_me && link.me.is_none() => {
+            link.me_note = Some(format!(
+                "You said {hub}'s answer of who you are on {} isn't you: check again once it's right.",
+                link.system.title()
+            ));
+        }
+        Some(me) => {
+            if let Err(e) = sync::check_me(link.system, me) {
+                return refusal(StatusCode::BAD_REQUEST, &e);
+            }
+        }
+        None => match sync::identify(&*remote, link.system).await {
+            Ok(sync::Who::Person(me)) => {
+                link.me = Some(me.id);
+                link.me_name = Some(me.name);
+                link.me_source = Some(workforce_desk::board::MeSource::Vouched);
+            }
+            Ok(other) => link.me_note = other.why_not(&hub, link.system),
+            Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+        },
     }
     // A Linear team is named by its key and its id: the two must be one team
     // on that hub, so a link never syncs a team other than the one named.
     if link.system == System::Linear {
-        let remote = match r.sync.offered(link.system, &link.via, &person).await {
-            Ok(remote) => remote,
-            Err(p) => {
-                return refusal(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    &paused_words(&hub, link.system, &p),
-                )
-            }
-        };
         let teams = match sync::call(&*remote, link.system, "linear.teams_list", json!({})).await {
             Ok(t) => teams_of(&t),
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
@@ -1072,6 +1179,85 @@ async fn sync_board(
             r.sync.kick(id);
             StatusCode::ACCEPTED.into_response()
         }
+        Ok(None) => refusal(StatusCode::CONFLICT, "That board isn't synced."),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Take it: the ticket's issue is assigned to the person there, as
+/// themselves, through the route its board syncs by.
+async fn take_ticket(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let person = person!(r, h, q);
+    let desk = &r.sync.desk;
+    let board = match desk.ticket(id).await {
+        Ok(t) => t.ticket.board,
+        Err(e) => return e.into_response(),
+    };
+    let s = match desk.board_sync(board).await {
+        Ok(Some((_, s))) => s,
+        Ok(None) => return refusal(StatusCode::CONFLICT, "That ticket's board isn't synced."),
+        Err(e) => return e.into_response(),
+    };
+    // A board syncs as the person who linked it; Take it assigns to them.
+    if s.person != person {
+        return refusal(
+            StatusCode::FORBIDDEN,
+            "Only the person who linked this board takes its issues.",
+        );
+    }
+    let remote = match r.sync.remote(s.system, &s.via, &person).await {
+        Ok(remote) => remote,
+        Err(p) => {
+            let hub = r.sync.hub_name(&s.via).await;
+            return refusal(StatusCode::CONFLICT, &paused_words(&hub, s.system, &p));
+        }
+    };
+    let hub = r.sync.hub_name(&s.via).await;
+    match desk
+        .take_ticket(id, &*remote, &hub, &workforce_desk::crew::By::you())
+        .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Asks the hub again who the person is on a board's Jira or Linear (the
+/// board's "that's not me" or "check again"), and keeps its answer.
+async fn recheck_me(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let person = person!(r, h, q);
+    let desk = &r.sync.desk;
+    let s = match desk.board_sync(id).await {
+        Ok(Some((_, s))) => s,
+        Ok(None) => return refusal(StatusCode::CONFLICT, "That board isn't synced."),
+        Err(e) => return e.into_response(),
+    };
+    if s.person != person {
+        return refusal(
+            StatusCode::FORBIDDEN,
+            "Only the person who linked this board checks who they are on it.",
+        );
+    }
+    let hub = r.sync.hub_name(&s.via).await;
+    let remote = match r.sync.remote(s.system, &s.via, &person).await {
+        Ok(remote) => remote,
+        Err(p) => return refusal(StatusCode::CONFLICT, &paused_words(&hub, s.system, &p)),
+    };
+    if let Err(e) = desk.recheck_me(id, &*remote, &hub).await {
+        return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}"));
+    }
+    match desk.board_sync(id).await {
+        Ok(Some((b, _))) => Json(b).into_response(),
         Ok(None) => refusal(StatusCode::CONFLICT, "That board isn't synced."),
         Err(e) => e.into_response(),
     }

@@ -800,6 +800,7 @@ pub async fn mount(
         .await
         .context("opening the desk registry")?;
     let cancel_crew = cancel.clone();
+    let cancel_uplink = cancel.clone();
     let cancel_sync = cancel.clone();
     let floor = workforce_desk::Floor {
         pricer: Some(Arc::new(crate::desk_ledger::HubPricer::new(Arc::clone(
@@ -846,6 +847,8 @@ pub async fn mount(
     desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
+    let browser_routes =
+        crate::desk_browser::install(state, config, computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
     desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
     // The Codex sessions an agent starts run as fast as it does.
@@ -867,6 +870,22 @@ pub async fn mount(
         crate::desk_crew::Timing::default(),
         cancel_crew,
     );
+    // The boss links this engine holds, its key, and its uplinks to their
+    // boss hubs.
+    let app = app.merge(crate::gateway::hardened(crate::desk_uplink::routes(
+        Arc::clone(state),
+    )));
+    crate::desk_uplink::start(
+        crate::desk_uplink::Uplink {
+            state: Arc::clone(state),
+            crew: Arc::clone(&crew),
+            limits: config.desk.bosses.clone(),
+            #[cfg(test)]
+            dial: None,
+            rates: Default::default(),
+        },
+        cancel_uplink,
+    );
     // The relay to the person's machines, Desk's native side's alone.
     let app = app.merge(crate::gateway::hardened(crate::desk_crew::relay::routes(
         Arc::clone(state),
@@ -878,6 +897,7 @@ pub async fn mount(
         config,
         desk.clone(),
     )));
+    let app = app.merge(crate::gateway::hardened(browser_routes));
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(board_sync_routes));

@@ -759,6 +759,10 @@ pub struct BossView {
     pub name: String,
     /// `watch`, `suggest` or `act`.
     pub level: String,
+    /// It is unbound now: Act fully anywhere with every switch on, and its
+    /// budget, when set, not spent. Left out when it isn't.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unbound: bool,
     pub state: BossState,
     /// What holds its turns, in plain words, while something does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1981,6 +1985,7 @@ mod tests {
             agent: "sarah".into(),
             name: "Sarah".into(),
             level: "act".into(),
+            unbound: false,
             state: BossState::Idle,
             paused: None,
             spend: None,

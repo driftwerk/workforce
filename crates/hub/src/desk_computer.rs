@@ -14,6 +14,12 @@
 //!
 //! An agent with no `[computer]` is Full access, asking first; its own
 //! folder is the roots its tools already have (`tool_roots`).
+//!
+//! `browser.*` is decided too, by where the agent stands as an overseer
+//! ([`browsing_of`]): reading a page runs; changing one asks below unbound,
+//! "Allow for this session" holding for one site; after a page that scanned
+//! hostile it asks every time. Desk's browser hooks (`desk_browser`) record
+//! what it did, with a screenshot.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +33,9 @@ use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_core::computer::{By, ComputerAccess, Effect, Refusal, Refused, Verdict};
 use workforce_core::policy::PermissionChoice;
 use workforce_desk::computer::policy::{namespace, shown, Namespace};
-use workforce_desk::computer::{Activity, AgentPolicy, CallFacts, Computer, NewGrant};
+use workforce_desk::computer::{
+    browser_site, Activity, AgentPolicy, Browser, Browsing, CallFacts, Computer, NewGrant,
+};
 
 /// How long "Allow for this session" lasts at most.
 pub const SESSION_HOURS: i64 = 12;
@@ -38,6 +46,99 @@ use crate::serve::ComputerSubject;
 pub struct HubComputerGate {
     computer: Computer,
     policy: AgentPolicy,
+}
+
+/// The browser tools that only read: everything else in `browser.*`
+/// changes a page.
+pub const BROWSER_READS: &[&str] = workforce_skills::adapters::browser::READS;
+
+/// Whether `connector` is what a browser call is kept under: `browser…` in
+/// Desk's own, `chrome…` in the person's.
+pub fn is_browser_key(connector: &str) -> bool {
+    ["browser", "chrome"].iter().any(|k| {
+        connector == *k
+            || connector
+                .strip_prefix(k)
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
+    })
+}
+
+/// Whether `tool` is a browser tool that changes a page.
+pub fn changes_a_page(tool: &str) -> bool {
+    tool.starts_with("browser.") && !BROWSER_READS.contains(&tool)
+}
+
+/// Whether an overseer of this hub is unbound: Act fully, anywhere, every
+/// `[oversight.act]` switch on ([`Oversight::unbound`]), and overseeing.
+///
+/// [`Oversight::unbound`]: workforce_common::oversight::Oversight::unbound
+pub fn unbound(o: &workforce_common::oversight::Oversight) -> bool {
+    o.enabled && o.unbound(true)
+}
+
+/// Where an agent stands in a browser, by its `[oversight]`: an overseer
+/// at Watch or Suggest only suggests, an unbound one acts freely, and
+/// every other agent (and an overseer at Act short of unbound) asks first.
+pub fn browsing_of(o: &workforce_common::oversight::Oversight) -> Browsing {
+    use workforce_common::oversight::Level;
+    match o.level {
+        _ if !o.enabled => Browsing::Asks,
+        Level::Watch | Level::Suggest => Browsing::Suggests,
+        _ if unbound(o) => Browsing::Unbound,
+        _ => Browsing::Asks,
+    }
+}
+
+/// This agent's browser standing, read from its `config.toml`. One that
+/// can't be read asks first.
+fn browsing_for(subject: &ComputerSubject) -> Browsing {
+    match AgentWorkspaceConfig::load(&subject.workspace) {
+        Ok(Some(config)) => config
+            .oversight()
+            .map(|o| browsing_of(&o))
+            .unwrap_or_default(),
+        _ => Browsing::Asks,
+    }
+}
+
+/// The page `agent`'s browser is on for the person in scope, and whether
+/// a page it read scanned hostile.
+fn page_now(agent: &str) -> (Option<String>, bool) {
+    let user = current_user();
+    match workforce_skills::adapters::browser::page_state(agent, &user) {
+        Some(page) => (
+            workforce_skills::adapters::browser::origin_of(&page.url),
+            page.hostile,
+        ),
+        None => (None, false),
+    }
+}
+
+fn current_user() -> String {
+    CURRENT_USER_ID
+        .try_with(|u| u.clone())
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| workforce_agent::runner::SYSTEM_USER_ID.to_string())
+}
+
+/// Who judges, call by call, whether an agent is unbound in the browser
+/// now: the crew (Act fully in force, its budget not spent) in a turn the
+/// person whose Desk this is started and is in. Installed with Desk's
+/// browser; without it, no agent is unbound in the browser.
+pub type UnboundJudge = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+static JUDGE: std::sync::OnceLock<UnboundJudge> = std::sync::OnceLock::new();
+
+/// Installs the judge, once.
+pub fn judge_unbound_with(judge: UnboundJudge) -> bool {
+    JUDGE.set(judge).is_ok()
+}
+
+/// Whether `agent`, unbound by its settings, is unbound for this call. With
+/// no judge installed, it isn't: unbound is never assumed.
+fn unbound_now(agent: &str) -> bool {
+    JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
 /// Where the person's home is.
@@ -146,12 +247,7 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
 /// verdict.
 fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
-    let desk = data
-        .parent()
-        .filter(|hub| hub.file_name().is_some_and(|n| n == "hub"))
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    let mut out = vec![desk.unwrap_or(data)];
+    let mut out = vec![crate::desk_folder::of(config).unwrap_or(data)];
     out.push(home.join("Library/Keychains"));
     out
 }
@@ -240,6 +336,10 @@ impl HubComputerGate {
                 // Commands can't be contained yet (AC5).
                 contained: false,
                 connectors: connectors_of(subject),
+                browser: Browser {
+                    browsing: browsing_for(subject),
+                    hostile: false,
+                },
             },
         }
     }
@@ -290,9 +390,12 @@ impl HubComputerGate {
             _ => None,
         });
         // A session allowance is scoped to the same folder an "always" would
-        // be: where no folder can be offered, neither can it.
+        // be: where no folder can be offered, neither can it. A browser's
+        // holds for its site, and no "always" is offered there.
+        let site =
+            matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector));
         options.allow_session =
-            always.is_some() && choices.iter().any(|c| matches!(c, Choice::AllowSession));
+            (always.is_some() || site) && choices.iter().any(|c| matches!(c, Choice::AllowSession));
         options.allow_in_folder = always;
         options.facts = Some(Box::new(facts_of(effect, home, why)));
         options
@@ -502,13 +605,27 @@ impl ComputerGate for HubComputerGate {
         match namespace(tool) {
             Some(Namespace::Computer) => true,
             Some(Namespace::Connector) => {
-                workforce_common::connector_binding::connector_of(tool).is_some()
+                tool.starts_with("browser.")
+                    || workforce_common::connector_binding::connector_of(tool).is_some()
             }
             None => false,
         }
     }
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
+        // A browser call says itself what it opens (a file, as a read) or
+        // the origin it acts on; one that can't is kept under the origin
+        // its page was last seen on.
+        if tool.starts_with("browser.") {
+            if matches!(effect, Effect::Read { .. } | Effect::Connector { .. }) {
+                return effect;
+            }
+            let (origin, _) = page_now(&self.policy.agent);
+            return Effect::Connector {
+                connector: browser_site(origin.as_deref()),
+                write: changes_a_page(tool),
+            };
+        }
         match (
             effect,
             workforce_common::connector_binding::connector_of(tool),
@@ -589,6 +706,13 @@ impl ComputerGate for HubComputerGate {
                 ..
             }
         );
+        let their_chrome = matches!(
+            &decision.verdict,
+            Verdict::Ask {
+                why: workforce_core::computer::Why::TheirChrome,
+                ..
+            }
+        );
         let facts = self.facts("", &decision.effect);
         let person = facts
             .person
@@ -603,10 +727,14 @@ impl ComputerGate for HubComputerGate {
             Effect::Move { .. } => (vec![Ability::Write, Ability::Delete], None),
             Effect::Exec { .. } => (vec![Ability::Run], None),
             Effect::Session { .. } => (vec![Ability::Session], None),
-            Effect::Connector {
-                connector,
-                write: true,
-            } => (vec![Ability::ConnectorWrite], Some(connector.clone())),
+            // "Use my Chrome for this session" is kept for the Chrome as a
+            // whole; a browser's other answers for their site.
+            Effect::Connector { .. } if their_chrome => {
+                (vec![Ability::ConnectorWrite], Some("chrome".to_string()))
+            }
+            Effect::Connector { connector, write } if *write || is_browser_key(connector) => {
+                (vec![Ability::ConnectorWrite], Some(connector.clone()))
+            }
             _ => eyre::bail!("nothing to keep for this call"),
         };
         let session = matches!(choice, PermissionChoice::AllowSession);
@@ -643,7 +771,49 @@ impl ComputerGate for HubComputerGate {
             };
             self.block_on(self.computer.store().add_grant(&grant))?;
         }
+        // Allowing the Chrome to open a site allows that site too: one
+        // question, not two, for the first page.
+        if let (true, Effect::Connector { connector, .. }) = (their_chrome, &decision.effect) {
+            if connector.starts_with("chrome-visit:") {
+                let grant = NewGrant {
+                    hub: self.policy.hub.clone(),
+                    agent: self.policy.agent.clone(),
+                    person,
+                    ability: Ability::ConnectorWrite,
+                    folder: None,
+                    connector: Some(connector.clone()),
+                    session_id,
+                    expires_at: session
+                        .then(|| chrono::Utc::now() + chrono::Duration::hours(SESSION_HOURS)),
+                    run: None,
+                    run_name: None,
+                };
+                self.block_on(self.computer.store().add_grant(&grant))?;
+            }
+        }
         Ok(())
+    }
+
+    fn unbound(&self) -> bool {
+        self.policy.browser.browsing == Browsing::Unbound && unbound_now(&self.policy.agent)
+    }
+
+    fn asks_unattended(&self, tool: &str) -> bool {
+        tool.starts_with("browser.")
+    }
+
+    fn refuses_unattended(&self, tool: &str, effect: &Effect) -> Option<String> {
+        // A change to a page, or anything in the person's own Chrome.
+        let acts = match effect {
+            Effect::Connector { connector, write } => *write || connector.starts_with("chrome"),
+            _ => false,
+        };
+        (tool.starts_with("browser.") && acts).then(|| {
+            format!(
+                "{} changes a page only in a turn you're in, so this job didn't. Ask it in Desk.",
+                self.policy.name
+            )
+        })
     }
 
     fn asks_nothing(&self) -> bool {
@@ -667,9 +837,19 @@ impl ComputerGate for HubComputerGate {
         if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
             return self.unreachable();
         }
-        let reached = tokio::task::block_in_place(|| {
-            handle.block_on(self.computer.verdict(&self.policy, &facts))
-        });
+        // A browser call reads what its page scanned as, now, and is
+        // unbound only as the crew judges this turn.
+        let mut policy = std::borrow::Cow::Borrowed(&self.policy);
+        if tool.starts_with("browser.") {
+            let agent = &self.policy.agent;
+            let mine = policy.to_mut();
+            mine.browser.hostile = page_now(agent).1;
+            if mine.browser.browsing == Browsing::Unbound && !unbound_now(agent) {
+                mine.browser.browsing = Browsing::Asks;
+            }
+        }
+        let reached =
+            tokio::task::block_in_place(|| handle.block_on(self.computer.verdict(&policy, &facts)));
         reached.unwrap_or_else(|e| {
             warn!(agent = %self.policy.agent, tool, error = %format!("{e:#}"), "computer verdict unreachable");
             self.unreachable()
@@ -677,6 +857,30 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn record(&self, record: Record) {
+        // What a browser read, or did on its own, Desk's browser hooks record
+        // as it is done, with its page and a screenshot; only what was asked
+        // or refused is recorded here.
+        if record.tool.starts_with("browser.")
+            && matches!(record.decision.verdict, Verdict::Run { by: By::Rule })
+        {
+            return;
+        }
+        // A browser call that won't run takes with it what it was decided
+        // for: the next call is decided afresh. (A hostile page's flag is
+        // never lifted here: only the person's Stop lifts it.)
+        if record.tool.starts_with("browser.")
+            && matches!(
+                record.outcome,
+                Outcome::Refused | Outcome::Declined | Outcome::NotAnswered | Outcome::Unattended
+            )
+        {
+            workforce_skills::adapters::browser::forget_decision(
+                &self.policy.agent,
+                &current_user(),
+                &record.tool,
+                &record.input,
+            );
+        }
         let activity = self.activity(&record);
         let computer = self.computer.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -821,6 +1025,69 @@ mod tests {
                 ..
             } => "asks once",
             GateOutcome::RequireApproval { .. } => "asks, offering always",
+        }
+    }
+
+    /// Desk's browser keeps its profiles in Desk's own folder, which no
+    /// agent's file tools reach, its own folder or Full access included.
+    #[test]
+    fn desks_browser_profiles_are_kept_from_every_agent() {
+        let mut hub = hub();
+        assert_eq!(
+            crate::desk_folder::browser_profiles(&hub.config),
+            None,
+            "only on Desk"
+        );
+        hub.config.desk.enabled = true;
+        let root =
+            crate::desk_folder::browser_profiles(&hub.config).expect("Desk's browser folder");
+        assert!(root.ends_with("Desk/browser"), "{}", root.display());
+        let home = home();
+        let policy = AgentPolicy {
+            hub: "local".into(),
+            agent: "allan".into(),
+            name: "Allan".into(),
+            access: ComputerAccess::default(),
+            own: vec![hub.subject.workspace.clone()],
+            works_in: Vec::new(),
+            withheld: withheld(&hub.config, &home),
+            config: own_config(&hub.subject.workspace),
+            scratch: scratch(),
+            home,
+            contained: false,
+            connectors: None,
+            browser: Browser::default(),
+        };
+        let profile = root.join("0123abcd/Default/Cookies");
+        for effect in [
+            Effect::Read {
+                paths: vec![profile.clone()],
+            },
+            Effect::Write {
+                paths: vec![profile.clone()],
+            },
+        ] {
+            let call = CallFacts {
+                tool: "filesystem.read".into(),
+                effect: effect.clone(),
+                person: Some("sarah".into()),
+                session_id: Some("s1".into()),
+                run: None,
+                folder: None,
+            };
+            let verdict = workforce_desk::computer::policy::verdict(&policy, false, &[], &call);
+            assert!(
+                matches!(
+                    &verdict,
+                    Verdict::Refuse {
+                        refusal: Refusal {
+                            rule: Refused::Withheld,
+                            ..
+                        }
+                    }
+                ),
+                "{effect:?}: {verdict:?}"
+            );
         }
     }
 
@@ -991,6 +1258,199 @@ mod tests {
             assert_eq!(decide_with("", "slack.send").0, "asks once");
         })
         .await;
+    }
+
+    /// Every `[oversight.act]` switch on, Act fully anywhere.
+    const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
+        act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
+        interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
+        hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
+
+    #[test]
+    fn unbound_is_act_fully_anywhere_with_every_switch_on() {
+        let parse = |body: &str| {
+            let value: toml::Value = toml::from_str(body).unwrap();
+            workforce_common::oversight::Oversight::of(value.get("oversight")).unwrap()
+        };
+        assert_eq!(browsing_of(&parse(UNBOUND)), Browsing::Unbound);
+        let one_off = UNBOUND.replace("hand_off = true", "hand_off = false");
+        assert_eq!(
+            browsing_of(&parse(&one_off)),
+            Browsing::Asks,
+            "one switch off"
+        );
+        let listed = UNBOUND.replace(
+            "anywhere = true",
+            "repos = [\"acme/web\"], budget_usd_per_day = 20",
+        );
+        assert_eq!(
+            browsing_of(&parse(&listed)),
+            Browsing::Asks,
+            "Act fully, not anywhere"
+        );
+        let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+        assert_eq!(browsing_of(&parse(&act)), Browsing::Asks, "at Act");
+        let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
+        assert_eq!(browsing_of(&parse(&suggest)), Browsing::Suggests);
+        let off = UNBOUND.replace("enabled = true", "enabled = false");
+        assert_eq!(browsing_of(&parse(&off)), Browsing::Asks, "not an overseer");
+        assert_eq!(browsing_of(&parse("")), Browsing::Asks, "no [oversight]");
+    }
+
+    /// Browser calls through the gate, by the agent's standing: reading
+    /// runs at every level; changing a page asks an agent that isn't an
+    /// overseer and one at Act, is refused at Suggest and runs unbound.
+    /// With nobody to ask, a change to a page is refused, never run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_calls_follow_the_agents_standing() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let config = hub.subject.workspace.join("config.toml");
+            let tools = tools(&hub.subject.workspace);
+            for name in [
+                "browser.snapshot",
+                "browser.navigate",
+                "browser.click",
+                "browser.fill",
+            ] {
+                tools.register(Arc::new(Elsewhere(name)));
+            }
+            let decide_with = |body: &str, tool: &str| {
+                std::fs::write(&config, body).unwrap();
+                let gate: Arc<dyn ComputerGate> = Arc::new(HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                ));
+                let g = gates(Some(Arc::clone(&gate)));
+                let asked =
+                    as_sarah(|| kind(&gate_tool_call(&g, &policy(), &tools, tool, &json!({}))));
+                let unattended =
+                    as_sarah(|| unattended_refusal(Some(gate.as_ref()), &tools, tool, &json!({})));
+                (asked, unattended.is_none(), gate.unbound())
+            };
+            let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
+            let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+                for read in ["browser.snapshot", "browser.navigate"] {
+                    assert_eq!(decide_with(body, read).0, "run", "{read} in {body:?}");
+                }
+            }
+            for body in ["", act.as_str()] {
+                let (asked, ran_unattended, unbound) = decide_with(body, "browser.click");
+                assert!(asked.starts_with("asks"), "{asked} in {body:?}");
+                assert!(!ran_unattended, "a job never clicks without the person");
+                assert!(!unbound);
+            }
+            // One that only suggests is refused.
+            assert_eq!(decide_with(&suggest, "browser.click").0, "refused");
+            // With no judge, unbound settings aren't enough: it asks.
+            let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
+            assert!(asked.starts_with("asks"), "fails closed: {asked}");
+            assert!(!unbound);
+            // The judge says this turn is unbound: it runs; a job never
+            // changes a page.
+            static JUDGED_OUT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            judge_unbound_with(Box::new(|_| {
+                !JUDGED_OUT.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+            assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
+            assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
+            // A judged-out turn (a job's, another person's, a spent budget)
+            // is not unbound however the settings read.
+            JUDGED_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
+            assert!(asked.starts_with("asks"), "{asked}");
+            assert!(!unbound);
+        })
+        .await;
+    }
+
+    /// "Use my Chrome for this session" keeps the Chrome for the session,
+    /// and the site it was opening; a change on a site keeps that site. A
+    /// browser's card offers this session, never "always".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_persons_chrome_answers_are_kept_for_the_session() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let visit = Effect::Connector {
+                connector: "chrome-visit:shop.example".into(),
+                write: false,
+            };
+            assert_eq!(
+                gate.effect_of("browser.navigate", visit.clone()),
+                visit,
+                "the tool's own effect stands"
+            );
+            let first = Decision {
+                verdict: as_sarah(|| gate.verdict("browser.navigate", &visit)),
+                effect: visit,
+                reach: None,
+            };
+            assert!(
+                matches!(
+                    &first.verdict,
+                    Verdict::Ask {
+                        why: workforce_core::computer::Why::TheirChrome,
+                        ..
+                    }
+                ),
+                "{:?}",
+                first.verdict
+            );
+            let card = as_sarah(|| gate.prompt(&first));
+            assert!(card.allow_session);
+            assert_eq!(card.allow_in_folder, None, "no always for a browser");
+            as_sarah(|| gate.keep(&first, PermissionChoice::AllowSession)).unwrap();
+            let mut kept: Vec<String> = store
+                .grants(Some("allan"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|g| g.grant.connector)
+                .collect();
+            kept.sort();
+            assert_eq!(kept, ["chrome", "chrome-visit:shop.example"]);
+            // Now the visit runs on the session's allowance.
+            let again = as_sarah(|| {
+                gate.verdict(
+                    "browser.navigate",
+                    &Effect::Connector {
+                        connector: "chrome-visit:shop.example".into(),
+                        write: false,
+                    },
+                )
+            });
+            assert!(
+                matches!(again, Verdict::Run { by: By::Session(_) }),
+                "{again:?}"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn browser_keys_are_desks_and_the_persons_chrome() {
+        for k in [
+            "browser",
+            "browser:a.test",
+            "chrome",
+            "chrome:a.test",
+            "chrome-visit:a.test",
+        ] {
+            assert!(is_browser_key(k), "{k}");
+        }
+        for k in ["linear", "browserx", "chromecast", "chrome-x:a"] {
+            assert!(!is_browser_key(k), "{k}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

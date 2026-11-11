@@ -322,7 +322,14 @@ pub fn prepare_allowed(gates: &ToolGates, tool_name: &str, input: &Value) -> Gat
         };
     }
     let exec_input = sub.original.is_some().then_some(sub.input);
-    let findings = scan_parameters(tool_name, input);
+    let mut findings = scan_parameters(tool_name, input);
+    // An unbound agent types what it is given into a page, as it is.
+    if gates.computer_gate.as_ref().is_some_and(|g| g.unbound()) {
+        use workforce_common::security_scanner::{typed_into_page, TYPED_CREDENTIAL_RULES};
+        findings.retain(|f| {
+            !(TYPED_CREDENTIAL_RULES.contains(&f.rule) && typed_into_page(tool_name, &f.field_path))
+        });
+    }
     if let Some(ParameterBlock { reason, message }) = parameter_block(&findings) {
         warn!(target: "sentinel", agent = %gates.agent_id, tool = %tool_name, %reason, "Parameter scan blocked tool");
         return GateOutcome::Blocked {
@@ -2245,6 +2252,73 @@ mod tests {
         assert!(
             matches!(from_slack, GateOutcome::Execute { .. }),
             "{from_slack:?}"
+        );
+    }
+
+    /// A gate that decides nothing, unbound or not.
+    struct Standing(bool);
+
+    impl ComputerGate for Standing {
+        fn decides(&self, _tool: &str) -> bool {
+            false
+        }
+        fn verdict(
+            &self,
+            _tool: &str,
+            _effect: &workforce_core::computer::Effect,
+        ) -> workforce_core::computer::Verdict {
+            workforce_core::computer::Verdict::Run {
+                by: workforce_core::computer::By::Rule,
+            }
+        }
+        fn record(&self, _record: crate::tools::computer::Record) {}
+        fn unbound(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// A credential typed into a page as it is is refused, unless the
+    /// agent is unbound; every other rule still holds for it.
+    #[test]
+    fn a_literal_credential_typed_into_a_page_runs_only_unbound() {
+        let calls = Arc::new(Calls::default());
+        let token = format!("lin_api_{}", "a1".repeat(15));
+        let input = serde_json::json!({ "selector": "#key", "value": token });
+        for (unbound, runs) in [(false, false), (true, true)] {
+            let mut g = gates(&calls, None, CascadeState::Allow);
+            g.computer_gate = Some(Arc::new(Standing(unbound)));
+            let outcome = prepare_allowed(&g, "browser.fill", &input);
+            assert_eq!(
+                matches!(outcome, GateOutcome::Execute { .. }),
+                runs,
+                "unbound={unbound}"
+            );
+        }
+        let mut g = gates(&calls, None, CascadeState::Allow);
+        g.computer_gate = Some(Arc::new(Standing(true)));
+        let ghp = format!("ghp_{}", "a".repeat(36));
+        let typed = serde_json::json!({ "selector": "#key", "value": ghp });
+        assert!(
+            matches!(
+                prepare_allowed(&g, "browser.fill", &typed),
+                GateOutcome::Execute { .. }
+            ),
+            "unbound, any credential may be typed into the page"
+        );
+        let elsewhere = serde_json::json!({ "selector": ghp, "value": "x" });
+        assert!(
+            matches!(
+                prepare_allowed(&g, "browser.fill", &elsewhere),
+                GateOutcome::Blocked { .. }
+            ),
+            "outside what is typed, the credential rule still holds"
+        );
+        assert!(
+            matches!(
+                prepare_allowed(&g, "web.fetch", &serde_json::json!({ "url": ghp })),
+                GateOutcome::Blocked { .. }
+            ),
+            "and in every other tool"
         );
     }
 }

@@ -94,6 +94,7 @@ mod memory_line;
 #[cfg(test)]
 mod memory_line_tests;
 mod memory_recall;
+mod modes;
 mod moves;
 #[cfg(test)]
 mod moves_tests;
@@ -603,6 +604,12 @@ impl Drop for CodexLink {
 
 #[derive(Default)]
 struct State {
+    /// The permission mode each Claude Code session last said it runs in
+    /// ([`crate::mode`]).
+    modes_seen: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode that doesn't ask each session was last started in, as a
+    /// boss kept it ([`SessionView::mode`]).
+    modes_started: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -905,6 +912,13 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while the modes Desk keeps are read and written
+    /// ([`crate::mode`]).
+    modes_write: tokio::sync::Mutex<()>,
+    /// Held while sessions are put back in their own modes.
+    modes_restoring: tokio::sync::Mutex<()>,
+    /// Something changed that may end a mode since the restore last looked.
+    modes_dirty: std::sync::atomic::AtomicBool,
     /// Held while a move is made: two previews of one item never both go
     /// through, the second finding what it does changed.
     move_write: tokio::sync::Mutex<()>,
@@ -1558,6 +1572,9 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            modes_write: tokio::sync::Mutex::new(()),
+            modes_restoring: tokio::sync::Mutex::new(()),
+            modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
             grants: Mutex::default(),
@@ -1892,6 +1909,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.mode = live.and(state.modes_started.get(&r.id).copied());
         view
     }
 
@@ -3107,6 +3125,8 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.mode_lets(id, by.as_ref())?;
+        self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -3229,8 +3249,10 @@ impl Desk {
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
         self.boss_holds(id, Some(&by))?;
+        self.mode_lets(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
+        self.person_resumes(id, Some(&by)).await;
         let running = self.0.state.lock().live.contains_key(&id);
         if running {
             self.0.state.lock().acted.insert(id);
@@ -3394,6 +3416,11 @@ impl Desk {
         {
             self.boss_decides(id, approval, decision, boss)?;
         }
+        // Allowing what it asks drives it: in a mode that doesn't ask, only
+        // the person's or its unbound boss's.
+        if decision != Decision::Deny && decision != Decision::Cancel {
+            self.mode_lets_anyone(id, by.as_ref())?;
+        }
         let codex = self
             .0
             .state
@@ -3479,12 +3506,14 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        // The boss of a session it runs, checked in `decide`.
+        // The boss of a session it runs, checked in `decide`; an unbound
+        // boss answers Codex too, wherever it asks.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
-                && self
-                    .charge_of(id)
-                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
         };
         let by = by
             .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
@@ -3564,6 +3593,7 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.mode_lets_anyone(id, by.as_ref())?;
         let view = self.type_prompt(id, text, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(
@@ -4227,6 +4257,16 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
+        // The mode Desk keeps for it, as an overseer set it; one that
+        // doesn't ask is shown on its card while it runs in it.
+        let mode = self.mode_to_start(r.id).await;
+        {
+            let mut st = self.0.state.lock();
+            match mode.filter(|m| !m.asks()) {
+                Some(m) => st.modes_started.insert(r.id, m),
+                None => st.modes_started.remove(&r.id),
+            };
+        }
         // A boss served from a grant runs it: Desk's check of each call fails
         // closed. Kept with its process, so a hub that takes it back knows.
         let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
@@ -4257,6 +4297,7 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
+                    mode,
                     fail_closed,
                 });
                 (spec, None)
@@ -4281,6 +4322,7 @@ impl Desk {
                     prompt,
                     approve_for_me: r.approve_for_me,
                     fast: r.fast,
+                    mode,
                     env: &env,
                 });
                 let link =
@@ -4578,6 +4620,9 @@ impl Desk {
             .is_some_and(|l| l.token == token);
         if !authorised {
             return None;
+        }
+        if let Some(mode) = crate::mode::of_hook(body) {
+            self.0.state.lock().modes_seen.insert(id, mode);
         }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,

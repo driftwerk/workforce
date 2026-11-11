@@ -33,6 +33,8 @@ pub struct ClaudeSpawn<'a> {
     /// terminal, [`crate::first_run::claude_follows_terminal`]); none keeps
     /// the person's.
     pub theme: Option<&'a str>,
+    /// The permission mode to start in ([`crate::mode`]); none, its own.
+    pub mode: Option<crate::mode::Mode>,
     /// A boss served from a grant runs it: its pre-tool hook fails closed
     /// ([`hook_settings_for`]).
     pub fail_closed: bool,
@@ -136,6 +138,7 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         "--settings".to_string(),
         settings.to_string(),
     ]);
+    args.extend(s.mode.into_iter().flat_map(crate::mode::Mode::claude_args));
     // A session a boss served from a grant runs reads the person's own
     // settings and Desk's alone: none its repository brings (a pull or a
     // merge can add `.claude/settings.json`), which could switch hooks off
@@ -642,6 +645,7 @@ pub(crate) mod tests {
             approval_timeout_secs: 60,
             env: &env,
             theme: None,
+            mode: None,
             fail_closed: false,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
@@ -675,6 +679,7 @@ pub(crate) mod tests {
                 approval_timeout_secs: 60,
                 env: &env,
                 theme: None,
+                mode: None,
                 fail_closed,
             })
             .args
@@ -773,6 +778,7 @@ pub(crate) mod tests {
                 approval_timeout_secs: 60,
                 env: &env,
                 theme,
+                mode: None,
                 fail_closed: false,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();

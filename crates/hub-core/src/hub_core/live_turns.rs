@@ -621,8 +621,23 @@ impl LiveTurn {
     }
 }
 
+/// What the hub does when a turn ends, for each of its session ids: Desk
+/// lets go of the person's Chrome there.
+static ON_TURN_END: std::sync::OnceLock<TurnEnded> = std::sync::OnceLock::new();
+
+/// What runs for each session id of a turn that ended.
+pub type TurnEnded = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Sets what happens when a turn ends, once. False when it was set before.
+pub fn on_turn_end(f: TurnEnded) -> bool {
+    ON_TURN_END.set(f).is_ok()
+}
+
 impl Drop for LiveTurn {
     fn drop(&mut self) {
+        if let Some(ended) = ON_TURN_END.get() {
+            self.ids.iter().for_each(|id| ended(id));
+        }
         self.turns.unregister(&self.ids, self.entry.generation);
         self.entry.settled.cancel();
         self.pumps.iter().for_each(JoinHandle::abort);

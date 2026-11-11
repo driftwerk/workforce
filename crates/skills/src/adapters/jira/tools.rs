@@ -33,6 +33,20 @@ use super::markdown::markdown_to_adf;
 // ──────────────────────────────────────────────────────────────────────
 
 /// Wrap a JSON string field with security boundary markers if it contains content.
+/// The most of an issue's rendered description one `jira.search` row carries.
+const SEARCH_DESCRIPTION_MAX: usize = 8_000;
+
+/// `value`'s text cut to `max` characters, marked where it was cut; anything
+/// else as it is.
+fn clip_chars(value: &Value, max: usize) -> Value {
+    match value.as_str() {
+        Some(s) if s.chars().count() > max => {
+            Value::String(format!("{}…", s.chars().take(max).collect::<String>()))
+        }
+        _ => value.clone(),
+    }
+}
+
 fn wrap_field(value: &Value, source: &str) -> Value {
     match value.as_str() {
         Some(s) if !s.is_empty() => Value::String(wrap_external_content(s, source).wrapped_content),
@@ -315,11 +329,17 @@ impl Tool for JiraSearchTool {
             })
             .unwrap_or(default_fields);
 
+        // A description asked for comes rendered, as `jira.get_issue` gives it.
+        let described = fields.iter().any(|f| f == "description");
+        let labelled = fields.iter().any(|f| f == "labels");
         let mut body = json!({
             "jql": jql,
             "maxResults": max_results,
             "fields": fields,
         });
+        if described {
+            body["expand"] = json!("renderedFields");
+        }
         if let Some(token) = input.get("next_page_token").and_then(|v| v.as_str()) {
             body["nextPageToken"] = json!(token);
         }
@@ -337,16 +357,40 @@ impl Tool for JiraSearchTool {
                     .iter()
                     .map(|i| {
                         let f = &i["fields"];
-                        json!({
+                        let mut out = json!({
                             "key": i["key"],
                             "id": i["id"],
                             "summary": wrap_field(&f["summary"], "jira.search.summary"),
                             "status": f["status"]["name"],
+                            "status_category": f["status"]["statusCategory"]["key"],
                             "assignee": f["assignee"]["displayName"],
+                            "assignee_account_id": f["assignee"]["accountId"],
                             "priority": f["priority"]["name"],
                             "issuetype": f["issuetype"]["name"],
                             "updated": f["updated"],
-                        })
+                        });
+                        // A page of descriptions stays small: each is clipped
+                        // before it is wrapped; get_issue reads one whole.
+                        if described {
+                            out["description_html"] = wrap_field(
+                                &clip_chars(
+                                    &i["renderedFields"]["description"],
+                                    SEARCH_DESCRIPTION_MAX,
+                                ),
+                                "jira.search.description",
+                            );
+                        }
+                        if labelled {
+                            out["labels"] = Value::Array(
+                                f["labels"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|l| wrap_field(l, "jira.search.label"))
+                                    .collect(),
+                            );
+                        }
+                        out
                     })
                     .collect();
                 info!(count = summary.len(), "Jira search");
@@ -415,6 +459,7 @@ impl Tool for JiraGetIssueTool {
                     "summary": wrap_field(&f["summary"], "jira.get_issue.summary"),
                     "description_html": wrap_field(&rendered["description"], "jira.get_issue.description"),
                     "status": f["status"]["name"],
+                    "status_category": f["status"]["statusCategory"]["key"],
                     "issuetype": f["issuetype"]["name"],
                     "priority": f["priority"]["name"],
                     "assignee": {
@@ -712,6 +757,52 @@ impl Tool for JiraAssignIssueTool {
             Err(e) => Ok(ToolResult::from_report(
                 &e.wrap_err(format!("Failed to assign {key}")),
                 duration_ms,
+            )),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 6b. jira.myself
+// ──────────────────────────────────────────────────────────────────────
+
+jira_tool_struct!(JiraMyselfTool);
+
+#[async_trait]
+impl Tool for JiraMyselfTool {
+    fn name(&self) -> &str {
+        "jira.myself"
+    }
+    fn description(&self) -> &str {
+        "Who the Jira token in use belongs to: its accountId, display name and email, and whether it is your own token (personal) or one shared with others."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) }
+            }
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let client = resolve_or_fail!(self, input, start);
+        let path = format!("{REST}/myself");
+        // A shared token's account is whoever owns the token, not the caller.
+        let personal = client.token_is_personal();
+        match client.get(&path).await {
+            Ok(me) => Ok(ToolResult::success(
+                json!({
+                    "account_id": me["accountId"],
+                    "display_name": me["displayName"],
+                    "email": me["emailAddress"],
+                    "personal": personal,
+                }),
+                start.elapsed().as_millis() as u64,
+            )),
+            Err(e) => Ok(ToolResult::from_report(
+                &e.wrap_err("Failed to read who you are on Jira"),
+                start.elapsed().as_millis() as u64,
             )),
         }
     }
