@@ -388,24 +388,25 @@ async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_a
             mode,
         };
         use workforce_desk::mode::Mode;
+        // A mode that asks is suggested; one that doesn't isn't even that,
+        // as Desk would refuse it from the person's yes.
         for mode in Mode::ALL {
-            assert!(
-                matches!(crew.gate(&set(mode), &o), Gate::Suggest(_)),
-                "{mode:?}"
-            );
+            let gate = crew.gate(&set(mode), &o);
+            match mode.asks() {
+                true => assert!(matches!(gate, Gate::Suggest(_)), "{mode:?}"),
+                false => assert_eq!(gate, Gate::Refuse, "{mode:?}"),
+            }
         }
         o.act.set_mode = true;
         for mode in [Mode::Default, Mode::AcceptEdits, Mode::Plan] {
             assert_eq!(crew.gate(&set(mode), &o), Gate::Run, "{mode:?}");
         }
         for mode in [Mode::Auto, Mode::BypassPermissions] {
-            assert!(
-                matches!(crew.gate(&set(mode), &o), Gate::Suggest(_)),
-                "{mode:?}"
-            );
+            assert_eq!(crew.gate(&set(mode), &o), Gate::Refuse, "{mode:?}");
         }
         o.level = workforce_common::oversight::Level::Suggest;
         assert!(matches!(crew.gate(&set(Mode::Plan), &o), Gate::Suggest(_)));
+        assert_eq!(crew.gate(&set(Mode::Auto), &o), Gate::Refuse);
     })
     .await;
 }
@@ -645,6 +646,202 @@ async fn anywhere_ships_in_any_repository_and_the_hard_limits_still_hold() {
         assert!(held.output["suggested"].is_string(), "{held:?}");
         tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
         assert_eq!(decided(asked.await.unwrap()), "deny");
+    })
+    .await;
+}
+
+/// What ends an unbound boss's hold over a running session in auto mode.
+#[derive(Debug, Clone, Copy)]
+enum Ends {
+    BoxUnticked,
+    AnywhereOff,
+    BudgetSpent,
+    Released,
+    AnotherBoss,
+}
+
+/// A session running in auto mode, which an unbound boss set, mid-turn:
+/// when the boss stops being unbound over it, every boss action on it but
+/// stopping it waits, and once its turn ends Desk starts it again in place
+/// in its own mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
+    use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let budgeted = UNBOUND.replace(
+            "anywhere = true\n",
+            "anywhere = true\nbudget_usd_per_day = 1\n",
+        );
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.set_mode").then_some(())
+        })
+        .await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let tool = overseer.tools.get("crew.set_mode").unwrap();
+        for (i, ends) in [
+            Ends::BoxUnticked,
+            Ends::AnywhereOff,
+            Ends::BudgetSpent,
+            Ends::Released,
+            Ends::AnotherBoss,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config = match ends {
+                Ends::BudgetSpent => budgeted.clone(),
+                _ => UNBOUND.to_string(),
+            };
+            write_config(&overseer, &config);
+            super::super::config_saved(&overseer);
+            eventually("unbound", async || {
+                let (_, o) = crew.overseer_service()?;
+                crew.unbound(&o).then_some(())
+            })
+            .await;
+            let s = new_session(&d, &base, &format!("acme-{i}")).await;
+            hook_url(&base, s.id).await;
+            d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            eventually("Desk to know it is unbound", async || {
+                d.acts_fully_in(s.id, "desk").then_some(())
+            })
+            .await;
+            let done = tool
+                .execute(
+                    json!({"session_id": s.id.to_string(), "mode": "auto", "reason": "Routine."}),
+                )
+                .await
+                .unwrap();
+            assert!(done.output["done"].is_string(), "{ends:?}: {done:?}");
+            let url = started_in(&base, s.id, "auto").await;
+            assert_eq!(
+                d.view(s.id).unwrap().mode,
+                Some(workforce_desk::mode::Mode::Auto)
+            );
+            // It works on a turn.
+            hook(
+                &url,
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1",
+                    "tool_input": {"command": "npm test"}}),
+            )
+            .await;
+            eventually("its turn", async || {
+                (d.view(s.id).unwrap().state == workforce_desk::model::SessionState::Working)
+                    .then_some(())
+            })
+            .await;
+            let before = starts_of(&base, s.id);
+            match ends {
+                Ends::BoxUnticked => {
+                    write_config(
+                        &overseer,
+                        &UNBOUND.replace("interrupt = true", "interrupt = false"),
+                    );
+                    super::super::config_saved(&overseer);
+                }
+                Ends::AnywhereOff => {
+                    write_config(
+                        &overseer,
+                        &UNBOUND.replace("anywhere = true", "anywhere = false"),
+                    );
+                    super::super::config_saved(&overseer);
+                }
+                Ends::BudgetSpent => {
+                    d.store()
+                        .ledger_write(
+                            s.id,
+                            Engine::Claude,
+                            None,
+                            &[workforce_desk::ledger_store::Kept {
+                                spend: Spend {
+                                    key: uuid::Uuid::new_v4().to_string(),
+                                    at: chrono::Utc::now(),
+                                    model: Some("claude-opus-5-5".into()),
+                                    tokens: Tokens {
+                                        input: 100,
+                                        ..Default::default()
+                                    },
+                                    usd: Some(5.0),
+                                    priced: Priced::Reported,
+                                    billing: None,
+                                },
+                                billing: Billing::Key,
+                                account: None,
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                }
+                Ends::Released => {
+                    d.release(s.id, &By::you()).await.unwrap();
+                }
+                Ends::AnotherBoss => {
+                    d.take_on(
+                        s.id,
+                        &Party::manager("mia", "Mia"),
+                        How::Handed,
+                        &Default::default(),
+                        &By::you(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            // Until it is back in its own mode, the boss may only stop it.
+            let deploy = Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Run the deploy".into(),
+                reply_to: None,
+            };
+            let why = eventually("the boss held", async || {
+                let (_, o) = crew.overseer_service()?;
+                match crew.gate(&deploy, &o) {
+                    Gate::Suggest(why) if why.contains("still runs in auto mode") => Some(why),
+                    _ => None,
+                }
+            })
+            .await;
+            assert!(
+                why.contains("put back in its own mode") || why.contains("puts it back"),
+                "{why}"
+            );
+            let (_, o) = crew.overseer_service().unwrap();
+            assert_eq!(
+                crew.gate(&Action::Interrupt { session: s.id }, &o),
+                Gate::Run
+            );
+            assert_eq!(
+                d.view(s.id).unwrap().mode,
+                Some(workforce_desk::mode::Mode::Auto),
+                "{ends:?}: mid-turn"
+            );
+            // Its turn ends: it starts again in its own mode.
+            hook(&url, json!({"hook_event_name": "Stop"})).await;
+            let args = next_start(&base, s.id, &before).await;
+            assert!(!args.contains("--permission-mode"), "{ends:?}: {args}");
+            eventually("its card", async || {
+                d.view(s.id).unwrap().mode.is_none().then_some(())
+            })
+            .await;
+            eventually("said in Activity", async || {
+                d.activity(Filter::All, None, 80)
+                    .await
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|e| {
+                        e.text
+                            .starts_with(&format!("put acme-{i} back in its own mode"))
+                    })
+                    .then_some(())
+            })
+            .await;
+        }
     })
     .await;
 }

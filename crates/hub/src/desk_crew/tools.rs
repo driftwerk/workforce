@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde_json::{json, Value};
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_common::oversight::{Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_desk::charge::Wheel;
 use workforce_desk::crew::{self, Item, ItemState};
 use workforce_desk::scope::Seen;
@@ -401,9 +401,15 @@ impl CrewTool {
         let by = crew.by_boss(&b.service, reason);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
-            Gate::Refuse => {
-                Err("You only watch the crew: tell the person what you would do instead.".into())
-            }
+            Gate::Refuse => match &action {
+                Action::SetMode { mode, .. } if !mode.asks() && b.oversight.level != Level::Watch => {
+                    Err(format!(
+                        "Only an unbound overseer puts a session in {} mode, so Desk won't do it or suggest it; tell the person what you'd want instead.",
+                        mode.title()
+                    ))
+                }
+                _ => Err("You only watch the crew: tell the person what you would do instead.".into()),
+            },
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
                 let done = crew.perform(&action, by).await?;

@@ -146,7 +146,16 @@ impl Desk {
     /// id, as the hub reads their settings and spend: a boss left out
     /// doesn't act fully anywhere.
     pub fn set_full(&self, full: HashMap<String, charge::FullGrant>) {
-        self.0.state.lock().charges.full = full;
+        let changed = {
+            let mut st = self.0.state.lock();
+            let changed = st.charges.full != full;
+            st.charges.full = full;
+            changed
+        };
+        // A boss no longer unbound: its sessions go back to their own modes.
+        if changed {
+            self.modes_changed();
+        }
     }
 
     /// Where `boss` acts fully now; nowhere when it doesn't.
@@ -493,6 +502,8 @@ impl Desk {
         let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
             return Ok(());
         };
+        self.boss_may_drive(id, &boss.party.id)
+            .map_err(DeskError::Conflict)?;
         let Some(c) = self.charge_of(id).filter(Charge::live) else {
             return Ok(());
         };
@@ -604,6 +615,8 @@ impl Desk {
             .charges
             .rows
             .insert(c.session, c.clone());
+        // Released, or another boss's: a mode the last one kept it in ends.
+        self.modes_changed();
         let view = self.charge_view(&c, wheel);
         let _ = self.0.events.send(DeskEvent::Charge {
             charge: Box::new(view.clone()),

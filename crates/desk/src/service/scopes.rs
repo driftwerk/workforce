@@ -274,6 +274,7 @@ impl Desk {
         bosses
             .into_iter()
             .map(|b| BossView {
+                unbound: self.full_of(&b.agent).unbound,
                 state: floor::boss_state(view, &b.agent),
                 paused: self.agent_held(&b.agent).filter(|why| !why.is_empty()),
                 spend: b.scope.group().and_then(|g| spend.get(g).cloned()),

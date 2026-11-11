@@ -900,6 +900,11 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while the modes Desk keeps are read and written
+    /// ([`crate::mode`]).
+    modes_write: tokio::sync::Mutex<()>,
+    /// Held while sessions are put back in their own modes.
+    modes_restoring: tokio::sync::Mutex<()>,
     /// Held while a move is made: two previews of one item never both go
     /// through, the second finding what it does changed.
     move_write: tokio::sync::Mutex<()>,
@@ -1548,6 +1553,8 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            modes_write: tokio::sync::Mutex::new(()),
+            modes_restoring: tokio::sync::Mutex::new(()),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
         }));

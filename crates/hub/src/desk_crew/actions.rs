@@ -495,8 +495,32 @@ impl CrewHub {
         // Unbound, every crew action runs: Desk answers what it asks for
         // itself (`boss_decides`), and only the hold while the person types
         // into a session it runs waits, as a courtesy.
+        // A session still running in a mode that doesn't ask, set while a
+        // boss was unbound, is driven only by an unbound boss that runs it
+        // until Desk has put it back in its own mode. Denying, stopping and
+        // interrupting it make nothing happen, so they still run.
+        let ends = matches!(
+            action,
+            Action::Deny { .. } | Action::Stop { .. } | Action::Interrupt { .. }
+        );
+        if let (Some(session), false) = (Self::session_of(action), ends) {
+            let boss = self.boss_id(o).unwrap_or_default();
+            if let Err(why) = self.desk.boss_may_drive(session, &boss) {
+                return match o.level {
+                    Level::Watch => Gate::Refuse,
+                    _ => Gate::Suggest(why.into()),
+                };
+            }
+        }
         if o.level != Level::Watch && self.unbound(o) {
             return self.unbound_gate(action, o);
+        }
+        // A mode that doesn't ask is an unbound overseer's alone: not even
+        // suggested, as Desk refuses it from anyone else.
+        if let Action::SetMode { mode, .. } = action {
+            if !mode.asks() {
+                return Gate::Refuse;
+            }
         }
         // Continuing a session in another engine sends its brief to that
         // engine's vendor: the person's call, every time.
@@ -650,18 +674,8 @@ impl CrewHub {
             Action::Handoff { .. } => false,
             // At Act, only to a mode that still asks before it runs a
             // command; any other is an unbound overseer's alone.
-            Action::SetMode { mode, .. } => {
-                if !mode.asks() {
-                    return Gate::Suggest(
-                        format!(
-                            "only an unbound overseer puts a session in {} mode",
-                            mode.title()
-                        )
-                        .into(),
-                    );
-                }
-                o.act.set_mode
-            }
+            // Only a mode that asks gets here.
+            Action::SetMode { .. } => o.act.set_mode,
         };
         if allowed {
             Gate::Run
@@ -1296,8 +1310,12 @@ impl CrewHub {
                 let name = set.view.label().to_string();
                 if let Some(why) = &set.not_started {
                     return Ok(format!(
-                        "stopped {name} to put it in {} mode, but it didn't start again ({why}); it is stopped in that mode and resumes in it",
-                        mode.title()
+                        "stopped {name} to put it in {} mode, but it didn't start again ({why}); it is stopped, and resumes in that mode {}",
+                        mode.title(),
+                        match mode.asks() {
+                            true => "whoever resumes it",
+                            false => "only while you are still unbound and still run it; otherwise in its own",
+                        }
                     ));
                 }
                 Ok(match (set.running, set.confirmed) {

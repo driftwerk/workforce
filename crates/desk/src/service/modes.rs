@@ -25,6 +25,10 @@ const MODES: &str = "hub.desk.modes";
 /// How long Desk waits for Claude Code to say the mode it started in.
 const READ_BACK: Duration = Duration::from_secs(15);
 
+/// How often Desk looks again for a session to put back in its own mode
+/// while one is mid-turn.
+const RESTORE_EVERY: Duration = Duration::from_secs(1);
+
 /// How long a session gets to stop before Desk starts it again.
 const STOP_WITHIN: Duration = Duration::from_secs(10);
 
@@ -59,6 +63,21 @@ impl Desk {
         }
     }
 
+    /// Reads the kept modes, changes them with `f`, and keeps what it made
+    /// of them, as one step against every other change of them.
+    async fn edit_modes<R>(
+        &self,
+        f: impl FnOnce(&mut HashMap<Uuid, Kept>) -> (R, bool),
+    ) -> Result<R, DeskError> {
+        let _one = self.0.modes_write.lock().await;
+        let mut modes = self.kept_modes().await;
+        let (out, changed) = f(&mut modes);
+        if changed {
+            self.keep_modes(&modes).await?;
+        }
+        Ok(out)
+    }
+
     async fn keep_modes(&self, modes: &HashMap<Uuid, Kept>) -> Result<(), DeskError> {
         let value = serde_json::to_value(modes).map_err(|e| DeskError::Internal(e.into()))?;
         self.0
@@ -82,17 +101,131 @@ impl Desk {
     /// doesn't ask is dropped (and the session starts in its own) unless
     /// the boss that set it is still unbound and still runs it.
     pub(crate) async fn mode_to_start(&self, id: Uuid) -> Option<Mode> {
-        let mut modes = self.kept_modes().await;
-        let kept = modes.get(&id)?.clone();
-        if kept.mode.asks() || self.unbound_runs(id, &kept.boss) {
-            return Some(kept.mode);
+        let decided = self
+            .edit_modes(|modes| {
+                let Some(kept) = modes.get(&id).cloned() else {
+                    return (None, false);
+                };
+                if kept.mode.asks() || self.unbound_runs(id, &kept.boss) {
+                    return (Some(kept.mode), false);
+                }
+                tracing::info!(%id, mode = kept.mode.as_str(), "its boss is no longer unbound over it, so it starts in its own mode");
+                modes.remove(&id);
+                (None, true)
+            })
+            .await;
+        decided.unwrap_or_else(|e| {
+            tracing::warn!(%id, error = %e, "dropping a session's kept mode failed; it starts in its own mode");
+            None
+        })
+    }
+
+    /// Whether boss `boss` may act on `id` now, as far as its mode goes:
+    /// while it runs in a mode that doesn't ask, only an unbound boss that
+    /// runs it may, until Desk has put it back in its own mode.
+    pub fn boss_may_drive(&self, id: Uuid, boss: &str) -> Result<(), String> {
+        let Some(mode) = self.0.state.lock().modes_started.get(&id).copied() else {
+            return Ok(());
+        };
+        if mode.asks() || self.unbound_runs(id, boss) {
+            return Ok(());
         }
-        tracing::info!(%id, mode = kept.mode.as_str(), "its boss is no longer unbound over it, so it starts in its own mode");
-        modes.remove(&id);
-        if let Err(e) = self.keep_modes(&modes).await {
-            tracing::warn!(%id, error = %e, "dropping a session's kept mode failed");
+        Err(format!(
+            "it still runs in {} mode, which only an unbound boss that runs it may drive; Desk puts it back in its own mode once its turn ends, and it's the person's until then",
+            mode.title()
+        ))
+    }
+
+    /// Something that decides whose modes hold changed (a boss's grant, a
+    /// charge): the sessions it affects go back to their own modes.
+    pub(crate) fn modes_changed(&self) {
+        let d = self.clone();
+        tokio::spawn(async move { d.restore_modes().await });
+    }
+
+    /// Drops each kept mode that doesn't ask whose boss is no longer
+    /// unbound over its session, and starts each running session still in
+    /// one again in its own mode: at once when it is between turns, else
+    /// once its turn ends.
+    async fn restore_modes(&self) {
+        // One at a time: another sees what this one leaves.
+        let Ok(_one) = self.0.modes_restoring.try_lock() else {
+            return;
+        };
+        use crate::model::SessionState as S;
+        loop {
+            let dropped = self
+                .edit_modes(|modes| {
+                    let before = modes.len();
+                    modes.retain(|id, k| k.mode.asks() || self.unbound_runs(*id, &k.boss));
+                    ((), modes.len() != before)
+                })
+                .await;
+            if let Err(e) = dropped {
+                tracing::warn!(error = %e, "dropping sessions' kept modes failed");
+            }
+            let kept = self.kept_modes().await;
+            let running: Vec<(Uuid, Mode)> = {
+                let st = self.0.state.lock();
+                st.modes_started
+                    .iter()
+                    .filter(|(id, m)| !m.asks() && st.live.contains_key(id))
+                    .filter(|(id, _)| !kept.contains_key(id))
+                    .map(|(id, m)| (*id, *m))
+                    .collect()
+            };
+            if running.is_empty() {
+                return;
+            }
+            let mut waiting = false;
+            for (id, mode) in running {
+                let Ok(view) = self.view(id) else { continue };
+                if view.pending.is_some()
+                    || matches!(view.state, S::Working | S::Blocked | S::Asking)
+                {
+                    waiting = true;
+                    continue;
+                }
+                match self.start_again(id).await {
+                    Ok(v) => self.note(By::desk("Its boss is no longer unbound over it.").event(
+                        Kind::Restarted,
+                        Some(Party::session(&v)),
+                        format!(
+                            "put {} back in its own mode from {} mode (started again in place; its conversation is kept)",
+                            v.label(),
+                            mode.title()
+                        ),
+                    )),
+                    Err(e) => {
+                        tracing::warn!(%id, error = %e, "a session didn't go back to its own mode; trying again");
+                        waiting = true;
+                    }
+                }
+            }
+            if waiting {
+                tokio::time::sleep(RESTORE_EVERY).await;
+            }
         }
-        None
+    }
+
+    /// Stops `id` and starts it again in place, resumed by id: within
+    /// [`STOP_WITHIN`], or not at all.
+    async fn start_again(&self, id: Uuid) -> Result<SessionView, DeskError> {
+        self.0.state.lock().modes_seen.remove(&id);
+        self.0.state.lock().acted.insert(id);
+        self.stop(id, None)?;
+        let until = tokio::time::Instant::now() + STOP_WITHIN;
+        while self.0.state.lock().live.contains_key(&id) {
+            if tokio::time::Instant::now() >= until {
+                return Err(DeskError::Conflict(format!(
+                    "it didn't stop within {} s",
+                    STOP_WITHIN.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        self.0.state.lock().acted.insert(id);
+        self.resume_checked(id, None, None).await
     }
 
     /// The person resumes `id` themselves: a mode that doesn't ask, which a
@@ -101,12 +234,16 @@ impl Desk {
         if !by.is_some_and(|b| b.party.kind == PartyKind::You) {
             return;
         }
-        let mut modes = self.kept_modes().await;
-        if modes.get(&id).is_some_and(|k| !k.mode.asks()) {
-            modes.remove(&id);
-            if let Err(e) = self.keep_modes(&modes).await {
-                tracing::warn!(%id, error = %e, "dropping a session's kept mode failed");
-            }
+        let dropped = self
+            .edit_modes(
+                |modes| match modes.get(&id).is_some_and(|k| !k.mode.asks()) {
+                    true => ((), modes.remove(&id).is_some()),
+                    false => ((), false),
+                },
+            )
+            .await;
+        if let Err(e) = dropped {
+            tracing::warn!(%id, error = %e, "dropping a session's kept mode failed");
         }
     }
 
@@ -162,35 +299,23 @@ impl Desk {
         }
         self.boss_holds(id, Some(&by))?;
         self.breaker_refuses_prompt(id, Some(&by))?;
-        let mut modes = self.kept_modes().await;
-        modes.insert(
-            id,
-            Kept {
-                mode,
-                boss: by.party.id.clone(),
-            },
-        );
-        self.keep_modes(&modes).await?;
+        let kept = Kept {
+            mode,
+            boss: by.party.id.clone(),
+        };
+        self.edit_modes(|modes| ((), modes.insert(id, kept.clone()) != Some(kept)))
+            .await?;
         let running = self.0.state.lock().live.contains_key(&id);
         let mut not_started = None;
         let view = if running {
-            self.0.state.lock().modes_seen.remove(&id);
-            self.0.state.lock().acted.insert(id);
-            self.stop(id, None)?;
-            let until = tokio::time::Instant::now() + STOP_WITHIN;
-            while self.0.state.lock().live.contains_key(&id) {
-                if tokio::time::Instant::now() >= until {
+            match self.start_again(id).await {
+                Ok(v) => v,
+                Err(DeskError::Conflict(why)) if self.0.state.lock().live.contains_key(&id) => {
                     return Err(DeskError::Conflict(format!(
-                        "it didn't stop within {} s, so Desk didn't start it again over it; it starts in {} mode once it has",
-                        STOP_WITHIN.as_secs(),
+                        "{why}, so Desk didn't start it again over it; it starts in {} mode once it has",
                         mode.title()
                     )));
                 }
-                tokio::time::sleep(Duration::from_millis(40)).await;
-            }
-            self.0.state.lock().acted.insert(id);
-            match self.resume_checked(id, None, None).await {
-                Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(%id, error = %e, "a session didn't start again in its new mode");
                     not_started = Some(e.to_string());
