@@ -74,7 +74,7 @@ pub struct ServedCall {
 }
 
 /// What became of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServedStatus {
     Ok,
