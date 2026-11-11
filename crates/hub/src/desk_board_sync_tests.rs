@@ -288,6 +288,32 @@ pub(crate) async fn remote_hub(
     for name in workforce_desk::board_sync::LINEAR_TOOLS {
         service.tools.register(Arc::new(FakeLinearTool(name)));
     }
+    serve_remote(fx, allow, jira).await
+}
+
+/// A remote hub of two agents, each with tools of its own: the default
+/// with none of Jira's, and `jira_on` (when named) with all of them.
+pub(crate) async fn remote_hub_of_agents(
+    dir: &std::path::Path,
+    jira_on: Option<&str>,
+) -> RemoteHub {
+    let fx = fixture(true);
+    let jira: Shared = Arc::default();
+    for (n, id) in ["default", "lattice"].into_iter().enumerate() {
+        let service = crate::serve::testing::plain_service(&dir.join(format!("agent-{n}"))).await;
+        if jira_on == Some(id) {
+            register_jira(&service.tools, &jira, &[]);
+        }
+        fx.state.registry.insert(id, service);
+    }
+    serve_remote(fx, &["jira.*"], jira).await
+}
+
+async fn serve_remote(
+    fx: crate::remote_mcp::testing::Fixture,
+    allow: &[&str],
+    jira: Shared,
+) -> RemoteHub {
     let state = Arc::try_unwrap(fx.state)
         .ok()
         .expect("the fixture's only handle");
@@ -428,6 +454,7 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         via: Via::Hub {
             hub: "atlas".into(),
         },
+        agent: None,
         filter,
         me: None,
         me_name: None,
@@ -572,7 +599,7 @@ async fn only_the_person_whose_desk_it_is_links_a_board() {
 }
 
 /// A hub that doesn't offer its Jira tools over remote MCP refuses the
-/// link, saying what its admin must add; nothing is linked.
+/// link, saying so in plain words; nothing is linked.
 #[tokio::test]
 async fn a_hub_without_jira_on_remote_mcp_refuses_the_link() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -591,13 +618,9 @@ async fn a_hub_without_jira_on_remote_mcp_refuses_the_link() {
             .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let said = body["error"].as_str().unwrap();
-        assert!(
-            said.contains("Atlas doesn't offer its Jira tools"),
-            "{said}"
-        );
-        assert!(
-            said.contains("Ask its admin to add `jira.*` to remote MCP"),
-            "{said}"
+        assert_eq!(
+            said,
+            "No agent on Atlas you can reach has Jira switched on."
         );
         let (status, _) = local
             .send(
@@ -1163,6 +1186,7 @@ async fn a_tool_a_hub_lacks_reads_as_missing() {
         &remote.url,
         &Secret::new(&remote.token).unwrap(),
         Arc::new(reqwest::Client::new()),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1365,6 +1389,90 @@ async fn a_link_that_isn_t_you_keeps_no_one() {
             .calls
             .iter()
             .any(|(t, _)| t == "jira.myself"));
+    })
+    .await;
+}
+
+// ── Picking the agent ────────────────────────────────────────────────────
+
+/// A hub whose default agent hasn't Jira switched on, but another the
+/// person may reach has: the dialog says "Jira through Lattice", the link
+/// keeps that agent and the sync goes through it; when it stops offering
+/// the tools, the agents are asked again.
+#[tokio::test]
+async fn a_board_syncs_through_the_agent_that_has_jira() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents(&dir.path().join("remote"), Some("lattice")).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &[]);
+        let local = local_hub(desk.clone(), dir.path());
+        let (status, body) = local.link_atlas(&remote).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["offers"]["jira"], true, "{body}");
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": { "kind": "all", "value": { "includeDone": false } } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"], json!({ "id": "lattice", "name": "Lattice" }));
+        assert_eq!(body["matches"], 1);
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                link_body(Filter::All { include_done: false }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["agent"], "lattice");
+        local.sync.pass_board(b.id, true).await.unwrap();
+        assert_eq!(desk.tickets(b.id, &Default::default()).await.unwrap().len(), 1);
+        // Paused as if its agent stopped offering the tools: asked again,
+        // it goes on through the one that has them.
+        desk.change_sync(b.id, |s| {
+            s.agent = Some("default".into());
+            s.paused = Some(Paused::Missing {
+                tools: vec!["jira.search".into()],
+            });
+        })
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.agent.as_deref(), s.paused), (Some("lattice"), None));
+    })
+    .await;
+}
+
+/// No agent the person may reach has Jira switched on: said plainly, with
+/// no config key in it.
+#[tokio::test]
+async fn no_agent_with_jira_is_said_plainly() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents(&dir.path().join("remote"), None).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "No agent on Atlas you can reach has Jira switched on."
+        );
+        assert_eq!(body["paused"]["kind"], "missing");
     })
     .await;
 }

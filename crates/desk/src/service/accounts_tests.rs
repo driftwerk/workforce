@@ -2571,7 +2571,7 @@ async fn a_machine_told_an_account_is_full_starts_new_sessions_on_the_next_and_s
                 .unwrap_err()
                 .to_string();
             assert!(
-                refused.contains("every Claude Code account here is at its limit")
+                refused.contains("every Claude Code account here is at its plan limit")
                     && refused.contains("Work")
                     && refused.contains("Personal"),
                 "{refused}"
@@ -3593,6 +3593,81 @@ async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_curre
         d.read_engine_now(Engine::Claude).await;
         assert!(d.0.state.lock().own_read);
         assert!(d.current_plan_keys().is_some(), "the filter is on");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_start_goes_ahead() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let december = now + chrono::Duration::days(20);
+        let week = now + chrono::Duration::days(3);
+        // The session at 34% and the week at 41%.
+        d.report_usage(both(34.0, 41.0, (3600, 86_400)), Some(a));
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            let hit = |window: &str, resets| crate::limit::LimitHit {
+                window: Some(window.into()),
+                resets_at: Some(resets),
+            };
+            // Extra usage spent until 1 Dec; Opus's weekly window spent.
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit("overage", december)));
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit("seven_day_opus", week)));
+        }
+        let standing = work_standing(&d, work);
+        assert_eq!(standing.full(now), None, "{standing:?}");
+        assert_eq!(standing.hit_until, None);
+        // A new session starts on the account.
+        d.create(session(dir.path(), None), None).await.unwrap();
+        // Extra usage spent while a reading shows the weekly window at
+        // 100%: the plan is full after all, until that window resets.
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.read_at = Some(chrono::Utc::now());
+            s.windows = vec![crate::usage::LimitWindow {
+                used_percent: 100.0,
+                resets_at: Some(week),
+                minutes: 10_080,
+            }];
+            let raw = Desk::raw_running(&st, a);
+            let hit = crate::limit::LimitHit {
+                window: Some("overage".into()),
+                resets_at: Some(december),
+            };
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
+        }
+        let standing = work_standing(&d, work);
+        assert_eq!(standing.hit_until, Some(week), "not December: {standing:?}");
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.windows.clear();
+            s.hit_at = None;
+            s.hit_until = None;
+            s.hit_window = None;
+        }
+        // The plan's own weekly window is a stop that fills it, and the
+        // refusal says which and when.
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            let hit = crate::limit::LimitHit {
+                window: Some("seven_day".into()),
+                resets_at: Some(week),
+            };
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
+        }
+        assert_eq!(work_standing(&d, work).full(now), Some(Some(week)));
     })
     .await;
 }
