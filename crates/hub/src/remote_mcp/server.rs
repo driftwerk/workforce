@@ -363,6 +363,28 @@ mod tests {
     use workforce_agent::tools::dispatch::ToolGates;
     use workforce_common::sentinel_config::SentinelConfig;
     use workforce_common::settings::RemoteMcpConfig;
+
+    /// The default surface offers every tool Desk's board sync calls, by
+    /// exact name, and none of either system's raw, delete or bulk tools.
+    #[test]
+    fn the_default_surface_offers_board_sync_by_name() {
+        let allow = RemoteMcpConfig::DEFAULT_TOOLS_ALLOW;
+        for tool in workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+            .iter()
+            .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        {
+            assert!(allow.contains(tool), "{tool} is not offered by default");
+        }
+        for wide in [
+            "jira.*",
+            "linear.*",
+            "jira.api",
+            "jira.delete_issue",
+            "linear.issue_bulk_update",
+        ] {
+            assert!(!allow.contains(&wide), "{wide} is offered by default");
+        }
+    }
     use workforce_policy::engine::PolicyEngine;
 
     use crate::mcp_turn::testing::text_of;

@@ -9104,8 +9104,9 @@ pub struct AgentDeskBossConfig {
 impl RemoteMcpConfig {
     /// Tool patterns exposed by default: authoring and running workflows,
     /// playbooks, schedules and skills of both kinds, vault access, the `agent.*`
-    /// collaboration tools, the `approval.*` bridge and `help`. Shell, code
-    /// and delivery tools stay opt-in.
+    /// collaboration tools, the `approval.*` bridge, `help`, and the Linear
+    /// and Jira tools Desk's board sync reads and writes through (by name).
+    /// Shell, code and delivery tools stay opt-in.
     pub const DEFAULT_TOOLS_ALLOW: &'static [&'static str] = &[
         "workflow",
         "playbook",
@@ -9127,6 +9128,27 @@ impl RemoteMcpConfig {
         "skill.*",
         "pipeline.*",
         "hubspot.*",
+        // Desk's board sync, by name: the raw, delete and bulk tools of
+        // both stay opt-in.
+        "jira.search",
+        "jira.get_issue",
+        "jira.create_issue",
+        "jira.update_issue",
+        "jira.list_transitions",
+        "jira.transition_issue",
+        "jira.add_comment",
+        "jira.get_project",
+        "jira.myself",
+        "linear.issue_list",
+        "linear.issue_get",
+        "linear.issue_search",
+        "linear.issue_create",
+        "linear.issue_update",
+        "linear.issue_link",
+        "linear.comment_add",
+        "linear.states_list",
+        "linear.teams_list",
+        "linear.viewer",
         "help",
     ];
 
