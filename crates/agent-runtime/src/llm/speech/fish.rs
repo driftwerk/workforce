@@ -190,7 +190,7 @@ mod tests {
             };
             let p = FishAudioSpeech::from_config(&cfg, KeySlot::fixed("k"));
             assert_eq!(p.model, FREE_MODEL, "{model:?}");
-            assert_eq!(p.markup(), Markup::of("fish_audio", model));
+            assert_eq!(p.markup(), Markup::FishS2, "the free model is an S2 voice");
         }
         let cfg = LlmSpeechConfig {
             provider: "fish_audio".into(),
