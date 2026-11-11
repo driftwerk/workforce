@@ -365,7 +365,7 @@ impl Desk {
             .map_err(DeskError::Internal)?
             .ok_or_else(|| {
                 DeskError::Conflict(format!(
-                    "{}'s sign-in is no longer in {}: add the account again",
+                    "{}'s sign-in is no longer in {}: sign it in again",
                     a.name,
                     self.accounts_store().unwrap_or("the store")
                 ))

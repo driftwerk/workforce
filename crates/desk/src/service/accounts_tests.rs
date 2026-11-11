@@ -688,7 +688,7 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .create(session(dir.path(), Some(Some(work))), None)
             .await
             .unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         let work_view = d.accounts().into_iter().find(|a| a.id == work).unwrap();
         assert!(
             !work_view.signed_in,
@@ -1529,7 +1529,7 @@ async fn an_accounts_sign_in_is_handed_over_whole_and_said_nowhere_else() {
         // Gone from the store: said, never an empty token.
         keys.delete(personal).unwrap();
         let gone = d.hand_over_account(personal).await.unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         // No such account.
         assert!(d.hand_over_account(Uuid::new_v4()).await.is_err());
     })
