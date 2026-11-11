@@ -299,6 +299,84 @@ impl Desk {
         approval: Uuid,
         boss: &str,
     ) -> Result<(), charge::Irreversible> {
+        let Some(pending) = self.pending_of(id, approval) else {
+            return Err(charge::Irreversible("already answered".into()));
+        };
+        self.boss_judges(id, &pending, boss)
+    }
+
+    /// Whether `id` may be run by a boss served from a grant: it isn't
+    /// running, or its CLI was launched with the pre-tool hook that fails
+    /// closed. One already running with the person's hook (which lets a
+    /// call go on when Desk can't answer) is restarted for it first.
+    pub fn servable_launch(&self, id: Uuid) -> bool {
+        self.0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_none_or(|l| l.fail_closed)
+    }
+
+    /// Whether a boss served from a grant runs `id` now.
+    pub fn served_runs(&self, id: Uuid) -> bool {
+        self.charge_of(id)
+            .filter(Charge::live)
+            .is_some_and(|c| crate::grant::is_served(&c.boss))
+    }
+
+    /// Why a tool call of `id`, a session a boss served from a grant runs,
+    /// is refused before it runs; none when Desk judges it safe, as it
+    /// would for that boss's answer to it ([`Self::boss_judges`]). Every
+    /// call is judged so, sub-agents' too, whatever the person's own allow
+    /// rules say: their rules are for the person, not for the boss.
+    pub fn served_refuses(
+        &self,
+        id: Uuid,
+        tool: &str,
+        input: &serde_json::Value,
+        cwd: Option<String>,
+    ) -> Option<String> {
+        let boss = self.charge_of(id).filter(Charge::live)?.boss;
+        if !crate::grant::is_served(&boss) {
+            return None;
+        }
+        let pending = crate::model::PendingApproval {
+            id: Uuid::nil(),
+            tool: tool.to_string(),
+            detail: String::new(),
+            since: Utc::now(),
+            answerable: false,
+            choices: Vec::new(),
+            why: None,
+            options: None,
+            request: Some(crate::model::Request {
+                tool: tool.to_string(),
+                input: input.clone(),
+                cwd,
+                read_only: false,
+            }),
+            call: None,
+            agent: None,
+            cli_session: None,
+        };
+        self.boss_judges(id, &pending, &boss).err().map(|why| {
+            format!(
+                "A boss on another hub runs this session, and this call {}: it needs the person, \
+                 in Desk.",
+                why.0
+            )
+        })
+    }
+
+    /// Whether `boss` may let `pending`, a request of `id`, go on itself:
+    /// what Desk reads in full and judges safe.
+    fn boss_judges(
+        &self,
+        id: Uuid,
+        pending: &crate::model::PendingApproval,
+        boss: &str,
+    ) -> Result<(), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
         let Some(mut bounds) = self.0.boss_bounds.lock().clone() else {
             return no("Desk can't judge requests for a boss yet");
@@ -308,11 +386,8 @@ impl Desk {
         let Ok(view) = self.view(id) else {
             return no("that session isn't there any more");
         };
-        let Some(pending) = self.pending_of(id, approval) else {
-            return no("already answered");
-        };
         let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
-        let mut facts = charge::facts_of(view.engine, &pending, &view, &bounds.home, moved);
+        let mut facts = charge::facts_of(view.engine, pending, &view, &bounds.home, moved);
         // Its folder as the disk spells it.
         if let Ok(own) = std::fs::canonicalize(&facts.own) {
             facts.own = own;
@@ -608,6 +683,20 @@ impl Desk {
         }
         charge::chargeable(&view, scope, &self.bossed())
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
+        // Only on an engine whose every call Desk checks and refuses when it
+        // can't: a stopped Codex session would come back without it.
+        if crate::grant::is_served(&boss.id) && !crate::engine::boss_safe(view.engine) {
+            return Err(DeskError::Conflict(format!(
+                "A boss on another hub runs only sessions Desk checks every call of, so not {}.",
+                view.label()
+            )));
+        }
+        if crate::grant::is_served(&boss.id) && !self.servable_launch(id) {
+            return Err(DeskError::Conflict(format!(
+                "{} runs without Desk's closed check of each call, so a boss on another hub can't run it; stop it, then hand it over.",
+                view.label()
+            )));
+        }
         let existing = self.charge_of(id).filter(Charge::live);
         if let Some(c) = existing.as_ref().filter(|c| c.boss == boss.id) {
             let wheel = self.wheel_of(id).unwrap_or(Wheel::Boss);
@@ -736,9 +825,25 @@ impl Desk {
         c.released_at = Some(now);
         c.updated_at = now;
         let boss = Party::manager(&c.boss, &self.boss_name(&c.boss));
+        let served = crate::grant::is_served(&c.boss);
         let wheel = c.wheel;
         let shown = self.put_charge(c, wheel).await?;
         self.charge_withdraw(id).await;
+        // A boss served from a grant let go of it: the turn it set going
+        // ends here, so nothing of its work goes on under the person's own
+        // rules. The person starts it again if they want it.
+        if served
+            && matches!(
+                view.state,
+                crate::model::SessionState::Working
+                    | crate::model::SessionState::Blocked
+                    | crate::model::SessionState::Asking
+            )
+        {
+            if let Err(e) = self.interrupt(id, Some(By::desk("Its boss no longer runs it."))) {
+                tracing::info!(%id, error = %e, "a session let go by its served boss wasn't interrupted");
+            }
+        }
         let name = view.label().to_string();
         let text = match by.party.kind {
             PartyKind::You => format!("took {name} back from {}", boss.name),

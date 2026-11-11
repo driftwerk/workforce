@@ -43,6 +43,10 @@ pub(crate) struct Scopes {
     /// When each group that was a boundary stopped being one: the main
     /// overseer sees its rows from then on, never its past. Kept too.
     opened: HashMap<String, DateTime<Utc>>,
+    /// Groups a grant here names a boss for, stopped or expired included,
+    /// until the grant is deleted: no other boss, the main overseer
+    /// included, sees inside them.
+    pub(crate) granted: HashSet<String>,
     /// Sessions being put in their group as they start: not a move.
     pub(crate) placing: HashSet<uuid::Uuid>,
     /// Sessions a confirmed move is moving: it does what the move does,
@@ -133,6 +137,7 @@ impl Scopes {
             .flatten()
             .filter_map(|b| b.scope.group().map(str::to_string))
             .chain(self.bounded.iter().cloned())
+            .chain(self.granted.iter().cloned())
             .collect()
     }
 }
@@ -377,6 +382,13 @@ impl Desk {
     /// sees, once the hub has said who the bosses are (before, there is one
     /// scope). One that isn't a boss reaches nothing.
     pub(crate) fn boss_reaches(&self, agent: &str, group: Option<&str>) -> bool {
+        // A boss served from a grant reaches its live grant's group alone.
+        if crate::grant::is_served(agent) {
+            return group.is_some_and(|g| {
+                self.grant_live(g)
+                    .is_ok_and(|grant| grant.boss.is_some_and(|b| b.party_id() == agent))
+            });
+        }
         let s = self.0.scopes.lock();
         let Some(bosses) = &s.bosses else {
             return true;
