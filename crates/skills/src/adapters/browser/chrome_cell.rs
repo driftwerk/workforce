@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY};
 
 use super::chrome::MyChrome;
+use super::client::Decided;
 use super::client::{
     fill_expression, host_of, select_option_expression, shown_expression,
     stage_screenshot_artifact, wait_budget_ms, POLL_BACKOFF_MS,
@@ -36,6 +37,9 @@ pub(super) struct ChromeCell {
     /// That conversation's key, which its allowances are kept under.
     pub(super) last_key: StdMutex<Option<String>>,
     pub(super) last_used: StdMutex<Instant>,
+    /// The site a call the person allowed opened: it may show without the
+    /// gate allowing a visit again.
+    visited: StdMutex<Option<String>>,
     pub(super) inner: Mutex<Option<MyChrome>>,
     dir: PathBuf,
 }
@@ -73,6 +77,7 @@ impl ChromeCell {
             last_session: StdMutex::new(None),
             last_key: StdMutex::new(None),
             last_used: StdMutex::new(Instant::now()),
+            visited: StdMutex::new(None),
             inner: Mutex::new(None),
             dir,
         }
@@ -95,12 +100,14 @@ impl ChromeCell {
     /// on (the web or blank, a site the list allows, one this session may
     /// visit), else it is blanked and nothing is done; and a call decided
     /// for one origin acts there or not at all.
-    async fn keep_page(&self, c: &MyChrome, decided: Option<Option<String>>) -> Result<()> {
+    async fn keep_page(&self, c: &MyChrome, decided: Option<Decided>) -> Result<()> {
         let url = self.url_of(c).await;
         let mut refused = (!may_show(&url))
             .then(|| kept_away(&host_of(&url).unwrap_or_else(|| "that page".into())).to_string());
         if refused.is_none() {
-            if let (Some(origin), Some(h)) = (super::address::origin_of(&url), hooks::hooks()) {
+            let origin = super::address::origin_of(&url);
+            let allowed = origin.is_some() && *self.visited.lock().unwrap() == origin;
+            if let (Some(origin), Some(h), false) = (origin, hooks::hooks(), allowed) {
                 refused = h.may_visit(&self.agent, &origin).err();
             }
         }
@@ -109,7 +116,7 @@ impl ChromeCell {
             untrusted::on(&self.key, "about:blank");
             return Err(eyre!("{why} Desk's tab is blank now."));
         }
-        if let Some(decided) = decided {
+        if let Some(Decided::Origin(decided)) = decided {
             if super::address::origin_of(&url) != decided {
                 return Err(eyre!(
                     "The page moved since this was decided, so nothing was done. Call again."
@@ -149,10 +156,16 @@ impl ChromeCell {
                     .max(self.config.console_log_capacity),
             )
             .await?;
+            attached.scan_into(&self.key);
             *guard = Some(attached);
         }
         let chrome = guard.as_ref().expect("just attached");
         let decided = super::client::decided(super::client::Backend::Chrome);
+        // A site the person allowed this call to open may show, in place of
+        // any allowed before, without the gate allowing it again.
+        if let Some(Decided::Visit(origin)) = &decided {
+            *self.visited.lock().unwrap() = origin.clone();
+        }
         self.keep_page(chrome, decided).await?;
         let out = op(chrome).await;
         if out.is_err() && !chrome.alive() {

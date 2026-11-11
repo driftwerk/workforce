@@ -29,8 +29,8 @@ pub use chrome::{
     available as chrome_available, default_user_data_dir as chrome_user_data_dir, MIN_CHROME,
 };
 pub use client::{
-    calm, close, close_backend, live, page_state, stop_session, turn_ended, Backend, BrowserClient,
-    Live, Which,
+    close, close_backend, forget_decision, live, page_state, stop_session, turn_ended, Backend,
+    BrowserClient, Live, Which,
 };
 pub use config::BrowserSkillConfig;
 pub use hooks::{install_hooks, BrowserHooks, Done, OnPage, Settings, Sites, Uses};
@@ -330,6 +330,7 @@ mod tests {
     /// What the test's hub holds back and keeps.
     struct TestHooks {
         done: std::sync::Mutex<Vec<Done>>,
+        asked_files: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
     impl BrowserHooks for TestHooks {
@@ -353,7 +354,14 @@ mod tests {
         fn record(&self, done: Done) {
             self.done.lock().unwrap().push(done);
         }
+        fn may_visit(&self, agent: &str, _origin: &str) -> Result<(), String> {
+            match agent == "visit-once-agent" {
+                true => Err("No visit was allowed for this site.".into()),
+                false => Ok(()),
+            }
+        }
         fn may_open_file(&self, _agent: &str, path: &std::path::Path) -> Result<(), String> {
+            self.asked_files.lock().unwrap().push(path.to_path_buf());
             match path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -368,6 +376,7 @@ mod tests {
     static TEST_HOOKS: std::sync::LazyLock<Arc<TestHooks>> = std::sync::LazyLock::new(|| {
         Arc::new(TestHooks {
             done: Default::default(),
+            asked_files: Default::default(),
         })
     });
 
@@ -535,8 +544,19 @@ mod tests {
                     !moved.success,
                     "a file page moved to a file the agent may not read"
                 );
+                // Refused as it loads (the request itself fails) or as it
+                // shows: either way the file was asked about and isn't open.
                 let why = moved.error.unwrap_or_default();
-                assert!(why.contains("can't read that file"), "{why}");
+                assert!(
+                    why.contains("can't read that file") || why.contains("doesn't open"),
+                    "{why}"
+                );
+                assert!(TEST_HOOKS
+                    .asked_files
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.ends_with("no-b.html")));
                 let snap = run_tool(&tools, "browser.snapshot", serde_json::json!({})).await;
                 assert!(snap.success);
                 assert!(
@@ -693,6 +713,66 @@ mod tests {
         assert!(
             open.iter().any(|l| l.agent == "stop-agent-b"),
             "another session's stays"
+        );
+        close(Which::All).await;
+    }
+
+    /// #4 item 3 and 5 end to end: a file the gate's decision allowed (a
+    /// name not otherwise readable here) opens and stays open for the
+    /// calls after; a file it pulls in (an iframe) is checked as a read
+    /// and refused, so the forbidden file never loads.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn browser_e2e_an_allowed_file_stays_and_what_it_pulls_in_is_checked() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        install_hooks(TEST_HOOKS.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("allowed-once.html");
+        let secret = dir.path().join("no-secret.html");
+        std::fs::write(&page, "<!doctype html><title>Frame</title><iframe id=\"f\" src=\"no-secret.html\"></iframe><p id=\"p\">outer</p>").unwrap();
+        std::fs::write(&secret, "<!doctype html><title>Secret</title>secret words").unwrap();
+        let skill = e2e_skill(&dir.path().join("profiles"));
+        let tools = skill.tools();
+        let nav = tools
+            .iter()
+            .find(|t| t.name() == "browser.navigate")
+            .unwrap()
+            .clone();
+        let url = format!("file://{}", page.display());
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("frame-agent".into(), async {
+                // The gate decides the file (as Allow once would); the call
+                // opens it though the hook alone wouldn't allow its name.
+                let effect = nav.effect(&serde_json::json!({ "url": url }));
+                assert!(matches!(
+                    effect,
+                    workforce_core::computer::Effect::Read { .. }
+                ));
+                let r = nav
+                    .execute(serde_json::json!({ "url": url }))
+                    .await
+                    .unwrap();
+                assert!(r.success, "{:?}", r.error);
+                let snap = run_tool(&tools, "browser.snapshot", serde_json::json!({})).await;
+                assert!(
+                    snap.success,
+                    "the allowed file stays open: {:?}",
+                    snap.error
+                );
+                let body = snap.output["body_text"].as_str().unwrap_or_default();
+                assert!(
+                    body.contains("outer") && !body.contains("secret words"),
+                    "{body}"
+                );
+            })
+            .await;
+        let real = |p: &std::path::Path| workforce_agent::tools::paths::resolve_real(p);
+        let asked = TEST_HOOKS.asked_files.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|p| real(p) == real(&secret)),
+            "the iframe's file was checked: {asked:?}"
         );
         close(Which::All).await;
     }
@@ -887,7 +967,7 @@ mod tests {
                         run("browser.click", serde_json::json!({"selector": "#buy"})).await;
                     assert!(!covered.success);
                     assert!(covered.error.unwrap_or_default().contains("covers"));
-                    // L: a tab Desk's opens is Desk's, closed with it.
+                    // L: a tab Desk's opens is Desk's: closed as it opens.
                     assert!(
                         run(
                             "browser.navigate",
@@ -901,14 +981,11 @@ mod tests {
                             .await
                             .success
                     );
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while !open_tabs(port).contains(&popup) {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "the popup never opened"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    assert!(
+                        !open_tabs(port).contains(&popup),
+                        "the popup was closed as it opened"
+                    );
                     // H8: a page that takes itself to a site the list keeps Desk
                     // from is blanked, without a call.
                     let blocked_shop = shop.replace("127.0.0.1", "localhost");
@@ -972,8 +1049,40 @@ mod tests {
             .iter()
             .any(|l| l.agent == "chrome-agent" && l.backend == "chrome"));
 
+        // Allow once for a new site holds for the calls on that page after
+        // it: the gate's decision goes with the call, though no visit grant
+        // stands for it.
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope(
+                "visit-once-agent".into(),
+                workforce_agent::runner::CURRENT_SESSION_ID.scope(session_id.clone(), async {
+                    let nav = tools
+                        .iter()
+                        .find(|t| t.name() == "browser.navigate")
+                        .unwrap()
+                        .clone();
+                    let input = serde_json::json!({"url": site.url("/form"), "browser": "chrome"});
+                    nav.effect(&input);
+                    let r = nav.execute(input).await.unwrap();
+                    assert!(r.success, "{:?}", r.error);
+                    let snap = tools
+                        .iter()
+                        .find(|t| t.name() == "browser.snapshot")
+                        .unwrap()
+                        .clone();
+                    snap.effect(&serde_json::json!({}));
+                    let r = snap.execute(serde_json::json!({})).await.unwrap();
+                    assert!(r.success, "the allowed site stays: {:?}", r.error);
+                    assert!(r.output["body_text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Send"));
+                }),
+            )
+            .await;
+
         // H6(c): the turn's end, by its session id, lets the Chrome go.
-        assert_eq!(turn_ended(&session_id).await, 1);
+        assert_eq!(turn_ended(&session_id).await, 2);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let tabs = open_tabs(port);

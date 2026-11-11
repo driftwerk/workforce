@@ -168,18 +168,57 @@ fn unbound_now(state: &Arc<GatewayState>, agent: &str) -> bool {
     crew.unbound_given(&service, &o) && attended_by_holder(state)
 }
 
-/// Whether this turn is the Desk holder's own, started by them.
+/// Whether this turn may be unbound in the browser: the Desk holder's
+/// own, and either one they started (no automated origin: no schedule,
+/// heartbeat, monitor, workflow or job) or the overseer's own wake-up by
+/// the crew ([`CrewWake`]), which the person asked to watch and act.
 fn attended_by_holder(state: &Arc<GatewayState>) -> bool {
-    use workforce_agent::runner::{CURRENT_AUTOMATED_ORIGIN, CURRENT_USER_ID};
-    let automated = CURRENT_AUTOMATED_ORIGIN
-        .try_with(|o| !o.is_empty())
-        .unwrap_or(false);
+    use workforce_agent::runner::CURRENT_USER_ID;
     let user = CURRENT_USER_ID
         .try_with(|u| u.clone())
         .ok()
         .filter(|u| !u.is_empty());
-    !automated
-        && crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user.as_deref())
+    let holder =
+        crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user.as_deref());
+    attended(
+        crate::hub_core::origins::automated_origin().as_deref(),
+        crew_wake_now(),
+        holder,
+    )
+}
+
+/// The rule [`attended_by_holder`] applies.
+fn attended(automated: Option<&str>, crew_wake: bool, holder: bool) -> bool {
+    holder && (crew_wake || automated.is_none())
+}
+
+/// The sessions the crew is running an overseer's own wake-up in now (its
+/// watcher's check-ins, its plans, lines and handovers): named here as the
+/// crew starts the turn, not guessed from a session key.
+static CREW_WAKES: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A crew wake-up in progress in one session; it ends when this drops.
+pub(crate) struct CrewWake(String);
+
+impl CrewWake {
+    pub(crate) fn begin(session: &str) -> Self {
+        CREW_WAKES.lock().insert(session.to_string());
+        Self(session.to_string())
+    }
+}
+
+impl Drop for CrewWake {
+    fn drop(&mut self) {
+        CREW_WAKES.lock().remove(&self.0);
+    }
+}
+
+/// Whether the turn in scope is a crew wake-up.
+fn crew_wake_now() -> bool {
+    workforce_agent::runner::CURRENT_SESSION_ID
+        .try_with(|id| CREW_WAKES.lock().contains(id))
+        .unwrap_or(false)
 }
 
 /// What a turn's own Stop reaches, set when Desk's browser is.
@@ -870,5 +909,53 @@ mod tests {
             .unwrap_err();
             assert!(err.contains("isn't a site"), "{bad}: {err}");
         }
+    }
+
+    /// A schedule, heartbeat, monitor or workflow turn is never unbound in
+    /// the browser, even run as the Desk holder; the overseer's own crew
+    /// wake-up is; anyone but the holder never is.
+    #[tokio::test]
+    async fn only_the_holders_own_turns_and_the_overseers_crew_wake_ups_are_unbound() {
+        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY};
+        assert!(attended(None, false, true), "a turn the person started");
+        assert!(!attended(None, false, false), "someone else's turn");
+        assert!(!attended(Some("scheduler"), false, true));
+        assert!(
+            attended(Some("scheduler"), true, true),
+            "the crew's own wake-up"
+        );
+        assert!(!attended(None, true, false));
+        for key in [
+            "scheduler:job-1",
+            "heartbeat:allan",
+            "workflow-engine:w1",
+            "monitor:m1",
+        ] {
+            let origin = CURRENT_SESSION_KEY
+                .scope(key.into(), async {
+                    crate::hub_core::origins::automated_origin()
+                })
+                .await;
+            assert!(origin.is_some(), "{key} reads as automated");
+            assert!(!attended(origin.as_deref(), false, true), "{key}");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let woken = CURRENT_SESSION_ID
+            .scope(id.clone(), async {
+                let wake = CrewWake::begin(&id);
+                let during = crew_wake_now();
+                drop(wake);
+                (during, crew_wake_now())
+            })
+            .await;
+        assert_eq!(
+            woken,
+            (true, false),
+            "named while the crew runs it, and only then"
+        );
+        let other = CURRENT_SESSION_ID
+            .scope("another".into(), async { crew_wake_now() })
+            .await;
+        assert!(!other);
     }
 }

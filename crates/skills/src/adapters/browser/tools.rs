@@ -53,11 +53,15 @@ impl Tool for BrowserTool {
         use workforce_core::computer::Effect;
         let navigating = self.spec.name == "browser.navigate";
         let target = input["url"].as_str().unwrap_or_default();
+        use super::client::{expect, Decided};
         if navigating {
             if let super::address::Kind::File(path) = super::address::kind(target) {
-                return Effect::Read {
-                    paths: vec![workforce_agent::tools::paths::resolve_real(&path)],
-                };
+                let real = workforce_agent::tools::paths::resolve_real(&path);
+                expect(
+                    super::client::Backend::Desk,
+                    Some(Decided::File(real.clone())),
+                );
+                return Effect::Read { paths: vec![real] };
             }
         }
         let backend = super::client::pick(input["browser"].as_str(), true)
@@ -66,9 +70,12 @@ impl Tool for BrowserTool {
             true => super::address::origin_of(target),
             false => super::client::origin_now(backend),
         };
-        if !navigating {
-            super::client::expect_origin(backend, origin.clone());
-        }
+        let decision = match (backend, navigating) {
+            (_, false) => Some(Decided::Origin(origin.clone())),
+            (super::client::Backend::Chrome, true) => Some(Decided::Visit(origin.clone())),
+            (super::client::Backend::Desk, true) => None,
+        };
+        expect(backend, decision);
         Effect::Connector {
             connector: site_key(backend, navigating, origin.as_deref()),
             write: !READS.contains(&self.spec.name),

@@ -103,6 +103,12 @@ impl Seen {
         }
     }
 
+    /// Keeps what the scans found for `session`: a hostile one holds it
+    /// back, as [`Self::into_output`] does.
+    pub(super) fn keep(self, session: &str) {
+        self.into_output(session, Value::Null);
+    }
+
     /// `output` with the scan's findings added, kept for `session` too.
     pub(super) fn into_output(self, session: &str, mut output: Value) -> Value {
         if self.hostile {

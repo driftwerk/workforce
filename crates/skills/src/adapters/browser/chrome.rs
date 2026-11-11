@@ -83,8 +83,12 @@ pub struct MyChrome {
     pub(super) network: Arc<Mutex<VecDeque<Value>>>,
     pub(super) console: Arc<Mutex<VecDeque<Value>>>,
     call_timeout: Duration,
-    /// Tabs Desk's tab opened (popups): closed with it.
+    /// Tabs Desk's tab opened (popups), and theirs: each closed as it
+    /// opens, and any left closed with Desk's tab.
     popups: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The browser session what a page's scripts throw is kept under, for
+    /// the hostile flag.
+    scan_key: std::sync::Mutex<Option<String>>,
 }
 
 /// Ids for what the reader sends of its own accord, apart from calls'.
@@ -94,9 +98,8 @@ const OWN_IDS: u64 = 1_000_000_000;
 /// The user id this process runs as.
 #[cfg(unix)]
 fn my_uid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    let probe = tempfile::NamedTempFile::new().ok()?;
-    probe.as_file().metadata().ok().map(|m| m.uid())
+    // SAFETY: getuid has no preconditions and cannot fail.
+    Some(unsafe { libc::getuid() })
 }
 
 /// Whether what listens on `port` here is a process of this user's: any
@@ -138,6 +141,9 @@ pub fn listener_is_ours(port: u16) -> bool {
     }
 }
 
+/// On Windows there is no same-user check yet: any local process that
+/// opens Chrome's debugging port is spoken to. Chrome's own consent prompt
+/// is the only guard there.
 #[cfg(not(unix))]
 pub fn listener_is_ours(_port: u16) -> bool {
     true
@@ -239,13 +245,15 @@ impl MyChrome {
             let popups = Arc::clone(&popups);
             let own = out.clone();
             let own_ids = AtomicU64::new(OWN_IDS);
-            let send_own = move |session: &str, method: &str, params: Value| {
-                let msg = json!({
+            let send_own = move |session: Option<&str>, method: &str, params: Value| {
+                let mut msg = json!({
                     "id": own_ids.fetch_add(1, Ordering::Relaxed),
                     "method": method,
                     "params": params,
-                    "sessionId": session,
                 });
+                if let Some(session) = session {
+                    msg["sessionId"] = json!(session);
+                }
                 let _ = own.send(Message::Text(msg.to_string().into()));
             };
             let pending = Arc::clone(&pending);
@@ -276,11 +284,20 @@ impl MyChrome {
                     // A tab Desk's opened is Desk's, to close with it.
                     if v["method"] == "Target.targetCreated" {
                         let info = &v["params"]["targetInfo"];
+                        let opener = info["openerId"].as_str().map(str::to_string);
                         let mine = target_slot.lock().unwrap().clone();
-                        if mine.is_some() && info["openerId"].as_str() == mine.as_deref() {
-                            if let Some(id) = info["targetId"].as_str() {
-                                popups.lock().unwrap().push(id.to_string());
-                            }
+                        let ours = opener.is_some()
+                            && (opener == mine
+                                || popups
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|p| Some(p) == opener.as_ref()));
+                        if let (true, Some(id)) = (ours, info["targetId"].as_str()) {
+                            popups.lock().unwrap().push(id.to_string());
+                            // Desk works in its own tab only: what a page
+                            // opens from it is closed as it opens.
+                            send_own(None, "Target.closeTarget", json!({ "targetId": id }));
                         }
                         continue;
                     }
@@ -300,7 +317,11 @@ impl MyChrome {
                             let url = p["frame"]["url"].as_str().unwrap_or_default().to_string();
                             let frame = p["frame"]["id"].as_str().unwrap_or_default().to_string();
                             if !super::chrome_cell::may_show(&url) {
-                                send_own(&ours, "Page.navigate", json!({ "url": "about:blank" }));
+                                send_own(
+                                    Some(&ours),
+                                    "Page.navigate",
+                                    json!({ "url": "about:blank" }),
+                                );
                             }
                             main = Some((frame, url));
                         }
@@ -309,7 +330,7 @@ impl MyChrome {
                             if let Some((frame, url)) = main.as_ref() {
                                 if frame == stopped && !super::chrome_cell::may_show(url) {
                                     send_own(
-                                        &ours,
+                                        Some(&ours),
                                         "Page.navigate",
                                         json!({ "url": "about:blank" }),
                                     );
@@ -320,7 +341,7 @@ impl MyChrome {
                         // answered for the person, and noted.
                         Some("Page.javascriptDialogOpening") => {
                             send_own(
-                                &ours,
+                                Some(&ours),
                                 "Page.handleJavaScriptDialog",
                                 json!({ "accept": false }),
                             );
@@ -389,6 +410,7 @@ impl MyChrome {
             console,
             call_timeout,
             popups,
+            scan_key: std::sync::Mutex::new(None),
         };
         // Chrome asks the person before the first command is answered.
         let version = tokio::time::timeout(
@@ -476,6 +498,11 @@ impl MyChrome {
         !self.reader.is_finished()
     }
 
+    /// Keeps what a page's scripts throw under the browser session `key`.
+    pub fn scan_into(&self, key: &str) {
+        *self.scan_key.lock().unwrap() = Some(key.to_string());
+    }
+
     /// The value of `expression` in Desk's tab.
     pub async fn evaluate(&self, expression: &str) -> Result<Value> {
         let r = self
@@ -491,7 +518,11 @@ impl MyChrome {
                 .or(e["text"].as_str())
                 .unwrap_or("script failed");
             let mut seen = super::untrusted::Seen::at("");
-            return Err(eyre!("script failed: {}", seen.text(thrown)));
+            let fenced = seen.text(thrown);
+            if let Some(key) = self.scan_key.lock().unwrap().as_deref() {
+                seen.keep(key);
+            }
+            return Err(eyre!("script failed: {fenced}"));
         }
         Ok(r["result"]["value"].clone())
     }

@@ -125,7 +125,7 @@ fn current_user() -> String {
 /// Who judges, call by call, whether an agent is unbound in the browser
 /// now: the crew (Act fully in force, its budget not spent) in a turn the
 /// person whose Desk this is started and is in. Installed with Desk's
-/// browser; without it, an agent's settings alone say.
+/// browser; without it, no agent is unbound in the browser.
 pub type UnboundJudge = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 static JUDGE: std::sync::OnceLock<UnboundJudge> = std::sync::OnceLock::new();
@@ -135,9 +135,10 @@ pub fn judge_unbound_with(judge: UnboundJudge) -> bool {
     JUDGE.set(judge).is_ok()
 }
 
-/// Whether `agent`, unbound by its settings, is unbound for this call.
+/// Whether `agent`, unbound by its settings, is unbound for this call. With
+/// no judge installed, it isn't: unbound is never assumed.
 fn unbound_now(agent: &str) -> bool {
-    JUDGE.get().is_none_or(|judge| judge(agent))
+    JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
 /// Where the person's home is.
@@ -864,17 +865,19 @@ impl ComputerGate for HubComputerGate {
         {
             return;
         }
-        // The person answered what a hostile page raised: it holds the
-        // browser back no longer.
-        if matches!(
-            record.decision.verdict,
-            Verdict::Ask {
-                why: workforce_core::computer::Why::HostilePage,
-                ..
-            }
-        ) && matches!(record.outcome, Outcome::Allowed | Outcome::Declined)
+        // A browser call that won't run takes with it what it was decided
+        // for: the next call is decided afresh. (A hostile page's flag is
+        // never lifted here: only the person's Stop lifts it.)
+        if record.tool.starts_with("browser.")
+            && matches!(
+                record.outcome,
+                Outcome::Refused | Outcome::Declined | Outcome::NotAnswered | Outcome::Unattended
+            )
         {
-            workforce_skills::adapters::browser::calm(&self.policy.agent, &current_user());
+            workforce_skills::adapters::browser::forget_decision(
+                &self.policy.agent,
+                &current_user(),
+            );
         }
         let activity = self.activity(&record);
         let computer = self.computer.clone();
@@ -1338,14 +1341,24 @@ mod tests {
                 assert!(!ran_unattended, "a job never clicks without the person");
                 assert!(!unbound);
             }
-            // One that only suggests is refused; an unbound one runs.
+            // One that only suggests is refused.
             assert_eq!(decide_with(&suggest, "browser.click").0, "refused");
-            // Unbound, in a turn of the person's; a job never changes a page.
+            // With no judge, unbound settings aren't enough: it asks.
+            let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
+            assert!(asked.starts_with("asks"), "fails closed: {asked}");
+            assert!(!unbound);
+            // The judge says this turn is unbound: it runs; a job never
+            // changes a page.
+            static JUDGED_OUT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            judge_unbound_with(Box::new(|_| {
+                !JUDGED_OUT.load(std::sync::atomic::Ordering::SeqCst)
+            }));
             assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
             // A judged-out turn (a job's, another person's, a spent budget)
             // is not unbound however the settings read.
-            judge_unbound_with(Box::new(|agent| agent != "allan"));
+            JUDGED_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
             let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
             assert!(asked.starts_with("asks"), "{asked}");
             assert!(!unbound);

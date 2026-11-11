@@ -69,6 +69,8 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
+        // The crew's own wake-up, by name, for as long as it runs.
+        let _wake = crate::desk_browser::CrewWake::begin(&sid);
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
         }
