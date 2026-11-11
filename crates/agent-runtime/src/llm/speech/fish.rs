@@ -14,6 +14,23 @@ use super::{Markup, SpeechOutput, SpeechProvider, SpeechRequest};
 
 const DEFAULT_BASE_URL: &str = "https://api.fish.audio";
 const DEFAULT_MODEL: &str = "s1";
+/// The model Fish Audio serves at no charge ($0.00 per million bytes on its
+/// pricing page); every other model is billed, and `s1` retires on
+/// 2026-12-31.
+pub const FREE_MODEL: &str = "s2.1-pro-free";
+
+/// What a refusal from Fish Audio is told as. A 402 is Fish saying the model
+/// asked for needs credit on the account, which the bare status doesn't.
+fn refusal(status: reqwest::StatusCode, model: &str, body: &str, key: &str) -> String {
+    let body = scrub(body, Some(key));
+    if status == reqwest::StatusCode::PAYMENT_REQUIRED && model != FREE_MODEL {
+        return format!(
+            "fish audio wants payment for the {model} model (402): add credit at fish.audio, \
+             or speak with the free model, {FREE_MODEL}. {body}"
+        );
+    }
+    format!("fish audio speech returned {status}: {body}")
+}
 
 pub struct FishAudioSpeech {
     client: Client,
@@ -82,10 +99,7 @@ impl SpeechProvider for FishAudioSpeech {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(eyre!(
-                "fish audio speech returned {status}: {}",
-                scrub(&body, Some(&api_key))
-            ));
+            return Err(eyre!("{}", refusal(status, &self.model, &body, &api_key)));
         }
 
         let bytes = response
@@ -134,6 +148,28 @@ mod tests {
         assert_eq!(p.model, DEFAULT_MODEL);
         assert!(p.reference_id.is_none());
         assert_eq!(p.voice_label(), "s1/default-voice");
+    }
+
+    #[test]
+    fn a_402_on_a_billed_model_says_it_wants_payment_and_names_the_free_model() {
+        let paid = refusal(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            "s1",
+            "no payment key-123",
+            "key-123",
+        );
+        assert!(paid.contains("wants payment for the s1 model"), "{paid}");
+        assert!(paid.contains(FREE_MODEL), "{paid}");
+        assert!(!paid.contains("key-123"), "the key is scrubbed: {paid}");
+        let free = refusal(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            FREE_MODEL,
+            "nope",
+            "k",
+        );
+        assert!(free.starts_with("fish audio speech returned 402"), "{free}");
+        let other = refusal(reqwest::StatusCode::BAD_REQUEST, "s1", "bad", "k");
+        assert_eq!(other, "fish audio speech returned 400 Bad Request: bad");
     }
 
     #[test]
