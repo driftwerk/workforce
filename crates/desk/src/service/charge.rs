@@ -683,6 +683,14 @@ impl Desk {
         }
         charge::chargeable(&view, scope, &self.bossed())
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
+        // Only on an engine whose every call Desk checks and refuses when it
+        // can't: a stopped Codex session would come back without it.
+        if crate::grant::is_served(&boss.id) && !crate::engine::boss_safe(view.engine) {
+            return Err(DeskError::Conflict(format!(
+                "A boss on another hub runs only sessions Desk checks every call of, so not {}.",
+                view.label()
+            )));
+        }
         if crate::grant::is_served(&boss.id) && !self.servable_launch(id) {
             return Err(DeskError::Conflict(format!(
                 "{} runs without Desk's closed check of each call, so a boss on another hub can't run it; stop it, then hand it over.",

@@ -459,6 +459,58 @@ pub fn secret(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
             .any(|d| rest.starts_with(d.to_lowercase()))
 }
 
+/// `pattern` with each bracket expression (`[a-z]`, `[^x]`, `[[:alpha:]]`)
+/// as `?`: one character, any. A `]` right after `[`, `[!` or `[^` is one
+/// of its characters, as the shell reads it; an unclosed `[` is left for
+/// the glob to refuse.
+fn brackets_as_any(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if matches!(chars.get(j), Some('!' | '^')) {
+            j += 1;
+        }
+        if chars.get(j) == Some(&']') {
+            j += 1;
+        }
+        let mut close = None;
+        while j < chars.len() {
+            match chars[j] {
+                // A class (`[:alpha:]`) inside it closes on its own `]`.
+                '[' if chars.get(j + 1) == Some(&':') => {
+                    match chars[j + 2..].iter().position(|c| *c == ']') {
+                        Some(k) => j += k + 3,
+                        None => break,
+                    }
+                }
+                ']' => {
+                    close = Some(j);
+                    break;
+                }
+                _ => j += 1,
+            }
+        }
+        match close {
+            Some(c) => {
+                out.push('?');
+                i = c + 1;
+            }
+            None => {
+                out.push('[');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Whether writing `path` changes the session's own settings or checks:
 /// an engine's settings, git's own files and hooks, the project's CI and
 /// commit hooks, what a new shell runs, or Desk's data. A write there is
@@ -793,7 +845,11 @@ impl Walk<'_, '_> {
         let Some(pattern) = self.here.joined(text, self.cwd.as_deref()) else {
             return unknown();
         };
-        let Ok(found) = glob::glob(&pattern.to_string_lossy()) else {
+        // A shell reads brackets more ways than the glob crate does (`[^…]`,
+        // `[[:alpha:]]`): each becomes `?`, which matches all a bracket can
+        // and more, so nothing it reaches is missed.
+        let pattern = brackets_as_any(&pattern.to_string_lossy());
+        let Ok(found) = glob::glob(&pattern) else {
             return unknown();
         };
         let mut n = 0;
@@ -3064,11 +3120,18 @@ pub(crate) mod tests {
         let real = |p: &Path| resolve_real(p);
         let at = |c: &str| judge(c, &here(&home, &own, &[], &[], &real, "feat/date-picker"));
         assert_eq!(at("cat src/*.rs"), Ok(()));
+        std::fs::create_dir_all(home.join(".config/gh")).unwrap();
+        std::fs::write(home.join(".config/gh/hosts.yml"), "k").unwrap();
+        assert_eq!(brackets_as_any("a[^x]b[[:alpha:]]c[]x]d[!"), "a?b?c?d[!");
         for c in [
             "cat ~/.ss*/id_x",
             "cat ~/.s?h/*",
             "cat ./*.pem",
             "cat env-li*",
+            "cat ~/.config/[^x]h/hosts.yml",
+            "cat ~/.config/[!x]h/hosts.yml",
+            "cat ~/.config/[[:alpha:]]h/hosts.yml",
+            "cat ~/.[s]sh/id_x",
         ] {
             assert_eq!(at(c), Err(SECRETS.into()), "{c}");
         }
