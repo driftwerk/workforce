@@ -1015,7 +1015,7 @@ async fn take_it_goes_only_to_whom_the_person_s_own_key_says() {
         // who you are first.
         refused(
             d.take_ticket(t, &linear, "Atlas", &you).await,
-            "check who you are first",
+            "Use Check who you are on the board, then take it.",
         );
         // An agent's shared key answers as its owner: checking says so, and
         // Take it still won't.
@@ -1026,7 +1026,7 @@ async fn take_it_goes_only_to_whom_the_person_s_own_key_says() {
         assert!(s.me_note.unwrap().contains("shared Linear key"));
         refused(
             d.take_ticket(t, &linear, "Atlas", &you).await,
-            "check who you are first",
+            "Use Check who you are on the board, then take it.",
         );
         // Vouched, then the key becomes a shared one: nothing is assigned,
         // and the board's answer isn't changed by Take it.
@@ -1267,7 +1267,10 @@ async fn take_it_leaves_a_not_me_link_as_it_was() {
         let r = d
             .take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
             .await;
-        refused(r, "POST /api/desk/boards/");
+        refused(
+            r,
+            "Desk doesn't know who you are on Linear yet. Use Check who you are on the board, then take it.",
+        );
         let s = d.board_sync(b.id).await.unwrap().unwrap().1;
         assert_eq!((s.me, s.me_source, s.me_note.as_deref()), (None, None, Some(note)));
         assert!(linear.calls_of("linear.viewer").is_empty());

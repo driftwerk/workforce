@@ -1463,10 +1463,14 @@ impl Desk {
         let known = match (s.me_source, s.me.as_deref()) {
             (Some(board::MeSource::Vouched), Some(known)) => known.to_string(),
             _ => {
-                return Err(DeskError::Conflict(format!(
-                    "Desk doesn't know who you are on {title} yet: check who you are first (Check who you are on the board, or POST /api/desk/boards/{}/me), then take it.",
+                tracing::info!(
+                    board = %b.id,
+                    "Take it waits on who the person is: POST /api/desk/boards/{}/me",
                     b.id
-                )))
+                );
+                return Err(DeskError::Conflict(format!(
+                    "Desk doesn't know who you are on {title} yet. Use Check who you are on the board, then take it."
+                )));
             }
         };
         // Who the person is, asked now, and only compared: Take it changes

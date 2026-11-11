@@ -1308,10 +1308,12 @@ async fn a_shared_key_never_says_who_you_are() {
             .send("POST", &format!("/api/desk/tickets/{t}/take"), json!(null))
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        // No one is known: check who you are first, at the board's route.
+        // No one is known: the person is told to check who they are first.
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("check who you are first"), "{error}");
-        assert!(error.contains(&format!("/api/desk/boards/{}/me", b.id)), "{error}");
+        assert_eq!(
+            error,
+            "Desk doesn't know who you are on Jira yet. Use Check who you are on the board, then take it."
+        );
         assert!(!remote
             .jira
             .lock()
