@@ -1793,6 +1793,8 @@ mod act_fully;
 
 mod served;
 
+mod uplink_client;
+
 mod relay;
 
 /// A boss still among the hub's agents whose config fails to read for a
