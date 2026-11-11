@@ -188,6 +188,14 @@ impl ChromeCell {
     }
 
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
+        // In the person's Chrome: web pages and a blank page only, never
+        // their files or the browser's own pages.
+        let scheme = url.trim().split(':').next().unwrap_or_default().to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https" | "about") {
+            return Err(eyre!(
+                "In your Chrome Desk opens web pages only, not `{scheme}`; use Desk's own browser (`browser: \"desk\"`) for a file or an inline page."
+            ));
+        }
         let host = host_of(url).filter(|_| !url.starts_with("about:"));
         if !hooks::settings().sites.allows(host.as_deref()) {
             return Err(kept_away(host.as_deref().unwrap_or(url)));

@@ -489,7 +489,8 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
         return Verdict::Run { by: By::Rule };
     }
     // A browser: its own rules, by where the agent stands.
-    if call.tool.starts_with("browser.") {
+    // (A browser opening a file reads it: the rules below decide that.)
+    if call.tool.starts_with("browser.") && matches!(call.effect, Effect::Connector { .. }) {
         return browsing(p, grants, call);
     }
     let connector = match &call.effect {
@@ -805,6 +806,11 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
     }
     if p.access.access == Access::Full && p.access.asks == Asking::Never {
         return Verdict::Run { by: By::Rule };
+    }
+    // A script can do anything on the page, past what a site's allowance
+    // and the never-list read: it is asked about each time.
+    if call.tool == "browser.evaluate" {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::Unclear);
     }
     if let Some(by) = site_granted(p, grants, call, connector) {
         return Verdict::Run { by };

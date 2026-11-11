@@ -46,6 +46,15 @@ impl Tool for BrowserTool {
     /// A browser call, as Desk's gate keeps it: which browser, which site,
     /// and whether it changes the page.
     fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
+        // Opening a file on this computer reads it, as a file tool would,
+        // so Desk's gate holds it to the agent's level and what it withholds.
+        if let ("browser.navigate", Some(path)) =
+            (self.spec.name, input["url"].as_str().and_then(file_of))
+        {
+            return workforce_core::computer::Effect::Read {
+                paths: vec![workforce_agent::tools::paths::resolve_real(&path)],
+            };
+        }
         let backend = super::client::pick(input["browser"].as_str(), true)
             .unwrap_or(super::client::Backend::Desk);
         let navigating = self.spec.name == "browser.navigate";
@@ -118,6 +127,51 @@ fn with_browser(mut schema: Value) -> Value {
     schema
 }
 
+/// The file a `file://` URL names.
+pub fn file_of(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.trim().strip_prefix("file://")?;
+    let path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let path = path.strip_prefix("localhost").unwrap_or(path);
+    let decoded = percent_decoded(path);
+    decoded
+        .starts_with('/')
+        .then(|| std::path::PathBuf::from(decoded))
+}
+
+fn percent_decoded(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether the browser may be sent to `url`: the web, a blank page, an
+/// inline page, or a file (which Desk's gate decides as a read). Never a
+/// script (`javascript:`) or the browser's own pages (`chrome:`,
+/// `devtools:`, …).
+pub fn navigable(url: &str) -> bool {
+    let scheme = url
+        .trim()
+        .split_once(':')
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        scheme.as_str(),
+        "http" | "https" | "about" | "data" | "file"
+    )
+}
+
 fn elapsed(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -152,6 +206,12 @@ fn specs() -> Vec<ToolSpec> {
             handler: handler(|c, input| {
                 async move {
                     let url = require_str(&input, "url")?;
+                    if !navigable(url) {
+                        return Err(eyre!(
+                            "The browser opens web pages, a blank page, an inline page or a file, not `{}`.",
+                            url.split(':').next().unwrap_or(url)
+                        ));
+                    }
                     c.navigate(url).await
                 }
                 .boxed()
@@ -543,5 +603,62 @@ mod tests {
             assert!(names.contains(&w) && !READS.contains(&w), "{w}");
         }
         assert_eq!(READS.len() + 7, names.len());
+    }
+
+    #[test]
+    fn only_pages_files_and_blanks_are_navigable() {
+        for ok in [
+            "https://a.test/",
+            "http://127.0.0.1:8/x",
+            "about:blank",
+            "data:text/html,<p>x</p>",
+            "file:///tmp/a.html",
+        ] {
+            assert!(navigable(ok), "{ok}");
+        }
+        for no in [
+            "javascript:alert(1)",
+            "JavaScript:x",
+            "chrome://settings",
+            "devtools://x",
+            "view-source:https://a.test",
+            "chrome-extension://x/y",
+            "nope",
+        ] {
+            assert!(!navigable(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_file_url_names_its_file() {
+        assert_eq!(
+            file_of("file:///Users/s/a%20b.html?x#y"),
+            Some("/Users/s/a b.html".into())
+        );
+        assert_eq!(
+            file_of("file://localhost/etc/hosts"),
+            Some("/etc/hosts".into())
+        );
+        assert_eq!(file_of("https://a.test/"), None);
+    }
+
+    #[test]
+    fn opening_a_file_is_a_read_of_it() {
+        let skill =
+            super::super::BrowserSkill::new(super::super::BrowserSkillConfig::default()).unwrap();
+        let nav = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.navigate")
+            .unwrap();
+        let effect = nav.effect(&json!({ "url": "file:///etc/hosts" }));
+        assert!(
+            matches!(effect, workforce_core::computer::Effect::Read { ref paths } if paths.len() == 1),
+            "{effect:?}"
+        );
+        assert!(matches!(
+            nav.effect(&json!({ "url": "https://a.test/", "browser": "desk" })),
+            workforce_core::computer::Effect::Connector { .. }
+        ));
     }
 }

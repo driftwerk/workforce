@@ -598,10 +598,10 @@ impl ComputerGate for HubComputerGate {
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
         // A browser call is kept under the browser and site it names
-        // (`browser.*`'s own effect); one that names none, under the site
-        // Desk's own browser is on.
+        // (`browser.*`'s own effect), and opening a file is a read of it;
+        // one that names neither, under the site Desk's own browser is on.
         if tool.starts_with("browser.") {
-            if matches!(effect, Effect::Connector { .. }) {
+            if matches!(effect, Effect::Connector { .. } | Effect::Read { .. }) {
                 return effect;
             }
             let (host, _) = page_now(&self.policy.agent);

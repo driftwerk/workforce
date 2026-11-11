@@ -251,10 +251,17 @@ pub async fn close_backend(backend: Backend) -> usize {
 }
 
 /// At the end of a turn: lets go of the person's Chrome the turn's
-/// conversation was using. Desk's own browser stays open for the next.
+/// conversation was using, and a hostile page it read no longer holds the
+/// next turn back. Desk's own browser stays open for the next.
 pub async fn turn_ended(session: &str) -> usize {
     let mut n = 0;
     for client in clients() {
+        // A hostile page holds the turn that read it back, not later ones.
+        for cell in client.sessions.lock().await.values() {
+            if cell.last_session.lock().unwrap().as_deref() == Some(session) {
+                untrusted::calm(&cell.key);
+            }
+        }
         n += detach(&client, Which::Session(session)).await;
     }
     n
