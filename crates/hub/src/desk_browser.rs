@@ -275,7 +275,7 @@ fn activity_of(done: &Done, shot: Option<&str>) -> Activity {
         tool: done.tool.clone(),
         vault_source: None,
         decided_by: "rule".into(),
-        outcome: json!({ "outcome": "done" }),
+        outcome: json!({ "outcome": "ran" }),
         reason: None,
         exit_code: None,
         duration_ms: None,
@@ -623,6 +623,7 @@ mod tests {
     fn a_row_says_what_was_done_where_and_names_its_screenshot() {
         let row = activity_of(&done("browser.click", Some("#save")), Some("a.png"));
         assert_eq!(row.kind, "browser");
+        assert_eq!(row.outcome["outcome"], "ran", "as Desk's activity list reads it");
         assert_eq!(row.doing, "Clicked #save on shop.example");
         assert_eq!(row.connector.as_deref(), Some("browser"));
         assert_eq!(row.arguments["url"], "https://shop.example/cart?x=1");
