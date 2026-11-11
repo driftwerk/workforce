@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 
 use super::{Desk, DeskError};
 use crate::board::{
-    self, Board, External, Filter, Paused, Retry, Seen, Sync, System, Ticket, TicketState, Via,
+    self, Assignee, Board, External, Filter, Listing, Paused, Retry, Seen, Sync, System, Ticket,
+    TicketState, Via,
 };
 use crate::board_sync::{check_filter, check_target, Issue, Remote, RemoteError};
 use crate::board_sync_store::SyncHub;
@@ -36,9 +37,14 @@ pub struct LinkBoard {
     pub target_id: Option<String>,
     pub via: Via,
     pub filter: Filter,
-    /// The person's Linear user id, for "assigned to me" there.
+    /// Who the person is there (their Linear user id or Jira accountId),
+    /// for "assigned to me", Mine and Take it: the hub's to look up, or
+    /// the person's to say where it can't.
     #[serde(default)]
     pub me: Option<String>,
+    /// Their name there, as the hub said it.
+    #[serde(default)]
+    pub me_name: Option<String>,
     pub states: BTreeMap<TicketState, String>,
 }
 
@@ -228,6 +234,7 @@ impl Desk {
             person: person.to_string(),
             filter: link.filter,
             me: link.me,
+            me_name: link.me_name,
             states: link.states,
             group: b.group.clone(),
             cursor: None,
@@ -238,6 +245,7 @@ impl Desk {
             failures: 0,
             problem: None,
             retry: Default::default(),
+            listing: None,
         };
         self.0
             .store
@@ -393,6 +401,26 @@ impl Budget {
     }
 }
 
+/// What a listing of a board's issues read.
+struct Listed {
+    issues: Vec<Issue>,
+    /// No page was left unread.
+    complete: bool,
+    /// The Linear page it goes on from, when it isn't complete.
+    next: Option<String>,
+    /// Read oldest change first (Jira, or a Linear that doesn't page), so
+    /// what was read is all there is up to its last.
+    ordered: bool,
+}
+
+/// How a pull pass ended: the cursor it got to, whether it swept, and the
+/// Linear listing it left part read (none when it read it through).
+struct PassEnd {
+    cursor: Option<String>,
+    swept: bool,
+    listing: Option<Listing>,
+}
+
 /// The issue `key` failed again: tried later, on its own back-off.
 fn failed_again(
     retry: &mut BTreeMap<String, Retry>,
@@ -481,13 +509,18 @@ impl Desk {
     async fn sync_ok(
         &self,
         id: Uuid,
-        cursor: Option<String>,
-        swept: bool,
+        end: PassEnd,
         retry: BTreeMap<String, Retry>,
     ) -> Result<(), DeskError> {
         let now = crate::crew::now();
+        let PassEnd {
+            cursor,
+            swept,
+            listing,
+        } = end;
         self.change_sync(id, |s| {
             s.retry = retry;
+            s.listing = listing;
             if s.paused.as_ref().is_some_and(retried) {
                 s.paused = None;
             }
@@ -538,8 +571,8 @@ impl Desk {
             .pull_pass(&b, &s, remote, &mut budget, sweep, &mut retry, &mut out)
             .await
         {
-            Ok((cursor, swept)) => {
-                self.sync_ok(id, cursor, swept, retry).await?;
+            Ok(end) => {
+                self.sync_ok(id, end, retry).await?;
                 Ok(out)
             }
             Err(e) => {
@@ -553,32 +586,35 @@ impl Desk {
     }
 
     /// The issues `s`'s filter matches since `since` (all, without), oldest
-    /// change first, in the board's project or team only; and whether that
-    /// is all of them (no page was left unread).
+    /// change first, in the board's project or team only, from the Linear
+    /// page `after`; and whether that is all of them (no page was left
+    /// unread), and where a Linear listing goes on from when it isn't.
     async fn matching(
         &self,
         s: &Sync,
         remote: &dyn Remote,
         since: Option<&str>,
+        after: Option<&str>,
         budget: &mut Budget,
-    ) -> Result<(Vec<Issue>, bool), RemoteError> {
-        let mut issues = vec![];
-        let mut complete = true;
+    ) -> Result<Listed, RemoteError> {
+        let mut out = Listed {
+            issues: vec![],
+            complete: true,
+            next: None,
+            ordered: true,
+        };
         match s.system {
             System::Jira => {
                 let mut page: Option<String> = None;
                 for n in 0.. {
-                    if n == crate::board_sync::PAGES_PER_PASS {
-                        complete = false;
-                        break;
-                    }
-                    if budget.take().is_err() {
-                        complete = false;
+                    if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
+                        out.complete = false;
                         break;
                     }
                     let mut args = json!({
                         "jql": crate::board_sync::jql(&s.target, &s.filter, since),
-                        "max_results": 100,
+                        "max_results": crate::board_sync::PAGE,
+                        "fields": crate::board_sync::JIRA_FIELDS,
                     });
                     if let Some(p) = &page {
                         args["next_page_token"] = json!(p);
@@ -586,7 +622,7 @@ impl Desk {
                     let answer =
                         crate::board_sync::call(remote, s.system, "jira.search", args).await?;
                     let (found, next) = crate::board_sync::jira_search_issues(&answer, "");
-                    issues.extend(found);
+                    out.issues.extend(found);
                     match next {
                         Some(n) => page = Some(n),
                         None => break,
@@ -594,37 +630,70 @@ impl Desk {
                 }
             }
             System::Linear => {
-                if budget.take().is_err() {
-                    return Ok((vec![], false));
-                }
                 let team = s.target_id.as_deref().unwrap_or_default();
-                let answer = crate::board_sync::call(
-                    remote,
-                    s.system,
-                    "linear.issue_list",
-                    crate::board_sync::linear_args(team, &s.filter, s.me.as_deref()),
-                )
-                .await?;
-                let found = crate::board_sync::linear_issues(&answer);
-                // One page of 100: more than that may be left unread.
-                complete = found.len() < 100;
+                let mut page = after.map(str::to_string);
+                for n in 0.. {
+                    if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
+                        out.complete = false;
+                        out.next = page;
+                        break;
+                    }
+                    let answer = crate::board_sync::call(
+                        remote,
+                        s.system,
+                        "linear.issue_list",
+                        crate::board_sync::linear_args(
+                            team,
+                            &s.filter,
+                            s.me.as_deref(),
+                            since,
+                            page.as_deref(),
+                        ),
+                    )
+                    .await?;
+                    let found = crate::board_sync::linear_issues(&answer);
+                    // A hub whose tool doesn't page answers one page of 100,
+                    // which may not be all.
+                    if !crate::board_sync::linear_pages(&answer) {
+                        out.complete = found.len() < crate::board_sync::PAGE;
+                        out.issues.extend(found);
+                        break;
+                    }
+                    // Linear lists newest first: only a listing read through
+                    // moves the cursor.
+                    out.ordered = false;
+                    out.issues.extend(found);
+                    match crate::board_sync::linear_next_page(&answer) {
+                        Some(next) => page = Some(next),
+                        None => break,
+                    }
+                }
                 let cursor = since.and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok());
-                issues.extend(
-                    found
-                        .into_iter()
-                        .filter(|i| match &s.filter {
-                            Filter::Label(l) => {
-                                i.labels.iter().any(|x| x.eq_ignore_ascii_case(l.trim()))
-                            }
-                            _ => true,
-                        })
-                        .filter(|i| cursor.is_none_or(|c| i.updated_at >= c)),
-                );
+                let done_since = crate::board_sync::done_since(crate::crew::now());
+                out.issues.retain(|i| {
+                    let label = match &s.filter {
+                        Filter::Label(l) => {
+                            i.labels.iter().any(|x| x.eq_ignore_ascii_case(l.trim()))
+                        }
+                        _ => true,
+                    };
+                    // What a hub that can't filter by state answered: the
+                    // whole listing is the open issues, and the recently
+                    // done when the board takes them.
+                    let open = match (&s.filter, since) {
+                        (Filter::All { include_done }, None) => {
+                            !i.is_closed(&s.states) || (*include_done && i.updated_at >= done_since)
+                        }
+                        _ => true,
+                    };
+                    label && open && cursor.is_none_or(|c| i.updated_at >= c)
+                });
             }
         }
-        issues.retain(|i| crate::board_sync::key_in_target(&i.key, &s.target));
-        issues.sort_by_key(|i| i.updated_at);
-        Ok((issues, complete))
+        out.issues
+            .retain(|i| crate::board_sync::key_in_target(&i.key, &s.target));
+        out.issues.sort_by_key(|i| i.updated_at);
+        Ok(out)
     }
 
     /// One pull: what changed, then (when `sweep`) who left. The new
@@ -638,8 +707,14 @@ impl Desk {
         sweep: bool,
         retry: &mut BTreeMap<String, Retry>,
         out: &mut Pulled,
-    ) -> Result<(Option<String>, bool), RemoteError> {
+    ) -> Result<PassEnd, RemoteError> {
         let now = crate::crew::now();
+        // A pass that stops early keeps where a listing had got to.
+        let stopped = |cursor: Option<String>| PassEnd {
+            cursor,
+            swept: false,
+            listing: s.listing.clone(),
+        };
         // What failed before, when its turn comes.
         let due: Vec<String> = retry
             .iter()
@@ -658,13 +733,35 @@ impl Desk {
                     retry.remove(&key);
                 }
                 Err(RemoteError::Failed(why)) => failed_again(retry, &key, why, now),
-                Err(RemoteError::Spent) => return Ok((None, false)),
+                Err(RemoteError::Spent) => return Ok(stopped(None)),
                 Err(e) => return Err(e),
             }
         }
-        let (changed, complete) = self
-            .matching(s, remote, s.cursor.as_deref(), budget)
+        // A Linear listing goes on where the last pass left it, while it is
+        // still the listing from this cursor.
+        let resume = s.listing.as_ref().filter(|l| l.since == s.cursor);
+        let listed = self
+            .matching(
+                s,
+                remote,
+                s.cursor.as_deref(),
+                resume.map(|l| l.after.as_str()),
+                budget,
+            )
             .await?;
+        let Listed {
+            issues: changed,
+            complete,
+            next,
+            ordered,
+        } = listed;
+        // A listing from no cursor, read through in this pass, is the whole
+        // filter: the sweep goes by it rather than read it all again.
+        let whole = (s.cursor.is_none() && resume.is_none() && complete).then(|| changed.clone());
+        let mut top = resume
+            .and_then(|l| l.top.as_deref())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
         let mut cursor = None;
         for issue in changed {
             match self.take_in(b, s, remote, budget, &issue, out).await {
@@ -676,22 +773,51 @@ impl Desk {
                     failed_again(retry, &issue.key, why, now);
                 }
                 // The pass's calls are spent: what was taken in stands.
-                Err(RemoteError::Spent) => return Ok((cursor, false)),
+                Err(RemoteError::Spent) => {
+                    return Ok(stopped(cursor.filter(|_| ordered)));
+                }
                 Err(e) => return Err(e),
             }
+            top = top.max(Some(issue.updated_at));
             cursor = Some(issue.updated_at.to_rfc3339());
         }
-        if !complete {
-            return Ok((cursor, false));
+        // Newest first: the cursor moves only once the listing is read
+        // through, to the latest change it saw; until then it goes on from
+        // its next page.
+        if !ordered {
+            if !complete {
+                return Ok(PassEnd {
+                    cursor: None,
+                    swept: false,
+                    listing: next.map(|after| Listing {
+                        after,
+                        since: s.cursor.clone(),
+                        top: top.map(|t| t.to_rfc3339()),
+                    }),
+                });
+            }
+            cursor = top.map(|t| t.to_rfc3339());
         }
+        if !complete {
+            return Ok(PassEnd {
+                cursor,
+                swept: false,
+                listing: None,
+            });
+        }
+        let end = |swept| PassEnd {
+            cursor: cursor.clone(),
+            swept,
+            listing: None,
+        };
         if sweep {
-            match self.sweep(b, s, remote, budget, out).await {
-                Ok(()) => return Ok((cursor, true)),
-                Err(RemoteError::Spent) => return Ok((cursor, false)),
+            match self.sweep(b, s, remote, budget, out, whole).await {
+                Ok(()) => return Ok(end(true)),
+                Err(RemoteError::Spent) => return Ok(end(false)),
                 Err(e) => return Err(e),
             }
         }
-        Ok((cursor, false))
+        Ok(end(false))
     }
 
     /// The issue `key`, read whole; `None` when it isn't in the board's
@@ -741,8 +867,14 @@ impl Desk {
                 return Ok(());
             }
             if issue.updated_at <= e.remote_updated_at && e.synced {
-                return Ok(());
+                return self.refresh_assignee(t.clone(), issue).await.map_err(fail);
             }
+        }
+        // A whole board takes in what is open; what is done there comes on
+        // only when it takes the recently done, and what isn't on the board
+        // yet isn't read for it.
+        if existing.is_none() && !Self::comes_on(s, issue) {
+            return Ok(());
         }
         let issue = self.with_body(s, remote, budget, issue).await?;
         match existing {
@@ -789,6 +921,37 @@ impl Desk {
         })
     }
 
+    /// Whether `issue`, not on the board, comes onto it: anything the
+    /// filter matched, but on a whole board only what is open there, or done
+    /// lately when the board takes the recently done.
+    fn comes_on(s: &Sync, issue: &Issue) -> bool {
+        match &s.filter {
+            Filter::All { include_done } if issue.is_closed(&s.states) => {
+                *include_done
+                    && issue.updated_at >= crate::board_sync::done_since(crate::crew::now())
+            }
+            _ => true,
+        }
+    }
+
+    /// Keeps who has `t`'s issue in step with `issue`, quietly: no history,
+    /// only the ticket announced, so a board catches up without noise.
+    async fn refresh_assignee(&self, mut t: Ticket, issue: &Issue) -> Result<(), DeskError> {
+        let Some(a) = crate::board_sync::assignee_changed(&t, issue) else {
+            return Ok(());
+        };
+        if let Some(e) = t.external.as_mut() {
+            e.assignee = a;
+        }
+        self.save_ticket(&mut t).await?;
+        if let Ok(v) = self.view_ticket(t).await {
+            self.announce(DeskEvent::Ticket {
+                ticket: Box::new(v),
+            });
+        }
+        Ok(())
+    }
+
     fn pulled_by(s: &Sync) -> By {
         By {
             party: crate::board_sync::remote_party(s.system, &s.target),
@@ -832,7 +995,19 @@ impl Desk {
         if came_back {
             said.push("it matches the board's filter again".to_string());
         }
+        if let Some(a) = &p.assignee {
+            said.push(match a {
+                Some(a) => format!(
+                    "assigned it to {} there",
+                    crate::board_sync::defanged_name(&a.name)
+                ),
+                None => "unassigned it there".to_string(),
+            });
+        }
         let e = t.external.as_mut().expect("a synced ticket");
+        if let Some(a) = p.assignee.clone() {
+            e.assignee = a;
+        }
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
         e.synced = true;
         e.flagged = e.flagged || issue.flagged;
@@ -902,6 +1077,7 @@ impl Desk {
                     state: Some(state),
                     needs: vec![],
                 },
+                assignee: issue.assignee.clone().flatten(),
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -935,21 +1111,41 @@ impl Desk {
         remote: &dyn Remote,
         budget: &mut Budget,
         out: &mut Pulled,
+        whole: Option<Vec<Issue>>,
     ) -> Result<(), RemoteError> {
         let fail = |e: eyre::Report| RemoteError::Failed(e.to_string());
-        let (all, complete) = self.matching(s, remote, None, budget).await?;
-        // Only a full answer can say what isn't in it.
-        if !complete {
-            return Ok(());
-        }
-        let matching: std::collections::HashSet<String> = all.into_iter().map(|i| i.key).collect();
+        let issues = match whole {
+            Some(issues) => issues,
+            None => {
+                let listed = self.matching(s, remote, None, None, budget).await?;
+                // Only a full answer can say what isn't in it.
+                if !listed.complete {
+                    return Ok(());
+                }
+                listed.issues
+            }
+        };
+        let all: std::collections::HashMap<String, Issue> =
+            issues.into_iter().map(|i| (i.key.clone(), i)).collect();
         let tickets = self.0.store.board_tickets(b.id).await.map_err(fail)?;
         for t in tickets {
             let Some(e) = &t.external else { continue };
-            if !e.synced || e.made_here || e.kept || e.link != s.link || matching.contains(&e.key) {
+            if !e.synced || e.kept || e.link != s.link {
                 continue;
             }
-            if t.state == TicketState::Dropped {
+            // Who has it is kept in step from the listing itself.
+            if let Some(issue) = all.get(&e.key) {
+                self.refresh_assignee(t.clone(), issue)
+                    .await
+                    .map_err(|e| RemoteError::Failed(e.to_string()))?;
+                continue;
+            }
+            if e.made_here || t.state == TicketState::Dropped {
+                continue;
+            }
+            // A whole board lists what is open: a ticket already Done here
+            // is where its issue's state put it.
+            if s.filter.is_all() && t.state == TicketState::Done {
                 continue;
             }
             let tool = match s.system {
@@ -957,6 +1153,7 @@ impl Desk {
                 System::Linear => ("linear.issue_get", json!({ "identifier": e.key })),
             };
             budget.take()?;
+            let mut closed = None;
             let gone = match crate::board_sync::call(remote, s.system, tool.0, tool.1).await {
                 Ok(v) => {
                     let read = match s.system {
@@ -966,7 +1163,13 @@ impl Desk {
                         }
                     };
                     // Moved to another project: no longer this board's.
-                    read.is_none_or(|i| !crate::board_sync::key_in_target(&i.key, &s.target))
+                    let gone = read
+                        .as_ref()
+                        .is_none_or(|i| !crate::board_sync::key_in_target(&i.key, &s.target));
+                    // Done or cancelled there, off a whole board's listing:
+                    // it moves to its column, not to the shelf.
+                    closed = read.filter(|i| s.filter.is_all() && i.is_closed(&s.states));
+                    gone
                 }
                 Err(RemoteError::Failed(why)) => {
                     let w = why.to_ascii_lowercase();
@@ -974,6 +1177,16 @@ impl Desk {
                 }
                 Err(other) => return Err(other),
             };
+            if let (false, Some(issue)) = (gone, closed) {
+                if self
+                    .update_pulled(b, s, t, &issue)
+                    .await
+                    .map_err(|e| RemoteError::Failed(e.to_string()))?
+                {
+                    out.updated += 1;
+                }
+                continue;
+            }
             let changed = match gone {
                 true => self.drop_gone(b, s, t).await,
                 false => self.detach(b, s, t).await,
@@ -1079,6 +1292,117 @@ impl Desk {
                     .await
             }
         }
+    }
+}
+
+// ── Taking an issue ──────────────────────────────────────────────────────
+
+impl Desk {
+    /// Who the person is on board `id`'s Jira or Linear: as its link keeps
+    /// it, else as the hub says (kept on the link from then on).
+    pub async fn sync_me(
+        &self,
+        id: Uuid,
+        s: &Sync,
+        remote: &dyn Remote,
+    ) -> Result<Option<Assignee>, RemoteError> {
+        if let Some(me) = &s.me {
+            return Ok(Some(Assignee {
+                id: me.clone(),
+                name: s.me_name.clone().unwrap_or_else(|| "You".into()),
+            }));
+        }
+        let Some(me) = crate::board_sync::identify(remote, s.system).await? else {
+            return Ok(None);
+        };
+        let kept = me.clone();
+        let _ = self
+            .change_sync(id, move |s| {
+                s.me = Some(kept.id);
+                s.me_name = Some(kept.name);
+            })
+            .await;
+        Ok(Some(me))
+    }
+
+    /// The person takes ticket `id`'s issue: it is assigned to them there,
+    /// as themselves, through `remote` (the route the board syncs by). Only
+    /// an issue no one has there is taken; one someone took meanwhile is
+    /// left theirs, and the ticket says who has it. Its Desk assignee (a
+    /// session's, an agent's) is left as it is.
+    pub async fn take_ticket(
+        &self,
+        id: Uuid,
+        remote: &dyn Remote,
+        by: &By,
+    ) -> Result<crate::service::TicketView, DeskError> {
+        let mut t = self.ticket_of(id).await?;
+        let b = self.board_of(t.board).await?;
+        let Some(s) = b.sync.clone() else {
+            return Err(DeskError::Invalid(format!("{} isn't synced.", b.name)));
+        };
+        let title = s.system.title();
+        if Desk::left_its_group(&b) || s.paused.is_some() {
+            return Err(DeskError::Conflict(format!(
+                "{}'s sync is paused: resume it to take issues on {title}.",
+                b.name
+            )));
+        }
+        let Some(e) = t.external.clone().filter(|e| e.writable_by(s.link)) else {
+            return Err(DeskError::Conflict(format!(
+                "That ticket isn't synced with {title}, so it can't be taken there."
+            )));
+        };
+        let key = e.key.clone();
+        let said = |why: RemoteError| match why {
+            RemoteError::Waiting { .. } => DeskError::Conflict(format!(
+                "Your hub holds the change for your approval: approve it there, and {key} is yours."
+            )),
+            why => DeskError::Conflict(format!("{title} said: {why}")),
+        };
+        let me = self
+            .sync_me(b.id, &s, remote)
+            .await
+            .map_err(&said)?
+            .ok_or_else(|| {
+                DeskError::Conflict(format!(
+                    "The hub can't say who you are on {title}, so Desk can't assign {} to you. Ask its admin to offer {}.",
+                    e.key,
+                    crate::board_sync::identity_tool(s.system)
+                ))
+            })?;
+        // Who has it now, read fresh: never taken from someone else.
+        let mut budget = Budget(2);
+        let now = self
+            .fetch_issue(&s, remote, &mut budget, &e.key)
+            .await
+            .map_err(&said)?
+            .ok_or_else(|| {
+                DeskError::Conflict(format!("{} isn't in {} any more.", e.key, s.target))
+            })?;
+        match now.assignee.clone().flatten() {
+            Some(a) if a.id == me.id => {}
+            Some(a) => {
+                self.refresh_assignee(t, &now).await?;
+                return Err(DeskError::Conflict(format!(
+                    "{} has {} on {title} already.",
+                    a.name, e.key
+                )));
+            }
+            None => {
+                let (tool, args) = crate::board_sync::take_call(s.system, &e.key, &me.id);
+                crate::board_sync::call(remote, s.system, tool, args)
+                    .await
+                    .map_err(&said)?;
+            }
+        }
+        if let Some(x) = t.external.as_mut() {
+            x.assignee = Some(me);
+        }
+        self.save_ticket(&mut t).await?;
+        let text = format!("took {} on {title}: it is assigned to you there", e.key);
+        self.ticket_changed(t, by, Kind::TicketEdited, None, text)
+            .await
     }
 }
 
@@ -1591,6 +1915,7 @@ impl Desk {
                 state: None,
                 needs: vec![],
             },
+            assignee: None,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

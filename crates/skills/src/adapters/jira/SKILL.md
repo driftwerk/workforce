@@ -51,7 +51,7 @@ reload.
 
 | Tool | Description |
 |---|---|
-| `jira.search` | JQL search via the new `/rest/api/3/search/jql` endpoint, with cursor pagination (`next_page_token`). |
+| `jira.search` | JQL search via the new `/rest/api/3/search/jql` endpoint, with cursor pagination (`next_page_token`). Asking for the `description` field adds its rendered HTML (`description_html`). |
 | `jira.get_issue` | Full issue + comments + rendered description. |
 | `jira.create_issue` | Create issue. Descriptions accept markdown (rendered to ADF) or a raw ADF object. |
 | `jira.update_issue` | Update fields on an existing issue. Custom fields via the `fields` passthrough. |
@@ -65,6 +65,7 @@ reload.
 | `jira.list_projects` | List accessible projects. |
 | `jira.get_project` | Project detail with issue types. |
 | `jira.search_users` | Find users by name/email; returns `accountId`. |
+| `jira.myself` | Who you are on Jira: your `accountId`, display name and email. |
 | `jira.list_boards` | List Jira Software boards (Agile API). |
 | `jira.list_sprints` | List sprints on a board, optionally filtered by state. |
 | `jira.add_worklog` | Log time on an issue. |

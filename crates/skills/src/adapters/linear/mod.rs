@@ -38,6 +38,7 @@ pub const READ_TOOLS: &[&str] = &[
     "linear.project_get",
     "linear.labels_list",
     "linear.members_list",
+    "linear.viewer",
     "linear.document_get",
     "linear.document_list",
     "linear.document_search",
@@ -207,6 +208,11 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
+            Arc::new(tools::LinearViewerTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                Arc::clone(pm),
+            )),
             Arc::new(tools::LinearDocumentGetTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -259,6 +265,7 @@ impl LinearSkill {
             "linear.project_get",
             "linear.labels_list",
             "linear.members_list",
+            "linear.viewer",
             "linear.document_get",
             "linear.document_list",
             "linear.document_create",
@@ -294,6 +301,10 @@ impl LinearSkill {
                             "project_id": { "type": "string" },
                             "parent_id": { "type": "string" },
                             "limit": { "type": "integer" },
+                            "after": { "type": "string" },
+                            "updated_since": { "type": "string" },
+                            "open_only": { "type": "boolean" },
+                            "completed_since": { "type": "string" },
                             "workspace": { "type": "string" }
                         }
                     }),
@@ -494,6 +505,17 @@ impl LinearSkill {
                     }),
                 },
                 SkillTool {
+                    name: "linear.viewer".to_string(),
+                    description: "Who you are on Linear: your user's id, name and email"
+                        .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" }
+                        }
+                    }),
+                },
+                SkillTool {
                     name: "linear.document_get".to_string(),
                     description: "Get a specific Linear document by its UUID or URL".to_string(),
                     input_schema: serde_json::json!({
@@ -642,6 +664,10 @@ impl LinearSkill {
                 },
                 SkillPolicy {
                     tool: "linear.members_list".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "linear.viewer".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {

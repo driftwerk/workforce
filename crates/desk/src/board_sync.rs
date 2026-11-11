@@ -14,15 +14,32 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::board::{Filter, System, Ticket, TicketState};
+use crate::board::{Assignee, Filter, System, Ticket, TicketState};
 use crate::crew::{Party, PartyKind};
 
 // ── Tools ────────────────────────────────────────────────────────────────
 
-/// The tools a board's sync may call, and nothing else: no raw API, no
-/// delete, no reassigning.
+/// The tools a board's sync needs, and may call: no raw API, no delete; an
+/// issue is assigned only to the person, by Take it.
 pub const JIRA_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS;
 pub const LINEAR_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS;
+
+/// The tool that says who the person is on `system`: called when the hub
+/// offers it, never needed (a hub without it still syncs).
+pub fn identity_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "jira.myself",
+        System::Linear => "linear.viewer",
+    }
+}
+
+/// Every tool `system`'s sync may call: the ones it needs and the one that
+/// says who the person is.
+pub fn callable(system: System) -> Vec<&'static str> {
+    let mut all = tools_of(system).to_vec();
+    all.push(identity_tool(system));
+    all
+}
 
 /// The tools `system`'s sync needs a hub to offer.
 pub fn tools_of(system: System) -> &'static [&'static str] {
@@ -99,7 +116,7 @@ pub async fn call(
     tool: &str,
     args: Value,
 ) -> Result<Value, RemoteError> {
-    if !tools_of(system).contains(&tool) {
+    if !callable(system).contains(&tool) {
         return Err(RemoteError::NotAllowed(tool.to_string()));
     }
     let answer = remote.call(tool, args).await?;
@@ -309,6 +326,17 @@ fn linear_query(q: &str) -> Result<serde_json::Map<String, Value>, String> {
 /// parentheses, oldest change first.
 pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
     let filter = match f {
+        // A change since the cursor comes in whatever its state, so an
+        // issue on the board that is done or cancelled there moves here;
+        // the whole listing is the open issues (and the recently done).
+        Filter::All { .. } if since.is_some() => String::new(),
+        Filter::All {
+            include_done: false,
+        } => "statusCategory != Done".to_string(),
+        Filter::All { include_done: true } => format!(
+            "statusCategory != Done OR statusCategoryChangedDate >= -{}d",
+            crate::board::DONE_WITHIN_DAYS
+        ),
         Filter::AssignedToMe => "assignee = currentUser()".to_string(),
         Filter::CurrentCycle => "sprint in openSprints()".to_string(),
         Filter::Label(l) => format!("labels = \"{}\"", l.trim()),
@@ -322,15 +350,52 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
         .map(|t| (t.with_timezone(&Utc) - Duration::hours(15)).format("%Y-%m-%d %H:%M"))
         .map(|t| format!(" AND updated >= \"{t}\""))
         .unwrap_or_default();
-    format!("project = \"{project}\" AND ({filter}){since} ORDER BY updated ASC")
+    let filter = match filter.is_empty() {
+        true => String::new(),
+        false => format!(" AND ({filter})"),
+    };
+    format!("project = \"{project}\"{filter}{since} ORDER BY updated ASC")
 }
 
+/// The fields a pull's `jira.search` asks for: with the description, so a
+/// hub that renders it there saves a read of each issue.
+pub const JIRA_FIELDS: &[&str] = &[
+    "summary",
+    "status",
+    "assignee",
+    "updated",
+    "labels",
+    "description",
+];
+
 /// The `linear.issue_list` arguments a filter means for the team
-/// `team_id`; a label is matched on what comes back. `me` is the person's
-/// Linear user id.
-pub fn linear_args(team_id: &str, f: &Filter, me: Option<&str>) -> Value {
+/// `team_id`, from `since` (the cursor) and at the page `after`; a label is
+/// matched on what comes back. `me` is the person's Linear user id. A hub
+/// whose tool doesn't take `updated_since`, `open_only` or `after` answers
+/// one page of everything, which the pull filters itself.
+pub fn linear_args(
+    team_id: &str,
+    f: &Filter,
+    me: Option<&str>,
+    since: Option<&str>,
+    after: Option<&str>,
+) -> Value {
     let mut args = json!({ "team_id": team_id, "limit": 100 });
+    if let Some(since) = since {
+        args["updated_since"] = json!(since);
+    }
+    if let Some(after) = after {
+        args["after"] = json!(after);
+    }
     match f {
+        Filter::All { include_done } => {
+            if since.is_none() {
+                args["open_only"] = json!(true);
+                if *include_done {
+                    args["completed_since"] = json!(done_since(Utc::now()).to_rfc3339());
+                }
+            }
+        }
         Filter::AssignedToMe => args["assignee_id"] = json!(me.unwrap_or_default()),
         Filter::Query(q) => {
             for (k, v) in linear_query(q).unwrap_or_default() {
@@ -340,6 +405,107 @@ pub fn linear_args(team_id: &str, f: &Filter, me: Option<&str>) -> Value {
         Filter::Label(_) | Filter::CurrentCycle => {}
     }
     args
+}
+
+/// Since when a done issue still comes onto a whole board that includes
+/// the done.
+pub fn done_since(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - Duration::days(crate::board::DONE_WITHIN_DAYS)
+}
+
+/// A `linear.issue_list` answer's next page, when it says there is one.
+pub fn linear_next_page(answer: &Value) -> Option<String> {
+    let info = answer.get("page_info")?;
+    match info["has_next_page"].as_bool() {
+        Some(true) => info["end_cursor"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Whether a `linear.issue_list` answer said how it pages: a hub whose
+/// tool doesn't answers one page, which may not be all.
+pub fn linear_pages(answer: &Value) -> bool {
+    answer.get("page_info").is_some_and(Value::is_object)
+}
+
+// ── Who the person is there ──────────────────────────────────────────────
+
+/// Who the person is on `system`, as the hub's identity tool says: `None`
+/// when the hub doesn't offer it, holds it for approval or can't say. Only
+/// an offline hub or a refused token is an error.
+pub async fn identify(
+    remote: &dyn Remote,
+    system: System,
+) -> Result<Option<Assignee>, RemoteError> {
+    match call(remote, system, identity_tool(system), json!({})).await {
+        Ok(answer) => Ok(identity_of(system, &answer)),
+        Err(
+            e @ (RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }),
+        ) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The person as `system`'s identity tool answered: an id the sync can put
+/// where it goes (a Linear id, a Jira accountId), and a name.
+pub fn identity_of(system: System, answer: &Value) -> Option<Assignee> {
+    let (id, name) = match system {
+        System::Jira => (&answer["account_id"], &answer["display_name"]),
+        System::Linear => (
+            &answer["id"],
+            match answer["display_name"].as_str() {
+                Some(n) if !n.trim().is_empty() => &answer["display_name"],
+                _ => &answer["name"],
+            },
+        ),
+    };
+    let id = id.as_str()?.trim().to_string();
+    check_me(system, &id).ok()?;
+    Some(Assignee {
+        name: name_of(name).unwrap_or_else(|| "You".into()),
+        id,
+    })
+}
+
+/// Whether `id` can be the person's id on `system`: a Linear id, or a Jira
+/// accountId (letters, digits, `:`, `-` and `_`).
+pub fn check_me(system: System, id: &str) -> Result<(), String> {
+    let ok = match system {
+        System::Linear => uuid_like(id),
+        System::Jira => {
+            (1..=128).contains(&id.len())
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_'))
+        }
+    };
+    match ok {
+        true => Ok(()),
+        false => Err(format!("{id:?} isn't a {} user's id.", system.title())),
+    }
+}
+
+/// The call that assigns `key` to the person (`me`) there: what Take it
+/// sends, with the write tool a move already uses.
+pub fn take_call(system: System, key: &str, me: &str) -> (&'static str, Value) {
+    match system {
+        System::Jira => (
+            "jira.update_issue",
+            json!({ "issue_key": key, "fields": { "assignee": { "accountId": me } } }),
+        ),
+        System::Linear => (
+            "linear.issue_update",
+            json!({ "identifier": key, "assignee_id": me }),
+        ),
+    }
+}
+
+/// Someone's name there, as a history line says it: on one line, defanged.
+pub fn defanged_name(name: &str) -> String {
+    crate::memory::render::defanged(&crate::crew::one_line(name, 80))
 }
 
 // ── Issues ───────────────────────────────────────────────────────────────
@@ -362,6 +528,62 @@ pub struct Issue {
     pub blocked_by: Option<Vec<String>>,
     /// Its words read as instructions to a model.
     pub flagged: bool,
+    /// Who has it there: `None` when the answer didn't say, `Some(None)`
+    /// when no one does.
+    pub assignee: Option<Option<Assignee>>,
+    /// Whether it is done or cancelled there, when the answer says.
+    pub closed: Option<bool>,
+}
+
+impl Issue {
+    /// Whether it is done or cancelled there: as the answer says, else by
+    /// the column its state maps to.
+    pub fn is_closed(&self, states: &BTreeMap<TicketState, String>) -> bool {
+        self.closed.unwrap_or_else(|| {
+            matches!(
+                column_for(states, &self.state, self.state_kind.as_deref()),
+                Some(TicketState::Done | TicketState::Dropped)
+            )
+        })
+    }
+}
+
+/// A name someone else wrote, on one line and not too long.
+fn name_of(v: &Value) -> Option<String> {
+    let name = unfence(v.as_str()?).0;
+    let name = crate::crew::one_line(name.trim(), 80);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Who a Jira issue is assigned to: `jira.search` gives the name and (on a
+/// newer hub) the accountId beside it, `jira.get_issue` an object of both.
+fn jira_assignee(i: &Value) -> Option<Option<Assignee>> {
+    let a = i.get("assignee")?;
+    let (id, name) = match a {
+        Value::Null => return Some(None),
+        Value::Object(_) => (&a["account_id"], &a["display_name"]),
+        _ => (&i["assignee_account_id"], a),
+    };
+    let id = id.as_str().unwrap_or_default().to_string();
+    match name_of(name) {
+        Some(name) => Some(Some(Assignee { id, name })),
+        None if id.is_empty() => Some(None),
+        None => Some(Some(Assignee {
+            name: "Someone".into(),
+            id,
+        })),
+    }
+}
+
+/// Who a Linear issue is assigned to.
+fn linear_assignee(i: &Value) -> Option<Option<Assignee>> {
+    let a = i.get("assignee")?;
+    if a.is_null() {
+        return Some(None);
+    }
+    let id = a["id"].as_str()?.to_string();
+    let name = name_of(&a["name"]).unwrap_or_else(|| "Someone".into());
+    Some(Some(Assignee { id, name }))
 }
 
 /// What a hub's own wrapping of untrusted content leaves of `text`, and
@@ -507,6 +729,11 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
             .map(str::to_string)
             .collect(),
         blocked_by: None,
+        assignee: jira_assignee(i),
+        closed: i
+            .get("status_category")
+            .and_then(Value::as_str)
+            .map(|c| c == "done"),
         key,
     })
 }
@@ -555,6 +782,10 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
             .collect(),
         blocked_by,
         flagged: f1 || f2,
+        assignee: linear_assignee(i),
+        closed: i["state"]["type"]
+            .as_str()
+            .map(|k| matches!(k, "completed" | "canceled" | "cancelled")),
     })
 }
 
@@ -639,12 +870,24 @@ pub struct Pulled {
     pub title: Option<String>,
     pub body: Option<String>,
     pub state: Option<TicketState>,
+    /// Who has it now, when that changed.
+    pub assignee: Option<Option<Assignee>>,
 }
 
 impl Pulled {
     pub fn is_empty(&self) -> bool {
-        self.title.is_none() && self.body.is_none() && self.state.is_none()
+        self.title.is_none()
+            && self.body.is_none()
+            && self.state.is_none()
+            && self.assignee.is_none()
     }
+}
+
+/// Who has `t`'s issue now, when `issue` says and it isn't who `t` last
+/// saw: kept in step whenever the issue is read, changed or not.
+pub fn assignee_changed(t: &Ticket, issue: &Issue) -> Option<Option<Assignee>> {
+    let e = t.external.as_ref()?;
+    issue.assignee.clone().filter(|a| *a != e.assignee)
 }
 
 /// What `issue` changes on `t`, given the board's state map; nothing when
@@ -662,6 +905,7 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
             .then(|| issue.title.clone()),
         body: issue.body.clone().filter(|b| *b != t.body),
         state: state.filter(|s| *s != t.state),
+        assignee: assignee_changed(t, issue),
     }
 }
 
@@ -788,8 +1032,14 @@ pub const PULL_EVERY: Duration = Duration::minutes(2);
 pub const SWEEP_EVERY: Duration = Duration::minutes(30);
 /// The most calls one pass of a board makes.
 pub const CALLS_PER_PASS: usize = 60;
-/// The most pages a pull reads in one pass.
-pub const PAGES_PER_PASS: usize = 5;
+/// The most pages a pull reads in one pass: a whole board of up to
+/// [`MATCH_CEILING`] issues is listed in one, and a bigger one goes on in
+/// the next.
+pub const PAGES_PER_PASS: usize = 20;
+/// The most issues the link dialog counts: past it, it says "or more".
+pub const MATCH_CEILING: usize = 2000;
+/// A page of issues, as the sync asks for them.
+pub const PAGE: usize = 100;
 
 // ── Words a model reads ──────────────────────────────────────────────────
 

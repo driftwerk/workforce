@@ -315,11 +315,17 @@ impl Tool for JiraSearchTool {
             })
             .unwrap_or(default_fields);
 
+        // A description asked for comes rendered, as `jira.get_issue` gives it.
+        let described = fields.iter().any(|f| f == "description");
+        let labelled = fields.iter().any(|f| f == "labels");
         let mut body = json!({
             "jql": jql,
             "maxResults": max_results,
             "fields": fields,
         });
+        if described {
+            body["expand"] = json!("renderedFields");
+        }
         if let Some(token) = input.get("next_page_token").and_then(|v| v.as_str()) {
             body["nextPageToken"] = json!(token);
         }
@@ -337,16 +343,28 @@ impl Tool for JiraSearchTool {
                     .iter()
                     .map(|i| {
                         let f = &i["fields"];
-                        json!({
+                        let mut out = json!({
                             "key": i["key"],
                             "id": i["id"],
                             "summary": wrap_field(&f["summary"], "jira.search.summary"),
                             "status": f["status"]["name"],
+                            "status_category": f["status"]["statusCategory"]["key"],
                             "assignee": f["assignee"]["displayName"],
+                            "assignee_account_id": f["assignee"]["accountId"],
                             "priority": f["priority"]["name"],
                             "issuetype": f["issuetype"]["name"],
                             "updated": f["updated"],
-                        })
+                        });
+                        if described {
+                            out["description_html"] = wrap_field(
+                                &i["renderedFields"]["description"],
+                                "jira.search.description",
+                            );
+                        }
+                        if labelled {
+                            out["labels"] = f["labels"].clone();
+                        }
+                        out
                     })
                     .collect();
                 info!(count = summary.len(), "Jira search");
@@ -415,6 +433,7 @@ impl Tool for JiraGetIssueTool {
                     "summary": wrap_field(&f["summary"], "jira.get_issue.summary"),
                     "description_html": wrap_field(&rendered["description"], "jira.get_issue.description"),
                     "status": f["status"]["name"],
+                    "status_category": f["status"]["statusCategory"]["key"],
                     "issuetype": f["issuetype"]["name"],
                     "priority": f["priority"]["name"],
                     "assignee": {
@@ -712,6 +731,49 @@ impl Tool for JiraAssignIssueTool {
             Err(e) => Ok(ToolResult::from_report(
                 &e.wrap_err(format!("Failed to assign {key}")),
                 duration_ms,
+            )),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 6b. jira.myself
+// ──────────────────────────────────────────────────────────────────────
+
+jira_tool_struct!(JiraMyselfTool);
+
+#[async_trait]
+impl Tool for JiraMyselfTool {
+    fn name(&self) -> &str {
+        "jira.myself"
+    }
+    fn description(&self) -> &str {
+        "Who you are on Jira: your accountId, display name and email."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) }
+            }
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let client = resolve_or_fail!(self, input, start);
+        let path = format!("{REST}/myself");
+        match client.get(&path).await {
+            Ok(me) => Ok(ToolResult::success(
+                json!({
+                    "account_id": me["accountId"],
+                    "display_name": me["displayName"],
+                    "email": me["emailAddress"],
+                }),
+                start.elapsed().as_millis() as u64,
+            )),
+            Err(e) => Ok(ToolResult::from_report(
+                &e.wrap_err("Failed to read who you are on Jira"),
+                start.elapsed().as_millis() as u64,
             )),
         }
     }

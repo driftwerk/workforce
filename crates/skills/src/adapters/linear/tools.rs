@@ -196,6 +196,22 @@ impl Tool for LinearIssueListTool {
                     "minimum": 1,
                     "maximum": 100
                 },
+                "after": {
+                    "type": "string",
+                    "description": "The next page: page_info.end_cursor from the page before"
+                },
+                "updated_since": {
+                    "type": "string",
+                    "description": "Only issues updated at or after this ISO 8601 time"
+                },
+                "open_only": {
+                    "type": "boolean",
+                    "description": "Leave out completed and canceled issues"
+                },
+                "completed_since": {
+                    "type": "string",
+                    "description": "With open_only: also issues completed at or after this ISO 8601 time"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -256,17 +272,52 @@ impl Tool for LinearIssueListTool {
         if let Some(parent_id) = input["parent_id"].as_str() {
             filters.push(format!(r#"parent: {{ id: {{ eq: "{}" }} }}"#, parent_id));
         }
+        // Times and the cursor go in as variables, never into the query.
+        let mut variables = serde_json::Map::new();
+        let mut params = vec![];
+        if let Some(since) = input["updated_since"].as_str().filter(|s| !s.is_empty()) {
+            params.push("$updatedSince: DateTimeOrDuration");
+            variables.insert("updatedSince".into(), serde_json::json!(since));
+            filters.push("updatedAt: { gte: $updatedSince }".to_string());
+        }
+        if input["open_only"].as_bool() == Some(true) {
+            let open = r#"state: { type: { nin: ["completed", "canceled"] } }"#;
+            match input["completed_since"].as_str().filter(|s| !s.is_empty()) {
+                Some(done) => {
+                    params.push("$completedSince: DateTimeOrDuration");
+                    variables.insert("completedSince".into(), serde_json::json!(done));
+                    filters.push(format!(
+                        "or: [{{ {open} }}, {{ completedAt: {{ gte: $completedSince }} }}]"
+                    ));
+                }
+                None => filters.push(open.to_string()),
+            }
+        }
+        let mut page = String::new();
+        if let Some(after) = input["after"].as_str().filter(|s| !s.is_empty()) {
+            params.push("$after: String");
+            variables.insert("after".into(), serde_json::json!(after));
+            page = ", after: $after".to_string();
+        }
 
         let filter_clause = if filters.is_empty() {
             String::new()
         } else {
             format!("filter: {{ {} }}", filters.join(", "))
         };
+        let params = match params.is_empty() {
+            true => String::new(),
+            false => format!("({})", params.join(", ")),
+        };
 
         let query = format!(
             r#"
-            query {{
-                issues(first: {}, {}) {{
+            query{} {{
+                issues(first: {}{}, {}) {{
+                    pageInfo {{
+                        hasNextPage
+                        endCursor
+                    }}
                     nodes {{
                         id
                         identifier
@@ -313,12 +364,12 @@ impl Tool for LinearIssueListTool {
                 }}
             }}
             "#,
-            limit, filter_clause
+            params, limit, page, filter_clause
         );
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        match client.query(&query, serde_json::json!({})).await {
+        match client.query(&query, Value::Object(variables)).await {
             Ok(data) => {
                 let issues = data
                     .get("issues")
@@ -326,9 +377,14 @@ impl Tool for LinearIssueListTool {
                     .cloned()
                     .unwrap_or(serde_json::json!([]));
                 let count = issues.as_array().map(|a| a.len()).unwrap_or(0);
+                let info = &data["issues"]["pageInfo"];
+                let page_info = serde_json::json!({
+                    "has_next_page": info["hasNextPage"].as_bool().unwrap_or(false),
+                    "end_cursor": info["endCursor"],
+                });
                 info!(count, "Listed Linear issues");
                 Ok(ToolResult::success(
-                    serde_json::json!({ "count": count, "issues": issues }),
+                    serde_json::json!({ "count": count, "issues": issues, "page_info": page_info }),
                     duration_ms,
                 ))
             }
@@ -2088,6 +2144,93 @@ impl Tool for LinearLabelsListTool {
                 Ok(ToolResult::from_report(
                     &e.wrap_err("Failed to list labels"),
                     duration_ms,
+                ))
+            }
+        }
+    }
+}
+
+// ── linear.viewer ──────────────────────────────────────────────────────
+
+/// Who the workspace's key belongs to: the person's own Linear user.
+pub struct LinearViewerTool {
+    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    default_workspace: String,
+    prefix_map: Arc<HashMap<String, String>>,
+}
+
+impl LinearViewerTool {
+    pub fn new(
+        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        default_workspace: String,
+        prefix_map: Arc<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            clients,
+            default_workspace,
+            prefix_map,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for LinearViewerTool {
+    fn name(&self) -> &str {
+        "linear.viewer"
+    }
+
+    fn description(&self) -> &str {
+        "Who you are on Linear: your user's id, name and email."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "workspace": {
+                    "type": "string",
+                    "description": workspace_description(&self.clients, &self.default_workspace)
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let client = match resolve_client(
+            &self.clients,
+            &self.default_workspace,
+            &self.prefix_map,
+            &input,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    format!("{e}"),
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+        };
+        let query = "query { viewer { id name email displayName } }";
+        match client.query(query, serde_json::json!({})).await {
+            Ok(data) => {
+                let v = &data["viewer"];
+                Ok(ToolResult::success(
+                    serde_json::json!({
+                        "id": v["id"],
+                        "name": v["name"],
+                        "display_name": v["displayName"],
+                        "email": v["email"],
+                    }),
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to read the Linear viewer");
+                Ok(ToolResult::from_report(
+                    &e.wrap_err("Failed to read who you are on Linear"),
+                    start.elapsed().as_millis() as u64,
                 ))
             }
         }
