@@ -26,9 +26,10 @@
 //! `gh workflow run` of a workflow `workflows` lists (by its file name
 //! exactly) on the default branch, with no inputs. Deploys run through
 //! those workflows: deploy tools and the project's own release, deploy and
-//! promote scripts stay the person's. It needs both named
-//! repositories and `budget_usd_per_day`, and holds only while today's
-//! spend is under that budget. The budget counts real money only: calls
+//! promote scripts stay the person's. It needs named repositories;
+//! `budget_usd_per_day` is optional (with none, only the check-in
+//! ceilings and Stop bound it), and when set it holds only while today's
+//! spend is under it. The budget counts real money only: calls
 //! paid by an API key or a cloud vendor (Bedrock, Vertex), never those on
 //! the person's Claude or ChatGPT plans, whose API-equivalent value the
 //! ledger keeps but nobody is billed for. `budget_cleared_at` (an RFC 3339
@@ -38,7 +39,7 @@
 //! fully included, is Desk's own list (`workforce_desk::never`).
 //!
 //! `anywhere = true` takes the lists away: Act fully ships in any
-//! repository and runs any workflow, and `budget_usd_per_day` is optional.
+//! repository and runs any workflow.
 //! With `level = "full"`, `anywhere` and every `[oversight.act]` switch on,
 //! the overseer is **unbound** ([`Oversight::unbound`]): it answers every
 //! request and question itself, does every crew action, and checks in as
@@ -261,7 +262,8 @@ impl Full {
 /// Why Act fully isn't in force though chosen: no repositories named.
 pub const FULL_NO_REPOS: &str =
     "Act fully needs at least one repository named, so it acts within Desk for now.";
-/// Why Act fully isn't in force though chosen: no daily budget.
+/// Why a boss served from a grant doesn't act fully: its grant gives no
+/// daily budget (one of this hub's own may leave it blank).
 pub const FULL_NO_BUDGET: &str = "Act fully needs a daily budget, so it acts within Desk for now.";
 /// The most workflows Act fully may name.
 pub const MAX_FULL_WORKFLOWS: usize = 20;
@@ -828,9 +830,12 @@ impl Oversight {
     }
 
     /// Whether Act fully is in force by its settings, or why not: it is
-    /// chosen, with repositories named and a daily budget. (Whether today's
-    /// spend is under that budget is the hub's to read.) `Err(None)` when
-    /// it isn't chosen at all.
+    /// chosen, with repositories named (or anywhere). Its daily budget is
+    /// optional: with none, only the check-in ceilings and Stop bound it,
+    /// as on plans alone, where no real money is spent. (Whether today's
+    /// spend is under a budget is the hub's to read; a boss served from a
+    /// grant needs one, which the hub holds it to.) `Err(None)` when it
+    /// isn't chosen at all.
     pub fn fully(&self) -> Result<&Full, Option<&'static str>> {
         if self.level != Level::Full {
             return Err(None);
@@ -842,9 +847,6 @@ impl Oversight {
         }
         if self.full.repos.is_empty() {
             return Err(Some(FULL_NO_REPOS));
-        }
-        if self.full.budget_cents_per_day.is_none() {
-            return Err(Some(FULL_NO_BUDGET));
         }
         Ok(&self.full)
     }
@@ -967,7 +969,7 @@ mod tests {
         let no_budget =
             parse("[oversight]\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n")
                 .unwrap();
-        assert_eq!(no_budget.fully(), Err(Some(FULL_NO_BUDGET)));
+        assert!(no_budget.fully().is_ok(), "a budget is optional");
         let act = parse("[oversight]\nlevel = \"act\"\nfull = { repos = [\"acme/acme-web\"], budget_usd_per_day = 5 }\n").unwrap();
         assert_eq!(act.fully(), Err(None));
 

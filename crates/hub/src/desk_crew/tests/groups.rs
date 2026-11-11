@@ -452,7 +452,11 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
         let after = c.d.store().suggestions(100).await.unwrap();
         for s in after.iter().skip(suggestions) {
             if s.action["tool"] == super::super::own_settings::NAME {
-                assert_eq!(s.action["input"]["agent_id"].as_str(), Some(s.agent_id.as_str()), "{s:?}");
+                assert_eq!(
+                    s.action["input"]["agent_id"].as_str(),
+                    Some(s.agent_id.as_str()),
+                    "{s:?}"
+                );
             }
         }
         let outside = [

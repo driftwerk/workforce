@@ -171,13 +171,7 @@ impl Desk {
 
     /// `boss`'s Act fully budget and today's real money, when it has one.
     pub fn full_budget_of(&self, boss: &str) -> Option<crate::floor::FullBudget> {
-        self.0
-            .state
-            .lock()
-            .charges
-            .full_budgets
-            .get(boss)
-            .cloned()
+        self.0.state.lock().charges.full_budgets.get(boss).cloned()
     }
 
     /// Where `boss` acts fully now; nowhere when it doesn't.

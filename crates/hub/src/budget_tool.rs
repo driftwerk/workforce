@@ -31,7 +31,8 @@ use crate::serve::AgentService;
 
 /// What the tool says it is: which budget it reads and changes, and which
 /// it doesn't.
-const DESCRIPTION: &str = "The hub's model-spend ceilings: what agents may spend on metered model calls (API keys, \
+const DESCRIPTION: &str =
+    "The hub's model-spend ceilings: what agents may spend on metered model calls (API keys, \
          Bedrock) a day, workspace-wide, per agent (this agent's own model spend) and per person. \
          Calls on Claude or ChatGPT plans never count against them. Shows live status (spend, \
          limits, remaining); SysAdmins can also set or clear runtime ceiling overrides that take \
@@ -288,7 +289,11 @@ fn act_fully_line(b: &workforce_desk::floor::FullBudget) -> String {
          budget ({spent} of {} real money today; plans aren't counted{}). Only the person \
          changes it: say so plainly, and post crew.ask_oversight_change for them to approve.",
         money(b.budget_usd),
-        if b.spent { "; it is spent, so Act fully is stopped" } else { "" }
+        if b.spent {
+            "; it is spent, so Act fully is stopped"
+        } else {
+            ""
+        }
     )
 }
 

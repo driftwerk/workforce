@@ -104,9 +104,9 @@ impl Change {
                 return Err("Say a new budget or remove it, not both.".into());
             }
             Some(v) => {
-                let usd = v.as_f64().filter(|u| {
-                    u.is_finite() && *u > 0.0 && *u <= MAX_FULL_BUDGET_USD
-                });
+                let usd = v
+                    .as_f64()
+                    .filter(|u| u.is_finite() && *u > 0.0 && *u <= MAX_FULL_BUDGET_USD);
                 let usd = usd.ok_or(format!(
                     "budget_usd_per_day must be dollars above 0 and up to {MAX_FULL_BUDGET_USD}."
                 ))?;
@@ -128,9 +128,7 @@ impl Change {
                         SWITCHES.join(", ")
                     ));
                 }
-                let on = v
-                    .as_bool()
-                    .ok_or(format!("{k} must be true or false."))?;
+                let on = v.as_bool().ok_or(format!("{k} must be true or false."))?;
                 c.act.insert(k.clone(), on);
             }
         }
@@ -211,7 +209,11 @@ impl Change {
 
     /// `body`, a config.toml, with the change made, `now` being when the
     /// person approves it. Everything else in it is kept as written.
-    pub(crate) fn apply(&self, body: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+    pub(crate) fn apply(
+        &self,
+        body: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, String> {
         let mut doc: toml_edit::DocumentMut = body
             .parse()
             .map_err(|_| "Its config.toml can't be read, so nothing was changed.".to_string())?;
@@ -264,7 +266,7 @@ fn dollars(cents: u64) -> String {
     let whole = (cents / 100).to_string();
     let mut grouped = String::new();
     for (i, ch) in whole.chars().enumerate() {
-        if i > 0 && (whole.len() - i) % 3 == 0 {
+        if i > 0 && (whole.len() - i).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -302,9 +304,7 @@ impl CrewHub {
         let service = self
             .services()
             .into_iter()
-            .find(|s| {
-                s.agent_id.as_str() == agent && !workforce_desk::grant::is_served(agent)
-            })
+            .find(|s| s.agent_id.as_str() == agent && !workforce_desk::grant::is_served(agent))
             .ok_or("That agent isn't on this hub any more, so nothing was changed.")?;
         let path = service
             .workspace
@@ -362,10 +362,16 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let c = Change::parse(&json!({"budget_usd_per_day": 5000, "clear_spent_today": true, "act": {"set_mode": true}})).unwrap();
         let out = c.apply(body, now).unwrap();
-        assert!(out.starts_with("# mine\n[llm]\nprovider = \"claude-code\""), "{out}");
+        assert!(
+            out.starts_with("# mine\n[llm]\nprovider = \"claude-code\""),
+            "{out}"
+        );
         assert!(out.contains("level = \"full\" # all in"), "{out}");
         assert!(out.contains("budget_usd_per_day = 5000\n"), "{out}");
-        assert!(out.contains("budget_cleared_at = \"2026-11-11T14:02:00.000Z\""), "{out}");
+        assert!(
+            out.contains("budget_cleared_at = \"2026-11-11T14:02:00.000Z\""),
+            "{out}"
+        );
         let doc: toml::Table = toml::from_str(&out).unwrap();
         let o = workforce_common::oversight::Oversight::of(doc.get("oversight")).unwrap();
         assert_eq!(o.full.budget_cents_per_day, Some(500_000));

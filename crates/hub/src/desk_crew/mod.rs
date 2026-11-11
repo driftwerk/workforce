@@ -415,6 +415,23 @@ pub(crate) fn fully_given(
     }
 }
 
+/// [`fully_given`] for the overseer `agent`: a boss served from a grant
+/// acts fully only under a daily budget its grant gives; this hub's own
+/// may leave it blank.
+pub(crate) fn fully_for<'o>(
+    agent: &str,
+    o: &'o Oversight,
+    spent: Option<f64>,
+) -> Result<&'o workforce_common::oversight::Full, String> {
+    if workforce_desk::grant::is_served(agent)
+        && o.level == Level::Full
+        && o.full.budget_cents_per_day.is_none()
+    {
+        return Err(workforce_common::oversight::FULL_NO_BUDGET.to_string());
+    }
+    fully_given(o, spent)
+}
+
 /// Why Act fully stopped, its budget spent: what it counts, what stopped,
 /// and what the person can do.
 pub(crate) fn full_spent_why(spent: f64, budget: f64) -> String {
@@ -627,7 +644,7 @@ impl CrewHub {
         o: &'o Oversight,
     ) -> Result<&'o workforce_common::oversight::Full, String> {
         let spent = self.spent_today.lock().get(agent).copied();
-        fully_given(o, spent)
+        fully_for(agent, o, spent)
     }
 
     /// The level the overseer `agent` runs at now, and, when it chose Act
@@ -779,8 +796,7 @@ impl CrewHub {
         let me = overseer.agent_id.as_str();
         rows.iter()
             .filter(|r| {
-                r.agent_id == me
-                    || seen.sees(self.desk.group_of_agent(&r.agent_id).as_deref())
+                r.agent_id == me || seen.sees(self.desk.group_of_agent(&r.agent_id).as_deref())
             })
             .map(|r| r.cost_usd)
             .sum()

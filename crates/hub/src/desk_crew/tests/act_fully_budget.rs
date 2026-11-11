@@ -80,7 +80,11 @@ async fn plans_never_spend_act_fullys_budget_and_real_money_does() {
         hub_call(&overseer, &id, HubBilling::Subscription, 400.0);
         // A call Desk can't say the billing of isn't taken for billed.
         spent(&d, s.id, Billing::Unknown, 50.0).await;
-        assert_eq!(level().await, (Level::Full, None), "plans are never real money");
+        assert_eq!(
+            level().await,
+            (Level::Full, None),
+            "plans are never real money"
+        );
         let shown = d.full_budget_of(&id).unwrap();
         assert_eq!(shown.spent_usd, Some(0.0));
         assert_eq!(shown.budget_usd, 200.0);
@@ -101,7 +105,10 @@ async fn plans_never_spend_act_fullys_budget_and_real_money_does() {
             "{why}"
         );
         assert!(why.contains("plans aren't counted"), "{why}");
-        assert!(why.contains("stopped merging, tagging, releasing and running workflows"), "{why}");
+        assert!(
+            why.contains("stopped merging, tagging, releasing and running workflows"),
+            "{why}"
+        );
         assert!(d.full_budget_of(&id).unwrap().spent);
         assert!(d.bosses().iter().all(|b| b.level == "act"));
     })
