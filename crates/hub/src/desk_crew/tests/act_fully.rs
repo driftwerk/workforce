@@ -416,7 +416,7 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
     assert!(super::super::fully_given(&full, Some(24.99)).is_ok());
     assert!(super::super::fully_given(&full, Some(25.0))
         .unwrap_err()
-        .contains("daily budget of $25.00, for the Desk sessions' spend in this scope and the overseer's own model use, is spent"));
+        .contains("Act fully's daily budget is spent: $25.00 of $25.00 in real money today"));
     assert!(super::super::fully_given(&full, None)
         .unwrap_err()
         .contains("today's spend is read"));

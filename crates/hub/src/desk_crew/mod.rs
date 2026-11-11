@@ -34,6 +34,7 @@ mod extras;
 mod handover;
 mod line;
 mod observe;
+mod own_settings;
 mod plan;
 mod read_only;
 mod reading;
@@ -119,10 +120,10 @@ pub struct CrewHub {
     sent: Mutex<Vec<DateTime<Utc>>>,
     /// Each agent's `[oversight]`, by the config.toml mtime it was read at.
     read: Mutex<HashMap<String, (Option<SystemTime>, Oversight)>>,
-    /// What each overseer acting fully has spent today, in dollars, by
-    /// agent, as last read: its scope's Desk sessions and its own model
-    /// calls. Act fully holds only under its budget, and not before this is
-    /// read.
+    /// The real money each overseer acting fully has spent today, in
+    /// dollars, by agent, as last read ([`Self::read_spent_today`]): what
+    /// keys paid for, never the person's plans. Act fully holds only under
+    /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
@@ -390,8 +391,9 @@ pub(crate) fn group_named_in(body: &str) -> Option<String> {
     (!g.is_empty() && g != workforce_desk::UNGROUPED).then(|| g.to_string())
 }
 
-/// Whether Act fully is in force for `o`, having spent `spent` dollars
-/// today in its scope (`None`: not read), or why not in plain words.
+/// Whether Act fully is in force for `o`, having spent `spent` dollars of
+/// real money today in its scope (`None`: not read), or why not in plain
+/// words.
 pub(crate) fn fully_given(
     o: &Oversight,
     spent: Option<f64>,
@@ -408,11 +410,28 @@ pub(crate) fn fully_given(
         None => Err(
             "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
         ),
-        Some(spent) if spent >= budget => Err(format!(
-            "Act fully's daily budget of ${budget:.2}, for the Desk sessions' spend in this scope and the overseer's own model use, is spent (${spent:.2} today), so it acts within Desk until tomorrow."
-        )),
+        Some(spent) if spent >= budget => Err(full_spent_why(spent, budget)),
         Some(_) => Ok(full),
     }
+}
+
+/// Why Act fully stopped, its budget spent: what it counts, what stopped,
+/// and what the person can do.
+pub(crate) fn full_spent_why(spent: f64, budget: f64) -> String {
+    format!(
+        "Act fully's daily budget is spent: ${spent:.2} of ${budget:.2} in real money today (calls paid by an API key, Bedrock or Vertex, in this scope; Claude and ChatGPT plans aren't counted). So it stopped merging, tagging, releasing and running workflows on its own, and acts within Desk until tomorrow, or until the person raises or clears the budget in its Desk settings."
+    )
+}
+
+/// Where today's count of Act fully's budget starts: midnight in the
+/// person's time, or when they last cleared it, if that is later.
+pub(crate) fn counted_from(
+    midnight: DateTime<Utc>,
+    full: &workforce_common::oversight::Full,
+) -> DateTime<Utc> {
+    full.budget_cleared_at
+        .filter(|c| *c > midnight)
+        .unwrap_or(midnight)
 }
 
 fn mtime(workspace: &Path) -> Option<SystemTime> {
@@ -688,54 +707,83 @@ impl CrewHub {
                 .is_some_and(|id| self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id))
     }
 
-    /// Reads what each overseer that chose Act fully has spent today (its
-    /// scope's Desk sessions and its own model calls), for
-    /// [`Self::fully`]. One that can't be read isn't in
-    /// force until it can be.
+    /// Reads the real money each overseer that chose Act fully has spent
+    /// today, for [`Self::fully`], and tells Desk, which shows it: its
+    /// scope's Desk sessions' calls a key paid for, and the model calls of
+    /// the agents in its scope (itself among them, once) the hub billed as
+    /// metered. A call on the person's Claude or ChatGPT plan bills nobody,
+    /// so it never counts, however much it would cost at API prices. One
+    /// that can't be read isn't in force until it can be.
     pub(crate) async fn read_spent_today(&self, overseers: &[(Arc<AgentService>, Oversight)]) {
         let now = Utc::now();
-        let from = self
+        let midnight = self
             .desk
             .period_start(workforce_desk::ledger::Period::Day, now);
         let mut spent = HashMap::new();
+        let mut shown = HashMap::new();
         for (s, o) in overseers {
-            if o.fully().is_err() {
+            let Ok(full) = o.fully() else {
                 continue;
-            }
-            let query = workforce_desk::SpendQuery {
-                by: workforce_desk::ledger::SpendBy::Group,
-                from,
-                to: now,
-                limit: 1,
-                filter: workforce_desk::ledger_store::Filter {
-                    seen: Some(self.desk.seen_by(&o.scope)),
-                    ..Default::default()
-                },
             };
-            match self.desk.spend(&query).await {
-                Ok(view) => {
-                    // Its own model calls count too, where the hub records
-                    // them.
-                    let own: f64 = s
-                        .telemetry_store
-                        .agent_use(from, now)
-                        .map(|rows| {
-                            rows.iter()
-                                .filter(|u| u.agent_id == s.agent_id.as_str())
-                                .map(|u| u.cost_usd)
-                                .sum()
-                        })
-                        .unwrap_or_default();
-                    spent.insert(s.agent_id.as_str().to_string(), view.total.usd + own);
+            let from = counted_from(midnight, full);
+            let seen = self.desk.seen_by(&o.scope);
+            let filter = workforce_desk::ledger_store::Filter {
+                seen: Some(seen.clone()),
+                ..Default::default()
+            };
+            let read = match self.desk.billed_usd(from, now, &filter).await {
+                Ok(sessions) => s
+                    .telemetry_store
+                    .metered_spend(from, now)
+                    .map(|rows| sessions + self.agents_billed(s, &seen, &rows)),
+                Err(e) => Err(eyre::eyre!("{e}")),
+            };
+            let usd = match read {
+                Ok(usd) => {
+                    spent.insert(s.agent_id.as_str().to_string(), usd);
+                    Some(usd)
                 }
-                Err(e) => tracing::warn!(
-                    agent = s.agent_id.as_str(),
-                    error = %e,
-                    "couldn't read today's spend; Act fully waits until it can"
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        agent = s.agent_id.as_str(),
+                        error = %e,
+                        "couldn't read today's spend; Act fully waits until it can"
+                    );
+                    None
+                }
+            };
+            if let Some(budget) = full.budget_usd_per_day() {
+                shown.insert(
+                    s.agent_id.as_str().to_string(),
+                    workforce_desk::floor::FullBudget {
+                        spent_usd: usd,
+                        budget_usd: budget,
+                        spent: usd.is_some_and(|u| u >= budget),
+                        cleared_at: full.budget_cleared_at.filter(|c| *c > midnight),
+                    },
+                );
             }
         }
         *self.spent_today.lock() = spent;
+        self.desk.set_full_budgets(shown);
+    }
+
+    /// What the hub billed as metered to the agents `overseer`'s scope
+    /// sees, `overseer` itself among them, each once, of `rows`.
+    fn agents_billed(
+        &self,
+        overseer: &AgentService,
+        seen: &workforce_desk::scope::Seen,
+        rows: &[workforce_common::persistence::MeteredSpend],
+    ) -> f64 {
+        let me = overseer.agent_id.as_str();
+        rows.iter()
+            .filter(|r| {
+                r.agent_id == me
+                    || seen.sees(self.desk.group_of_agent(&r.agent_id).as_deref())
+            })
+            .map(|r| r.cost_usd)
+            .sum()
     }
 
     /// Every group an agent's config.toml on disk names in `[oversight]

@@ -1,6 +1,13 @@
 //! `budget` tool — live spend visibility for everyone, runtime ceiling
 //! overrides for SysAdmins.
 //!
+//! The budget it reads and changes is the hub's model-spend ceiling
+//! (`[budget]`, and the overrides on it): what the hub's agents may spend on
+//! metered model calls, workspace-wide, per agent and per person. It is not
+//! a Desk overseer's Act fully daily budget (`[oversight.full]`), which only
+//! the person changes; it says so, so an overseer asked to raise that one
+//! never changes this one instead.
+//!
 //! `status` answers "how much have I spent / have left, and what are the
 //! agents up to" from the governor's live figures. `set_override` /
 //! `clear_override` are the agent-reachable half of the runtime override
@@ -21,6 +28,16 @@ use crate::authz::IsAdminFn;
 use crate::budget_overrides::{BudgetOverride, OverrideScope};
 use crate::cost_governor::{BudgetStatus, ScopeStatus};
 use crate::serve::AgentService;
+
+/// What the tool says it is: which budget it reads and changes, and which
+/// it doesn't.
+const DESCRIPTION: &str = "The hub's model-spend ceilings: what agents may spend on metered model calls (API keys, \
+         Bedrock) a day, workspace-wide, per agent (this agent's own model spend) and per person. \
+         Calls on Claude or ChatGPT plans never count against them. Shows live status (spend, \
+         limits, remaining); SysAdmins can also set or clear runtime ceiling overrides that take \
+         effect immediately. This is NOT the Desk overseer's Act fully daily budget \
+         ([oversight.full]), which is a different budget only the person changes: for that, as \
+         the overseer, use crew.ask_oversight_change.";
 
 pub struct BudgetTool {
     service: Arc<AgentService>,
@@ -77,8 +94,7 @@ impl Tool for BudgetTool {
     }
 
     fn description(&self) -> &str {
-        "Show live LLM budget status (spend, limits, remaining — per agent and for your account). \
-         SysAdmins can also set or clear runtime ceiling overrides that take effect immediately."
+        DESCRIPTION
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -88,7 +104,7 @@ impl Tool for BudgetTool {
                 "action": {
                     "type": "string",
                     "enum": ["status", "set_override", "clear_override"],
-                    "description": "status: spend vs limits. set_override/clear_override: SysAdmin only."
+                    "description": "status: model spend vs these ceilings. set_override/clear_override: SysAdmin only. None of them touch the Desk overseer's Act fully budget."
                 },
                 "scope": {
                     "type": "string",
@@ -126,8 +142,10 @@ impl Tool for BudgetTool {
                     identity.as_deref(),
                     admin,
                 )?;
+                let mut said = render_status(&status, admin);
+                said.push_str(&self.act_fully_note());
                 Ok(ToolResult::success(
-                    serde_json::Value::String(render_status(&status, admin)),
+                    serde_json::Value::String(said),
                     elapsed(),
                 ))
             }
@@ -194,8 +212,9 @@ impl Tool for BudgetTool {
                     .unwrap_or_else(|| " until cleared".to_string());
                 Ok(ToolResult::success(
                     serde_json::Value::String(format!(
-                        "Daily budget for {target} is now ${daily_usd:.2}{until}. \
-                         Takes effect within a few seconds."
+                        "The model-spend ceiling for {target} is now ${daily_usd:.2} a day{until} \
+                         (metered model calls only). Takes effect within a few seconds.{}",
+                        self.act_fully_note()
                     )),
                     elapsed(),
                 ))
@@ -241,6 +260,36 @@ impl Tool for BudgetTool {
             )),
         }
     }
+}
+
+impl BudgetTool {
+    /// What this answer doesn't change, said when this agent is a Desk
+    /// overseer with an Act fully budget: that budget, and where it stands.
+    fn act_fully_note(&self) -> String {
+        #[cfg(feature = "postgres")]
+        if let Some(b) = crate::desk_crew::for_service(&self.service)
+            .and_then(|c| c.desk().full_budget_of(self.service.agent_id.as_str()))
+        {
+            return act_fully_line(&b);
+        }
+        String::new()
+    }
+}
+
+/// The Act fully budget `b`, as a line after the ceilings: a different
+/// budget, the person's.
+#[cfg(feature = "postgres")]
+fn act_fully_line(b: &workforce_desk::floor::FullBudget) -> String {
+    let spent = b
+        .spent_usd
+        .map_or_else(|| "not read yet".to_string(), money);
+    format!(
+        "\n\nNot changed here: your Act fully daily budget as the Desk overseer, a different \
+         budget ({spent} of {} real money today; plans aren't counted{}). Only the person \
+         changes it: say so plainly, and post crew.ask_oversight_change for them to approve.",
+        money(b.budget_usd),
+        if b.spent { "; it is spent, so Act fully is stopped" } else { "" }
+    )
 }
 
 fn parse_target(params: &BudgetInput) -> Result<(OverrideScope, String), String> {
@@ -431,6 +480,20 @@ mod tests {
         let (s, k) = parse_target(&mk(Some("agent"), Some("atlas"))).unwrap();
         assert_eq!(s, OverrideScope::Agent);
         assert_eq!(k, "atlas");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn the_act_fully_budget_is_named_as_a_different_one() {
+        let line = act_fully_line(&workforce_desk::floor::FullBudget {
+            spent_usd: Some(1000.0),
+            budget_usd: 200.0,
+            spent: true,
+            cleared_at: None,
+        });
+        assert!(line.contains("a different budget ($1000.00 of $200.00 real money today; plans aren't counted; it is spent"), "{line}");
+        assert!(line.contains("crew.ask_oversight_change"), "{line}");
+        assert!(DESCRIPTION.contains("NOT the Desk overseer's Act fully daily budget"));
     }
 
     #[test]

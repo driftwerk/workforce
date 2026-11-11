@@ -906,6 +906,28 @@ impl Desk {
         view
     }
 
+    /// The real money the ledger's calls cost from `from` to `to`, in the
+    /// rows `filter` keeps: only the calls a key paid for
+    /// ([`Billing::billed`]), never a plan's at their API-equivalent.
+    pub async fn billed_usd(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        filter: &Filter,
+    ) -> Result<f64, DeskError> {
+        let tz = self.timezone();
+        let cells = self
+            .0
+            .store
+            .ledger_cells(from, to, tz.name(), filter)
+            .await?;
+        Ok(cells
+            .iter()
+            .filter(|c| c.billing.billed())
+            .map(|c| c.usd)
+            .sum())
+    }
+
     /// Where `period` began, in the person's timezone.
     pub fn period_start(&self, period: Period, now: DateTime<Utc>) -> DateTime<Utc> {
         ledger::window_start(period, now, self.timezone())

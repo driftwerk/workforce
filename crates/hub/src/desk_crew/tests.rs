@@ -1791,6 +1791,8 @@ mod plans;
 
 mod act_fully;
 
+mod act_fully_budget;
+
 mod served;
 mod unbound;
 

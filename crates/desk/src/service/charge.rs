@@ -42,6 +42,10 @@ pub(crate) struct Charges {
     /// only those whose Act fully is in force (named repositories, a
     /// budget not yet spent), as the hub says.
     full: HashMap<String, charge::FullGrant>,
+    /// Each boss's Act fully budget and today's real money against it, by
+    /// agent id, as the hub last read it: only bosses that chose Act fully
+    /// with a budget.
+    full_budgets: HashMap<String, crate::floor::FullBudget>,
     /// Every agent's own settings files (its `config.toml` and the like),
     /// as the hub says: withheld from what a boss answers for, as Desk's
     /// data is, so no boss allows a change to its own limits.
@@ -156,6 +160,24 @@ impl Desk {
         if changed {
             self.modes_changed();
         }
+    }
+
+    /// Each boss's Act fully budget and today's real money spent against
+    /// it, by agent id, as the hub reads them: the Floor and the boss's
+    /// settings show it.
+    pub fn set_full_budgets(&self, budgets: HashMap<String, crate::floor::FullBudget>) {
+        self.0.state.lock().charges.full_budgets = budgets;
+    }
+
+    /// `boss`'s Act fully budget and today's real money, when it has one.
+    pub fn full_budget_of(&self, boss: &str) -> Option<crate::floor::FullBudget> {
+        self.0
+            .state
+            .lock()
+            .charges
+            .full_budgets
+            .get(boss)
+            .cloned()
     }
 
     /// Where `boss` acts fully now; nowhere when it doesn't.
