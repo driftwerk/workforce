@@ -33,11 +33,23 @@ pub fn identity_tool(system: System) -> &'static str {
     }
 }
 
-/// Every tool `system`'s sync may call: the ones it needs and the one that
-/// says who the person is.
+/// The tools a ticket's view of `system`'s issue calls when the hub offers
+/// them ([`workforce_core::desk::BOARD_SYNC_VIEW_TOOLS`]).
+pub fn view_tools(system: System) -> Vec<&'static str> {
+    let prefix = format!("{}.", system.as_str());
+    workforce_core::desk::BOARD_SYNC_VIEW_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| t.starts_with(&prefix))
+        .collect()
+}
+
+/// Every tool `system`'s sync may call: the ones it needs, the one that
+/// says who the person is, and the ones a ticket's view reads with.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
     all.push(identity_tool(system));
+    all.extend(view_tools(system));
     all
 }
 
@@ -366,7 +378,22 @@ pub const JIRA_FIELDS: &[&str] = &[
     "updated",
     "labels",
     "description",
+    "priority",
+    "duedate",
+    "attachment",
 ];
+
+/// A priority as an issue names it: none when it says it has none.
+fn priority_of(v: &Value) -> Option<String> {
+    let p = name_of(v)?;
+    let lower = p.to_ascii_lowercase();
+    (!matches!(lower.as_str(), "no priority" | "none" | "")).then_some(p)
+}
+
+/// A due date as Jira or Linear writes it (`2026-11-14`).
+fn due_of(v: &Value) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(v.as_str()?.get(..10)?, "%Y-%m-%d").ok()
+}
 
 /// The `linear.issue_list` arguments a filter means for the team
 /// `team_id`, from `since` (the cursor) and at the page `after`; a label is
@@ -571,6 +598,13 @@ pub struct Issue {
     pub closed: Option<bool>,
     /// Its description was cut to [`BODY_MAX`](crate::board::BODY_MAX).
     pub clipped: bool,
+    /// Its priority, project and due date there; its labels are above.
+    pub priority: Option<String>,
+    pub project: Option<String>,
+    pub due: Option<chrono::NaiveDate>,
+    /// The files it holds, when the answer says (`None`: an older hub's,
+    /// which leaves what is known).
+    pub files: Option<Vec<crate::ticket_files::RemoteFile>>,
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
@@ -864,6 +898,10 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
             .get("status_category")
             .and_then(Value::as_str)
             .map(|c| c == "done"),
+        priority: priority_of(&i["priority"]),
+        project: None,
+        due: due_of(&i["duedate"]),
+        files: crate::ticket_files::jira_files(i),
         key,
     })
 }
@@ -885,6 +923,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
     let (body, clipped) = held_body(unescape_newlines(&body));
+    let files = crate::ticket_files::linear_files(i, &body);
     let blocked_by = i.get("relations").map(|r| {
         r.get("nodes")
             .and_then(Value::as_array)
@@ -918,7 +957,29 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         closed: i["state"]["type"]
             .as_str()
             .map(|k| matches!(k, "completed" | "canceled" | "cancelled")),
+        priority: priority_of(&i["priorityLabel"]),
+        project: name_of(&i["project"]["name"]),
+        due: due_of(&i["dueDate"]),
+        files: Some(files),
     })
+}
+
+/// What `issue` says of itself, kept on its ticket: its priority, labels,
+/// project and due date, with when its issue was last read whole carried
+/// over from `was`.
+pub fn details_of(issue: &Issue, was: Option<&crate::board::Details>) -> crate::board::Details {
+    crate::board::Details {
+        priority: issue.priority.clone(),
+        labels: issue
+            .labels
+            .iter()
+            .take(20)
+            .map(|l| crate::crew::one_line(l, 60))
+            .collect(),
+        project: issue.project.clone(),
+        due: issue.due,
+        read_at: was.and_then(|d| d.read_at),
+    }
 }
 
 // ── States ───────────────────────────────────────────────────────────────

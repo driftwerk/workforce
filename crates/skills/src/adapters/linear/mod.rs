@@ -39,6 +39,7 @@ pub const READ_TOOLS: &[&str] = &[
     "linear.labels_list",
     "linear.members_list",
     "linear.viewer",
+    "linear.upload_read",
     "linear.document_get",
     "linear.document_list",
     "linear.document_search",
@@ -213,6 +214,11 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
+            Arc::new(tools::LinearUploadReadTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                Arc::clone(pm),
+            )),
             Arc::new(tools::LinearDocumentGetTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -266,6 +272,7 @@ impl LinearSkill {
             "linear.labels_list",
             "linear.members_list",
             "linear.viewer",
+            "linear.upload_read",
             "linear.document_get",
             "linear.document_list",
             "linear.document_create",
@@ -516,6 +523,23 @@ impl LinearSkill {
                     }),
                 },
                 SkillTool {
+                    name: "linear.upload_read".to_string(),
+                    description:
+                        "Desk's board sync reads a file uploaded to Linear, a base64 chunk at a time"
+                            .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "url": { "type": "string" },
+                            "identifier": { "type": "string" },
+                            "offset": { "type": "integer" },
+                            "length": { "type": "integer" },
+                            "workspace": { "type": "string" }
+                        },
+                        "required": ["url"]
+                    }),
+                },
+                SkillTool {
                     name: "linear.document_get".to_string(),
                     description: "Get a specific Linear document by its UUID or URL".to_string(),
                     input_schema: serde_json::json!({
@@ -668,6 +692,10 @@ impl LinearSkill {
                 },
                 SkillPolicy {
                     tool: "linear.viewer".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "linear.upload_read".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {

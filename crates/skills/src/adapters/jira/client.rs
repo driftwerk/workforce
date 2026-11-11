@@ -184,6 +184,34 @@ impl JiraClient {
         Ok(response.bytes().await?.to_vec())
     }
 
+    /// A file's bytes, as [`Self::get_bytes`] reads them, refused once they
+    /// pass [`crate::adapters::file_read::FILE_MAX`].
+    pub async fn get_file(&self, path: &str) -> Result<Vec<u8>> {
+        let response = self
+            .build_request(reqwest::Method::GET, path)?
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = retry_after_secs(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(jira_status_error(status, retry_after, &body));
+        }
+        crate::adapters::file_read::capped_body(response)
+            .await
+            .map_err(|e| eyre!("{e}"))
+    }
+
+    /// The credential a call is made with now, and its site, as a key a
+    /// file read with it is kept by: a hash, never the credential.
+    pub fn credential_key(&self) -> Result<String> {
+        let (auth, site) = self.resolve_auth()?;
+        Ok(format!(
+            "{}:{site}",
+            crate::adapters::file_read::fingerprint(auth.as_bytes())
+        ))
+    }
+
     /// GET request with query parameters.
     pub async fn get_with_query(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
         let response = self

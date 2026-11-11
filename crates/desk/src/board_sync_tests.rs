@@ -50,6 +50,7 @@ fn synced(state: TicketState) -> Ticket {
         },
         assignee: None,
         clipped: false,
+        details: Default::default(),
     });
     t
 }
@@ -268,6 +269,10 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         assignee: None,
         closed: None,
         clipped: false,
+        priority: None,
+        project: None,
+        due: None,
+        files: None,
     };
     let p = pulled(&t, &issue, &states);
     assert_eq!(p.title.as_deref(), Some("Fix the login page"));

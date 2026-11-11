@@ -405,6 +405,29 @@ pub struct External {
     /// never sent back, so the issue's whole text is never cut.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clipped: bool,
+    /// What its issue says of itself besides its words, as last pulled:
+    /// shown beside it, never pushed.
+    #[serde(default)]
+    pub details: Details,
+}
+
+/// What a synced ticket's issue says of itself: its priority, labels,
+/// project and due date there (someone else's words, unwrapped), and when
+/// it was last read whole for its files.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Details {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<chrono::NaiveDate>,
+    /// When its issue was last read whole, for its files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 impl External {

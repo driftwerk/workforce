@@ -1146,6 +1146,7 @@ pub async fn mount(
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(board_sync_routes));
+    let app = app.merge(crate::desk_ticket_files::install(Arc::clone(&board_sync)));
     Ok(app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),

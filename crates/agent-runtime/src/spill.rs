@@ -22,6 +22,10 @@ use crate::tools::image_gen::GENERATED_IMAGES_KEY;
 
 const VIEWED_IMAGES_KEY: &str = "viewed_images";
 
+/// The `kind` of a chunk of a file a program reads a piece at a time (Desk's
+/// board sync reading a ticket's attachment): bytes, never staged.
+pub const FILE_BYTES_KIND: &str = "file_bytes";
+
 /// Where the row table sits inside a tool output.
 #[derive(Debug)]
 enum RowsAt {
@@ -368,7 +372,7 @@ fn manages_own_staging(output: &Value) -> bool {
         || obj.contains_key(VIEWED_IMAGES_KEY)
         || matches!(
             obj.get("kind").and_then(Value::as_str),
-            Some(TABULAR_ARTIFACT_KIND | CLIPPED_ARTIFACT_KIND)
+            Some(TABULAR_ARTIFACT_KIND | CLIPPED_ARTIFACT_KIND | FILE_BYTES_KIND)
         )
 }
 
@@ -500,6 +504,24 @@ mod tests {
 
         let (_, v) = spill_scoped("spill-a", big.clone(), true, &SpillConfig::default());
         assert_eq!(v, big, "errors never spill");
+    }
+
+    /// A chunk of a file a program reads in pieces is never staged, however
+    /// large: its reader needs the bytes, not a handle.
+    #[test]
+    fn a_file_chunk_is_never_staged() {
+        install_test_global_store();
+        let chunk = json!({
+            "kind": FILE_BYTES_KIND,
+            "media_type": "image/png",
+            "size": 600_000,
+            "offset": 0,
+            "length": 600_000,
+            "data": "A".repeat(800_000),
+        });
+        let (s, v) = spill_scoped("spill-chunk", chunk.clone(), false, &SpillConfig::default());
+        assert_eq!(v, chunk);
+        assert_eq!(s, chunk.to_string());
     }
 
     #[test]

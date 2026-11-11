@@ -30,6 +30,7 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.search",
     "jira.get_issue",
     "jira.get_attachment",
+    "jira.attachment_read",
     "jira.list_comments",
     "jira.list_transitions",
     "jira.list_projects",
@@ -134,6 +135,7 @@ impl JiraSkill {
             Arc::new(tools::JiraTransitionIssueTool::new(c(), w(), p())),
             Arc::new(tools::JiraAddAttachmentTool::new(c(), w(), p())),
             Arc::new(tools::JiraGetAttachmentTool::new(c(), w(), p())),
+            Arc::new(tools::JiraAttachmentReadTool::new(c(), w(), p())),
             Arc::new(tools::JiraListProjectsTool::new(c(), w(), p())),
             Arc::new(tools::JiraGetProjectTool::new(c(), w(), p())),
             Arc::new(tools::JiraSearchUsersTool::new(c(), w(), p())),
@@ -160,6 +162,7 @@ impl JiraSkill {
             "jira.transition_issue",
             "jira.add_attachment",
             "jira.get_attachment",
+            "jira.attachment_read",
             "jira.list_projects",
             "jira.get_project",
             "jira.search_users",
@@ -343,6 +346,22 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.attachment_read",
+                    "Desk's board sync reads a Jira attachment's bytes, a base64 chunk at a time",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" },
+                            "issue_key": { "type": "string" },
+                            "attachment_id": { "type": "string" },
+                            "thumbnail": { "type": "boolean" },
+                            "offset": { "type": "integer" },
+                            "length": { "type": "integer" }
+                        },
+                        "required": ["attachment_id"]
+                    }),
+                ),
+                mk_tool(
                     "jira.get_attachment",
                     "Download a Jira issue attachment and render it into the agent's view (image, PDF, document, audio, or video)",
                     serde_json::json!({
@@ -475,6 +494,7 @@ impl JiraSkill {
                 allow("jira.transition_issue"),
                 allow("jira.add_attachment"),
                 allow("jira.get_attachment"),
+                allow("jira.attachment_read"),
                 allow("jira.list_projects"),
                 allow("jira.get_project"),
                 allow("jira.search_users"),
@@ -527,7 +547,7 @@ mod tests {
         };
         let skill = JiraSkill::new(cfg).unwrap();
         let tools = skill.tools();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
         // Sanity check: all tool names start with "jira."
         for t in &tools {
             assert!(t.name().starts_with("jira."));
@@ -597,10 +617,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_lists_all_20_tools() {
+    fn definition_lists_all_21_tools() {
         let def = JiraSkill::definition();
-        assert_eq!(def.tools.len(), 20);
-        assert_eq!(def.default_policies.len(), 20);
+        assert_eq!(def.tools.len(), 21);
+        assert_eq!(def.default_policies.len(), 21);
         assert_eq!(def.requirements.credentials.len(), 3);
         assert!(def.validate().is_ok());
     }

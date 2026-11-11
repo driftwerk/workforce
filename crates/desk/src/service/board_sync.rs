@@ -309,6 +309,12 @@ impl Desk {
             .change_board_sync(id, move |_, old| Ok((None, old.or(Some(prefix)))))
             .await
             .map_err(internal)?;
+        // Its issues' files are no longer read: what was kept of them goes.
+        self.0
+            .store
+            .forget_remote_files(id)
+            .await
+            .map_err(internal)?;
         for mut t in self.0.store.board_tickets(id).await.map_err(internal)? {
             if let Some(e) = t.external.as_mut().filter(|e| e.synced) {
                 e.synced = false;
@@ -1096,6 +1102,7 @@ impl Desk {
         if p.body.is_some() || issue.body.is_some() {
             e.clipped = issue.clipped;
         }
+        e.details = crate::board_sync::details_of(issue, Some(&e.details));
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
         e.synced = true;
         e.flagged = e.flagged || issue.flagged;
@@ -1108,8 +1115,24 @@ impl Desk {
         if p.state.is_some() {
             e.seen.state = Some(t.state);
         }
+        let files = match &issue.files {
+            Some(files) => self
+                .0
+                .store
+                .put_remote_files(t.id, files, &Self::pulled_by(s).party)
+                .await
+                .map_err(internal)?,
+            None => false,
+        };
         if said.is_empty() {
             self.save_ticket(&mut t).await?;
+            if files {
+                if let Ok(v) = self.view_ticket(t).await {
+                    self.announce(DeskEvent::Ticket {
+                        ticket: Box::new(v),
+                    });
+                }
+            }
             return Ok(false);
         }
         t.updated_at = at;
@@ -1165,6 +1188,7 @@ impl Desk {
                 },
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
+                details: crate::board_sync::details_of(issue, None),
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -1177,6 +1201,13 @@ impl Desk {
         };
         if !self.0.store.import_ticket(&mut t).await.map_err(internal)? {
             return Ok(false);
+        }
+        if let Some(files) = &issue.files {
+            self.0
+                .store
+                .put_remote_files(t.id, files, &by.party)
+                .await
+                .map_err(internal)?;
         }
         let text = format!(
             "imported {} “{}”",
@@ -2085,6 +2116,7 @@ impl Desk {
             },
             assignee: None,
             clipped: false,
+            details: Default::default(),
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

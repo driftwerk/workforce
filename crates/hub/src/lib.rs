@@ -127,6 +127,8 @@ pub(crate) mod desk_pool;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]
+pub mod desk_ticket_files;
+#[cfg(feature = "postgres")]
 pub mod desk_tools;
 #[cfg(feature = "postgres")]
 pub mod desk_uplink;
