@@ -564,9 +564,7 @@ impl CrewHub {
         }
         let named: Vec<String> = off.iter().map(|label| format!("“{label}”")).collect();
         format!(
-            "{hint} Off in the person's Desk settings now: {}. What one of those would let you do \
-             becomes a suggestion; when that happens, tell them which switch to turn on for you to \
-             do it yourself.",
+            "{hint} Off: {}; for those, say which to turn on.",
             named.join(", ")
         )
     }
@@ -581,13 +579,13 @@ impl CrewHub {
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
-            Level::Act => "at Act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) rather than offering it.",
-            Level::Full => "at Act fully: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer), and ship in the repositories the person named.",
+            Level::Act => "at Act: do the work yourself with the crew.* tools, don't offer it.",
+            Level::Full => "at Act fully: do the work yourself with the crew.* tools, and ship in the repos the person named.",
         };
         let off = o.act.off();
         let off = match level.acts() && !off.is_empty() {
             true => format!(
-                " Off: {}; those become suggestions, so say which to turn on.",
+                " Off: {}; for those, say which to turn on.",
                 off.iter()
                     .map(|label| format!("“{label}”"))
                     .collect::<Vec<_>>()
@@ -602,7 +600,7 @@ impl CrewHub {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
-            Level::Act => "You act: do what the work needs yourself with the crew.* tools (start a session for it, hand it to a session, nudge, answer, resume) rather than offering it, within the switches the person turned on; only what those don't allow becomes a suggestion they can do or dismiss. Give a reason each time.",
+            Level::Act => "You act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
             Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's. Give a reason each time.",
         }
     }

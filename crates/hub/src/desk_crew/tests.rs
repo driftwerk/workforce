@@ -4895,6 +4895,11 @@ mod board {
             watching.level = workforce_common::oversight::Level::Watch;
             ticket(&d, b, "Tidy the footer", TicketState::Todo, &[]).await;
             assert!(crew.ready_unhanded(&mut seen, |_| Some(watching.clone())).await.is_empty());
+            // At Suggest, Hand out work on by default doesn't wake it either.
+            let mut suggesting = on.clone();
+            suggesting.level = workforce_common::oversight::Level::Suggest;
+            ticket(&d, b, "Name the release", TicketState::Todo, &[]).await;
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(suggesting.clone())).await.is_empty());
         })
         .await;
     }
@@ -5113,4 +5118,28 @@ async fn a_dm_turn_is_told_its_level_and_the_switches_that_are_off() {
         assert_eq!(super::dm_oversight_hint(&helper), None);
     })
     .await;
+}
+
+/// A boss served from a grant is never told to turn on a switch in Desk:
+/// what a grant could give is the hub's person's to grant, and what no
+/// grant gives is theirs alone.
+#[test]
+fn a_served_boss_is_told_whose_switch_it_is() {
+    use workforce_common::oversight::switch;
+    let local = CrewHub::switch_off(switch::HAND_OUT_WORK, false);
+    assert!(local.contains("turning “Hand out work” on"), "{local}");
+    let granted = CrewHub::switch_off(switch::HAND_OUT_WORK, true);
+    assert!(
+        granted.contains("hasn't granted you “Hand out work”"),
+        "{granted}"
+    );
+    for pinned in [
+        switch::MESSAGE_AGENTS,
+        switch::MESSAGE_TERMINAL_SESSIONS,
+        switch::SET_MODE,
+    ] {
+        let why = CrewHub::switch_off(pinned, true);
+        assert!(why.contains("never a remote boss's"), "{why}");
+        assert!(!why.contains("Desk"), "{why}");
+    }
 }

@@ -56,17 +56,14 @@ pub const ALWAYS_SESSIONS: &str = always_sessions_then!("");
 /// [`ALWAYS_SESSIONS`] at Act while "Hand out work" is off: the session it
 /// would start is a suggestion until the person turns it on.
 pub const ALWAYS_SESSIONS_HAND_OUT_OFF: &str = always_sessions_then!(
-    " “Hand out work” is off in your Desk settings, so a session you start is a suggestion \
-     the person starts; tell them that turning “Hand out work” on lets you start sessions \
-     yourself."
+    " “Hand out work” is off, so the start is a suggestion; tell the person turning “Hand out \
+     work” on lets you start sessions."
 );
 
 /// [`ALWAYS_SESSIONS`] at Suggest: every session it would start is a
 /// suggestion.
-pub const ALWAYS_SESSIONS_SUGGEST: &str = always_sessions_then!(
-    " At Suggest, a session you start is a suggestion the person starts; at Act, with “Hand \
-     out work” on, you start it yourself."
-);
+pub const ALWAYS_SESSIONS_SUGGEST: &str =
+    always_sessions_then!(" At Suggest, the start is a suggestion.");
 
 fn oversight_of(workspace: &Path) -> workforce_common::oversight::Oversight {
     workforce_common::settings::AgentWorkspaceConfig::load(workspace)

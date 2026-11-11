@@ -503,7 +503,7 @@ impl CrewHub {
             }
             return self.unbound_gate(action, o);
         }
-        self.gate_as(action, o, boss.as_deref())
+        self.gate_as(action, o, boss.as_deref(), false)
     }
 
     /// A session still running in a mode that doesn't ask, set while a
@@ -529,7 +529,15 @@ impl CrewHub {
     /// What `level` and `[oversight.act]` let `boss` do with `action`: the
     /// boss named, never looked up by its scope, so a boss served from a
     /// grant is never taken for a local overseer of the same group.
-    pub(crate) fn gate_as(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Gate {
+    /// `served`: it is such a boss, whose switches are this hub's person's
+    /// grant, not its own Desk settings.
+    pub(crate) fn gate_as(
+        &self,
+        action: &Action,
+        o: &Oversight,
+        boss: Option<&str>,
+        served: bool,
+    ) -> Gate {
         if let Some(held) = self.mode_hold(action, o, boss) {
             return held;
         }
@@ -586,10 +594,10 @@ impl CrewHub {
                 TakeOn::Handed => Gate::Suggest("the person hands you the sessions you run; offer to take it on and they accept".into()),
             };
         }
-        if let Some(gate) = self.gate_charged(action, o, boss) {
+        if let Some(gate) = self.gate_charged(action, o, boss, served) {
             return gate;
         }
-        if let Some(why) = self.uncontained(action, &o.act) {
+        if let Some(why) = self.uncontained(action, &o.act, served) {
             return Gate::Suggest(why);
         }
         // What a message, an answer or a ticket's text says isn't read for
@@ -626,7 +634,7 @@ impl CrewHub {
         } = action
         {
             if !o.act.message_terminal_sessions {
-                return Gate::Suggest(Self::terminal_off());
+                return Gate::Suggest(Self::terminal_off(served));
             }
         }
         // Whether it runs, and the switch that would let it when it doesn't.
@@ -699,7 +707,7 @@ impl CrewHub {
         };
         match (allowed, needs) {
             (true, _) => Gate::Run,
-            (false, Some(label)) => Gate::Suggest(switch::off(label).into()),
+            (false, Some(label)) => Gate::Suggest(Self::switch_off(label, served)),
             (false, None) => match action {
                 Action::Deny { .. } | Action::Stop { .. } => Gate::Suggest(
                     "denying a request or stopping a session is the person's call".into(),
@@ -784,11 +792,17 @@ impl CrewHub {
     /// of sessions it doesn't run; resuming and restarting it stay the
     /// person's; only suggest while the person drives it. `None`: the usual rules decide (a plain
     /// message waits on its line while the person drives).
-    fn gate_charged(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
+    fn gate_charged(
+        &self,
+        action: &Action,
+        o: &Oversight,
+        boss: Option<&str>,
+        served: bool,
+    ) -> Option<Gate> {
         let session =
             Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)))?;
         // What it leads to must wait on the person as for any session.
-        if let Some(why) = self.uncontained(action, &o.act) {
+        if let Some(why) = self.uncontained(action, &o.act, served) {
             return Some(Gate::Suggest(why));
         }
         let name = self.session_name(session);
@@ -820,7 +834,7 @@ impl CrewHub {
                 reply_to: Some(_), ..
             } => Some(match o.act.answer_sessions {
                 true => Gate::Run,
-                false => Gate::Suggest(switch::off(switch::ANSWER_SESSIONS).into()),
+                false => Gate::Suggest(Self::switch_off(switch::ANSWER_SESSIONS, served)),
             }),
             Action::Interrupt { .. } => Some(Gate::Run),
             // A session started again reads its settings again: changes to
@@ -849,7 +863,12 @@ impl CrewHub {
     /// been started not to ask: messages to either wait on the person unless
     /// they switched them on (`message_agents`, `message_terminal_sessions`).
     /// Resuming or restarting a session from another terminal always does.
-    pub(crate) fn uncontained(&self, action: &Action, act: &Act) -> Option<Cow<'static, str>> {
+    pub(crate) fn uncontained(
+        &self,
+        action: &Action,
+        act: &Act,
+        served: bool,
+    ) -> Option<Cow<'static, str>> {
         let started_here = |session: &Uuid| {
             self.desk
                 .view(*session)
@@ -862,7 +881,7 @@ impl CrewHub {
             } => match self.desk.view(*s).map(|v| v.origin) {
                 Ok(Origin::Desk) => true,
                 Ok(Origin::External) if !act.message_terminal_sessions => {
-                    return Some(Self::terminal_off());
+                    return Some(Self::terminal_off(served));
                 }
                 Ok(Origin::External) => true,
                 Err(_) => false,
@@ -877,7 +896,7 @@ impl CrewHub {
                 ..
             } => match self.desk.view(*s).map(|v| v.origin) {
                 Ok(Origin::External) if !act.message_terminal_sessions => {
-                    return Some(Self::terminal_off());
+                    return Some(Self::terminal_off(served));
                 }
                 _ => true,
             },
@@ -885,7 +904,7 @@ impl CrewHub {
                 to: Handout::Agent(_),
                 ..
             } => {
-                return (!act.message_agents).then(Self::agents_off);
+                return (!act.message_agents).then(|| Self::agents_off(served));
             }
             Action::AssignTicket {
                 to: Handout::NewSession { .. },
@@ -909,7 +928,7 @@ impl CrewHub {
                 ..
             }
             | Action::Assign { .. } => {
-                return (!act.message_agents).then(Self::agents_off);
+                return (!act.message_agents).then(|| Self::agents_off(served));
             }
         };
         (!held).then_some(
@@ -917,22 +936,47 @@ impl CrewHub {
         )
     }
 
+    /// Why what the switch `label` keeps off waits on the person. A local
+    /// overseer is told to name the switch to turn on in Desk; a boss served
+    /// from a grant, that this hub's person hasn't granted it, or, for what
+    /// a grant never gives, that it is theirs alone.
+    pub(super) fn switch_off(label: &'static str, served: bool) -> Cow<'static, str> {
+        if !served {
+            return switch::off(label).into();
+        }
+        let pinned = [
+            switch::MESSAGE_AGENTS,
+            switch::MESSAGE_TERMINAL_SESSIONS,
+            switch::SET_MODE,
+        ];
+        match pinned.contains(&label) {
+            true => format!(
+                "“{label}” is this hub's person's own and never a remote boss's, so it waits on them"
+            )
+            .into(),
+            false => format!(
+                "this hub's person hasn't granted you “{label}”, so it waits on them"
+            )
+            .into(),
+        }
+    }
+
     /// Why a message to an agent waits on the person while
     /// `message_agents` is off.
-    fn agents_off() -> Cow<'static, str> {
+    fn agents_off(served: bool) -> Cow<'static, str> {
         format!(
             "an agent acts on a message under its own permissions; {}",
-            switch::off(switch::MESSAGE_AGENTS)
+            Self::switch_off(switch::MESSAGE_AGENTS, served)
         )
         .into()
     }
 
     /// Why a message to a session started in another terminal waits on the
     /// person while `message_terminal_sessions` is off.
-    fn terminal_off() -> Cow<'static, str> {
+    fn terminal_off(served: bool) -> Cow<'static, str> {
         format!(
             "a session started in another terminal may not ask before it acts; {}",
-            switch::off(switch::MESSAGE_TERMINAL_SESSIONS)
+            Self::switch_off(switch::MESSAGE_TERMINAL_SESSIONS, served)
         )
         .into()
     }

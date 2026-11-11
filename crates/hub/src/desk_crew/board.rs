@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Level, Oversight};
+use workforce_common::oversight::Oversight;
 use workforce_desk::board::TicketState;
 use workforce_desk::crew::{self, PartyKind};
 use workforce_desk::scope::Seen;
@@ -274,7 +274,8 @@ impl CrewHub {
             let Some(o) = oversight_of(b.group.as_deref()) else {
                 continue;
             };
-            if o.level == Level::Watch || !o.act.hand_out_work {
+            // Only a level that acts hands out what is ready.
+            if !o.level.acts() || !o.act.hand_out_work {
                 continue;
             }
             out.extend(fresh.into_iter().map(|v| Trigger {

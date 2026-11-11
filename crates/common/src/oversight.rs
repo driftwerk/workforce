@@ -199,10 +199,7 @@ pub mod switch {
     /// Why something waits on the person because the switch `label` is
     /// off, said so the overseer tells them which one to turn on.
     pub fn off(label: &str) -> String {
-        format!(
-            "“{label}” is off in your Desk settings (What it may do without asking), so it \
-             waits on the person; tell them that turning “{label}” on lets you do this yourself"
-        )
+        format!("“{label}” is off in Desk; tell the person turning “{label}” on lets you do this")
     }
 }
 

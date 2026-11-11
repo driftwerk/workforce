@@ -426,7 +426,7 @@ impl CrewTool {
                 Ok(json!({
                     "suggested": s.text,
                     "suggestion_id": s.id,
-                    "note": format!("Not done: {why}. The person sees it as a suggestion beside your message and can do it or dismiss it; mention it briefly, with anything the reason says to tell them."),
+                    "note": format!("Not done: {why}. The person sees it as a suggestion beside your message and can do it or dismiss it; mention it briefly, as the reason says."),
                 }))
             }
         }
