@@ -253,6 +253,7 @@ mod tests {
                 )
                 .await;
                 fenced(&nav, "title");
+                fenced(&nav, "url");
                 call(
                     "browser.fill",
                     serde_json::json!({"selector": "#name", "value": "Sam"}),
@@ -264,6 +265,7 @@ mod tests {
                 assert!(fenced(&text, "content").contains("Thanks, Sam"));
                 let snap = call("browser.snapshot", serde_json::json!({})).await;
                 fenced(&snap, "body_text");
+                fenced(&snap, "url");
                 assert_eq!(snap["_security"]["hostile"], false);
 
                 // A console error.
