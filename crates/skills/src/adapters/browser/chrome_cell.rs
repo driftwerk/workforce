@@ -60,6 +60,17 @@ pub(super) fn may_show(url: &str) -> bool {
     openable(&kind(url), In::Chrome) && hooks::settings().sites.allows(host.as_deref())
 }
 
+/// Clears the site a call was opening when the call ends, any way it ends.
+struct PendingVisit<'a>(&'a StdMutex<Option<String>>);
+
+impl Drop for PendingVisit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.0.lock() {
+            *pending = None;
+        }
+    }
+}
+
 /// Where the person's Chrome may not be, as a refusal.
 fn kept_away(host: &str) -> eyre::Report {
     eyre!("Desk keeps away from {host} in your Chrome (Settings → Browser), so it wasn't opened.")
@@ -171,6 +182,7 @@ impl ChromeCell {
         }
         let chrome = guard.as_ref().expect("just attached");
         let decided = super::client::take_decided(super::client::Backend::Chrome);
+        super::client::undecided_write(&decided)?;
         self.keep_page(chrome, decided.clone()).await?;
         // The site the person allowed this very call to open: it stays
         // allowed only if the call lands there ([`Self::navigate`]).
@@ -178,8 +190,9 @@ impl ChromeCell {
             Some(Decided::Visit(origin)) => origin,
             _ => None,
         };
+        // Cleared however the call ends: done, failed, cancelled or panicked.
+        let _pending = PendingVisit(&self.pending_visit);
         let out = op(chrome).await;
-        *self.pending_visit.lock().unwrap() = None;
         if out.is_err() && !chrome.alive() {
             *guard = None;
         }

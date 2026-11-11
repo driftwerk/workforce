@@ -270,6 +270,10 @@ impl BrowserHooks for DeskHooks {
         unbound_now(&self.state, agent)
     }
 
+    fn gate_decides(&self) -> bool {
+        true
+    }
+
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String> {
         if self.unbound(agent) {
             return None;

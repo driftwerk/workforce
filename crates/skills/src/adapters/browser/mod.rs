@@ -360,6 +360,9 @@ mod tests {
                 false => Ok(()),
             }
         }
+        fn gate_decides(&self) -> bool {
+            GATE_DECIDES.load(std::sync::atomic::Ordering::SeqCst)
+        }
         fn may_open_file(&self, _agent: &str, path: &std::path::Path) -> Result<(), String> {
             self.asked_files.lock().unwrap().push(path.to_path_buf());
             match path
@@ -372,6 +375,9 @@ mod tests {
             }
         }
     }
+
+    /// Whether the test's hub decides every call, as Desk's does.
+    static GATE_DECIDES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     static TEST_HOOKS: std::sync::LazyLock<Arc<TestHooks>> = std::sync::LazyLock::new(|| {
         Arc::new(TestHooks {
@@ -835,6 +841,59 @@ mod tests {
             })
             .await;
         close(Which::All).await;
+    }
+
+    /// Where the gate decides every call, a write it decided nothing for is
+    /// refused; the same write decided for (its own call, a typed value
+    /// put in after) runs; a read needs no decision.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn browser_e2e_an_undecided_write_is_refused_where_the_gate_decides() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        install_hooks(TEST_HOOKS.clone());
+        let site = fixture::serve();
+        let dir = tempfile::tempdir().unwrap();
+        let skill = e2e_skill(dir.path());
+        let tools = skill.tools();
+        let tool = |n: &str| tools.iter().find(|t| t.name() == n).unwrap().clone();
+        let (nav, fill, click) = (
+            tool("browser.navigate"),
+            tool("browser.fill"),
+            tool("browser.click"),
+        );
+        GATE_DECIDES.store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("decides-agent".into(), async {
+                let r = nav
+                    .execute(serde_json::json!({"url": site.url("/form")}))
+                    .await
+                    .unwrap();
+                assert!(r.success, "a read needs no decision: {:?}", r.error);
+                let save = serde_json::json!({"selector": "#send"});
+                let undecided = click.execute(save.clone()).await.unwrap();
+                assert!(!undecided.success);
+                assert!(undecided
+                    .error
+                    .unwrap_or_default()
+                    .contains("changed since this was decided"));
+                // Decided with the marker the model wrote, run with what the
+                // marker stood for: the same call.
+                fill.effect(&serde_json::json!({"selector": "#name", "value": "[[secret:abc]]"}));
+                let typed = fill
+                    .execute(serde_json::json!({"selector": "#name", "value": "Sam"}))
+                    .await
+                    .unwrap();
+                assert!(typed.success, "{:?}", typed.error);
+                click.effect(&save);
+                let decided = click.execute(save).await.unwrap();
+                assert!(decided.success, "{:?}", decided.error);
+            })
+            .await;
+        GATE_DECIDES.store(false, std::sync::atomic::Ordering::SeqCst);
+        close(Which::All).await;
+        out
     }
 
     /// `GET path` on 127.0.0.1:`port`, the body.
