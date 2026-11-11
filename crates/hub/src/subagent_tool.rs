@@ -208,9 +208,10 @@ impl SubAgentTool {
     /// sessions ([`crate::sessions_only`]), and the sub-agent would do work
     /// rather than look things up.
     fn prefers_sessions(&self, profile: AgentProfile) -> Option<&'static str> {
-        (profile != AgentProfile::Worker
-            && crate::sessions_only::always_sessions(&self.service.workspace))
-        .then_some(crate::sessions_only::ALWAYS_SESSIONS)
+        if profile == AgentProfile::Worker {
+            return None;
+        }
+        crate::sessions_only::always_sessions_refusal(&self.service.workspace)
     }
 
     async fn handle_spawn(&self, input: SubAgentInput, start: Instant) -> Result<ToolResult> {

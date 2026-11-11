@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Act, Level, Oversight, Scope, TakeOn};
+use workforce_common::oversight::{switch, Act, Level, Oversight, Scope, TakeOn};
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
@@ -590,7 +590,7 @@ impl CrewHub {
             return gate;
         }
         if let Some(why) = self.uncontained(action, &o.act) {
-            return Gate::Suggest(why.into());
+            return Gate::Suggest(why);
         }
         // What a message, an answer or a ticket's text says isn't read for
         // pushing or sending: a message can't act. What the session or
@@ -626,25 +626,26 @@ impl CrewHub {
         } = action
         {
             if !o.act.message_terminal_sessions {
-                return Gate::Suggest(
-                    "moving it tells a session in another terminal, which the person hasn't let you message without asking".into(),
-                );
+                return Gate::Suggest(Self::terminal_off());
             }
         }
-        let allowed = match action {
+        // Whether it runs, and the switch that would let it when it doesn't.
+        let (allowed, needs) = match action {
             Action::Nudge {
                 reply_to: Some(_), ..
-            } => o.act.answer_sessions,
-            Action::Nudge { .. } => o.act.nudge,
-            Action::Escalate { .. } => true,
+            } => (o.act.answer_sessions, Some(switch::ANSWER_SESSIONS)),
+            Action::Nudge { .. } => (o.act.nudge, Some(switch::NUDGE)),
+            Action::Escalate { .. } => (true, None),
             // Switched on by `message_agents`, above.
-            Action::Assign { .. } => true,
-            Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
-            Action::StartSession { .. } => o.act.hand_out_work,
+            Action::Assign { .. } => (true, None),
+            Action::Resume { .. } | Action::Restart { .. } => {
+                (o.act.resume_restart, Some(switch::RESUME_RESTART))
+            }
+            Action::StartSession { .. } => (o.act.hand_out_work, Some(switch::HAND_OUT_WORK)),
             // The person's approval of its plan is the authority for its
             // tickets' sessions and moves, whatever `hand_out_work` says.
             Action::AssignTicket { planned, .. } | Action::MoveTicket { planned, .. } => {
-                *planned || o.act.hand_out_work
+                (*planned || o.act.hand_out_work, Some(switch::HAND_OUT_WORK))
             }
             Action::Approve { session, approval } => {
                 // Codex's requests are to leave its sandbox, and what it says
@@ -672,7 +673,7 @@ impl CrewHub {
                     };
                 }
                 if !o.act.read_only_approvals {
-                    false
+                    (false, Some(switch::READ_ONLY_APPROVALS))
                 } else {
                     let view = self.desk.view(*session).ok();
                     let ok = view.as_ref().is_some_and(|v| {
@@ -683,23 +684,28 @@ impl CrewHub {
                     if !ok {
                         return Gate::Suggest("only requests that just read inside the session's folder are allowed without the person".into());
                     }
-                    true
+                    (true, None)
                 }
             }
-            Action::Interrupt { .. } => o.act.interrupt,
-            Action::Deny { .. } | Action::Stop { .. } => false,
+            Action::Interrupt { .. } => (o.act.interrupt, Some(switch::INTERRUPT)),
+            Action::Deny { .. } | Action::Stop { .. } => (false, None),
             // Decided above.
-            Action::TakeOn { .. } | Action::Release { .. } => true,
-            Action::Handoff { .. } => false,
+            Action::TakeOn { .. } | Action::Release { .. } => (true, None),
+            Action::Handoff { .. } => (false, None),
             // At Act, only to a mode that still asks before it runs a
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
-            Action::SetMode { .. } => o.act.set_mode,
+            Action::SetMode { .. } => (o.act.set_mode, Some(switch::SET_MODE)),
         };
-        if allowed {
-            Gate::Run
-        } else {
-            Gate::Suggest("the person hasn't let you do that without asking".into())
+        match (allowed, needs) {
+            (true, _) => Gate::Run,
+            (false, Some(label)) => Gate::Suggest(switch::off(label).into()),
+            (false, None) => match action {
+                Action::Deny { .. } | Action::Stop { .. } => Gate::Suggest(
+                    "denying a request or stopping a session is the person's call".into(),
+                ),
+                _ => Gate::Suggest("the person hasn't let you do that without asking".into()),
+            },
         }
     }
 
@@ -783,7 +789,7 @@ impl CrewHub {
             Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)))?;
         // What it leads to must wait on the person as for any session.
         if let Some(why) = self.uncontained(action, &o.act) {
-            return Some(Gate::Suggest(why.into()));
+            return Some(Gate::Suggest(why));
         }
         let name = self.session_name(session);
         if self.desk.wheel_of(session).is_some_and(|w| w.person()) {
@@ -814,9 +820,7 @@ impl CrewHub {
                 reply_to: Some(_), ..
             } => Some(match o.act.answer_sessions {
                 true => Gate::Run,
-                false => {
-                    Gate::Suggest("the person hasn't let you answer sessions without asking".into())
-                }
+                false => Gate::Suggest(switch::off(switch::ANSWER_SESSIONS).into()),
             }),
             Action::Interrupt { .. } => Some(Gate::Run),
             // A session started again reads its settings again: changes to
@@ -845,7 +849,7 @@ impl CrewHub {
     /// been started not to ask: messages to either wait on the person unless
     /// they switched them on (`message_agents`, `message_terminal_sessions`).
     /// Resuming or restarting a session from another terminal always does.
-    pub(crate) fn uncontained(&self, action: &Action, act: &Act) -> Option<&'static str> {
+    pub(crate) fn uncontained(&self, action: &Action, act: &Act) -> Option<Cow<'static, str>> {
         let started_here = |session: &Uuid| {
             self.desk
                 .view(*session)
@@ -857,7 +861,10 @@ impl CrewHub {
                 ..
             } => match self.desk.view(*s).map(|v| v.origin) {
                 Ok(Origin::Desk) => true,
-                Ok(Origin::External) => act.message_terminal_sessions,
+                Ok(Origin::External) if !act.message_terminal_sessions => {
+                    return Some(Self::terminal_off());
+                }
+                Ok(Origin::External) => true,
                 Err(_) => false,
             },
             Action::Resume { session: s, .. } | Action::Restart { session: s, .. } => {
@@ -869,16 +876,16 @@ impl CrewHub {
                 to: Handout::Session(s),
                 ..
             } => match self.desk.view(*s).map(|v| v.origin) {
-                Ok(Origin::External) => act.message_terminal_sessions,
+                Ok(Origin::External) if !act.message_terminal_sessions => {
+                    return Some(Self::terminal_off());
+                }
                 _ => true,
             },
             Action::AssignTicket {
                 to: Handout::Agent(_),
                 ..
             } => {
-                return (!act.message_agents).then_some(
-                    "the person hasn't let you message agents without asking: an agent acts on a message under its own permissions",
-                );
+                return (!act.message_agents).then(Self::agents_off);
             }
             Action::AssignTicket {
                 to: Handout::NewSession { .. },
@@ -902,14 +909,32 @@ impl CrewHub {
                 ..
             }
             | Action::Assign { .. } => {
-                return (!act.message_agents).then_some(
-                    "the person hasn't let you message agents without asking: an agent acts on a message under its own permissions",
-                );
+                return (!act.message_agents).then(Self::agents_off);
             }
         };
         (!held).then_some(
-            "what it leads to wouldn't wait on the person: a session Desk didn't start may not ask before it acts",
+            "what it leads to wouldn't wait on the person: a session Desk didn't start may not ask before it acts".into(),
         )
+    }
+
+    /// Why a message to an agent waits on the person while
+    /// `message_agents` is off.
+    fn agents_off() -> Cow<'static, str> {
+        format!(
+            "an agent acts on a message under its own permissions; {}",
+            switch::off(switch::MESSAGE_AGENTS)
+        )
+        .into()
+    }
+
+    /// Why a message to a session started in another terminal waits on the
+    /// person while `message_terminal_sessions` is off.
+    fn terminal_off() -> Cow<'static, str> {
+        format!(
+            "a session started in another terminal may not ask before it acts; {}",
+            switch::off(switch::MESSAGE_TERMINAL_SESSIONS)
+        )
+        .into()
     }
 
     /// Whether a boss ran `session` and it was let go: only the person

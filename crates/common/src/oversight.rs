@@ -12,7 +12,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
@@ -182,6 +182,54 @@ pub struct Act {
     pub set_mode: bool,
 }
 
+/// The `[oversight.act]` switches as Desk's settings name them ("What it
+/// may do without asking"), so what the overseer tells the person matches
+/// what they see there.
+pub mod switch {
+    pub const NUDGE: &str = "Nudge";
+    pub const RESUME_RESTART: &str = "Resume and restart";
+    pub const READ_ONLY_APPROVALS: &str = "Allow read-only requests";
+    pub const HAND_OUT_WORK: &str = "Hand out work";
+    pub const INTERRUPT: &str = "Interrupt";
+    pub const MESSAGE_AGENTS: &str = "Message agents";
+    pub const ANSWER_SESSIONS: &str = "Answer sessions’ questions";
+    pub const MESSAGE_TERMINAL_SESSIONS: &str = "Message sessions from other terminals";
+    pub const SET_MODE: &str = "Change sessions’ permission mode";
+
+    /// Why something waits on the person because the switch `label` is
+    /// off, said so the overseer tells them which one to turn on.
+    pub fn off(label: &str) -> String {
+        format!(
+            "“{label}” is off in your Desk settings (What it may do without asking), so it \
+             waits on the person; tell them that turning “{label}” on lets you do this yourself"
+        )
+    }
+}
+
+impl Act {
+    /// The switches that are off, by the names Desk shows them under.
+    pub fn off(&self) -> Vec<&'static str> {
+        [
+            (self.nudge, switch::NUDGE),
+            (self.resume_restart, switch::RESUME_RESTART),
+            (self.read_only_approvals, switch::READ_ONLY_APPROVALS),
+            (self.hand_out_work, switch::HAND_OUT_WORK),
+            (self.interrupt, switch::INTERRUPT),
+            (self.message_agents, switch::MESSAGE_AGENTS),
+            (self.answer_sessions, switch::ANSWER_SESSIONS),
+            (
+                self.message_terminal_sessions,
+                switch::MESSAGE_TERMINAL_SESSIONS,
+            ),
+            (self.set_mode, switch::SET_MODE),
+        ]
+        .into_iter()
+        .filter(|(on, _)| !on)
+        .map(|(_, label)| label)
+        .collect()
+    }
+}
+
 /// `[oversight.full]`: where, and on what budget, Act fully ships.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct Full {
@@ -325,7 +373,9 @@ impl Default for Oversight {
                 nudge: true,
                 resume_restart: true,
                 read_only_approvals: false,
-                hand_out_work: false,
+                // At Act it starts the sessions its work needs: with
+                // `prefer_sessions` on too, that is how it does any.
+                hand_out_work: true,
                 interrupt: false,
                 message_agents: false,
                 message_terminal_sessions: false,
@@ -1189,6 +1239,24 @@ mod tests {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }
+    }
+
+    /// At Act it starts the sessions its work needs unless the person
+    /// turns that off, and each switch that is off is named as Desk shows it.
+    #[test]
+    fn act_hands_out_work_by_default_and_names_what_is_off() {
+        let o = Oversight::default();
+        assert!(o.act.hand_out_work);
+        assert!(!o.act.off().contains(&switch::HAND_OUT_WORK));
+        let off = Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o
+        };
+        assert!(off.act.off().contains(&switch::HAND_OUT_WORK));
+        assert!(switch::off(switch::HAND_OUT_WORK).contains("turning “Hand out work” on"));
     }
 
     /// Every `[oversight.act]` switch on, Act fully anywhere.

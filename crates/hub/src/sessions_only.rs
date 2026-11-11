@@ -36,24 +36,71 @@ use eyre::Result;
 use workforce_agent::tools::{SurfaceEffect, Tool, ToolDefinition, ToolResult};
 use workforce_core::computer::Effect;
 
+/// [`ALWAYS_SESSIONS`], and what follows it when a session it starts is
+/// only a suggestion.
+macro_rules! always_sessions_then {
+    ($then:literal) => {
+        concat!(
+            "Desk is set to always work in real sessions: start one with crew.start_session so \
+             the person can watch it. Here only read-only lookups run: reads, search, notes in \
+             the agent's own workspace, and sub-agents with profile \"worker\".",
+            $then
+        )
+    };
+}
+
 /// Why a call is refused while the switch is on: the same words for every
 /// held tool and for a sub-agent that would do the work.
-pub const ALWAYS_SESSIONS: &str = "Desk is set to always work in real sessions: start one \
-with crew.start_session so the person can watch it. Here only read-only lookups run: reads, \
-search, notes in the agent's own workspace, and sub-agents with profile \"worker\".";
+pub const ALWAYS_SESSIONS: &str = always_sessions_then!("");
+
+/// [`ALWAYS_SESSIONS`] at Act while "Hand out work" is off: the session it
+/// would start is a suggestion until the person turns it on.
+pub const ALWAYS_SESSIONS_HAND_OUT_OFF: &str = always_sessions_then!(
+    " “Hand out work” is off in your Desk settings, so a session you start is a suggestion \
+     the person starts; tell them that turning “Hand out work” on lets you start sessions \
+     yourself."
+);
+
+/// [`ALWAYS_SESSIONS`] at Suggest: every session it would start is a
+/// suggestion.
+pub const ALWAYS_SESSIONS_SUGGEST: &str = always_sessions_then!(
+    " At Suggest, a session you start is a suggestion the person starts; at Act, with “Hand \
+     out work” on, you start it yourself."
+);
+
+fn oversight_of(workspace: &Path) -> workforce_common::oversight::Oversight {
+    workforce_common::settings::AgentWorkspaceConfig::load(workspace)
+        .ok()
+        .flatten()
+        .and_then(|c| c.oversight().ok())
+        .unwrap_or_default()
+}
 
 /// Whether the agent whose workspace is `workspace` always works in real
 /// sessions: it oversees the crew at a level that starts sessions (Watch
 /// starts none) with `[oversight.work] prefer_sessions` on.
 pub fn always_sessions(workspace: &Path) -> bool {
-    let oversight = workforce_common::settings::AgentWorkspaceConfig::load(workspace)
-        .ok()
-        .flatten()
-        .and_then(|c| c.oversight().ok())
-        .unwrap_or_default();
-    oversight.enabled
-        && oversight.level != workforce_common::oversight::Level::Watch
-        && oversight.work.prefer_sessions
+    refusal_for(&oversight_of(workspace)).is_some()
+}
+
+/// What a call held to the switch is told, for the agent whose workspace
+/// is `workspace`: `None` unless it always works in real sessions, and
+/// whether the session it is pointed to would only be suggested.
+pub fn always_sessions_refusal(workspace: &Path) -> Option<&'static str> {
+    refusal_for(&oversight_of(workspace))
+}
+
+fn refusal_for(o: &workforce_common::oversight::Oversight) -> Option<&'static str> {
+    use workforce_common::oversight::Level;
+    if !o.enabled || !o.work.prefer_sessions {
+        return None;
+    }
+    match o.level {
+        Level::Watch => None,
+        Level::Suggest => Some(ALWAYS_SESSIONS_SUGGEST),
+        Level::Act | Level::Full if !o.act.hand_out_work => Some(ALWAYS_SESSIONS_HAND_OUT_OFF),
+        Level::Act | Level::Full => Some(ALWAYS_SESSIONS),
+    }
 }
 
 /// What a held tool is, for what of its calls is refused.
@@ -162,9 +209,10 @@ impl Bounds {
                     held.is_some()
                 }
             };
-        if !may_be || !always_sessions(&self.workspace) {
+        if !may_be {
             return None;
         }
+        let refusal = always_sessions_refusal(&self.workspace)?;
         let touches = |paths: &[&PathBuf]| paths.iter().any(|p| self.touches_code(p));
         let refused = match (held, effect) {
             (Some(Held::Shell), _) | (_, Effect::Exec { .. }) => true,
@@ -177,7 +225,7 @@ impl Bounds {
             (Some(Held::Files), _) => true,
             (None, Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown) => false,
         };
-        refused.then_some(ALWAYS_SESSIONS)
+        refused.then_some(refusal)
     }
 }
 
@@ -654,6 +702,36 @@ mod tests {
         // Starting a session, a connector, a tool that names nothing: run.
         assert!(at.runs("crew.start_session", session, json!({})).await);
         assert!(at.runs("memory.remember", unknown, json!({})).await);
+    }
+
+    /// The refusal points to a session it starts, and says when that start
+    /// is only a suggestion and which switch would let it start it itself.
+    #[test]
+    fn the_refusal_says_when_the_session_it_points_to_is_only_suggested() {
+        let at = |config: &str| {
+            let place = Place::new(config);
+            always_sessions_refusal(&place.bounds.workspace)
+        };
+        assert_eq!(
+            at(ON),
+            Some(ALWAYS_SESSIONS),
+            "Act starts sessions by default"
+        );
+        assert_eq!(
+            at(&format!("{ON}[oversight.act]\nhand_out_work = false\n")),
+            Some(ALWAYS_SESSIONS_HAND_OUT_OFF)
+        );
+        assert!(ALWAYS_SESSIONS_HAND_OUT_OFF
+            .contains(workforce_common::oversight::switch::HAND_OUT_WORK));
+        assert_eq!(
+            at("[oversight]\nenabled = true\nlevel = \"suggest\"\n"),
+            Some(ALWAYS_SESSIONS_SUGGEST)
+        );
+        assert_eq!(at("[oversight]\nenabled = true\nlevel = \"watch\"\n"), None);
+        assert_eq!(
+            at("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n"),
+            None
+        );
     }
 
     #[tokio::test]

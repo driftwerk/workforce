@@ -4154,6 +4154,9 @@ mod board {
             let r = tool("crew.assign_ticket").execute(assign("ACM-1")).await.unwrap();
             assert!(r.success, "{r:?}");
             assert_eq!(r.output["suggested"], "Give ACM-1 to acme-web", "{r:?}");
+            // The overseer is told which switch would let it, to tell the person.
+            let note = r.output["note"].as_str().unwrap_or_default();
+            assert!(note.contains("turning “Hand out work” on"), "{note}");
             let r = tool("crew.move_ticket").execute(mv("acm-2", "doing")).await.unwrap();
             assert_eq!(r.output["suggested"], "Move ACM-2 to Doing", "{r:?}");
             assert_eq!(state_of(&d, "ACM-1").await, (TicketState::Todo, None));
@@ -5061,4 +5064,25 @@ mod board {
         })
         .await;
     }
+}
+
+/// At Act, the check-in tells the overseer to act, and names the switches
+/// that are off so it can tell the person which to turn on.
+#[test]
+fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
+    use workforce_common::oversight::{switch, Act, Level, Oversight};
+    let o = Oversight::default();
+    let hint = CrewHub::level_hint(Level::Act, &o);
+    assert!(hint.starts_with("You act: "), "{hint}");
+    assert!(!hint.contains(switch::HAND_OUT_WORK), "{hint}");
+    assert!(hint.contains(switch::INTERRUPT), "{hint}");
+    let off = Oversight {
+        act: Act {
+            hand_out_work: false,
+            ..o.act
+        },
+        ..o.clone()
+    };
+    assert!(CrewHub::level_hint(Level::Act, &off).contains("“Hand out work”"));
+    assert!(!CrewHub::level_hint(Level::Suggest, &off).contains("Hand out work"));
 }
