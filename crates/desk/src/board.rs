@@ -96,12 +96,90 @@ pub enum Via {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
 pub enum Filter {
+    /// Every open issue in the project or team, whoever has it or none:
+    /// the whole board, to pick work up from and see who has what. Done
+    /// and cancelled issues stay out; `include_done` also brings in what
+    /// was done in the last [`DONE_WITHIN_DAYS`] days.
+    All {
+        #[serde(default, rename = "includeDone")]
+        include_done: bool,
+    },
     AssignedToMe,
     /// The open sprint (Jira) or the active cycle.
     CurrentCycle,
     Label(String),
     /// Raw JQL, or a Linear filter as a JSON object.
     Query(String),
+}
+
+/// How far back the whole board's "include done" reaches.
+pub const DONE_WITHIN_DAYS: i64 = 14;
+
+impl Filter {
+    /// The whole project or team ([`Filter::All`]).
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All { .. })
+    }
+
+    /// Whether a done issue that isn't on the board yet comes onto it.
+    pub fn takes_done(&self) -> bool {
+        !matches!(
+            self,
+            Self::All {
+                include_done: false
+            }
+        )
+    }
+}
+
+/// Who an issue is assigned to on Jira or Linear: their id there (a Jira
+/// accountId, a Linear user id) and their name. Someone else's words: it
+/// is shown, never read as an instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Assignee {
+    pub id: String,
+    pub name: String,
+}
+
+/// Where the board's idea of who the person is there came from: their
+/// hub vouched for it (its identity tool answered with their own key), or
+/// they typed it. Only a vouched one is ever assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeSource {
+    Vouched,
+    Typed,
+}
+
+/// A field that can be absent (not known), null (known to be none) or a
+/// value: `None`, `Some(None)`, `Some(Some(v))`.
+pub(crate) mod known {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
+/// A Linear listing a pass read only part of: the page it goes on from,
+/// what it lists from, and the latest change it has seen, which becomes the
+/// cursor once the listing is read through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Listing {
+    pub after: String,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub top: Option<String>,
+    /// When the listing began: the cursor never moves past it.
+    #[serde(default)]
+    pub started: Option<String>,
 }
 
 /// Why a synced board isn't syncing, in both directions; local edits wait.
@@ -171,9 +249,21 @@ pub struct Sync {
     /// Whose token or keys it syncs with: the person who linked it.
     pub person: String,
     pub filter: Filter,
-    /// The person's own Linear user id, for "assigned to me" there.
+    /// Who the person is there: their Linear user id or Jira accountId,
+    /// for "assigned to me", Mine and Take it. Looked up from the hub
+    /// (`linear.viewer`, `jira.myself`) when it can say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub me: Option<String>,
+    /// Their name there, as the hub said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me_name: Option<String>,
+    /// Where `me` came from; none on a link made before this was kept,
+    /// which is never vouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me_source: Option<MeSource>,
+    /// Why the hub can't vouch for who the person is, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me_note: Option<String>,
     /// The remote state each column moves an issue to.
     pub states: BTreeMap<TicketState, String>,
     /// The sidebar group the board was in when it was linked: the link
@@ -203,6 +293,13 @@ pub struct Sync {
     /// while the cursor goes on past them.
     #[serde(default)]
     pub retry: BTreeMap<String, Retry>,
+    /// A Linear listing left part read, gone on with by the next pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing: Option<Listing>,
+    /// Who has each issue was read for every ticket once: a board linked
+    /// before assignees were kept catches up on its first pass.
+    #[serde(default)]
+    pub assignees_swept: bool,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.
@@ -260,6 +357,18 @@ pub struct External {
     pub flagged: bool,
     #[serde(default)]
     pub seen: Seen,
+    /// Who has the issue there, as last pulled: absent while not known,
+    /// null when no one does.
+    #[serde(
+        default,
+        deserialize_with = "known::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assignee: Option<Option<Assignee>>,
+    /// Its description was longer than Desk keeps: a change to it here is
+    /// never sent back, so the issue's whole text is never cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
 }
 
 impl External {

@@ -185,6 +185,21 @@ impl Surface {
         }
     }
 
+    /// Bring into a live surface the tools a call just made callable
+    /// (`system.enable_skill`, a WASM install) that it admits. They are
+    /// registered in the agent's registry, which the turn's own registry
+    /// may only [follow](ToolRegistry::follow): without taking them, the
+    /// turn's `tool_call` could never reach them until the next turn. A
+    /// fixed surface takes nothing.
+    pub fn adopt(&self, loads: &[String]) {
+        if let Self::Live { source, admits } = self {
+            let wanted: Vec<String> = loads.iter().filter(|l| admits(l)).cloned().collect();
+            if !wanted.is_empty() {
+                source.adopt(&wanted);
+            }
+        }
+    }
+
     /// What `tools/list` declares: the tools served now, and on a live
     /// surface the [`CALL_TOOL`] that reaches a tool the client's list
     /// predates. The HTTP transport cannot push `list_changed`.

@@ -241,21 +241,26 @@ impl PlanSource {
             SubscriptionKind::ChatGpt => catalog::chatgpt_models(&self.shared, &self.scope).await,
             SubscriptionKind::Claude => catalog::claude_models(&self.shared, &self.scope).await,
         }?;
-        Some(
-            models
-                .iter()
-                .map(|m| workforce_desk::providers::Listed {
-                    id: m.id.clone(),
-                    resolves_to: m.resolves_to.clone(),
-                    name: m.name.clone(),
-                    description: m.description.clone(),
-                    efforts: m.efforts.clone(),
-                    default_effort: m.default_effort.clone(),
-                    fast: m.fast.clone(),
-                })
-                .collect(),
-        )
+        Some(listed(&models))
     }
+}
+
+/// `models` as Desk words a model its provider lists.
+fn listed(
+    models: &[crate::subscription::catalog::PlanModel],
+) -> Vec<workforce_desk::providers::Listed> {
+    models
+        .iter()
+        .map(|m| workforce_desk::providers::Listed {
+            id: m.id.clone(),
+            resolves_to: m.resolves_to.clone(),
+            name: m.name.clone(),
+            description: m.description.clone(),
+            efforts: m.efforts.clone(),
+            default_effort: m.default_effort.clone(),
+            fast: m.fast.clone(),
+        })
+        .collect()
 }
 
 /// The subscription a plan provider signs in to.
@@ -498,12 +503,39 @@ impl Accounts for HubAccounts {
             };
         }
         if spec.group != Group::Local {
+            let key = vault
+                .find_account_api_key(name)
+                .filter(|key| !key.trim().is_empty());
+            // What the person's own account lists now, for the providers
+            // that can say (Desk's table stands when they can't).
+            let listed = match (kind, key.as_deref()) {
+                (ProviderKind::Anthropic, Some(key)) => {
+                    crate::desk_key_models::anthropic_listed(key)
+                        .await
+                        .map(|models| listed(&models))
+                }
+                (ProviderKind::Bedrock, Some(key)) => {
+                    let extras: AccountExtras = vault
+                        .find_account(name)
+                        .and_then(|(_, record)| serde_json::from_value(record).ok())
+                        .unwrap_or_default();
+                    fn given(v: &Option<String>) -> Option<&str> {
+                        v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+                    }
+                    crate::desk_key_models::bedrock_listed(
+                        key,
+                        given(&extras.profile),
+                        given(&extras.region),
+                    )
+                    .await
+                    .map(|models| listed(&models))
+                }
+                _ => None,
+            };
             return Standing {
-                connected: vault
-                    .find_account_api_key(name)
-                    .is_some_and(|key| !key.trim().is_empty()),
+                connected: key.is_some(),
                 installed: Vec::new(),
-                listed: None,
+                listed,
             };
         }
         let (Some(server), Some((url, token))) = (Server::of(spec.id), self.endpoint(kind)) else {

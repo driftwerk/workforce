@@ -127,18 +127,18 @@ Each configured adapter exposes the full surface from the underlying
 send `tools/list` over stdio) for the complete, schema-annotated
 list. A summary of what's available:
 
-### Jira (18 tools, prefix `jira.`)
+### Jira (20 tools, prefix `jira.`)
 
 Search, fetch, create / update / delete issues, comments,
 transitions, worklogs, attachments, boards, sprints, projects, user
-search, plus a generic `jira.api` escape hatch for any REST v3 call
+search, who you are (`jira.myself`), plus a generic `jira.api` escape hatch for any REST v3 call
 not covered by a typed tool.
 
-### Linear (22 tools, prefix `linear.`)
+### Linear (23 tools, prefix `linear.`)
 
-Issue list / search / get / create / update / link / bulk-update,
-comment list / add, project list / get, team / state / label /
-member list, plus full document CRUD (`linear.document_*`).
+Issue list (paged, with `after`) / search / get / create / update /
+link / bulk-update, comment list / add, project list / get, team /
+state / label / member list, who you are (`linear.viewer`), plus full document CRUD (`linear.document_*`).
 
 ### Datadog (31 tools, prefix `datadog.`)
 

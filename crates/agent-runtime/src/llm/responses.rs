@@ -1150,6 +1150,36 @@ fn retry_after_in(message: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalogue as the Codex CLI cached it on 2026-11-11 (slugs and
+    /// visibility only): both Terras are listed for a picker, and the two
+    /// hidden entries are not.
+    #[test]
+    fn a_catalogue_lists_terra_for_a_picker_and_hides_only_what_it_marks_hidden() {
+        let entry = |slug: &str, visibility: &str, priority: i64| serde_json::json!({"slug": slug, "visibility": visibility, "priority": priority});
+        let body = serde_json::json!({"models": [
+            entry("gpt-6.1-sol", "list", 1),
+            entry("gpt-6-astra", "list", 2),
+            entry("gpt-6.1-terra", "list", 3),
+            entry("gpt-reserve", "hide", 5),
+            entry("gpt-5.6-terra", "list", 8),
+            entry("codex-auto-review", "hide", 10),
+        ]});
+        let listed: Vec<String> = parse_catalog(&body)
+            .into_iter()
+            .filter(CatalogModel::listed)
+            .map(|m| m.slug)
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6.1-terra",
+                "gpt-5.6-terra"
+            ]
+        );
+    }
     use crate::llm::failover::{classify_error, ErrorKind};
     use crate::llm::provider::{with_reasoning_suppressed, with_thinking_budget_override};
     use crate::llm::streaming::StreamCollector;

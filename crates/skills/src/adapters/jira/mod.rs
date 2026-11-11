@@ -35,6 +35,7 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.list_projects",
     "jira.get_project",
     "jira.search_users",
+    "jira.myself",
     "jira.list_boards",
     "jira.list_sprints",
 ];
@@ -136,6 +137,7 @@ impl JiraSkill {
             Arc::new(tools::JiraListProjectsTool::new(c(), w(), p())),
             Arc::new(tools::JiraGetProjectTool::new(c(), w(), p())),
             Arc::new(tools::JiraSearchUsersTool::new(c(), w(), p())),
+            Arc::new(tools::JiraMyselfTool::new(c(), w(), p())),
             Arc::new(tools::JiraListBoardsTool::new(c(), w(), p())),
             Arc::new(tools::JiraListSprintsTool::new(c(), w(), p())),
             Arc::new(tools::JiraAddWorklogTool::new(c(), w(), p())),
@@ -161,6 +163,7 @@ impl JiraSkill {
             "jira.list_projects",
             "jira.get_project",
             "jira.search_users",
+            "jira.myself",
             "jira.list_boards",
             "jira.list_sprints",
             "jira.add_worklog",
@@ -390,6 +393,16 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.myself",
+                    "Who you are on Jira: your accountId, display name and email",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" }
+                        }
+                    }),
+                ),
+                mk_tool(
                     "jira.list_boards",
                     "List Jira Software (Agile) boards",
                     serde_json::json!({
@@ -465,6 +478,7 @@ impl JiraSkill {
                 allow("jira.list_projects"),
                 allow("jira.get_project"),
                 allow("jira.search_users"),
+                allow("jira.myself"),
                 allow("jira.list_boards"),
                 allow("jira.list_sprints"),
                 allow("jira.add_worklog"),
@@ -513,7 +527,7 @@ mod tests {
         };
         let skill = JiraSkill::new(cfg).unwrap();
         let tools = skill.tools();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         // Sanity check: all tool names start with "jira."
         for t in &tools {
             assert!(t.name().starts_with("jira."));
@@ -583,10 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_lists_all_19_tools() {
+    fn definition_lists_all_20_tools() {
         let def = JiraSkill::definition();
-        assert_eq!(def.tools.len(), 19);
-        assert_eq!(def.default_policies.len(), 19);
+        assert_eq!(def.tools.len(), 20);
+        assert_eq!(def.default_policies.len(), 20);
         assert_eq!(def.requirements.credentials.len(), 3);
         assert!(def.validate().is_ok());
     }

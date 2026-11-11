@@ -34,7 +34,12 @@ pub(crate) struct FakeIssue {
     pub status: String,
     pub updated: String,
     pub labels: Vec<String>,
+    /// Who has it: their accountId and name.
+    pub assignee: Option<(String, String)>,
 }
+
+/// Who the fake's `jira.myself` says the person is.
+pub(crate) const SAM_ACCOUNT: &str = "557058:5a1c0e7b-sam";
 
 #[derive(Default)]
 pub(crate) struct Jira {
@@ -43,6 +48,8 @@ pub(crate) struct Jira {
     pub next: u32,
     /// A tool that answers as the hub's policy refusing it.
     pub refuse: Option<&'static str>,
+    /// The hub's Jira token is a shared one, not the person's own.
+    pub shared_key: bool,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -62,9 +69,22 @@ fn issue_json(i: &FakeIssue, full: bool) -> Value {
     let mut v = json!({
         "key": i.key, "id": format!("1{}", i.key.rsplit('-').next().unwrap_or("0")),
         "summary": wrapped(&i.summary, "jira.search.summary"),
-        "status": i.status, "assignee": "Sam", "priority": "Medium",
+        "status": i.status, "priority": "Medium",
+        "status_category": if i.status == "Done" { "done" } else { "new" },
         "issuetype": "Task", "updated": i.updated, "labels": i.labels,
     });
+    match full {
+        true => {
+            v["assignee"] = json!({
+                "display_name": i.assignee.as_ref().map(|a| &a.1),
+                "account_id": i.assignee.as_ref().map(|a| &a.0),
+            })
+        }
+        false => {
+            v["assignee"] = json!(i.assignee.as_ref().map(|a| &a.1));
+            v["assignee_account_id"] = json!(i.assignee.as_ref().map(|a| &a.0));
+        }
+    }
     if full {
         v["description_html"] = wrapped(
             &format!("<p>{}</p>", i.description),
@@ -101,12 +121,18 @@ impl Tool for FakeJiraTool {
                     .nth(1)
                     .and_then(|r| r.split('"').next())
                     .map(str::to_string);
+                let open = jql.contains("statusCategory != Done");
+                // A newer hub renders the description into the search.
+                let described = input["fields"]
+                    .as_array()
+                    .is_some_and(|f| f.contains(&json!("description")));
                 let issues: Vec<Value> = j
                     .issues
                     .values()
                     .filter(|i| i.key.starts_with(&format!("{project}-")))
                     .filter(|i| label.as_ref().is_none_or(|l| i.labels.contains(l)))
-                    .map(|i| issue_json(i, false))
+                    .filter(|i| !open || i.status != "Done")
+                    .map(|i| issue_json(i, described))
                     .collect();
                 json!({ "count": issues.len(), "issues": issues, "next_page_token": null, "is_last": true })
             }
@@ -138,6 +164,7 @@ impl Tool for FakeJiraTool {
                             .filter_map(Value::as_str)
                             .map(str::to_string)
                             .collect(),
+                        assignee: None,
                     },
                 );
                 json!({ "key": key, "id": "1", "self": "https://acme.example/rest/api/3/issue/1" })
@@ -151,6 +178,10 @@ impl Tool for FakeJiraTool {
                 }
                 if let Some(d) = input["description"].as_str() {
                     i.description = d.into();
+                }
+                if let Some(id) = input["fields"]["assignee"]["accountId"].as_str() {
+                    i.assignee = Some((id.into(), "Sam".into()));
+                    i.updated = "2026-11-09T12:00:00.000+0000".into();
                 }
                 json!({ "key": key, "updated": true })
             }
@@ -173,6 +204,10 @@ impl Tool for FakeJiraTool {
                 json!({ "key": key, "transitioned": true })
             }
             "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
+            "jira.myself" => {
+                json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
+                    "personal": !j.shared_key })
+            }
             "jira.get_project" => json!({
                 "key": input["project_key"],
                 "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
@@ -191,7 +226,7 @@ pub(crate) fn register_jira(
 ) {
     for name in workforce_desk::board_sync::JIRA_TOOLS
         .iter()
-        .chain(["jira.api", "jira.delete_issue"].iter())
+        .chain(["jira.api", "jira.delete_issue", "jira.myself"].iter())
     {
         if !except.contains(name) {
             registry.register(Arc::new(FakeJiraTool {
@@ -395,6 +430,10 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         },
         filter,
         me: None,
+        me_name: None,
+        me_source: None,
+        me_note: None,
+        not_me: false,
         states: states(),
     }
 }
@@ -419,6 +458,7 @@ pub(crate) fn seed(jira: &Shared, key: &str, summary: &str, labels: &[&str]) {
             status: "To Do".into(),
             updated: "2026-11-09T10:00:00.000+0000".into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
+            assignee: None,
         },
     );
 }
@@ -1129,4 +1169,199 @@ async fn a_tool_a_hub_lacks_reads_as_missing() {
             .await,
         Err(RemoteError::Missing("jira.get_project".into()))
     );
+}
+
+// ── The whole project ────────────────────────────────────────────────────
+
+/// A whole project: the dialog counts every open issue (not only the first
+/// page) and says who the person is there; the link keeps them; the pull
+/// brings in every open issue whoever has it; Take it assigns an unassigned
+/// one to the person, through the hub, with the tool a move uses.
+#[tokio::test]
+async fn a_whole_project_comes_in_and_take_it_assigns_it_to_you() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        for n in 1..=4 {
+            seed(&remote.jira, &format!("ACME-{n}"), &format!("Issue {n}"), &[]);
+        }
+        {
+            let mut j = remote.jira.lock().unwrap();
+            j.issues.get_mut("ACME-2").unwrap().assignee = Some(("acct-ana".into(), "Ana".into()));
+            j.issues.get_mut("ACME-4").unwrap().status = "Done".into();
+        }
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let all = json!({ "kind": "all", "value": { "includeDone": false } });
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": all }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["matches"].clone(), body["matchesAtLeast"].clone()), (json!(3), json!(false)));
+        assert_eq!(body["me"], json!({ "id": SAM_ACCOUNT, "name": "Sam" }));
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                json!({ "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": all, "states": states() }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], SAM_ACCOUNT);
+        assert_eq!(body["sync"]["meName"], "Sam");
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let tickets = desk.tickets(b.id, &Default::default()).await.unwrap();
+        let mut keys: Vec<_> = tickets.iter().filter_map(|t| t.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, ["ACME-1", "ACME-2", "ACME-3"], "done stays out");
+        let by_key = |k: &str| tickets.iter().find(|t| t.key.as_deref() == Some(k)).unwrap();
+        assert_eq!(
+            by_key("ACME-2").ticket.external.as_ref().unwrap().assignee.clone().flatten().unwrap().name,
+            "Ana"
+        );
+        // The search carried the descriptions: no issue was read one by one.
+        let calls = remote.jira.lock().unwrap().calls.clone();
+        assert!(!calls.iter().any(|(t, _)| t == "jira.get_issue"), "{calls:?}");
+        assert_eq!(by_key("ACME-3").ticket.body, "About Issue 3.");
+
+        // Take it, through the route.
+        let one = by_key("ACME-1").ticket.id;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/tickets/{one}/take"), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["external"]["assignee"], json!({ "id": SAM_ACCOUNT, "name": "Sam" }));
+        let sent = remote.jira.lock().unwrap().calls.clone();
+        let updates: Vec<_> = sent.iter().filter(|(t, _)| t == "jira.update_issue").collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1["issue_key"], "ACME-1");
+        assert_eq!(updates[0].1["fields"]["assignee"]["accountId"], SAM_ACCOUNT);
+        // Ana's stays hers.
+        let two = by_key("ACME-2").ticket.id;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/tickets/{two}/take"), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("Ana has ACME-2"));
+        // The next pull agrees with what was taken.
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let after = desk.ticket(one).await.unwrap();
+        assert_eq!(after.ticket.external.unwrap().assignee.flatten().unwrap().id, SAM_ACCOUNT);
+    })
+    .await;
+}
+
+/// A hub whose Jira token is shared answers `jira.myself` as the token's
+/// owner: the dialog names no one and says why, the link keeps no one, and
+/// Take it assigns nothing. Checking again once the person has their own
+/// token vouches for them.
+#[tokio::test]
+async fn a_shared_key_never_says_who_you_are() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        remote.jira.lock().unwrap().shared_key = true;
+        seed(&remote.jira, "ACME-1", "Issue 1", &[]);
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let all = json!({ "kind": "all", "value": { "includeDone": false } });
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": all }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["me"], Value::Null);
+        assert_eq!(
+            body["meWhy"],
+            "Atlas uses a shared Jira key, so it can't say who you are."
+        );
+        let b = board(&desk, "Acme").await;
+        // A source given by the asker is never taken.
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                json!({ "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": all, "states": states(), "meSource": "vouched" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], Value::Null);
+        assert_eq!(body["sync"].get("meSource"), None);
+        assert!(body["sync"]["meNote"].as_str().unwrap().contains("shared Jira key"));
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.tickets(b.id, &Default::default()).await.unwrap()[0].ticket.id;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/tickets/{t}/take"), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"],
+            "Atlas uses a shared Jira key, so it can't say who you are."
+        );
+        assert!(!remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(t, _)| t == "jira.update_issue"));
+        // Their own token now: checking again vouches for them.
+        remote.jira.lock().unwrap().shared_key = false;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/boards/{}/me", b.id), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], SAM_ACCOUNT);
+        assert_eq!(body["sync"]["meSource"], "vouched");
+        assert_eq!(body["sync"].get("meNote"), None);
+    })
+    .await;
+}
+
+/// "That's not me": a link the person says the hub's answer isn't them
+/// keeps no one, and says so.
+#[tokio::test]
+async fn a_link_that_isn_t_you_keeps_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                json!({ "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": { "kind": "all", "value": { "includeDone": false } },
+                        "states": states(), "notMe": true }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], Value::Null);
+        assert!(body["sync"]["meNote"].as_str().unwrap().contains("isn't you"));
+        assert!(!remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(t, _)| t == "jira.myself"));
+    })
+    .await;
 }

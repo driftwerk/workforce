@@ -269,10 +269,12 @@ async fn serve(
 }
 
 /// What a token a paired device minted may call besides the board sync's
-/// own Jira and Linear tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
+/// own Jira, Linear and identity tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
 /// by exact name, within what the hub exposes anyway. Never `agent.*` (a
 /// delegated turn runs with the person's own role), `approval.*`, `vault.*`,
-/// `jira.api`, a delete, an assign or a bulk change.
+/// `jira.api`, a delete, an assign tool or a bulk change. (A board's Take it
+/// assigns an issue only to the person, through `jira.update_issue` or
+/// `linear.issue_update`, which the sync already calls.)
 pub const DEVICE_SURFACE_EXTRA: &[&str] = &["help", "identity.whoami"];
 
 /// `surface` narrowed to the device surface, by exact names only.
@@ -281,6 +283,7 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
     workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
         .iter()
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
         .chain(DEVICE_SURFACE_EXTRA)
         .filter_map(|name| surface.get(name))
         .for_each(|tool| narrowed.register(tool));
@@ -360,6 +363,28 @@ mod tests {
     use workforce_agent::tools::dispatch::ToolGates;
     use workforce_common::sentinel_config::SentinelConfig;
     use workforce_common::settings::RemoteMcpConfig;
+
+    /// The default surface offers every tool Desk's board sync calls, by
+    /// exact name, and none of either system's raw, delete or bulk tools.
+    #[test]
+    fn the_default_surface_offers_board_sync_by_name() {
+        let allow = RemoteMcpConfig::DEFAULT_TOOLS_ALLOW;
+        for tool in workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+            .iter()
+            .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        {
+            assert!(allow.contains(tool), "{tool} is not offered by default");
+        }
+        for wide in [
+            "jira.*",
+            "linear.*",
+            "jira.api",
+            "jira.delete_issue",
+            "linear.issue_bulk_update",
+        ] {
+            assert!(!allow.contains(&wide), "{wide} is offered by default");
+        }
+    }
     use workforce_policy::engine::PolicyEngine;
 
     use crate::mcp_turn::testing::text_of;
@@ -998,7 +1023,9 @@ mod tests {
             "jira.api",
             "jira.delete_issue",
             "jira.assign_issue",
+            "jira.myself",
             "linear.issue_list",
+            "linear.viewer",
             "linear.issue_bulk_update",
             "linear.document_delete",
             "vault.get",
@@ -1012,7 +1039,16 @@ mod tests {
         let full = curated_surface(&source, &extra, &["*".to_string()]);
         let mut names = device_surface(&full).names();
         names.sort();
-        assert_eq!(names, ["help", "jira.search", "linear.issue_list"]);
+        assert_eq!(
+            names,
+            [
+                "help",
+                "jira.myself",
+                "jira.search",
+                "linear.issue_list",
+                "linear.viewer"
+            ]
+        );
     }
 
     #[tokio::test]

@@ -403,6 +403,9 @@ mod tests {
             "anthropic/claude-haiku-5.5",
             "claude-fable-5-1",
             "global.anthropic.claude-fable-5-1",
+            "claude-fable-5-2",
+            "anthropic.claude-fable-5-2",
+            "global.anthropic.claude-fable-5-2",
         ] {
             let limits = model_limits(model).unwrap_or_else(|| panic!("{model} is known"));
             assert_eq!(limits.context_tokens, 1_000_000, "{model} context");

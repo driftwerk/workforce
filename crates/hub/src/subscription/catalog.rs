@@ -105,10 +105,10 @@ struct Kept {
 /// The lists read so far, by plan and login.
 #[derive(Default)]
 pub struct PlanCatalog {
-    lists: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Kept>>,
+    lists: parking_lot::Mutex<HashMap<(&'static str, String), Kept>>,
     /// One read at a time per login: a caller that finds one running waits
     /// for it and takes its list, so cold callers start one CLI, not many.
-    reading: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Arc<tokio::sync::Mutex<()>>>>,
+    reading: parking_lot::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl PlanCatalog {
@@ -132,8 +132,24 @@ impl PlanCatalog {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<PlanModel>>>,
     {
-        let key = (kind, login.to_string());
-        let settled = |lists: &HashMap<(SubscriptionKind, String), Kept>| {
+        self.models_of(kind.label(), login, read).await
+    }
+
+    /// [`Self::models`] for any service with a list to keep, by `service`
+    /// name (`"anthropic"` for the models an Anthropic key lists) and the
+    /// account's fingerprint.
+    pub async fn models_of<F, Fut>(
+        &self,
+        service: &'static str,
+        login: &str,
+        read: F,
+    ) -> Option<Arc<Vec<PlanModel>>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<PlanModel>>>,
+    {
+        let key = (service, login.to_string());
+        let settled = |lists: &HashMap<(&'static str, String), Kept>| {
             lists.get(&key).and_then(|kept| {
                 let fresh = kept.read_at.is_some_and(|at| at.elapsed() < FRESH_FOR);
                 (fresh || kept.tried_at.elapsed() < RETRY_AFTER).then(|| kept.models.clone())
@@ -163,11 +179,11 @@ impl PlanCatalog {
                 kept.read_at = Some(now);
             }
             Ok(_) => tracing::warn!(
-                plan = kind.label(),
+                plan = service,
                 "the plan listed no models: keeping the list Desk had"
             ),
             Err(e) => tracing::warn!(
-                plan = kind.label(),
+                plan = service,
                 error = %format!("{e:#}"),
                 "the plan's models couldn't be read: keeping the list Desk had"
             ),
