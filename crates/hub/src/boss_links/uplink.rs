@@ -539,9 +539,17 @@ pub(crate) async fn handler(
         }
         Err(why) => return refused(StatusCode::FORBIDDEN, why.to_string()),
     };
-    let address = extensions
+    // The client's address as the hub's trusted proxies say it, never a
+    // proxy's own.
+    let peer = extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip());
+        .cloned();
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let address = Some(crate::trusted_proxy::extract_client_ip(
+        &peer,
+        xff,
+        &state.trusted_proxies,
+    ));
     let Some(place) = state.uplinks.unproved(first.token.id, address) else {
         audit(
             &state,
@@ -761,9 +769,10 @@ async fn run(
                             "ok" | "suggested" | "escalated" => Ok(json!({"status": status, "body": body})),
                             _ => Err("The engine's answer couldn't be read.".to_string()),
                         };
-                        if !uplinks.take_result(&socket, call_id, result) {
-                            bad += 1;
-                        }
+                        // A result for a call this hub no longer knows (it
+                        // restarted, or the call timed out) is dropped, not
+                        // counted against the engine.
+                        let _ = uplinks.take_result(&socket, call_id, result);
                     }
                     // Frames of later versions (asks_open, catch_up, …) are
                     // RB6's and RB7's: not counted against it.
