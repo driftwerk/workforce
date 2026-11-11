@@ -102,16 +102,36 @@ fn lookup_kinds() -> impl Iterator<Item = &'static str> {
 /// its own `{kind}:{device_id}` key, or one kind's single slot as pairing
 /// used to record it (including the `desk` alias Desk once paired under).
 fn holder_of(store: &dyn IdentityStore, device_id: &str) -> Option<Identity> {
-    lookup_kinds()
+    try_holder_of(store, device_id).ok().flatten()
+}
+
+/// [`holder_of`], telling a store that couldn't answer apart from a device
+/// no one holds.
+fn try_holder_of(store: &dyn IdentityStore, device_id: &str) -> eyre::Result<Option<Identity>> {
+    for key in lookup_kinds()
         .map(|kind| device_link_key(kind, device_id))
         .chain(lookup_kinds().map(str::to_string))
-        .find_map(|key| store.get_by_linked_id(&key, device_id).ok().flatten())
+    {
+        if let Some(identity) = store.get_by_linked_id(&key, device_id)? {
+            return Ok(Some(identity));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve the identity that owns `device_id`, whatever kind it paired as and
 /// however it was recorded.
 pub(crate) fn identity_for_device(store: &dyn IdentityStore, device_id: &str) -> Option<String> {
     holder_of(store, device_id).map(|identity| identity.id.to_string())
+}
+
+/// [`identity_for_device`], or the store's error when it couldn't answer,
+/// for a caller that must not take "couldn't tell" for "no one".
+pub(crate) fn try_identity_for_device(
+    store: &dyn IdentityStore,
+    device_id: &str,
+) -> eyre::Result<Option<String>> {
+    Ok(try_holder_of(store, device_id)?.map(|identity| identity.id.to_string()))
 }
 
 /// Whether `device_id` was paired as a desktop (Desk) device to the person

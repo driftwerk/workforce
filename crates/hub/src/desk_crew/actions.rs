@@ -1294,6 +1294,12 @@ impl CrewHub {
                     e => plain(e),
                 })?;
                 let name = set.view.label().to_string();
+                if let Some(why) = &set.not_started {
+                    return Ok(format!(
+                        "stopped {name} to put it in {} mode, but it didn't start again ({why}); it is stopped in that mode and resumes in it",
+                        mode.title()
+                    ));
+                }
                 Ok(match (set.running, set.confirmed) {
                     (false, _) => format!(
                         "{name} isn't running; it starts in {} mode next time",

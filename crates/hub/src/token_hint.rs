@@ -58,6 +58,8 @@ fn kind_of(token: &str) -> &'static str {
         "device token"
     } else if token.starts_with("wfr_") {
         "API token"
+    } else if token.starts_with("wfb_") {
+        "Desk boss link token"
     } else if token.starts_with("eyJ") && token.matches('.').count() == 2 {
         "JWT"
     } else {
@@ -88,6 +90,7 @@ mod tests {
     fn the_kind_is_read_from_the_format_marker() {
         assert_eq!(kind_of("wfp_abcdef"), "device token");
         assert_eq!(kind_of("wfr_abcdef"), "API token");
+        assert_eq!(kind_of("wfb_abcdef"), "Desk boss link token");
         assert_eq!(kind_of("eyJhbGci.eyJzdWIi.c2ln"), "JWT");
         assert_eq!(kind_of("eyJnotajwt"), "unknown format");
         assert_eq!(kind_of("hunter2"), "unknown format");

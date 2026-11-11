@@ -457,6 +457,7 @@ async fn sessions_reach_the_ones_the_reach_setting_lets_them() {
             Options {
                 line_reach: Reach::Overseer,
                 memory: Default::default(),
+                bosses: Default::default(),
                 ..options(dir.path())
             },
             Default::default(),

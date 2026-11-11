@@ -57,6 +57,9 @@ mod charge;
 pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
+mod grants;
+#[cfg(test)]
+mod grants_tests;
 mod groups;
 mod handoff;
 #[cfg(test)]
@@ -108,6 +111,8 @@ mod unread;
 
 use transition::Transition;
 
+pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
+pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
@@ -163,6 +168,9 @@ pub struct Options {
     pub line_reach: crate::line::Reach,
     /// What session memory keeps, from `[desk.memory]`.
     pub memory: crate::memory::MemoryOptions,
+    /// Whether this is a machine's hub, and how long grants last
+    /// (`[desk.bosses]`).
+    pub bosses: crate::grant::BossOptions,
 }
 
 #[cfg(test)]
@@ -595,6 +603,9 @@ struct State {
     /// The permission mode each Claude Code session last said it runs in
     /// ([`crate::mode`]).
     modes_seen: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode that doesn't ask each session was last started in, as a
+    /// boss kept it ([`SessionView::mode`]).
+    modes_started: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -903,6 +914,11 @@ struct Inner {
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
+    /// This engine's copy of the home's grants, and its pause.
+    grants: Mutex<grants::GrantsRun>,
+    /// Held while a grant is written: one at a time, from reading the copy
+    /// to keeping it.
+    grant_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -1547,9 +1563,12 @@ impl Desk {
             plan_write: tokio::sync::Mutex::new(()),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
+            grants: Mutex::default(),
+            grant_write: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
+        desk.grants_load().await;
         desk.lineage_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -1875,6 +1894,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.mode = live.and(state.modes_started.get(&r.id).copied());
         view
     }
 
@@ -2929,6 +2949,11 @@ impl Desk {
             self.charge_started(id, boss, group).await?;
         }
         if let Some(g) = group {
+            // On a machine whose groups are its grants, it is born in its
+            // group's grant.
+            if self.born_in(id, g).await? {
+                return Ok(());
+            }
             let item = groups::session_item(id);
             // Starting in its group is no move: nothing of a move is done.
             self.0.scopes.lock().placing.insert(id);
@@ -2948,6 +2973,7 @@ impl Desk {
             }
         }
         if grouped {
+            self.born_undo(id).await;
             self.drop_from_layout(id).await;
         }
     }
@@ -3076,6 +3102,7 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -3200,6 +3227,7 @@ impl Desk {
         self.boss_holds(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
+        self.person_resumes(id, Some(&by)).await;
         let running = self.0.state.lock().live.contains_key(&id);
         if running {
             self.0.state.lock().acted.insert(id);
@@ -4198,8 +4226,16 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
-        // The mode Desk keeps for it, as an overseer set it.
-        let mode = self.kept_mode(r.id).await;
+        // The mode Desk keeps for it, as an overseer set it; one that
+        // doesn't ask is shown on its card while it runs in it.
+        let mode = self.mode_to_start(r.id).await;
+        {
+            let mut st = self.0.state.lock();
+            match mode.filter(|m| !m.asks()) {
+                Some(m) => st.modes_started.insert(r.id, m),
+                None => st.modes_started.remove(&r.id),
+            };
+        }
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {
@@ -6413,6 +6449,7 @@ mod tests {
             account_keys: None,
             line_reach: crate::line::Reach::Group,
             memory: Default::default(),
+            bosses: Default::default(),
         }
     }
 
@@ -8513,6 +8550,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8556,6 +8594,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8634,6 +8673,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -8697,6 +8737,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {

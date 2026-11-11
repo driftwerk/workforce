@@ -164,6 +164,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_grants",
+        "members",
+        NotPersonal("this engine's sessions in a bossed group, by session id, never a person's"),
+    ),
+    (
+        "desk",
         "breakers",
         "subject",
         NotPersonal("the session, agent or spend total a breaker holds, never a person's id"),

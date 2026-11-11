@@ -42,6 +42,8 @@ pub struct PairingToolContext {
     /// Remote MCP tokens, late-bound: a revoked device's minted tokens are
     /// revoked with it.
     pub remote_mcp_tokens: crate::serve::RemoteMcpTokensHandle,
+    /// Where a revoked device's boss links are recorded in `audit_log`.
+    pub telemetry: Option<Arc<dyn workforce_common::telemetry::TelemetryStore>>,
 }
 
 impl PairingToolContext {
@@ -459,6 +461,7 @@ impl Tool for PairingRevokeTool {
                     crate::remote_mcp::tokens::revoke_device_tokens(
                         tokens.as_ref(),
                         &params.device_id,
+                        self.ctx.telemetry.as_ref(),
                     );
                 }
                 info!(device_id = %params.device_id, "Device revoked via pairing.revoke tool");
@@ -632,6 +635,7 @@ mod tests {
                         Arc::clone(&store),
                     ),
                 ))),
+                telemetry: None,
             },
             store,
         }
@@ -935,6 +939,7 @@ mod tests {
                 expires_at: now + chrono::Duration::days(90),
                 last_used_at: None,
                 revoked_at: None,
+                desk_link: None,
             })
             .unwrap();
         PairingRevokeTool::new(f.ctx.clone())

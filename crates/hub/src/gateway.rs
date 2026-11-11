@@ -124,6 +124,10 @@ pub struct GatewayState {
         Option<Arc<dyn workforce_identity::remote_mcp_token::RemoteMcpTokenStore>>,
     /// `[remote_mcp]` — the hub-as-MCP-server surface and its token policy.
     pub remote_mcp: workforce_common::settings::RemoteMcpConfig,
+    /// `[desk_boss]` — whether a paired Desk may make this hub's agents a
+    /// boss of its person's groups, and the link tokens' limits. Live: the
+    /// config overlay watcher replaces it when the overlay changes.
+    pub desk_boss: crate::boss_links::LiveConfig,
     /// Permission cascade evaluator — owns the rule store + LRU cache
     /// and is the single read/write entry point for `/api/permissions/*`
     /// endpoints plus the runner's Always-* persistence path. `None` when
@@ -1060,6 +1064,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
         .route("/api/me/remote-mcp-tokens/desk/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_device_token))
         .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
+        .route("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
+        .route("/api/me/desk-boss-links/{id}", axum::routing::delete(crate::api_handlers::desk_boss_links::revoke))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──
@@ -8615,7 +8621,11 @@ async fn pair_revoke_device(
     match pairing.revoke_async(device_id.clone()).await {
         Ok(()) => {
             if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
-                crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device_id);
+                crate::remote_mcp::tokens::revoke_device_tokens(
+                    tokens,
+                    &device_id,
+                    state.telemetry_store.as_ref(),
+                );
             }
             retarget_device(&state, &owner, &device_id).await;
             state.local_agents.forget_desk(&device_id).await;
@@ -8655,7 +8665,11 @@ async fn pair_device_revoke_self(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     if let Some(tokens) = state.remote_mcp_tokens.as_deref() {
-        crate::remote_mcp::tokens::revoke_device_tokens(tokens, &device.id);
+        crate::remote_mcp::tokens::revoke_device_tokens(
+            tokens,
+            &device.id,
+            state.telemetry_store.as_ref(),
+        );
     }
     retarget_device(&state, &owner, &device.id).await;
     state.local_agents.forget_desk(&device.id).await;

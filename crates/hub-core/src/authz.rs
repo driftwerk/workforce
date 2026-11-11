@@ -318,6 +318,11 @@ pub enum Capability {
     OwnDataRw,
     /// Destructive action on the caller's own data (delete/drop) — confirmed.
     OwnDataDestructive,
+    /// Let a paired Desk make an agent here the boss of one of the caller's
+    /// own Desk groups (`POST /api/me/desk-boss-links`). Member-allowed, so an
+    /// admin can deny it per role or person; the hub's `[desk_boss] enabled`
+    /// and the agent's own `[desk_boss] accept` must allow it too.
+    DeskBoss,
     /// Read a shared (T3) / global (T4) vault secret.
     VaultSharedRead,
     /// Write a shared / global vault secret.
@@ -415,9 +420,10 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability, in matrix order — drives the [`CapabilitySummary`].
-    pub const ALL: [Capability; 24] = [
+    pub const ALL: [Capability; 25] = [
         Capability::OwnDataRw,
         Capability::OwnDataDestructive,
+        Capability::DeskBoss,
         Capability::VaultSharedRead,
         Capability::VaultSharedWrite,
         Capability::VaultSharedDelete,
@@ -447,6 +453,7 @@ impl Capability {
         match self {
             Capability::OwnDataRw => "own_data_rw",
             Capability::OwnDataDestructive => "own_data_destructive",
+            Capability::DeskBoss => "desk_boss",
             Capability::VaultSharedRead => "vault_shared_read",
             Capability::VaultSharedWrite => "vault_shared_write",
             Capability::VaultSharedDelete => "vault_shared_delete",
@@ -482,6 +489,7 @@ impl Capability {
         match self {
             Capability::OwnDataRw => "Own data",
             Capability::OwnDataDestructive => "Delete own data",
+            Capability::DeskBoss => "Make agents bosses in Desk",
             Capability::VaultSharedRead => "Read shared secrets",
             Capability::VaultSharedWrite => "Write shared secrets",
             Capability::VaultSharedDelete => "Delete shared secrets",
@@ -510,7 +518,9 @@ impl Capability {
     /// Coarse grouping for the catalog UI.
     pub fn category(self) -> &'static str {
         match self {
-            Capability::OwnDataRw | Capability::OwnDataDestructive => "own_data",
+            Capability::OwnDataRw | Capability::OwnDataDestructive | Capability::DeskBoss => {
+                "own_data"
+            }
             Capability::VaultSharedRead
             | Capability::VaultSharedWrite
             | Capability::VaultSharedDelete => "vault",
@@ -539,6 +549,12 @@ impl Capability {
             }
             Capability::OwnDataDestructive => {
                 "Delete or drop the caller's own data. Always confirmed before it runs."
+            }
+            Capability::DeskBoss => {
+                "Let the caller's paired Desk make an agent on this hub the boss of one of their \
+                 own Desk groups, through a link token only that Desk can mint, list or revoke. \
+                 The hub's [desk_boss] switch and the agent's own [desk_boss] accept must allow \
+                 it too."
             }
             Capability::VaultSharedRead => "Read shared (team) and global vault secrets.",
             Capability::VaultSharedWrite => {
@@ -732,6 +748,7 @@ impl Capability {
             ],
             Capability::RolesAssign => &["identity.lifecycle"],
             Capability::VaultSharedRead
+            | Capability::DeskBoss
             | Capability::VaultSharedDelete
             | Capability::PermissionsManage
             | Capability::AgentExport
@@ -817,9 +834,10 @@ pub fn baseline_for(role_key: &str, cap: Capability) -> Decision {
 /// already-configured skill; every shared / admin capability is a hard Deny.
 fn member_baseline(cap: Capability) -> Decision {
     match cap {
-        Capability::OwnDataRw | Capability::SkillsEnable | Capability::SkillsAuthor => {
-            Decision::Allow
-        }
+        Capability::OwnDataRw
+        | Capability::DeskBoss
+        | Capability::SkillsEnable
+        | Capability::SkillsAuthor => Decision::Allow,
         Capability::OwnDataDestructive => Decision::Ask,
         _ => Decision::Deny,
     }
@@ -2504,5 +2522,22 @@ mod tests {
         }
         // The ShellExec description must spell out the host-execution risk.
         assert!(Capability::ShellExec.description().contains("vault key"));
+    }
+
+    #[test]
+    fn desk_boss_is_own_data_every_built_in_role_holds() {
+        assert_eq!(
+            Capability::from_key("desk_boss"),
+            Some(Capability::DeskBoss)
+        );
+        assert_eq!(Capability::DeskBoss.category(), "own_data");
+        for role in ["member", "manager", "system_admin", "custom-role"] {
+            assert_eq!(
+                baseline_for(role, Capability::DeskBoss),
+                Decision::Allow,
+                "{role}"
+            );
+        }
+        assert!(!is_protected_admin_cap(Capability::DeskBoss));
     }
 }

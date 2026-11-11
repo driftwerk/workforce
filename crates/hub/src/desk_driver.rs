@@ -308,6 +308,23 @@ fn account(
     };
     let mut extras = AccountExtras::default();
     let api_key = match kind {
+        ProviderKind::Bedrock if field(fields, "profile").is_some() => {
+            let profile = required("profile")?;
+            if !profile
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.@+".contains(c))
+            {
+                return Err(AccountError::Invalid(
+                    "an AWS profile name is letters, digits and - _ . @ +, as in ~/.aws/config"
+                        .into(),
+                ));
+            }
+            extras.region = field(fields, "region").map(str::to_string);
+            extras.profile = Some(profile);
+            // The profile, not the hub's environment or default chain, is
+            // where its credentials come from.
+            workforce_agent::llm::bedrock_credentials::CHAIN_SENTINEL.to_string()
+        }
         ProviderKind::Bedrock => {
             extras.region = field(fields, "region").map(str::to_string);
             format!(
@@ -623,7 +640,19 @@ fn options(config: &WorkforceConfig) -> Options {
             machine: may_be_machine(desk),
             brief_max_tokens: desk.memory.brief_max_tokens,
         },
+        bosses: workforce_desk::grant::BossOptions {
+            machine: is_machine(desk),
+            grant_hours: desk.bosses.grant_hours,
+        },
     }
+}
+
+/// Whether Desk's helper said this hub is a machine's (`[desk] machine =
+/// true`), which is when its grants say its sessions' groups. Unlike
+/// [`may_be_machine`], unset is not a machine here: a grant must never
+/// rewrite the person's own sidebar.
+fn is_machine(desk: &workforce_common::settings::DeskConfig) -> bool {
+    desk.machine == Some(true)
 }
 
 /// Whether this hub might be a machine's: unless Desk's helper said it is
@@ -902,6 +931,26 @@ mod tests {
         for (toml, machine) in cases {
             assert_eq!(super::may_be_machine(&parse(toml)), machine, "{toml}");
         }
+    }
+
+    /// Grants say a hub's sessions' groups only where the helper wrote
+    /// `machine = true`: an unknown hub keeps its own sidebar.
+    #[test]
+    fn grants_say_the_groups_only_of_a_hub_the_helper_said_is_a_machine() {
+        let options = |toml: &str| {
+            super::options(
+                &toml::from_str::<workforce_common::settings::WorkforceConfig>(toml).unwrap(),
+            )
+            .bosses
+        };
+        assert!(options("[desk]\nmachine = true\n").machine);
+        assert!(!options("[desk]\nmachine = false\n").machine);
+        assert!(!options("[desk]\n").machine, "unset is not a machine here");
+        assert_eq!(options("[desk]\n").grant_hours, 72);
+        assert_eq!(
+            options("[desk.bosses]\ngrant_hours = 336\n").grant_hours,
+            336
+        );
     }
 
     /// Moves (preview and commit) are the hub holder's alone: an
@@ -1274,6 +1323,57 @@ mod tests {
                 accounts.disconnect(spec).await.unwrap();
                 assert!(global.list(Some("llm/accounts/")).is_empty(), "{}", spec.id);
             }
+        }
+
+        #[tokio::test]
+        async fn bedrock_on_an_aws_profile_keeps_its_name_and_region_and_no_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let bedrock = spec("bedrock").unwrap();
+            let given = workforce_desk::providers::checked(
+                bedrock,
+                fields(&[("profile", "work-sso"), ("region", "eu-west-2")]),
+            )
+            .unwrap();
+            accounts.connect(bedrock, &given).await.unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(&global.get("llm/accounts/bedrock").unwrap()).unwrap();
+            assert_eq!(
+                record,
+                serde_json::json!({
+                    "provider": "bedrock",
+                    "api_key": "none",
+                    "region": "eu-west-2",
+                    "profile": "work-sso",
+                })
+            );
+            assert!(accounts.standing(bedrock).await.connected);
+            let providers = agent_providers(&global);
+            providers
+                .provider(
+                    ProviderKind::Bedrock,
+                    Some("anthropic.claude-sonnet-5-5"),
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("builds without reaching AWS");
+            // Keys still connect as before, over the profile.
+            accounts
+                .connect(bedrock, &connect_fields("bedrock"))
+                .await
+                .unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(&global.get("llm/accounts/bedrock").unwrap()).unwrap();
+            assert_eq!(record["api_key"], "AKIADESK:desk/secret+key");
+            assert!(record.get("profile").is_none());
+            let err = accounts
+                .connect(bedrock, &fields(&[("profile", "work sso]")]))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("AWS profile name"), "{err}");
         }
 
         #[tokio::test]
