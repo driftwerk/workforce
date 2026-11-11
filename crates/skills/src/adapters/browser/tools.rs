@@ -84,6 +84,14 @@ impl Tool for BrowserTool {
         }
     }
 
+    /// What an approval card shows of a fill: the field and what goes in
+    /// it, as the model wrote it (a credential stays its `[[secret:…]]` or
+    /// `[[vault:…]]` marker; anything that reads as one is redacted),
+    /// capped, so two fills can be told apart.
+    fn approval_summary(&self, input: &Value) -> Option<String> {
+        (self.spec.name == "browser.fill").then(|| fill_summary(input))
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
         if let Err(e) = super::client::pick(input["browser"].as_str(), false) {
@@ -152,6 +160,20 @@ fn with_browser(mut schema: Value) -> Value {
         );
     }
     schema
+}
+
+/// The most of a fill's value an approval card shows.
+const SHOWN_VALUE: usize = 200;
+
+fn fill_summary(input: &Value) -> String {
+    let selector = input["selector"].as_str().unwrap_or_default();
+    let value =
+        workforce_common::redact::redact_secrets(input["value"].as_str().unwrap_or_default());
+    let shown = match value.char_indices().nth(SHOWN_VALUE) {
+        Some((at, _)) => format!("{}…", &value[..at]),
+        None => value,
+    };
+    format!("Fill {selector} with: {shown}")
 }
 
 fn elapsed(start: std::time::Instant) -> u64 {
@@ -615,5 +637,47 @@ mod tests {
             assert!(names.contains(r), "{r}");
         }
         assert_eq!(READS.len() + 7, names.len());
+    }
+
+    #[test]
+    fn a_fills_card_shows_the_field_and_the_value_as_written() {
+        let skill =
+            super::super::BrowserSkill::new(super::super::BrowserSkillConfig::default()).unwrap();
+        let fill = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.fill")
+            .unwrap();
+        assert_eq!(
+            fill.approval_summary(&json!({"selector": "#name", "value": "Sam"}))
+                .as_deref(),
+            Some("Fill #name with: Sam")
+        );
+        let marker = "[[secret:7f3a type=password preview=hu…]]";
+        assert_eq!(
+            fill.approval_summary(&json!({"selector": "#pw", "value": marker})),
+            Some(format!("Fill #pw with: {marker}"))
+        );
+        let vault = "[[vault:agent:site_password]]";
+        assert!(fill
+            .approval_summary(&json!({"selector": "#pw", "value": vault}))
+            .unwrap()
+            .ends_with(vault));
+        let token = format!("lin_api_{}", "a1".repeat(15));
+        let shown = fill
+            .approval_summary(&json!({"selector": "#k", "value": token}))
+            .unwrap();
+        assert!(!shown.contains(&token), "{shown}");
+        let long = "x".repeat(500);
+        let shown = fill
+            .approval_summary(&json!({"selector": "#a", "value": long}))
+            .unwrap();
+        assert!(shown.ends_with('…') && shown.chars().filter(|c| *c == 'x').count() == 200);
+        let click = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.click")
+            .unwrap();
+        assert_eq!(click.approval_summary(&json!({"selector": "#a"})), None);
     }
 }
