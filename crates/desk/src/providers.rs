@@ -196,6 +196,14 @@ impl Spec {
         self.models.iter().map(|((id, _, _), _)| *id)
     }
 
+    /// The curated model new agents start on, if the provider has a table.
+    pub fn default_model(&self) -> Option<&'static str> {
+        self.models
+            .iter()
+            .find(|(_, default)| *default)
+            .map(|((id, _, _), _)| *id)
+    }
+
     /// Whether the models are the server's own, listed live.
     pub fn lists_installed(&self) -> bool {
         self.group == Group::Local
@@ -679,8 +687,10 @@ pub trait Accounts: Send + Sync {
     fn model_efforts(&self, provider: &str, _model: &str) -> Vec<&'static str> {
         self.efforts(provider)
     }
-    /// Stores `fields` (already checked against the provider's) where the
-    /// hub reads `provider`'s credentials.
+    /// Tries `fields` (already checked against the provider's) with one
+    /// call as small as the provider takes, then stores them where the hub
+    /// reads `provider`'s credentials. A key the provider refuses is never
+    /// stored: [`AccountError::Invalid`] says why in the person's words.
     async fn connect(&self, provider: &Spec, fields: &Fields) -> Result<(), AccountError>;
     /// Removes every credential the hub would read for `provider`.
     async fn disconnect(&self, provider: &Spec) -> Result<(), AccountError>;
