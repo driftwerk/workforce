@@ -71,6 +71,12 @@ const ACTOR: VaultActor<'static> = VaultActor::System("desk_boss_links");
 pub const SKEW: chrono::Duration = chrono::Duration::seconds(120);
 /// How often the links are read again, for ones added or ended.
 const LOOK_EVERY: Duration = Duration::from_secs(15);
+/// How long a boss hub may take to accept a socket.
+const CONNECT_WITHIN: Duration = Duration::from_secs(15);
+/// How long a socket may stay silent: three of the hub's 20 s pings.
+pub const QUIET_WITHIN: Duration = Duration::from_secs(60);
+/// The largest result sent up.
+const MAX_RESULT: usize = 512 * 1024;
 
 /// A link this engine holds, as kept.
 #[derive(Clone, Serialize, Deserialize)]
@@ -136,6 +142,11 @@ fn keep(vault: &Vault, link: &HeldLink) -> eyre::Result<()> {
 
 /// This engine's key: the one kept, or a new one, kept now.
 pub fn engine_key(vault: &Vault) -> eyre::Result<EngineKey> {
+    // One maker at a time: two first uplinks never make two keys.
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = MAKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(kept) = vault.get(DESK_ENGINE_KEY) {
         let bytes = Zeroizing::new(
             base64::engine::general_purpose::STANDARD
@@ -227,6 +238,37 @@ struct PutLink {
     agent_id: String,
 }
 
+/// Whether `url`'s host isn't this computer, a private network or a link's
+/// own address, written as one.
+pub fn public_address(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d != "localhost" && !d.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            let seg = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some())
+        }
+        None => false,
+    }
+}
+
 fn name_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -257,6 +299,19 @@ async fn put_link(
     }
     if !name_ok(&p.hub) || !name_ok(&p.engine_id) || !name_ok(&p.agent_id) {
         return bad("that hub, engine or agent can't be named so");
+    }
+    if !public_address(&p.hub_url) {
+        return bad("a boss hub is linked at a public address, never this computer's or a private network's");
+    }
+    // A grant names its boss by hub and agent: one hub name is one hub here,
+    // and one hub has one name.
+    let clash = held_links(vault).into_iter().any(|l| {
+        l.link_id != p.link_id
+            && (l.hub == p.hub)
+                != (canonical_hub(&l.hub_url).as_deref() == Some(p.canonical_hub.as_str()))
+    });
+    if clash {
+        return bad("another boss hub here goes by that name, or this hub by another");
     }
     let token_ok = p
         .token
@@ -363,7 +418,7 @@ fn tools() -> Vec<&'static str> {
 
 /// Calls and starts each link made lately, for its limits.
 #[derive(Default)]
-struct Rates {
+pub struct Rates {
     calls: HashMap<Uuid, VecDeque<Instant>>,
     starts: HashMap<Uuid, VecDeque<Instant>>,
 }
@@ -431,6 +486,8 @@ pub struct Uplink {
     /// serve `https` here. What is signed is still the hub's own name.
     #[cfg(test)]
     pub dial: Option<String>,
+    /// Each link's calls and starts lately: kept across its sockets.
+    pub rates: Arc<parking_lot::Mutex<Rates>>,
 }
 
 impl Uplink {
@@ -482,12 +539,15 @@ impl Uplink {
         };
         req.headers_mut().insert("authorization", bearer);
         req.headers_mut().insert(PROTOCOL_HEADER, protocol);
-        let (ws, _) = match tokio_tungstenite::connect_async(req).await {
-            Ok(c) => c,
-            Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status() == 401 => {
+        let connected =
+            tokio::time::timeout(CONNECT_WITHIN, tokio_tungstenite::connect_async(req)).await;
+        let (ws, _) = match connected {
+            Ok(Ok(c)) => c,
+            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(r))) if r.status() == 401 => {
                 return Ended::Revoked
             }
-            Err(e) => return Ended::Dropped(e.to_string()),
+            Ok(Err(e)) => return Ended::Dropped(e.to_string()),
+            Err(_) => return Ended::Dropped("the hub didn't answer in time".into()),
         };
         let (mut sink, mut stream) = ws.split();
         let read = |m: Option<Result<Ws, _>>| -> Option<Value> {
@@ -580,10 +640,14 @@ impl Uplink {
             let _ = sink.close().await;
         });
         let mut last_seq = 0u64;
-        let rates = Arc::new(parking_lot::Mutex::new(Rates::default()));
+        let rates = Arc::clone(&self.rates);
         let ended = loop {
-            let Some(msg) = stream.next().await else {
-                break Ended::Dropped("closed".into());
+            // The hub pings every 20 s: silence three times that long is a
+            // socket gone quiet, and it is opened again.
+            let msg = match tokio::time::timeout(QUIET_WITHIN, stream.next()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => break Ended::Dropped("closed".into()),
+                Err(_) => break Ended::Dropped("quiet".into()),
             };
             let frame = match msg {
                 Ok(Ws::Text(t)) => match serde_json::from_str::<Value>(&t) {
@@ -625,7 +689,30 @@ impl Uplink {
                         continue;
                     };
                     let tool = frame["tool"].as_str().unwrap_or_default().to_string();
-                    let allowed = rates.lock().take(link.link_id, &tool, &self.limits);
+                    let mut allowed = rates.lock().take(link.link_id, &tool, &self.limits);
+                    // Starts are counted from what this engine recorded too,
+                    // so a restart doesn't make room.
+                    if allowed.is_ok() && tool == "crew.start_session" {
+                        let since = Utc::now() - chrono::Duration::hours(1);
+                        let started = self
+                            .crew
+                            .desk()
+                            .store()
+                            .boss_calls_count(
+                                &link.link_id.to_string(),
+                                "crew.start_session",
+                                "ok",
+                                since,
+                            )
+                            .await
+                            .unwrap_or(i64::MAX);
+                        if started >= i64::from(self.limits.starts_per_hour) {
+                            allowed = Err(format!(
+                                "This engine lets a boss start at most {} sessions an hour.",
+                                self.limits.starts_per_hour
+                            ));
+                        }
+                    }
                     if let Err(why) = allowed {
                         let _ = tx.send(refuse(&why)).await;
                         continue;
@@ -646,10 +733,13 @@ impl Uplink {
                                 &link.group,
                             )
                             .await;
-                        let _ = tx
-                            .send(json!({"type": "result", "callId": call_id,
-                                         "status": served.status, "body": served.body}))
-                            .await;
+                        let mut result = json!({"type": "result", "callId": call_id,
+                                                "status": served.status, "body": served.body});
+                        if result.to_string().len() > MAX_RESULT {
+                            result = json!({"type": "result", "callId": call_id, "status": "refused",
+                                            "body": {"error": "The answer was too large to send."}});
+                        }
+                        let _ = tx.send(result).await;
                     });
                 }
                 Some("state") => {
@@ -672,14 +762,13 @@ impl Uplink {
         let Some(since) = since else {
             return json!({"type": "catch_up", "links": []});
         };
-        let events = match crate::desk_driver::desk() {
-            Some(d) => d
-                .store()
-                .events_since(since, &[], 500, None)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let events = self
+            .crew
+            .desk()
+            .store()
+            .events_since(since, &[], 500, None)
+            .await
+            .unwrap_or_default();
         let parts: Vec<Value> = links
             .values()
             .map(|l| {

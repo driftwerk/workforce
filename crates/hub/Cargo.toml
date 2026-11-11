@@ -66,8 +66,9 @@ vellev-core = { workspace = true }
 workforce-vellev = { workspace = true }
 libc = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
-# The engine's uplink to a boss hub (`desk_uplink`), TLS as Desk's own sockets.
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+# The engine's uplink to a boss hub (`desk_uplink`), on rustls with the
+# system's roots, as the hub's own clients.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 blake3 = { workspace = true }
 base64 = { workspace = true }
 aes-gcm = { workspace = true }

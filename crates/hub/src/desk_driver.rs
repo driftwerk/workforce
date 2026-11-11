@@ -880,6 +880,7 @@ pub async fn mount(
             limits: config.desk.bosses.clone(),
             #[cfg(test)]
             dial: None,
+            rates: Default::default(),
         },
         cancel_uplink,
     );

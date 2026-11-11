@@ -157,6 +157,10 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
         )
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "https alone");
+        for private in ["https://127.0.0.1", "https://10.0.0.5:8443", "https://[::1]", "https://169.254.1.1", "https://localhost"] {
+            let (code, _) = send(&app, "PUT", "/api/desk/boss-links/acme", &token, link(private)).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{private}");
+        }
         let (code, _) = send(
             &app,
             "PUT",
@@ -166,6 +170,11 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
         )
         .await;
         assert_eq!(code, StatusCode::NO_CONTENT);
+        // Another hub can't take the name this one has here.
+        let mut other = link("https://other.example.com");
+        other["linkId"] = json!(uuid::Uuid::new_v4());
+        let (code, _) = send(&app, "PUT", "/api/desk/boss-links/acme", &token, other).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "one name, one hub");
         let (_, listed) = send(&app, "GET", "/api/desk/boss-links", &token, json!({})).await;
         assert_eq!(listed["links"][0]["linkId"], json!(link_id));
         assert!(!listed.to_string().contains(&secret), "never a token");
@@ -279,7 +288,10 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
                 ..Default::default()
             },
             dial: Some(format!("ws://{addr}")),
+            rates: Default::default(),
         };
+        let reconnecting = uplink.clone();
+        let held_again = held.clone();
         let running = tokio::spawn(async move {
             uplink
                 .connect_once(
@@ -339,6 +351,76 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
         );
         assert_eq!(results["last"]["status"], "refused");
         running.abort();
+
+        // Connected again, the link's limits are where they were.
+        *calls.lock().await = vec![call("after", 1, chrono::Utc::now(), link_id)];
+        let running = tokio::spawn(async move {
+            reconnecting.connect_once(BOSS_HUB, &held_again, None).await
+        });
+        let mut after = None;
+        while after.is_none() {
+            let v = tokio::time::timeout(std::time::Duration::from_secs(10), said.recv())
+                .await
+                .expect("the engine's answer")
+                .unwrap();
+            if v["callId"] == "after" {
+                after = Some(v);
+            }
+        }
+        let after = after.unwrap();
+        assert!(after["body"]["error"].as_str().unwrap().contains("a minute"), "{after}");
+        running.abort();
+
+        // Starts are counted from what this engine recorded: a fresh socket,
+        // even a restarted engine, makes no room.
+        let row = workforce_desk::grant_store::CallRow {
+            caller: "boss:driftwerk/allan".into(),
+            boss: None,
+            group: Some("acme".into()),
+            tool: "crew.start_session",
+            input: "{}".into(),
+            input_hash: String::new(),
+            outcome: "pending",
+            said: None,
+            result: json!({}),
+        };
+        let store = d.store();
+        if let workforce_desk::grant_store::Begun::New(id) = store
+            .boss_call_begin(Some(&link_id.to_string()), Some("earlier-start"), &row)
+            .await
+            .unwrap()
+        {
+            store.boss_call_end(id, "ok", None, &json!({})).await.unwrap();
+        }
+        *calls.lock().await = vec![json!({"type": "call", "callId": "start", "seq": 1,
+            "linkId": link_id, "tool": "crew.start_session",
+            "input": {"folder": "/tmp", "goal": "g", "reason": "r"}, "sentAt": chrono::Utc::now()})];
+        let fresh = Uplink {
+            state: Arc::clone(&state),
+            crew: Arc::clone(&crew),
+            limits: workforce_common::settings::DeskBossesConfig {
+                starts_per_hour: 1,
+                ..Default::default()
+            },
+            dial: Some(format!("ws://{addr}")),
+            rates: Default::default(),
+        };
+        let held_once_more = desk_uplink::held_links(state.vault.as_ref().unwrap());
+        let running =
+            tokio::spawn(async move { fresh.connect_once(BOSS_HUB, &held_once_more, None).await });
+        let mut start = None;
+        while start.is_none() {
+            let v = tokio::time::timeout(std::time::Duration::from_secs(10), said.recv())
+                .await
+                .expect("the engine's answer")
+                .unwrap();
+            if v["callId"] == "start" {
+                start = Some(v);
+            }
+        }
+        let start = start.unwrap();
+        assert!(start["body"]["error"].as_str().unwrap().contains("an hour"), "{start}");
+        running.abort();
     })
     .await;
 }
@@ -369,6 +451,7 @@ async fn a_hub_that_refuses_the_link_marks_it_revoked() {
             crew,
             limits: Default::default(),
             dial: Some(format!("ws://{addr}")),
+            rates: Default::default(),
         };
         assert_eq!(
             uplink.connect_once(BOSS_HUB, &[held], None).await,
@@ -376,4 +459,17 @@ async fn a_hub_that_refuses_the_link_marks_it_revoked() {
         );
     })
     .await;
+}
+
+/// The uplink's TLS is the hub's rustls, with the system's roots: dialing a
+/// `wss` address that isn't there is an error, never a panic.
+#[tokio::test]
+async fn a_wss_dial_uses_the_hubs_tls() {
+    workforce_common::tls::install_default_crypto_provider();
+    let dialed = tokio_tungstenite::connect_async("wss://127.0.0.1:9/ws/desk-boss").await;
+    assert!(dialed.is_err());
+    assert!(desk_uplink::public_address("https://boss.example.com"));
+    assert!(!desk_uplink::public_address("https://192.168.1.4"));
+    assert!(!desk_uplink::public_address("https://100.64.0.1"));
+    assert!(!desk_uplink::public_address("https://[fd00::1]"));
 }
