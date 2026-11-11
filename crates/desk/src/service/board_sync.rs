@@ -424,6 +424,8 @@ const LINEAR_LOOKBACK: chrono::Duration = chrono::Duration::minutes(2);
 /// What a listing of a board's issues read.
 struct Listed {
     issues: Vec<Issue>,
+    /// Every Linear page gone on from, this listing.
+    seen: Vec<String>,
     /// No page was left unread.
     complete: bool,
     /// The Linear page it goes on from, when it isn't complete.
@@ -618,10 +620,12 @@ impl Desk {
         remote: &dyn Remote,
         since: Option<&str>,
         after: Option<&str>,
+        seen: &[String],
         budget: &mut Budget,
     ) -> Result<Listed, RemoteError> {
         let mut out = Listed {
             issues: vec![],
+            seen: seen.to_vec(),
             complete: true,
             next: None,
             ordered: true,
@@ -686,9 +690,18 @@ impl Desk {
                     // moves the cursor.
                     out.ordered = false;
                     out.issues.extend(found);
+                    if let Some(p) = &page {
+                        if !out.seen.contains(p) {
+                            out.seen.push(p.clone());
+                        }
+                    }
                     match crate::board_sync::linear_next_page(&answer) {
-                        // A page that names itself as next would never end.
-                        Some(next) if page.as_deref() == Some(next.as_str()) => {
+                        // A page named again (itself, or one before it)
+                        // would go round for ever.
+                        Some(next)
+                            if page.as_deref() == Some(next.as_str())
+                                || out.seen.contains(&next) =>
+                        {
                             return Err(RemoteError::Failed(
                                 "Linear gave the same page twice".into(),
                             ))
@@ -778,6 +791,7 @@ impl Desk {
                 remote,
                 s.cursor.as_deref(),
                 resume.map(|l| l.after.as_str()),
+                resume.map_or(&[][..], |l| l.seen.as_slice()),
                 budget,
             )
             .await
@@ -793,6 +807,7 @@ impl Desk {
         };
         let Listed {
             issues: changed,
+            seen,
             complete,
             next,
             ordered,
@@ -836,6 +851,7 @@ impl Desk {
                         since: s.cursor.clone(),
                         top: top.map(|t| t.to_rfc3339()),
                         started: Some(started),
+                        seen,
                     }),
                 });
             }
@@ -1171,7 +1187,7 @@ impl Desk {
         let issues = match whole {
             Some(issues) => issues,
             None => {
-                let listed = self.matching(s, remote, None, None, budget).await?;
+                let listed = self.matching(s, remote, None, None, &[], budget).await?;
                 // Only a full answer can say what isn't in it.
                 if !listed.complete {
                     return Ok(());
@@ -1441,18 +1457,32 @@ impl Desk {
                 "You typed your {title} id, so Desk can't vouch it's you: Take it needs {hub} to say who you are."
             )));
         }
-        // Who the person is, asked now: never a cached answer.
-        let who = self.recheck_me(b.id, remote, hub).await.map_err(&said)?;
-        let me = match (who, s.me.as_deref()) {
-            (Who::Person(me), Some(known)) if me.id == known => me,
-            (Who::Person(me), Some(_)) => {
+        // Only someone the hub vouched for, on this board, is assigned to:
+        // never one first learnt here, so a link the person said isn't them
+        // (or one the hub couldn't vouch for) stays as they left it.
+        let known = match (s.me_source, s.me.as_deref()) {
+            (Some(board::MeSource::Vouched), Some(known)) => known.to_string(),
+            _ => {
                 return Err(DeskError::Conflict(format!(
-                    "{hub} now says you are {} on {title}, not who this board knew: nothing was assigned. Take it again to go by the new answer.",
+                    "Desk doesn't know who you are on {title} yet: check who you are first (Check who you are on the board, or POST /api/desk/boards/{}/me), then take it.",
+                    b.id
+                )))
+            }
+        };
+        // Who the person is, asked now, and only compared: Take it changes
+        // nothing about who the board knows.
+        let who = crate::board_sync::identify(remote, s.system)
+            .await
+            .map_err(&said)?;
+        let me = match who {
+            Who::Person(me) if me.id == known => me,
+            Who::Person(me) => {
+                return Err(DeskError::Conflict(format!(
+                    "{hub} now says you are {} on {title}, not who this board knew: nothing was assigned. Check who you are on the board, then take it.",
                     me.name
                 )))
             }
-            (Who::Person(me), None) => me,
-            (other, _) => {
+            other => {
                 return Err(DeskError::Conflict(
                     other.why_not(hub, s.system).unwrap_or_default(),
                 ))

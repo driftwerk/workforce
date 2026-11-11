@@ -1308,10 +1308,10 @@ async fn a_shared_key_never_says_who_you_are() {
             .send("POST", &format!("/api/desk/tickets/{t}/take"), json!(null))
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(
-            body["error"],
-            "Atlas uses a shared Jira key, so it can't say who you are."
-        );
+        // No one is known: check who you are first, at the board's route.
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("check who you are first"), "{error}");
+        assert!(error.contains(&format!("/api/desk/boards/{}/me", b.id)), "{error}");
         assert!(!remote
             .jira
             .lock()
