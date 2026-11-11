@@ -1162,6 +1162,79 @@ mod tests {
         );
     }
 
+    /// A Desk DM's turn runs on a copy that follows the agent's registry
+    /// (one of the person's machines is connected, say), while
+    /// `system.enable_skill` registers in the agent's own. Enabling Jira in
+    /// the turn makes its tools callable in that same turn on a CLI route.
+    #[tokio::test]
+    async fn skill_enabled_mid_turn_is_callable_on_a_following_turn_registry() {
+        let service = service().await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::system_tool::SystemToolContext {
+            tools: Arc::clone(&service.tools),
+            ..crate::system_tool::tests::test_context(
+                dir.path(),
+                workforce_common::settings::WorkforceConfig::default(),
+            )
+        };
+        ctx.vault
+            .set("skills/jira/email", "someone@example.com")
+            .unwrap();
+        ctx.vault.set("skills/jira/api_token", "token").unwrap();
+        ctx.vault
+            .set("skills/jira/site", "http://127.0.0.1:9")
+            .unwrap();
+        for tool in crate::system_tool::system_tools(ctx) {
+            if tool.name() == "system.enable_skill" {
+                service.tools.register(tool);
+            }
+        }
+        let turn = TurnTools {
+            registry: Arc::new(ToolRegistry::follow(&service.tools, |_| true)),
+            exclusive: false,
+        };
+        let tools = bind_in_turn(&service, "alice", McpExposure::Turn(turn), None, None)
+            .await
+            .unwrap();
+        assert!(!listed(tools.endpoint())
+            .await
+            .contains(&"jira_search".to_string()));
+
+        let (is_error, text) = text_of(
+            &call(
+                tools.endpoint(),
+                "system_enable_skill",
+                serde_json::json!({ "skill": "jira" }),
+            )
+            .await,
+        );
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains("\"name\":\"jira_search\""),
+            "the enabled skill's definitions come back with the result: {text}"
+        );
+        assert!(listed(tools.endpoint())
+            .await
+            .contains(&"jira_search".to_string()));
+
+        for (name, arguments) in [
+            (
+                "tool_call",
+                serde_json::json!({ "name": "jira_search", "arguments": { "jql": "assignee = currentUser()" } }),
+            ),
+            (
+                "jira_search",
+                serde_json::json!({ "jql": "assignee = currentUser()" }),
+            ),
+        ] {
+            let response = call(tools.endpoint(), name, arguments).await;
+            assert!(
+                response.get("error").is_none(),
+                "{name} reaches jira.search in the same turn: {response}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn mcp_call_runs_under_its_own_tool_call() {
         #[derive(Default)]
