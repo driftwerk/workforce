@@ -222,6 +222,18 @@ impl CrewHub {
             said: None,
             result: json!({}),
         };
+        // A boss on another hub's every call carries its link and its id,
+        // or a repeat of it couldn't be told from a new one.
+        if matches!(call.boss, BossRef::Remote { .. })
+            && (call.link_id.as_deref().is_none_or(str::is_empty)
+                || call.call_id.as_deref().is_none_or(str::is_empty))
+        {
+            return Served {
+                status: ServedStatus::Refused,
+                body: json!({ "error": "A call from another hub needs its link and its id." }),
+                audit: None,
+            };
+        }
         let store = self.desk.store();
         let begun = store
             .boss_call_begin(call.link_id.as_deref(), call.call_id.as_deref(), &row)
@@ -617,6 +629,14 @@ impl CrewHub {
         else {
             return Err("That isn't a session to start.".into());
         };
+        // What becomes its launch says nothing that reads as an option.
+        if goal.trim_start().starts_with('-')
+            || name
+                .as_deref()
+                .is_some_and(|n| n.trim_start().starts_with('-'))
+        {
+            return Err("A session's goal and name can't start with \"-\".".into());
+        }
         if worktree.is_some() {
             return Err(
                 "A boss on another hub starts sessions in the grant's folders themselves, not in a worktree."

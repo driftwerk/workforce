@@ -436,6 +436,11 @@ pub fn secret(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
         return true;
     }
     let path = fold(path);
+    // What every process runs with, the hub's and its sessions' own
+    // environments among it.
+    if path.starts_with("/proc") {
+        return true;
+    }
     if withheld.iter().any(|w| path.starts_with(fold(w))) {
         return true;
     }
@@ -558,7 +563,12 @@ impl Here<'_> {
     /// `text` as a path, from `cwd`, through its symlinks; `None` when it
     /// can't be told.
     fn path_from(&self, text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-        let joined = if text == "~" {
+        (self.real)(&self.joined(text, cwd)?)
+    }
+
+    /// `text` as a whole path, nothing resolved: `~` and the cwd put in.
+    fn joined(&self, text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+        Some(if text == "~" {
             self.home.to_path_buf()
         } else if let Some(rest) = text.strip_prefix("~/") {
             self.home.join(rest)
@@ -568,8 +578,7 @@ impl Here<'_> {
             PathBuf::from(text)
         } else {
             cwd?.join(text)
-        };
-        (self.real)(&joined)
+        })
     }
 
     fn in_own(&self, p: &Path) -> bool {
@@ -745,14 +754,10 @@ impl Walk<'_, '_> {
 
     /// `w`, which the command reads: anywhere but where secrets are kept.
     fn reads(&self, w: &Word) -> Judged {
-        // A pattern reads under what comes before it.
-        let text = match w.glob {
-            true => {
-                let at = w.text.find(['*', '?', '[', '{']).unwrap_or(0);
-                &w.text[..at]
-            }
-            false => w.text.as_str(),
-        };
+        if w.glob {
+            return self.reads_pattern(&w.text);
+        }
+        let text = w.text.as_str();
         if text.is_empty() {
             return Ok(());
         }
@@ -763,6 +768,56 @@ impl Walk<'_, '_> {
             None if pathy(text) => no("reads somewhere Desk can't tell"),
             None => Ok(()),
         }
+    }
+
+    /// A pattern the command reads: whatever it matches on the disk now,
+    /// each where it really leads, is read as a path would be. A pattern
+    /// Desk can't expand (braces, one it can't read, too many matches) is
+    /// one it can't tell.
+    fn reads_pattern(&self, text: &str) -> Judged {
+        const MOST: usize = 2000;
+        let unknown = || no("reads what a pattern matches, which Desk can't tell");
+        if text.contains('{') {
+            return unknown();
+        }
+        // It reads under what comes before it, whatever it matches.
+        let at = text.find(['*', '?', '[']).unwrap_or(0);
+        let fixed = &text[..at];
+        if !fixed.is_empty() {
+            if let Some(p) = self.here.path_from(fixed, self.cwd.as_deref()) {
+                if secret(&p, self.here.home, self.here.withheld) {
+                    return no(SECRETS);
+                }
+            }
+        }
+        let Some(pattern) = self.here.joined(text, self.cwd.as_deref()) else {
+            return unknown();
+        };
+        let Ok(found) = glob::glob(&pattern.to_string_lossy()) else {
+            return unknown();
+        };
+        let mut n = 0;
+        for m in found {
+            n += 1;
+            let Ok(m) = m else {
+                return unknown();
+            };
+            if n > MOST {
+                return unknown();
+            }
+            let real = (self.here.real)(&m);
+            let named = |p: &Path| crate::never::path(p).is_some();
+            if secret(&m, self.here.home, self.here.withheld)
+                || named(&m)
+                || real.as_ref().is_some_and(|r| named(r))
+                || real
+                    .as_ref()
+                    .is_some_and(|r| secret(r, self.here.home, self.here.withheld))
+            {
+                return no(SECRETS);
+            }
+        }
+        Ok(())
     }
 
     /// `w`, a path a tool works on: in the folder or scratch space.
@@ -2989,6 +3044,35 @@ pub(crate) mod tests {
 
     fn judged(command: &str) -> Judged {
         judged_on(command, "feat/date-picker")
+    }
+
+    /// A pattern is read as what it matches on the disk, each match where
+    /// it really leads: one that reaches `~/.ssh` by a prefix, a link into
+    /// `/proc`, or a secret file in the folder is refused.
+    #[test]
+    fn a_pattern_is_judged_by_what_it_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let own = home.join("acme-web");
+        std::fs::create_dir_all(own.join("src")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_x"), "k").unwrap();
+        std::fs::write(own.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(own.join("server.pem"), "k").unwrap();
+        std::os::unix::fs::symlink("/proc/self/environ", own.join("env-link")).unwrap();
+        let (home, own) = (home.canonicalize().unwrap(), own.canonicalize().unwrap());
+        let real = |p: &Path| resolve_real(p);
+        let at = |c: &str| judge(c, &here(&home, &own, &[], &[], &real, "feat/date-picker"));
+        assert_eq!(at("cat src/*.rs"), Ok(()));
+        for c in [
+            "cat ~/.ss*/id_x",
+            "cat ~/.s?h/*",
+            "cat ./*.pem",
+            "cat env-li*",
+        ] {
+            assert_eq!(at(c), Err(SECRETS.into()), "{c}");
+        }
+        assert!(at("cat {src,..}/x").is_err());
     }
 
     /// [`judged_on`], the boss acting fully in this repository.

@@ -430,9 +430,11 @@ fn one(words: &[String], at: &Where<'_>, depth: usize) -> Option<Never> {
     // Secrets.
     // `ps e`, `ps eww`, `ps auxe`: every process's environment (BSD-style
     // words, no dash; `ps -e` only lists them all).
+    // `ps -E` and `ps -axE` (macOS) show it too.
     if prog == "ps"
-        && args.iter().any(|a| {
-            !a.starts_with('-') && a.chars().all(|c| c.is_ascii_alphabetic()) && a.contains('e')
+        && args.iter().any(|a| match a.strip_prefix('-') {
+            Some(flags) => !flags.starts_with('-') && flags.contains('E'),
+            None => a.chars().all(|c| c.is_ascii_alphabetic()) && a.contains('e'),
         })
     {
         return Some(Never::Secrets);
@@ -1286,6 +1288,8 @@ mod tests {
             "ps e",
             "ps eww -p 4242",
             "ps auxe",
+            "ps -E",
+            "ps -axE -o pid,command",
             "cat ~/Library/Application\\ Support/Desk/hub/config.toml",
             "cat '/Users/sam/Library/Application Support/Desk/hub/workforce.toml'",
             "ls ~/.local/share/Desk/hub/data",

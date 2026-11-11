@@ -17,6 +17,7 @@ chrono-tz = "0.10"
 deadpool-postgres = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
+glob = "0.3"
 hex = "0.4"
 parking_lot = { workspace = true }
 libc = "0.2"

@@ -177,7 +177,7 @@ impl BossRef {
     pub fn servable(&self) -> bool {
         match self {
             Self::Local { .. } => true,
-            Self::Remote { hub, .. } => !RESERVED_HUBS.contains(&hub.as_str()),
+            Self::Remote { hub, .. } => !RESERVED_HUBS.iter().any(|r| r.eq_ignore_ascii_case(hub)),
         }
     }
 }

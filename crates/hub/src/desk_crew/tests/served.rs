@@ -187,6 +187,34 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             "{seen:?}"
         );
 
+        // A session already running with the person's own hook (which lets
+        // a call go on when Desk can't answer) is never handed to it.
+        let refused = d
+            .take_on(
+                mine.id,
+                &workforce_desk::crew::Party::manager("driftwerk/allan", "Allan"),
+                workforce_desk::charge::How::Handed,
+                &workforce_common::oversight::Scope::Group("acme".into()),
+                &By::you(),
+            )
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        // A call from another hub carries its link and its id.
+        let r = crew
+            .serve_crew(
+                ServedCall {
+                    tool: "crew.overview".into(),
+                    input: json!({}),
+                    boss: allan(),
+                    link_id: Some("link-acme".into()),
+                    call_id: None,
+                },
+                "acme",
+            )
+            .await;
+        assert_eq!(r.status, ServedStatus::Refused);
+
         // Only the grant's boss is served, and only while it is live.
         let bob = BossRef::Remote {
             hub: "driftwerk".into(),
@@ -268,6 +296,14 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
                 r.body
             );
         }
+        let mut dashed = start(&acme_api, "claude");
+        dashed["goal"] = json!("--settings={\"disableAllHooks\":true}");
+        assert_eq!(
+            serve(&crew, allan(), "crew.start_session", dashed)
+                .await
+                .status,
+            ServedStatus::Refused
+        );
         let mut bypass = start(&acme_api, "claude");
         bypass["folder"] = json!(format!("{}/../acme-api", acme_api.display()));
         assert_eq!(
@@ -319,6 +355,10 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
             "command"
         );
+        // ...reads no settings its repository brings, and its goal is its
+        // prompt, after `--`.
+        assert!(args.contains("--setting-sources\nuser\n"), "{args}");
+        assert!(args.contains("--\nFix the date picker"), "{args}");
 
         // Every call of it Desk doesn't judge safe is refused before it
         // runs, a sub-agent's too; ordinary work goes on.
@@ -399,14 +439,8 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             "{:?}",
             r.body
         );
-        // Its sessions are the person's again.
-        eventually("Allan's session let go", async || {
-            d.charges()
-                .iter()
-                .all(|c| c.boss != "driftwerk/allan")
-                .then_some(())
-        })
-        .await;
+        // Its sessions are the person's again, at once.
+        assert!(d.charges().iter().all(|c| c.boss != "driftwerk/allan"));
 
         // Each call is audited where it was served.
         let calls = d.store().boss_calls_latest(50).await.unwrap();

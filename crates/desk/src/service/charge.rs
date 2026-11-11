@@ -305,6 +305,19 @@ impl Desk {
         self.boss_judges(id, &pending, boss)
     }
 
+    /// Whether `id` may be run by a boss served from a grant: it isn't
+    /// running, or its CLI was launched with the pre-tool hook that fails
+    /// closed. One already running with the person's hook (which lets a
+    /// call go on when Desk can't answer) is restarted for it first.
+    pub fn servable_launch(&self, id: Uuid) -> bool {
+        self.0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_none_or(|l| l.fail_closed)
+    }
+
     /// Whether a boss served from a grant runs `id` now.
     pub fn served_runs(&self, id: Uuid) -> bool {
         self.charge_of(id)
@@ -670,6 +683,12 @@ impl Desk {
         }
         charge::chargeable(&view, scope, &self.bossed())
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
+        if crate::grant::is_served(&boss.id) && !self.servable_launch(id) {
+            return Err(DeskError::Conflict(format!(
+                "{} runs without Desk's closed check of each call, so a boss on another hub can't run it; stop it, then hand it over.",
+                view.label()
+            )));
+        }
         let existing = self.charge_of(id).filter(Charge::live);
         if let Some(c) = existing.as_ref().filter(|c| c.boss == boss.id) {
             let wheel = self.wheel_of(id).unwrap_or(Wheel::Boss);
@@ -798,9 +817,25 @@ impl Desk {
         c.released_at = Some(now);
         c.updated_at = now;
         let boss = Party::manager(&c.boss, &self.boss_name(&c.boss));
+        let served = crate::grant::is_served(&c.boss);
         let wheel = c.wheel;
         let shown = self.put_charge(c, wheel).await?;
         self.charge_withdraw(id).await;
+        // A boss served from a grant let go of it: the turn it set going
+        // ends here, so nothing of its work goes on under the person's own
+        // rules. The person starts it again if they want it.
+        if served
+            && matches!(
+                view.state,
+                crate::model::SessionState::Working
+                    | crate::model::SessionState::Blocked
+                    | crate::model::SessionState::Asking
+            )
+        {
+            if let Err(e) = self.interrupt(id, Some(By::desk("Its boss no longer runs it."))) {
+                tracing::info!(%id, error = %e, "a session let go by its served boss wasn't interrupted");
+            }
+        }
         let name = view.label().to_string();
         let text = match by.party.kind {
             PartyKind::You => format!("took {name} back from {}", boss.name),

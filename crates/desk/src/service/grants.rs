@@ -393,6 +393,8 @@ impl Desk {
         }
         call.result = serde_json::json!({"change": accepted.change});
         let restamped = self.commit_grants(writes, None, call).await?;
+        drop(_one);
+        self.served_settle().await;
         let grant = self
             .grant_view(&Native::routes(), group)
             .ok_or(DeskError::NotFound)?;
@@ -435,6 +437,8 @@ impl Desk {
         self.commit_grants(Vec::new(), Some((group, stopped)), call)
             .await?;
         self.0.grants.lock().stopping.remove(group);
+        drop(_one);
+        self.served_settle().await;
         Ok(())
     }
 
@@ -549,7 +553,40 @@ impl Desk {
                 run.stopping.remove(g);
             }
         }
+        drop(_one);
+        self.served_settle().await;
         Ok(self.grants_view(&Native::routes()))
+    }
+
+    /// Lets go, at once, of every session a boss served from a grant runs
+    /// whose grant no longer lets it: stopped, paused, expired, deleted, or
+    /// no longer naming the session or the boss. Its turn is ended and what
+    /// the boss queued for it withdrawn ([`Desk::release`]). The hub's
+    /// crew does the same on its tick, for expiry.
+    pub async fn served_settle(&self) {
+        let charges: Vec<(Uuid, String)> = self
+            .charges()
+            .into_iter()
+            .filter(|c| grant::is_served(&c.boss))
+            .map(|c| (c.session, c.boss))
+            .collect();
+        for (id, boss) in charges {
+            let live = self.grant_group_of(id).is_some_and(|g| {
+                self.grant_live(&g)
+                    .is_ok_and(|x| x.boss.is_some_and(|b| b.party_id() == boss))
+            });
+            if !live {
+                if let Err(e) = self
+                    .release(
+                        id,
+                        &crate::crew::By::desk("Its boss's grant is no longer live."),
+                    )
+                    .await
+                {
+                    tracing::info!(%id, error = %e, "a session wasn't let go by its served boss");
+                }
+            }
+        }
     }
 
     /// Lets the bosses here go on: only Desk on the Mac asks it. Written
@@ -607,12 +644,20 @@ impl Desk {
 
     /// Puts `id`, about to start for the boss of `group`'s grant, in that
     /// grant as born, on any engine.
-    pub(super) async fn served_born(&self, id: Uuid, group: &str) -> Result<(), DeskError> {
+    pub(super) async fn served_born(
+        &self,
+        id: Uuid,
+        group: &str,
+        boss: &str,
+    ) -> Result<(), DeskError> {
         let _one = self.0.grant_write.lock().await;
         self.grants_loaded().await?;
-        let Some(g) = self.0.grants.lock().grants.get(group).cloned() else {
-            return Err(DeskError::NotFound);
-        };
+        // Checked again here, under the write lock: a stop, a pause or a
+        // new boss since the call was decided leaves nothing born.
+        let g = self.grant_live(group).map_err(DeskError::Conflict)?;
+        if g.boss.as_ref().map(grant::BossRef::party_id).as_deref() != Some(boss) {
+            return Err(DeskError::Conflict(crate::scope::not_ours(None)));
+        }
         if g.born.contains(&id) || g.members.contains(&id) {
             return Ok(());
         }

@@ -235,6 +235,10 @@ pub(crate) struct Live {
     denials: Vec<Denied>,
     /// Tool calls the person allowed for the rest of the session.
     allowed: HashSet<Call>,
+    /// Its CLI was launched with the pre-tool hook that fails closed
+    /// ([`claude::hook_settings_for`]): only then may a boss served from a
+    /// grant run it.
+    fail_closed: bool,
     /// Its turn was ended from Desk (Esc), which Claude Code reports no
     /// hook for.
     interrupted: bool,
@@ -1783,6 +1787,7 @@ impl Desk {
                 Live {
                     pty: Arc::new(pty),
                     token: h.meta["token"].as_str().unwrap_or_default().to_string(),
+                    fail_closed: h.meta["failClosed"].as_bool().unwrap_or(false),
                     current_tool: None,
                     // What it asked is shown again once every session is
                     // back (`carry_asks`): its terminal's to answer now.
@@ -2942,7 +2947,7 @@ impl Desk {
         // its grant names it.
         if let (Some(g), Some(b)) = (group, boss) {
             if crate::grant::is_served(&b.id) {
-                self.served_born(id, g).await?;
+                self.served_born(id, g, &b.id).await?;
             }
         }
         if let Some(boss) = boss {
@@ -4222,6 +4227,9 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
+        // A boss served from a grant runs it: Desk's check of each call fails
+        // closed. Kept with its process, so a hub that takes it back knows.
+        let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {
@@ -4249,9 +4257,7 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
-                    // A boss served from a grant runs it: Desk's check of
-                    // each call fails closed.
-                    fail_closed: self.served_runs(r.id),
+                    fail_closed,
                 });
                 (spec, None)
             }
@@ -4304,6 +4310,7 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
             "startedAt": started_at,
+            "failClosed": fail_closed,
         });
         let spec = match account_token {
             Some(account_token) => {
@@ -4335,6 +4342,7 @@ impl Desk {
             Live {
                 pty: Arc::new(pty),
                 token,
+                fail_closed,
                 current_tool: None,
                 pending: None,
                 answer: None,
