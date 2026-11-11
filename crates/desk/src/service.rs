@@ -3416,6 +3416,11 @@ impl Desk {
         {
             self.boss_decides(id, approval, decision, boss)?;
         }
+        // Allowing what it asks drives it: in a mode that doesn't ask, only
+        // the person's or its unbound boss's.
+        if decision != Decision::Deny && decision != Decision::Cancel {
+            self.mode_lets_anyone(id, by.as_ref())?;
+        }
         let codex = self
             .0
             .state
@@ -3588,6 +3593,7 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.mode_lets_anyone(id, by.as_ref())?;
         let view = self.type_prompt(id, text, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(

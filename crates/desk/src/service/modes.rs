@@ -158,6 +158,25 @@ impl Desk {
                 .is_some_and(|c| self.unbound_runs(id, &c.boss))
     }
 
+    /// Whether `by` may drive `id` (type into it, allow what it asks) as far
+    /// as its mode goes: while it runs in a mode that doesn't ask, only the
+    /// person, Desk itself (no one), or an unbound boss that runs it may.
+    pub(crate) fn mode_lets_anyone(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
+        let Some(by) = by.filter(|b| b.party.kind != PartyKind::You) else {
+            return Ok(());
+        };
+        let Some(mode) = self.live_mode(id) else {
+            return Ok(());
+        };
+        if by.party.kind == PartyKind::Manager && self.unbound_runs(id, &by.party.id) {
+            return Ok(());
+        }
+        Err(DeskError::Conflict(format!(
+            "it runs in {} mode, which only the person or an unbound boss that runs it drives",
+            mode.title()
+        )))
+    }
+
     /// [`Self::boss_may_drive`] for `by`, when it is a boss.
     pub(crate) fn mode_lets(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
         match by.filter(|b| b.party.kind == PartyKind::Manager) {

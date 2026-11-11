@@ -852,20 +852,38 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             };
             // The queued deploy never goes in while it runs in auto mode:
             // it starts again in its own mode first.
+            // An unbound boss that runs it again (Desk passes a session on
+            // to its scope's overseer when the boss that took it oversees
+            // nothing here) drives it in auto mode as before.
+            let desks = || {
+                matches!(ends, Ends::AnotherBoss)
+                    && d.charge_of(s.id)
+                        .is_some_and(|c| c.live() && c.boss == "desk")
+            };
             let args = loop {
                 let m = d.store().line_message(queued).await.unwrap().unwrap();
                 let mode = d.view(s.id).unwrap().mode;
                 // Queued still, or withdrawn with the boss that sent it.
                 use workforce_desk::line::Delivery;
                 assert!(
-                    mode.is_none() || matches!(m.delivery, Delivery::Queued | Delivery::Withdrawn),
+                    mode.is_none()
+                        || matches!(m.delivery, Delivery::Queued | Delivery::Withdrawn)
+                        || desks(),
                     "{ends:?}: {:?} in {mode:?}",
                     m.delivery
                 );
                 if let Some(a) = starts_of(&base, s.id).into_iter().find(|a| !before.contains(a)) {
-                    break a;
+                    break Some(a);
+                }
+                if mode.is_some() && desks() {
+                    break None;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let Some(args) = args else {
+                assert!(matches!(ends, Ends::AnotherBoss), "{ends:?}");
+                assert_eq!(crew.gate(&deploy, &crew.overseer_service().unwrap().1), Gate::Run);
+                continue;
             };
             assert!(!args.contains("--permission-mode"), "{ends:?}: {args}");
             // In its own mode, the deploy goes in, asking as any turn does.
@@ -913,6 +931,109 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             })
             .await;
         }
+    })
+    .await;
+}
+
+/// The hook URL a start of `id`'s CLI with `args` was given.
+fn hook_of(args: &str, id: uuid::Uuid) -> String {
+    let marker = format!("/hook/{id}/");
+    let at = args.find(&marker).unwrap();
+    let token: String = args[at + marker.len()..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    let start = args[..at].rfind("http://").unwrap();
+    format!("{}{token}", &args[start..at + marker.len()])
+}
+
+/// Another agent's `desk.prompt` and `desk.approve` never drive a session
+/// running in bypass mode: not while its boss is unbound over it, and not
+/// once that has ended and it is on its way back to its own mode. Denying
+/// what it asks still runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
+    use workforce_agent::tools::Tool as _;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.set_mode").then_some(())
+        })
+        .await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let s = new_session(&d, &base, "acme-web").await;
+        hook_url(&base, s.id).await;
+        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        eventually("Desk to know it is unbound", async || {
+            d.acts_fully_in(s.id, "desk").then_some(())
+        })
+        .await;
+        let done = overseer
+            .tools
+            .get("crew.set_mode")
+            .unwrap()
+            .execute(json!({"session_id": s.id.to_string(), "mode": "bypassPermissions", "reason": "Routine."}))
+            .await
+            .unwrap();
+        assert!(done.output["done"].is_string(), "{done:?}");
+        let args = eventually("its bypass start", async || {
+            starts_of(&base, s.id)
+                .into_iter()
+                .find(|a| a.contains("--dangerously-skip-permissions\n"))
+        })
+        .await;
+        let url = hook_of(&args, s.id);
+        let tools = crate::desk_tools::DeskTool::all(&d, "scout");
+        let tool = |name: &str| tools.iter().find(|t| t.name() == name).unwrap();
+        let drives = async |when: &str| {
+            let typed = tool("desk.prompt")
+                .execute(json!({"session_id": s.id.to_string(), "prompt": "Run the deploy"}))
+                .await
+                .unwrap();
+            assert!(!typed.success, "{when}: {typed:?}");
+            assert!(
+                typed.error.as_deref().unwrap_or_default().contains("bypass permissions mode"),
+                "{when}: {typed:?}"
+            );
+            let asked = ask(&url, "git push origin main");
+            let a = pending(&d, s.id, "git push origin main").await;
+            let allowed = tool("desk.approve")
+                .execute(json!({"session_id": s.id.to_string(), "approval_id": a.to_string(), "allow": true}))
+                .await
+                .unwrap();
+            assert!(!allowed.success, "{when}: {allowed:?}");
+            let denied = tool("desk.approve")
+                .execute(json!({"session_id": s.id.to_string(), "approval_id": a.to_string(), "allow": false}))
+                .await
+                .unwrap();
+            assert!(denied.success, "{when}: {denied:?}");
+            assert_eq!(decided(asked.await.unwrap()), "deny", "{when}");
+        };
+        drives("unbound").await;
+
+        // Mid-turn, a box unticked: on its way back, and still not another's.
+        hook(
+            &url,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1",
+                "tool_input": {"command": "npm test"}}),
+        )
+        .await;
+        write_config(&overseer, &UNBOUND.replace("interrupt = true", "interrupt = false"));
+        super::super::config_saved(&overseer);
+        eventually("no longer unbound", async || {
+            let (_, o) = crew.overseer_service()?;
+            (!crew.unbound(&o)).then_some(())
+        })
+        .await;
+        assert_eq!(
+            d.view(s.id).unwrap().mode,
+            Some(workforce_desk::mode::Mode::BypassPermissions)
+        );
+        drives("after unbound ended").await;
     })
     .await;
 }
