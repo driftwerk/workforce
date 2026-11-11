@@ -180,6 +180,10 @@ pub struct Listing {
     /// When the listing began: the cursor never moves past it.
     #[serde(default)]
     pub started: Option<String>,
+    /// Every page it has gone on from: one named again means Linear's
+    /// pages go round, and the listing ends as an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<String>,
 }
 
 /// Why a synced board isn't syncing, in both directions; local edits wait.

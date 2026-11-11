@@ -910,9 +910,12 @@ fn viewer(personal: bool) -> Value {
     json!({ "id": ME, "name": "sam", "display_name": "Sam", "personal": personal })
 }
 
+/// A whole team pulled, and who the person is asked of the hub (as the
+/// link does), when it can say.
 async fn taker(d: &Desk, linear: &FakeLinear) -> Board {
     let b = whole_team(d, None).await;
     d.pull_board(b.id, linear).await.unwrap();
+    d.recheck_me(b.id, linear, "Atlas").await.unwrap();
     b
 }
 
@@ -963,9 +966,10 @@ async fn take_it_assigns_an_unassigned_issue_to_the_person() {
             linear.calls_of("linear.issue_update"),
             vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
         );
-        // Read before and after the write, and who the person is asked each time.
+        // Read before and after the write; who the person is asked when the
+        // board checked, and again by Take it.
         assert_eq!(linear.calls_of("linear.issue_get").len(), 2);
-        assert_eq!(linear.calls_of("linear.viewer").len(), 1);
+        assert_eq!(linear.calls_of("linear.viewer").len(), 2);
         let s = d.board_sync(b.id).await.unwrap().unwrap().1;
         assert_eq!(
             (s.me.as_deref(), s.me_source),
@@ -1007,25 +1011,44 @@ async fn take_it_goes_only_to_whom_the_person_s_own_key_says() {
         let b = taker(&d, &linear).await;
         let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
         let you = crate::crew::By::you();
-        // The hub doesn't offer linear.viewer.
+        // The hub doesn't offer linear.viewer: no one is known, so check
+        // who you are first.
         refused(
             d.take_ticket(t, &linear, "Atlas", &you).await,
-            "linear.viewer",
+            "Use Check who you are on the board, then take it.",
         );
-        // An agent's shared key answers as its owner.
+        // An agent's shared key answers as its owner: checking says so, and
+        // Take it still won't.
         *linear.viewer.lock().unwrap() = Some(viewer(false));
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.me, None);
+        assert!(s.me_note.unwrap().contains("shared Linear key"));
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "Use Check who you are on the board, then take it.",
+        );
+        // Vouched, then the key becomes a shared one: nothing is assigned,
+        // and the board's answer isn't changed by Take it.
+        d.change_sync(b.id, |s| {
+            s.me = Some(ME.into());
+            s.me_source = Some(crate::board::MeSource::Vouched);
+        })
+        .await
+        .unwrap();
         refused(
             d.take_ticket(t, &linear, "Atlas", &you).await,
             "Atlas uses a shared Linear key, so it can't say who you are.",
         );
-        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
-        assert_eq!(s.me, None);
-        assert!(s.me_note.unwrap().contains("shared Linear key"));
         // An older hub that doesn't say whose key it used.
         *linear.viewer.lock().unwrap() = Some(json!({ "id": ME, "name": "sam" }));
         refused(
             d.take_ticket(t, &linear, "Atlas", &you).await,
             "can't say who you are",
+        );
+        assert_eq!(
+            d.board_sync(b.id).await.unwrap().unwrap().1.me_source,
+            Some(crate::board::MeSource::Vouched)
         );
         // Vouched once, then the hub answers as someone else.
         *linear.viewer.lock().unwrap() = Some(viewer(true));
@@ -1111,8 +1134,14 @@ async fn a_linear_page_that_repeats_ends_the_listing() {
             Ok(vec![])
         }
         async fn call(&self, _tool: &str, args: Value) -> Result<Value, RemoteError> {
-            let page = args["after"].as_str().unwrap_or("p1").to_string();
-            Ok(json!({ "issues": [], "page_info": { "has_next_page": true, "end_cursor": page } }))
+            // p1 names itself; p2 and p3 name each other.
+            let next = match args["after"].as_str() {
+                None => "p1",
+                Some("p1") => "p1",
+                Some("p2") => "p3",
+                Some(_) => "p2",
+            };
+            Ok(json!({ "issues": [], "page_info": { "has_next_page": true, "end_cursor": next } }))
         }
     }
     with_test_pool(build_pool, |pool| async move {
@@ -1134,6 +1163,7 @@ async fn a_linear_page_that_repeats_ends_the_listing() {
                 since: None,
                 top: None,
                 started: None,
+                seen: vec![],
             });
             s.backoff_until = None;
         })
@@ -1141,6 +1171,29 @@ async fn a_linear_page_that_repeats_ends_the_listing() {
         .unwrap();
         d.pull_board(b.id, &Loop).await.unwrap();
         assert_eq!(d.board_sync(b.id).await.unwrap().unwrap().1.listing, None);
+        // Two pages that name each other, one pass apart: the second pass
+        // knows the first's pages.
+        d.change_sync(b.id, |s| {
+            s.listing = Some(crate::board::Listing {
+                after: "p2".into(),
+                since: None,
+                top: None,
+                started: None,
+                seen: vec!["p3".into()],
+            });
+            s.backoff_until = None;
+        })
+        .await
+        .unwrap();
+        let pulled = d.pull_board(b.id, &Loop).await.unwrap();
+        assert!(
+            pulled
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("same page twice"),
+            "{pulled:?}"
+        );
     })
     .await;
 }
@@ -1190,6 +1243,38 @@ async fn an_older_board_learns_who_has_each_issue_on_its_first_pass() {
         assert_eq!(who("ENG-1").await.flatten().unwrap().id, ANA);
         assert_eq!(who("ENG-2").await, Some(None));
         assert!(d.board_sync(b.id).await.unwrap().unwrap().1.assignees_swept);
+    })
+    .await;
+}
+
+/// A link the person said isn't them: Take it refuses without asking the
+/// hub, and leaves their choice and its note as they were.
+#[tokio::test]
+async fn take_it_leaves_a_not_me_link_as_it_was() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        linear.set(1, "unstarted", 1, None);
+        let b = whole_team(&d, None).await;
+        d.pull_board(b.id, &linear).await.unwrap();
+        let note = "You said Atlas's answer of who you are on Linear isn't you: check again once it's right.";
+        d.change_sync(b.id, |s| s.me_note = Some(note.into()))
+            .await
+            .unwrap();
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        let r = d
+            .take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+            .await;
+        refused(
+            r,
+            "Desk doesn't know who you are on Linear yet. Use Check who you are on the board, then take it.",
+        );
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_source, s.me_note.as_deref()), (None, None, Some(note)));
+        assert!(linear.calls_of("linear.viewer").is_empty());
+        assert!(linear.calls_of("linear.issue_update").is_empty());
     })
     .await;
 }
