@@ -15,7 +15,7 @@ use eyre::{eyre, Result};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use workforce_agent::runner::CURRENT_SESSION_KEY;
+use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY};
 
 use super::chrome::MyChrome;
 use super::client::{
@@ -31,7 +31,10 @@ pub(super) struct ChromeCell {
     pub(super) key: String,
     pub(super) agent: String,
     pub(super) user: String,
+    /// The session (id) its last call came from.
     pub(super) last_session: StdMutex<Option<String>>,
+    /// That conversation's key, which its allowances are kept under.
+    pub(super) last_key: StdMutex<Option<String>>,
     pub(super) last_used: StdMutex<Instant>,
     pub(super) inner: Mutex<Option<MyChrome>>,
     dir: PathBuf,
@@ -41,6 +44,14 @@ impl Drop for ChromeCell {
     fn drop(&mut self) {
         untrusted::forget(&self.key);
     }
+}
+
+/// Whether the person's Chrome may show Desk `url`: the web and a blank
+/// page only, and a site the person's list allows.
+pub(super) fn may_show(url: &str) -> bool {
+    use super::address::{kind, openable, In};
+    let host = host_of(url);
+    openable(&kind(url), In::Chrome) && hooks::settings().sites.allows(host.as_deref())
 }
 
 /// Where the person's Chrome may not be, as a refusal.
@@ -60,6 +71,7 @@ impl ChromeCell {
             agent,
             user,
             last_session: StdMutex::new(None),
+            last_key: StdMutex::new(None),
             last_used: StdMutex::new(Instant::now()),
             inner: Mutex::new(None),
             dir,
@@ -68,13 +80,43 @@ impl ChromeCell {
 
     fn touch(&self) {
         *self.last_used.lock().unwrap() = Instant::now();
-        if let Some(session) = CURRENT_SESSION_KEY
-            .try_with(|k| k.clone())
-            .ok()
-            .filter(|k| !k.is_empty())
-        {
-            *self.last_session.lock().unwrap() = Some(session);
+        let local = |k: &'static tokio::task::LocalKey<String>| {
+            k.try_with(|v| v.clone()).ok().filter(|v| !v.is_empty())
+        };
+        if let Some(id) = local(&CURRENT_SESSION_ID) {
+            *self.last_session.lock().unwrap() = Some(id);
         }
+        if let Some(key) = local(&CURRENT_SESSION_KEY) {
+            *self.last_key.lock().unwrap() = Some(key);
+        }
+    }
+
+    /// Before every call: the page Desk's tab is on now is one it may be
+    /// on (the web or blank, a site the list allows, one this session may
+    /// visit), else it is blanked and nothing is done; and a call decided
+    /// for one origin acts there or not at all.
+    async fn keep_page(&self, c: &MyChrome, decided: Option<Option<String>>) -> Result<()> {
+        let url = self.url_of(c).await;
+        let mut refused = (!may_show(&url))
+            .then(|| kept_away(&host_of(&url).unwrap_or_else(|| "that page".into())).to_string());
+        if refused.is_none() {
+            if let (Some(origin), Some(h)) = (super::address::origin_of(&url), hooks::hooks()) {
+                refused = h.may_visit(&self.agent, &origin).err();
+            }
+        }
+        if let Some(why) = refused {
+            let _ = c.navigate("about:blank").await;
+            untrusted::on(&self.key, "about:blank");
+            return Err(eyre!("{why} Desk's tab is blank now."));
+        }
+        if let Some(decided) = decided {
+            if super::address::origin_of(&url) != decided {
+                return Err(eyre!(
+                    "The page moved since this was decided, so nothing was done. Call again."
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Whether it is attached now.
@@ -110,6 +152,8 @@ impl ChromeCell {
             *guard = Some(attached);
         }
         let chrome = guard.as_ref().expect("just attached");
+        let decided = super::client::decided(super::client::Backend::Chrome);
+        self.keep_page(chrome, decided).await?;
         let out = op(chrome).await;
         if out.is_err() && !chrome.alive() {
             *guard = None;
@@ -135,6 +179,10 @@ impl ChromeCell {
         Err(kept_away(host.as_deref().unwrap_or(&url)))
     }
 
+    /// Holds back what is the person's to do (paying, signing in or out,
+    /// a credential's file), read from what the page shows in a world of
+    /// Desk's own; for a click, also where it lands, which must be the
+    /// element read and not something laid over it.
     async fn hold(
         &self,
         c: &MyChrome,
@@ -142,16 +190,20 @@ impl ChromeCell {
         target: Option<&str>,
         selector: Option<&str>,
         form: bool,
-        file: Option<&str>,
-    ) -> Result<()> {
+        files: &[&str],
+    ) -> Result<Option<(f64, f64)>> {
+        let at = match (tool, selector) {
+            ("browser.click", Some(sel)) => Some(c.press_point(sel).await?),
+            _ => None,
+        };
         let Some(hooks) = hooks::hooks() else {
-            return Ok(());
+            return Ok(at);
         };
         if hooks.unbound(&self.agent) {
-            return Ok(());
+            return Ok(at);
         }
         let shown = c
-            .evaluate(&shown_expression(selector, form))
+            .evaluate_isolated(&shown_expression(selector, form))
             .await
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -161,12 +213,23 @@ impl ChromeCell {
             url: self.url_of(c).await,
             target: target.map(str::to_string),
             shown,
-            file: file.map(str::to_string),
+            files: files.iter().map(|f| f.to_string()).collect(),
         };
         match hooks.holds(&self.agent, &what) {
             Some(why) => Err(eyre!("{why}")),
-            None => Ok(()),
+            None => Ok(at),
         }
+    }
+
+    /// Keys go only where `selector` has focus.
+    async fn focus_on(&self, c: &MyChrome, selector: &str) -> Result<()> {
+        c.focus(selector).await?;
+        if !c.focused_is(selector).await? {
+            return Err(eyre!(
+                "`{selector}` didn't take the focus, so nothing was typed."
+            ));
+        }
+        Ok(())
     }
 
     async fn done(&self, c: &MyChrome, tool: &str, target: Option<&str>) {
@@ -174,7 +237,10 @@ impl ChromeCell {
             return;
         };
         let url = self.url_of(c).await;
-        let screenshot = c.screenshot().await.ok();
+        let screenshot = match tool {
+            "browser.fill" | "browser.type" => None,
+            _ => c.screenshot().await.ok(),
+        };
         hooks.record(Done {
             agent: self.agent.clone(),
             user: self.user.clone(),
@@ -189,16 +255,10 @@ impl ChromeCell {
 
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
         // In the person's Chrome: web pages and a blank page only, never
-        // their files or the browser's own pages.
-        let scheme = url
-            .trim()
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "http" | "https" | "about") {
+        // their files, an inline page or the browser's own pages.
+        if !super::address::openable(&super::address::kind(url), super::address::In::Chrome) {
             return Err(eyre!(
-                "In your Chrome Desk opens web pages only, not `{scheme}`; use Desk's own browser (`browser: \"desk\"`) for a file or an inline page."
+                "In your Chrome Desk opens web pages and about:blank only; use Desk's own browser (`browser: \"desk\"`) for a file or an inline page."
             ));
         }
         let host = host_of(url).filter(|_| !url.starts_with("about:"));
@@ -207,15 +267,16 @@ impl ChromeCell {
         }
         self.with(async |c| {
             c.navigate(url).await?;
+            self.done(c, "browser.navigate", Some(url)).await;
             self.keep_to_sites(c).await?;
             let title = c.evaluate("document.title").await.unwrap_or_default();
             let final_url = self.url_of(c).await;
-            self.done(c, "browser.navigate", Some(url)).await;
             let mut seen = Seen::at(&final_url);
             let title = seen.text(title.as_str().unwrap_or_default());
+            let shown_url = seen.text(&final_url);
             Ok(seen.into_output(
                 &self.key,
-                json!({ "url": final_url, "title": title, "browser": "chrome" }),
+                json!({ "url": shown_url, "title": title, "browser": "chrome" }),
             ))
         })
         .await
@@ -232,6 +293,7 @@ impl ChromeCell {
             let mut seen = Seen::at(&url);
             let title = seen.text(title.as_str().unwrap_or_default());
             let body = seen.text(body.as_str().unwrap_or_default());
+            let url = seen.text(&url);
             Ok(seen.into_output(
                 &self.key,
                 json!({ "url": url, "title": title, "body_text": body, "browser": "chrome" }),
@@ -251,18 +313,22 @@ impl ChromeCell {
 
     pub(super) async fn click(&self, selector: &str) -> Result<Value> {
         self.with(async |c| {
-            self.hold(
-                c,
-                "browser.click",
-                Some(selector),
-                Some(selector),
-                true,
-                None,
-            )
-            .await?;
-            c.click(selector).await?;
-            self.keep_to_sites(c).await?;
+            let at = self
+                .hold(
+                    c,
+                    "browser.click",
+                    Some(selector),
+                    Some(selector),
+                    true,
+                    &[],
+                )
+                .await?;
+            match at {
+                Some((x, y)) => c.click_at(x, y).await?,
+                None => c.click(selector).await?,
+            }
             self.done(c, "browser.click", Some(selector)).await;
+            self.keep_to_sites(c).await?;
             Ok(json!({ "clicked": selector }))
         })
         .await
@@ -283,7 +349,7 @@ impl ChromeCell {
                 Some(selector),
                 Some(selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             let url = self.url_of(c).await;
@@ -311,12 +377,12 @@ impl ChromeCell {
                 Some(selector),
                 Some(selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             let url = self.url_of(c).await;
             let resolved = resolve(text, host_of(&url).as_deref())?;
-            c.focus(selector).await?;
+            self.focus_on(c, selector).await?;
             c.insert_text(&resolved).await?;
             self.done(c, "browser.type", Some(selector)).await;
             Ok(json!({ "typed_chars": resolved.chars().count() }))
@@ -326,14 +392,14 @@ impl ChromeCell {
 
     pub(super) async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<Value> {
         self.with(async |c| {
-            self.hold(c, "browser.press_key", Some(key), selector, true, None)
+            self.hold(c, "browser.press_key", Some(key), selector, true, &[])
                 .await?;
             if let Some(sel) = selector {
-                c.focus(sel).await?;
+                self.focus_on(c, sel).await?;
             }
             c.press(key).await?;
-            self.keep_to_sites(c).await?;
             self.done(c, "browser.press_key", Some(key)).await;
+            self.keep_to_sites(c).await?;
             Ok(json!({ "pressed": key }))
         })
         .await
@@ -347,7 +413,7 @@ impl ChromeCell {
                 Some(selector),
                 Some(selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             let ok = c
@@ -365,8 +431,8 @@ impl ChromeCell {
     pub(super) async fn evaluate(&self, expression: &str) -> Result<Value> {
         self.with(async |c| {
             let value = c.evaluate(expression).await?;
-            self.keep_to_sites(c).await?;
             self.done(c, "browser.evaluate", None).await;
+            self.keep_to_sites(c).await?;
             let url = self.url_of(c).await;
             let mut seen = Seen::at(&url);
             let value = seen.value(value);
@@ -452,6 +518,7 @@ impl ChromeCell {
         selector: &str,
         path: &str,
         name: &str,
+        names: &[&str],
     ) -> Result<Value> {
         self.with(async |c| {
             self.hold(
@@ -460,7 +527,7 @@ impl ChromeCell {
                 Some(selector),
                 Some(selector),
                 false,
-                Some(name),
+                names,
             )
             .await?;
             c.set_file(selector, path).await?;

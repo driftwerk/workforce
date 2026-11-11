@@ -83,18 +83,80 @@ pub struct MyChrome {
     pub(super) network: Arc<Mutex<VecDeque<Value>>>,
     pub(super) console: Arc<Mutex<VecDeque<Value>>>,
     call_timeout: Duration,
+    /// Tabs Desk's tab opened (popups): closed with it.
+    popups: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Ids for what the reader sends of its own accord, apart from calls'.
+/// Chrome reads an id as a 32-bit integer, so they stay below 2^31.
+const OWN_IDS: u64 = 1_000_000_000;
+
+/// The user id this process runs as.
+#[cfg(unix)]
+fn my_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let probe = tempfile::NamedTempFile::new().ok()?;
+    probe.as_file().metadata().ok().map(|m| m.uid())
+}
+
+/// Whether what listens on `port` here is a process of this user's: any
+/// local process can open a port, and Desk speaks only to the person's own
+/// Chrome. Read from the system's socket table (Linux) or `lsof` (macOS).
+#[cfg(unix)]
+pub fn listener_is_ours(port: u16) -> bool {
+    let Some(me) = my_uid() else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let want = format!("{port:04X}");
+        ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+            std::fs::read_to_string(table).is_ok_and(|t| {
+                t.lines().skip(1).any(|line| {
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    cols.len() > 7
+                        && cols[3] == "0A"
+                        && cols[1].rsplit(':').next() == Some(want.as_str())
+                        && cols[7].parse::<u32>() == Ok(me)
+                })
+            })
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fu"])
+            .output()
+            .is_ok_and(|o| {
+                let out = String::from_utf8_lossy(&o.stdout).to_string();
+                let uids: Vec<u32> = out
+                    .lines()
+                    .filter_map(|l| l.strip_prefix('u')?.parse().ok())
+                    .collect();
+                !uids.is_empty() && uids.iter().all(|u| *u == me)
+            })
+    }
+}
+
+#[cfg(not(unix))]
+pub fn listener_is_ours(_port: u16) -> bool {
+    true
 }
 
 impl Drop for MyChrome {
     fn drop(&mut self) {
         // Closing Desk's own tab is asked for on the way out; the socket
         // then goes, and with it Chrome's "being controlled" bar.
-        let close = json!({
-            "id": self.next.fetch_add(1, Ordering::Relaxed),
-            "method": "Target.closeTarget",
-            "params": { "targetId": self.target },
-        });
-        let _ = self.out.send(Message::Text(close.to_string().into()));
+        // And every tab it opened, which are Desk's too.
+        let popups = std::mem::take(&mut *self.popups.lock().unwrap());
+        for target in popups.iter().chain([&self.target]) {
+            let close = json!({
+                "id": self.next.fetch_add(1, Ordering::Relaxed),
+                "method": "Target.closeTarget",
+                "params": { "targetId": target },
+            });
+            let _ = self.out.send(Message::Text(close.to_string().into()));
+        }
         let _ = self.out.send(Message::Close(None));
         let reader = self.reader.abort_handle();
         let writer = self.writer.abort_handle();
@@ -139,6 +201,16 @@ impl MyChrome {
         })?;
         let socket =
             socket_of(&file).ok_or_else(|| eyre!("Chrome's DevToolsActivePort can't be read"))?;
+        let port: u16 = file
+            .lines()
+            .next()
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap_or(0);
+        if !listener_is_ours(port) {
+            eyre::bail!(
+                "What answers on Chrome's debugging port isn't a program of yours, so Desk didn't connect."
+            );
+        }
         let (ws, _) =
             tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(socket))
                 .await
@@ -160,12 +232,29 @@ impl MyChrome {
         let network = Arc::new(Mutex::new(VecDeque::with_capacity(log_capacity)));
         let console = Arc::new(Mutex::new(VecDeque::with_capacity(log_capacity)));
         let session_slot: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let target_slot: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let popups: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let reader = {
+            let target_slot = Arc::clone(&target_slot);
+            let popups = Arc::clone(&popups);
+            let own = out.clone();
+            let own_ids = AtomicU64::new(OWN_IDS);
+            let send_own = move |session: &str, method: &str, params: Value| {
+                let msg = json!({
+                    "id": own_ids.fetch_add(1, Ordering::Relaxed),
+                    "method": method,
+                    "params": params,
+                    "sessionId": session,
+                });
+                let _ = own.send(Message::Text(msg.to_string().into()));
+            };
             let pending = Arc::clone(&pending);
             let network = Arc::clone(&network);
             let console = Arc::clone(&console);
             let session_slot = Arc::clone(&session_slot);
             tokio::spawn(async move {
+                // Desk's tab's main frame, and the page it last committed.
+                let mut main: Option<(String, String)> = None;
                 while let Some(Ok(msg)) = stream.next().await {
                     let Message::Text(text) = msg else { continue };
                     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -184,13 +273,69 @@ impl MyChrome {
                         }
                         continue;
                     }
-                    // Events: only Desk's own tab's are kept.
-                    let ours = session_slot.lock().unwrap().clone();
-                    if ours.is_none() || v["sessionId"].as_str() != ours.as_deref() {
+                    // A tab Desk's opened is Desk's, to close with it.
+                    if v["method"] == "Target.targetCreated" {
+                        let info = &v["params"]["targetInfo"];
+                        let mine = target_slot.lock().unwrap().clone();
+                        if mine.is_some() && info["openerId"].as_str() == mine.as_deref() {
+                            if let Some(id) = info["targetId"].as_str() {
+                                popups.lock().unwrap().push(id.to_string());
+                            }
+                        }
                         continue;
                     }
+                    // Events: only Desk's own tab's are kept.
+                    let ours = session_slot.lock().unwrap().clone();
+                    let Some(ours) = ours.filter(|o| v["sessionId"].as_str() == Some(o.as_str()))
+                    else {
+                        continue;
+                    };
                     let p = &v["params"];
                     match v["method"].as_str() {
+                        // Wherever the page takes itself, a page the person's
+                        // Chrome may not show Desk is left at once: as it
+                        // commits, and again once it has loaded (a navigation
+                        // asked for mid-commit can be overtaken by it).
+                        Some("Page.frameNavigated") if p["frame"]["parentId"].is_null() => {
+                            let url = p["frame"]["url"].as_str().unwrap_or_default().to_string();
+                            let frame = p["frame"]["id"].as_str().unwrap_or_default().to_string();
+                            if !super::chrome_cell::may_show(&url) {
+                                send_own(&ours, "Page.navigate", json!({ "url": "about:blank" }));
+                            }
+                            main = Some((frame, url));
+                        }
+                        Some("Page.frameStoppedLoading") => {
+                            let stopped = p["frameId"].as_str().unwrap_or_default();
+                            if let Some((frame, url)) = main.as_ref() {
+                                if frame == stopped && !super::chrome_cell::may_show(url) {
+                                    send_own(
+                                        &ours,
+                                        "Page.navigate",
+                                        json!({ "url": "about:blank" }),
+                                    );
+                                }
+                            }
+                        }
+                        // An alert, confirm or prompt is dismissed, never
+                        // answered for the person, and noted.
+                        Some("Page.javascriptDialogOpening") => {
+                            send_own(
+                                &ours,
+                                "Page.handleJavaScriptDialog",
+                                json!({ "accept": false }),
+                            );
+                            push(
+                                &mut *console.lock().await,
+                                log_capacity,
+                                json!({
+                                    "source": "dialog",
+                                    "level": p["type"],
+                                    "text": p["message"],
+                                    "url": p["url"],
+                                    "dismissed": true,
+                                }),
+                            );
+                        }
                         Some("Network.requestWillBeSent") => push(
                             &mut *network.lock().await,
                             log_capacity,
@@ -243,6 +388,7 @@ impl MyChrome {
             network,
             console,
             call_timeout,
+            popups,
         };
         // Chrome asks the person before the first command is answered.
         let version = tokio::time::timeout(
@@ -267,6 +413,15 @@ impl MyChrome {
             .await
             .wrap_err("Chrome wouldn't open a window for Desk")?;
         me.target = created["targetId"].as_str().unwrap_or_default().to_string();
+        *target_slot.lock().unwrap() = Some(me.target.clone());
+        // To learn of the tabs Desk's opens; no other tab is attached to.
+        me.send(
+            None,
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+        )
+        .await
+        .wrap_err("Chrome wouldn't say which tabs Desk opens")?;
         let attached = me
             .send(
                 None,
@@ -330,13 +485,13 @@ impl MyChrome {
             )
             .await?;
         if let Some(e) = r.get("exceptionDetails") {
-            return Err(eyre!(
-                "{}",
-                e["exception"]["description"]
-                    .as_str()
-                    .or(e["text"].as_str())
-                    .unwrap_or("script failed")
-            ));
+            // What a page's script throws is the page's words: fenced.
+            let thrown = e["exception"]["description"]
+                .as_str()
+                .or(e["text"].as_str())
+                .unwrap_or("script failed");
+            let mut seen = super::untrusted::Seen::at("");
+            return Err(eyre!("script failed: {}", seen.text(thrown)));
         }
         Ok(r["result"]["value"].clone())
     }
@@ -446,6 +601,110 @@ impl MyChrome {
             .wrap_err("screenshot wasn't an image")
     }
 
+    /// The value of `expression` in a world of Desk's own in its tab, which
+    /// the page's scripts can't reach or reshape.
+    pub async fn evaluate_isolated(&self, expression: &str) -> Result<Value> {
+        let tree = self.call("Page.getFrameTree", json!({})).await?;
+        let frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let world = self
+            .call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame, "worldName": "desk-browser" }),
+            )
+            .await?;
+        let r = self
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "contextId": world["executionContextId"],
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        Ok(r["result"]["value"].clone())
+    }
+
+    /// The node `selector` names, by the DOM's own lookup.
+    async fn node(&self, selector: &str) -> Result<i64> {
+        let doc = self.call("DOM.getDocument", json!({ "depth": 0 })).await?;
+        let root = doc["root"]["nodeId"].as_i64().unwrap_or_default();
+        let found = self
+            .call(
+                "DOM.querySelector",
+                json!({ "nodeId": root, "selector": selector }),
+            )
+            .await?;
+        found["nodeId"]
+            .as_i64()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| eyre!("element not found for selector `{selector}`"))
+    }
+
+    /// Where Desk would press `selector`: the middle of its content box, by
+    /// the DOM's own geometry, and only where the element shown there is
+    /// that one (or inside it), not something laid over it.
+    pub async fn press_point(&self, selector: &str) -> Result<(f64, f64)> {
+        let node = self.node(selector).await?;
+        let _ = self
+            .call("DOM.scrollIntoViewIfNeeded", json!({ "nodeId": node }))
+            .await;
+        let quads = self
+            .call("DOM.getContentQuads", json!({ "nodeId": node }))
+            .await
+            .wrap_err("the element has no box on the page")?;
+        let q: Vec<f64> = quads["quads"][0]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_f64).collect())
+            .unwrap_or_default();
+        if q.len() != 8 {
+            return Err(eyre!("the element has no box on the page"));
+        }
+        let x = (q[0] + q[2] + q[4] + q[6]) / 4.0;
+        let y = (q[1] + q[3] + q[5] + q[7]) / 4.0;
+        let sel = serde_json::to_string(selector)?;
+        let hit = self
+            .evaluate_isolated(&format!(
+                "(() => {{ const el = document.querySelector({sel}); \
+                   const at = document.elementFromPoint({x}, {y}); \
+                   return !!el && !!at && (el === at || el.contains(at)); }})()"
+            ))
+            .await?;
+        if hit != Value::Bool(true) {
+            return Err(eyre!(
+                "Something on the page covers `{selector}`, so nothing was pressed."
+            ));
+        }
+        Ok((x, y))
+    }
+
+    /// A real click at `(x, y)`.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<()> {
+        for kind in ["mousePressed", "mouseReleased"] {
+            self.call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether what has focus is what `selector` names: keys go nowhere
+    /// else.
+    pub async fn focused_is(&self, selector: &str) -> Result<bool> {
+        let sel = serde_json::to_string(selector)?;
+        Ok(self
+            .evaluate_isolated(&format!(
+                "document.activeElement === document.querySelector({sel})"
+            ))
+            .await?
+            == Value::Bool(true))
+    }
+
     /// Puts `file` in the file input `selector` names.
     pub async fn set_file(&self, selector: &str, file: &str) -> Result<()> {
         let doc = self.call("DOM.getDocument", json!({ "depth": 0 })).await?;
@@ -507,5 +766,15 @@ mod tests {
         )
         .unwrap();
         assert!(available(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_port_this_user_listens_on_is_ours_and_a_closed_one_is_not() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(listener_is_ours(port));
+        drop(listener);
+        assert!(!listener_is_ours(port));
     }
 }

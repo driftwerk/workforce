@@ -140,11 +140,12 @@ pub struct Browser {
     pub hostile: bool,
 }
 
-/// The connector a browser write is kept under: `browser:<host>`, so "Allow
-/// for this session" holds for one site.
-pub fn browser_site(host: Option<&str>) -> String {
-    match host.filter(|h| !h.is_empty()) {
-        Some(h) => format!("browser:{h}"),
+/// The connector a browser call is kept under: `browser:<origin>`
+/// (`browser:https://shop.example`), so "Allow for this session" holds for
+/// one origin; `browser` alone for a page with none.
+pub fn browser_site(origin: Option<&str>) -> String {
+    match origin.filter(|o| !o.is_empty()) {
+        Some(o) => format!("browser:{o}"),
         None => "browser".to_string(),
     }
 }
@@ -765,8 +766,13 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
         || connector.starts_with("chrome:")
         || connector.starts_with("chrome-visit:");
     let hostile = p.browser.hostile;
+    // After a hostile page, going anywhere new asks too: the page may be
+    // sending it there. Allow once only, unbound included.
+    if hostile && (write || call.tool == "browser.navigate") {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
+    }
     match p.browser.browsing {
-        Browsing::Unbound if !hostile => return Verdict::Run { by: By::Rule },
+        Browsing::Unbound => return Verdict::Run { by: By::Rule },
         Browsing::Suggests if theirs => {
             return refuse(
                 Refused::OutsideLevel,
@@ -787,9 +793,6 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
         }
         _ => {}
     }
-    if hostile && write {
-        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
-    }
     if theirs {
         if site_granted(p, grants, call, "chrome").is_none() {
             return once_or_session(call, Why::TheirChrome);
@@ -804,16 +807,22 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
     if !write {
         return Verdict::Run { by: By::Rule };
     }
-    if p.access.access == Access::Full && p.access.asks == Asking::Never {
-        return Verdict::Run { by: By::Rule };
-    }
     // A script can do anything on the page, past what a site's allowance
-    // and the never-list read: it is asked about each time.
+    // and the never-list read: below unbound it is asked about each time,
+    // whatever else would let it run.
     if call.tool == "browser.evaluate" {
         return ask(vec![Choice::AllowOnce, Choice::Deny], Why::Unclear);
+    }
+    if p.access.access == Access::Full && p.access.asks == Asking::Never {
+        return Verdict::Run { by: By::Rule };
     }
     if let Some(by) = site_granted(p, grants, call, connector) {
         return Verdict::Run { by };
     }
-    once_or_session(call, Why::OnAPage)
+    // An allowance for the session holds for one origin; a page with none
+    // of its own (blank, inline, a file) shares none.
+    match connector.contains("://") {
+        true => once_or_session(call, Why::OnAPage),
+        false => ask(vec![Choice::AllowOnce, Choice::Deny], Why::OnAPage),
+    }
 }

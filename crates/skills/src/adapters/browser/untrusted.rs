@@ -17,8 +17,8 @@ use workforce_agent::security::external_content::wrap_external_content;
 pub struct PageState {
     /// The page it is on, as last seen.
     pub url: String,
-    /// Whether any page it read scanned as hostile. It stays set until the
-    /// session's browser is closed.
+    /// Whether any page it read scanned as hostile. It stays set, its
+    /// browser closed too, until the person answers the question it raises.
     pub hostile: bool,
 }
 
@@ -36,19 +36,30 @@ pub(super) fn on(session: &str, url: &str) {
     }
 }
 
-/// Puts `session` back from hostile: the turn that read the page is over.
-pub(super) fn calm(session: &str) {
+/// Forgets what `session` read: its browser closed. A hostile page it read
+/// still holds it back, until the person answers ([`calm`]).
+pub(super) fn forget(session: &str) {
     if let Ok(mut pages) = PAGES.lock() {
-        if let Some(page) = pages.get_mut(session) {
-            page.hostile = false;
+        match pages.get(session).is_some_and(|p| p.hostile) {
+            true => {
+                if let Some(p) = pages.get_mut(session) {
+                    p.url.clear();
+                }
+            }
+            false => {
+                pages.remove(session);
+            }
         }
     }
 }
 
-/// Forgets what `session` read: its browser closed.
-pub(super) fn forget(session: &str) {
+/// The person answered: a hostile page `session` read holds it back no
+/// longer.
+pub(super) fn calm(session: &str) {
     if let Ok(mut pages) = PAGES.lock() {
-        pages.remove(session);
+        if let Some(p) = pages.get_mut(session) {
+            p.hostile = false;
+        }
     }
 }
 
@@ -159,6 +170,13 @@ mod tests {
         let out = seen.into_output(session, json!({}));
         assert_eq!(out["_security"]["hostile"], true, "{out}");
         assert!(state(session).unwrap().hostile);
+        forget(session);
+        assert!(
+            state(session).unwrap().hostile,
+            "kept until the person answers"
+        );
+        calm(session);
+        assert!(!state(session).unwrap().hostile);
         forget(session);
         assert!(state(session).is_none());
     }

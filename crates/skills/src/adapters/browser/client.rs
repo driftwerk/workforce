@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactDescriptor, ContentType};
 use workforce_agent::runner::{
-    CURRENT_AGENT_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID, SYSTEM_USER_ID,
+    CURRENT_AGENT_ID, CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID, SYSTEM_USER_ID,
 };
 use workforce_agent::tools::image_gen::GENERATED_IMAGES_KEY;
 use workforce_common::settings::SecretStore;
@@ -99,7 +99,7 @@ fn clients() -> Vec<Arc<BrowserClient>> {
 pub struct Live {
     pub agent: String,
     pub user: String,
-    /// The conversation its last call came from.
+    /// The session (its id) its last call came from.
     pub session: Option<String>,
     pub url: String,
     pub host: Option<String>,
@@ -160,7 +160,7 @@ pub async fn live() -> Vec<Live> {
 pub enum Which<'a> {
     All,
     Agent(&'a str),
-    /// Those whose last call came from this conversation.
+    /// Those whose last call came from this session (its id).
     Session(&'a str),
 }
 
@@ -250,21 +250,77 @@ pub async fn close_backend(backend: Backend) -> usize {
     n
 }
 
-/// At the end of a turn: lets go of the person's Chrome the turn's
-/// conversation was using, and a hostile page it read no longer holds the
-/// next turn back. Desk's own browser stays open for the next.
+/// At the end of a turn: lets go of the person's Chrome the turn's session
+/// (its id) was using. Desk's own browser stays open for the next.
 pub async fn turn_ended(session: &str) -> usize {
     let mut n = 0;
     for client in clients() {
-        // A hostile page holds the turn that read it back, not later ones.
-        for cell in client.sessions.lock().await.values() {
-            if cell.last_session.lock().unwrap().as_deref() == Some(session) {
-                untrusted::calm(&cell.key);
-            }
-        }
         n += detach(&client, Which::Session(session)).await;
     }
     n
+}
+
+/// Closes the browsers whose last call came from session `id` now, and
+/// says, for each, its agent and the conversation's key (what its
+/// allowances are kept under).
+pub async fn stop_session(id: &str) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    for client in clients() {
+        let sessions = client.sessions.lock().await;
+        for cell in sessions.values() {
+            if cell.last_session.lock().unwrap().as_deref() == Some(id) {
+                if let Some(key) = cell.last_key.lock().unwrap().clone() {
+                    keys.push((cell.agent.clone(), key));
+                }
+            }
+        }
+        let chromes = client.chromes.lock().await;
+        for cell in chromes.values() {
+            if cell.last_session.lock().unwrap().as_deref() == Some(id) {
+                if let Some(key) = cell.last_key.lock().unwrap().clone() {
+                    keys.push((cell.agent.clone(), key));
+                }
+            }
+        }
+    }
+    close(Which::Session(id)).await;
+    keys
+}
+
+/// The person answered a hostile page's question: `agent`'s browser for
+/// `user` is no longer held back by it.
+pub fn calm(agent: &str, user: &str) {
+    untrusted::calm(&SessionId::derive(agent, user).0);
+}
+
+/// The origin each identity's call was decided for, taken by the call.
+static EXPECTED: std::sync::LazyLock<StdMutex<HashMap<SessionId, Option<String>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Notes that the call about to be made by the identity in scope was
+/// decided for `origin`: it acts there, or not at all.
+pub(super) fn expect_origin(backend: Backend, origin: Option<String>) {
+    EXPECTED.lock().unwrap().insert(backend_id(backend), origin);
+}
+
+/// What the call now being made by the identity in scope in `backend` was
+/// decided for, if it was.
+pub(super) fn decided(backend: Backend) -> Option<Option<String>> {
+    EXPECTED.lock().unwrap().remove(&backend_id(backend))
+}
+
+fn backend_id(backend: Backend) -> SessionId {
+    let (agent, user) = current_identity();
+    match backend {
+        Backend::Desk => SessionId::derive(&agent, &user),
+        Backend::Chrome => chrome_id(&agent, &user),
+    }
+}
+
+/// The origin the identity in scope's page in `backend` was last seen on.
+pub(super) fn origin_now(backend: Backend) -> Option<String> {
+    let url = untrusted::state(&backend_id(backend).0)?.url;
+    super::address::origin_of(&url)
 }
 
 /// What the browser session of `agent` for `user` has read, if it has a
@@ -369,17 +425,6 @@ pub(super) fn pick(requested: Option<&str>, peek: bool) -> Result<Backend> {
         STICKY.lock().unwrap().insert(id, chosen);
     }
     Ok(chosen)
-}
-
-/// The host of the page the identity in scope has open in `backend`.
-pub(super) fn host_now(backend: Backend) -> Option<String> {
-    let (agent, user) = current_identity();
-    let key = match backend {
-        Backend::Desk => SessionId::derive(&agent, &user),
-        Backend::Chrome => chrome_id(&agent, &user),
-    };
-    let url = untrusted::state(&key.0)?.url;
-    host_of(&url).filter(|_| !url.starts_with("about:"))
 }
 
 /// The browser the identity in scope works in now, without choosing.
@@ -517,6 +562,7 @@ struct Active {
     page: Page,
     _browser: Browser,
     _handler_task: JoinHandle<()>,
+    _dialog_task: JoinHandle<()>,
     _network_task: JoinHandle<()>,
     _console_log_task: JoinHandle<()>,
     _console_api_task: JoinHandle<()>,
@@ -534,8 +580,10 @@ struct SessionCell {
     key: String,
     agent: String,
     user: String,
-    /// The conversation its last call came from, for a Stop there.
+    /// The session (id) its last call came from, for a Stop there.
     last_session: StdMutex<Option<String>>,
+    /// That conversation's key, which its allowances are kept under.
+    last_key: StdMutex<Option<String>>,
     profile_dir: PathBuf,
     inner: Mutex<Option<Active>>,
     respawn: Mutex<RespawnBudget>,
@@ -563,6 +611,7 @@ impl SessionCell {
             agent,
             user,
             last_session: StdMutex::new(None),
+            last_key: StdMutex::new(None),
             profile_dir,
             inner: Mutex::new(None),
             respawn: Mutex::new(RespawnBudget::new(RESPAWN_WINDOW_MS, RESPAWN_LIMIT)),
@@ -587,13 +636,142 @@ impl SessionCell {
 
     fn touch(&self, now: Instant) {
         *self.last_used.lock().unwrap() = now;
-        if let Some(session) = CURRENT_SESSION_KEY
-            .try_with(|k| k.clone())
-            .ok()
-            .filter(|k| !k.is_empty())
-        {
-            *self.last_session.lock().unwrap() = Some(session);
+        let local = |k: &'static tokio::task::LocalKey<String>| {
+            k.try_with(|v| v.clone()).ok().filter(|v| !v.is_empty())
+        };
+        if let Some(id) = local(&CURRENT_SESSION_ID) {
+            *self.last_session.lock().unwrap() = Some(id);
         }
+        if let Some(key) = local(&CURRENT_SESSION_KEY) {
+            *self.last_key.lock().unwrap() = Some(key);
+        }
+    }
+
+    /// Keeps the page to what may be open, before and after every call: a
+    /// file page only while the agent may read that file, never another
+    /// kind of page (a script, the browser's own) — any such is blanked.
+    /// And a call decided for one origin acts there or not at all.
+    async fn keep_page(&self, page: &Page, decided: Option<Option<String>>) -> Result<()> {
+        use super::address::{kind, openable, In, Kind};
+        let url = self.current_url(page).await;
+        let refused = match kind(&url) {
+            Kind::File(path) => {
+                hooks::hooks().and_then(|h| h.may_open_file(&self.agent, &path).err())
+            }
+            k if openable(&k, In::Desk) => None,
+            Kind::Other(what) => Some(format!(
+                "The page went to {what}, which the browser doesn't open."
+            )),
+            _ => None,
+        };
+        if let Some(why) = refused {
+            blank(page).await;
+            untrusted::on(&self.key, "about:blank");
+            return Err(eyre!("{why} The page is blank now."));
+        }
+        if let Some(decided) = decided {
+            if super::address::origin_of(&url) != decided {
+                return Err(eyre!(
+                    "The page moved since this was decided, so nothing was done. Call again."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Where `selector` (the focused element where none) is, and what the
+    /// page shows of it, read in a world of Desk's own that the page's
+    /// scripts can't reach, and whether the point Desk would press is that
+    /// element and not something laid over it.
+    async fn probe(
+        &self,
+        page: &Page,
+        selector: Option<&str>,
+        form: bool,
+        press: bool,
+    ) -> Result<Probe> {
+        use chromiumoxide::cdp::browser_protocol::dom::{
+            GetBoxModelParams, ScrollIntoViewIfNeededParams,
+        };
+        use chromiumoxide::cdp::browser_protocol::page::CreateIsolatedWorldParams;
+        use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+        let frame = page
+            .mainframe()
+            .await?
+            .ok_or_else(|| eyre!("the page has no frame"))?;
+        let world = page
+            .execute(
+                CreateIsolatedWorldParams::builder()
+                    .frame_id(frame)
+                    .world_name("desk-browser")
+                    .build()
+                    .map_err(|e| eyre!("{e}"))?,
+            )
+            .await?;
+        let context = world.result.execution_context_id;
+        let read = |expression: String| {
+            EvaluateParams::builder()
+                .expression(expression)
+                .context_id(context)
+                .return_by_value(true)
+                .build()
+                .map_err(|e| eyre!("{e}"))
+        };
+        let shown = page
+            .execute(read(shown_expression(selector, form))?)
+            .await?
+            .result
+            .result
+            .value
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let Some(sel) = selector.filter(|_| press) else {
+            return Ok(Probe { at: None, shown });
+        };
+        let element = page
+            .find_element(sel)
+            .await
+            .wrap_err_with(|| format!("element not found for selector `{sel}`"))?;
+        let _ = page
+            .execute(
+                ScrollIntoViewIfNeededParams::builder()
+                    .backend_node_id(element.backend_node_id)
+                    .build(),
+            )
+            .await;
+        let model = page
+            .execute(
+                GetBoxModelParams::builder()
+                    .backend_node_id(element.backend_node_id)
+                    .build(),
+            )
+            .await
+            .wrap_err("the element has no box on the page")?;
+        let quad = model.result.model.content.inner();
+        let (x, y) = (
+            quad.iter().step_by(2).sum::<f64>() / 4.0,
+            quad.iter().skip(1).step_by(2).sum::<f64>() / 4.0,
+        );
+        let sel_js = serde_json::to_string(sel)?;
+        let hit = page
+            .execute(read(format!(
+                "(() => {{ const el = document.querySelector({sel_js}); \
+                   const at = document.elementFromPoint({x}, {y}); \
+                   return !!el && !!at && (el === at || el.contains(at)); }})()"
+            ))?)
+            .await?
+            .result
+            .result
+            .value;
+        if hit != Some(Value::Bool(true)) {
+            return Err(eyre!(
+                "Something on the page covers `{sel}`, so nothing was pressed."
+            ));
+        }
+        Ok(Probe {
+            at: Some((x, y)),
+            shown,
+        })
     }
 
     /// Refuses what `tool` would do on the element `selector` names (the
@@ -607,40 +785,48 @@ impl SessionCell {
         target: Option<&str>,
         selector: Option<&str>,
         form: bool,
-        file: Option<&str>,
-    ) -> Result<()> {
+        files: &[&str],
+    ) -> Result<Probe> {
+        let probe = self
+            .probe(page, selector, form, tool == "browser.click")
+            .await?;
         let Some(hooks) = hooks::hooks() else {
-            return Ok(());
+            return Ok(probe);
         };
         if hooks.unbound(&self.agent) {
-            return Ok(());
+            return Ok(probe);
         }
-        let shown = page
-            .evaluate(shown_expression(selector, form))
-            .await
-            .ok()
-            .and_then(|r| r.into_value::<String>().ok())
-            .unwrap_or_default();
         let what = OnPage {
             tool: tool.to_string(),
             url: self.current_url(page).await,
             target: target.map(str::to_string),
-            shown,
-            file: file.map(str::to_string),
+            shown: probe.shown.clone(),
+            files: files.iter().map(|f| f.to_string()).collect(),
         };
         match hooks.holds(&self.agent, &what) {
             Some(why) => Err(eyre!("{why}")),
-            None => Ok(()),
+            None => Ok(probe),
         }
     }
 
-    /// Records what `tool` did, with the page as it looks now.
+    /// Records what `tool` did, with the page as it looks now; never a
+    /// picture of what was just typed (a credential, perhaps).
     async fn done(&self, page: &Page, tool: &str, target: Option<&str>) {
         let Some(hooks) = hooks::hooks() else {
             return;
         };
         let url = self.current_url(page).await;
-        let screenshot = page.screenshot(ScreenshotParams::default()).await.ok();
+        let typed = matches!(tool, "browser.fill" | "browser.type");
+        let screenshot = match typed {
+            true => None,
+            false => timeout(
+                Duration::from_secs(10),
+                page.screenshot(ScreenshotParams::default()),
+            )
+            .await
+            .ok()
+            .and_then(|s| s.ok()),
+        };
         hooks.record(Done {
             agent: self.agent.clone(),
             user: self.user.clone(),
@@ -710,6 +896,18 @@ impl SessionCell {
             self.config.console_log_capacity,
         )));
 
+        // Nothing a page offers is saved to this computer.
+        {
+            use chromiumoxide::cdp::browser_protocol::browser::{
+                SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
+            };
+            browser
+                .execute(SetDownloadBehaviorParams::new(
+                    SetDownloadBehaviorBehavior::Deny,
+                ))
+                .await
+                .wrap_err("couldn't turn the browser's downloads off")?;
+        }
         let network_task =
             spawn_network_listener(&page, network_log.clone(), self.config.network_log_capacity)
                 .await?;
@@ -717,10 +915,14 @@ impl SessionCell {
             spawn_console_listeners(&page, console_log.clone(), self.config.console_log_capacity)
                 .await?;
 
+        let dialog_task =
+            spawn_dialog_dismisser(&page, console_log.clone(), self.config.console_log_capacity)
+                .await?;
         Ok(Active {
             page,
             _browser: browser,
             _handler_task: handler_task,
+            _dialog_task: dialog_task,
             _network_task: network_task,
             _console_log_task: console_log_task,
             _console_api_task: console_api_task,
@@ -751,9 +953,13 @@ impl SessionCell {
             )
         };
         let _serial = call_lock.lock().await;
+        let decided = decided(Backend::Desk);
+        self.keep_page(&page, decided).await?;
+        let after = page.clone();
         match timeout(timeout_dur, op(page, network_log, console_log)).await {
             Ok(Ok(v)) => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                self.keep_page(&after, None).await?;
                 Ok(v)
             }
             Ok(Err(e)) => {
@@ -801,8 +1007,9 @@ impl SessionCell {
             untrusted::on(&self.key, &final_url);
             self.done(&page, "browser.navigate", Some(&url)).await;
             let mut seen = Seen::at(&final_url);
-            let title = seen.text(&title);
-            Ok(seen.into_output(&self.key, json!({ "url": final_url, "title": title })))
+            // The address is the page's to choose too (its path, its query).
+            let (shown_url, title) = (seen.text(&final_url), seen.text(&title));
+            Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
         })
         .await
     }
@@ -830,7 +1037,8 @@ impl SessionCell {
                 .unwrap_or_default();
             let url = self.current_url(&page).await;
             let mut seen = Seen::at(&url);
-            let (title, body_text) = (seen.text(&title), seen.text(&body_text));
+            let (url, title, body_text) =
+                (seen.text(&url), seen.text(&title), seen.text(&body_text));
             Ok(seen.into_output(
                 &self.key,
                 json!({ "url": url, "title": title, "body_text": body_text }),
@@ -900,16 +1108,22 @@ impl SessionCell {
                 .find_element(selector.as_str())
                 .await
                 .wrap_err_with(|| format!("element not found for selector `{selector}`"))?;
-            self.hold(
-                &page,
-                "browser.click",
-                Some(&selector),
-                Some(&selector),
-                true,
-                None,
-            )
-            .await?;
-            element.click().await.wrap_err("click failed")?;
+            let probe = self
+                .hold(
+                    &page,
+                    "browser.click",
+                    Some(&selector),
+                    Some(&selector),
+                    true,
+                    &[],
+                )
+                .await?;
+            match probe.at {
+                Some((x, y)) => press_at(&page, x, y).await?,
+                None => {
+                    element.click().await.wrap_err("click failed")?;
+                }
+            }
             self.done(&page, "browser.click", Some(&selector)).await;
             Ok(json!({ "clicked": selector }))
         })
@@ -920,7 +1134,7 @@ impl SessionCell {
         let key = key.to_string();
         let selector = selector.map(str::to_string);
         self.with_page(|page, _n, _c| async move {
-            self.hold(&page, "browser.press_key", Some(&key), selector.as_deref(), true, None)
+            self.hold(&page, "browser.press_key", Some(&key), selector.as_deref(), true, &[])
                 .await?;
             match selector {
                 Some(sel) => {
@@ -960,7 +1174,7 @@ impl SessionCell {
                 Some(&selector),
                 Some(&selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             let ok = page
@@ -982,10 +1196,15 @@ impl SessionCell {
     async fn evaluate(&self, expression: &str) -> Result<Value> {
         let expression = expression.to_string();
         self.with_page(|page, _n, _c| async move {
-            let result = page
-                .evaluate(expression.as_str())
-                .await
-                .wrap_err("evaluate failed")?;
+            // What a page's script throws is the page's words: fenced.
+            let result = match page.evaluate(expression.as_str()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let url = self.current_url(&page).await;
+                    let mut seen = Seen::at(&url);
+                    return Err(eyre!("evaluate failed: {}", seen.text(&e.to_string())));
+                }
+            };
             let value = result.into_value::<Value>().unwrap_or(Value::Null);
             self.done(&page, "browser.evaluate", None).await;
             let url = self.current_url(&page).await;
@@ -1330,7 +1549,7 @@ impl BrowserClient {
                 Some(&selector),
                 Some(&selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             // Resolve the credential against the page we're about to fill, so the
@@ -1373,7 +1592,7 @@ impl BrowserClient {
                 Some(&selector),
                 Some(&selector),
                 false,
-                None,
+                &[],
             )
             .await?;
             let host = page.url().await.ok().flatten().and_then(|u| host_of(&u));
@@ -1469,6 +1688,7 @@ impl BrowserClient {
             .unwrap_or_default();
         let staged = crate::adapters::utils::resolve_staged_file(&agent_id, artifact_id)
             .wrap_err_with(|| format!("could not read artifact {artifact_id}"))?;
+        let staged_name = staged.filename.clone();
         let name = filename
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -1482,7 +1702,12 @@ impl BrowserClient {
             return self
                 .chrome()
                 .await?
-                .upload_file(selector, &path_str, &name)
+                .upload_file(
+                    selector,
+                    &path_str,
+                    &name,
+                    &[staged_name.as_str(), name.as_str()],
+                )
                 .await;
         }
 
@@ -1496,7 +1721,7 @@ impl BrowserClient {
                 Some(&selector),
                 Some(&selector),
                 false,
-                Some(&name),
+                &[staged_name.as_str(), name.as_str()],
             )
             .await?;
             let element = page
@@ -1580,9 +1805,16 @@ async fn launch_chromium(
     profile_dir: &Path,
     show: bool,
 ) -> Result<(Browser, Handler)> {
-    let builder: BrowserConfigBuilder = BrowserConfig::builder()
-        .no_sandbox()
-        .user_data_dir(profile_dir)
+    let builder: BrowserConfigBuilder = BrowserConfig::builder().user_data_dir(profile_dir);
+    // Chrome's sandbox stays on, unless it can't start here: as root in a
+    // container, or where the install says so (a build box without user
+    // namespaces).
+    let builder = if config.no_sandbox || root_in_container() {
+        builder.no_sandbox()
+    } else {
+        builder
+    };
+    let builder = builder
         .viewport(Viewport {
             width: config.viewport_width,
             height: config.viewport_height,
@@ -1610,6 +1842,98 @@ async fn launch_chromium(
     Browser::launch(cfg)
         .await
         .wrap_err("failed to launch chromium")
+}
+
+/// Whether this process runs as root in a container, where Chrome's
+/// sandbox can't start.
+fn root_in_container() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+        let contained =
+            Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        root && contained
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Where a click lands and what the page shows of it.
+struct Probe {
+    /// The middle of the element's box, when it was pressed for.
+    at: Option<(f64, f64)>,
+    shown: String,
+}
+
+/// Sends the page to about:blank, not waiting on whatever it was loading.
+async fn blank(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
+    let _ = timeout(
+        Duration::from_secs(5),
+        page.execute(NavigateParams::new("about:blank")),
+    )
+    .await;
+}
+
+/// A real click at `(x, y)` on the page.
+async fn press_at(page: &Page, x: f64, y: f64) -> Result<()> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+    };
+    for kind in [
+        DispatchMouseEventType::MousePressed,
+        DispatchMouseEventType::MouseReleased,
+    ] {
+        page.execute(
+            DispatchMouseEventParams::builder()
+                .r#type(kind)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| eyre!("{e}"))?,
+        )
+        .await
+        .wrap_err("click failed")?;
+    }
+    // A click that opens another page: let it settle, briefly.
+    let _ = timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+    Ok(())
+}
+
+/// Dismisses every alert, confirm and prompt a page opens (none waits on
+/// the person, and none is accepted for them), noting each, fenced as the
+/// page's words, in the console log.
+async fn spawn_dialog_dismisser(
+    page: &Page,
+    log: Arc<Mutex<VecDeque<Value>>>,
+    capacity: usize,
+) -> Result<JoinHandle<()>> {
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
+    };
+    let mut events = page
+        .event_listener::<EventJavascriptDialogOpening>()
+        .await
+        .wrap_err("failed to subscribe to dialogs")?;
+    let page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            let _ = page.execute(HandleJavaScriptDialogParams::new(false)).await;
+            let entry = json!({
+                "source": "dialog",
+                "level": format!("{:?}", event.r#type),
+                "text": event.message,
+                "url": event.url,
+                "dismissed": true,
+            });
+            push_bounded(&mut *log.lock().await, capacity, entry);
+        }
+    }))
 }
 
 struct RespawnBudget {
@@ -1835,14 +2159,7 @@ fn stage_pdf_artifact(bytes: Vec<u8>, filename: &str) -> Result<Value> {
 /// scheme, any `userinfo@`, the path/query/fragment, and the `:port`. Returns
 /// `None` for an empty or scheme-only string.
 pub(super) fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    super::address::host_of(url)
 }
 
 /// What the page shows of the element `selector` names (the focused one
@@ -1960,7 +2277,7 @@ mod tests {
             host_of("https://user:pw@host.example.com:8443/p").as_deref(),
             Some("host.example.com")
         );
-        assert_eq!(host_of("about:blank").as_deref(), Some("about"));
+        assert_eq!(host_of("about:blank").as_deref(), None);
         assert_eq!(host_of(""), None);
     }
 
@@ -2309,6 +2626,7 @@ mod tests {
         let client = BrowserClient::new(BrowserSkillConfig {
             profile_root: Some(dir.path().display().to_string()),
             chrome_binary: std::env::var("BROWSER_E2E_CHROMIUM").ok(),
+            no_sandbox: std::env::var("BROWSER_E2E_NO_SANDBOX").is_ok(),
             ..Default::default()
         });
 

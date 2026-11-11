@@ -44,6 +44,7 @@ use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 /// What Desk tells the browser, and keeps of what it did.
 struct DeskHooks {
     state: Arc<GatewayState>,
+    config: WorkforceConfig,
     computer: Computer,
     /// `…/Desk/browser/shots`.
     shots: PathBuf,
@@ -143,6 +144,76 @@ fn checked(mut settings: Settings) -> Result<Settings, String> {
     Ok(settings)
 }
 
+/// Whether `agent` is unbound in the browser for this call: the crew says
+/// so (Act fully anywhere, every switch on, its budget not spent), and the
+/// turn is one the person whose Desk this is started and is in: no job,
+/// schedule or other person's turn.
+fn unbound_now(state: &Arc<GatewayState>, agent: &str) -> bool {
+    let Some(service) = state.registry.get(agent) else {
+        return false;
+    };
+    let o = match AgentWorkspaceConfig::load(&service.workspace) {
+        Ok(Some(config)) => match config.oversight() {
+            Ok(o) => o,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    if !o.enabled {
+        return false;
+    }
+    let Some(crew) = crate::desk_crew::for_service(&service) else {
+        return false;
+    };
+    crew.unbound_given(&service, &o) && attended_by_holder(state)
+}
+
+/// Whether this turn is the Desk holder's own, started by them.
+fn attended_by_holder(state: &Arc<GatewayState>) -> bool {
+    use workforce_agent::runner::{CURRENT_AUTOMATED_ORIGIN, CURRENT_USER_ID};
+    let automated = CURRENT_AUTOMATED_ORIGIN
+        .try_with(|o| !o.is_empty())
+        .unwrap_or(false);
+    let user = CURRENT_USER_ID
+        .try_with(|u| u.clone())
+        .ok()
+        .filter(|u| !u.is_empty());
+    !automated
+        && crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user.as_deref())
+}
+
+/// What a turn's own Stop reaches, set when Desk's browser is.
+static STOPPING: std::sync::OnceLock<Computer> = std::sync::OnceLock::new();
+
+/// A turn's own Stop: the browser its session was using closes now, and
+/// the "Allow for this session" answers that conversation held for it go.
+pub async fn stopped(session_id: &str) {
+    let kept = browser::stop_session(session_id).await;
+    let Some(computer) = STOPPING.get() else {
+        return;
+    };
+    for (agent, key) in kept {
+        if let Err(e) = computer
+            .store()
+            .forget_browser_grants_in(&agent, &key)
+            .await
+        {
+            warn!(error = %format!("{e:#}"), "forgetting browser allowances on Stop failed");
+        }
+    }
+}
+
+/// Erases what Desk's browser kept of `person`: the screenshots their
+/// activity names, then that activity and their grants.
+pub async fn erase_person(computer: &Computer, shots: &Path, person: &str) -> eyre::Result<u64> {
+    for name in computer.store().browser_shots_of(person).await? {
+        if let Some(name) = shot_name(&name) {
+            let _ = std::fs::remove_file(shots.join(name));
+        }
+    }
+    computer.store().erase_access_person(person).await
+}
+
 /// The sentence a browser call the never-list holds is refused with.
 fn persons(never: workforce_desk::never::Never) -> String {
     format!(
@@ -157,15 +228,7 @@ impl BrowserHooks for DeskHooks {
     }
 
     fn unbound(&self, agent: &str) -> bool {
-        let Some(service) = self.state.registry.get(agent) else {
-            return false;
-        };
-        match AgentWorkspaceConfig::load(&service.workspace) {
-            Ok(Some(config)) => config
-                .oversight()
-                .is_ok_and(|o| crate::desk_computer::unbound(&o)),
-            _ => false,
-        }
+        unbound_now(&self.state, agent)
     }
 
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String> {
@@ -173,11 +236,70 @@ impl BrowserHooks for DeskHooks {
             return None;
         }
         let file = what
-            .file
-            .as_deref()
-            .and_then(|f| workforce_desk::never::path(Path::new(f)));
+            .files
+            .iter()
+            .find_map(|f| workforce_desk::never::path(Path::new(f)));
         file.or_else(|| workforce_desk::never::on_page(&what.shown))
             .map(persons)
+    }
+
+    /// A page in the person's Chrome that took itself to another site is
+    /// held to that site's visit as the gate decides one: it stays only
+    /// where this session may be, without asking.
+    fn may_visit(&self, agent: &str, origin: &str) -> Result<(), String> {
+        use workforce_core::computer::Verdict;
+        let Some(service) = self.state.registry.get(agent) else {
+            return Err("Desk couldn't check that site for this agent.".into());
+        };
+        let subject = crate::serve::ComputerSubject {
+            agent: agent.to_string(),
+            name: None,
+            workspace: service.workspace.clone(),
+        };
+        let gate = crate::desk_computer::HubComputerGate::for_agent(
+            self.computer.clone(),
+            &self.config,
+            &subject,
+        );
+        let effect = workforce_core::computer::Effect::Connector {
+            connector: format!("chrome-visit:{origin}"),
+            write: false,
+        };
+        use workforce_agent::tools::computer::ComputerGate;
+        match gate.verdict("browser.snapshot", &effect) {
+            Verdict::Run { .. } => Ok(()),
+            Verdict::Refuse { refusal } => Err(refusal.sentence),
+            _ => Err("The page took itself to a site this session hasn't been allowed in your Chrome; open it with browser.navigate so you're asked.".into()),
+        }
+    }
+
+    /// A page that moved to another file is read again as the gate reads a
+    /// file: it stays open only where the agent may read that file now,
+    /// without asking.
+    fn may_open_file(&self, agent: &str, path: &Path) -> Result<(), String> {
+        use workforce_core::computer::Verdict;
+        let Some(service) = self.state.registry.get(agent) else {
+            return Err("Desk couldn't check that file for this agent.".into());
+        };
+        let subject = crate::serve::ComputerSubject {
+            agent: agent.to_string(),
+            name: None,
+            workspace: service.workspace.clone(),
+        };
+        let gate = crate::desk_computer::HubComputerGate::for_agent(
+            self.computer.clone(),
+            &self.config,
+            &subject,
+        );
+        let effect = workforce_core::computer::Effect::Read {
+            paths: vec![workforce_agent::tools::paths::resolve_real(path)],
+        };
+        use workforce_agent::tools::computer::ComputerGate;
+        match gate.verdict("browser.navigate", &effect) {
+            Verdict::Run { .. } => Ok(()),
+            Verdict::Refuse { refusal } => Err(refusal.sentence),
+            _ => Err("Opening that file asks the person first; open it with browser.navigate so they're asked.".into()),
+        }
     }
 
     fn record(&self, done: Done) {
@@ -556,6 +678,7 @@ pub fn install(
         .or_else(browser::chrome_user_data_dir);
     let hooks = Arc::new(DeskHooks {
         state: Arc::clone(state),
+        config: config.clone(),
         computer: computer.clone(),
         shots: shots.clone(),
         settings: Arc::clone(&settings),
@@ -569,6 +692,11 @@ pub fn install(
             });
         }
     }));
+    {
+        let state = Arc::clone(state);
+        crate::desk_computer::judge_unbound_with(Box::new(move |agent| unbound_now(&state, agent)));
+    }
+    let _ = STOPPING.set(computer.clone());
     if !browser::install_hooks(hooks) {
         warn!("Desk's browser hooks were installed twice; the first stand");
     }

@@ -87,6 +87,11 @@ pub struct BrowserSkillConfig {
     /// it in Chrome's own prompt.
     #[serde(default = "default_chrome_connect_timeout_ms")]
     pub chrome_connect_timeout_ms: u64,
+    /// Run Chrome without its sandbox. Only where the sandbox can't start
+    /// (a build box without user namespaces); as root in a container it is
+    /// off already.
+    #[serde(default)]
+    pub no_sandbox: bool,
 }
 
 fn default_chrome_connect_timeout_ms() -> u64 {
@@ -113,6 +118,7 @@ impl Default for BrowserSkillConfig {
             keep_profiles: false,
             chrome_user_data_dir: None,
             chrome_connect_timeout_ms: default_chrome_connect_timeout_ms(),
+            no_sandbox: false,
         }
     }
 }

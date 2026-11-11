@@ -19,8 +19,9 @@ pub struct OnPage {
     /// What the page shows of the element: its text, value, label, title,
     /// type, name and autocomplete hint, and its form's action.
     pub shown: String,
-    /// The name of a file it uploads.
-    pub file: Option<String>,
+    /// The names of a file it uploads: the staged file's own, and the one
+    /// the site is told.
+    pub files: Vec<String>,
 }
 
 /// One navigation or change a browser made, for the agent's activity.
@@ -28,7 +29,7 @@ pub struct OnPage {
 pub struct Done {
     pub agent: String,
     pub user: String,
-    /// The conversation it was made in.
+    /// The session it was made in (its id).
     pub session: Option<String>,
     pub tool: String,
     /// Which browser: `desk` (Desk's own) or `chrome` (the person's).
@@ -71,8 +72,10 @@ fn matches(site: &str, host: &str) -> bool {
     let site = site
         .trim()
         .trim_start_matches("*.")
+        .trim_start_matches('.')
         .trim_end_matches('.')
         .to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
     !site.is_empty() && (host == site || host.ends_with(&format!(".{site}")))
 }
 
@@ -114,6 +117,18 @@ pub trait BrowserHooks: Send + Sync {
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String>;
     /// Keeps what was done. Must neither block nor fail the call.
     fn record(&self, done: Done);
+    /// Whether `agent` may have the file at `path` open, now: a page can
+    /// move to another file after the first was allowed. `Err` says why
+    /// not. A hub with no say lets it be.
+    fn may_open_file(&self, _agent: &str, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+    /// Whether `agent` may be on `origin` in the person's Chrome, now: a
+    /// page can take itself to a site the visit wasn't allowed for. `Err`
+    /// says why not. A hub with no say lets it be.
+    fn may_visit(&self, _agent: &str, _origin: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 static HOOKS: OnceLock<Arc<dyn BrowserHooks>> = OnceLock::new();
@@ -152,6 +167,16 @@ mod tests {
         assert!(sites.allows(Some("example.com")));
         assert!(sites.allows(Some("shop.example.com")));
         assert!(sites.allows(Some("a.docs.test")));
+        let dotted = Sites {
+            allow: vec![],
+            block: vec![".bank.test".into()],
+        };
+        assert!(
+            !dotted.allows(Some("bank.test")),
+            "a leading dot is the same site"
+        );
+        assert!(!dotted.allows(Some("www.bank.test")));
+        assert!(!dotted.allows(Some("bank.test.")), "a trailing dot is too");
         assert!(!sites.allows(Some("admin.example.com")));
         assert!(!sites.allows(Some("x.admin.example.com")));
         assert!(!sites.allows(Some("notexample.com")));
