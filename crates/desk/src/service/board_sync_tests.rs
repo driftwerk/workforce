@@ -100,6 +100,7 @@ fn link(hub: Option<&str>) -> LinkBoard {
         me_name: None,
         me_source: None,
         me_note: None,
+        not_me: false,
         states: BTreeMap::from([(TicketState::Todo, "To Do".to_string())]),
     }
 }
@@ -791,6 +792,7 @@ async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
             me_name: me.map(|_| "Sam".to_string()),
             me_source: None,
             me_note: None,
+            not_me: false,
             states: BTreeMap::from([
                 (TicketState::Todo, "unstarted".to_string()),
                 (TicketState::Done, "completed".to_string()),

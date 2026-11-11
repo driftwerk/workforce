@@ -1089,6 +1089,12 @@ async fn link_board(
     // Who the person is there, kept on the link for "assigned to me",
     // Mine and Take it; an id they typed is theirs to keep.
     match &link.me {
+        _ if link.not_me && link.me.is_none() => {
+            link.me_note = Some(format!(
+                "You said {hub}'s answer of who you are on {} isn't you: check again once it's right.",
+                link.system.title()
+            ));
+        }
         Some(me) => {
             if let Err(e) = sync::check_me(link.system, me) {
                 return refusal(StatusCode::BAD_REQUEST, &e);

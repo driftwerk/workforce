@@ -52,6 +52,10 @@ pub struct LinkBoard {
     /// Why the hub can't vouch for who the person is.
     #[serde(skip)]
     pub me_note: Option<String>,
+    /// The person said the hub's answer of who they are isn't them: it is
+    /// not kept, and Take it waits until they check again.
+    #[serde(default)]
+    pub not_me: bool,
     pub states: BTreeMap<TicketState, String>,
 }
 

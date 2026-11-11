@@ -433,6 +433,7 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         me_name: None,
         me_source: None,
         me_note: None,
+        not_me: false,
         states: states(),
     }
 }
@@ -1327,6 +1328,40 @@ async fn a_shared_key_never_says_who_you_are() {
         assert_eq!(body["sync"]["me"], SAM_ACCOUNT);
         assert_eq!(body["sync"]["meSource"], "vouched");
         assert_eq!(body["sync"].get("meNote"), None);
+    })
+    .await;
+}
+
+/// "That's not me": a link the person says the hub's answer isn't them
+/// keeps no one, and says so.
+#[tokio::test]
+async fn a_link_that_isn_t_you_keeps_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                json!({ "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": { "kind": "all", "value": { "includeDone": false } },
+                        "states": states(), "notMe": true }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], Value::Null);
+        assert!(body["sync"]["meNote"].as_str().unwrap().contains("isn't you"));
+        assert!(!remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(t, _)| t == "jira.myself"));
     })
     .await;
 }
