@@ -98,7 +98,7 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
         let token = crew.state.auth_token.clone();
         let call = |boss: &str, id: &str| {
             json!({"group": "acme", "tool": "crew.overview", "input": {}, "boss": boss,
-                   "linkId": "home-relay", "id": id})
+                   "linkId": "home-relay", "id": id, "level": "act", "act": {"interrupt": true}})
         };
 
         let (code, out) = post(
@@ -153,6 +153,24 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
             call("local:sarah", "c-5"),
         )
         .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // The home's own level is the most it does there: at Watch it does
+        // nothing, whatever the grant says.
+        let mut watching = call("local:sarah", "c-6");
+        watching["tool"] = json!("crew.interrupt");
+        watching["input"] = json!({"session_id": s.id, "reason": "Loops."});
+        watching["level"] = json!("watch");
+        let (_, out) = post(&app, "/api/desk/crew/served", &token, watching).await;
+        assert_eq!(out["status"], "refused", "{out}");
+        // Only on the home's relay link, and only with the level said.
+        let mut other_link = call("local:sarah", "c-7");
+        other_link["linkId"] = json!("link-of-mine");
+        let (code, _) = post(&app, "/api/desk/crew/served", &token, other_link).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let mut no_level = call("local:sarah", "c-8");
+        no_level.as_object_mut().unwrap().remove("level");
+        let (code, _) = post(&app, "/api/desk/crew/served", &token, no_level).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
 
         // The same call sent again is never done twice.
@@ -251,12 +269,15 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         assert_eq!(sent.group, "acme");
         assert_eq!(sent.boss, BossRef::Local { agent: "desk".into() }.key());
         assert_eq!(sent.link_id, "home-relay");
+        assert_eq!(sent.level, workforce_common::oversight::Level::Act);
+        assert!(sent.act.interrupt);
         assert_eq!(sent.input["session_id"], json!(remote.to_string()));
 
         // The overview has devbox's part of Acme, said as devbox said it.
         let r = tool("crew.overview").execute(json!({})).await.unwrap();
         assert!(r.success, "{r:?}");
         assert_eq!(r.output["machines"][0]["machine"], "devbox", "{r:?}");
+        assert!(!super::super::relay::machine_ok(".devbox"));
         assert!(r.output["machines"][0]["sessions"].as_str().unwrap().contains(&remote.to_string()));
 
         // A session outside its group, or a tool not relayed, sends nothing.
@@ -283,7 +304,9 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
             .await
             .unwrap();
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("can't be reached"));
+        // Desk took it: it may have been done, so it isn't said unreached.
+        let said = r.error.unwrap();
+        assert!(said.contains("outcome isn't known"), "{said}");
         // Its late answer goes nowhere.
         let late = took.await.unwrap();
         assert_eq!(late.len(), 1);

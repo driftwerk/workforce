@@ -81,6 +81,7 @@ async fn serve(
             boss,
             link_id: Some("link-acme".into()),
             call_id: Some(uuid::Uuid::new_v4().to_string()),
+            ceiling: None,
         },
         "acme",
     )
@@ -209,6 +210,7 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
                     boss: allan(),
                     link_id: Some("link-acme".into()),
                     call_id: None,
+                    ceiling: None,
                 },
                 "acme",
             )
@@ -391,6 +393,7 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             boss: allan(),
             link_id: Some("link-acme".into()),
             call_id: Some("call-7".into()),
+            ceiling: None,
         };
         let r = crew.serve_crew(call.clone(), "acme").await;
         assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
@@ -499,6 +502,7 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
             boss,
             link_id: Some("link-acme".into()),
             call_id: Some("call-1".into()),
+            ceiling: None,
         };
         crew.serve_crew(call(allan()), "acme").await;
         let bob = BossRef::Remote {

@@ -40,11 +40,14 @@ use workforce_desk::grant::BossRef;
 use super::served::{ServedCall, ServedStatus};
 use super::CrewHub;
 use crate::gateway::GatewayState;
+use workforce_desk::sees;
 
 /// The link every relayed call comes on.
 pub const RELAY_LINK: &str = "home-relay";
 /// The most calls waiting to be taken at once.
 const MOST_QUEUED: usize = 64;
+/// The most calls waiting for their answers at once, taken or not.
+const MOST_WAITING: usize = 128;
 /// The most calls one poll takes.
 const MOST_TAKEN: usize = 16;
 /// The largest answer a machine's call may post.
@@ -66,6 +69,10 @@ pub struct RelayCall {
     /// `local:<agent>`: the overseer that made it.
     pub boss: String,
     pub link_id: &'static str,
+    /// The overseer's own level and switches here: the machine decides at
+    /// no more than these and its grant's.
+    pub level: workforce_common::oversight::Level,
+    pub act: workforce_common::oversight::Act,
 }
 
 /// What a machine answered.
@@ -82,11 +89,14 @@ pub struct RelayAnswer {
 pub(crate) struct Relays {
     queued: VecDeque<(RelayCall, Instant)>,
     waiting: HashMap<Uuid, tokio::sync::oneshot::Sender<RelayAnswer>>,
+    /// Calls Desk's native side took: they may have been done.
+    taken: std::collections::HashSet<Uuid>,
 }
 
 /// Whether `name` can name a machine: no `/`, `:` or space in it.
 pub fn machine_ok(name: &str) -> bool {
     !name.is_empty()
+        && !name.starts_with('.')
         && name.len() <= 100
         && name
             .chars()
@@ -111,6 +121,7 @@ impl CrewHub {
         tool: &str,
         input: Value,
         agent: &str,
+        ceiling: &super::served::Ceiling,
     ) -> Result<RelayAnswer, String> {
         let unreached = || {
             format!(
@@ -131,7 +142,7 @@ impl CrewHub {
             let mut r = self.relays.lock();
             let wait = *self.relay_wait.lock();
             r.queued.retain(|(_, at)| at.elapsed() < wait);
-            if r.queued.len() >= MOST_QUEUED {
+            if r.queued.len() >= MOST_QUEUED || r.waiting.len() >= MOST_WAITING {
                 return Err(unreached());
             }
             r.queued.push_back((
@@ -146,6 +157,8 @@ impl CrewHub {
                     }
                     .key(),
                     link_id: RELAY_LINK,
+                    level: ceiling.level,
+                    act: ceiling.act,
                 },
                 Instant::now(),
             ));
@@ -156,13 +169,19 @@ impl CrewHub {
         let got = tokio::time::timeout(wait, rx).await;
         // Whatever came of it, nothing waits for it any more, and a call
         // no one took goes.
-        {
+        let taken = {
             let mut r = self.relays.lock();
             r.waiting.remove(&id);
             r.queued.retain(|(c, _)| c.id != id);
-        }
+            r.taken.remove(&id)
+        };
         match got {
             Ok(Ok(answer)) => Ok(answer),
+            // Desk took it: it may have been done there. Not to be sent
+            // again as new.
+            _ if taken => Err(format!(
+                "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
+            )),
             _ => Err(unreached()),
         }
     }
@@ -176,7 +195,10 @@ impl CrewHub {
             let mut out = Vec::new();
             while out.len() < MOST_TAKEN {
                 match r.queued.pop_front() {
-                    Some((c, _)) if r.waiting.contains_key(&c.id) => out.push(c),
+                    Some((c, _)) if r.waiting.contains_key(&c.id) => {
+                        r.taken.insert(c.id);
+                        out.push(c);
+                    }
                     Some(_) => {}
                     None => break,
                 }
@@ -217,14 +239,23 @@ pub fn merge_overview(
             Ok(a) if a.status == ServedStatus::Ok => json!({
                 "machine": machine,
                 "sessions": super::watcher::reported(
-                    &a.body.get("sessions").map_or_else(String::new, Value::to_string),
+                    &sees::capped(
+                        &a.body.get("sessions").map_or_else(String::new, Value::to_string),
+                        sees::MAX_CHARS,
+                    ),
                     &format!("{machine}'s sessions"),
                 ),
                 "ids": format!("Name them as {machine}/<id>."),
             }),
             Ok(a) => json!({
                 "machine": machine,
-                "not_read": a.body.get("error").cloned().unwrap_or(Value::Null),
+                "not_read": super::watcher::reported(
+                    &sees::capped(
+                        &a.body.get("error").map_or_else(String::new, Value::to_string),
+                        2000,
+                    ),
+                    &format!("{machine}'s answer"),
+                ),
             }),
             Err(why) => json!({ "machine": machine, "not_read": why }),
         })
@@ -335,6 +366,10 @@ struct Relayed {
     boss: String,
     link_id: String,
     id: String,
+    /// The boss's own level and switches at its home.
+    level: String,
+    #[serde(default)]
+    act: Value,
 }
 
 /// On the machine: a boss's call relayed from the home, decided under the
@@ -350,10 +385,22 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
         Ok(b @ BossRef::Local { .. }) => b,
         _ => return bad("only a boss on the home's own hub is relayed"),
     };
-    // Its link and its id, always: one sent again is never done twice.
-    if r.link_id.trim().is_empty() || r.id.trim().is_empty() || r.id.len() > 100 {
-        return bad("a relayed call needs its link and its id");
+    // On the home's relay link, with its id, always: one sent again is
+    // never done twice.
+    if r.link_id != RELAY_LINK || r.id.trim().is_empty() || r.id.len() > 100 {
+        return bad("a relayed call needs the home's link and its id");
     }
+    use workforce_common::oversight::Level;
+    let level = match r.level.as_str() {
+        "watch" => Some(Level::Watch),
+        "suggest" => Some(Level::Suggest),
+        "act" => Some(Level::Act),
+        "full" => Some(Level::Full),
+        _ => None,
+    };
+    let Some(level) = level else {
+        return bad("a relayed call says its boss's level");
+    };
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
@@ -364,8 +411,12 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
                 tool: r.tool,
                 input: r.input,
                 boss,
-                link_id: Some(r.link_id),
+                link_id: Some(RELAY_LINK.to_string()),
                 call_id: Some(r.id),
+                ceiling: Some(super::served::Ceiling {
+                    level,
+                    act: super::served::act_of(&r.act),
+                }),
             },
             &r.group,
         )

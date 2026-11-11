@@ -257,7 +257,7 @@ impl CrewTool {
                     "slots": { "busy": crew.desk.charges_busy(&boss), "parallel": parallel },
                     "plans": crew.plans_seen(seen).await,
                 });
-                Ok(self.with_machines(crew, &boss, local).await)
+                Ok(self.with_machines(crew, b, &boss, local).await)
             }
             "crew.activity" => {
                 let limit = input["limit"].as_i64().unwrap_or(30).clamp(1, 100);
@@ -469,14 +469,27 @@ impl CrewTool {
 
     /// `local`, the overview of this Mac, with each machine's part of its
     /// group, asked through the relay at once.
-    async fn with_machines(&self, crew: &Arc<CrewHub>, boss: &str, local: Value) -> Value {
+    async fn with_machines(
+        &self,
+        crew: &Arc<CrewHub>,
+        b: &Bound,
+        boss: &str,
+        local: Value,
+    ) -> Value {
         let (Some(g), machines) = (self.group(), self.machines(crew)) else {
             return local;
         };
+        let ceiling = super::served::Ceiling {
+            level: b.oversight.level,
+            act: b.oversight.act,
+        };
+        let ceiling = &ceiling;
         let asks = machines.iter().map(|m| {
             let crew = Arc::clone(crew);
             async move {
-                let part = crew.relay(m, g, "crew.overview", json!({}), boss).await;
+                let part = crew
+                    .relay(m, g, "crew.overview", json!({}), boss, ceiling)
+                    .await;
                 (m.clone(), part)
             }
         });
@@ -512,23 +525,47 @@ impl CrewTool {
         if crew.desk.group_of_member(&item).as_deref() != Some(g) {
             return Some(Err(crew.not_ours(&self.scope)));
         }
+        // What its own level here doesn't let it do, it doesn't ask of a
+        // machine either; the machine decides at no more than it.
+        if self.name != "crew.history"
+            && b.oversight.level == workforce_common::oversight::Level::Watch
+        {
+            return Some(Err(
+                "You only watch the crew: tell the person what you would do instead.".into(),
+            ));
+        }
+        let ceiling = super::served::Ceiling {
+            level: b.oversight.level,
+            act: b.oversight.act,
+        };
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());
         let agent = b.service.agent_id.as_str();
-        Some(match crew.relay(machine, g, self.name, sent, agent).await {
-            Ok(a) => {
-                let said = reported(&a.body.to_string(), &format!("{machine}'s answer"));
-                match a.status {
-                    super::served::ServedStatus::Refused => Err(said),
-                    super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
-                    super::served::ServedStatus::Suggested => Ok(json!({
-                        "suggested": said,
-                        "note": format!("Not done: {machine} keeps it for the person to decide."),
-                    })),
+        Some(
+            match crew
+                .relay(machine, g, self.name, sent, agent, &ceiling)
+                .await
+            {
+                Ok(a) => {
+                    let said = reported(
+                        &workforce_desk::sees::capped(
+                            &a.body.to_string(),
+                            workforce_desk::sees::MAX_CHARS,
+                        ),
+                        &format!("{machine}'s answer"),
+                    );
+                    match a.status {
+                        super::served::ServedStatus::Refused => Err(said),
+                        super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
+                        super::served::ServedStatus::Suggested => Ok(json!({
+                            "suggested": said,
+                            "note": format!("Not done: {machine} keeps it for the person to decide."),
+                        })),
+                    }
                 }
-            }
-            Err(why) => Err(why),
-        })
+                Err(why) => Err(why),
+            },
+        )
     }
 }
 
