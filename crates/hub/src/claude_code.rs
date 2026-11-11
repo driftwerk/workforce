@@ -3222,6 +3222,16 @@ pub fn extract_json_array(text: &str) -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn only_an_absolute_claude_path_replaces_the_one_found_on_path() {
+        assert!(
+            !super::use_program_named("claude"),
+            "a bare name is left to PATH"
+        );
+        assert!(!super::use_program_named("  "));
+        assert!(!super::use_program_named("bin/claude"));
+    }
+
     use super::*;
 
     tokio::task_local! {
