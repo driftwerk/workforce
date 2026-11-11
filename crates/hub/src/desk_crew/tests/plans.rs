@@ -53,7 +53,10 @@ async fn hub_with(
     (overseer, state, d, llm)
 }
 
-const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n";
+/// Act, with `hand_out_work` off: what a plan the person approved starts
+/// runs whatever it says.
+const ACTS: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n";
 
 fn tickets(dir: &Path, n: usize) -> Vec<Value> {
     (1..=n)
@@ -101,7 +104,7 @@ fn started(d: &Desk) -> Vec<workforce_desk::model::SessionView> {
 async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        // `hand_out_work` is off, as it is by default.
+        // `hand_out_work` is off.
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
         let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         eventually("the plan tools", async || {
@@ -523,7 +526,7 @@ async fn the_approval_counts_only_for_a_running_plan_of_the_bosss_own_and_where_
         let (_overseer, state, d, _llm) = hub_with(
             dir.path(),
             pool,
-            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n[oversight.work]\nparallel = 1\n",
         )
         .await;
         let p = proposed(&d, dir.path(), 2).await;
@@ -707,7 +710,7 @@ async fn the_boss_is_told_in_plain_words_when_the_person_turns_its_change_down()
         let (_overseer, state, d, llm) = hub_with(
             dir.path(),
             pool,
-            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n[oversight.work]\nparallel = 1\n",
         )
         .await;
         let p = proposed(&d, dir.path(), 1).await;

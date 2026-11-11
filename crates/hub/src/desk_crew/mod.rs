@@ -168,6 +168,17 @@ pub(crate) fn for_service(service: &AgentService) -> Option<Arc<CrewHub>> {
     })
 }
 
+/// What a turn of `service`'s in its Desk DM is told of how much it may do
+/// on its own, when it oversees the crew: its level now and the switches
+/// that are off. `None` for an agent that doesn't oversee.
+pub(crate) fn dm_oversight_hint(service: &AgentService) -> Option<String> {
+    let crew = for_service(service)?;
+    let (service, o) = crew.overseer_named(service.agent_id.as_str())?;
+    let (level, _) = crew.level_now(service.agent_id.as_str(), &o);
+    let unbound = o.level != Level::Watch && crew.unbound_given(&service, &o);
+    Some(CrewHub::dm_hint(level, &o, unbound))
+}
+
 /// Puts what `service`'s own check-in found into its Desk DM, when Desk
 /// is on for its hub. Whether it was delivered.
 pub(crate) async fn heartbeat_found(service: &Arc<AgentService>, found: &str) -> bool {
