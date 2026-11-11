@@ -646,7 +646,7 @@ impl CrewHub {
             }
         }
         let by = By::manager(boss, &boss_name(g), reason);
-        match self.gate_as(&action, o, Some(boss)) {
+        match self.gate_as(&action, o, Some(boss), true) {
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }
