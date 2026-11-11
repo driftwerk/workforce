@@ -67,6 +67,7 @@ async fn a_real_delete_answers_202_and_its_record_is_read_until_it_ends() {
         defs: None,
         artifacts: None,
         pictures: None,
+        desk_activity: None,
         external_skills: Arc::clone(&state.external_skills),
         data_dir: data.path().to_path_buf(),
         runs: Runs::default(),
