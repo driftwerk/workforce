@@ -15,6 +15,16 @@ use super::client::LinearClient;
 
 use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
 
+/// A description that arrives as one line with its newlines written out
+/// (`\n` as two characters, as a model sometimes sends them) is turned
+/// into real line breaks; text with real ones is left alone.
+fn unescape_newlines(text: &str) -> String {
+    if text.contains('\n') || !text.contains("\\n") {
+        return text.to_string();
+    }
+    text.replace("\\r\\n", "\n").replace("\\n", "\n")
+}
+
 /// Wrap the `description` field of a Linear issue/comment JSON value with security markers.
 fn wrap_description_field(value: &Value, source: &str) -> Value {
     let mut v = value.clone();
@@ -850,7 +860,7 @@ impl Tool for LinearIssueCreateTool {
         });
 
         if let Some(desc) = input["description"].as_str() {
-            issue_input["description"] = serde_json::json!(desc);
+            issue_input["description"] = serde_json::json!(unescape_newlines(desc));
         }
         if let Some(state_id) = input["state_id"].as_str() {
             issue_input["stateId"] = serde_json::json!(state_id);
@@ -1077,7 +1087,10 @@ impl Tool for LinearIssueUpdateTool {
             update_input.insert("title".to_string(), serde_json::json!(title));
         }
         if let Some(desc) = input["description"].as_str() {
-            update_input.insert("description".to_string(), serde_json::json!(desc));
+            update_input.insert(
+                "description".to_string(),
+                serde_json::json!(unescape_newlines(desc)),
+            );
         }
         if let Some(state_id) = input["state_id"].as_str() {
             update_input.insert("stateId".to_string(), serde_json::json!(state_id));
@@ -3927,6 +3940,15 @@ impl Tool for LinearIssueChildrenTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_description_with_newlines_written_out_gets_real_ones() {
+        assert_eq!(
+            unescape_newlines("**A:**\\nb\\n\\n* [ ] c"),
+            "**A:**\nb\n\n* [ ] c"
+        );
+        assert_eq!(unescape_newlines("a\nb \\n c"), "a\nb \\n c");
+    }
 
     fn fixture() -> (HashMap<String, Arc<LinearClient>>, HashMap<String, String>) {
         let clients = ["main", "staging"]

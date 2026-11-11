@@ -698,11 +698,31 @@ pub fn unfence(text: &str) -> (String, bool) {
     (out.join("\n").trim().to_string(), flagged)
 }
 
-/// HTML (Jira's rendered description) as plain text.
+/// Whether `text` is one run of words with `\n` written out in it (a
+/// description an agent sent to Linear with its newlines escaped twice):
+/// no real line break, and a literal backslash-n.
+pub fn has_escaped_newlines(text: &str) -> bool {
+    !text.contains('\n') && text.contains("\\n")
+}
+
+/// `text` with the newlines written out in it made real, when it has no
+/// real ones of its own; any other text as it is.
+pub fn unescape_newlines(text: &str) -> String {
+    match has_escaped_newlines(text) {
+        true => text.replace("\\r\\n", "\n").replace("\\n", "\n"),
+        false => text.to_string(),
+    }
+}
+
+/// HTML (Jira's rendered description) as markdown the board shows safely:
+/// headings, bullets, bold, italics and code keep their marks, every other
+/// tag goes, and what a script or style held goes with it.
 pub fn html_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut tag = String::new();
     let mut in_tag = false;
+    // Inside a `script` or `style`: nothing is kept until it closes.
+    let mut skipping: Option<String> = None;
     for c in html.chars() {
         match (in_tag, c) {
             (false, '<') => {
@@ -711,22 +731,50 @@ pub fn html_text(html: &str) -> String {
             }
             (true, '>') => {
                 in_tag = false;
+                let closing = tag.starts_with('/');
                 let name = tag
                     .trim_start_matches('/')
                     .split(|c: char| c.is_whitespace() || c == '/')
                     .next()
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if matches!(
-                    name.as_str(),
-                    "br" | "p" | "li" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "pre"
-                ) && !out.ends_with('\n')
-                {
-                    out.push('\n');
+                if let Some(open) = &skipping {
+                    if closing && *open == name {
+                        skipping = None;
+                    }
+                    continue;
+                }
+                if !closing && matches!(name.as_str(), "script" | "style") {
+                    skipping = Some(name);
+                    continue;
+                }
+                let line = |out: &mut String| {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                };
+                match (closing, name.as_str()) {
+                    (false, "h1" | "h2" | "h3" | "h4") => {
+                        line(&mut out);
+                        out.push_str(&"#".repeat(usize::from(name.as_bytes()[1] - b'0')));
+                        out.push(' ');
+                    }
+                    (false, "li") => {
+                        line(&mut out);
+                        out.push_str("* ");
+                    }
+                    (_, "strong" | "b") => out.push_str("**"),
+                    (_, "em" | "i") => out.push('*'),
+                    (_, "code") => out.push('`'),
+                    (_, "br" | "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "pre" | "li") => {
+                        line(&mut out)
+                    }
+                    _ => {}
                 }
             }
             (true, c) => tag.push(c),
-            (false, c) => out.push(c),
+            (false, c) if skipping.is_none() => out.push(c),
+            (false, _) => {}
         }
     }
     let out = out
@@ -836,7 +884,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let key = parse_issue_key(i.get("identifier")?.as_str()?)?;
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
-    let (body, clipped) = held_body(body);
+    let (body, clipped) = held_body(unescape_newlines(&body));
     let blocked_by = i.get("relations").map(|r| {
         r.get("nodes")
             .and_then(Value::as_array)
@@ -984,7 +1032,15 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
         return Pulled::default();
     };
     if issue.updated_at <= e.remote_updated_at {
-        return Pulled::default();
+        // Unchanged there, but the description held here still has its
+        // newlines written out: it is read again, once.
+        return Pulled {
+            body: issue
+                .body
+                .clone()
+                .filter(|b| has_escaped_newlines(&t.body) && e.seen.body == t.body && *b != t.body),
+            ..Pulled::default()
+        };
     }
     let state = issue.column(states);
     Pulled {

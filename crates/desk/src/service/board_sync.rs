@@ -934,7 +934,10 @@ impl Desk {
             if t.board != b.id || e.link != s.link || e.kept {
                 return Ok(());
             }
-            if issue.updated_at <= e.remote_updated_at && e.synced {
+            if issue.updated_at <= e.remote_updated_at
+                && e.synced
+                && !crate::board_sync::has_escaped_newlines(&t.body)
+            {
                 return self.refresh_assignee(t.clone(), issue).await.map_err(fail);
             }
         }
