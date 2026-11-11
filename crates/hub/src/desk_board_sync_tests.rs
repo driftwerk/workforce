@@ -263,6 +263,7 @@ pub(crate) async fn remote_hub(
             ..Default::default()
         },
         desk_boss: Default::default(),
+        uplinks: Default::default(),
         ..state
     });
     let fx = crate::remote_mcp::testing::Fixture {

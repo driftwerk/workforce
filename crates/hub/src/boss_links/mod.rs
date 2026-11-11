@@ -29,6 +29,7 @@
 pub mod auth;
 pub mod engine_key;
 pub mod links;
+pub mod uplink;
 
 #[cfg(test)]
 mod tests;
