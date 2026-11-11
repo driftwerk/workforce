@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::extract::Form;
@@ -86,6 +87,8 @@ impl Statuses for Kept {
 struct Crew {
     agents: Mutex<Vec<Agent>>,
     reloads: Mutex<Vec<(String, String)>>,
+    /// Each agent's `config.toml`, as the hub's write keeps it.
+    configs: Mutex<HashMap<String, String>>,
 }
 
 #[async_trait]
@@ -99,6 +102,27 @@ impl Agents for Crew {
             .lock()
             .unwrap()
             .push((agent.to_string(), connector.to_string()));
+    }
+    async fn choose(
+        &self,
+        agent: &str,
+        person: &str,
+        choice: &picks::Choice,
+    ) -> Result<(), String> {
+        assert_eq!(person, SARAH);
+        let body = self
+            .configs
+            .lock()
+            .unwrap()
+            .get(agent)
+            .cloned()
+            .unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = body.parse().map_err(|e| format!("{e}"))?;
+        choice.apply(&mut doc)?;
+        let body = doc.to_string();
+        self.bind(agent, Binding::parse(&body));
+        self.configs.lock().unwrap().insert(agent.into(), body);
+        Ok(())
     }
 }
 
@@ -634,6 +658,7 @@ async fn used_by_follows_each_agents_skills() {
         Binding {
             enabled: Some(vec![]),
             own: vec![],
+            ..Default::default()
         },
     );
     h.crew.bind(
@@ -641,6 +666,7 @@ async fn used_by_follows_each_agents_skills() {
         Binding {
             enabled: Some(vec!["linear".into()]),
             own: vec!["linear".into()],
+            ..Default::default()
         },
     );
     let list = h.c.list(SARAH).await;
@@ -651,6 +677,7 @@ async fn used_by_follows_each_agents_skills() {
         Binding {
             enabled: Some(vec!["linear".into()]),
             own: vec![],
+            ..Default::default()
         },
     );
     let list = h.c.list(SARAH).await;
@@ -679,6 +706,7 @@ fn a_binding_is_read_from_the_agents_config() {
         Binding {
             enabled: Some(vec!["linear".into()]),
             own: vec!["linear".into()],
+            ..Default::default()
         }
     );
 }
@@ -1479,4 +1507,207 @@ fn the_other_adapters_are_every_built_in_one_the_catalog_leaves_out() {
         others.len() + catalog::CATALOG.len(),
         crate::skill_loader::builtin_skill_catalog().len()
     );
+}
+
+#[tokio::test]
+async fn an_agent_uses_the_connections_it_is_given_one_by_one() {
+    let h = hub().await;
+    let acme = h.connect(Some("Acme"), "all", None, GOOD).await.unwrap();
+    let globex = h.connect(Some("Globex"), "all", None, GOOD2).await.unwrap();
+    let bens = h
+        .connect(Some("Initech"), "agent", Some("ben"), GOOD)
+        .await
+        .unwrap();
+    let services = h.c.agent_picks(SARAH, "allan").await.unwrap();
+    let linear = services.iter().find(|s| s.id == "linear").unwrap();
+    // Before anything is chosen: what reaches it today. Ben's own isn't
+    // Allan's to use.
+    assert!(!linear.chosen && linear.read_only_each);
+    assert_eq!(
+        linear
+            .connections
+            .iter()
+            .map(|p| (p.name.as_str(), p.picked, p.write, p.default))
+            .collect::<Vec<_>>(),
+        [("Acme", true, true, true), ("Globex", true, true, false)]
+    );
+
+    let services =
+        h.c.set_picks(
+            SARAH,
+            "allan",
+            picks::PicksBody {
+                service: "linear".into(),
+                connections: vec![
+                    picks::Use {
+                        id: acme.id.clone(),
+                        write: false,
+                    },
+                    picks::Use {
+                        id: globex.id.clone(),
+                        write: true,
+                    },
+                ],
+                default: Some(globex.id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let linear = services.iter().find(|s| s.id == "linear").unwrap();
+    assert!(linear.chosen);
+    assert_eq!(
+        linear
+            .connections
+            .iter()
+            .map(|p| (p.name.as_str(), p.picked, p.write, p.default))
+            .collect::<Vec<_>>(),
+        [("Acme", true, false, false), ("Globex", true, true, true)]
+    );
+    let config = h.crew.configs.lock().unwrap()["allan"].clone();
+    assert!(
+        config.contains("linear = [\"globex-2\", \"default\"]")
+            || config.contains("linear = [\"globex\", \"default\"]"),
+        "{config}"
+    );
+    assert!(config.contains("linear:default"), "{config}");
+    // Every other connector stays on.
+    assert!(config.contains("\"github\""), "{config}");
+
+    // Used by follows it.
+    let list = h.c.list(SARAH).await;
+    let users: Vec<Vec<&str>> = connector(&list, "linear")
+        .connections
+        .iter()
+        .map(|c| c.used_by.iter().map(|u| u.agent.as_str()).collect())
+        .collect();
+    assert_eq!(
+        users,
+        [vec!["allan", "ben"], vec!["allan", "ben"], vec!["ben"]]
+    );
+
+    // Another agent's own, a default it doesn't use, and one gone are refused.
+    for (connections, default, want) in [
+        (vec![bens.id.clone()], None, "another agent's own"),
+        (
+            vec![acme.id.clone()],
+            Some(globex.id.clone()),
+            "one of the connections",
+        ),
+        (vec!["all~~gone".to_string()], None, "isn't there any more"),
+    ] {
+        let e =
+            h.c.set_picks(
+                SARAH,
+                "allan",
+                picks::PicksBody {
+                    service: "linear".into(),
+                    connections: connections
+                        .into_iter()
+                        .map(|id| picks::Use { id, write: true })
+                        .collect(),
+                    default,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{e:?}").contains(want), "{e:?}");
+    }
+
+    // A connection disconnected is no longer named.
+    h.c.disconnect(SARAH, "linear", &globex.id).await.unwrap();
+    let config = h.crew.configs.lock().unwrap()["allan"].clone();
+    assert!(config.contains("linear = [\"default\"]"), "{config}");
+}
+
+/// The tools of an agent reach exactly the connections it uses: its
+/// adapter builds only those, a write to one that only reads is refused
+/// wherever the instance is resolved, and an environment can't reach past
+/// them.
+#[test]
+fn an_agents_tools_reach_exactly_its_connections() {
+    use workforce_agent::runner::{ACTIVE_ENVIRONMENT, ACTIVE_SKILL_INSTANCES, CURRENT_USER_ID};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Arc::new(Vault::open(&dir.path().join("agent"), "test-key").unwrap());
+    let global = Arc::new(Vault::open(&dir.path().join("global"), "test-key").unwrap());
+    for (key, value) in [("acme", GOOD), ("globex", GOOD2), ("initech", GOOD)] {
+        global.set(&mine(&ws(key, "api_key")), value).unwrap();
+        global
+            .set(&mine(&ws(key, "label")), &key.to_uppercase())
+            .unwrap();
+    }
+    let workspace = dir.path().join("allan");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join(workforce_common::config_files::WORKSPACE_CONFIG),
+        "[skills]\nenabled = [\"linear\"]\nread_only = [\"linear:globex\"]\n\n[skills.connections]\nlinear = [\"acme\", \"globex\"]\n",
+    )
+    .unwrap();
+    let config = workforce_common::settings::WorkforceConfig::default();
+    let tools = workforce_agent::tools::registry::ToolRegistry::new();
+    tools
+        .credential_pins()
+        .fill(Arc::new(crate::connector_pins::AgentPins::new(workspace)));
+    let loaded = CURRENT_USER_ID
+        .sync_scope(SARAH.to_string(), || {
+            crate::skill_loader::load_skill_from_vault(
+                "linear",
+                Arc::clone(&agent),
+                Some(Arc::clone(&global)),
+                &config,
+                &tools,
+            )
+        })
+        .unwrap();
+    let hint = loaded.context_hint.unwrap();
+    assert!(hint.contains("\"acme\" is ACME (default)"), "{hint}");
+    assert!(hint.contains("\"globex\" is GLOBEX (read only)"), "{hint}");
+    assert!(!hint.contains("INITECH"), "{hint}");
+    assert!(hint.contains("ask"), "{hint}");
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let call = |tool: &str, input: serde_json::Value| {
+        let t = tools.get(tool).unwrap();
+        runtime.block_on(CURRENT_USER_ID.scope(SARAH.to_string(), async move {
+            let r = t.execute(input).await;
+            match r {
+                Ok(r) => format!("{:?} {:?}", r.output, r.error),
+                Err(e) => format!("{e:#}"),
+            }
+        }))
+    };
+    // One it doesn't use isn't there to reach.
+    let said = call("linear.issue_get", json!({ "workspace": "initech" }));
+    assert!(
+        said.contains("initech") && said.contains("Unknown"),
+        "{said}"
+    );
+    // A write to one that only reads is refused, by name or by default.
+    let said = call("linear.issue_create", json!({ "workspace": "globex" }));
+    assert!(said.contains("only reads"), "{said}");
+    // Acme takes it, and goes on to ask for its title, with no call made.
+    let said = call("linear.issue_create", json!({}));
+    assert!(
+        said.contains("title") && !said.contains("only reads"),
+        "{said}"
+    );
+    // A read of the one that only reads goes ahead.
+    let said = call("linear.issue_get", json!({ "workspace": "globex" }));
+    assert!(!said.contains("only reads"), "{said}");
+    // An environment can only narrow it: one pointing past it is refused.
+    let pins: workforce_agent::llm::environment::SkillPins =
+        [("linear".to_string(), vec!["initech".to_string()])].into();
+    let t = tools.get("linear.issue_get").unwrap();
+    let said = runtime.block_on(CURRENT_USER_ID.scope(
+        SARAH.to_string(),
+        ACTIVE_ENVIRONMENT.scope(
+            "work".to_string(),
+            ACTIVE_SKILL_INSTANCES.scope(pins, async move {
+                match t.execute(json!({})).await {
+                    Ok(r) => format!("{:?} {:?}", r.output, r.error),
+                    Err(e) => format!("{e:#}"),
+                }
+            }),
+        ),
+    ));
+    assert!(said.contains("not configured"), "{said}");
 }

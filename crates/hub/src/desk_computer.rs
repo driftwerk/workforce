@@ -225,17 +225,23 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
         }),
         _ => return None,
     };
-    if binding.enabled.is_none() && binding.read_only.is_empty() {
+    if binding.enabled.is_none() && binding.read_only.is_empty() && binding.connections.is_empty() {
         return None;
     }
+    // A connector it uses no connection of is off; one connection that only
+    // reads is refused where the adapter resolves it, not here.
     Some(workforce_desk::computer::Connectors {
-        enabled: binding.enabled.unwrap_or_else(|| {
-            workforce_common::connector_binding::CONNECTORS
-                .iter()
-                .map(|c| c.to_string())
-                .collect()
-        }),
-        read_only: binding.read_only,
+        enabled: workforce_common::connector_binding::CONNECTORS
+            .iter()
+            .filter(|c| binding.is_on(c))
+            .map(|c| c.to_string())
+            .collect(),
+        read_only: binding
+            .read_only
+            .iter()
+            .filter(|r| !r.contains(':'))
+            .cloned()
+            .collect(),
     })
 }
 

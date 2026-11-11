@@ -43,6 +43,15 @@ impl TierPin {
 /// Decides the pin of a logical vault path for one agent.
 pub trait PinSource: Send + Sync {
     fn pin(&self, path: &str) -> TierPin;
+    /// The instance of `connector` a call naming none gets, where the agent
+    /// names one.
+    fn default_instance(&self, _connector: &str) -> Option<String> {
+        None
+    }
+    /// Whether instance `instance` of `connector` only reads for the agent.
+    fn read_only_instance(&self, _connector: &str, _instance: &str) -> bool {
+        false
+    }
 }
 
 /// Where an agent's [`PinSource`] is put once its hub knows it runs Desk.
@@ -62,6 +71,50 @@ impl PinSlot {
     pub fn is_filled(&self) -> bool {
         self.0.read().is_some()
     }
+
+    /// [`PinSource::default_instance`]: none while the slot is empty.
+    pub fn default_instance(&self, connector: &str) -> Option<String> {
+        self.0
+            .read()
+            .as_ref()
+            .and_then(|s| s.default_instance(connector))
+    }
+
+    /// [`PinSource::read_only_instance`]: none while the slot is empty.
+    pub fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+        self.0
+            .read()
+            .as_ref()
+            .is_some_and(|s| s.read_only_instance(connector, instance))
+    }
+}
+
+/// A connector's write tool running for one agent: the instance its
+/// adapter resolves is checked against the agent's read-only connections
+/// ([`write_refused`]).
+#[derive(Clone)]
+pub struct Writing {
+    pub connector: String,
+    pub pins: Arc<PinSlot>,
+}
+
+tokio::task_local! {
+    static WRITING: Writing;
+}
+
+impl Writing {
+    /// Runs `fut` as this write.
+    pub async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        WRITING.scope(self, fut).await
+    }
+}
+
+/// Whether the call in scope is a write of `connector`'s to an instance
+/// that only reads for its agent.
+pub fn write_refused(connector: &str, instance: &str) -> bool {
+    WRITING
+        .try_with(|w| w.connector == connector && w.pins.read_only_instance(connector, instance))
+        .unwrap_or(false)
 }
 
 impl std::fmt::Debug for PinSlot {
@@ -75,6 +128,39 @@ impl std::fmt::Debug for PinSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Globex;
+    impl PinSource for Globex {
+        fn pin(&self, _: &str) -> TierPin {
+            TierPin::All
+        }
+        fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+            (connector, instance) == ("jira", "globex")
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_write_to_a_read_only_connection_is_refused() {
+        let pins = Arc::new(PinSlot::default());
+        assert!(
+            !pins.read_only_instance("jira", "globex"),
+            "an empty slot pins nothing"
+        );
+        pins.fill(Arc::new(Globex));
+        // Outside a write, nothing is refused.
+        assert!(!write_refused("jira", "globex"));
+        let writing = Writing {
+            connector: "jira".into(),
+            pins: Arc::clone(&pins),
+        };
+        writing
+            .scope(async {
+                assert!(write_refused("jira", "globex"));
+                assert!(!write_refused("jira", "acme"));
+                assert!(!write_refused("linear", "globex"));
+            })
+            .await;
+    }
 
     #[test]
     fn each_pin_admits_its_tiers() {

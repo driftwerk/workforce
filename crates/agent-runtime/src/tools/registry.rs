@@ -29,6 +29,99 @@ pub struct ToolRegistry {
     guard: RwLock<Option<Guard>>,
 }
 
+/// A connector's write tool, run in its connector's write scope
+/// ([`workforce_common::credential_pin::Writing`]): where its adapter
+/// resolves the instance, one the agent only reads is refused. Every other
+/// tool is registered as it is.
+pub struct ConnectionWrite {
+    inner: Arc<dyn Tool>,
+    connector: &'static str,
+    pins: Arc<workforce_common::credential_pin::PinSlot>,
+}
+
+impl ConnectionWrite {
+    pub fn wrap(
+        tool: Arc<dyn Tool>,
+        pins: &Arc<workforce_common::credential_pin::PinSlot>,
+    ) -> Arc<dyn Tool> {
+        use workforce_common::connector_binding::{connector_of, is_read};
+        let name = tool.name().to_string();
+        match connector_of(&name).filter(|_| !is_read(&name)) {
+            Some(connector) => Arc::new(Self {
+                inner: tool,
+                connector,
+                pins: Arc::clone(pins),
+            }),
+            None => tool,
+        }
+    }
+
+    fn writing(&self) -> workforce_common::credential_pin::Writing {
+        workforce_common::credential_pin::Writing {
+            connector: self.connector.to_string(),
+            pins: Arc::clone(&self.pins),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ConnectionWrite {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner.input_schema()
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> eyre::Result<super::ToolResult> {
+        self.writing().scope(self.inner.execute(input)).await
+    }
+
+    fn soft_deadline(&self) -> Option<std::time::Duration> {
+        self.inner.soft_deadline()
+    }
+
+    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(input)
+    }
+
+    fn approval_requirement(&self) -> Option<String> {
+        self.inner.approval_requirement()
+    }
+
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<super::SurfaceEffect> {
+        self.inner.surface_effect(input)
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        self.inner.effect(input)
+    }
+
+    async fn collect(
+        &self,
+        input: serde_json::Value,
+        plan: serde_json::Value,
+        checkpoint: Option<String>,
+    ) -> eyre::Result<super::ToolResult> {
+        self.writing()
+            .scope(self.inner.collect(input, plan, checkpoint))
+            .await
+    }
+
+    async fn abandon(&self, plan: serde_json::Value, checkpoint: Option<String>) {
+        self.inner.abandon(plan, checkpoint).await
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.inner.definition()
+    }
+}
+
 /// A wrapper every tool a registry holds runs through, such as one that
 /// refuses a call its agent may not make now.
 pub type Guard = Arc<dyn Fn(Arc<dyn Tool>) -> Arc<dyn Tool> + Send + Sync>;
@@ -86,8 +179,11 @@ impl ToolRegistry {
         Arc::clone(&self.credential_pins)
     }
 
-    /// Register a tool.
+    /// Register a tool. A connector's write tool runs as a write of its
+    /// connector's ([`ConnectionWrite`]), so a connection that only reads
+    /// for this agent is refused where its adapter resolves it.
     pub fn register(&self, tool: Arc<dyn Tool>) {
+        let tool = ConnectionWrite::wrap(tool, &self.credential_pins);
         let tool = match self.guard.read().as_ref() {
             Some(guard) => guard(tool),
             None => tool,

@@ -558,7 +558,7 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
             return Vec::new();
         }
         let user_prefix = current_identity_id().map(|uid| format!("{USER_PREFIX}{uid}/"));
-        match tier {
+        let mut listed = match tier {
             VaultSource::AgentPerUser => {
                 Self::list_user_scoped(self.agent_vault.as_ref(), user_prefix.as_deref(), prefix)
             }
@@ -574,7 +574,11 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
                 .map(|g| Self::list_bare(g, prefix))
                 .unwrap_or_default(),
             VaultSource::Unknown => Vec::new(),
-        }
+        };
+        // A listing open to the tier may hold paths pinned shut: one
+        // connection of a connector the agent doesn't use.
+        listed.retain(|(path, _)| self.pin(path).admits(tier));
+        listed
     }
 
     fn set_many(&self, entries: &[(&str, &str)], actor: VaultActor<'_>) -> eyre::Result<()> {

@@ -76,13 +76,18 @@ pub struct Agent {
 }
 
 /// An agent's `[skills]` as "Used by" reads it: which connectors are on,
-/// and which use its own connection. AC9a's grammar, read raw here so the
-/// listing follows it on any hub version.
+/// which use its own connection, and the connections it names. AC9a's
+/// grammar, read raw here so the listing follows it on any hub version.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Binding {
     /// `None`: every connector, as before the key existed.
     pub enabled: Option<Vec<String>>,
     pub own: Vec<String>,
+    /// Connectors, and single connections (`jira:globex`), that only read.
+    pub read_only: Vec<String>,
+    /// `[skills.connections]`: per connector, the instances it uses, the
+    /// first its default.
+    pub connections: BTreeMap<String, Vec<String>>,
 }
 
 impl Binding {
@@ -92,23 +97,22 @@ impl Binding {
             workspace.join(workforce_common::config_files::WORKSPACE_CONFIG),
         )
         .unwrap_or_default();
+        Self::parse(&body)
+    }
+
+    /// `[skills]` of a `config.toml` body; none where it doesn't parse.
+    pub fn parse(body: &str) -> Self {
         let Ok(doc) = body.parse::<toml::Table>() else {
             return Self::default();
         };
-        let skills = doc.get("skills").and_then(toml::Value::as_table);
-        let names = |key: &str| {
-            skills
-                .and_then(|t| t.get(key))
-                .and_then(toml::Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-        };
-        Self {
-            enabled: names("enabled"),
-            own: names("own_credential").unwrap_or_default(),
+        match workforce_common::connector_binding::of(doc.get("skills")) {
+            Ok(b) => Self {
+                enabled: b.enabled,
+                own: b.own_credential,
+                read_only: b.read_only,
+                connections: b.connections,
+            },
+            Err(_) => Self::default(),
         }
     }
 
@@ -116,20 +120,42 @@ impl Binding {
         self.enabled
             .as_ref()
             .is_none_or(|e| e.iter().any(|c| c == connector))
+            && self
+                .connections
+                .get(connector)
+                .is_none_or(|p| !p.is_empty())
     }
 
-    /// Whether the agent `agent` with this binding reaches `connector`'s
-    /// connections kept at `level`, by the tiers its pin admits: none when
-    /// the connector is off; only its own when it uses its own connection;
-    /// only the person's when it names `enabled` and uses theirs; both when
-    /// it names neither, as before the keys existed.
-    fn reaches(&self, agent: &str, connector: &str, level: &Level) -> bool {
+    /// The instances of `connector` it names, the first its default.
+    pub fn picks(&self, connector: &str) -> Option<&[String]> {
+        self.connections.get(connector).map(Vec::as_slice)
+    }
+
+    /// Whether instance `key` of `connector` only reads for it.
+    pub fn reads_only(&self, connector: &str, key: &str) -> bool {
+        self.read_only
+            .iter()
+            .any(|r| r == connector || r.split_once(':') == Some((connector, key)))
+    }
+
+    /// Whether the agent `agent` with this binding reaches instance `key`
+    /// of `connector`, kept at `level`: one it names, when it names them;
+    /// otherwise by the tiers its pin admits: none when the connector is
+    /// off; only its own when it uses its own connection; only the
+    /// person's when it names `enabled` and uses theirs; both when it
+    /// names neither, as before the keys existed.
+    fn reaches(&self, agent: &str, connector: &str, level: &Level, key: &str) -> bool {
         if !self.is_on(connector) {
             return false;
         }
+        if matches!(level, Level::Agent(a) if a != agent) {
+            return false;
+        }
+        if let Some(picks) = self.picks(connector) {
+            return picks.iter().any(|p| p == key);
+        }
         let own = self.own.iter().any(|o| o == connector);
         match level {
-            Level::Agent(a) if a != agent => false,
             Level::Agent(_) => own || self.enabled.is_none(),
             Level::All => !own,
         }
@@ -147,6 +173,17 @@ pub trait Agents: Send + Sync {
     /// copied its keys when it loaded (Email) or holds them in memory
     /// (Slack) uses what is kept now.
     async fn reload(&self, _agent: &str, _connector: &str, _person: &str) {}
+    /// Makes `agent` use the connections `choice` names, in its `[skills]`,
+    /// through the hub's one write of its `config.toml`, as `person`. What
+    /// is wrong, in words.
+    async fn choose(
+        &self,
+        _agent: &str,
+        _person: &str,
+        _choice: &picks::Choice,
+    ) -> Result<(), String> {
+        Err("Desk can't change this agent's connections here.".into())
+    }
 }
 
 /// Where what a check found is kept.
@@ -681,7 +718,7 @@ impl Connections {
         let account = checked.and_then(|k| k.account.clone());
         let used_by = agents
             .iter()
-            .filter(|a| a.binding.reaches(&a.id, c.id, &conn.level))
+            .filter(|a| a.binding.reaches(&a.id, c.id, &conn.level, &conn.key))
             .map(|a| UsedBy {
                 agent: a.id.clone(),
                 name: a.name.clone(),
@@ -1352,6 +1389,9 @@ impl Connections {
         // A key kept at another tier of this level still connects it: an
         // older one saved for the whole hub, say.
         let still = self.held_at(c, &conn.level, &conn.key, person);
+        if still.is_none() {
+            self.unpick(c, &conn.key, person).await;
+        }
         Ok(Disconnected {
             still_kept: still,
             note: still.map(|tier| match tier {
@@ -1914,6 +1954,18 @@ impl Agents for Registry {
         reload_service(&service, connector, person).await;
     }
 
+    async fn choose(
+        &self,
+        agent: &str,
+        person: &str,
+        choice: &picks::Choice,
+    ) -> Result<(), String> {
+        let Some(service) = self.0.registry.get(agent) else {
+            return Err(format!("There's no agent {agent}"));
+        };
+        choose_for(&service, person, choice).await
+    }
+
     fn all(&self) -> Vec<Agent> {
         let mut agents: Vec<Agent> = self
             .0
@@ -1940,6 +1992,49 @@ impl Agents for Registry {
             binding: Binding::read(&s.workspace),
         })
     }
+}
+
+/// Makes `service` use the connections `choice` names, through the hub's
+/// one write of its `config.toml` (recorded, admitted, hot-applied; the
+/// connector loads again as its binding changes). Tried twice if it changed
+/// meanwhile.
+pub async fn choose_for(
+    service: &crate::serve::AgentService,
+    person: &str,
+    choice: &picks::Choice,
+) -> Result<(), String> {
+    let path = service
+        .workspace
+        .join(workforce_common::config_files::WORKSPACE_CONFIG);
+    let store = crate::serve::shared_workflow_store(&service.config).await;
+    for _ in 0..2 {
+        let read = workforce_common::config_files::read(&path)
+            .map_err(|e| format!("Desk couldn't read the agent's settings: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = read
+            .as_deref()
+            .unwrap_or_default()
+            .parse()
+            .map_err(|_| {
+                "The agent's settings file has a mistake in it, so Desk won't change it. Fix it in Settings → This computer.".to_string()
+            })?;
+        choice.apply(&mut doc)?;
+        let body = doc.to_string();
+        match crate::agent_config_write::save(
+            service,
+            service.agent_id.as_str(),
+            store.as_deref(),
+            &body,
+            workforce_orchestrator::workflow_store::EditContext::new("desk", Some(person)),
+            |now| now == read.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(crate::agent_config_write::Refused::Stale { .. }) => continue,
+            Err(e) => return Err(format!("The agent's connections weren't changed: {e}")),
+        }
+    }
+    Err("The agent's settings kept changing. Try again.".into())
 }
 
 /// Loads `connector` again on `service`, as `person`: Slack reconnects
@@ -2131,6 +2226,9 @@ macro_rules! person {
     };
 }
 
+// After `person!`, which its routes use.
+pub mod picks;
+
 /// Connections' routes over `connections`.
 pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router {
     Router::new()
@@ -2153,6 +2251,10 @@ pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router
         .route(
             "/api/desk/connection-flows/{flow}",
             get(flow).delete(cancel),
+        )
+        .route(
+            "/api/desk/agents/{agent}/connections",
+            get(picks::get_picks).put(picks::put_picks),
         )
         .with_state(Arc::new(Routes { state, connections }))
 }

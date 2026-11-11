@@ -2303,7 +2303,9 @@ pub fn load_skill_from_vault(
     }
     LOADING_PINS.with(|p| *p.borrow_mut() = Some(registry.credential_pins()));
     let _loading = Loading;
-    match skill_name {
+    let names_store = workforce_common::connector_binding::instance_prefix(skill_name)
+        .map(|_| layered_user_store(Arc::clone(&vault), global_vault.clone()));
+    let loaded = match skill_name {
         "github" => load_github_from_vault(vault, global_vault, config, registry),
         "google" => load_google_from_vault(vault, global_vault, registry),
         "linear" => load_linear_from_vault(vault, global_vault, config, registry),
@@ -2321,7 +2323,104 @@ pub fn load_skill_from_vault(
         "obscura" => load_obscura_from_vault(vault, global_vault, config, registry),
         "email" => load_email_from_vault(vault, global_vault, config, registry),
         _ => Err(eyre::eyre!("Unknown built-in skill: {}", skill_name)),
+    };
+    loaded.map(|mut loaded| {
+        if let Some(names) = names_store
+            .as_deref()
+            .and_then(|store| connection_names(skill_name, store))
+        {
+            loaded.context_hint = Some(match loaded.context_hint.take() {
+                Some(hint) => format!("{hint}\n{names}"),
+                None => names,
+            });
+        }
+        loaded
+    })
+}
+
+/// The default instance the loading agent's connections name for
+/// `connector` (`[skills.connections]`), if they name one.
+fn pinned_default(connector: &str) -> Option<String> {
+    LOADING_PINS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .and_then(|slot| slot.default_instance(connector))
+    })
+}
+
+/// The instance a call naming none gets: the one the agent's connections
+/// name first, else the hub-wide selector at `path`.
+fn selector(
+    store: &dyn workforce_common::settings::SecretStore,
+    connector: &str,
+    path: &str,
+) -> Option<String> {
+    pinned_default(connector).or_else(|| shared_get(store, path))
+}
+
+/// What the agent is told of `connector`'s connections it may use: each by
+/// the name the person gave it in Desk, which is its default and which only
+/// read, and, with several, to ask when a request doesn't say and to say
+/// which it used. `None` where none is named.
+fn connection_names(
+    connector: &str,
+    store: &dyn workforce_common::settings::SecretStore,
+) -> Option<String> {
+    let prefix = workforce_common::connector_binding::instance_prefix(connector)?;
+    let mut named: Vec<(String, String)> = store
+        .list(Some(prefix))
+        .into_iter()
+        .filter_map(|path| {
+            let key = path
+                .strip_prefix(prefix)?
+                .strip_suffix("/label")?
+                .to_string();
+            let label: String = store
+                .get(&path)?
+                .chars()
+                .filter(|c| !c.is_control() && *c != '"')
+                .take(80)
+                .collect();
+            Some((key, label.trim().to_string()))
+        })
+        .filter(|(key, label)| !key.contains('/') && !label.is_empty())
+        .collect();
+    named.sort();
+    named.dedup_by(|a, b| a.0 == b.0);
+    if named.is_empty() {
+        return None;
     }
+    let pins = LOADING_PINS.with(|p| p.borrow().clone());
+    let default = pinned_default(connector);
+    let parts: Vec<String> = named
+        .iter()
+        .map(|(key, label)| {
+            let mut notes = Vec::new();
+            if default.as_deref() == Some(key.as_str()) {
+                notes.push("default");
+            }
+            if pins
+                .as_ref()
+                .is_some_and(|p| p.read_only_instance(connector, key))
+            {
+                notes.push("read only");
+            }
+            match notes.is_empty() {
+                true => format!("\"{key}\" is {label}"),
+                false => format!("\"{key}\" is {label} ({})", notes.join(", ")),
+            }
+        })
+        .collect();
+    let mut said = format!(
+        "Your {connector} connections, by the names the person uses for them: {}.",
+        parts.join(", ")
+    );
+    if named.len() > 1 {
+        said.push_str(
+            " When a request doesn't make clear which one it means, ask. When you use one, say which.",
+        );
+    }
+    Some(said)
 }
 
 /// The instance the skill will use when a call names none, by the adapters'
@@ -2362,7 +2461,7 @@ fn github_vault_config(
         })
         .collect();
 
-    let default_workspace = shared_get(store, "skills/github/default_workspace");
+    let default_workspace = selector(store, "github", "skills/github/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2492,7 +2591,8 @@ fn load_google_from_vault(
         }
     }
 
-    let default_ws = vault.get("skills/google/default_workspace");
+    let default_ws =
+        pinned_default("google").or_else(|| vault.get("skills/google/default_workspace"));
 
     // Build GoogleApi per workspace.
     let mut account_apis: std::collections::HashMap<String, Arc<GoogleApi>> =
@@ -2633,7 +2733,7 @@ fn linear_vault_config(
         }
     }
 
-    let default_workspace = shared_get(store, "skills/linear/default_workspace");
+    let default_workspace = selector(store, "linear", "skills/linear/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2804,7 +2904,7 @@ fn jira_vault_config(
         );
     }
 
-    let default_workspace = shared_get(store, "skills/jira/default_workspace");
+    let default_workspace = selector(store, "jira", "skills/jira/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2965,7 +3065,7 @@ fn datadog_vault_config(
         );
     }
 
-    let default_account = shared_get(store, "skills/datadog/default_account");
+    let default_account = selector(store, "datadog", "skills/datadog/default_account");
     let effective_default = effective_default(&accounts, default_account.as_deref());
 
     let context_hint = if !accounts.is_empty() {
@@ -3096,7 +3196,7 @@ fn metabase_vault_config(
         );
     }
 
-    let default_instance = shared_get(store, "skills/metabase/default_instance");
+    let default_instance = selector(store, "metabase", "skills/metabase/default_instance");
     let effective_default = effective_default(&instances, default_instance.as_deref());
 
     let context_hint = if !instances.is_empty() {
@@ -4182,7 +4282,7 @@ fn load_email_from_vault(
         });
     }
 
-    let default_account = shared_get(store.as_ref(), "skills/email/default_account");
+    let default_account = selector(store.as_ref(), "email", "skills/email/default_account");
 
     let context_hint = {
         let mut parts: Vec<String> = accounts

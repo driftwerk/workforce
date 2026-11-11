@@ -164,6 +164,7 @@ mod tests {
             enabled: Some(names(&["linear", "github"])),
             read_only: names(&["github"]),
             own_credential: vec![],
+            ..Default::default()
         };
         let snapshot = hidden(&binding, names(TOOLS));
         assert!(!snapshot.is_blocked("linear.issue_get"));
