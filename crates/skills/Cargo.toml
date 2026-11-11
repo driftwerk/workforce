@@ -65,7 +65,7 @@ datadog = ["reqwest", "tokio"]
 metabase = ["reqwest", "tokio"]
 hubspot = ["reqwest", "tokio"]
 notion = ["reqwest", "tokio"]
-browser = ["tokio", "chromiumoxide", "futures", "sha2", "url"]
+browser = ["tokio", "chromiumoxide", "futures", "sha2", "tokio-tungstenite", "url"]
 obscura = ["tokio", "futures"]
 email = ["tokio", "async-imap", "async-native-tls", "mailparse", "htmd", "futures", "lettre", "pulldown-cmark"]
 postmark = ["reqwest", "tokio"]
@@ -79,3 +79,6 @@ http = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 wiremock = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

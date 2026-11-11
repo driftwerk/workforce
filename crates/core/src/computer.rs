@@ -337,6 +337,10 @@ pub enum Why {
     OnAPage,
     /// The page it read tried to give it instructions.
     HostilePage,
+    /// It would use the person's own Chrome, signed in as them.
+    TheirChrome,
+    /// It would open a site in the person's Chrome it hasn't this session.
+    NewSite,
 }
 
 impl Why {
@@ -352,6 +356,8 @@ impl Why {
             Self::Unknown => "This tool can't say what it changes",
             Self::OnAPage => "Acts on a web page",
             Self::HostilePage => "The page it read tried to give it instructions",
+            Self::TheirChrome => "Uses your own Chrome, signed in as you",
+            Self::NewSite => "Opens a new site in your Chrome",
         }
     }
 }

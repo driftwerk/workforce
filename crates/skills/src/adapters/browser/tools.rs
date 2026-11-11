@@ -40,7 +40,7 @@ impl Tool for BrowserTool {
     }
 
     fn input_schema(&self) -> Value {
-        self.spec.schema.clone()
+        with_browser(self.spec.schema.clone())
     }
 
     /// A browser call, as Desk's gate keeps it. Opening a file reads it,
@@ -58,17 +58,28 @@ impl Tool for BrowserTool {
         if navigating {
             if let super::address::Kind::File(path) = super::address::kind(target) {
                 let real = workforce_agent::tools::paths::resolve_real(&path);
-                expect(&key, Some(Decided::File(real.clone())));
+                expect(
+                    super::client::Backend::Desk,
+                    &key,
+                    Some(Decided::File(real.clone())),
+                );
                 return Effect::Read { paths: vec![real] };
             }
         }
+        let backend = super::client::pick(input["browser"].as_str(), true)
+            .unwrap_or(super::client::Backend::Desk);
         let origin = match navigating {
             true => super::address::origin_of(target),
-            false => super::client::origin_now(),
+            false => super::client::origin_now(backend),
         };
-        expect(&key, (!navigating).then(|| Decided::Origin(origin.clone())));
+        let decision = match (backend, navigating) {
+            (_, false) => Some(Decided::Origin(origin.clone())),
+            (super::client::Backend::Chrome, true) => Some(Decided::Visit(origin.clone())),
+            (super::client::Backend::Desk, true) => None,
+        };
+        expect(backend, &key, decision);
         Effect::Connector {
-            connector: site_key(origin.as_deref()),
+            connector: site_key(backend, navigating, origin.as_deref()),
             write: !READS.contains(&self.spec.name),
         }
     }
@@ -83,6 +94,9 @@ impl Tool for BrowserTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Err(e) = super::client::pick(input["browser"].as_str(), false) {
+            return Ok(ToolResult::failure(e.to_string(), elapsed(start)));
+        }
         // This call takes what was decided for it, and nothing decided for
         // another call made alongside it.
         let call = super::client::Call {
@@ -114,14 +128,38 @@ pub const READS: &[&str] = &[
     "browser.wait",
 ];
 
-/// What Desk's gate keeps a browser call under: `browser:<origin>`, or
-/// `browser` alone for a page with no origin of its own (a blank, inline
-/// or file page), which no allowance is shared for.
-pub fn site_key(origin: Option<&str>) -> String {
+/// What Desk's gate keeps a browser call under: `browser:<origin>` in
+/// Desk's own browser; in the person's Chrome `chrome:<origin>`, and for
+/// opening a site there `chrome-visit:<origin>`. A page with no origin of
+/// its own (blank, inline, a file) is kept under the browser alone, which
+/// no allowance is shared for.
+pub fn site_key(backend: super::client::Backend, navigating: bool, origin: Option<&str>) -> String {
+    use super::client::Backend;
+    let kind = match (backend, navigating) {
+        (Backend::Desk, _) => "browser",
+        (Backend::Chrome, true) => "chrome-visit",
+        (Backend::Chrome, false) => "chrome",
+    };
     match origin.filter(|o| !o.is_empty()) {
-        Some(o) => format!("browser:{o}"),
-        None => "browser".into(),
+        Some(o) => format!("{kind}:{o}"),
+        None if backend == Backend::Chrome => "chrome".into(),
+        None => kind.into(),
     }
+}
+
+/// Every tool's `browser`: which browser it works in.
+fn with_browser(mut schema: Value) -> Value {
+    if let Some(props) = schema["properties"].as_object_mut() {
+        props.insert(
+            "browser".into(),
+            json!({
+                "type": "string",
+                "enum": ["desk", "chrome"],
+                "description": "Which browser: `desk` (Desk's own, which the person signs in to by hand) or `chrome` (the person's own Chrome, signed in as them, where Desk works in a window of its own). Leave it out to carry on in the one used last."
+            }),
+        );
+    }
+    schema
 }
 
 /// The most of a fill's value an approval card shows.
@@ -469,7 +507,7 @@ pub(super) fn skill_tools_and_policies() -> (Vec<SkillTool>, Vec<SkillPolicy>) {
                 SkillTool {
                     name: spec.name.to_string(),
                     description: spec.description.to_string(),
-                    input_schema: spec.schema,
+                    input_schema: with_browser(spec.schema),
                 },
                 SkillPolicy {
                     tool: spec.name.to_string(),
@@ -557,9 +595,48 @@ mod tests {
     }
 
     #[test]
-    fn a_site_is_kept_by_its_origin_and_a_page_with_none_shares_nothing() {
-        assert_eq!(site_key(Some("https://a.test")), "browser:https://a.test");
-        assert_eq!(site_key(None), "browser");
+    fn a_site_is_kept_by_its_browser_and_origin_and_a_page_with_none_shares_nothing() {
+        use super::super::client::Backend;
+        assert_eq!(
+            site_key(Backend::Desk, false, Some("https://a.test")),
+            "browser:https://a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Desk, true, Some("https://a.test")),
+            "browser:https://a.test"
+        );
+        assert_eq!(site_key(Backend::Desk, false, None), "browser");
+        assert_eq!(
+            site_key(Backend::Chrome, false, Some("https://a.test")),
+            "chrome:https://a.test"
+        );
+        assert_eq!(
+            site_key(Backend::Chrome, true, Some("https://a.test")),
+            "chrome-visit:https://a.test"
+        );
+        assert_eq!(site_key(Backend::Chrome, true, None), "chrome");
+    }
+
+    #[test]
+    fn every_tool_names_its_browser() {
+        for spec in specs() {
+            let schema = with_browser(spec.schema);
+            assert_eq!(
+                schema["properties"]["browser"]["enum"],
+                json!(["desk", "chrome"]),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn reads_are_every_tool_that_changes_no_page() {
+        let names = tool_names();
+        for r in READS {
+            assert!(names.contains(r), "{r}");
+        }
+        assert_eq!(READS.len() + 7, names.len());
     }
 
     #[test]

@@ -7,6 +7,8 @@
 //! (`untrusted`).
 
 mod address;
+mod chrome;
+mod chrome_cell;
 mod client;
 mod config;
 mod hooks;
@@ -23,11 +25,15 @@ use workforce_agent::tools::Tool;
 use crate::definition::{SkillDefinition, SkillRequirements};
 
 pub use address::{host_of, origin_of};
+pub use chrome::{
+    available as chrome_available, default_user_data_dir as chrome_user_data_dir, MIN_CHROME,
+};
 pub use client::{
-    close, forget_decision, live, page_state, stop_session, BrowserClient, Live, Which,
+    close, close_backend, forget_decision, live, page_state, stop_session, turn_ended, Backend,
+    BrowserClient, Live, Which,
 };
 pub use config::BrowserSkillConfig;
-pub use hooks::{install_hooks, BrowserHooks, Done, OnPage};
+pub use hooks::{install_hooks, BrowserHooks, Done, OnPage, Settings, Sites, Uses};
 pub use tools::{site_key, READS};
 pub use untrusted::PageState;
 
@@ -92,6 +98,7 @@ impl BrowserSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::browser::chrome;
 
     #[test]
     fn definition_lists_all_tools_with_allow_policies() {
@@ -327,6 +334,15 @@ mod tests {
     }
 
     impl BrowserHooks for TestHooks {
+        fn settings(&self) -> Settings {
+            Settings {
+                sites: Sites {
+                    allow: vec![],
+                    block: vec!["localhost".into()],
+                },
+                ..Settings::default()
+            }
+        }
         fn unbound(&self, agent: &str) -> bool {
             agent == "unbound-agent"
         }
@@ -337,6 +353,12 @@ mod tests {
         }
         fn record(&self, done: Done) {
             self.done.lock().unwrap().push(done);
+        }
+        fn may_visit(&self, agent: &str, _origin: &str) -> Result<(), String> {
+            match agent == "visit-once-agent" {
+                true => Err("No visit was allowed for this site.".into()),
+                false => Ok(()),
+            }
         }
         fn gate_decides(&self) -> bool {
             GATE_DECIDES.load(std::sync::atomic::Ordering::SeqCst)
@@ -417,9 +439,12 @@ mod tests {
         workforce_agent::runner::CURRENT_AGENT_ID
             .scope("unbound-agent".into(), async {
                 assert!(
-                    run("browser.navigate", serde_json::json!({"url": shop}))
-                        .await
-                        .success
+                    run(
+                        "browser.navigate",
+                        serde_json::json!({"url": shop, "browser": "desk"})
+                    )
+                    .await
+                    .success
                 );
                 assert!(
                     run("browser.click", serde_json::json!({"selector": "#buy"}))
@@ -869,5 +894,385 @@ mod tests {
         GATE_DECIDES.store(false, std::sync::atomic::Ordering::SeqCst);
         close(Which::All).await;
         out
+    }
+
+    /// `GET path` on 127.0.0.1:`port`, the body.
+    fn http_get(port: u16, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        // Chrome may keep the socket open: read the body by its length.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len = head.lines().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                });
+                if len.is_some_and(|n| body.len() >= n) {
+                    return body.to_string();
+                }
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    return text
+                        .split_once("\r\n\r\n")
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_default()
+                }
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// The page targets the throwaway Chrome has open, by URL.
+    fn open_tabs(port: u16) -> Vec<String> {
+        let body = http_get(port, "/json/list");
+        let start = body.find('[').unwrap_or(0);
+        let list: serde_json::Value = serde_json::from_str(&body[start..]).unwrap_or_default();
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["type"] == "page")
+            .filter_map(|t| t["url"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// My Chrome end to end, against a throwaway Chrome launched with its
+    /// own user data folder in a test folder (never the person's): Desk
+    /// attaches by its `DevToolsActivePort`, works in a window of its own,
+    /// reads fenced, holds the person's steps, records what it did, keeps
+    /// to the site list, and on Stop closes its own tab only; the tab the
+    /// "person" had open is still there, on the same page. Gated on
+    /// `BROWSER_E2E`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn browser_e2e_my_chrome_works_in_its_own_tab_and_leaves_the_rest() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        install_hooks(TEST_HOOKS.clone());
+        let site = fixture::serve();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("their-chrome");
+        let binary = std::env::var("BROWSER_E2E_CHROMIUM").unwrap_or_else(|_| "chromium".into());
+        let theirs = site.url("/form");
+        let mut chrome = std::process::Command::new(binary)
+            .args([
+                "--headless=new",
+                "--no-sandbox",
+                "--remote-debugging-port=0",
+                "--no-first-run",
+                &format!("--user-data-dir={}", profile.display()),
+                &theirs,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the throwaway Chrome starts");
+        let port_file = profile.join("DevToolsActivePort");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !chrome::available(&profile) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no DevToolsActivePort"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The person's tab has loaded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !open_tabs(port).contains(&theirs) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the person's tab never loaded: {:?} / {}",
+                open_tabs(port),
+                http_get(port, "/json/list")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let skill = BrowserSkill::new(BrowserSkillConfig {
+            chrome_user_data_dir: Some(profile.display().to_string()),
+            profile_root: Some(dir.path().join("desk").display().to_string()),
+            ..BrowserSkillConfig::default()
+        })
+        .unwrap();
+        let tools = skill.tools();
+        let run = |name: &'static str, input: serde_json::Value| {
+            let tool = tools.iter().find(|t| t.name() == name).unwrap().clone();
+            async move { tool.execute(input).await.unwrap() }
+        };
+        let shop = site.url("/shop");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let popup = site.url("/network");
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope(
+                "chrome-agent".into(),
+                workforce_agent::runner::CURRENT_SESSION_ID.scope(session_id.clone(), async {
+                    let nav = run(
+                        "browser.navigate",
+                        serde_json::json!({"url": shop, "browser": "chrome"}),
+                    )
+                    .await;
+                    assert!(nav.success, "{:?}", nav.error);
+                    assert_eq!(nav.output["browser"], "chrome");
+                    // The call after carries on in the person's Chrome.
+                    let snap = run("browser.snapshot", serde_json::json!({})).await;
+                    assert_eq!(snap.output["browser"], "chrome");
+                    let body = snap.output["body_text"].as_str().unwrap_or_default();
+                    assert!(
+                        body.contains("EXTERNAL_UNTRUSTED_CONTENT_") && body.contains("Buy now"),
+                        "{body}"
+                    );
+                    let buy = run("browser.click", serde_json::json!({"selector": "#buy"})).await;
+                    assert!(
+                        !buy.success,
+                        "a Buy click in the person's Chrome below unbound"
+                    );
+                    assert!(
+                        run("browser.click", serde_json::json!({"selector": "#save"}))
+                            .await
+                            .success
+                    );
+                    let shot = run("browser.screenshot", serde_json::json!({})).await;
+                    assert!(shot.success && shot.output["size_bytes"].as_u64().unwrap_or(0) > 200);
+                    let blocked = site.url("/form").replace("127.0.0.1", "localhost");
+                    let away = run("browser.navigate", serde_json::json!({"url": blocked})).await;
+                    assert!(!away.success);
+                    assert!(away.error.unwrap_or_default().contains("keeps away"));
+
+                    // M9: keys go only where the field has focus.
+                    assert!(
+                        run(
+                            "browser.navigate",
+                            serde_json::json!({"url": site.url("/form")})
+                        )
+                        .await
+                        .success
+                    );
+                    let typed = run(
+                        "browser.type",
+                        serde_json::json!({"selector": "#name", "text": "Sam"}),
+                    )
+                    .await;
+                    assert!(typed.success, "{:?}", typed.error);
+                    // M9: a click lands only on what was checked.
+                    assert!(
+                        run(
+                            "browser.navigate",
+                            serde_json::json!({"url": site.url("/overlay")})
+                        )
+                        .await
+                        .success
+                    );
+                    let covered =
+                        run("browser.click", serde_json::json!({"selector": "#buy"})).await;
+                    assert!(!covered.success);
+                    assert!(covered.error.unwrap_or_default().contains("covers"));
+                    // L: a tab Desk's opens is Desk's: closed as it opens.
+                    assert!(
+                        run(
+                            "browser.navigate",
+                            serde_json::json!({"url": site.url("/popup")})
+                        )
+                        .await
+                        .success
+                    );
+                    assert!(
+                        run("browser.click", serde_json::json!({"selector": "#open"}))
+                            .await
+                            .success
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    assert!(
+                        !open_tabs(port).contains(&popup),
+                        "the popup was closed as it opened"
+                    );
+                    // H8: a page that takes itself to a site the list keeps Desk
+                    // from is blanked, without a call.
+                    let blocked_shop = shop.replace("127.0.0.1", "localhost");
+                    let moving = format!("/moving?to={blocked_shop}");
+                    assert!(
+                        run(
+                            "browser.navigate",
+                            serde_json::json!({"url": site.url(&moving)})
+                        )
+                        .await
+                        .success
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                    let snap = run("browser.snapshot", serde_json::json!({})).await;
+                    let url = snap.output["url"].as_str().unwrap_or_default().to_string();
+                    assert!(url.contains("about:blank"), "{url} / {:?}", snap.error);
+                    // An alert in the person's Chrome is dismissed and noted.
+                    let alert = run(
+                        "browser.navigate",
+                        serde_json::json!({"url": site.url("/alert")}),
+                    )
+                    .await;
+                    assert!(alert.success, "{:?}", alert.error);
+                    let console = run("browser.console_messages", serde_json::json!({})).await;
+                    let text = console.output["messages"].as_str().unwrap_or_default();
+                    assert!(
+                        text.contains("dialog") && text.contains("fixture alert"),
+                        "{text}"
+                    );
+                    // Desk's own tab left the person's tab where it was.
+                    let shop_again =
+                        run("browser.navigate", serde_json::json!({"url": shop})).await;
+                    assert!(shop_again.success);
+                }),
+            )
+            .await;
+
+        let tabs = open_tabs(port);
+        assert!(tabs.contains(&theirs), "the person's tab: {tabs:?}");
+        assert!(tabs.contains(&shop), "Desk's own tab: {tabs:?}");
+        let done = TEST_HOOKS.done.lock().unwrap().clone();
+        let mine: Vec<&Done> = done.iter().filter(|d| d.agent == "chrome-agent").collect();
+        assert_eq!(
+            mine.iter()
+                .take(2)
+                .map(|d| d.tool.as_str())
+                .collect::<Vec<_>>(),
+            ["browser.navigate", "browser.click"]
+        );
+        assert!(mine.iter().all(|d| d.backend == "chrome"));
+        assert!(
+            mine.iter()
+                .all(|d| (d.tool == "browser.type") == d.screenshot.is_none()),
+            "a picture of all but typing"
+        );
+        assert!(mine
+            .iter()
+            .all(|d| d.session.as_deref() == Some(session_id.as_str())));
+        assert!(live()
+            .await
+            .iter()
+            .any(|l| l.agent == "chrome-agent" && l.backend == "chrome"));
+
+        // Allow once for a new site holds for the calls on that page after
+        // it: the gate's decision goes with the call, though no visit grant
+        // stands for it.
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope(
+                "visit-once-agent".into(),
+                workforce_agent::runner::CURRENT_SESSION_ID.scope(session_id.clone(), async {
+                    let nav = tools
+                        .iter()
+                        .find(|t| t.name() == "browser.navigate")
+                        .unwrap()
+                        .clone();
+                    let input = serde_json::json!({"url": site.url("/form"), "browser": "chrome"});
+                    nav.effect(&input);
+                    let r = nav.execute(input).await.unwrap();
+                    assert!(r.success, "{:?}", r.error);
+                    let snap = tools
+                        .iter()
+                        .find(|t| t.name() == "browser.snapshot")
+                        .unwrap()
+                        .clone();
+                    snap.effect(&serde_json::json!({}));
+                    let r = snap.execute(serde_json::json!({})).await.unwrap();
+                    assert!(r.success, "the allowed site stays: {:?}", r.error);
+                    assert!(r.output["body_text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Send"));
+                // A visit decided for one call but declined is taken by no
+                // other: a read run meanwhile takes only its own decision,
+                // and when the page later takes itself there, it's blanked.
+                let elsewhere = fixture::serve();
+                let there = serde_json::json!({"url": elsewhere.url("/shop"), "browser": "chrome"});
+                nav.effect(&there);
+                snap.effect(&serde_json::json!({}));
+                let read = snap.execute(serde_json::json!({})).await.unwrap();
+                assert!(read.success, "{:?}", read.error);
+                forget_decision("visit-once-agent", workforce_agent::runner::SYSTEM_USER_ID, "browser.navigate", &there);
+                let eval = tools.iter().find(|t| t.name() == "browser.evaluate").unwrap().clone();
+                let moving = serde_json::json!({"expression": format!("location.href = '{}'", elsewhere.url("/shop"))});
+                eval.effect(&moving);
+                let _ = eval.execute(moving).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                snap.effect(&serde_json::json!({}));
+                let after = snap.execute(serde_json::json!({})).await.unwrap();
+                assert!(!after.success, "a declined site stayed open");
+                assert!(after.error.unwrap_or_default().contains("blank now"));
+                }),
+            )
+            .await;
+
+        // H6(c): the turn's end, by its session id, lets the Chrome go.
+        assert_eq!(turn_ended(&session_id).await, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let tabs = open_tabs(port);
+            if !tabs.contains(&shop) && !tabs.contains(&popup) {
+                assert!(
+                    tabs.contains(&theirs),
+                    "Stop left the person's tab: {tabs:?}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Desk's tab never closed: {tabs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!live().await.iter().any(|l| l.agent == "chrome-agent"));
+        let _ = chrome.kill();
+        let _ = chrome.wait();
+    }
+
+    /// With remote debugging off (no `DevToolsActivePort`), My Chrome says
+    /// how to turn it on and nothing else happens.
+    #[tokio::test]
+    async fn my_chrome_with_remote_debugging_off_says_how_to_turn_it_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = BrowserSkill::new(BrowserSkillConfig {
+            chrome_user_data_dir: Some(dir.path().display().to_string()),
+            profile_root: Some(dir.path().join("desk").display().to_string()),
+            ..BrowserSkillConfig::default()
+        })
+        .unwrap();
+        let nav = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "browser.navigate")
+            .unwrap();
+        let out = workforce_agent::runner::CURRENT_AGENT_ID
+            .scope(
+                "chrome-off-agent".into(),
+                nav.execute(serde_json::json!({"url": "about:blank", "browser": "chrome"})),
+            )
+            .await
+            .unwrap();
+        // With no hooks installed only Desk's own browser is on; with the
+        // test's hooks, both are and the toggle is what's missing.
+        let error = out.error.unwrap_or_default();
+        assert!(!out.success);
+        assert!(
+            error.contains("chrome://inspect/#remote-debugging")
+                || error.contains("Desk doesn't use the person's Chrome"),
+            "{error}"
+        );
     }
 }

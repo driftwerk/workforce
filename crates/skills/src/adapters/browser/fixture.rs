@@ -60,6 +60,8 @@ fn page(path: &str) -> (&'static str, &'static str) {
         "/inject" => ("text/html", INJECTION),
         "/shop" => ("text/html", SHOP),
         "/overlay" => ("text/html", OVERLAY),
+        "/popup" => ("text/html", "<!doctype html><title>Popup</title><body>\
+            <button id=\"open\" onclick=\"window.open(location.origin + '/network')\">Open</button></body>"),
         "/alert" => ("text/html", ALERT),
         // Moves itself, a moment after it loads, to the address `?to=`
         // names: another origin, say.

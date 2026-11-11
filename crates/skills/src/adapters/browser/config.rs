@@ -78,11 +78,24 @@ pub struct BrowserSkillConfig {
     /// profile the person signed in to by hand stays signed in.
     #[serde(default)]
     pub keep_profiles: bool,
+    /// The person's Chrome's user data folder, where it writes
+    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
+    /// own for this platform.
+    #[serde(default)]
+    pub chrome_user_data_dir: Option<String>,
+    /// How long attaching to the person's Chrome waits for them to allow
+    /// it in Chrome's own prompt.
+    #[serde(default = "default_chrome_connect_timeout_ms")]
+    pub chrome_connect_timeout_ms: u64,
     /// Run Chrome without its sandbox. Only where the sandbox can't start
     /// (a build box without user namespaces); as root in a container it is
     /// off already.
     #[serde(default)]
     pub no_sandbox: bool,
+}
+
+fn default_chrome_connect_timeout_ms() -> u64 {
+    60_000
 }
 
 impl Default for BrowserSkillConfig {
@@ -103,6 +116,8 @@ impl Default for BrowserSkillConfig {
             reap_interval_ms: default_reap_interval_ms(),
             show: false,
             keep_profiles: false,
+            chrome_user_data_dir: None,
+            chrome_connect_timeout_ms: default_chrome_connect_timeout_ms(),
             no_sandbox: false,
         }
     }

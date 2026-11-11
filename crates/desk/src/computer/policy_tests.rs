@@ -1457,6 +1457,137 @@ fn a_session_may_start_in_a_folder_it_works_in() {
     );
 }
 
+// ── The person's own Chrome ──────────────────────────────────────────────
+
+fn in_chrome(tool: &str, connector: &str, write: bool) -> CallFacts {
+    CallFacts {
+        tool: tool.into(),
+        ..call(Effect::Connector {
+            connector: connector.into(),
+            write,
+        })
+    }
+}
+
+fn kept(connector: &str, id: u128) -> Grant {
+    Grant {
+        id: Uuid::from_u128(id),
+        connector: Some(connector.into()),
+        ..site_allowance("x", "s1")
+    }
+}
+
+fn their_ask(why: Why) -> Verdict {
+    Verdict::Ask {
+        choices: vec![Choice::AllowOnce, Choice::AllowSession, Choice::Deny],
+        why,
+    }
+}
+
+/// Below unbound, the person's Chrome asks before its first use in a
+/// session, then before each new site it opens, then before each change on
+/// a site, each answer holding for the session.
+#[test]
+fn the_persons_chrome_asks_once_a_session_then_per_site() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let snap = in_chrome("browser.snapshot", "chrome:https://shop.example", false);
+    let visit = in_chrome(
+        "browser.navigate",
+        "chrome-visit:https://shop.example",
+        false,
+    );
+    let click = in_chrome("browser.click", "chrome:https://shop.example", true);
+
+    assert_eq!(verdict(&p_, false, &[], &snap), their_ask(Why::TheirChrome));
+    assert_eq!(
+        verdict(&p_, false, &[], &visit),
+        their_ask(Why::TheirChrome)
+    );
+    assert_eq!(
+        verdict(&p_, false, &[], &click),
+        their_ask(Why::TheirChrome)
+    );
+
+    let chrome = kept("chrome", 10);
+    assert_eq!(
+        verdict(&p_, false, std::slice::from_ref(&chrome), &snap),
+        Verdict::Run { by: By::Rule }
+    );
+    assert_eq!(
+        verdict(&p_, false, std::slice::from_ref(&chrome), &visit),
+        their_ask(Why::NewSite)
+    );
+    assert_eq!(
+        verdict(&p_, false, std::slice::from_ref(&chrome), &click),
+        their_ask(Why::OnAPage)
+    );
+
+    let visited = [
+        chrome.clone(),
+        kept("chrome-visit:https://shop.example", 11),
+    ];
+    assert_eq!(
+        verdict(&p_, false, &visited, &visit),
+        Verdict::Run {
+            by: By::Session(Uuid::from_u128(11))
+        }
+    );
+    assert_eq!(
+        verdict(&p_, false, &visited, &click),
+        their_ask(Why::OnAPage),
+        "visiting a site doesn't allow changing it"
+    );
+    let changing = [chrome, kept("chrome:https://shop.example", 12)];
+    assert_eq!(
+        verdict(&p_, false, &changing, &click),
+        Verdict::Run {
+            by: By::Session(Uuid::from_u128(12))
+        }
+    );
+}
+
+/// Unbound, the person's Chrome asks nothing; at Suggest it isn't used.
+#[test]
+fn the_persons_chrome_unbound_runs_and_at_suggest_is_refused() {
+    for (tool, connector, write) in [
+        ("browser.snapshot", "chrome:https://a.test", false),
+        ("browser.navigate", "chrome-visit:https://a.test", false),
+        ("browser.click", "chrome:https://a.test", true),
+    ] {
+        let call = in_chrome(tool, connector, write);
+        assert_eq!(
+            verdict(
+                &browsing_as(Browsing::Unbound, Access::Full, false),
+                false,
+                &[],
+                &call
+            ),
+            Verdict::Run { by: By::Rule },
+            "{tool}"
+        );
+        let refused = verdict(
+            &browsing_as(Browsing::Suggests, Access::Full, false),
+            false,
+            &[],
+            &call,
+        );
+        assert!(
+            matches!(&refused, Verdict::Refuse { refusal } if refusal.sentence.contains("own Chrome")),
+            "{tool}: {refused:?}"
+        );
+    }
+    // Desk's own browser still reads at Suggest.
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Suggests, Access::Full, false),
+            false,
+            &[],
+            &on_page("browser.snapshot", false)
+        ),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
 /// A script on a page asks each time below unbound: no site allowance
 /// covers it, since it can press what the never-list reads.
 #[test]
@@ -1480,6 +1611,23 @@ fn a_script_on_a_page_asks_each_time_below_unbound() {
             &[],
             &script
         ),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
+/// "Do anything" Full access still asks before using the person's Chrome:
+/// it is signed in as them.
+#[test]
+fn full_access_that_never_asks_still_asks_for_the_persons_chrome() {
+    let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    p_.access.asks = Asking::Never;
+    let click = in_chrome("browser.click", "chrome:https://a.test", true);
+    assert_eq!(
+        verdict(&p_, false, &[], &click),
+        their_ask(Why::TheirChrome)
+    );
+    assert_eq!(
+        verdict(&p_, false, &[kept("chrome", 10)], &click),
         Verdict::Run { by: By::Rule }
     );
 }
