@@ -372,7 +372,13 @@ mod tests {
         {
             assert!(allow.contains(tool), "{tool} is not offered by default");
         }
-        for wide in ["jira.*", "linear.*", "jira.api", "jira.delete_issue", "linear.issue_bulk_update"] {
+        for wide in [
+            "jira.*",
+            "linear.*",
+            "jira.api",
+            "jira.delete_issue",
+            "linear.issue_bulk_update",
+        ] {
             assert!(!allow.contains(&wide), "{wide} is offered by default");
         }
     }
