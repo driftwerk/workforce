@@ -94,7 +94,11 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
                 .flat_map(|c| ["-c".to_string(), c.to_string()]),
         );
     }
-    args.extend(s.prompt.map(str::to_string));
+    // Its prompt is a prompt whatever it says: nothing after `--` is read
+    // as an option.
+    if let Some(p) = s.prompt {
+        args.extend(["--".to_string(), p.to_string()]);
+    }
     Spawn {
         program: s.program.to_path_buf(),
         args,
@@ -1348,7 +1352,7 @@ pub(crate) mod tests {
                 .args
                 .iter()
                 .rev()
-                .take(7)
+                .take(8)
                 .rev()
                 .map(String::as_str)
                 .collect();
@@ -1361,6 +1365,7 @@ pub(crate) mod tests {
                     "approval_policy=on-request",
                     "-c",
                     "sandbox_mode=workspace-write",
+                    "--",
                     "go"
                 ]
             );
@@ -1390,8 +1395,8 @@ pub(crate) mod tests {
             };
             let on = fast(true);
             assert_eq!(
-                &on[on.len() - 3..],
-                ["-c", "service_tier=\"priority\"", "go"]
+                &on[on.len() - 4..],
+                ["-c", "service_tier=\"priority\"", "--", "go"]
             );
             assert!(!fast(false).iter().any(|a| a.contains("service_tier")));
         }

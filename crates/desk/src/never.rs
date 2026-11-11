@@ -282,6 +282,25 @@ fn secret_file(name: &str) -> bool {
         || lower.contains("/keychains")
         || lower.contains(".docker/config.json")
         || lower.contains(".kube/config")
+        // Another process's environment: what the hub, Desk Helper and
+        // every session were started with, their tokens among it.
+        || (lower.contains("/proc/") && base == "environ")
+        // Desk's own data: the hub's config, its secrets and database, and
+        // Desk Helper's files, wherever the person's computer or a machine
+        // keeps them.
+        || lower.contains("/application support/desk/")
+        || lower.ends_with("/application support/desk")
+        || lower.contains("/.local/share/desk/")
+        || lower.ends_with("/.local/share/desk")
+        || lower.contains("xyz.driftwerk.desk")
+        || desk_home().is_some_and(|h| lower == h || lower.starts_with(&format!("{h}/")))
+}
+
+/// Where `DESK_HOME` puts Desk's data instead, lowercased, when it is set.
+fn desk_home() -> Option<String> {
+    let h = std::env::var("DESK_HOME").ok()?;
+    let h = h.trim_end_matches('/').to_lowercase();
+    (h.len() > 1).then_some(h)
 }
 
 /// Whether `w` expands a variable that holds a secret: `$GITHUB_TOKEN`,
@@ -409,6 +428,17 @@ fn one(words: &[String], at: &Where<'_>, depth: usize) -> Option<Never> {
     }
 
     // Secrets.
+    // `ps e`, `ps eww`, `ps auxe`: every process's environment (BSD-style
+    // words, no dash; `ps -e` only lists them all).
+    // `ps -E` and `ps -axE` (macOS) show it too.
+    if prog == "ps"
+        && args.iter().any(|a| match a.strip_prefix('-') {
+            Some(flags) => !flags.starts_with('-') && flags.contains('E'),
+            None => a.chars().all(|c| c.is_ascii_alphabetic()) && a.contains('e'),
+        })
+    {
+        return Some(Never::Secrets);
+    }
     if matches!(prog, "printenv" | "env" | "set" | "export" | "declare")
         && (prog == "printenv" || args.is_empty() || has("-p") || has("-x"))
     {
@@ -813,6 +843,7 @@ const PROGRAMS: &[&str] = &[
     ".",
     "printenv",
     "env",
+    "ps",
     "export",
     "security",
     "op",
@@ -1246,6 +1277,44 @@ mod tests {
         ] {
             assert_eq!(path(Path::new(p)), None, "{p}");
         }
+    }
+
+    #[test]
+    fn desk_itself_and_other_processes_environments_are_secrets() {
+        for c in [
+            "cat /proc/1/environ",
+            "tr '\\0' '\\n' < /proc/self/environ",
+            "xargs -0 -L1 -a /proc/4242/environ",
+            "ps e",
+            "ps eww -p 4242",
+            "ps auxe",
+            "ps -E",
+            "ps -axE -o pid,command",
+            "cat ~/Library/Application\\ Support/Desk/hub/config.toml",
+            "cat '/Users/sam/Library/Application Support/Desk/hub/workforce.toml'",
+            "ls ~/.local/share/Desk/hub/data",
+            "cp /home/sam/.local/share/Desk/hub/secrets.json /tmp/x",
+        ] {
+            assert_eq!(run(c), Some(Never::Secrets), "{c}");
+        }
+        for c in [
+            "ps -e",
+            "ps aux",
+            "cat /proc/cpuinfo",
+            "ls ~/.local/share/other",
+        ] {
+            assert_ne!(run(c), Some(Never::Secrets), "{c}");
+        }
+        for p in [
+            "/proc/1/environ",
+            "/proc/self/environ",
+            "/home/sam/.local/share/Desk/hub/config.toml",
+            "/Users/sam/Library/Application Support/Desk/hub/data/x",
+            "/Users/sam/Library/Keychains/xyz.driftwerk.desk.plist",
+        ] {
+            assert_eq!(path(Path::new(p)), Some(Never::Secrets), "{p}");
+        }
+        assert_eq!(path(Path::new("/proc/cpuinfo")), None);
     }
 
     #[test]

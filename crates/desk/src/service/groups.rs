@@ -418,74 +418,7 @@ impl DeskStore {
     pub async fn put_layout_with(&self, layout: &Layout, moves: bool) -> Result<Vec<Uuid>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
-        // Where each session was, to say which moved.
-        let before: Vec<(String, Option<String>)> = tx
-            .query(
-                "SELECT item, NULLIF(group_id, 'ungrouped') FROM group_members \
-                 WHERE item LIKE 'session:%' FOR UPDATE",
-                &[],
-            )
-            .await?
-            .iter()
-            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
-            .collect::<Result<_, tokio_postgres::Error>>()?;
-        tx.execute("DELETE FROM groups", &[]).await?;
-        let now = Utc::now();
-        let ungrouped = Group {
-            id: UNGROUPED.into(),
-            name: "Ungrouped".into(),
-            collapsed: layout.ungrouped.collapsed,
-            items: layout.ungrouped.items.clone(),
-        };
-        for (position, g) in layout.groups.iter().chain([&ungrouped]).enumerate() {
-            let position = i32::try_from(position).unwrap_or(i32::MAX);
-            tx.execute(
-                "INSERT INTO groups (id, name, position, collapsed, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[&g.id, &g.name, &position, &g.collapsed, &now],
-            )
-            .await?;
-            for (at, item) in g.items.iter().enumerate() {
-                let at = i32::try_from(at).unwrap_or(i32::MAX);
-                tx.execute(
-                    "INSERT INTO group_members (item, group_id, position) VALUES ($1, $2, $3)",
-                    &[item, &g.id, &at],
-                )
-                .await?;
-            }
-        }
-        for g in &layout.groups {
-            tx.execute(
-                "INSERT INTO group_ids_used (id, first_used) VALUES ($1, now()) \
-                 ON CONFLICT DO NOTHING",
-                &[&g.id],
-            )
-            .await?;
-        }
-        // Each session whose group changed: what is read about it later,
-        // but happened before, keeps the group it happened in.
-        let (items, froms, tos) = moved_sessions(&before, layout);
-        if moves && !items.is_empty() {
-            tx.execute(
-                // The database's clock: the one the rows it stamps are
-                // compared with as they are written.
-                "INSERT INTO group_moves (item, from_group, to_group, at) \
-                 SELECT i, f, t, now() FROM UNNEST($1::text[], $2::text[], $3::text[]) AS m(i, f, t)",
-                &[&items, &froms, &tos],
-            )
-            .await?;
-        }
-        let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
-        let ungrouped = tx
-            .query(
-                "UPDATE boards SET group_id = NULL, updated_at = now() \
-                 WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id",
-                &[&kept],
-            )
-            .await?
-            .iter()
-            .map(|r| r.try_get(0))
-            .collect::<Result<Vec<Uuid>, _>>()?;
+        let ungrouped = put_layout_in(&tx, layout, moves).await?;
         tx.commit().await.context("saving the sidebar's groups")?;
         Ok(ungrouped)
     }
@@ -528,6 +461,84 @@ impl DeskStore {
             .await?;
         Ok(row.get(0))
     }
+}
+
+/// [`DeskStore::put_layout_with`] within `tx`: the boards in a group it
+/// no longer has, which become ungrouped.
+pub(crate) async fn put_layout_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    layout: &Layout,
+    moves: bool,
+) -> Result<Vec<Uuid>> {
+    // Where each session was, to say which moved.
+    let before: Vec<(String, Option<String>)> = tx
+        .query(
+            "SELECT item, NULLIF(group_id, 'ungrouped') FROM group_members \
+             WHERE item LIKE 'session:%' FOR UPDATE",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+        .collect::<Result<_, tokio_postgres::Error>>()?;
+    tx.execute("DELETE FROM groups", &[]).await?;
+    let now = Utc::now();
+    let ungrouped = Group {
+        id: UNGROUPED.into(),
+        name: "Ungrouped".into(),
+        collapsed: layout.ungrouped.collapsed,
+        items: layout.ungrouped.items.clone(),
+    };
+    for (position, g) in layout.groups.iter().chain([&ungrouped]).enumerate() {
+        let position = i32::try_from(position).unwrap_or(i32::MAX);
+        tx.execute(
+            "INSERT INTO groups (id, name, position, collapsed, updated_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+            &[&g.id, &g.name, &position, &g.collapsed, &now],
+        )
+        .await?;
+        for (at, item) in g.items.iter().enumerate() {
+            let at = i32::try_from(at).unwrap_or(i32::MAX);
+            tx.execute(
+                "INSERT INTO group_members (item, group_id, position) VALUES ($1, $2, $3)",
+                &[item, &g.id, &at],
+            )
+            .await?;
+        }
+    }
+    for g in &layout.groups {
+        tx.execute(
+            "INSERT INTO group_ids_used (id, first_used) VALUES ($1, now()) \
+             ON CONFLICT DO NOTHING",
+            &[&g.id],
+        )
+        .await?;
+    }
+    // Each session whose group changed: what is read about it later,
+    // but happened before, keeps the group it happened in.
+    let (items, froms, tos) = moved_sessions(&before, layout);
+    if moves && !items.is_empty() {
+        tx.execute(
+            // The database's clock: the one the rows it stamps are
+            // compared with as they are written.
+            "INSERT INTO group_moves (item, from_group, to_group, at) \
+             SELECT i, f, t, now() FROM UNNEST($1::text[], $2::text[], $3::text[]) AS m(i, f, t)",
+            &[&items, &froms, &tos],
+        )
+        .await?;
+    }
+    let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
+    let ungrouped = tx
+        .query(
+            "UPDATE boards SET group_id = NULL, updated_at = now() \
+             WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id",
+            &[&kept],
+        )
+        .await?
+        .iter()
+        .map(|r| r.try_get(0))
+        .collect::<Result<Vec<Uuid>, _>>()?;
+    Ok(ungrouped)
 }
 
 /// The sessions whose group `after` changes from `before` (each item and
@@ -662,6 +673,17 @@ impl Desk {
         let after = f(&before)?.checked_except(&closed)?;
         if after == before {
             return Ok(after);
+        }
+        // On a machine whose groups are its grants, no change but a grant
+        // puts a session of its in another group, or out of one.
+        if self.stamps_from_grants() {
+            let ids: Vec<Uuid> = self.0.state.lock().records.keys().copied().collect();
+            for id in ids {
+                let item = session_item(id);
+                if before.group_of(&item).map(|g| &g.id) != after.group_of(&item).map(|g| &g.id) {
+                    return Err(self.layout_refused().unwrap_or(DeskError::CrossesBoss));
+                }
+            }
         }
         // A group id is never used twice: rows stamped with a deleted
         // group must never become another group's.

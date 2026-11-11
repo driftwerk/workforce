@@ -57,6 +57,9 @@ mod charge;
 pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
+mod grants;
+#[cfg(test)]
+mod grants_tests;
 mod groups;
 mod handoff;
 #[cfg(test)]
@@ -108,6 +111,8 @@ mod unread;
 
 use transition::Transition;
 
+pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
+pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
@@ -163,6 +168,9 @@ pub struct Options {
     pub line_reach: crate::line::Reach,
     /// What session memory keeps, from `[desk.memory]`.
     pub memory: crate::memory::MemoryOptions,
+    /// Whether this is a machine's hub, and how long grants last
+    /// (`[desk.bosses]`).
+    pub bosses: crate::grant::BossOptions,
 }
 
 #[cfg(test)]
@@ -228,6 +236,10 @@ pub(crate) struct Live {
     denials: Vec<Denied>,
     /// Tool calls the person allowed for the rest of the session.
     allowed: HashSet<Call>,
+    /// Its CLI was launched with the pre-tool hook that fails closed
+    /// ([`claude::hook_settings_for`]): only then may a boss served from a
+    /// grant run it.
+    fail_closed: bool,
     /// Its turn was ended from Desk (Esc), which Claude Code reports no
     /// hook for.
     interrupted: bool,
@@ -913,6 +925,11 @@ struct Inner {
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
+    /// This engine's copy of the home's grants, and its pause.
+    grants: Mutex<grants::GrantsRun>,
+    /// Held while a grant is written: one at a time, from reading the copy
+    /// to keeping it.
+    grant_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -1560,9 +1577,12 @@ impl Desk {
             modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
+            grants: Mutex::default(),
+            grant_write: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
+        desk.grants_load().await;
         desk.lineage_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -1784,6 +1804,7 @@ impl Desk {
                 Live {
                     pty: Arc::new(pty),
                     token: h.meta["token"].as_str().unwrap_or_default().to_string(),
+                    fail_closed: h.meta["failClosed"].as_bool().unwrap_or(false),
                     current_tool: None,
                     // What it asked is shown again once every session is
                     // back (`carry_asks`): its terminal's to answer now.
@@ -2939,10 +2960,23 @@ impl Desk {
         group: Option<&str>,
         boss: Option<&Party>,
     ) -> Result<(), DeskError> {
+        // A session a boss served from a grant starts is born in that
+        // grant first, whichever engine this is: it is the boss's only while
+        // its grant names it.
+        if let (Some(g), Some(b)) = (group, boss) {
+            if crate::grant::is_served(&b.id) {
+                self.served_born(id, g, &b.id).await?;
+            }
+        }
         if let Some(boss) = boss {
             self.charge_started(id, boss, group).await?;
         }
         if let Some(g) = group {
+            // On a machine whose groups are its grants, it is born in its
+            // group's grant.
+            if self.born_in(id, g).await? {
+                return Ok(());
+            }
             let item = groups::session_item(id);
             // Starting in its group is no move: nothing of a move is done.
             self.0.scopes.lock().placing.insert(id);
@@ -2962,6 +2996,7 @@ impl Desk {
             }
         }
         if grouped {
+            self.born_undo(id).await;
             self.drop_from_layout(id).await;
         }
     }
@@ -4226,6 +4261,9 @@ impl Desk {
                 None => st.modes_started.remove(&r.id),
             };
         }
+        // A boss served from a grant runs it: Desk's check of each call fails
+        // closed. Kept with its process, so a hub that takes it back knows.
+        let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let follows = {
@@ -4254,6 +4292,7 @@ impl Desk {
                     env: &env,
                     theme,
                     mode,
+                    fail_closed,
                 });
                 (spec, None)
             }
@@ -4307,6 +4346,7 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
             "startedAt": started_at,
+            "failClosed": fail_closed,
         });
         let spec = match account_token {
             Some(account_token) => {
@@ -4338,6 +4378,7 @@ impl Desk {
             Live {
                 pty: Arc::new(pty),
                 token,
+                fail_closed,
                 current_tool: None,
                 pending: None,
                 answer: None,
@@ -4662,10 +4703,21 @@ impl Desk {
             Hook::ToolStart { tool, .. } => self.breaker_tool(id, tool),
             _ => None,
         };
-        let answer = move || match (held, allowed) {
-            (Some(why), _) => claude::deny_call(&why),
-            (None, true) => claude::allow_call(),
-            (None, false) => empty(),
+        // A session a boss served from a grant runs: every call Desk doesn't
+        // judge safe for that boss is refused before it runs, the person's
+        // own allow rules notwithstanding, unless the person allowed it in
+        // Desk. Sub-agents' calls too.
+        let served = match (&hook, held.is_some() || allowed) {
+            (Hook::ToolStart { call, input, .. }, false) => {
+                self.served_refuses(id, &call.tool, input, None)
+            }
+            _ => None,
+        };
+        let answer = move || match (held, allowed, served) {
+            (Some(why), ..) => claude::deny_call(&why),
+            (None, true, _) => claude::allow_call(),
+            (None, false, Some(why)) => claude::deny_call(&why),
+            (None, false, None) => empty(),
         };
         // A steer waiting for this tool call's result goes with it.
         let steer = |desk: &Desk, event: &str| {
@@ -6439,6 +6491,7 @@ mod tests {
             account_keys: None,
             line_reach: crate::line::Reach::Group,
             memory: Default::default(),
+            bosses: Default::default(),
         }
     }
 
@@ -8539,6 +8592,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8582,6 +8636,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -8660,6 +8715,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -8723,6 +8779,7 @@ mod tests {
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
+                    bosses: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
