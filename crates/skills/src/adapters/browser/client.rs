@@ -197,28 +197,57 @@ pub(super) enum Decided {
     File(PathBuf),
 }
 
-/// What each identity's next call was decided for, taken by the call.
-static EXPECTED: std::sync::LazyLock<StdMutex<HashMap<SessionId, Decided>>> =
+/// What each call was decided for, by the identity making it and the
+/// call itself ([`call_key`]): taken by that call alone.
+static EXPECTED: std::sync::LazyLock<StdMutex<HashMap<(SessionId, String), Decided>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Notes what the call about to be made by the identity in scope was
-/// decided for; `None` clears it (a navigation to the web is decided by
-/// the gate alone).
-pub(super) fn expect(decided: Option<Decided>) {
+tokio::task_local! {
+    /// The call being made ([`call_key`]), for the length of its tool's run.
+    pub(super) static CALL_KEY: String;
+}
+
+/// Which call this is, as both the gate's decision and the call itself
+/// name it: the tool and its input, less what a credential may be put in
+/// for between the two (`value`, `text`).
+pub(super) fn call_key(tool: &str, input: &Value) -> String {
+    let mut bare = input.clone();
+    if let Value::Object(map) = &mut bare {
+        map.remove("value");
+        map.remove("text");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(tool.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(bare.to_string().as_bytes());
+    lower_hex(&hasher.finalize())
+}
+
+/// Notes what the call `key`, about to be made by the identity in scope,
+/// was decided for; `None` clears it.
+pub(super) fn expect(key: &str, decided: Option<Decided>) {
     let mut expected = EXPECTED.lock().unwrap();
+    let at = (current_session_id(), key.to_string());
     match decided {
-        Some(d) => expected.insert(current_session_id(), d),
-        None => expected.remove(&current_session_id()),
+        Some(d) => expected.insert(at, d),
+        None => expected.remove(&at),
     };
 }
 
-/// Forgets what `agent`'s next call for `user` was decided for: the call
-/// was refused or declined, so it never comes.
-pub fn forget_decision(agent: &str, user: &str) {
+/// Takes what the call in scope was decided for, if it was.
+fn take_decided(id: SessionId) -> Option<Decided> {
+    let key = CALL_KEY.try_with(Clone::clone).ok()?;
+    EXPECTED.lock().unwrap().remove(&(id, key))
+}
+
+/// Forgets what `agent`'s call of `tool` with `input` for `user` was
+/// decided for: it was refused or declined, so it never comes.
+pub fn forget_decision(agent: &str, user: &str, tool: &str, input: &Value) {
+    let key = call_key(tool, input);
     EXPECTED
         .lock()
         .unwrap()
-        .remove(&SessionId::derive(agent, user));
+        .remove(&(SessionId::derive(agent, user), key));
 }
 
 /// The origin the identity in scope's page was last seen on.
@@ -380,10 +409,11 @@ struct SessionCell {
     /// The session (id) its last call came from, for a Stop there.
     last_session: StdMutex<Option<String>>,
     /// That conversation's key, which its allowances are kept under.
-    last_key: StdMutex<Option<String>>,
-    /// The file the page was opened at by a call the person allowed: it
-    /// may show that file (and load it) without the gate allowing it again.
-    opened: Arc<StdMutex<Option<PathBuf>>>,
+    last_key: Arc<StdMutex<Option<String>>>,
+    /// The file a call the person allowed opened, and the one such a call
+    /// is opening now: each may show (and load) without the gate allowing it
+    /// again, and only while the page is on it.
+    files: Arc<StdMutex<FileAllowance>>,
     profile_dir: PathBuf,
     inner: Mutex<Option<Active>>,
     respawn: Mutex<RespawnBudget>,
@@ -411,8 +441,8 @@ impl SessionCell {
             agent,
             user,
             last_session: StdMutex::new(None),
-            last_key: StdMutex::new(None),
-            opened: Arc::new(StdMutex::new(None)),
+            last_key: Arc::new(StdMutex::new(None)),
+            files: Arc::new(StdMutex::new(FileAllowance::default())),
             profile_dir,
             inner: Mutex::new(None),
             respawn: Mutex::new(RespawnBudget::new(RESPAWN_WINDOW_MS, RESPAWN_LIMIT)),
@@ -448,6 +478,18 @@ impl SessionCell {
         }
     }
 
+    /// Whose turn the cell's file checks are made as.
+    fn scope(&self) -> Scope {
+        self.scope_cell()
+    }
+
+    fn scope_cell(&self) -> Scope {
+        Scope {
+            user: self.user.clone(),
+            key: Arc::clone(&self.last_key),
+        }
+    }
+
     /// Keeps the page to what may be open, before and after every call: a
     /// file page only while the agent may read that file, never another
     /// kind of page (a script, the browser's own) — any such is blanked.
@@ -456,8 +498,16 @@ impl SessionCell {
         use super::address::{kind, openable, In, Kind};
         let url = self.current_url(page).await;
         let refused = match kind(&url) {
-            Kind::File(path) => file_refusal(&self.agent, &self.opened, &path),
-            k if openable(&k, In::Desk) => None,
+            Kind::File(path) => {
+                let real = workforce_agent::tools::paths::resolve_real(&path);
+                self.files.lock().unwrap().keep_only(Some(&real));
+                file_refusal(&self.agent, &self.files, &real, &self.scope())
+            }
+            k if openable(&k, In::Desk) => {
+                // Off the file: what was allowed for it is gone.
+                self.files.lock().unwrap().keep_only(None);
+                None
+            }
             Kind::Other(what) => Some(format!(
                 "The page went to {what}, which the browser doesn't open."
             )),
@@ -715,8 +765,13 @@ impl SessionCell {
         let dialog_task =
             spawn_dialog_dismisser(&page, console_log.clone(), self.config.console_log_capacity)
                 .await?;
-        let file_task =
-            spawn_file_keeper(&page, self.agent.clone(), Arc::clone(&self.opened)).await?;
+        let file_task = spawn_file_keeper(
+            &page,
+            self.agent.clone(),
+            Arc::clone(&self.files),
+            self.scope_cell(),
+        )
+        .await?;
         Ok(Active {
             page,
             _browser: browser,
@@ -753,15 +808,19 @@ impl SessionCell {
             )
         };
         let _serial = call_lock.lock().await;
-        let decided = EXPECTED.lock().unwrap().remove(&current_session_id());
-        // A file the person allowed this call to open may show, in place
-        // of any allowed before.
-        if let Some(Decided::File(path)) = &decided {
-            *self.opened.lock().unwrap() = Some(path.clone());
-        }
-        self.keep_page(&page, decided).await?;
+        let decided = take_decided(current_session_id());
+        self.keep_page(&page, decided.clone()).await?;
+        // The file the person allowed this very call to open may load
+        // while it opens it, and no longer unless it did.
+        let opening = match decided {
+            Some(Decided::File(path)) => Some(path),
+            _ => None,
+        };
+        self.files.lock().unwrap().pending = opening;
         let after = page.clone();
-        match timeout(timeout_dur, op(page, network_log, console_log)).await {
+        let ran = timeout(timeout_dur, op(page, network_log, console_log)).await;
+        self.files.lock().unwrap().pending = None;
+        match ran {
             Ok(Ok(v)) => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
                 self.keep_page(&after, None).await?;
@@ -797,15 +856,15 @@ impl SessionCell {
     }
 
     async fn navigate(&self, url: &str) -> Result<Value> {
-        // Leaving for anything but a file lets go of the one allowed.
-        if !matches!(super::address::kind(url), super::address::Kind::File(_)) {
-            *self.opened.lock().unwrap() = None;
-        }
         let url = url.to_string();
         self.with_page(|page, _n, _c| async move {
             page.goto(url.as_str())
                 .await
                 .wrap_err("navigation failed")?;
+            // Opened, by this call the person allowed, exactly the file it
+            // was allowed to: it may stay.
+            let landed = page.url().await.ok().flatten();
+            self.files.lock().unwrap().opened_now(landed.as_deref());
             let title = page
                 .evaluate("document.title")
                 .await
@@ -1561,14 +1620,67 @@ struct Probe {
     shown: String,
 }
 
-/// Why `agent` may not have the file at `path` open, if it may not: it is
-/// the one a call the person allowed opened, or the gate allows it now.
-fn file_refusal(agent: &str, opened: &StdMutex<Option<PathBuf>>, path: &Path) -> Option<String> {
-    let real = workforce_agent::tools::paths::resolve_real(path);
-    if opened.lock().unwrap().as_deref() == Some(real.as_path()) {
+/// What files a page may have without the gate allowing them again.
+#[derive(Debug, Default)]
+struct FileAllowance {
+    /// The file a call the person allowed opened, while the page is on it.
+    opened: Option<PathBuf>,
+    /// The file the call being made now was allowed to open.
+    pending: Option<PathBuf>,
+}
+
+impl FileAllowance {
+    fn allows(&self, real: &Path) -> bool {
+        self.opened.as_deref() == Some(real) || self.pending.as_deref() == Some(real)
+    }
+
+    /// The page is on `file` (or no file): an allowance for another goes.
+    fn keep_only(&mut self, file: Option<&Path>) {
+        if self.opened.as_deref() != file {
+            self.opened = None;
+        }
+    }
+
+    /// The navigation made by the call allowed to open `pending` landed on
+    /// `url`: exactly that file, and it stays allowed.
+    fn opened_now(&mut self, url: Option<&str>) {
+        let landed = match url.map(super::address::kind) {
+            Some(super::address::Kind::File(p)) => {
+                Some(workforce_agent::tools::paths::resolve_real(&p))
+            }
+            _ => None,
+        };
+        if landed.is_some() && landed == self.pending {
+            self.opened = landed;
+        }
+    }
+}
+
+/// Whose page the file keeper checks for: the person and the conversation
+/// key the cell's last call came from, so the gate reads their allowances.
+#[derive(Clone)]
+struct Scope {
+    user: String,
+    key: Arc<StdMutex<Option<String>>>,
+}
+
+/// Why `agent` may not have the file at `real` open, if it may not: a call
+/// the person allowed opened it (or is opening it now), or the gate, asked
+/// as `scope`'s turn, allows it now.
+fn file_refusal(
+    agent: &str,
+    files: &StdMutex<FileAllowance>,
+    real: &Path,
+    scope: &Scope,
+) -> Option<String> {
+    if files.lock().unwrap().allows(real) {
         return None;
     }
-    hooks::hooks().and_then(|h| h.may_open_file(agent, &real).err())
+    let hooks = hooks::hooks()?;
+    let key = scope.key.lock().unwrap().clone().unwrap_or_default();
+    CURRENT_USER_ID.sync_scope(scope.user.clone(), || {
+        CURRENT_SESSION_KEY.sync_scope(key, || hooks.may_open_file(agent, real).err())
+    })
 }
 
 /// Holds every file the page loads (an iframe, an image, a script, the
@@ -1577,7 +1689,8 @@ fn file_refusal(agent: &str, opened: &StdMutex<Option<PathBuf>>, path: &Path) ->
 async fn spawn_file_keeper(
     page: &Page,
     agent: String,
-    opened: Arc<StdMutex<Option<PathBuf>>>,
+    files: Arc<StdMutex<FileAllowance>>,
+    scope: Scope,
 ) -> Result<JoinHandle<()>> {
     use chromiumoxide::cdp::browser_protocol::fetch::{
         ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams, RequestPattern,
@@ -1599,7 +1712,10 @@ async fn spawn_file_keeper(
         while let Some(event) = paused.next().await {
             let id = event.request_id.clone();
             let refused = match super::address::kind(&event.request.url) {
-                super::address::Kind::File(path) => file_refusal(&agent, &opened, &path),
+                super::address::Kind::File(path) => {
+                    let real = workforce_agent::tools::paths::resolve_real(&path);
+                    file_refusal(&agent, &files, &real, &scope)
+                }
                 _ => None,
             };
             let _ = match refused {

@@ -751,4 +751,64 @@ mod tests {
         );
         close(Which::All).await;
     }
+
+    /// A decision goes with its own call: run alongside it, another call
+    /// takes nothing of it, and a decision the person declined lets no
+    /// later move of the page reach that file.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn browser_e2e_a_decision_is_taken_only_by_its_own_call() {
+        if std::env::var("BROWSER_E2E").is_err() {
+            return;
+        }
+        install_hooks(TEST_HOOKS.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let start = dir.path().join("ok-start.html");
+        let x = dir.path().join("decided-x.html");
+        std::fs::write(&start, "<!doctype html><title>Start</title>start").unwrap();
+        std::fs::write(&x, "<!doctype html><title>X</title>x words").unwrap();
+        let skill = e2e_skill(&dir.path().join("profiles"));
+        let tools = skill.tools();
+        let tool = |n: &str| tools.iter().find(|t| t.name() == n).unwrap().clone();
+        let (nav, snap, eval) = (
+            tool("browser.navigate"),
+            tool("browser.snapshot"),
+            tool("browser.evaluate"),
+        );
+        let to_x = serde_json::json!({ "url": format!("file://{}", x.display()) });
+        workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("decision-agent".into(), async {
+                let r = nav.execute(serde_json::json!({ "url": format!("file://{}", start.display()) })).await.unwrap();
+                assert!(r.success, "{:?}", r.error);
+
+                // Two calls decided together and run together: each takes
+                // its own decision.
+                nav.effect(&to_x);
+                snap.effect(&serde_json::json!({}));
+                let (a, b) = tokio::join!(nav.execute(to_x.clone()), snap.execute(serde_json::json!({})));
+                let (a, b) = (a.unwrap(), b.unwrap());
+                assert!(a.success, "the allowed file opens: {:?}", a.error);
+                assert!(b.success, "{:?}", b.error);
+
+                // Back to the start; then a call to X is decided and the
+                // person declines it, while a read runs alongside.
+                let r = nav.execute(serde_json::json!({ "url": format!("file://{}", start.display()) })).await.unwrap();
+                assert!(r.success, "{:?}", r.error);
+                nav.effect(&to_x);
+                snap.effect(&serde_json::json!({}));
+                let read = snap.execute(serde_json::json!({})).await.unwrap();
+                assert!(read.success, "{:?}", read.error);
+                forget_decision("decision-agent", workforce_agent::runner::SYSTEM_USER_ID, "browser.navigate", &to_x);
+                // The page moves itself to X: nothing let it.
+                let moving = serde_json::json!({ "expression": format!("location.href = 'file://{}'", x.display()) });
+                eval.effect(&moving);
+                let moved = eval.execute(moving).await.unwrap();
+                assert!(!moved.success, "a declined file opened after all");
+                let after = snap.execute(serde_json::json!({})).await.unwrap();
+                let url = after.output["url"].as_str().unwrap_or_default().to_string();
+                assert!(url.contains("about:blank"), "{url}");
+            })
+            .await;
+        close(Which::All).await;
+    }
 }

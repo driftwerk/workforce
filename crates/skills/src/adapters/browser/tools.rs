@@ -53,11 +53,12 @@ impl Tool for BrowserTool {
         use workforce_core::computer::Effect;
         let navigating = self.spec.name == "browser.navigate";
         let target = input["url"].as_str().unwrap_or_default();
-        use super::client::{expect, Decided};
+        use super::client::{call_key, expect, Decided};
+        let key = call_key(self.spec.name, input);
         if navigating {
             if let super::address::Kind::File(path) = super::address::kind(target) {
                 let real = workforce_agent::tools::paths::resolve_real(&path);
-                expect(Some(Decided::File(real.clone())));
+                expect(&key, Some(Decided::File(real.clone())));
                 return Effect::Read { paths: vec![real] };
             }
         }
@@ -65,7 +66,7 @@ impl Tool for BrowserTool {
             true => super::address::origin_of(target),
             false => super::client::origin_now(),
         };
-        expect((!navigating).then(|| Decided::Origin(origin.clone())));
+        expect(&key, (!navigating).then(|| Decided::Origin(origin.clone())));
         Effect::Connector {
             connector: site_key(origin.as_deref()),
             write: !READS.contains(&self.spec.name),
@@ -74,7 +75,13 @@ impl Tool for BrowserTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        match (self.spec.handler)(self.client.clone(), input).await {
+        // This call takes what was decided for it, and nothing decided for
+        // another call made alongside it.
+        let key = super::client::call_key(self.spec.name, &input);
+        let ran = super::client::CALL_KEY
+            .scope(key, (self.spec.handler)(self.client.clone(), input))
+            .await;
+        match ran {
             Ok(output) => Ok(ToolResult::success(output, elapsed(start))),
             Err(e) => {
                 warn!(target: "browser", tool = self.spec.name, error = %e, "tool call failed");
