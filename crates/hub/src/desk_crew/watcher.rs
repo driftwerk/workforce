@@ -571,6 +571,33 @@ impl CrewHub {
         )
     }
 
+    /// The short line a turn the person asks the overseer in its Desk DM
+    /// carries: its level now and, where it acts, the switches that are off,
+    /// so it acts within them from the first request.
+    pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
+        let says = match level {
+            _ if unbound => {
+                return "You oversee the crew, unbound: do everything yourself with the crew.* tools.".into();
+            }
+            Level::Watch => "at Watch: don't act; say what you would do.",
+            Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
+            Level::Act => "at Act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) rather than offering it.",
+            Level::Full => "at Act fully: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer), and ship in the repositories the person named.",
+        };
+        let off = o.act.off();
+        let off = match level.acts() && !off.is_empty() {
+            true => format!(
+                " Off: {}; those become suggestions, so say which to turn on.",
+                off.iter()
+                    .map(|label| format!("“{label}”"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            false => String::new(),
+        };
+        format!("You oversee the crew {says}{off}")
+    }
+
     fn level_words(level: Level) -> &'static str {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",

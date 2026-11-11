@@ -5086,3 +5086,31 @@ fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
     assert!(CrewHub::level_hint(Level::Act, &off).contains("“Hand out work”"));
     assert!(!CrewHub::level_hint(Level::Suggest, &off).contains("Hand out work"));
 }
+
+/// The person's own turns in the overseer's DM carry its level and the
+/// switches that are off, in a line, so it acts within them from the first
+/// request; an agent that doesn't oversee carries nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dm_turn_is_told_its_level_and_the_switches_that_are_off() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (helper, _llm) = agent(dir.path(), "scout", "ok").await;
+        let (overseer, _crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n",
+            std::slice::from_ref(&helper),
+        )
+        .await;
+        let hint = eventually("the overseer to be known", async || {
+            super::dm_oversight_hint(&overseer)
+        })
+        .await;
+        assert!(hint.starts_with("You oversee the crew at Act: do the work yourself"), "{hint}");
+        assert!(hint.contains("“Hand out work”"), "{hint}");
+        assert!(hint.len() < 600, "kept short: {hint}");
+        assert_eq!(super::dm_oversight_hint(&helper), None);
+    })
+    .await;
+}
