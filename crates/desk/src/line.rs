@@ -98,6 +98,9 @@ pub enum Wait {
     /// The person has the wheel of a session a boss runs: the boss's
     /// messages wait until their hold is up or they hand it back.
     PersonDriving,
+    /// It still runs in a mode that doesn't ask, set by a boss no longer
+    /// unbound over it: Desk starts it again in its own mode first.
+    ModeEnding,
 }
 
 /// One message on a line, as stored and as Desk shows it.

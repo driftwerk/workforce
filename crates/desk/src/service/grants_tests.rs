@@ -748,3 +748,45 @@ async fn a_session_that_didnt_start_is_born_in_no_grant() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_codex_session_is_never_handed_to_a_served_boss_even_stopped() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let first = engine(pool.clone(), dir.path(), false).await;
+        let mut codex = crate::store::tests::record_fixture("acme-codex");
+        codex.engine = crate::model::Engine::Codex;
+        codex.state = crate::model::SessionState::Stopped;
+        first.store().put(&codex).await.unwrap();
+        let mut claude = crate::store::tests::record_fixture("acme-web");
+        claude.state = crate::model::SessionState::Stopped;
+        first.store().put(&claude).await.unwrap();
+        let d = engine(pool, dir.path(), false).await;
+        for _ in 0..200 {
+            if d.charges_loaded() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let allan = crate::crew::Party::manager("driftwerk/allan", "Allan");
+        let handed = |id| {
+            let d = d.clone();
+            let allan = allan.clone();
+            async move {
+                d.take_on(
+                    id,
+                    &allan,
+                    crate::charge::How::Handed,
+                    &crate::scope::Scope::Ungrouped,
+                    &crate::crew::By::you(),
+                )
+                .await
+            }
+        };
+        let e = handed(codex.id).await.unwrap_err();
+        assert!(e.to_string().contains("checks every call"), "{e}");
+        let ok = handed(claude.id).await;
+        assert!(ok.is_ok(), "{ok:?}");
+    })
+    .await;
+}

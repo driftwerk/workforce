@@ -1791,7 +1791,12 @@ mod plans;
 
 mod act_fully;
 
+mod served;
 mod unbound;
+
+mod uplink_client;
+
+mod relay;
 
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them

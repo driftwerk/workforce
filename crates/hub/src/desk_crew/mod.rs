@@ -37,7 +37,9 @@ mod observe;
 mod plan;
 mod read_only;
 mod reading;
+pub(crate) mod relay;
 mod scope;
+pub(crate) mod served;
 mod spend;
 mod tools;
 mod watcher;
@@ -142,6 +144,16 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Calls for the person's machines, waiting for Desk's native side
+    /// ([`relay`]), and who waits for each answer.
+    relays: Mutex<relay::Relays>,
+    /// Told when a call is queued for a machine.
+    relay_queued: tokio::sync::Notify,
+    /// How long a relayed call waits for its machine's answer.
+    relay_wait: Mutex<Duration>,
+    /// When Desk's native side last asked for calls: while it hasn't
+    /// lately, nothing is queued and a machine is said not reached at once.
+    relay_polled: Mutex<Option<std::time::Instant>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -428,6 +440,10 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            relays: Mutex::default(),
+            relay_queued: tokio::sync::Notify::new(),
+            relay_wait: Mutex::new(Duration::from_secs(30)),
+            relay_polled: Mutex::new(None),
         });
         {
             let mut crews = CREWS.lock();
@@ -495,6 +511,12 @@ impl CrewHub {
             tokio::spawn(async move { desk.keep_boundaries().await });
         }
         for s in self.services() {
+            // A `/` is how a boss served from a grant is known
+            // (`<hub>/<agent>`): no agent of this hub is ever taken for one,
+            // nor oversees under such an id.
+            if workforce_desk::grant::is_served(s.agent_id.as_str()) {
+                continue;
+            }
             let o = self.oversight_of(&s);
             if !o.enabled {
                 continue;
@@ -610,15 +632,14 @@ impl CrewHub {
         by
     }
 
-    /// Whether `service`, an overseer, is an agent this hub runs. Every
-    /// boss is today; a remote boss (RB2) will not be, and is never
-    /// unbound nor anywhere: what it does is the remote hub's to judge, not
-    /// this one's to wave through. When remote bosses land, answer `false`
-    /// for them here.
+    /// Whether `service`, an overseer, is an agent this hub runs. A boss
+    /// served from a grant (a remote boss) never is, and is never unbound
+    /// nor anywhere: what it does is the remote hub's to judge, not this
+    /// one's to wave through.
     pub(crate) fn boss_is_local(&self, service: &AgentService) -> bool {
-        self.services()
-            .iter()
-            .any(|s| s.agent_id.as_str() == service.agent_id.as_str())
+        let id = service.agent_id.as_str();
+        !workforce_desk::grant::is_served(id)
+            && self.services().iter().any(|s| s.agent_id.as_str() == id)
     }
 
     /// Whether `service`, overseeing with `o`, is unbound now: it chose
@@ -637,11 +658,23 @@ impl CrewHub {
     /// Whether the overseer of `o`'s scope acts fully in the repository
     /// session `session` works in, now.
     pub(crate) fn ships_in(&self, session: uuid::Uuid, o: &Oversight) -> bool {
+        let boss = self
+            .overseer_for(&o.scope)
+            .map(|(s, _)| s.agent_id.as_str().to_string());
+        self.ships_in_for(session, o, boss.as_deref())
+    }
+
+    /// Whether `boss`, at `o`, acts fully in the repository session
+    /// `session` works in, now.
+    pub(crate) fn ships_in_for(
+        &self,
+        session: uuid::Uuid,
+        o: &Oversight,
+        boss: Option<&str>,
+    ) -> bool {
         o.level == Level::Full
-            && self.overseer_for(&o.scope).is_some_and(|(s, _)| {
-                let id = s.agent_id.as_str();
-                self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id)
-            })
+            && boss
+                .is_some_and(|id| self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id))
     }
 
     /// Reads what each overseer that chose Act fully has spent today (its

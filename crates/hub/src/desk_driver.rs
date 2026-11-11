@@ -800,6 +800,7 @@ pub async fn mount(
         .await
         .context("opening the desk registry")?;
     let cancel_crew = cancel.clone();
+    let cancel_uplink = cancel.clone();
     let cancel_sync = cancel.clone();
     let floor = workforce_desk::Floor {
         pricer: Some(Arc::new(crate::desk_ledger::HubPricer::new(Arc::clone(
@@ -869,6 +870,27 @@ pub async fn mount(
         crate::desk_crew::Timing::default(),
         cancel_crew,
     );
+    // The boss links this engine holds, its key, and its uplinks to their
+    // boss hubs.
+    let app = app.merge(crate::gateway::hardened(crate::desk_uplink::routes(
+        Arc::clone(state),
+    )));
+    crate::desk_uplink::start(
+        crate::desk_uplink::Uplink {
+            state: Arc::clone(state),
+            crew: Arc::clone(&crew),
+            limits: config.desk.bosses.clone(),
+            #[cfg(test)]
+            dial: None,
+            rates: Default::default(),
+        },
+        cancel_uplink,
+    );
+    // The relay to the person's machines, Desk's native side's alone.
+    let app = app.merge(crate::gateway::hardened(crate::desk_crew::relay::routes(
+        Arc::clone(state),
+        Arc::clone(&crew),
+    )));
     let voice = Realtime::new(Arc::new(VaultKeys(state.vault.clone())));
     let app = app.merge(crate::gateway::hardened(crate::desk_connections::install(
         state,

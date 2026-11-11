@@ -261,6 +261,14 @@ pub fn startable() -> Vec<&'static str> {
 }
 
 /// Whether Desk can start `engine` in `view`.
+/// Whether a boss served from a grant may run `engine`'s sessions: Desk's
+/// pre-tool hook denies every call it doesn't judge safe, and fails closed
+/// when Desk can't be reached ([`crate::claude::hook_settings`]). Claude
+/// Code alone: Codex has no hook that refuses a call before it runs.
+pub fn boss_safe(engine: Engine) -> bool {
+    matches!(engine, Engine::Claude)
+}
+
 pub fn runs(engine: Engine, view: View) -> bool {
     views(engine).contains(&view)
 }
