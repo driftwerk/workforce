@@ -238,21 +238,22 @@ impl DeskStore {
         })
     }
 
-    /// How many calls of `tool` that came to `outcome` link `link_id` made
-    /// here since `since`.
+    /// How many calls of `tool` that came to one of `outcomes` link
+    /// `link_id` made here since `since`.
     pub async fn boss_calls_count(
         &self,
         link_id: &str,
         tool: &str,
-        outcome: &str,
+        outcomes: &[&str],
         since: DateTime<Utc>,
     ) -> Result<i64> {
         let client = self.pool().get().await?;
+        let outcomes: Vec<String> = outcomes.iter().map(|o| o.to_string()).collect();
         Ok(client
             .query_one(
                 "SELECT COUNT(*) FROM boss_calls \
-                 WHERE link_id = $1 AND tool = $2 AND outcome = $3 AND at > $4",
-                &[&link_id, &tool, &outcome, &since],
+                 WHERE link_id = $1 AND tool = $2 AND outcome = ANY($3) AND at > $4",
+                &[&link_id, &tool, &outcomes, &since],
             )
             .await
             .context("counting a boss link's calls")?

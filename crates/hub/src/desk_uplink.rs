@@ -249,24 +249,41 @@ pub fn public_address(url: &str) -> bool {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
             d != "localhost" && !d.ends_with(".localhost")
         }
-        Some(url::Host::Ipv4(ip)) => {
-            !(ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
-        }
+        Some(url::Host::Ipv4(ip)) => public_v4(ip),
         Some(url::Host::Ipv6(ip)) => {
             let seg = ip.segments();
+            let o = ip.octets();
+            let v4 = |a: usize| std::net::Ipv4Addr::new(o[a], o[a + 1], o[a + 2], o[a + 3]);
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) carry an IPv4
+            // address: public only when it is.
+            let nat64 = seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+            let six_to_four = seg[0] == 0x2002;
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || (seg[0] & 0xfe00) == 0xfc00
                 || (seg[0] & 0xffc0) == 0xfe80
-                || ip.to_ipv4_mapped().is_some())
+                || ip.to_ipv4_mapped().is_some()
+                || (nat64 && !public_v4(v4(12)))
+                || (six_to_four && !public_v4(v4(2))))
         }
         None => false,
     }
+}
+
+/// Whether `ip` is an address on the public internet, as far as its range
+/// says.
+fn public_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || a == 0
+        || (a == 100 && (64..128).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 198 && (18..20).contains(&b))
+        || a >= 240)
 }
 
 fn name_ok(s: &str) -> bool {
@@ -287,6 +304,10 @@ async fn put_link(
     let Some(vault) = s.state.vault.as_ref() else {
         return no_vault();
     };
+    // One handover at a time: its checks against the links held and its
+    // write are one step.
+    static HANDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = HANDING.lock().await;
     let Ok(p) = serde_json::from_slice::<PutLink>(&body) else {
         return bad("that isn't a boss link");
     };
@@ -424,6 +445,12 @@ pub struct Rates {
 }
 
 impl Rates {
+    /// Forgets what links no longer held made.
+    fn prune(&mut self, held: &std::collections::HashSet<Uuid>) {
+        self.calls.retain(|id, _| held.contains(id));
+        self.starts.retain(|id, _| held.contains(id));
+    }
+
     /// Whether link `link` may make one more call of `tool` now, counting it.
     fn take(&mut self, link: Uuid, tool: &str, limits: &DeskBossesConfig) -> Result<(), String> {
         let now = Instant::now();
@@ -701,7 +728,7 @@ impl Uplink {
                             .boss_calls_count(
                                 &link.link_id.to_string(),
                                 "crew.start_session",
-                                "ok",
+                                &["ok", "pending"],
                                 since,
                             )
                             .await
@@ -805,6 +832,9 @@ pub fn start(uplink: Uplink, cancel: CancellationToken) {
                     by_hub.entry(l.hub_url.clone()).or_default().push(l);
                 }
             }
+            let held: std::collections::HashSet<Uuid> =
+                by_hub.values().flatten().map(|l| l.link_id).collect();
+            uplink.rates.lock().prune(&held);
             running.retain(|hub, (ids, task)| {
                 let same = by_hub
                     .get(hub)

@@ -472,4 +472,16 @@ async fn a_wss_dial_uses_the_hubs_tls() {
     assert!(!desk_uplink::public_address("https://192.168.1.4"));
     assert!(!desk_uplink::public_address("https://100.64.0.1"));
     assert!(!desk_uplink::public_address("https://[fd00::1]"));
+    for private in [
+        "https://0.1.2.3",
+        "https://192.0.0.8",
+        "https://198.18.0.1",
+        "https://240.0.0.1",
+        "https://[64:ff9b::a00:1]",
+        "https://[2002:c0a8:0101::1]",
+    ] {
+        assert!(!desk_uplink::public_address(private), "{private}");
+    }
+    assert!(desk_uplink::public_address("https://[64:ff9b::808:808]"));
+    assert!(desk_uplink::public_address("https://[2002:808:808::1]"));
 }

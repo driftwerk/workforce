@@ -789,7 +789,9 @@ pub struct DeskBossesConfig {
     /// The most crew calls one boss link may make here a minute. Default: 60.
     #[serde(default = "default_desk_bosses_calls_per_minute")]
     pub calls_per_minute: u32,
-    /// The most sessions one boss link may start here an hour. Default: 6.
+    /// The most sessions one boss link may start here an hour. A link is one
+    /// group's (one boss for one group on this engine), so this is per group.
+    /// Default: 6.
     #[serde(default = "default_desk_bosses_starts_per_hour")]
     pub starts_per_hour: u32,
 }
