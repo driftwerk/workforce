@@ -99,6 +99,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, o: Options) -> Desk {
 
 fn session(dir: &Path, account: Option<Option<Uuid>>) -> NewSession {
     NewSession {
+        fresh_worktree: false,
         engine: Engine::Claude,
         view: None,
         name: "auth-fix".into(),

@@ -56,6 +56,10 @@ pub struct LinkBoard {
     /// not kept, and Take it waits until they check again.
     #[serde(default)]
     pub not_me: bool,
+    /// Link a board that has tickets of its own: they stay on Desk only,
+    /// with their own keys, and the issues come in beside them.
+    #[serde(default)]
+    pub keep_tickets: bool,
     pub states: BTreeMap<TicketState, String>,
 }
 
@@ -223,19 +227,22 @@ impl Desk {
                 other.name
             )));
         }
-        if !self
+        let own = !self
             .0
             .store
             .board_tickets(id)
             .await
             .map_err(internal)?
-            .is_empty()
-        {
+            .is_empty();
+        if own && !link.keep_tickets {
             return Err(DeskError::Conflict(format!(
                 "{} has tickets of its own; link an empty board, or make a new one for {}.",
                 b.name, link.target
             )));
         }
+        // Its own tickets keep their keys, so the board keeps its prefix.
+        let keep_prefix = own && link.keep_tickets;
+        let local_before = keep_prefix.then(crate::crew::now);
         let sync = Sync {
             link: Uuid::new_v4(),
             system: link.system,
@@ -262,10 +269,13 @@ impl Desk {
             retry: Default::default(),
             listing: None,
             assignees_swept: true,
+            local_before,
         };
         self.0
             .store
-            .change_board_sync(id, move |_, _| Ok((Some(sync), None)))
+            .change_board_sync(id, move |_, prefix| {
+                Ok((Some(sync), prefix.filter(|_| keep_prefix)))
+            })
             .await
             .map_err(internal)?
             .ok_or(DeskError::NotFound)?;
@@ -1709,6 +1719,8 @@ impl Desk {
             // Only what the person made here becomes an issue there: never a
             // session's, an agent's or a plan's words.
             None if t.created_by.kind != crate::crew::PartyKind::You => return Ok(()),
+            // A ticket the board had before it was linked stays on Desk only.
+            None if s.local_before.is_some_and(|at| t.created_at <= at) => return Ok(()),
             None => {
                 let made = self.create_issue(b, s, remote, budget, t, q).await?;
                 out.created += 1;

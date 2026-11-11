@@ -2871,6 +2871,12 @@ impl Desk {
             .map(str::trim)
             .filter(|b| !b.is_empty())
         {
+            Some(base) if new.fresh_worktree => {
+                let (path, branch) = worktree::create_fresh(&cwd, base)
+                    .await
+                    .map_err(|e| DeskError::Invalid(e.to_string()))?;
+                (path, Some(branch))
+            }
             Some(branch) => (
                 worktree::create(&cwd, branch)
                     .await
@@ -6522,6 +6528,7 @@ mod tests {
     pub(super) async fn new_session(d: &Desk, dir: &Path) -> SessionView {
         d.create(
             NewSession {
+                fresh_worktree: false,
                 engine: Engine::Claude,
                 view: None,
                 name: "auth-fix".into(),
@@ -7068,6 +7075,7 @@ mod tests {
             let elsewhere = dir.path().join("acme-web");
             std::fs::create_dir(&elsewhere).unwrap();
             let new = |cwd: &Path, worktree: Option<&str>| NewSession {
+                fresh_worktree: false,
                 engine: Engine::Claude,
                 view: None,
                 name: "login-race".into(),
@@ -7232,6 +7240,7 @@ mod tests {
             let s = d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "auth-fix".into(),
@@ -7290,6 +7299,7 @@ mod tests {
             assert!(d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "bad".into(),
@@ -7341,6 +7351,7 @@ mod tests {
             let added = BTreeMap::from([(PLUGIN_DIRS.to_string(), "/plugins/desk".to_string())]);
             d.create(
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Claude,
                     view: None,
                     name: "auth-fix".into(),
@@ -7774,6 +7785,7 @@ mod tests {
             let s = d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "acme-web".into(),

@@ -113,6 +113,10 @@ pub struct Folder {
     pub path: String,
     /// It holds a `.git`: a repository (or a worktree of one).
     pub git: bool,
+    /// Where its repository comes from (its `origin`, else its first
+    /// remote), as `host/owner/repo`: never a user name or password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     pub hidden: bool,
 }
 
@@ -125,6 +129,95 @@ pub struct Listing {
     pub folders: Vec<Folder>,
     /// There were more than [`MAX_FOLDERS`]; the first are shown.
     pub truncated: bool,
+    /// The folder listed is in a git repository: a separate copy of it can
+    /// be made.
+    pub git: bool,
+    /// Its repository's remote, as [`Folder::remote`] says one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+}
+
+/// The `.git` folder that holds `dir`'s repository's config: its own, or
+/// for a worktree the repository it was made from. Looked for in `dir` and
+/// the folders above it while `may` allows them.
+fn git_dir(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let mut at = Some(dir);
+    while let Some(d) = at.filter(|d| may(d)) {
+        let dot = d.join(".git");
+        if dot.is_dir() {
+            return Some(dot);
+        }
+        if dot.is_file() {
+            // A worktree: `gitdir: <repo>/.git/worktrees/<name>`, whose
+            // `commondir` names the repository's own `.git`.
+            let text = std::fs::read_to_string(&dot).ok()?;
+            let linked = text.trim().strip_prefix("gitdir:")?.trim();
+            let linked = d.join(linked);
+            return Some(match std::fs::read_to_string(linked.join("commondir")) {
+                Ok(common) => linked.join(common.trim()),
+                Err(_) => linked,
+            });
+        }
+        at = d.parent();
+    }
+    None
+}
+
+/// Where `dir`'s repository comes from, if it is in one with a remote
+/// (looked for no higher than `may` allows).
+pub fn remote_of(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir(dir, may)?.join("config")).ok()?;
+    let mut section = String::new();
+    let mut first: Option<String> = None;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line.to_string();
+            continue;
+        }
+        let Some(url) = line
+            .strip_prefix("url")
+            .map(str::trim_start)
+            .and_then(|l| l.strip_prefix('='))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if !section.starts_with("[remote ") {
+            continue;
+        }
+        if section == "[remote \"origin\"]" {
+            return shown_remote(url);
+        }
+        first.get_or_insert_with(|| url.to_string());
+    }
+    first.as_deref().and_then(shown_remote)
+}
+
+/// A remote's URL as a person reads it: `host/owner/repo`, with no scheme,
+/// user, password or `.git`.
+pub fn shown_remote(url: &str) -> Option<String> {
+    let u = url.trim();
+    let rest = match u.split_once("://") {
+        Some((_, rest)) => rest.to_string(),
+        // `git@host:owner/repo`
+        None => match u.split_once(':') {
+            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
+            _ => return None,
+        },
+    };
+    // Whoever it signs in as, and any password, never shown.
+    let rest = match rest.split_once('/') {
+        Some((auth, path)) => {
+            let host = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+            format!("{host}/{path}")
+        }
+        None => return None,
+    };
+    let shown = rest
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    (shown.len() > 2 && !shown.chars().any(char::is_control)).then_some(shown)
 }
 
 /// `~` and `~/x` mean the hub user's home: the part after the `~/` (empty
@@ -192,8 +285,10 @@ pub fn list(
         if !real.is_dir() || !inside(&real) {
             continue;
         }
+        let git = real.join(".git").exists();
         found.push(Folder {
-            git: real.join(".git").exists(),
+            remote: git.then(|| remote_of(&real, &|p| p == real)).flatten(),
+            git,
             path: real.to_string_lossy().into_owned(),
             name,
             hidden: is_hidden,
@@ -210,6 +305,8 @@ pub fn list(
         path: dir.to_string_lossy().into_owned(),
         folders: found,
         truncated,
+        git: git_dir(&dir, &inside).is_some(),
+        remote: remote_of(&dir, &inside),
     })
 }
 
@@ -422,5 +519,63 @@ mod tests {
         assert_eq!(l.folders.len(), MAX_FOLDERS);
         assert!(l.truncated);
         assert_eq!(l.folders[0].name, "d0000");
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn a_remote_is_shown_without_who_signs_in() {
+        for (url, shown) in [
+            ("git@github.com:acme/web.git", "github.com/acme/web"),
+            ("https://github.com/acme/web.git", "github.com/acme/web"),
+            (
+                "https://sam:hunter2@gitlab.example/acme/web",
+                "gitlab.example/acme/web",
+            ),
+            (
+                "ssh://git@git.example:2222/acme/web.git/",
+                "git.example:2222/acme/web",
+            ),
+        ] {
+            assert_eq!(shown_remote(url).as_deref(), Some(shown), "{url}");
+        }
+        assert_eq!(shown_remote("/srv/git/web.git"), None);
+    }
+
+    #[test]
+    fn a_listing_says_its_repository_and_remote_and_a_copy_s_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let repo = home.join("web");
+        std::fs::create_dir_all(repo.join(".git/worktrees/fix")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join(".git/config"),
+            "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = https://github.com/up/web\n[remote \"origin\"]\n\turl = git@github.com:acme/web.git\n",
+        )
+        .unwrap();
+        // A separate copy: its `.git` is a file pointing back.
+        let copy = repo.join(".worktrees/fix");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(
+            copy.join(".git"),
+            format!("gitdir: {}\n", repo.join(".git/worktrees/fix").display()),
+        )
+        .unwrap();
+        std::fs::write(repo.join(".git/worktrees/fix/commondir"), "../..\n").unwrap();
+        let top = list(None, false, Some(&home), &[]).unwrap();
+        assert_eq!(
+            top.folders[0].remote.as_deref(),
+            Some("github.com/acme/web")
+        );
+        assert!(!top.git, "home itself is no repository");
+        let inner = list(Some("~/web/src"), false, Some(&home), &[]).unwrap();
+        assert!(inner.git);
+        assert_eq!(inner.remote.as_deref(), Some("github.com/acme/web"));
+        let c = list(Some("~/web/.worktrees/fix"), false, Some(&home), &[]).unwrap();
+        assert_eq!(c.remote.as_deref(), Some("github.com/acme/web"));
     }
 }

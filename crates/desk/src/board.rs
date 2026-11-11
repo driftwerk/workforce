@@ -304,6 +304,11 @@ pub struct Sync {
     /// before assignees were kept catches up on its first pass.
     #[serde(default)]
     pub assignees_swept: bool,
+    /// The board was linked with tickets of its own, which stay on Desk only
+    /// (keeping their own keys) while the issues come in beside them: none
+    /// made before this time is ever made an issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_before: Option<DateTime<Utc>>,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.

@@ -434,6 +434,7 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         me_source: None,
         me_note: None,
         not_me: false,
+        keep_tickets: false,
         states: states(),
     }
 }
