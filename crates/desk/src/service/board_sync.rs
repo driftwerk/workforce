@@ -36,6 +36,9 @@ pub struct LinkBoard {
     #[serde(default)]
     pub target_id: Option<String>,
     pub via: Via,
+    /// The agent there whose tools it syncs through: the hub's to find.
+    #[serde(skip)]
+    pub agent: Option<String>,
     pub filter: Filter,
     /// Who the person is there (their Linear user id or Jira accountId),
     /// for "assigned to me", Mine and Take it: the hub's to look up, or
@@ -242,6 +245,7 @@ impl Desk {
             target: link.target,
             target_id: link.target_id,
             via: link.via,
+            agent: link.agent,
             person: person.to_string(),
             filter: link.filter,
             me_source: link

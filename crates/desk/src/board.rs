@@ -226,13 +226,35 @@ impl Paused {
             ),
             Self::NoToken => format!("Paused: paste a new token for {hub}."),
             Self::Missing { tools } => format!(
-                "Paused: {hub} no longer offers {}.",
-                tools.join(", ")
+                "Paused: no agent on {hub} you can reach has {} switched on any more.",
+                system_of_tools(tools)
             ),
             Self::Refused { reason } => format!("Paused: {hub} refused: {reason}"),
             Self::LeftGroup => "Paused: this board left the group it was linked in; unlink it and link it again.".into(),
         }
     }
+}
+
+/// The system a list of sync tools belongs to, as a person names it.
+fn system_of_tools(tools: &[String]) -> &'static str {
+    match tools.first().map(String::as_str) {
+        Some(t) if t.starts_with("linear") => "Linear",
+        _ => "Jira",
+    }
+}
+
+/// An agent's id as a person reads it: `lattice` is Lattice.
+pub fn agent_title(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A board's link: one Jira project or one Linear team, through one hub,
@@ -250,6 +272,11 @@ pub struct Sync {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
     pub via: Via,
+    /// The agent on the hub whose tools it syncs through (`/mcp/agents/{id}`):
+    /// the one that offers them all, found when it is linked and again when
+    /// it stops offering them. None: the hub's default agent (`/mcp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Whose token or keys it syncs with: the person who linked it.
     pub person: String,
     pub filter: Filter,

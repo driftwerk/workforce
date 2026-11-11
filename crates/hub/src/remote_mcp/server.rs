@@ -27,7 +27,7 @@ use crate::mcp::{build_mcp_registry, matches_any, McpEndpoint, Surface};
 use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor, PendingCalls};
 use crate::serve::AgentService;
 
-use super::access::{reachable, Unreachable};
+use super::access::{reachable, reachable_ids, Unreachable};
 use super::agent_tools::{agent_tools, AgentToolsContext, ChatTurns};
 use super::approvals::approval_tools;
 use super::auth::authenticate;
@@ -127,6 +127,7 @@ pub fn router(remote: Arc<RemoteMcpState>) -> Router {
                 .get(method_not_allowed)
                 .delete(session_closed),
         )
+        .route("/mcp/agents", axum::routing::get(list_agents))
         .route(
             "/mcp/agents/{agent_id}",
             post(serve_agent)
@@ -135,6 +136,39 @@ pub fn router(remote: Arc<RemoteMcpState>) -> Router {
         )
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(remote)
+}
+
+/// `GET /mcp/agents`: the agents the token's person may reach here, each
+/// served at `/mcp/agents/{id}`, and which is the default (`/mcp`). What a
+/// client (a Desk's board sync) picks from when the default agent lacks the
+/// tools it needs. Ids only: each agent's tools are its own `tools/list`.
+async fn list_agents(State(remote): State<Arc<RemoteMcpState>>, headers: HeaderMap) -> Response {
+    let gateway = &remote.gateway;
+    if !gateway.remote_mcp.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            "remote MCP is not enabled on this install",
+        )
+            .into_response();
+    }
+    let caller = match authenticate(gateway, &headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let identity_id = caller.identity.id.to_string();
+    let limited = CallerContext {
+        identity_id: Some(identity_id.clone()),
+        ..Default::default()
+    };
+    if let Err(retry_after) = check_action_rate_limit(gateway.action_limiter.as_ref(), &limited) {
+        return too_many_requests_err(retry_after).into_response();
+    }
+    let default_id = gateway.registry.default_id().to_string();
+    let agents: Vec<serde_json::Value> = reachable_ids(gateway, &identity_id)
+        .into_iter()
+        .map(|id| serde_json::json!({ "default": id == default_id, "id": id }))
+        .collect();
+    axum::Json(serde_json::json!({ "agents": agents })).into_response()
 }
 
 async fn method_not_allowed() -> StatusCode {
