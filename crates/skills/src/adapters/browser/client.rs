@@ -578,8 +578,9 @@ impl SessionCell {
             untrusted::on(&self.key, &final_url);
             self.done(&page, "browser.navigate", Some(&url)).await;
             let mut seen = Seen::at(&final_url);
-            let title = seen.text(&title);
-            Ok(seen.into_output(&self.key, json!({ "url": final_url, "title": title })))
+            // The address is the page's to choose too (its path, its query).
+            let (shown_url, title) = (seen.text(&final_url), seen.text(&title));
+            Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
         })
         .await
     }
@@ -607,7 +608,8 @@ impl SessionCell {
                 .unwrap_or_default();
             let url = self.current_url(&page).await;
             let mut seen = Seen::at(&url);
-            let (title, body_text) = (seen.text(&title), seen.text(&body_text));
+            let (url, title, body_text) =
+                (seen.text(&url), seen.text(&title), seen.text(&body_text));
             Ok(seen.into_output(
                 &self.key,
                 json!({ "url": url, "title": title, "body_text": body_text }),
