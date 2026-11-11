@@ -42,7 +42,9 @@ pub fn channel_id(channel: &str) -> &str {
 }
 
 pub use workforce_core::desk;
-pub use workforce_core::desk::{is_desk_conversation, is_desk_room, DESK_CHANNEL};
+pub use workforce_core::desk::{
+    is_desk_boss_channel, is_desk_conversation, is_desk_room, DESK_BOSS_PREFIX, DESK_CHANNEL,
+};
 
 /// The chat platforms whose tools post where people read: a tool in one of
 /// their namespaces is taken to write there unless it says it only reads.

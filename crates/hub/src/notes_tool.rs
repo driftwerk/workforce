@@ -822,7 +822,7 @@ impl Tool for NotesTool {
                 // A boss's tasks in a group it has left stay with that group.
                 if let Some(sessions) = &self.sessions {
                     all.retain(|(sid, _)| {
-                        !matches!(sessions.get(sid), Ok(Some(s)) if s.left_behind())
+                        !matches!(sessions.get(sid), Ok(Some(s)) if s.kept_apart())
                     });
                 }
                 let mut visible_total = 0usize;

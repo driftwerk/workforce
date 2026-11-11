@@ -603,7 +603,8 @@ pub(crate) fn recent_sessions_digest_block(
     user: &str,
     channel_id: Option<&str>,
 ) -> Option<String> {
-    if !digest_turn_admits(session, user, channel_id) {
+    // A boss conversation's talk is its group's: no other's comes in.
+    if !digest_turn_admits(session, user, channel_id) || session.kept_apart() {
         return None;
     }
     crate::session_digest::build_digest(
@@ -1675,6 +1676,11 @@ pub(crate) async fn build_enhanced_prompt_with_context(
             contents.push(match from_store {
                 crate::notes_tool::EpisodicDay::Notes(joined) => Some(joined),
                 crate::notes_tool::EpisodicDay::Suppressed => None,
+                crate::notes_tool::EpisodicDay::Absent
+                    if crate::memory_fence::in_boss_conversation() =>
+                {
+                    None
+                }
                 crate::notes_tool::EpisodicDay::Absent => {
                     workforce_common::identity::load_daily_note(
                         &workspace,
@@ -2694,7 +2700,9 @@ pub(crate) fn know_how_person(
     session: &workforce_common::session::Session,
     principal: &str,
 ) -> Option<String> {
-    if crate::turn_extraction::is_internal_channel(&session.channel) {
+    // Nor a boss conversation's: what is learned there is its group's, and
+    // what is learned elsewhere isn't.
+    if crate::turn_extraction::is_internal_channel(&session.channel) || session.kept_apart() {
         return None;
     }
     crate::endpoint_cmd::identity_id(principal)
@@ -2845,7 +2853,9 @@ pub(crate) fn spawn_turn_extraction(
     }
     let mem = service.effective_memory();
     let turn_tokens = estimate_tokens(effective_message) + estimate_tokens(response);
-    let is_dm = session.context_type == Some(workforce_common::session::SessionContextType::Dm);
+    // What a boss conversation says of people isn't fenced to its group.
+    let is_dm = session.context_type == Some(workforce_common::session::SessionContextType::Dm)
+        && !workforce_common::channels::is_desk_boss_channel(&session.channel);
     let (want_passive, want_relationship) = plan_turn_extraction(
         &mem,
         turn_tokens,
@@ -3153,6 +3163,8 @@ pub(crate) async fn process_turn(
         memory_fence: Some(crate::memory_fence::fence_for_turn(
             &service.agent_id,
             &service.workspace,
+            channel,
+            || service.sessions.find(channel, user).ok().flatten(),
         )),
         ..SessionContext::capture()
     }
@@ -3295,6 +3307,12 @@ pub(crate) async fn process_admitted(
     }
 
     if let Some(block) = named_secret_context(channel) {
+        effective_message = format!("{block}\n\n{effective_message}");
+    }
+
+    // A Desk group's boss conversation opens every turn with whose group it
+    // is and what's connected: display alone, the engines decide.
+    if let Some(block) = crate::boss_links::tools::context_block(service, &session) {
         effective_message = format!("{block}\n\n{effective_message}");
     }
 
@@ -3818,7 +3836,8 @@ pub(crate) async fn process_admitted(
             // content. Reinforcement self-gates (nothing is injected in a
             // shared room, so it no-ops).
             extract_enabled: service.effective_memory().lesson_extract
-                && !session.is_shared_conversation(),
+                && !session.is_shared_conversation()
+                && !session.kept_apart(),
             llm: &service.llm,
             store: service.memory_store.as_ref(),
             agent_id: &service.agent_id,
@@ -4193,7 +4212,12 @@ pub(crate) async fn run_isolated(
             as_principal(
                 principal,
                 workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(
-                    crate::memory_fence::turn_fence(&service.agent_id, &service.workspace),
+                    crate::memory_fence::fence_for_turn(
+                        &service.agent_id,
+                        &service.workspace,
+                        channel,
+                        || None,
+                    ),
                     inner,
                 ),
             ),
@@ -4783,6 +4807,12 @@ pub(crate) async fn stream_admitted(
         effective_message = format!("{block}\n\n{effective_message}");
     }
 
+    // A Desk group's boss conversation opens every turn with whose group it
+    // is and what's connected: display alone, the engines decide.
+    if let Some(block) = crate::boss_links::tools::context_block(service, &session) {
+        effective_message = format!("{block}\n\n{effective_message}");
+    }
+
     // An agent that runs programs is told, in the request itself, when to
     // answer with one: guidance a model reads as part of the ask.
     if let Some(hint) = service.programs().as_deref().and_then(|p| p.hint()) {
@@ -5204,8 +5234,10 @@ pub(crate) async fn stream_admitted(
     // gated on `lesson_extract`.
     // Shared sessions are excluded from lesson extraction (see the
     // `process_message` site): their turns belong to no single user.
-    let ls_extract_enabled =
-        service.effective_memory().lesson_extract && !session.is_shared_conversation();
+    // Nor a boss conversation's: lessons aren't fenced to its group.
+    let ls_extract_enabled = service.effective_memory().lesson_extract
+        && !session.is_shared_conversation()
+        && !session.kept_apart();
     let ls_llm = Arc::clone(&service.llm);
     let ls_store = service.memory_store.as_ref().map(Arc::clone);
     let ls_agent_id = service.agent_id.clone();
@@ -5290,8 +5322,12 @@ pub(crate) async fn stream_admitted(
     // What the turn remembers is its agent's scope as it begins (boss-gaps
     // W8): a boss moved meanwhile tags none of this turn's writes as the
     // new scope's.
-    let memory_fence_for_task =
-        crate::memory_fence::fence_for_turn(&service.agent_id, &service.workspace);
+    let memory_fence_for_task = crate::memory_fence::fence_for_turn(
+        &service.agent_id,
+        &service.workspace,
+        &session.channel,
+        || Some(session.clone()),
+    );
     let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     let handle = tokio::spawn(workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),

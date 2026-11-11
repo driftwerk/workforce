@@ -38,6 +38,19 @@ pub fn is_desk_room(channel: &str) -> bool {
     room_slug(channel).is_some()
 }
 
+/// What the channel of a Desk group's boss conversation on a boss hub
+/// starts with (remote bosses): `desk:boss:<the hub's group key>`. Not a
+/// room ([`is_desk_room`] refuses its `:`), and only a link makes one.
+pub const DESK_BOSS_PREFIX: &str = "desk:boss:";
+
+/// Whether `channel` is, or claims to be, a Desk group's boss conversation:
+/// any case of [`DESK_BOSS_PREFIX`].
+pub fn is_desk_boss_channel(channel: &str) -> bool {
+    channel
+        .get(..DESK_BOSS_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(DESK_BOSS_PREFIX))
+}
+
 /// Whether `channel` is one of Desk's: a DM or a room.
 pub fn is_desk_conversation(channel: &str) -> bool {
     channel == DESK_CHANNEL || is_desk_room(channel)
@@ -884,6 +897,17 @@ mod tests {
 
     fn room_id() -> Uuid {
         Uuid::parse_str(ROOM).unwrap()
+    }
+
+    #[test]
+    fn a_boss_channel_is_no_room_and_is_told_in_any_case() {
+        for c in ["desk:boss:abc", "DESK:Boss:abc", "desk:boss:"] {
+            assert!(is_desk_boss_channel(c), "{c}");
+            assert!(!is_desk_conversation(c), "{c}");
+        }
+        for c in ["desk", "desk:boss", "desk:bossy", "slack:desk:boss:x", "dé"] {
+            assert!(!is_desk_boss_channel(c), "{c}");
+        }
     }
 
     fn in_room(thread: Option<Uuid>) -> DeskPlace {

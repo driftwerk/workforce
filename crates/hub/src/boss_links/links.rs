@@ -371,6 +371,29 @@ pub fn list(
     device_links(store(state)?, person, device_id, Utc::now())
 }
 
+/// The live links `person` holds for the agent `agent_id` as the boss of
+/// the group `group_key` (the hub's key), by link id: one per engine, from
+/// whichever device minted them. A link renewed but not yet revoked is
+/// counted once.
+pub fn group_links(
+    state: &GatewayState,
+    person: Uuid,
+    agent_id: &str,
+    group_key: &str,
+) -> Result<Vec<DeskLink>, LinkError> {
+    let now = Utc::now();
+    let mut links: Vec<DeskLink> = store(state)?
+        .list_tokens_for_identity(person)?
+        .into_iter()
+        .filter(|t| t.is_live(now) && t.scope() == Some(TokenScope::DeskBoss))
+        .filter_map(|t| t.desk_link)
+        .filter(|l| l.agent_id == agent_id && l.group_key == group_key)
+        .collect();
+    links.sort_by(|a, b| a.link_id.cmp(&b.link_id));
+    links.dedup_by(|a, b| a.link_id == b.link_id);
+    Ok(links)
+}
+
 /// Revokes the boss link token `id`, when it is a live one the device
 /// `device_id` minted for `person`. Anything else is `false`, and nothing
 /// says which. Works while `[desk_boss]` is off too, so a link can always

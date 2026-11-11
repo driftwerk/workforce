@@ -555,6 +555,11 @@ pub struct ToolStats {
 /// it was had in as that group's boss: the group's memory tag.
 pub const LEFT_SCOPE_KEY: &str = "desk_scope_left";
 
+/// The session metadata key of a Desk group's boss conversation on a boss
+/// hub: the group, person and agent its link made it for. Only the link
+/// code writes it, and it follows the conversation's rollovers.
+pub const DESK_BOSS_KEY: &str = "desk_boss";
+
 /// A conversation session between a user and an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -947,6 +952,13 @@ impl Session {
         self.metadata.get(LEFT_SCOPE_KEY).is_some()
     }
 
+    /// Whether this session is never read in its agent's other
+    /// conversations: [left behind](Self::left_behind) by a boss, or a Desk
+    /// group's boss conversation on a boss hub, whose talk is that group's.
+    pub fn kept_apart(&self) -> bool {
+        self.left_behind() || workforce_core::desk::is_desk_boss_channel(&self.channel)
+    }
+
     /// Whether this session has been sealed by a thread rollover. A sealed
     /// session is never returned by `get_or_create` — the thread's active
     /// session is the newest unsealed member sharing its `(channel, owner)`.
@@ -1267,6 +1279,7 @@ impl Session {
         for key in [
             DESK_ORIGIN_KEY,
             DESK_CLOSED_KEY,
+            DESK_BOSS_KEY,
             "voice_mode",
             "voice_turn",
             DICTATED_TURN_KEY,

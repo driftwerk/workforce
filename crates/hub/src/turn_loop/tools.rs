@@ -157,6 +157,14 @@ pub(crate) async fn turn_tools(
         base
     };
     let base = without_disabled_tools(service, base);
+    // A Desk group's boss conversation: its boss tools and the agent's
+    // fenced memory alone, whatever else a whitelist names.
+    if workforce_common::channels::is_desk_boss_channel(&session.channel) {
+        return TurnTools {
+            registry: crate::boss_links::tools::for_turn(service, session, base),
+            exclusive: true,
+        };
+    }
     let Some(whitelist) = whitelist else {
         return TurnTools {
             registry: base,
