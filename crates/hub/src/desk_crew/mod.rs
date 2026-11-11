@@ -37,6 +37,7 @@ mod observe;
 mod plan;
 mod read_only;
 mod reading;
+pub(crate) mod relay;
 mod scope;
 pub(crate) mod served;
 mod spend;
@@ -143,6 +144,16 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Calls for the person's machines, waiting for Desk's native side
+    /// ([`relay`]), and who waits for each answer.
+    relays: Mutex<relay::Relays>,
+    /// Told when a call is queued for a machine.
+    relay_queued: tokio::sync::Notify,
+    /// How long a relayed call waits for its machine's answer.
+    relay_wait: Mutex<Duration>,
+    /// When Desk's native side last asked for calls: while it hasn't
+    /// lately, nothing is queued and a machine is said not reached at once.
+    relay_polled: Mutex<Option<std::time::Instant>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -426,6 +437,10 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            relays: Mutex::default(),
+            relay_queued: tokio::sync::Notify::new(),
+            relay_wait: Mutex::new(Duration::from_secs(30)),
+            relay_polled: Mutex::new(None),
         });
         {
             let mut crews = CREWS.lock();

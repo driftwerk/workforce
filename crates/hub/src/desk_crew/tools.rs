@@ -251,12 +251,13 @@ impl CrewTool {
                     .filter(|c| c.boss == boss)
                     .map(|c| (c.session.to_string(), c.wheel))
                     .collect();
-                Ok(json!({
+                let local = json!({
                     "counts": o.counts,
                     "table": reported(&table(&o.items, &o.groups, &charged), "the crew's sessions and agents"),
                     "slots": { "busy": crew.desk.charges_busy(&boss), "parallel": parallel },
                     "plans": crew.plans_seen(seen).await,
-                }))
+                });
+                Ok(self.with_machines(crew, b, &boss, local).await)
             }
             "crew.activity" => {
                 let limit = input["limit"].as_i64().unwrap_or(30).clamp(1, 100);
@@ -422,6 +423,149 @@ impl CrewTool {
                 }))
             }
         }
+    }
+}
+
+/// What a local overseer may ask of its group's sessions on a machine,
+/// through the relay: by a session id of the machine's (`devbox/<id>`).
+const RELAYED: [&str; 9] = [
+    "crew.history",
+    "crew.nudge",
+    "crew.approve",
+    "crew.deny",
+    "crew.stop",
+    "crew.interrupt",
+    "crew.resume",
+    "crew.restart",
+    "crew.release",
+];
+
+impl CrewTool {
+    /// The group its scope is, when it is one: a machine's sessions are
+    /// relayed only for a group's boss for now.
+    fn group(&self) -> Option<&str> {
+        self.scope.group()
+    }
+
+    /// The machines whose sessions are in its group, by the sidebar.
+    fn machines(&self, crew: &CrewHub) -> Vec<String> {
+        let Some(g) = self.group() else {
+            return Vec::new();
+        };
+        let layout = crew.desk.layout();
+        let mut out: Vec<String> = layout
+            .groups
+            .iter()
+            .filter(|x| x.id == g)
+            .flat_map(|x| x.items.iter())
+            .filter_map(|i| i.strip_prefix("session:"))
+            .filter_map(super::relay::machine_session)
+            .map(|(m, _)| m.to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `local`, the overview of this Mac, with each machine's part of its
+    /// group, asked through the relay at once.
+    async fn with_machines(
+        &self,
+        crew: &Arc<CrewHub>,
+        b: &Bound,
+        boss: &str,
+        local: Value,
+    ) -> Value {
+        let (Some(g), machines) = (self.group(), self.machines(crew)) else {
+            return local;
+        };
+        let ceiling = super::served::Ceiling {
+            level: b.oversight.level,
+            act: b.oversight.act,
+        };
+        let ceiling = &ceiling;
+        let asks = machines.iter().map(|m| {
+            let crew = Arc::clone(crew);
+            async move {
+                let part = crew
+                    .relay(m, g, "crew.overview", json!({}), boss, ceiling)
+                    .await;
+                (m.clone(), part)
+            }
+        });
+        let parts = futures::future::join_all(asks).await;
+        super::relay::merge_overview(local, parts)
+    }
+
+    /// The call, when it names one of a machine's sessions: relayed there,
+    /// decided there under its grant for the group, the boss this tool's.
+    /// Nothing of it is done or judged here. None when it names none.
+    async fn relayed(
+        &self,
+        crew: &Arc<CrewHub>,
+        b: &Bound,
+        input: &Value,
+    ) -> Option<Result<Value, String>> {
+        let named = input["session_id"].as_str()?;
+        let (machine, id) = super::relay::machine_session(named)?;
+        if !RELAYED.contains(&self.name) {
+            return Some(Err(format!(
+                "{} can't be done to a session on {machine} yet; tell the person instead.",
+                self.name
+            )));
+        }
+        let Some(g) = self.group() else {
+            return Some(Err(
+                "Sessions on a machine are run only by their group's boss for now.".into(),
+            ));
+        };
+        // In its own group by the sidebar, as the machine's grant will also
+        // say: nothing outside it is sent anywhere.
+        let item = format!("session:{machine}/{id}");
+        if crew.desk.group_of_member(&item).as_deref() != Some(g) {
+            return Some(Err(crew.not_ours(&self.scope)));
+        }
+        // What its own level here doesn't let it do, it doesn't ask of a
+        // machine either; the machine decides at no more than it.
+        if self.name != "crew.history"
+            && b.oversight.level == workforce_common::oversight::Level::Watch
+        {
+            return Some(Err(
+                "You only watch the crew: tell the person what you would do instead.".into(),
+            ));
+        }
+        let ceiling = super::served::Ceiling {
+            level: b.oversight.level,
+            act: b.oversight.act,
+        };
+        let mut sent = input.clone();
+        sent["session_id"] = json!(id.to_string());
+        let agent = b.service.agent_id.as_str();
+        Some(
+            match crew
+                .relay(machine, g, self.name, sent, agent, &ceiling)
+                .await
+            {
+                Ok(a) => {
+                    let said = reported(
+                        &workforce_desk::sees::capped(
+                            &a.body.to_string(),
+                            workforce_desk::sees::MAX_CHARS,
+                        ),
+                        &format!("{machine}'s answer"),
+                    );
+                    match a.status {
+                        super::served::ServedStatus::Refused => Err(said),
+                        super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
+                        super::served::ServedStatus::Suggested => Ok(json!({
+                            "suggested": said,
+                            "note": format!("Not done: {machine} keeps it for the person to decide."),
+                        })),
+                    }
+                }
+                Err(why) => Err(why),
+            },
+        )
     }
 }
 
@@ -612,7 +756,9 @@ impl Tool for CrewTool {
             oversight,
             seen: crew.desk.seen_by(&self.scope),
         };
-        let result = if READ.contains(&self.name) {
+        let result = if let Some(relayed) = self.relayed(&crew, &bound, &input).await {
+            relayed
+        } else if READ.contains(&self.name) {
             self.read(&crew, &bound, &input).await
         } else if [super::plan::NAME, super::plan::UPDATE].contains(&self.name) {
             crew.plan_tool(self.name, &bound, &input).await

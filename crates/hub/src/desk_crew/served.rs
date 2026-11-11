@@ -71,10 +71,70 @@ pub struct ServedCall {
     /// call is acted on once.
     pub link_id: Option<String>,
     pub call_id: Option<String>,
+    /// What the boss may do where it runs, when its carrier says (a local
+    /// overseer's own level and switches, relayed): the call is decided at
+    /// the lower of it and the grant's, never above either.
+    pub ceiling: Option<Ceiling>,
+}
+
+/// Whether switch `k` of `act` is on: off unless said so.
+fn switch_on(act: &Value, k: &str) -> bool {
+    act.get(k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The switches `act` turns on, each off unless it says so.
+pub fn act_of(act: &Value) -> Act {
+    let on = |k: &str| switch_on(act, k);
+    Act {
+        nudge: on("nudge"),
+        resume_restart: on("resume_restart"),
+        read_only_approvals: on("read_only_approvals"),
+        hand_out_work: on("hand_out_work"),
+        interrupt: on("interrupt"),
+        message_agents: on("message_agents"),
+        message_terminal_sessions: on("message_terminal_sessions"),
+        answer_sessions: on("answer_sessions"),
+        hand_off: on("hand_off"),
+    }
+}
+
+/// A boss's own level and switches, as its home holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ceiling {
+    pub level: Level,
+    pub act: Act,
+}
+
+fn rank(l: Level) -> u8 {
+    match l {
+        Level::Watch => 0,
+        Level::Suggest => 1,
+        Level::Act => 2,
+        Level::Full => 3,
+    }
+}
+
+/// `o` no higher than `c`: the lower level, and each switch on only where
+/// both have it on.
+pub fn narrowed(mut o: Oversight, c: &Ceiling) -> Oversight {
+    if rank(c.level) < rank(o.level) {
+        o.level = c.level;
+    }
+    let (a, b) = (&mut o.act, &c.act);
+    a.nudge &= b.nudge;
+    a.resume_restart &= b.resume_restart;
+    a.read_only_approvals &= b.read_only_approvals;
+    a.hand_out_work &= b.hand_out_work;
+    a.interrupt &= b.interrupt;
+    a.answer_sessions &= b.answer_sessions;
+    a.message_agents &= b.message_agents;
+    a.message_terminal_sessions &= b.message_terminal_sessions;
+    a.hand_off &= b.hand_off;
+    o
 }
 
 /// What became of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServedStatus {
     Ok,
@@ -113,7 +173,7 @@ fn refused(why: impl Into<String>) -> (ServedStatus, Value) {
 /// widens it beyond the grant's group: never Ungrouped for a boss on
 /// another hub, never anywhere.
 pub fn served_oversight(g: &Grant) -> Oversight {
-    let on = |k: &str| g.act.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let on = |k: &str| switch_on(&g.act, k);
     let parallel = g
         .act
         .get("parallel")
@@ -319,7 +379,10 @@ impl CrewHub {
             return refused(workforce_desk::scope::not_ours(None));
         }
         let boss = call.boss.party_id();
-        let o = served_oversight(&grant);
+        let o = match &call.ceiling {
+            Some(c) => narrowed(served_oversight(&grant), c),
+            None => served_oversight(&grant),
+        };
         // One boss per group: a local overseer of it means no grant's boss
         // is served here.
         if self.overseer_for(&o.scope).is_some() {

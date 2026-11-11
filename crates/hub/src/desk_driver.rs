@@ -867,6 +867,11 @@ pub async fn mount(
         crate::desk_crew::Timing::default(),
         cancel_crew,
     );
+    // The relay to the person's machines, Desk's native side's alone.
+    let app = app.merge(crate::gateway::hardened(crate::desk_crew::relay::routes(
+        Arc::clone(state),
+        Arc::clone(&crew),
+    )));
     let voice = Realtime::new(Arc::new(VaultKeys(state.vault.clone())));
     let app = app.merge(crate::gateway::hardened(crate::desk_connections::install(
         state,
