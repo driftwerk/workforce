@@ -920,6 +920,7 @@ impl Tool for JiraListCommentsTool {
                             "id": c["id"],
                             "author": c["author"]["displayName"],
                             "author_account_id": c["author"]["accountId"],
+                            "author_account_type": c["author"]["accountType"],
                             "body_html": wrap_field(&c["renderedBody"], "jira.list_comments.body"),
                             "created": c["created"],
                             "updated": c["updated"],

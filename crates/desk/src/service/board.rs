@@ -1574,6 +1574,20 @@ impl Desk {
                     .detail(json!({ "comment": text }))
                     .about_ticket(t.id, group.as_deref()),
                 );
+                // A session's note is its own, and stays in Desk: never
+                // posted to an issue, where it might name what is private.
+                self.0
+                    .store
+                    .add_comment(
+                        t.id,
+                        None,
+                        &crate::ticket_comments::author_from(&by.party),
+                        &by.party,
+                        &crate::ticket_comments::held(&text),
+                        now(),
+                    )
+                    .await
+                    .map_err(|e| say(internal(e)))?;
                 Ok(json!({ "key": k, "commented": true }))
             }
             TicketCall::Create {

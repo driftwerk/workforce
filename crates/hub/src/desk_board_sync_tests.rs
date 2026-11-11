@@ -52,6 +52,8 @@ pub(crate) struct Jira {
     pub shared_key: bool,
     /// Each issue's attachments: id, filename, type and bytes.
     pub files: BTreeMap<String, Vec<(String, String, String, Vec<u8>)>>,
+    /// Each issue's comments: id, author, body, and whether an app wrote it.
+    pub comments: BTreeMap<String, Vec<(String, String, String, bool)>>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -205,7 +207,35 @@ impl Tool for FakeJiraTool {
                 }
                 json!({ "key": key, "transitioned": true })
             }
-            "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
+            "jira.add_comment" => {
+                let n = j.comments.values().map(Vec::len).sum::<usize>() + 1;
+                let id = format!("{}", 20_000 + n);
+                let body = input["body"].as_str().unwrap_or_default().to_string();
+                j.comments.entry(key.clone()).or_default().push((
+                    id.clone(),
+                    "Sam".into(),
+                    body,
+                    false,
+                ));
+                json!({ "key": key, "comment_id": id })
+            }
+            "jira.list_comments" => {
+                let comments: Vec<Value> = j
+                    .comments
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(n, (id, author, body, app))| {
+                        let at = format!("2026-11-10T09:{n:02}:00.000+0000");
+                        json!({ "id": id, "author": author, "author_account_id": "acc",
+                            "author_account_type": if *app { "app" } else { "atlassian" },
+                            "body_html": wrapped(&format!("<p>{body}</p>"), "jira.list_comments.body"),
+                            "created": at, "updated": at })
+                    })
+                    .collect();
+                json!({ "issue_key": key, "count": comments.len(), "comments": comments })
+            }
             "jira.myself" => {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
                     "personal": !j.shared_key })
@@ -264,6 +294,7 @@ pub(crate) fn register_jira(
             "jira.delete_issue",
             "jira.myself",
             "jira.attachment_read",
+            "jira.list_comments",
         ]
         .iter(),
     ) {

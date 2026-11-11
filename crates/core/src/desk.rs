@@ -884,10 +884,15 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
 pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &["jira.myself", "linear.viewer"];
 
 /// What a ticket's view reads of its issue through the board's sync: an
-/// attachment's or an upload's bytes, a chunk at a time. Like the identity
+/// attachment's or an upload's bytes, a chunk at a time, and its comments. Like the identity
 /// tools, called when the hub offers them and never needed: a hub without
 /// them still syncs, and its tickets' files open in Jira or Linear instead.
-pub const BOARD_SYNC_VIEW_TOOLS: &[&str] = &["jira.attachment_read", "linear.upload_read"];
+pub const BOARD_SYNC_VIEW_TOOLS: &[&str] = &[
+    "jira.attachment_read",
+    "jira.list_comments",
+    "linear.upload_read",
+    "linear.comment_list",
+];
 
 #[cfg(test)]
 mod tests {
