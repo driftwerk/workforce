@@ -594,8 +594,12 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
-        // A browser call is kept under the site its page is on.
+        // A browser opening a file reads it (its own effect); any other
+        // browser call is kept under the site its page is on.
         if tool.starts_with("browser.") {
+            if matches!(effect, Effect::Read { .. }) {
+                return effect;
+            }
             let (host, _) = page_now(&self.policy.agent);
             return Effect::Connector {
                 connector: browser_site(host.as_deref()),

@@ -1147,16 +1147,26 @@ fn browser_verdicts_by_standing_and_tool() {
                 run,
                 "unbound {tool}"
             );
-            assert_eq!(
-                verdict(
-                    &browsing_as(Browsing::Asks, access, false),
-                    false,
-                    &[],
-                    &write
-                ),
-                page_ask(true),
-                "asks {tool} at {access:?}"
+            let asked = verdict(
+                &browsing_as(Browsing::Asks, access, false),
+                false,
+                &[],
+                &write,
             );
+            if *tool == "browser.evaluate" {
+                assert!(
+                    matches!(
+                        asked,
+                        Verdict::Ask {
+                            why: Why::Unclear,
+                            ..
+                        }
+                    ),
+                    "{asked:?}"
+                );
+            } else {
+                assert_eq!(asked, page_ask(true), "asks {tool} at {access:?}");
+            }
             let suggests = verdict(
                 &browsing_as(Browsing::Suggests, access, false),
                 false,
@@ -1431,4 +1441,65 @@ fn a_session_may_start_in_a_folder_it_works_in() {
         ),
         run()
     );
+}
+
+/// A script on a page asks each time below unbound: no site allowance
+/// covers it, since it can press what the never-list reads.
+#[test]
+fn a_script_on_a_page_asks_each_time_below_unbound() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let script = on_page("browser.evaluate", true);
+    let once = Verdict::Ask {
+        choices: vec![Choice::AllowOnce, Choice::Deny],
+        why: Why::Unclear,
+    };
+    assert_eq!(verdict(&p_, false, &[], &script), once);
+    assert_eq!(
+        verdict(&p_, false, &[site_allowance("shop.example", "s1")], &script),
+        once,
+        "an allowance for the site doesn't cover a script"
+    );
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Unbound, Access::Full, false),
+            false,
+            &[],
+            &script
+        ),
+        Verdict::Run { by: By::Rule }
+    );
+}
+
+/// A browser opening a file reads it: Desk's data is withheld, and below
+/// Read anywhere only the own folder is read.
+#[test]
+fn a_browser_opening_a_file_is_held_as_a_read() {
+    for (access, path, refused) in [
+        (
+            Access::Full,
+            format!("{DATA}/hub/data/vault.enc"),
+            Some(Refused::Withheld),
+        ),
+        (
+            Access::OwnFolder,
+            "/Users/sarah/.ssh/id_rsa".to_string(),
+            Some(Refused::OutsideLevel),
+        ),
+        (Access::OwnFolder, format!("{OWN}/report.html"), None),
+    ] {
+        let mut p_ = browsing_as(Browsing::Unbound, access, false);
+        p_.browser.browsing = Browsing::Unbound;
+        let call = CallFacts {
+            tool: "browser.navigate".into(),
+            ..call(read(&path))
+        };
+        let v = verdict(&p_, false, &[], &call);
+        match refused {
+            Some(rule) => assert!(
+                matches!(&v, Verdict::Refuse { refusal } if refusal.rule == rule),
+                "{path}: {v:?}"
+            ),
+            None => assert_eq!(v, Verdict::Run { by: By::Rule }, "{path}"),
+        }
+    }
 }
