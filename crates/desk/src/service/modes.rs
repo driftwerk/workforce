@@ -124,7 +124,7 @@ impl Desk {
     /// while it runs in a mode that doesn't ask, only an unbound boss that
     /// runs it may, until Desk has put it back in its own mode.
     pub fn boss_may_drive(&self, id: Uuid, boss: &str) -> Result<(), String> {
-        let Some(mode) = self.0.state.lock().modes_started.get(&id).copied() else {
+        let Some(mode) = self.live_mode(id) else {
             return Ok(());
         };
         if mode.asks() || self.unbound_runs(id, boss) {
@@ -136,11 +136,52 @@ impl Desk {
         ))
     }
 
+    /// The mode that doesn't ask `id` runs in now, as a boss kept it.
+    fn live_mode(&self, id: Uuid) -> Option<Mode> {
+        let st = self.0.state.lock();
+        st.modes_started
+            .get(&id)
+            .copied()
+            .filter(|m| !m.asks() && st.live.contains_key(&id))
+    }
+
+    /// Whether `id` runs in a mode that doesn't ask while the boss that
+    /// runs it (if any) isn't unbound over it: it is on its way back to its
+    /// own mode, and only the person drives it until then.
+    pub(crate) fn mode_ending(&self, id: Uuid) -> bool {
+        self.live_mode(id).is_some()
+            && !self
+                .charge_of(id)
+                .filter(|c| c.live())
+                .is_some_and(|c| self.unbound_runs(id, &c.boss))
+    }
+
+    /// [`Self::boss_may_drive`] for `by`, when it is a boss.
+    pub(crate) fn mode_lets(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
+        match by.filter(|b| b.party.kind == PartyKind::Manager) {
+            Some(b) => self
+                .boss_may_drive(id, &b.party.id)
+                .map_err(DeskError::Conflict),
+            None => Ok(()),
+        }
+    }
+
     /// Something that decides whose modes hold changed (a boss's grant, a
-    /// charge): the sessions it affects go back to their own modes.
+    /// charge, a turn's end): the sessions it affects go back to their own
+    /// modes. Called from wherever, it runs on the runtime when there is
+    /// one.
     pub(crate) fn modes_changed(&self) {
+        self.0
+            .modes_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "no runtime to put sessions back in their own modes on; the next change does"
+            );
+            return;
+        };
         let d = self.clone();
-        tokio::spawn(async move { d.restore_modes().await });
+        rt.spawn(async move { d.restore_modes().await });
     }
 
     /// Drops each kept mode that doesn't ask whose boss is no longer
@@ -148,12 +189,15 @@ impl Desk {
     /// one again in its own mode: at once when it is between turns, else
     /// once its turn ends.
     async fn restore_modes(&self) {
-        // One at a time: another sees what this one leaves.
+        // One at a time: the one running sees what is marked dirty before
+        // it ends.
         let Ok(_one) = self.0.modes_restoring.try_lock() else {
             return;
         };
         use crate::model::SessionState as S;
+        use std::sync::atomic::Ordering;
         loop {
+            self.0.modes_dirty.store(false, Ordering::SeqCst);
             let dropped = self
                 .edit_modes(|modes| {
                     let before = modes.len();
@@ -166,22 +210,32 @@ impl Desk {
             }
             let kept = self.kept_modes().await;
             let running: Vec<(Uuid, Mode)> = {
-                let st = self.0.state.lock();
+                let mut st = self.0.state.lock();
+                // Stopped with its mode gone: nothing is left to restore.
+                let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
+                st.modes_started
+                    .retain(|id, _| live.contains(id) || kept.contains_key(id));
                 st.modes_started
                     .iter()
-                    .filter(|(id, m)| !m.asks() && st.live.contains_key(id))
+                    .filter(|(id, m)| !m.asks() && live.contains(id))
                     .filter(|(id, _)| !kept.contains_key(id))
                     .map(|(id, m)| (*id, *m))
                     .collect()
             };
             if running.is_empty() {
+                if self.0.modes_dirty.load(Ordering::SeqCst) {
+                    continue;
+                }
                 return;
             }
             let mut waiting = false;
             for (id, mode) in running {
                 let Ok(view) = self.view(id) else { continue };
+                // Mid-turn, waiting on an answer, or the person typing into
+                // it: once that is over.
                 if view.pending.is_some()
                     || matches!(view.state, S::Working | S::Blocked | S::Asking)
+                    || self.person_driving(id)
                 {
                     waiting = true;
                     continue;
@@ -298,6 +352,7 @@ impl Desk {
             ));
         }
         self.boss_holds(id, Some(&by))?;
+        self.mode_lets(id, Some(&by))?;
         self.breaker_refuses_prompt(id, Some(&by))?;
         let kept = Kept {
             mode,

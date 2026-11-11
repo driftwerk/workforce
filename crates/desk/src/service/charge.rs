@@ -502,8 +502,6 @@ impl Desk {
         let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
             return Ok(());
         };
-        self.boss_may_drive(id, &boss.party.id)
-            .map_err(DeskError::Conflict)?;
         let Some(c) = self.charge_of(id).filter(Charge::live) else {
             return Ok(());
         };
@@ -572,6 +570,10 @@ impl Desk {
         }
         self.boss_holds(id, Some(boss))?;
         self.breaker_refuses_prompt(id, Some(boss))?;
+        // Allowing what it asks drives it; denying makes nothing happen.
+        if decision == Decision::Allow {
+            self.mode_lets(id, Some(boss))?;
+        }
         if self.pending_of(id, approval).is_none() {
             return Err(DeskError::Conflict("already answered".into()));
         }

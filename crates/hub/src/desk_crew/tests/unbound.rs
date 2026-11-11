@@ -735,6 +735,26 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                     .then_some(())
             })
             .await;
+            // While unbound, it asks the session for the deploy: queued for
+            // its turn's end.
+            let asked = overseer
+                .tools
+                .get("crew.nudge")
+                .unwrap()
+                .execute(json!({"session_id": s.id.to_string(), "message": "Run the deploy", "reason": "Next."}))
+                .await
+                .unwrap();
+            assert!(asked.output["done"].is_string(), "{ends:?}: {asked:?}");
+            let queued = eventually("the nudge queued", async || {
+                d.store()
+                    .line_inbox(&s.id.to_string())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.text == "Run the deploy")
+                    .map(|m| m.id)
+            })
+            .await;
             let before = starts_of(&base, s.id);
             match ends {
                 Ends::BoxUnticked => {
@@ -810,20 +830,71 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                 why.contains("put back in its own mode") || why.contains("puts it back"),
                 "{why}"
             );
+            assert_eq!(d.view(s.id).unwrap().mode, Some(workforce_desk::mode::Mode::Auto), "{ends:?}: mid-turn");
+            // Stopping its turn still runs, Desk's side too, and ends it;
+            // handed to another boss, it is that boss's to stop, so its turn
+            // just ends.
             let (_, o) = crew.overseer_service().unwrap();
-            assert_eq!(
-                crew.gate(&Action::Interrupt { session: s.id }, &o),
-                Gate::Run
-            );
-            assert_eq!(
-                d.view(s.id).unwrap().mode,
-                Some(workforce_desk::mode::Mode::Auto),
-                "{ends:?}: mid-turn"
-            );
-            // Its turn ends: it starts again in its own mode.
-            hook(&url, json!({"hook_event_name": "Stop"})).await;
-            let args = next_start(&base, s.id, &before).await;
+            match ends {
+                Ends::AnotherBoss => hook(&url, json!({"hook_event_name": "Stop"})).await,
+                _ => {
+                    assert_eq!(crew.gate(&Action::Interrupt { session: s.id }, &o), Gate::Run);
+                    let stopped = overseer
+                        .tools
+                        .get("crew.interrupt")
+                        .unwrap()
+                        .execute(json!({"session_id": s.id.to_string(), "reason": "Hold on."}))
+                        .await
+                        .unwrap();
+                    assert!(stopped.output["done"].is_string(), "{ends:?}: {stopped:?}");
+                    json!(null)
+                }
+            };
+            // The queued deploy never goes in while it runs in auto mode:
+            // it starts again in its own mode first.
+            let args = loop {
+                let m = d.store().line_message(queued).await.unwrap().unwrap();
+                let mode = d.view(s.id).unwrap().mode;
+                // Queued still, or withdrawn with the boss that sent it.
+                use workforce_desk::line::Delivery;
+                assert!(
+                    mode.is_none() || matches!(m.delivery, Delivery::Queued | Delivery::Withdrawn),
+                    "{ends:?}: {:?} in {mode:?}",
+                    m.delivery
+                );
+                if let Some(a) = starts_of(&base, s.id).into_iter().find(|a| !before.contains(a)) {
+                    break a;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
             assert!(!args.contains("--permission-mode"), "{ends:?}: {args}");
+            // In its own mode, the deploy goes in, asking as any turn does.
+            let marker = format!("/hook/{}/", s.id);
+            let at = args.find(&marker).unwrap();
+            let token: String = args[at + marker.len()..]
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            let start = args[..at].rfind("http://").unwrap();
+            let new_url = format!("{}{token}", &args[start..at + marker.len()]);
+            hook(
+                &new_url,
+                json!({"hook_event_name": "SessionStart", "session_id": "cli-1", "source": "resume"}),
+            )
+            .await;
+            let went = eventually("the deploy settled", async || {
+                let m = d.store().line_message(queued).await.unwrap()?;
+                (m.delivery != workforce_desk::line::Delivery::Queued).then_some(m.delivery)
+            })
+            .await;
+            eprintln!("{ends:?}: the queued deploy {went:?}");
+            // Its boss let go of it: what it sent is withdrawn. Otherwise,
+            // another boss's now too, it goes in, in the session's own mode,
+            // where what it leads to asks.
+            match ends {
+                Ends::Released => assert_eq!(went, workforce_desk::line::Delivery::Withdrawn),
+                _ => assert_eq!(went, workforce_desk::line::Delivery::Delivered, "{ends:?}"),
+            }
             eventually("its card", async || {
                 d.view(s.id).unwrap().mode.is_none().then_some(())
             })

@@ -905,6 +905,8 @@ struct Inner {
     modes_write: tokio::sync::Mutex<()>,
     /// Held while sessions are put back in their own modes.
     modes_restoring: tokio::sync::Mutex<()>,
+    /// Something changed that may end a mode since the restore last looked.
+    modes_dirty: std::sync::atomic::AtomicBool,
     /// Held while a move is made: two previews of one item never both go
     /// through, the second finding what it does changed.
     move_write: tokio::sync::Mutex<()>,
@@ -1555,6 +1557,7 @@ impl Desk {
             plan_write: tokio::sync::Mutex::new(()),
             modes_write: tokio::sync::Mutex::new(()),
             modes_restoring: tokio::sync::Mutex::new(()),
+            modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
         }));
@@ -3087,6 +3090,7 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.mode_lets(id, by.as_ref())?;
         self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
@@ -3210,6 +3214,7 @@ impl Desk {
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
         self.boss_holds(id, Some(&by))?;
+        self.mode_lets(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
         self.person_resumes(id, Some(&by)).await;
