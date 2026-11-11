@@ -442,24 +442,43 @@ impl Desk {
         Err(Self::all_full(st, engine, &sides))
     }
 
-    /// "Every Claude account here is at its limit: Work until 12 Nov 09:00
-    /// UTC, Personal until …".
+    /// "Every Claude account here is at its plan limit: Work (its 5-hour
+    /// limit, resets 12 Nov 09:00 UTC), Personal (its weekly limit, resets
+    /// …)". Names the window each is full on, and says that extra usage and
+    /// one model's own limit aren't what stops a session starting.
     fn all_full(st: &super::State, engine: Engine, sides: &[Option<Uuid>]) -> DeskError {
+        let now = Utc::now();
         let until: Vec<String> = sides
             .iter()
             .map(|s| {
                 let name = accounts::Side::of(&st.accounts, *s).name;
-                match Self::full_now(st, *s).flatten() {
-                    Some(at) => format!("{name} until {}", at.format("%-d %b %H:%M UTC")),
+                match Self::standing_of(st, Self::canonical(st, *s)).full_by(now) {
+                    Some(f) => match f.until {
+                        Some(at) => format!(
+                            "{name} (its {}, resets {})",
+                            f.window_name(),
+                            at.format("%-d %b %H:%M UTC")
+                        ),
+                        None => format!("{name} (its {}, no reset time yet)", f.window_name()),
+                    },
                     None => format!("{name} (no reset time yet)"),
                 }
             })
             .collect();
         DeskError::Conflict(format!(
-            "every {} account here is at its limit: {}",
+            "every {} account here is at its plan limit: {}",
             engine.title(),
             until.join(", ")
         ))
+    }
+
+    /// A session was started on `account` (`None`: the CLI's own sign-in)
+    /// just now: a reading of the account taken before can't alone say it is
+    /// full from here on.
+    pub(super) fn started_on(&self, account: Option<Uuid>) {
+        let mut st = self.0.state.lock();
+        let raw = Self::raw_of(&st, account);
+        Self::standing_mut(&mut st, &raw).started_at = Some(Utc::now());
     }
 
     /// The person's Claude accounts for the hub's own model calls (the

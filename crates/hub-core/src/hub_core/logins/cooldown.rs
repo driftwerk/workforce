@@ -54,6 +54,16 @@ impl CooldownStore {
         if signal.status != LimitStatus::Rejected {
             return;
         }
+        // Extra usage or one model's weekly window spent stops no plan
+        // session: the login stays in use.
+        if !workforce_common::usage::window_stops_plan(signal.window.as_deref()) {
+            tracing::info!(
+                kind = key.kind.label(),
+                window = signal.window.as_deref().unwrap_or("unknown"),
+                "a login's extra usage or one model's limit is spent; the plan isn't full"
+            );
+            return;
+        }
         let until = signal
             .resets_at
             .filter(|reset| *reset > now)
@@ -136,6 +146,29 @@ mod tests {
             store.cooling.read().is_empty(),
             "expired entries are pruned"
         );
+    }
+
+    #[test]
+    fn extra_usage_and_one_models_limit_cool_nothing() {
+        let store = CooldownStore::default();
+        let now = Utc::now();
+        let december = now + TimeDelta::days(20);
+        for window in ["overage", "seven_day_opus"] {
+            let signal = LimitSignal {
+                status: LimitStatus::Rejected,
+                resets_at: Some(december),
+                window: Some(window.into()),
+            };
+            store.note(&key("claude"), &signal, now);
+            assert_eq!(store.until(&key("claude"), now), None, "{window}");
+        }
+        let weekly = LimitSignal {
+            status: LimitStatus::Rejected,
+            resets_at: Some(now + TimeDelta::days(2)),
+            window: Some("seven_day".into()),
+        };
+        store.note(&key("claude"), &weekly, now);
+        assert!(store.until(&key("claude"), now).is_some());
     }
 
     #[test]

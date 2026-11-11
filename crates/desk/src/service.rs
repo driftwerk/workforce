@@ -1982,11 +1982,28 @@ impl Desk {
             // When Claude Code said it resets; else what a reading says. The
             // account it stopped on, whichever credential of it it ran on.
             let raw = Self::raw_running(st, id);
+            // What Claude Code said; else what the words name, if not the
+            // plan's own window.
+            let in_words = view
+                .failure
+                .is_none()
+                .then(|| {
+                    transitions.iter().find_map(|t| match t {
+                        Transition::Finished { reply } => {
+                            Some(crate::limit::LimitHit::in_words(reply))
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
             Self::mark_hit(
                 st,
                 id,
                 &raw,
-                view.failure.as_ref().and_then(|f| f.limit()),
+                view.failure
+                    .as_ref()
+                    .and_then(|f| f.limit())
+                    .or(in_words.as_ref()),
                 Utc::now(),
             );
             let desk = self.clone();
@@ -2861,6 +2878,9 @@ impl Desk {
             ));
         }
         let account = self.account_for(new.engine, new.account)?;
+        if new.engine == Engine::Claude {
+            self.started_on(account);
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -5380,6 +5400,27 @@ impl Desk {
             identities::Waiting::Hit(id, hit.cloned(), now).wait(st);
             return None;
         }
+        // Only the plan's own window fills the account. A model's weekly
+        // window holds that model alone; extra usage or credits spent stops
+        // no plan session.
+        match hit.map(|h| h.reach()) {
+            Some(crate::limit::Reach::Credit) => {
+                tracing::info!(session = %id, window = hit.and_then(|h| h.window.as_deref()), "a session stopped on extra usage; the plan isn't full");
+                return None;
+            }
+            Some(crate::limit::Reach::Model(model)) => {
+                let until = hit
+                    .and_then(|h| h.resets_at)
+                    .unwrap_or(now + chrono::Duration::hours(5));
+                tracing::info!(session = %id, %model, %until, "a session stopped on one model's weekly limit; the account isn't full");
+                let standing = Self::standing_mut(st, raw);
+                let held = standing.model_holds.entry(model).or_insert(until);
+                *held = (*held).max(until);
+                Self::wrote_hit(st, raw, identities::Writer::Session(id));
+                return None;
+            }
+            _ => {}
+        }
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
@@ -5486,6 +5527,20 @@ impl Desk {
         });
     }
 
+    /// Takes back the stop session `id` marked on its account, when it was
+    /// the account's last: back to what the stop before it said.
+    fn undo_mark(st: &mut State, id: Uuid) {
+        if let Some(mark) = st.limit_marks.remove(&id) {
+            let s = Self::standing_mut(st, &mark.side);
+            if s.hit_at == Some(mark.at) {
+                (s.hit_at, s.hit_until, s.hit_window) = mark.before;
+                if let Some(by) = st.written_by.get_mut(&mark.side) {
+                    by.hit = None;
+                }
+            }
+        }
+    }
+
     /// What the transcript said of the API error session `id`'s turn ended
     /// on, on `account`; it decides over the hook's words. The plan's limit
     /// makes the account full until its reset, though the words didn't say
@@ -5505,9 +5560,16 @@ impl Desk {
             let current = st.turn_failures.get(&id).cloned();
             match (current, said) {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
-                    let standing = Self::standing_mut(&mut st, &account);
-                    standing.hit_until = hit.resets_at.or(standing.hit_until);
-                    standing.hit_window = hit.minutes().or(standing.hit_window);
+                    if hit.reach() == crate::limit::Reach::Plan {
+                        let standing = Self::standing_mut(&mut st, &account);
+                        standing.hit_until = hit.resets_at.or(standing.hit_until);
+                        standing.hit_window = hit.minutes().or(standing.hit_window);
+                    } else {
+                        // Words read as the plan's; the transcript names a
+                        // model's or extra usage: the account isn't full.
+                        Self::undo_mark(&mut st, id);
+                        Self::mark_session_hit(&mut st, id, &account, Some(&hit));
+                    }
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     false
                 }
@@ -5521,22 +5583,13 @@ impl Desk {
                     tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
                     // Only the stop this session marked: another session's
                     // stop on the same account since stands.
-                    if let Some(mark) = st.limit_marks.remove(&id) {
-                        let s = Self::standing_mut(&mut st, &mark.side);
-                        if s.hit_at == Some(mark.at) {
-                            // Back to what the last stop before it said.
-                            (s.hit_at, s.hit_until, s.hit_window) = mark.before;
-                            if let Some(by) = st.written_by.get_mut(&mark.side) {
-                                by.hit = None;
-                            }
-                        }
-                    }
+                    Self::undo_mark(&mut st, id);
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
                     true
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
-                    if standing.hit_at.is_some() {
+                    if standing.hit_at.is_some() && hit.reach() == crate::limit::Reach::Plan {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                         standing.hit_window = hit.minutes().or(standing.hit_window);
                     }
