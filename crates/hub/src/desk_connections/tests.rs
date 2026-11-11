@@ -781,6 +781,16 @@ async fn a_flat_connection_moves_to_a_named_one_at_its_own_tier_and_nothing_is_l
     h.global
         .set(&mine("skills/email/accounts/default/password"), "app-pass")
         .unwrap();
+    // And Allan's own mailbox, at the same instance of his own tier.
+    h.allan
+        .set(
+            &mine("skills/email/accounts/default/username"),
+            "bot@acme.example",
+        )
+        .unwrap();
+    h.allan
+        .set(&mine("skills/email/accounts/default/password"), "bot-pass")
+        .unwrap();
     // What Sarah's Linear's last check found goes with it.
     h.kept
         .put(
@@ -816,8 +826,9 @@ async fn a_flat_connection_moves_to_a_named_one_at_its_own_tier_and_nothing_is_l
                 "sarah@acme.example".into(),
                 VaultSource::GlobalPerUser
             ),
+            // Allan's own takes a key of its own: `default` is Sarah's.
             (
-                "agent~allan~default".into(),
+                "agent~allan~linear".into(),
                 "Linear".into(),
                 VaultSource::AgentPerUser
             ),
@@ -837,19 +848,36 @@ async fn a_flat_connection_moves_to_a_named_one_at_its_own_tier_and_nothing_is_l
     );
     assert_eq!(
         names("email"),
-        [(
-            "all~~default".into(),
-            "sarah@acme.example".into(),
-            VaultSource::GlobalPerUser
-        )]
+        [
+            (
+                "all~~default".into(),
+                "sarah@acme.example".into(),
+                VaultSource::GlobalPerUser
+            ),
+            (
+                "agent~allan~bot-acme-example".into(),
+                "bot@acme.example".into(),
+                VaultSource::AgentPerUser
+            ),
+        ]
     );
+    assert_eq!(
+        h.allan
+            .get(&mine("skills/email/accounts/bot-acme-example/password"))
+            .as_deref(),
+        Some("bot-pass")
+    );
+    assert!(h
+        .allan
+        .get(&mine("skills/email/accounts/default/password"))
+        .is_none());
     // Each moved at its tier, every value with it, the flat ones gone.
     assert_eq!(
         h.global.get(&mine(&ws("default", "api_key"))).as_deref(),
         Some(GOOD)
     );
     assert_eq!(
-        h.allan.get(&mine(&ws("default", "api_key"))).as_deref(),
+        h.allan.get(&mine(&ws("linear", "api_key"))).as_deref(),
         Some(GOOD2)
     );
     assert_eq!(

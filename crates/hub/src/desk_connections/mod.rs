@@ -746,7 +746,7 @@ impl Connections {
                     let Ok(vault) = self.vault_at(tier, &level) else {
                         continue;
                     };
-                    match self.migrate_at(c, tier, &vault, person, checked) {
+                    match self.migrate_at(c, &level, tier, &vault, person, checked) {
                         Ok(Some(key)) => {
                             moved = true;
                             if key != DEFAULT_INSTANCE {
@@ -774,49 +774,53 @@ impl Connections {
 
     /// [`Self::migrate`] of `c` at one tier: the instance it moved to, if
     /// it moved or was named.
+    ///
+    /// It becomes the adapters' `default` (GitHub's: the owner it reached),
+    /// unless another level holds that already (the person's connection for
+    /// all their agents, migrated first): it then takes a key of its own,
+    /// from its account, else the service, so the two stay two connections
+    /// an agent can pick one by one.
     fn migrate_at(
         &self,
         c: &Connector,
+        level: &Level,
         tier: VaultSource,
         vault: &Vault,
         person: &str,
         checked: Option<&Checked>,
     ) -> eyre::Result<Option<String>> {
         let actor = VaultActor::User(person);
-        let account = checked.and_then(|k| k.account.clone());
-        let flat_primary = key_at(tier, person, c.primary);
-        if vault.get(&flat_primary).is_none() {
+        // Email and Google always kept theirs at `default`, the instance
+        // path: unnamed, it is one kept before Connections named them.
+        let native = c.primary == c.primary_at(DEFAULT_INSTANCE);
+        if vault.get(&key_at(tier, person, c.primary)).is_none() {
             return Ok(None);
         }
-        // Email and Google always kept theirs at `default`: it only needs
-        // a name.
-        if c.primary == c.primary_at(DEFAULT_INSTANCE) {
-            let label = key_at(
-                tier,
-                person,
-                &c.label_at(DEFAULT_INSTANCE).expect("a named connector"),
-            );
-            if vault.get(&label).is_some() {
-                return Ok(None);
-            }
-            let account = account.or_else(|| {
-                ["username", "email"]
-                    .iter()
-                    .find_map(|sub| vault.get(&key_at(tier, person, &c.at(DEFAULT_INSTANCE, sub))))
-            });
-            let name = name_of(c, account.as_deref(), None);
-            vault.apply(
-                &[VaultOp::Set {
-                    path: &label,
-                    value: &name,
-                }],
-                actor,
-            )?;
-            return Ok(Some(DEFAULT_INSTANCE.to_string()));
+        let default_label = key_at(
+            tier,
+            person,
+            &c.label_at(DEFAULT_INSTANCE).expect("a named connector"),
+        );
+        if native && vault.get(&default_label).is_some() {
+            return Ok(None);
         }
-        // GitHub's instance is the owner it reaches by default: the one it
-        // reached before, or its own account's.
-        let key = match c.id {
+        let account = checked.and_then(|k| k.account.clone()).or_else(|| {
+            native
+                .then(|| {
+                    ["username", "email"].iter().find_map(|sub| {
+                        vault.get(&key_at(tier, person, &c.at(DEFAULT_INSTANCE, sub)))
+                    })
+                })
+                .flatten()
+        });
+        let site = c.site.filter(|_| !native).and_then(|s| {
+            c.fields
+                .iter()
+                .find(|f| f.name == s)
+                .and_then(|f| vault.get(&key_at(tier, person, f.path)))
+        });
+        let name = name_of(c, account.as_deref(), site.as_deref());
+        let mut key = match c.id {
             "github" => self
                 .github_owner
                 .as_deref()
@@ -826,6 +830,26 @@ impl Connections {
                 .unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
             _ => DEFAULT_INSTANCE.to_string(),
         };
+        // The person's connection for all their agents keeps its key.
+        let taken = *level != Level::All
+            && self
+                .levels()
+                .iter()
+                .filter(|l| *l != level)
+                .any(|l| self.instances(c, l, person).iter().any(|(k, _)| *k == key));
+        if taken {
+            key = self.new_key(c, person, &name);
+        }
+        if native && key == DEFAULT_INSTANCE {
+            vault.apply(
+                &[VaultOp::Set {
+                    path: &default_label,
+                    value: &name,
+                }],
+                actor,
+            )?;
+            return Ok(Some(DEFAULT_INSTANCE.to_string()));
+        }
         if vault
             .get(&key_at(tier, person, &c.primary_at(&key)))
             .is_some()
@@ -837,22 +861,27 @@ impl Connections {
             );
             return Ok(None);
         }
-        let moving: Vec<(String, String, String)> = c
-            .fields
-            .iter()
-            .filter_map(|f| {
-                let from = key_at(tier, person, f.path);
+        // What it holds, from where it is kept now to its instance's.
+        let from: Vec<(String, String)> = match native {
+            true => c
+                .subs
+                .iter()
+                .map(|sub| (c.at(DEFAULT_INSTANCE, sub), c.at(&key, sub)))
+                .collect(),
+            false => c
+                .fields
+                .iter()
+                .map(|f| (f.path.to_string(), c.field_at(f, &key)))
+                .collect(),
+        };
+        let moving: Vec<(String, String, String)> = from
+            .into_iter()
+            .filter_map(|(from, to)| {
+                let from = key_at(tier, person, &from);
                 let value = vault.get(&from)?;
-                Some((from, key_at(tier, person, &c.field_at(f, &key)), value))
+                Some((from, key_at(tier, person, &to), value))
             })
             .collect();
-        let site = c.site.and_then(|s| {
-            c.fields
-                .iter()
-                .find(|f| f.name == s)
-                .and_then(|f| vault.get(&key_at(tier, person, f.path)))
-        });
-        let name = name_of(c, account.as_deref(), site.as_deref());
         let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
         let mut ops: Vec<VaultOp<'_>> = Vec::new();
         for (_, to, value) in &moving {
