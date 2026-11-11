@@ -1,5 +1,5 @@
 //! What each connection to a service last said when it was checked
-//! (`desk` schema, V024). The keys are in the hub's vault only: a row here
+//! (`desk` schema, V024; one per adapter instance since V049). The keys are in the hub's vault only: a row here
 //! holds the account a check named, its status and when, never a secret.
 //! `detail` reaches here already tokenised by the hub.
 
@@ -78,6 +78,9 @@ impl Status {
 pub struct Checked {
     pub connector: String,
     pub level: Level,
+    /// The adapter instance it is (`acme` of `skills/jira/workspaces/acme/…`);
+    /// `default` for a service with one.
+    pub instance: String,
     pub person: String,
     pub account: Option<String>,
     pub status: Status,
@@ -98,6 +101,7 @@ fn checked(row: &Row) -> Result<Option<Checked>> {
     Ok(Some(Checked {
         connector: row.try_get("connector")?,
         level,
+        instance: row.try_get("instance")?,
         person: row.try_get("person")?,
         account: row.try_get("account")?,
         status,
@@ -113,7 +117,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                "SELECT * FROM connections WHERE person = $1 ORDER BY connector, level, agent",
+                "SELECT * FROM connections WHERE person = $1 ORDER BY connector, level, agent, instance",
                 &[&person],
             )
             .await?;
@@ -133,9 +137,9 @@ impl DeskStore {
         client
             .execute(
                 "INSERT INTO connections
-                   (connector, level, agent, person, account, status, detail, connected_at, checked_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (connector, level, agent, person) DO UPDATE SET
+                   (connector, level, agent, person, account, status, detail, connected_at, checked_at, instance)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11)
+                 ON CONFLICT (connector, level, agent, person, instance) DO UPDATE SET
                    account = COALESCE(EXCLUDED.account, connections.account),
                    status = EXCLUDED.status,
                    detail = EXCLUDED.detail,
@@ -153,6 +157,7 @@ impl DeskStore {
                     &c.connected_at,
                     &c.checked_at,
                     &connected,
+                    &c.instance,
                 ],
             )
             .await?;
@@ -164,14 +169,55 @@ impl DeskStore {
         &self,
         connector: &str,
         level: &Level,
+        instance: &str,
         person: &str,
     ) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
                 "DELETE FROM connections
-                 WHERE connector = $1 AND level = $2 AND agent = $3 AND person = $4",
-                &[&connector, &level.as_str(), &level.agent(), &person],
+                 WHERE connector = $1 AND level = $2 AND agent = $3 AND person = $4
+                   AND instance = $5",
+                &[
+                    &connector,
+                    &level.as_str(),
+                    &level.agent(),
+                    &person,
+                    &instance,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Moves a connection's checks to another instance: a flat connection
+    /// becoming a named one keeps what its last check found. A check
+    /// already kept there stays.
+    pub async fn move_connection(
+        &self,
+        connector: &str,
+        level: &Level,
+        person: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE connections SET instance = $6
+                 WHERE connector = $1 AND level = $2 AND agent = $3 AND person = $4
+                   AND instance = $5
+                   AND NOT EXISTS (SELECT 1 FROM connections c
+                                   WHERE c.connector = $1 AND c.level = $2 AND c.agent = $3
+                                     AND c.person = $4 AND c.instance = $6)",
+                &[
+                    &connector,
+                    &level.as_str(),
+                    &level.agent(),
+                    &person,
+                    &from,
+                    &to,
+                ],
             )
             .await?;
         Ok(())
@@ -188,6 +234,7 @@ mod tests {
         Checked {
             connector: connector.into(),
             level,
+            instance: "default".into(),
             person: "sarah".into(),
             account: account.map(str::to_string),
             status,
@@ -235,12 +282,78 @@ mod tests {
 
             // Dropping one level leaves the other.
             store
-                .drop_connection("linear", &Level::All, "sarah")
+                .drop_connection("linear", &Level::All, "default", "sarah")
                 .await
                 .unwrap();
             let rows = store.connections("sarah").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].level, Level::Agent("allan".into()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_check_is_kept_per_instance_and_moves_with_it() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let acme = Checked {
+                instance: "acme".into(),
+                ..check(
+                    "jira",
+                    Level::All,
+                    Status::Connected,
+                    Some("sarah@acme.example"),
+                )
+            };
+            let globex = Checked {
+                instance: "globex".into(),
+                ..check(
+                    "jira",
+                    Level::All,
+                    Status::Failing,
+                    Some("sarah@globex.example"),
+                )
+            };
+            store.put_connection(&acme, true).await.unwrap();
+            store.put_connection(&globex, true).await.unwrap();
+            let rows = store.connections("sarah").await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].instance, "acme");
+            assert_eq!(rows[1].status, Status::Failing);
+
+            // A flat connection's check moves with it to its instance, and
+            // never over one kept there.
+            let flat = check(
+                "linear",
+                Level::All,
+                Status::Connected,
+                Some("sarah@acme.example"),
+            );
+            store.put_connection(&flat, true).await.unwrap();
+            store
+                .move_connection("linear", &Level::All, "sarah", "default", "acme")
+                .await
+                .unwrap();
+            store
+                .move_connection("jira", &Level::All, "sarah", "acme", "globex")
+                .await
+                .unwrap();
+            let rows = store.connections("sarah").await.unwrap();
+            let names: Vec<(&str, &str)> = rows
+                .iter()
+                .map(|r| (r.connector.as_str(), r.instance.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                [("jira", "acme"), ("jira", "globex"), ("linear", "acme")]
+            );
+
+            store
+                .drop_connection("jira", &Level::All, "globex", "sarah")
+                .await
+                .unwrap();
+            assert_eq!(store.connections("sarah").await.unwrap().len(), 2);
         })
         .await;
     }

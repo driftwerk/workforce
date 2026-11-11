@@ -1844,6 +1844,34 @@ pub fn credential_catalog() -> Vec<CatalogEntry> {
                     multiline: false,
                 });
             }
+            // The name a person gave the connection in Desk's Connections:
+            // not a secret, kept beside its keys at its tier.
+            if workforce_common::connector_binding::CONNECTORS.contains(&meta.tool_prefix)
+                && !dotted
+            {
+                let template = format!("{prefix}{{{var_name}}}/label");
+                entries.push(CatalogEntry {
+                    id: template.clone(),
+                    skill: Some(meta.name.to_string()),
+                    group: group.clone(),
+                    label: format!("{} — connection name (per {var_name})", meta.name),
+                    template,
+                    variables: vec![CatalogVariable {
+                        name: var_name.to_string(),
+                        label: var_label.to_string(),
+                        placeholder: "change-me".to_string(),
+                        example: None,
+                    }],
+                    source: "builtin",
+                    addable: false,
+                    scope,
+                    managed_by: managed,
+                    per_user_allowed: meta.default_scope.allows_per_user(),
+                    required: false,
+                    description: "The name Desk shows for this connection".to_string(),
+                    multiline: false,
+                });
+            }
         }
     }
 

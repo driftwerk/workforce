@@ -1,34 +1,41 @@
 //! Settings → Connections: the services a person connects for their local
-//! agents, on a hub with `[desk]` only.
+//! agents, on a hub with `[desk]` only. A service may hold several
+//! connections (two Jira sites, work and personal email), each a name the
+//! person gave it over an instance of the service's adapter.
 //!
-//! - `GET /api/desk/connections`: every connector, where it is connected
-//!   (for all the person's agents, or just one), what its last check found,
-//!   and which agents use it. Never a value.
-//! - `POST /api/desk/connections/{connector}` `{level, agent?, fields}`:
-//!   tests the keys, then keeps them at the level's vault tier. A failed
-//!   Test keeps nothing.
-//! - `POST …/{connector}/test` `{level, agent?}`: checks the kept keys again.
-//! - `DELETE …/{connector}?level=&agent=`: removes the keys at that tier
-//!   alone.
-//! - `POST …/{connector}/oauth/start` `{level, agent?}`: GitHub's device
-//!   sign-in, or Google's on the person's own OAuth client;
-//!   `POST /api/desk/connections/google/client` keeps that client.
+//! - `GET /api/desk/connections`: every connector, its connections (each
+//!   with its name, where it is kept, what its last check found, and which
+//!   agents use it). Never a value. A connection kept before a service held
+//!   several is moved to its adapter's `default` instance first.
+//! - `POST /api/desk/connections/{connector}` `{name?, level, agent?,
+//!   fields}`: tests the keys, then keeps them as a new connection at the
+//!   level's vault tier. A failed Test keeps nothing.
+//! - `POST …/{connector}/{connection}` `{fields}`: reconnects it with new
+//!   keys; `PATCH` `{name}` renames it; `DELETE` removes its keys alone;
+//!   `POST …/{connector}/{connection}/test` checks it again.
+//! - `POST …/{connector}/oauth/start` `{name?, level, agent?}`: GitHub's
+//!   device sign-in, or Google's on the person's own OAuth client, for a new
+//!   connection; `POST /api/desk/connections/google/client` keeps that
+//!   client.
 //! - `GET|DELETE /api/desk/connection-flows/{flow}`: a sign-in's progress,
 //!   or cancelling it.
+//! - `POST …/{connector}/test` `{level, agent?}` and `DELETE
+//!   …/{connector}?level=&agent=` act on the level's one connection, for a
+//!   Desk from before a service held several.
 //!
 //! "All my agents" is the vault's `GlobalPerUser` tier and "just this agent"
 //! its `AgentPerUser` one. Slack's bot token is shared by its nature, so it
-//! is kept at `Global` / `AgentSpecific`. A key a person saved before
-//! Connections, at the bare tier, still counts. Requests are the person's
-//! own, through their paired device, and only the person whose hub this is
-//! may make them.
+//! is kept at `Global` / `AgentSpecific`, and Slack holds one connection. A
+//! key a person saved before Connections, at the bare tier, still counts.
+//! Requests are the person's own, through their paired device, and only the
+//! person whose hub this is may make them.
 
 pub mod catalog;
 pub mod check;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,18 +48,20 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 use workforce_common::settings::{VaultActor, VaultSource};
 use workforce_desk::connections::{Checked, Level, Status};
 
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 use crate::vault::{Vault, VaultOp};
-use catalog::{Connector, Field, SignIn, CATALOG};
+use catalog::{Connector, Field, SignIn, CATALOG, DEFAULT_INSTANCE};
 use check::{Found, Services};
 
 /// The largest value one field takes.
 const MAX_VALUE: usize = 16 * 1024;
+/// The longest name a connection takes.
+const MAX_NAME: usize = 80;
 /// How long a sign-in is waited on.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -108,6 +117,23 @@ impl Binding {
             .as_ref()
             .is_none_or(|e| e.iter().any(|c| c == connector))
     }
+
+    /// Whether the agent `agent` with this binding reaches `connector`'s
+    /// connections kept at `level`, by the tiers its pin admits: none when
+    /// the connector is off; only its own when it uses its own connection;
+    /// only the person's when it names `enabled` and uses theirs; both when
+    /// it names neither, as before the keys existed.
+    fn reaches(&self, agent: &str, connector: &str, level: &Level) -> bool {
+        if !self.is_on(connector) {
+            return false;
+        }
+        let own = self.own.iter().any(|o| o == connector);
+        match level {
+            Level::Agent(a) if a != agent => false,
+            Level::Agent(_) => own || self.enabled.is_none(),
+            Level::All => !own,
+        }
+    }
 }
 
 /// The hub's agents.
@@ -128,7 +154,23 @@ pub trait Agents: Send + Sync {
 pub trait Statuses: Send + Sync {
     async fn all(&self, person: &str) -> eyre::Result<Vec<Checked>>;
     async fn put(&self, checked: &Checked, connected: bool) -> eyre::Result<()>;
-    async fn forget(&self, connector: &str, level: &Level, person: &str) -> eyre::Result<()>;
+    async fn forget(
+        &self,
+        connector: &str,
+        level: &Level,
+        instance: &str,
+        person: &str,
+    ) -> eyre::Result<()>;
+    /// A connection moved from instance `from` to `to`: its checks go with
+    /// it.
+    async fn moved(
+        &self,
+        connector: &str,
+        level: &Level,
+        person: &str,
+        from: &str,
+        to: &str,
+    ) -> eyre::Result<()>;
 }
 
 #[async_trait]
@@ -139,8 +181,28 @@ impl Statuses for workforce_desk::Desk {
     async fn put(&self, checked: &Checked, connected: bool) -> eyre::Result<()> {
         self.store().put_connection(checked, connected).await
     }
-    async fn forget(&self, connector: &str, level: &Level, person: &str) -> eyre::Result<()> {
-        self.store().drop_connection(connector, level, person).await
+    async fn forget(
+        &self,
+        connector: &str,
+        level: &Level,
+        instance: &str,
+        person: &str,
+    ) -> eyre::Result<()> {
+        self.store()
+            .drop_connection(connector, level, instance, person)
+            .await
+    }
+    async fn moved(
+        &self,
+        connector: &str,
+        level: &Level,
+        person: &str,
+        from: &str,
+        to: &str,
+    ) -> eyre::Result<()> {
+        self.store()
+            .move_connection(connector, level, person, from, to)
+            .await
     }
 }
 
@@ -180,10 +242,48 @@ impl IntoResponse for Refusal {
     }
 }
 
+/// One connection: a service's instance, kept at a level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conn {
+    pub level: Level,
+    /// The adapter instance (`acme`); `default` for Slack's one.
+    pub key: String,
+}
+
+impl Conn {
+    /// The id Desk names it by, and never shows: `all~~acme`,
+    /// `agent~allan~acme`.
+    pub fn id(&self) -> String {
+        format!(
+            "{}~{}~{}",
+            self.level.as_str(),
+            self.level.agent(),
+            self.key
+        )
+    }
+}
+
+/// An agent a connection reaches, and through whose keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsedBy {
+    pub agent: String,
+    pub name: String,
+    /// `mine` (the person's, for all their agents) or `own` (just this
+    /// agent's).
+    pub connection: &'static str,
+}
+
 /// A connection as the page shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionView {
+    /// What Desk names it by in a request; never shown.
+    pub id: String,
+    /// The name the person gave it: "Acme", "Work".
+    pub name: String,
+    /// Where it is, for a service with a site: `acme.atlassian.net`.
+    pub site: Option<String>,
     /// `all` or `agent`.
     pub level: &'static str,
     pub agent: Option<String>,
@@ -196,17 +296,8 @@ pub struct ConnectionView {
     pub checked_at: Option<DateTime<Utc>>,
     /// The vault tier it is kept at.
     pub source: VaultSource,
-}
-
-/// An agent a connector reaches, and through whose keys.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsedBy {
-    pub agent: String,
-    pub name: String,
-    /// `mine` (the person's, for all their agents) or `own` (just this
-    /// agent's).
-    pub connection: &'static str,
+    /// The agents it reaches.
+    pub used_by: Vec<UsedBy>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,7 +311,12 @@ pub struct ConnectorView {
     /// Whether its sign-in can start: GitHub's app is set up, or the
     /// person's Google client is kept.
     pub sign_in_ready: bool,
+    /// Whether it holds more than one connection (Slack holds one).
+    pub several: bool,
+    /// What a new connection's name should be, as the form says.
+    pub name_hint: &'static str,
     pub connections: Vec<ConnectionView>,
+    /// Every agent it reaches, through any of its connections.
     pub used_by: Vec<UsedBy>,
 }
 
@@ -241,7 +337,7 @@ pub struct Started {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Disconnected {
-    /// The tier a key of this level is still kept at, if any.
+    /// The tier a key of this connection is still kept at, if any.
     pub still_kept: Option<VaultSource>,
     /// What to tell the person about it.
     pub note: Option<String>,
@@ -261,6 +357,11 @@ pub enum FlowState {
 struct Flow {
     person: String,
     level: Level,
+    /// The instance it keeps; GitHub's is its account's login when the
+    /// person named none.
+    key: Option<String>,
+    /// The name the person gave it, if any.
+    name: Option<String>,
     state: FlowState,
     until: Instant,
 }
@@ -275,7 +376,13 @@ pub struct Connections {
     pub github_client_id: Option<String>,
     /// The hub's own Google callback, for a client that names none.
     pub google_redirect: String,
+    /// `[github] default_owner`: the owner a flat GitHub connection reached
+    /// by default, which its instance is named after when it moves.
+    pub github_owner: Option<String>,
     flows: Mutex<HashMap<String, Flow>>,
+    /// Held while flat connections are moved, so two requests never move
+    /// one twice.
+    migrating: tokio::sync::Mutex<()>,
 }
 
 fn per_user(tier: VaultSource) -> bool {
@@ -300,6 +407,47 @@ fn scrub(text: &str, fields: &BTreeMap<String, String>) -> String {
     workforce_common::redact::redact_secrets(&text)
 }
 
+/// The instance key a name makes: lower case letters, digits and dashes.
+pub fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// A site as a name: `acme.atlassian.net` and `https://acme.atlassian.net`
+/// are "Acme".
+fn site_name(site: &str) -> Option<String> {
+    let host = site
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()?;
+    let first = host.split('.').next().filter(|f| !f.is_empty())?;
+    let mut chars = first.chars();
+    let head = chars.next()?;
+    Some(head.to_uppercase().chain(chars).collect())
+}
+
+/// What a connection is called when the person named it nothing: its
+/// account, else its site, else the service.
+fn name_of(c: &Connector, account: Option<&str>, site: Option<&str>) -> String {
+    account
+        .filter(|a| !a.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| site.and_then(site_name))
+        .unwrap_or_else(|| c.name.to_string())
+}
+
 impl Connections {
     pub fn new(
         global: Option<Arc<Vault>>,
@@ -316,7 +464,9 @@ impl Connections {
             services,
             github_client_id: github_client_id.filter(|id| !id.trim().is_empty()),
             google_redirect,
+            github_owner: None,
             flows: Mutex::new(HashMap::new()),
+            migrating: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -339,6 +489,24 @@ impl Connections {
         }
     }
 
+    /// The connection `id` names (`all~~acme`), as the page sent it back.
+    fn conn(&self, id: &str) -> Result<Conn, Refusal> {
+        let gone = || Refusal::NotFound("That connection isn't there any more".into());
+        let mut parts = id.splitn(3, '~');
+        let (Some(level), Some(agent), Some(key)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(gone());
+        };
+        if key.is_empty() || key.len() > 64 || key.contains('/') {
+            return Err(gone());
+        }
+        let agent = (!agent.is_empty()).then_some(agent);
+        Ok(Conn {
+            level: self.level(level, agent)?,
+            key: key.to_string(),
+        })
+    }
+
     fn vault_at(&self, tier: VaultSource, level: &Level) -> Result<Arc<Vault>, Refusal> {
         match (tier, level) {
             (VaultSource::GlobalPerUser | VaultSource::Global, _) => {
@@ -355,21 +523,109 @@ impl Connections {
         }
     }
 
-    /// The tier a connection at `level` is kept at now, if it is connected.
-    fn held_at(&self, c: &Connector, level: &Level, person: &str) -> Option<VaultSource> {
-        let tiers = c.tiers(matches!(level, Level::Agent(_)));
-        tiers.into_iter().find(|tier| {
+    /// The tiers of `level`, the one written first, each once.
+    fn tiers(c: &Connector, level: &Level) -> Vec<VaultSource> {
+        let mut tiers = c.tiers(matches!(level, Level::Agent(_))).to_vec();
+        tiers.dedup();
+        tiers
+    }
+
+    /// Every level a connection may be kept at: all the person's agents,
+    /// then each agent's own.
+    fn levels(&self) -> Vec<Level> {
+        std::iter::once(Level::All)
+            .chain(self.agents.all().into_iter().map(|a| Level::Agent(a.id)))
+            .collect()
+    }
+
+    /// The tier instance `key` of `c` is kept at, at `level`, if it is
+    /// connected.
+    fn held_at(
+        &self,
+        c: &Connector,
+        level: &Level,
+        key: &str,
+        person: &str,
+    ) -> Option<VaultSource> {
+        Self::tiers(c, level).into_iter().find(|tier| {
             self.vault_at(*tier, level)
                 .ok()
-                .is_some_and(|v| v.get(&key_at(*tier, person, c.primary)).is_some())
+                .is_some_and(|v| v.get(&key_at(*tier, person, &c.primary_at(key))).is_some())
         })
     }
 
-    /// The kept fields of a connection at `tier`.
+    /// Every connection of `c` kept at `level`, with its tier, by key.
+    fn instances(&self, c: &Connector, level: &Level, person: &str) -> Vec<(String, VaultSource)> {
+        let Some(prefix) = c.prefix else {
+            return self
+                .held_at(c, level, DEFAULT_INSTANCE, person)
+                .map(|tier| (DEFAULT_INSTANCE.to_string(), tier))
+                .into_iter()
+                .collect();
+        };
+        let mut out: Vec<(String, VaultSource)> = Vec::new();
+        for tier in Self::tiers(c, level) {
+            let Ok(vault) = self.vault_at(tier, level) else {
+                continue;
+            };
+            let at = key_at(tier, person, prefix);
+            let keys: BTreeSet<String> = vault
+                .list(Some(&at))
+                .into_iter()
+                .filter_map(|path| {
+                    let rest = path.strip_prefix(&at)?;
+                    let (key, _) = rest.split_once('/')?;
+                    Some(key.to_string())
+                })
+                .collect();
+            for key in keys {
+                let held = vault
+                    .get(&key_at(tier, person, &c.primary_at(&key)))
+                    .is_some();
+                if held && !out.iter().any(|(k, _)| *k == key) {
+                    out.push((key, tier));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every instance key of `c` the person holds anywhere.
+    fn keys_in_use(&self, c: &Connector, person: &str) -> BTreeSet<String> {
+        self.levels()
+            .iter()
+            .flat_map(|level| self.instances(c, level, person))
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// A key for a new connection of `c` named `name`, unique among the
+    /// person's: a connection's name is its key's first spelling, and the
+    /// key never changes after.
+    fn new_key(&self, c: &Connector, person: &str, name: &str) -> String {
+        if !c.named() {
+            return DEFAULT_INSTANCE.to_string();
+        }
+        let taken = self.keys_in_use(c, person);
+        let base = match slug(name) {
+            s if s.is_empty() => c.id.to_string(),
+            s => s,
+        };
+        (1..)
+            .map(|n| match n {
+                1 => base.clone(),
+                n => format!("{base}-{n}"),
+            })
+            .find(|k| !taken.contains(k))
+            .expect("some key is free")
+    }
+
+    /// The kept fields of instance `key` at `tier`.
     fn kept(
         &self,
         c: &Connector,
         level: &Level,
+        key: &str,
         tier: VaultSource,
         person: &str,
     ) -> BTreeMap<String, String> {
@@ -380,30 +636,78 @@ impl Connections {
             .iter()
             .filter_map(|f| {
                 vault
-                    .get(&key_at(tier, person, f.path))
+                    .get(&key_at(tier, person, &c.field_at(f, key)))
                     .map(|v| (f.name.to_string(), v))
             })
             .collect()
     }
 
-    fn view(&self, level: &Level, tier: VaultSource, checked: Option<&Checked>) -> ConnectionView {
-        let agent = match level {
+    /// What a connection is kept as at `tier`: its name and its site.
+    fn named_at(
+        &self,
+        c: &Connector,
+        level: &Level,
+        key: &str,
+        tier: VaultSource,
+        person: &str,
+    ) -> (Option<String>, Option<String>) {
+        let Ok(vault) = self.vault_at(tier, level) else {
+            return (None, None);
+        };
+        let name = c
+            .label_at(key)
+            .and_then(|p| vault.get(&key_at(tier, person, &p)));
+        let site = c
+            .site
+            .and_then(|s| c.fields.iter().find(|f| f.name == s))
+            .and_then(|f| vault.get(&key_at(tier, person, &c.field_at(f, key))));
+        (name, site)
+    }
+
+    fn view(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        tier: VaultSource,
+        person: &str,
+        checked: Option<&Checked>,
+        agents: &[Agent],
+    ) -> ConnectionView {
+        let agent = match &conn.level {
             Level::All => None,
             Level::Agent(agent) => Some(agent.clone()),
         };
+        let (name, site) = self.named_at(c, &conn.level, &conn.key, tier, person);
+        let account = checked.and_then(|k| k.account.clone());
+        let used_by = agents
+            .iter()
+            .filter(|a| a.binding.reaches(&a.id, c.id, &conn.level))
+            .map(|a| UsedBy {
+                agent: a.id.clone(),
+                name: a.name.clone(),
+                connection: match conn.level {
+                    Level::All => "mine",
+                    Level::Agent(_) => "own",
+                },
+            })
+            .collect();
         ConnectionView {
-            level: level.as_str(),
+            id: conn.id(),
+            name: name.unwrap_or_else(|| name_of(c, account.as_deref(), site.as_deref())),
+            site,
+            level: conn.level.as_str(),
             agent_name: agent
                 .as_deref()
-                .and_then(|a| self.agents.get(a))
-                .map(|a| a.name),
+                .and_then(|a| agents.iter().find(|x| x.id == a))
+                .map(|a| a.name.clone()),
             agent,
-            account: checked.and_then(|c| c.account.clone()),
-            status: checked.map_or(Status::Connected, |c| c.status),
-            detail: checked.and_then(|c| c.detail.clone()),
-            connected_at: checked.map(|c| c.connected_at),
-            checked_at: checked.and_then(|c| c.checked_at),
+            account,
+            status: checked.map_or(Status::Connected, |k| k.status),
+            detail: checked.and_then(|k| k.detail.clone()),
+            connected_at: checked.map(|k| k.connected_at),
+            checked_at: checked.and_then(|k| k.checked_at),
             source: tier,
+            used_by,
         }
     }
 
@@ -425,51 +729,180 @@ impl Connections {
         ))
     }
 
+    /// Moves every flat connection of `person`'s (`skills/jira/api_token`)
+    /// to its adapter's instance, at the tier it is kept at, in one write
+    /// each, named after its account or site; and names an instance kept
+    /// without one. Runs again harmlessly: what has moved isn't flat.
+    pub async fn migrate(&self, person: &str) {
+        let _one = self.migrating.lock().await;
+        let checks = self.statuses.all(person).await.unwrap_or_default();
+        for c in CATALOG.iter().filter(|c| c.named()) {
+            for level in self.levels() {
+                let checked = checks.iter().find(|k| {
+                    k.connector == c.id && k.level == level && k.instance == DEFAULT_INSTANCE
+                });
+                let mut moved = false;
+                for tier in Self::tiers(c, &level) {
+                    let Ok(vault) = self.vault_at(tier, &level) else {
+                        continue;
+                    };
+                    match self.migrate_at(c, tier, &vault, person, checked) {
+                        Ok(Some(key)) => {
+                            moved = true;
+                            if key != DEFAULT_INSTANCE {
+                                if let Err(e) = self
+                                    .statuses
+                                    .moved(c.id, &level, person, DEFAULT_INSTANCE, &key)
+                                    .await
+                                {
+                                    warn!(connector = c.id, error = %format!("{e:#}"), "a moved connection's check stayed behind");
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(connector = c.id, tier = ?tier, error = %format!("{e:#}"), "a flat connection wasn't moved; it stays as it was");
+                        }
+                    }
+                }
+                if moved {
+                    self.reload(c, &level, person).await;
+                }
+            }
+        }
+    }
+
+    /// [`Self::migrate`] of `c` at one tier: the instance it moved to, if
+    /// it moved or was named.
+    fn migrate_at(
+        &self,
+        c: &Connector,
+        tier: VaultSource,
+        vault: &Vault,
+        person: &str,
+        checked: Option<&Checked>,
+    ) -> eyre::Result<Option<String>> {
+        let actor = VaultActor::User(person);
+        let account = checked.and_then(|k| k.account.clone());
+        let flat_primary = key_at(tier, person, c.primary);
+        if vault.get(&flat_primary).is_none() {
+            return Ok(None);
+        }
+        // Email and Google always kept theirs at `default`: it only needs
+        // a name.
+        if c.primary == c.primary_at(DEFAULT_INSTANCE) {
+            let label = key_at(
+                tier,
+                person,
+                &c.label_at(DEFAULT_INSTANCE).expect("a named connector"),
+            );
+            if vault.get(&label).is_some() {
+                return Ok(None);
+            }
+            let account = account.or_else(|| {
+                ["username", "email"]
+                    .iter()
+                    .find_map(|sub| vault.get(&key_at(tier, person, &c.at(DEFAULT_INSTANCE, sub))))
+            });
+            let name = name_of(c, account.as_deref(), None);
+            vault.apply(
+                &[VaultOp::Set {
+                    path: &label,
+                    value: &name,
+                }],
+                actor,
+            )?;
+            return Ok(Some(DEFAULT_INSTANCE.to_string()));
+        }
+        // GitHub's instance is the owner it reaches by default: the one it
+        // reached before, or its own account's.
+        let key = match c.id {
+            "github" => self
+                .github_owner
+                .as_deref()
+                .or(account.as_deref())
+                .map(slug)
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
+            _ => DEFAULT_INSTANCE.to_string(),
+        };
+        if vault
+            .get(&key_at(tier, person, &c.primary_at(&key)))
+            .is_some()
+        {
+            warn!(
+                connector = c.id,
+                instance = %key,
+                "a flat connection wasn't moved: a connection of that name is kept already"
+            );
+            return Ok(None);
+        }
+        let moving: Vec<(String, String, String)> = c
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let from = key_at(tier, person, f.path);
+                let value = vault.get(&from)?;
+                Some((from, key_at(tier, person, &c.field_at(f, &key)), value))
+            })
+            .collect();
+        let site = c.site.and_then(|s| {
+            c.fields
+                .iter()
+                .find(|f| f.name == s)
+                .and_then(|f| vault.get(&key_at(tier, person, f.path)))
+        });
+        let name = name_of(c, account.as_deref(), site.as_deref());
+        let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
+        let mut ops: Vec<VaultOp<'_>> = Vec::new();
+        for (_, to, value) in &moving {
+            ops.push(VaultOp::Set { path: to, value });
+        }
+        ops.push(VaultOp::Set {
+            path: &label,
+            value: &name,
+        });
+        for (from, _, _) in &moving {
+            ops.push(VaultOp::Delete { path: from });
+        }
+        vault.apply(&ops, actor)?;
+        info!(connector = c.id, instance = %key, tier = ?tier, "a flat connection moved to a named one");
+        Ok(Some(key))
+    }
+
     /// Every connector, as `person` has connected it.
     pub async fn list(&self, person: &str) -> Vec<ConnectorView> {
+        self.migrate(person).await;
         let checks = self.statuses.all(person).await.unwrap_or_else(|e| {
             warn!(error = %format!("{e:#}"), "connection checks unreadable; showing keys only");
             Vec::new()
         });
         let agents = self.agents.all();
+        let levels = self.levels();
         CATALOG
             .iter()
             .map(|c| {
-                let checked = |level: &Level| {
-                    checks
-                        .iter()
-                        .find(|k| k.connector == c.id && &k.level == level)
-                };
-                let mine = self.held_at(c, &Level::All, person);
-                let mut connections: Vec<ConnectionView> = mine
-                    .map(|tier| self.view(&Level::All, tier, checked(&Level::All)))
-                    .into_iter()
-                    .collect();
-                let mut used_by = Vec::new();
-                for a in &agents {
-                    let level = Level::Agent(a.id.clone());
-                    let own = self.held_at(c, &level, person);
-                    if let Some(tier) = own {
-                        connections.push(self.view(&level, tier, checked(&level)));
+                let mut connections = Vec::new();
+                for level in &levels {
+                    for (key, tier) in self.instances(c, level, person) {
+                        let checked = checks.iter().find(|k| {
+                            k.connector == c.id && &k.level == level && k.instance == key
+                        });
+                        let conn = Conn {
+                            level: level.clone(),
+                            key,
+                        };
+                        connections.push(self.view(c, &conn, tier, person, checked, &agents));
                     }
-                    // An agent whose `[skills]` turns the connector off
-                    // doesn't use it; one set to its own connection uses
-                    // only that.
-                    if !a.binding.is_on(c.id) {
-                        continue;
+                }
+                let mut used_by: Vec<UsedBy> = Vec::new();
+                for u in connections.iter().flat_map(|x| x.used_by.iter()) {
+                    match used_by.iter_mut().find(|x| x.agent == u.agent) {
+                        // Its own connection wins, as its pin reads it first.
+                        Some(x) if u.connection == "own" => x.connection = "own",
+                        Some(_) => {}
+                        None => used_by.push(u.clone()),
                     }
-                    let bound_own = a.binding.own.iter().any(|o| o == c.id);
-                    let connection = match (own, mine, bound_own) {
-                        (Some(_), _, _) => "own",
-                        (None, _, true) => continue,
-                        (None, Some(_), false) => "mine",
-                        (None, None, false) => continue,
-                    };
-                    used_by.push(UsedBy {
-                        agent: a.id.clone(),
-                        name: a.name.clone(),
-                        connection,
-                    });
                 }
                 ConnectorView {
                     id: c.id,
@@ -478,6 +911,8 @@ impl Connections {
                     sign_in: c.sign_in,
                     fields: c.fields,
                     sign_in_ready: self.sign_in_ready(c),
+                    several: c.named(),
+                    name_hint: c.name_hint,
                     connections,
                     used_by,
                 }
@@ -513,22 +948,50 @@ impl Connections {
         Ok(out)
     }
 
-    /// Keeps `fields` at the level's tier: every one given, and none of the
-    /// optional ones left out.
+    /// A name as given: trimmed, not empty, not too long.
+    fn name(c: &Connector, name: Option<&str>) -> Result<Option<String>, Refusal> {
+        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+            return Ok(None);
+        };
+        if name.chars().count() > MAX_NAME {
+            return Err(Refusal::Invalid(format!(
+                "Give the {} connection a shorter name",
+                c.name
+            )));
+        }
+        if name.chars().any(char::is_control) {
+            return Err(Refusal::Invalid("A name is one line of words".into()));
+        }
+        Ok(Some(name.to_string()))
+    }
+
+    /// Keeps `fields` as instance `key` at the level's tier: every one
+    /// given, none of the optional ones left out, and its name where it is
+    /// given.
     fn keep(
         &self,
         c: &Connector,
         level: &Level,
+        key: &str,
         person: &str,
         fields: &BTreeMap<String, String>,
+        name: Option<&str>,
     ) -> Result<VaultSource, Refusal> {
-        let tier = c.tiers(matches!(level, Level::Agent(_)))[0];
+        let tier = Self::tiers(c, level)[0];
         let vault = self.vault_at(tier, level)?;
-        let keys: Vec<(String, Option<&String>)> = c
+        let mut keys: Vec<(String, Option<&str>)> = c
             .fields
             .iter()
-            .map(|f| (key_at(tier, person, f.path), fields.get(f.name)))
+            .map(|f| {
+                (
+                    key_at(tier, person, &c.field_at(f, key)),
+                    fields.get(f.name).map(String::as_str),
+                )
+            })
             .collect();
+        if let (Some(label), Some(name)) = (c.label_at(key), name) {
+            keys.push((key_at(tier, person, &label), Some(name)));
+        }
         let ops: Vec<VaultOp<'_>> = keys
             .iter()
             .map(|(path, value)| match value {
@@ -545,7 +1008,7 @@ impl Connections {
     async fn record(
         &self,
         c: &Connector,
-        level: &Level,
+        conn: &Conn,
         person: &str,
         found: &Found,
         connected: bool,
@@ -558,7 +1021,8 @@ impl Connections {
         let now = Utc::now();
         let checked = Checked {
             connector: c.id.to_string(),
-            level: level.clone(),
+            level: conn.level.clone(),
+            instance: conn.key.clone(),
             person: person.to_string(),
             account,
             status,
@@ -571,27 +1035,56 @@ impl Connections {
         }
     }
 
-    async fn shown(
+    /// Connection `conn` of `c` as the page shows it.
+    pub async fn shown(
         &self,
         c: &Connector,
-        level: &Level,
+        conn: &Conn,
         person: &str,
     ) -> Result<ConnectionView, Refusal> {
         let tier = self
-            .held_at(c, level, person)
-            .ok_or_else(|| Refusal::NotFound(format!("{} isn't connected there", c.name)))?;
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
         let checks = self.statuses.all(person).await.unwrap_or_default();
         let checked = checks
             .iter()
-            .find(|k| k.connector == c.id && &k.level == level);
-        Ok(self.view(level, tier, checked))
+            .find(|k| k.connector == c.id && k.level == conn.level && k.instance == conn.key);
+        Ok(self.view(c, conn, tier, person, checked, &self.agents.all()))
     }
 
-    /// Tests `fields`, then keeps them. A failed Test keeps nothing.
+    /// Runs `c`'s Test on `fields`, its words scrubbed of them.
+    async fn check(&self, c: &Connector, fields: &BTreeMap<String, String>) -> Found {
+        match self.services.check(c.id, fields).await {
+            Found::Works { account } => Found::Works { account },
+            Found::Refused(e) => Found::Refused(scrub(&e, fields)),
+            Found::Failed(e) => Found::Failed(scrub(&e, fields)),
+        }
+    }
+
+    fn failed(found: Found) -> Refusal {
+        match found {
+            Found::Refused(error) => Refusal::TestFailed {
+                error,
+                status: Status::NeedsReconnect,
+            },
+            Found::Failed(error) => Refusal::TestFailed {
+                error,
+                status: Status::Failing,
+            },
+            Found::Works { .. } => Refusal::Internal(eyre::eyre!("a working key failed")),
+        }
+    }
+
+    /// Tests `fields`, then keeps them as a new connection named `name`
+    /// (its account, if the person named it nothing). A failed Test keeps
+    /// nothing. Slack, which holds one connection, is connected again.
     pub async fn connect(
         &self,
         person: &str,
         id: &str,
+        name: Option<&str>,
         level: &str,
         agent: Option<&str>,
         given: BTreeMap<String, String>,
@@ -604,71 +1097,152 @@ impl Connections {
             )));
         }
         let level = self.level(level, agent)?;
+        let name = Self::name(c, name)?;
         let fields = Self::fields(c, given)?;
         // The tier must be reachable before anything is sent anywhere.
-        self.vault_at(c.tiers(matches!(level, Level::Agent(_)))[0], &level)?;
-        match self.services.check(c.id, &fields).await {
-            Found::Works { account } => {
-                self.keep(c, &level, person, &fields)?;
-                self.record(c, &level, person, &Found::Works { account }, true)
-                    .await;
-                self.reload(c, &level, person).await;
-                self.shown(c, &level, person).await
-            }
-            Found::Refused(e) => Err(Refusal::TestFailed {
-                error: scrub(&e, &fields),
-                status: Status::NeedsReconnect,
-            }),
-            Found::Failed(e) => Err(Refusal::TestFailed {
-                error: scrub(&e, &fields),
-                status: Status::Failing,
-            }),
-        }
+        self.vault_at(Self::tiers(c, &level)[0], &level)?;
+        // A flat connection still kept would be hidden by a named one.
+        self.migrate(person).await;
+        let account = match self.check(c, &fields).await {
+            Found::Works { account } => account,
+            other => return Err(Self::failed(other)),
+        };
+        let site = c.site.and_then(|s| fields.get(s)).map(String::as_str);
+        let name = name.unwrap_or_else(|| name_of(c, Some(&account), site));
+        let key = match (c.id, self.keys_in_use(c, person).is_empty()) {
+            // GitHub's instance is the owner it reaches by default.
+            ("github", _) => self.new_key(c, person, &name),
+            // A first connection is the adapters' `default`, as a flat one
+            // was.
+            (_, true) => DEFAULT_INSTANCE.to_string(),
+            _ => self.new_key(c, person, &name),
+        };
+        let conn = Conn { level, key };
+        self.keep(c, &conn.level, &conn.key, person, &fields, Some(&name))?;
+        self.record(c, &conn, person, &Found::Works { account }, true)
+            .await;
+        self.reload(c, &conn.level, person).await;
+        self.shown(c, &conn, person).await
     }
 
-    /// Checks a kept connection again, and keeps what it found.
+    /// Tests new `fields` for connection `conn`, then keeps them over its
+    /// old ones. A failed Test keeps the old ones as they were.
+    pub async fn reconnect(
+        &self,
+        person: &str,
+        id: &str,
+        conn: &str,
+        given: BTreeMap<String, String>,
+    ) -> Result<ConnectionView, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.conn(conn)?;
+        if c.fields.is_empty() {
+            return Err(Refusal::Invalid(format!(
+                "{} is connected again by signing in",
+                c.name
+            )));
+        }
+        self.held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let fields = Self::fields(c, given)?;
+        let found = self.check(c, &fields).await;
+        let Found::Works { .. } = &found else {
+            return Err(Self::failed(found));
+        };
+        self.keep(c, &conn.level, &conn.key, person, &fields, None)?;
+        self.record(c, &conn, person, &found, true).await;
+        self.reload(c, &conn.level, person).await;
+        self.shown(c, &conn, person).await
+    }
+
+    /// Gives connection `conn` a new name. Its instance stays as it was, so
+    /// what refers to it (an agent's choice, an environment) still does.
+    pub async fn rename(
+        &self,
+        person: &str,
+        id: &str,
+        conn: &str,
+        name: &str,
+    ) -> Result<ConnectionView, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.conn(conn)?;
+        let Some(label) = c.label_at(&conn.key) else {
+            return Err(Refusal::Invalid(format!(
+                "{} has one connection, which takes no name",
+                c.name
+            )));
+        };
+        let name =
+            Self::name(c, Some(name))?.ok_or_else(|| Refusal::Invalid("Give it a name".into()))?;
+        let tier = self
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let vault = self.vault_at(tier, &conn.level)?;
+        let path = key_at(tier, person, &label);
+        vault
+            .apply(
+                &[VaultOp::Set {
+                    path: &path,
+                    value: &name,
+                }],
+                VaultActor::User(person),
+            )
+            .map_err(Refusal::Internal)?;
+        // Its agents are told it by its new name.
+        self.reload(c, &conn.level, person).await;
+        self.shown(c, &conn, person).await
+    }
+
+    /// Checks connection `conn` again, and keeps what it found.
     pub async fn test(
         &self,
         person: &str,
         id: &str,
-        level: &str,
-        agent: Option<&str>,
+        conn: &str,
     ) -> Result<ConnectionView, Refusal> {
         let c = Self::connector(id)?;
-        let level = self.level(level, agent)?;
-        let tier = self
-            .held_at(c, &level, person)
-            .ok_or_else(|| Refusal::NotFound(format!("{} isn't connected there", c.name)))?;
-        let found = match c.sign_in {
-            SignIn::Google => self.test_google(&level, tier, person).await,
-            _ => {
-                let fields = self.kept(c, &level, tier, person);
-                match self.services.check(c.id, &fields).await {
-                    Found::Works { account } => Found::Works { account },
-                    Found::Refused(e) => Found::Refused(scrub(&e, &fields)),
-                    Found::Failed(e) => Found::Failed(scrub(&e, &fields)),
-                }
-            }
-        };
-        self.record(c, &level, person, &found, false).await;
-        self.shown(c, &level, person).await
+        let conn = self.conn(conn)?;
+        self.test_conn(c, &conn, person).await
     }
 
-    async fn test_google(&self, level: &Level, tier: VaultSource, person: &str) -> Found {
+    async fn test_conn(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        person: &str,
+    ) -> Result<ConnectionView, Refusal> {
+        let tier = self
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let found = match c.sign_in {
+            SignIn::Google => self.test_google(conn, tier, person).await,
+            _ => {
+                let fields = self.kept(c, &conn.level, &conn.key, tier, person);
+                self.check(c, &fields).await
+            }
+        };
+        self.record(c, conn, person, &found, false).await;
+        self.shown(c, conn, person).await
+    }
+
+    async fn test_google(&self, conn: &Conn, tier: VaultSource, person: &str) -> Found {
         let Some((id, secret, _)) = self.google_client() else {
             return Found::Refused("Your Google OAuth client isn't saved in Desk any more".into());
         };
-        let Ok(vault) = self.vault_at(tier, level) else {
+        let Ok(vault) = self.vault_at(tier, &conn.level) else {
             return Found::Failed("Desk couldn't read this connection".into());
         };
-        let Some(refresh) = vault.get(&key_at(
-            tier,
-            person,
-            catalog::find("google").map_or("", |c| c.primary),
-        )) else {
+        let google = catalog::find("google").expect("google is in the catalog");
+        let Some(refresh) = vault.get(&key_at(tier, person, &google.primary_at(&conn.key))) else {
             return Found::Refused("Google isn't signed in".into());
         };
-        let email = vault.get(&key_at(tier, person, catalog::GOOGLE_EMAIL));
+        let email = vault.get(&key_at(tier, person, &google.at(&conn.key, "email")));
         let mut fields = BTreeMap::new();
         fields.insert("refresh".into(), refresh.clone());
         fields.insert("secret".into(), secret.clone());
@@ -679,33 +1253,51 @@ impl Connections {
         }
     }
 
-    /// Removes a connection's keys at the tier it is kept at, and nothing
-    /// else.
+    /// Removes connection `conn`'s keys at the tier it is kept at, and
+    /// nothing else.
     pub async fn disconnect(
         &self,
         person: &str,
         id: &str,
-        level: &str,
-        agent: Option<&str>,
+        conn: &str,
     ) -> Result<Disconnected, Refusal> {
         let c = Self::connector(id)?;
-        let level = self.level(level, agent)?;
+        let conn = self.conn(conn)?;
+        self.disconnect_conn(c, &conn, person).await
+    }
+
+    async fn disconnect_conn(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        person: &str,
+    ) -> Result<Disconnected, Refusal> {
         let tier = self
-            .held_at(c, &level, person)
-            .ok_or_else(|| Refusal::NotFound(format!("{} isn't connected there", c.name)))?;
-        let vault = self.vault_at(tier, &level)?;
-        let keys: Vec<String> = c.held.iter().map(|p| key_at(tier, person, p)).collect();
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let vault = self.vault_at(tier, &conn.level)?;
+        let keys: Vec<String> = c
+            .held_at(&conn.key)
+            .iter()
+            .map(|p| key_at(tier, person, p))
+            .collect();
         let ops: Vec<VaultOp<'_>> = keys.iter().map(|path| VaultOp::Delete { path }).collect();
         vault
             .apply(&ops, VaultActor::User(person))
             .map_err(Refusal::Internal)?;
-        if let Err(e) = self.statuses.forget(c.id, &level, person).await {
+        if let Err(e) = self
+            .statuses
+            .forget(c.id, &conn.level, &conn.key, person)
+            .await
+        {
             warn!(connector = c.id, error = %format!("{e:#}"), "a connection's checks weren't forgotten");
         }
-        self.reload(c, &level, person).await;
+        self.reload(c, &conn.level, person).await;
         // A key kept at another tier of this level still connects it: an
         // older one saved for the whole hub, say.
-        let still = self.held_at(c, &level, person);
+        let still = self.held_at(c, &conn.level, &conn.key, person);
         Ok(Disconnected {
             still_kept: still,
             note: still.map(|tier| match tier {
@@ -716,6 +1308,63 @@ impl Connections {
                 _ => format!("Another {} key is still kept, so agents still reach {}.", c.name, c.name),
             }),
         })
+    }
+
+    /// The one connection of `c` at `level`, for a request from a Desk that
+    /// names a level only: its `default`, else its only one.
+    async fn only(
+        &self,
+        person: &str,
+        c: &Connector,
+        level: &str,
+        agent: Option<&str>,
+    ) -> Result<Conn, Refusal> {
+        let level = self.level(level, agent)?;
+        self.migrate(person).await;
+        let held = self.instances(c, &level, person);
+        let key = match held.iter().find(|(k, _)| k == DEFAULT_INSTANCE) {
+            Some((k, _)) => k.clone(),
+            None if held.len() == 1 => held[0].0.clone(),
+            None if held.is_empty() => {
+                return Err(Refusal::NotFound(format!(
+                    "{} isn't connected there",
+                    c.name
+                )))
+            }
+            None => {
+                return Err(Refusal::Invalid(format!(
+                    "{} has several connections there: update Desk to choose one",
+                    c.name
+                )))
+            }
+        };
+        Ok(Conn { level, key })
+    }
+
+    /// [`Self::test`] of the level's one connection.
+    pub async fn test_level(
+        &self,
+        person: &str,
+        id: &str,
+        level: &str,
+        agent: Option<&str>,
+    ) -> Result<ConnectionView, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.only(person, c, level, agent).await?;
+        self.test_conn(c, &conn, person).await
+    }
+
+    /// [`Self::disconnect`] of the level's one connection.
+    pub async fn disconnect_level(
+        &self,
+        person: &str,
+        id: &str,
+        level: &str,
+        agent: Option<&str>,
+    ) -> Result<Disconnected, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.only(person, c, level, agent).await?;
+        self.disconnect_conn(c, &conn, person).await
     }
 
     /// Loads `c` again on the agents a change at `level` reaches.
@@ -765,7 +1414,13 @@ impl Connections {
         Ok(())
     }
 
-    fn insert_flow(&self, person: &str, level: Level) -> String {
+    fn insert_flow(
+        &self,
+        person: &str,
+        level: Level,
+        key: Option<String>,
+        name: Option<String>,
+    ) -> String {
         let id = Uuid::new_v4().simple().to_string();
         let now = Instant::now();
         let mut flows = self.flows.lock().expect("connection flows poisoned");
@@ -775,6 +1430,8 @@ impl Connections {
             Flow {
                 person: person.to_string(),
                 level,
+                key,
+                name,
                 state: FlowState::Waiting,
                 until: now + FLOW_TTL,
             },
@@ -827,20 +1484,40 @@ impl Connections {
         }
     }
 
-    /// Starts a sign-in for `id` at `level`.
+    /// Starts a sign-in for a new connection of `id`, named `name`, at
+    /// `level`.
     pub async fn start(
         self: &Arc<Self>,
         person: &str,
         id: &str,
+        name: Option<&str>,
         level: &str,
         agent: Option<&str>,
     ) -> Result<Started, Refusal> {
         let c = Self::connector(id)?;
         let level = self.level(level, agent)?;
-        self.vault_at(c.tiers(matches!(level, Level::Agent(_)))[0], &level)?;
+        let name = Self::name(c, name)?;
+        self.vault_at(Self::tiers(c, &level)[0], &level)?;
+        self.migrate(person).await;
+        // GitHub's instance is its owner: the person's name for it, else
+        // its account's login once it is signed in.
+        let key = match (c.id, &name, self.keys_in_use(c, person).is_empty()) {
+            ("github", None, _) => None,
+            ("github", Some(name), _) => Some(self.new_key(c, person, name)),
+            // A first connection is the adapters' `default`, as a flat one
+            // was.
+            (_, _, true) => Some(DEFAULT_INSTANCE.to_string()),
+            (_, Some(name), false) => Some(self.new_key(c, person, name)),
+            (_, None, false) => Some(self.new_key(c, person, c.name)),
+        };
         match c.sign_in {
-            SignIn::Github => self.start_github(person, c, level).await,
-            SignIn::Google => self.start_google(person, level),
+            SignIn::Github => self.start_github(person, c, level, key, name).await,
+            SignIn::Google => self.start_google(
+                person,
+                level,
+                key.unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
+                name,
+            ),
             SignIn::Fields => Err(Refusal::Invalid(format!(
                 "{} is connected with a key",
                 c.name
@@ -853,6 +1530,8 @@ impl Connections {
         person: &str,
         c: &'static Connector,
         level: Level,
+        key: Option<String>,
+        name: Option<String>,
     ) -> Result<Started, Refusal> {
         let Some(client_id) = self.github_client_id.clone() else {
             return Err(Refusal::Unavailable(
@@ -884,7 +1563,7 @@ impl Connections {
             .json()
             .await
             .map_err(|_| Refusal::Unavailable("GitHub didn't start the sign-in".into()))?;
-        let flow = self.insert_flow(person, level.clone());
+        let flow = self.insert_flow(person, level.clone(), key, name);
         let expires_in = code.expires_in.unwrap_or(900);
         let this = Arc::clone(self);
         let (flow_id, person) = (flow.clone(), person.to_string());
@@ -953,19 +1632,28 @@ impl Connections {
                 }
                 let fields = BTreeMap::from([("token".to_string(), token.to_string())]);
                 return match self.services.github_user(token).await {
-                    Ok(Found::Works { account }) => match self.keep(c, level, person, &fields) {
-                        Ok(_) => {
-                            let found = Found::Works {
-                                account: account.clone(),
-                            };
-                            self.record(c, level, person, &found, true).await;
-                            self.reload(c, level, person).await;
-                            FlowState::Connected { account }
+                    Ok(Found::Works { account }) => {
+                        let (key, name) = self.flow_names(flow);
+                        let name = name.unwrap_or_else(|| account.clone());
+                        let key = key.unwrap_or_else(|| self.new_key(c, person, &account));
+                        let conn = Conn {
+                            level: level.clone(),
+                            key,
+                        };
+                        match self.keep(c, level, &conn.key, person, &fields, Some(&name)) {
+                            Ok(_) => {
+                                let found = Found::Works {
+                                    account: account.clone(),
+                                };
+                                self.record(c, &conn, person, &found, true).await;
+                                self.reload(c, level, person).await;
+                                FlowState::Connected { account }
+                            }
+                            Err(_) => FlowState::Failed {
+                                error: "Desk couldn't keep the sign-in".into(),
+                            },
                         }
-                        Err(_) => FlowState::Failed {
-                            error: "Desk couldn't keep the sign-in".into(),
-                        },
-                    },
+                    }
                     Ok(Found::Refused(e) | Found::Failed(e))
                     | Err(Found::Refused(e) | Found::Failed(e)) => FlowState::Failed {
                         error: scrub(&e, &fields),
@@ -990,7 +1678,23 @@ impl Connections {
         }
     }
 
-    fn start_google(&self, person: &str, level: Level) -> Result<Started, Refusal> {
+    /// The instance and name sign-in `flow` keeps.
+    fn flow_names(&self, flow: &str) -> (Option<String>, Option<String>) {
+        self.flows
+            .lock()
+            .expect("connection flows poisoned")
+            .get(flow)
+            .map(|f| (f.key.clone(), f.name.clone()))
+            .unwrap_or_default()
+    }
+
+    fn start_google(
+        &self,
+        person: &str,
+        level: Level,
+        key: String,
+        name: Option<String>,
+    ) -> Result<Started, Refusal> {
         use workforce_skills::adapters::google::oauth::{start_web_flow, OAuthClientCreds};
         use workforce_skills::adapters::google::web_flow::DeskFlow;
         let Some((client_id, client_secret, redirect)) = self.google_client() else {
@@ -1015,11 +1719,11 @@ impl Connections {
             Level::All => None,
             Level::Agent(agent) => Some(agent.clone()),
         };
-        let flow = self.insert_flow(person, level);
+        let flow = self.insert_flow(person, level, Some(key.clone()), name);
         crate::google_oauth_callback::google_web_flow_store().insert_flow(
             web.state,
             person.to_string(),
-            catalog::GOOGLE_WORKSPACE.to_string(),
+            key,
             web.verifier,
             Some(DeskFlow {
                 flow: flow.clone(),
@@ -1051,18 +1755,24 @@ impl Connections {
         );
     }
 
-    /// Google signed `person` in for `flow`: keeps the tokens at the flow's
-    /// tier, unless it was cancelled meanwhile.
+    /// Google signed `person` in for `flow`: keeps the tokens as the flow's
+    /// instance at its tier, unless it was cancelled meanwhile.
     pub async fn google_signed_in(
         &self,
         flow: &str,
         person: &str,
         tokens: &workforce_skills::adapters::google::oauth::StoredTokens,
     ) -> Result<String, String> {
-        let level = {
+        let (level, key, name) = {
             let flows = self.flows.lock().expect("connection flows poisoned");
             match flows.get(flow) {
-                Some(f) if f.person == person && f.state == FlowState::Waiting => f.level.clone(),
+                Some(f) if f.person == person && f.state == FlowState::Waiting => (
+                    f.level.clone(),
+                    f.key
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
+                    f.name.clone(),
+                ),
                 _ => {
                     return Err(
                         "This sign-in was cancelled or has expired. Nothing was saved.".into(),
@@ -1071,41 +1781,46 @@ impl Connections {
             }
         };
         let c = catalog::find("google").expect("google is in the catalog");
-        let tier = c.tiers(matches!(level, Level::Agent(_)))[0];
-        let vault = match self.vault_at(tier, &level) {
-            Ok(vault) => vault,
-            Err(_) => {
-                self.settle(
-                    flow,
-                    FlowState::Failed {
-                        error: "Desk couldn't keep the sign-in".into(),
-                    },
-                );
-                return Err("Desk couldn't keep the sign-in.".into());
-            }
-        };
-        let store = crate::user_config::UserAwareVault::for_user(vault, person.to_string());
-        if let Err(e) = workforce_skills::adapters::google::oauth::persist_tokens_at_user_scope(
-            &store,
-            person,
-            catalog::GOOGLE_WORKSPACE,
-            tokens,
-        ) {
-            tracing::error!(error = %format!("{e:#}"), "keeping a Google sign-in failed");
-            self.settle(
+        let tier = Self::tiers(c, &level)[0];
+        let failed = |this: &Self| {
+            this.settle(
                 flow,
                 FlowState::Failed {
                     error: "Desk couldn't keep the sign-in".into(),
                 },
             );
-            return Err("Desk couldn't keep the sign-in.".into());
+            Err("Desk couldn't keep the sign-in.".to_string())
+        };
+        let vault = match self.vault_at(tier, &level) {
+            Ok(vault) => vault,
+            Err(_) => return failed(self),
+        };
+        let store =
+            crate::user_config::UserAwareVault::for_user(Arc::clone(&vault), person.to_string());
+        if let Err(e) = workforce_skills::adapters::google::oauth::persist_tokens_at_user_scope(
+            &store, person, &key, tokens,
+        ) {
+            tracing::error!(error = %format!("{e:#}"), "keeping a Google sign-in failed");
+            return failed(self);
         }
         let account = tokens.email.clone().unwrap_or_else(|| "Google".into());
+        let label = key_at(tier, person, &c.label_at(&key).expect("google is named"));
+        let name = name.unwrap_or_else(|| account.clone());
+        if let Err(e) = vault.apply(
+            &[VaultOp::Set {
+                path: &label,
+                value: &name,
+            }],
+            VaultActor::User(person),
+        ) {
+            warn!(error = %format!("{e:#}"), "a Google connection's name wasn't kept");
+        }
         let found = Found::Works {
             account: account.clone(),
         };
-        self.record(c, &level, person, &found, true).await;
-        self.reload(c, &level, person).await;
+        let conn = Conn { level, key };
+        self.record(c, &conn, person, &found, true).await;
+        self.reload(c, &conn.level, person).await;
         self.settle(
             flow,
             FlowState::Connected {
@@ -1242,14 +1957,20 @@ pub fn install(
 ) -> Router {
     let connections = INSTALLED
         .get_or_init(|| {
-            Arc::new(Connections::new(
+            let mut connections = Connections::new(
                 state.vault.clone(),
                 Arc::new(Registry(Arc::clone(state))),
                 Arc::new(desk),
                 Services::live(),
                 config.desk.github_client_id.clone(),
                 google_redirect(&config.gateway.listen),
-            ))
+            );
+            connections.github_owner = config
+                .github
+                .default_owner
+                .clone()
+                .filter(|o| !o.trim().is_empty());
+            Arc::new(connections)
         })
         .clone();
     router(Arc::clone(state), connections)
@@ -1275,10 +1996,31 @@ struct At {
 
 #[derive(Deserialize)]
 struct ConnectBody {
+    #[serde(default)]
+    name: Option<String>,
     level: String,
     agent: Option<String>,
     #[serde(default)]
     fields: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct StartBody {
+    #[serde(default)]
+    name: Option<String>,
+    level: String,
+    agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FieldsBody {
+    #[serde(default)]
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -1341,11 +2083,19 @@ pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router
         .route("/api/desk/connections", get(list))
         .route(
             "/api/desk/connections/{connector}",
-            post(connect).delete(disconnect),
+            post(connect).delete(disconnect_level),
         )
-        .route("/api/desk/connections/{connector}/test", post(test))
+        .route("/api/desk/connections/{connector}/test", post(test_level))
         .route("/api/desk/connections/{connector}/client", post(client))
         .route("/api/desk/connections/{connector}/oauth/start", post(start))
+        .route(
+            "/api/desk/connections/{connector}/{connection}",
+            post(reconnect).patch(rename).delete(disconnect),
+        )
+        .route(
+            "/api/desk/connections/{connector}/{connection}/test",
+            post(test),
+        )
         .route(
             "/api/desk/connection-flows/{flow}",
             get(flow).delete(cancel),
@@ -1374,6 +2124,7 @@ async fn connect(
         .connect(
             &person,
             &connector,
+            body.name.as_deref(),
             &body.level,
             body.agent.as_deref(),
             body.fields,
@@ -1383,16 +2134,45 @@ async fn connect(
         .into_response()
 }
 
+async fn reconnect(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path((connector, connection)): Path<(String, String)>,
+    Json(body): Json<FieldsBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    r.connections
+        .reconnect(&person, &connector, &connection, body.fields)
+        .await
+        .map(|c| Json(json!({ "connection": c })))
+        .into_response()
+}
+
+async fn rename(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path((connector, connection)): Path<(String, String)>,
+    Json(body): Json<NameBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    r.connections
+        .rename(&person, &connector, &connection, &body.name)
+        .await
+        .map(|c| Json(json!({ "connection": c })))
+        .into_response()
+}
+
 async fn test(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
-    Path(connector): Path<String>,
-    Json(at): Json<At>,
+    Path((connector, connection)): Path<(String, String)>,
 ) -> Response {
     let person = person!(r, h, q);
     r.connections
-        .test(&person, &connector, &at.level, at.agent.as_deref())
+        .test(&person, &connector, &connection)
         .await
         .map(|c| Json(json!({ "connection": c })))
         .into_response()
@@ -1402,12 +2182,41 @@ async fn disconnect(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
+    Path((connector, connection)): Path<(String, String)>,
+) -> Response {
+    let person = person!(r, h, q);
+    r.connections
+        .disconnect(&person, &connector, &connection)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn test_level(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(connector): Path<String>,
+    Json(at): Json<At>,
+) -> Response {
+    let person = person!(r, h, q);
+    r.connections
+        .test_level(&person, &connector, &at.level, at.agent.as_deref())
+        .await
+        .map(|c| Json(json!({ "connection": c })))
+        .into_response()
+}
+
+async fn disconnect_level(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
     Path(connector): Path<String>,
     Query(at): Query<At>,
 ) -> Response {
     let person = person!(r, h, q);
     r.connections
-        .disconnect(&person, &connector, &at.level, at.agent.as_deref())
+        .disconnect_level(&person, &connector, &at.level, at.agent.as_deref())
         .await
         .map(Json)
         .into_response()
@@ -1435,11 +2244,17 @@ async fn start(
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
     Path(connector): Path<String>,
-    Json(at): Json<At>,
+    Json(at): Json<StartBody>,
 ) -> Response {
     let person = person!(r, h, q);
     r.connections
-        .start(&person, &connector, &at.level, at.agent.as_deref())
+        .start(
+            &person,
+            &connector,
+            at.name.as_deref(),
+            &at.level,
+            at.agent.as_deref(),
+        )
         .await
         .map(Json)
         .into_response()
