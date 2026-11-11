@@ -106,6 +106,12 @@ pub trait ComputerGate: Send + Sync {
     fn asks_unattended(&self, _tool: &str) -> bool {
         false
     }
+    /// Why `tool`, doing `effect`, is refused where nobody can be asked,
+    /// whatever its verdict would be: a browser changing a page (or using
+    /// the person's own Chrome) only ever acts in a turn the person is in.
+    fn refuses_unattended(&self, _tool: &str, _effect: &Effect) -> Option<String> {
+        None
+    }
     /// How far a call with `effect` reaches past its tool's own roots, at
     /// the agent's level: reads anywhere but the withheld set from Read
     /// anywhere up, changes anywhere at Full access. `None` keeps the tool's
@@ -144,6 +150,15 @@ pub fn decide_unattended(
     input: &Value,
 ) -> Option<Decision> {
     let mut decision = decide(gate, tools, tool_name, input)?;
+    if let Some(sentence) = gate.and_then(|g| g.refuses_unattended(tool_name, &decision.effect)) {
+        decision.verdict = Verdict::Refuse {
+            refusal: workforce_core::computer::Refusal {
+                rule: workforce_core::computer::Refused::OutsideLevel,
+                sentence,
+            },
+        };
+        return Some(decision);
+    }
     let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
     if asks && gate.is_some_and(|g| g.unattended_runs() && !g.asks_unattended(tool_name)) {
         decision.verdict = Verdict::Run {

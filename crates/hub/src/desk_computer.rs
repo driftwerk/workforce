@@ -102,25 +102,40 @@ fn browsing_for(subject: &ComputerSubject) -> Browsing {
 /// The page `agent`'s browser is on for the person in scope, and whether
 /// a page it read scanned hostile.
 fn page_now(agent: &str) -> (Option<String>, bool) {
-    let user = CURRENT_USER_ID
+    let user = current_user();
+    match workforce_skills::adapters::browser::page_state(agent, &user) {
+        Some(page) => (
+            workforce_skills::adapters::browser::origin_of(&page.url),
+            page.hostile,
+        ),
+        None => (None, false),
+    }
+}
+
+fn current_user() -> String {
+    CURRENT_USER_ID
         .try_with(|u| u.clone())
         .ok()
         .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| workforce_agent::runner::SYSTEM_USER_ID.to_string());
-    match workforce_skills::adapters::browser::page_state(agent, &user) {
-        Some(page) => {
-            let host = page
-                .url
-                .split_once("://")
-                .map(|(_, rest)| rest)
-                .and_then(|rest| rest.split(['/', '?', '#']).next())
-                .map(|authority| authority.rsplit('@').next().unwrap_or(authority))
-                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
-                .filter(|h| !h.is_empty());
-            (host, page.hostile)
-        }
-        None => (None, false),
-    }
+        .unwrap_or_else(|| workforce_agent::runner::SYSTEM_USER_ID.to_string())
+}
+
+/// Who judges, call by call, whether an agent is unbound in the browser
+/// now: the crew (Act fully in force, its budget not spent) in a turn the
+/// person whose Desk this is started and is in. Installed with Desk's
+/// browser; without it, an agent's settings alone say.
+pub type UnboundJudge = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+static JUDGE: std::sync::OnceLock<UnboundJudge> = std::sync::OnceLock::new();
+
+/// Installs the judge, once.
+pub fn judge_unbound_with(judge: UnboundJudge) -> bool {
+    JUDGE.set(judge).is_ok()
+}
+
+/// Whether `agent`, unbound by its settings, is unbound for this call.
+fn unbound_now(agent: &str) -> bool {
+    JUDGE.get().is_none_or(|judge| judge(agent))
 }
 
 /// Where the person's home is.
@@ -594,15 +609,16 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
-        // A browser opening a file reads it (its own effect); any other
-        // browser call is kept under the site its page is on.
+        // A browser call says itself what it opens (a file, as a read) or
+        // the origin it acts on; one that can't is kept under the origin
+        // its page was last seen on.
         if tool.starts_with("browser.") {
-            if matches!(effect, Effect::Read { .. }) {
+            if matches!(effect, Effect::Read { .. } | Effect::Connector { .. }) {
                 return effect;
             }
-            let (host, _) = page_now(&self.policy.agent);
+            let (origin, _) = page_now(&self.policy.agent);
             return Effect::Connector {
-                connector: browser_site(host.as_deref()),
+                connector: browser_site(origin.as_deref()),
                 write: changes_a_page(tool),
             };
         }
@@ -744,11 +760,21 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn unbound(&self) -> bool {
-        self.policy.browser.browsing == Browsing::Unbound
+        self.policy.browser.browsing == Browsing::Unbound && unbound_now(&self.policy.agent)
     }
 
     fn asks_unattended(&self, tool: &str) -> bool {
         tool.starts_with("browser.")
+    }
+
+    fn refuses_unattended(&self, tool: &str, effect: &Effect) -> Option<String> {
+        let acts = matches!(effect, Effect::Connector { write: true, .. });
+        (tool.starts_with("browser.") && acts).then(|| {
+            format!(
+                "{} changes a page only in a turn you're in, so this job didn't. Ask it in Desk.",
+                self.policy.name
+            )
+        })
     }
 
     fn asks_nothing(&self) -> bool {
@@ -772,10 +798,16 @@ impl ComputerGate for HubComputerGate {
         if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
             return self.unreachable();
         }
-        // A browser call reads what its page scanned as, now.
+        // A browser call reads what its page scanned as, now, and is
+        // unbound only as the crew judges this turn.
         let mut policy = std::borrow::Cow::Borrowed(&self.policy);
         if tool.starts_with("browser.") {
-            policy.to_mut().browser.hostile = page_now(&self.policy.agent).1;
+            let agent = &self.policy.agent;
+            let mine = policy.to_mut();
+            mine.browser.hostile = page_now(agent).1;
+            if mine.browser.browsing == Browsing::Unbound && !unbound_now(agent) {
+                mine.browser.browsing = Browsing::Asks;
+            }
         }
         let reached =
             tokio::task::block_in_place(|| handle.block_on(self.computer.verdict(&policy, &facts)));
@@ -793,6 +825,18 @@ impl ComputerGate for HubComputerGate {
             && matches!(record.decision.verdict, Verdict::Run { by: By::Rule })
         {
             return;
+        }
+        // The person answered what a hostile page raised: it holds the
+        // browser back no longer.
+        if matches!(
+            record.decision.verdict,
+            Verdict::Ask {
+                why: workforce_core::computer::Why::HostilePage,
+                ..
+            }
+        ) && matches!(record.outcome, Outcome::Allowed | Outcome::Declined)
+        {
+            workforce_skills::adapters::browser::calm(&self.policy.agent, &current_user());
         }
         let activity = self.activity(&record);
         let computer = self.computer.clone();
@@ -1258,8 +1302,15 @@ mod tests {
             }
             // One that only suggests is refused; an unbound one runs.
             assert_eq!(decide_with(&suggest, "browser.click").0, "refused");
-            assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", true, true));
+            // Unbound, in a turn of the person's; a job never changes a page.
+            assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
+            // A judged-out turn (a job's, another person's, a spent budget)
+            // is not unbound however the settings read.
+            judge_unbound_with(Box::new(|agent| agent != "allan"));
+            let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
+            assert!(asked.starts_with("asks"), "{asked}");
+            assert!(!unbound);
         })
         .await;
     }

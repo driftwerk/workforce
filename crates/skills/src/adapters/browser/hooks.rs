@@ -18,8 +18,9 @@ pub struct OnPage {
     /// What the page shows of the element: its text, value, label, title,
     /// type, name and autocomplete hint, and its form's action.
     pub shown: String,
-    /// The name of a file it uploads.
-    pub file: Option<String>,
+    /// The names of a file it uploads: the staged file's own, and the one
+    /// the site is told.
+    pub files: Vec<String>,
 }
 
 /// One navigation or change a browser made, for the agent's activity.
@@ -27,7 +28,7 @@ pub struct OnPage {
 pub struct Done {
     pub agent: String,
     pub user: String,
-    /// The conversation it was made in.
+    /// The session it was made in (its id).
     pub session: Option<String>,
     pub tool: String,
     /// Which browser: `desk` (Desk's own) or `chrome` (the person's).
@@ -48,6 +49,12 @@ pub trait BrowserHooks: Send + Sync {
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String>;
     /// Keeps what was done. Must neither block nor fail the call.
     fn record(&self, done: Done);
+    /// Whether `agent` may have the file at `path` open, now: a page can
+    /// move to another file after the first was allowed. `Err` says why
+    /// not. A hub with no say lets it be.
+    fn may_open_file(&self, _agent: &str, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 static HOOKS: OnceLock<Arc<dyn BrowserHooks>> = OnceLock::new();

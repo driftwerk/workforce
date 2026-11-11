@@ -1089,7 +1089,7 @@ fn on_page(tool: &str, write: bool) -> CallFacts {
     CallFacts {
         tool: tool.into(),
         ..call(Effect::Connector {
-            connector: browser_site(Some("shop.example")),
+            connector: browser_site(Some("https://shop.example")),
             write,
         })
     }
@@ -1122,16 +1122,27 @@ fn browser_verdicts_by_standing_and_tool() {
         for tool in BROWSER_READS {
             for browsing in [Browsing::Unbound, Browsing::Asks, Browsing::Suggests] {
                 for hostile in [false, true] {
-                    assert_eq!(
-                        verdict(
-                            &browsing_as(browsing, access, hostile),
-                            false,
-                            &[],
-                            &on_page(tool, false)
-                        ),
-                        run,
-                        "{tool} reads at {browsing:?} {access:?} hostile={hostile}"
+                    let v = verdict(
+                        &browsing_as(browsing, access, hostile),
+                        false,
+                        &[],
+                        &on_page(tool, false),
                     );
+                    if hostile && *tool == "browser.navigate" {
+                        assert_eq!(
+                            v,
+                            Verdict::Ask {
+                                choices: vec![Choice::AllowOnce, Choice::Deny],
+                                why: Why::HostilePage
+                            },
+                            "after a hostile page, going on asks at {browsing:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            v, run,
+                            "{tool} reads at {browsing:?} {access:?} hostile={hostile}"
+                        );
+                    }
                 }
             }
         }
@@ -1225,7 +1236,7 @@ fn site_allowance(host: &str, session: &str) -> Grant {
         person: "sarah".into(),
         ability: Ability::ConnectorWrite,
         folder: None,
-        connector: Some(browser_site(Some(host))),
+        connector: Some(browser_site(Some(&format!("https://{host}")))),
         session_id: Some(session.into()),
         run: None,
     }
@@ -1279,7 +1290,10 @@ fn a_browser_ask_outside_a_session_offers_allow_once_only() {
 
 #[test]
 fn a_browser_site_is_kept_by_its_host() {
-    assert_eq!(browser_site(Some("shop.example")), "browser:shop.example");
+    assert_eq!(
+        browser_site(Some("https://shop.example")),
+        "browser:https://shop.example"
+    );
     assert_eq!(browser_site(None), "browser");
     assert_eq!(browser_site(Some("")), "browser");
 }
@@ -1502,4 +1516,34 @@ fn a_browser_opening_a_file_is_held_as_a_read() {
             None => assert_eq!(v, Verdict::Run { by: By::Rule }, "{path}"),
         }
     }
+}
+
+/// Below unbound a script asks each time, Full access that never asks
+/// included: it can press what the never-list reads.
+#[test]
+fn a_script_asks_even_where_everything_else_runs() {
+    let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    p_.access.asks = Asking::Never;
+    assert!(matches!(
+        verdict(&p_, false, &[], &on_page("browser.evaluate", true)),
+        Verdict::Ask {
+            why: Why::Unclear,
+            ..
+        }
+    ));
+}
+
+/// A page with no origin of its own (blank, inline, a file) is asked about
+/// once at a time: no allowance is shared for it.
+#[test]
+fn a_page_with_no_origin_offers_no_session_allowance() {
+    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
+    let click = CallFacts {
+        tool: "browser.click".into(),
+        ..call(Effect::Connector {
+            connector: browser_site(None),
+            write: true,
+        })
+    };
+    assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
 }
