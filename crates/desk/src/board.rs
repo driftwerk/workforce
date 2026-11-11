@@ -142,6 +142,30 @@ pub struct Assignee {
     pub name: String,
 }
 
+/// Where the board's idea of who the person is there came from: their
+/// hub vouched for it (its identity tool answered with their own key), or
+/// they typed it. Only a vouched one is ever assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeSource {
+    Vouched,
+    Typed,
+}
+
+/// A field that can be absent (not known), null (known to be none) or a
+/// value: `None`, `Some(None)`, `Some(Some(v))`.
+pub(crate) mod known {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
 /// A Linear listing a pass read only part of: the page it goes on from,
 /// what it lists from, and the latest change it has seen, which becomes the
 /// cursor once the listing is read through.
@@ -153,6 +177,9 @@ pub struct Listing {
     pub since: Option<String>,
     #[serde(default)]
     pub top: Option<String>,
+    /// When the listing began: the cursor never moves past it.
+    #[serde(default)]
+    pub started: Option<String>,
 }
 
 /// Why a synced board isn't syncing, in both directions; local edits wait.
@@ -230,6 +257,13 @@ pub struct Sync {
     /// Their name there, as the hub said it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub me_name: Option<String>,
+    /// Where `me` came from; none on a link made before this was kept,
+    /// which is never vouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me_source: Option<MeSource>,
+    /// Why the hub can't vouch for who the person is, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub me_note: Option<String>,
     /// The remote state each column moves an issue to.
     pub states: BTreeMap<TicketState, String>,
     /// The sidebar group the board was in when it was linked: the link
@@ -262,6 +296,10 @@ pub struct Sync {
     /// A Linear listing left part read, gone on with by the next pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing: Option<Listing>,
+    /// Who has each issue was read for every ticket once: a board linked
+    /// before assignees were kept catches up on its first pass.
+    #[serde(default)]
+    pub assignees_swept: bool,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.
@@ -319,9 +357,18 @@ pub struct External {
     pub flagged: bool,
     #[serde(default)]
     pub seen: Seen,
-    /// Who has the issue there, as last pulled; none when no one does.
-    #[serde(default)]
-    pub assignee: Option<Assignee>,
+    /// Who has the issue there, as last pulled: absent while not known,
+    /// null when no one does.
+    #[serde(
+        default,
+        deserialize_with = "known::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assignee: Option<Option<Assignee>>,
+    /// Its description was longer than Desk keeps: a change to it here is
+    /// never sent back, so the issue's whole text is never cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
 }
 
 impl External {

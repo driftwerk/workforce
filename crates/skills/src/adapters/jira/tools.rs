@@ -33,6 +33,20 @@ use super::markdown::markdown_to_adf;
 // ──────────────────────────────────────────────────────────────────────
 
 /// Wrap a JSON string field with security boundary markers if it contains content.
+/// The most of an issue's rendered description one `jira.search` row carries.
+const SEARCH_DESCRIPTION_MAX: usize = 8_000;
+
+/// `value`'s text cut to `max` characters, marked where it was cut; anything
+/// else as it is.
+fn clip_chars(value: &Value, max: usize) -> Value {
+    match value.as_str() {
+        Some(s) if s.chars().count() > max => {
+            Value::String(format!("{}…", s.chars().take(max).collect::<String>()))
+        }
+        _ => value.clone(),
+    }
+}
+
 fn wrap_field(value: &Value, source: &str) -> Value {
     match value.as_str() {
         Some(s) if !s.is_empty() => Value::String(wrap_external_content(s, source).wrapped_content),
@@ -355,14 +369,26 @@ impl Tool for JiraSearchTool {
                             "issuetype": f["issuetype"]["name"],
                             "updated": f["updated"],
                         });
+                        // A page of descriptions stays small: each is clipped
+                        // before it is wrapped; get_issue reads one whole.
                         if described {
                             out["description_html"] = wrap_field(
-                                &i["renderedFields"]["description"],
+                                &clip_chars(
+                                    &i["renderedFields"]["description"],
+                                    SEARCH_DESCRIPTION_MAX,
+                                ),
                                 "jira.search.description",
                             );
                         }
                         if labelled {
-                            out["labels"] = f["labels"].clone();
+                            out["labels"] = Value::Array(
+                                f["labels"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|l| wrap_field(l, "jira.search.label"))
+                                    .collect(),
+                            );
                         }
                         out
                     })
@@ -748,7 +774,7 @@ impl Tool for JiraMyselfTool {
         "jira.myself"
     }
     fn description(&self) -> &str {
-        "Who you are on Jira: your accountId, display name and email."
+        "Who the Jira token in use belongs to: its accountId, display name and email, and whether it is your own token (personal) or one shared with others."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -762,12 +788,15 @@ impl Tool for JiraMyselfTool {
         let start = std::time::Instant::now();
         let client = resolve_or_fail!(self, input, start);
         let path = format!("{REST}/myself");
+        // A shared token's account is whoever owns the token, not the caller.
+        let personal = client.token_is_personal();
         match client.get(&path).await {
             Ok(me) => Ok(ToolResult::success(
                 json!({
                     "account_id": me["accountId"],
                     "display_name": me["displayName"],
                     "email": me["emailAddress"],
+                    "personal": personal,
                 }),
                 start.elapsed().as_millis() as u64,
             )),

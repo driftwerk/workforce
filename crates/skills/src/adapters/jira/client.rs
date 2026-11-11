@@ -92,6 +92,17 @@ impl JiraClient {
         field_paths("jira", "workspaces", &self.workspace, field)
     }
 
+    /// Whether the token a call is made with now is the caller's own (a
+    /// per-user tier of the vault): only then does `myself` say who the
+    /// caller is, not whoever the shared token belongs to.
+    pub fn token_is_personal(&self) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let (ws, flat) = self.paths("api_token");
+        resolve_credential(store.as_ref(), &ws, &flat).is_some_and(|r| r.per_user)
+    }
+
     fn resolve_auth(&self) -> Result<(HeaderValue, String)> {
         if let Some(ref auth) = self.static_auth {
             let site = self

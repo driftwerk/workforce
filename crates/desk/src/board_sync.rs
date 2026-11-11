@@ -433,25 +433,57 @@ pub fn linear_pages(answer: &Value) -> bool {
 
 // ── Who the person is there ──────────────────────────────────────────────
 
-/// Who the person is on `system`, as the hub's identity tool says: `None`
-/// when the hub doesn't offer it, holds it for approval or can't say. Only
-/// an offline hub or a refused token is an error.
-pub async fn identify(
-    remote: &dyn Remote,
-    system: System,
-) -> Result<Option<Assignee>, RemoteError> {
+/// What a hub's identity tool said of who the person is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Who {
+    /// Their own key answered: this is them.
+    Person(Assignee),
+    /// The key is shared (an agent's, the hub's): it says who owns the key,
+    /// never who the person is.
+    Shared,
+    /// The hub doesn't offer the tool, held it, or didn't say whose key it
+    /// used (an older hub).
+    Unsaid,
+}
+
+impl Who {
+    /// Why the hub can't vouch for who the person is, in plain words.
+    pub fn why_not(&self, hub: &str, system: System) -> Option<String> {
+        let title = system.title();
+        match self {
+            Self::Person(_) => None,
+            Self::Shared => Some(format!(
+                "{hub} uses a shared {title} key, so it can't say who you are."
+            )),
+            Self::Unsaid => Some(format!(
+                "{hub} can't say who you are on {title} (it doesn't offer {}, or needs updating).",
+                identity_tool(system)
+            )),
+        }
+    }
+}
+
+/// Who the person is on `system`, as the hub's identity tool says. Only an
+/// offline hub or a refused token is an error.
+pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
     match call(remote, system, identity_tool(system), json!({})).await {
         Ok(answer) => Ok(identity_of(system, &answer)),
         Err(
             e @ (RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }),
         ) => Err(e),
-        Err(_) => Ok(None),
+        Err(_) => Ok(Who::Unsaid),
     }
 }
 
-/// The person as `system`'s identity tool answered: an id the sync can put
-/// where it goes (a Linear id, a Jira accountId), and a name.
-pub fn identity_of(system: System, answer: &Value) -> Option<Assignee> {
+/// The person as `system`'s identity tool answered: them only when it says
+/// the key it used is their own, with an id the sync can put where it goes
+/// (a Linear id, a Jira accountId).
+pub fn identity_of(system: System, answer: &Value) -> Who {
+    match answer.get("personal").and_then(Value::as_bool) {
+        Some(true) => {}
+        Some(false) => return Who::Shared,
+        None => return Who::Unsaid,
+    }
     let (id, name) = match system {
         System::Jira => (&answer["account_id"], &answer["display_name"]),
         System::Linear => (
@@ -462,9 +494,13 @@ pub fn identity_of(system: System, answer: &Value) -> Option<Assignee> {
             },
         ),
     };
-    let id = id.as_str()?.trim().to_string();
-    check_me(system, &id).ok()?;
-    Some(Assignee {
+    let Some(id) = id.as_str().map(|i| i.trim().to_string()) else {
+        return Who::Unsaid;
+    };
+    if check_me(system, &id).is_err() {
+        return Who::Unsaid;
+    }
+    Who::Person(Assignee {
         name: name_of(name).unwrap_or_else(|| "You".into()),
         id,
     })
@@ -533,9 +569,49 @@ pub struct Issue {
     pub assignee: Option<Option<Assignee>>,
     /// Whether it is done or cancelled there, when the answer says.
     pub closed: Option<bool>,
+    /// Its description was cut to [`BODY_MAX`](crate::board::BODY_MAX).
+    pub clipped: bool,
+}
+
+/// `body` held to what Desk keeps, and whether it was cut.
+fn held_body(body: String) -> (String, bool) {
+    let max = crate::board::BODY_MAX;
+    match body.chars().count() > max {
+        true => (
+            format!("{}…", body.chars().take(max - 1).collect::<String>()),
+            true,
+        ),
+        false => (body, false),
+    }
 }
 
 impl Issue {
+    /// The column its state puts it in: by the board's map or its state's
+    /// type or name; a closed issue whose state says none goes to Done, or
+    /// Dropped when it reads as cancelled.
+    pub fn column(&self, states: &BTreeMap<TicketState, String>) -> Option<TicketState> {
+        column_for(states, &self.state, self.state_kind.as_deref()).or_else(|| {
+            (self.closed == Some(true)).then(|| {
+                let n = self.state.to_ascii_lowercase();
+                match [
+                    "cancel",
+                    "won't",
+                    "wont",
+                    "drop",
+                    "reject",
+                    "duplicate",
+                    "invalid",
+                ]
+                .iter()
+                .any(|w| n.contains(w))
+                {
+                    true => TicketState::Dropped,
+                    false => TicketState::Done,
+                }
+            })
+        })
+    }
+
     /// Whether it is done or cancelled there: as the answer says, else by
     /// the column its state maps to.
     pub fn is_closed(&self, states: &BTreeMap<TicketState, String>) -> bool {
@@ -709,6 +785,10 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
         let (html, f) = text_field(d);
         (html_text(&html), f)
     });
+    let body = body.map(|(b, f)| {
+        let (b, clipped) = held_body(b);
+        (b, f, clipped)
+    });
     Some(Issue {
         url: match site.trim_end_matches('/') {
             "" => String::new(),
@@ -717,16 +797,18 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
         id: i.get("id").and_then(Value::as_str).map(str::to_string),
         title,
         flagged: f1 || body.as_ref().is_some_and(|b| b.1),
+        clipped: body.as_ref().is_some_and(|b| b.2),
         body: body.map(|b| b.0),
         state: i["status"].as_str().unwrap_or_default().to_string(),
         state_kind: None,
         updated_at: remote_time(&i["updated"])?,
+        // A newer hub wraps each label as someone else's words.
         labels: i["labels"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(str::to_string)
+            .map(|l| unfence(l).0)
             .collect(),
         blocked_by: None,
         assignee: jira_assignee(i),
@@ -754,6 +836,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let key = parse_issue_key(i.get("identifier")?.as_str()?)?;
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
+    let (body, clipped) = held_body(body);
     let blocked_by = i.get("relations").map(|r| {
         r.get("nodes")
             .and_then(Value::as_array)
@@ -783,6 +866,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         blocked_by,
         flagged: f1 || f2,
         assignee: linear_assignee(i),
+        clipped,
         closed: i["state"]["type"]
             .as_str()
             .map(|k| matches!(k, "completed" | "canceled" | "cancelled")),
@@ -887,7 +971,10 @@ impl Pulled {
 /// saw: kept in step whenever the issue is read, changed or not.
 pub fn assignee_changed(t: &Ticket, issue: &Issue) -> Option<Option<Assignee>> {
     let e = t.external.as_ref()?;
-    issue.assignee.clone().filter(|a| *a != e.assignee)
+    issue
+        .assignee
+        .clone()
+        .filter(|a| e.assignee.as_ref() != Some(a))
 }
 
 /// What `issue` changes on `t`, given the board's state map; nothing when
@@ -899,7 +986,7 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
     if issue.updated_at <= e.remote_updated_at {
         return Pulled::default();
     }
-    let state = column_for(states, &issue.state, issue.state_kind.as_deref());
+    let state = issue.column(states);
     Pulled {
         title: (issue.title != t.title && !issue.title.trim().is_empty())
             .then(|| issue.title.clone()),
@@ -936,7 +1023,8 @@ pub fn push_of(t: &Ticket, needs: &[String]) -> Push {
     let seen = &e.seen;
     Push {
         title: (t.title != seen.title).then(|| t.title.clone()),
-        body: (t.body != seen.body).then(|| t.body.clone()),
+        // A description Desk holds only part of is never sent back.
+        body: (t.body != seen.body && !e.clipped).then(|| t.body.clone()),
         state: (Some(t.state) != seen.state).then_some(t.state),
         needs: needs
             .iter()

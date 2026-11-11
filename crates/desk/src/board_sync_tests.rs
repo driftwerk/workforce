@@ -49,6 +49,7 @@ fn synced(state: TicketState) -> Ticket {
             needs: vec![],
         },
         assignee: None,
+        clipped: false,
     });
     t
 }
@@ -266,6 +267,7 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         flagged: false,
         assignee: None,
         closed: None,
+        clipped: false,
     };
     let p = pulled(&t, &issue, &states);
     assert_eq!(p.title.as_deref(), Some("Fix the login page"));
@@ -578,26 +580,118 @@ fn who_has_it_follows_the_issue() {
             name: "Sam".into()
         }))
     );
+    // A ticket that didn't know who had it learns it's no one.
     issue.assignee = Some(None);
-    assert_eq!(assignee_changed(&t, &issue), None, "unassigned, as it was");
+    assert_eq!(assignee_changed(&t, &issue), Some(None));
+    let mut known = t.clone();
+    known.external.as_mut().unwrap().assignee = Some(None);
+    assert_eq!(assignee_changed(&known, &issue), None, "no one, as it was");
     issue.assignee = None;
     assert_eq!(assignee_changed(&t, &issue), None, "the answer didn't say");
+    // Absent and null stay apart on the wire.
+    let e = |a: Option<Option<Assignee>>| {
+        let mut x = t.external.clone().unwrap();
+        x.assignee = a;
+        serde_json::to_value(&x).unwrap()
+    };
+    assert!(e(None).get("assignee").is_none());
+    assert_eq!(e(Some(None))["assignee"], json!(null));
+    let back: External = serde_json::from_value(e(Some(None))).unwrap();
+    assert_eq!(back.assignee, Some(None));
+    let back: External = serde_json::from_value(e(None)).unwrap();
+    assert_eq!(back.assignee, None);
+}
+
+#[test]
+fn a_closed_issue_whose_state_maps_nowhere_is_done_or_dropped() {
+    let states = BTreeMap::from([(TicketState::Todo, "To Do".to_string())]);
+    let issue = |status: &str| {
+        jira_issue(
+            &json!({ "key": "ACME-1", "summary": "One", "status": status, "status_category": "done",
+                "updated": "2026-11-09T10:00:00.000+0000" }),
+            "",
+        )
+        .unwrap()
+    };
+    assert_eq!(issue("Shipped").column(&states), Some(TicketState::Done));
+    assert_eq!(
+        issue("Rejected").column(&states),
+        Some(TicketState::Dropped)
+    );
+    assert_eq!(
+        issue("Won't fix").column(&states),
+        Some(TicketState::Dropped)
+    );
+}
+
+#[test]
+fn a_pulled_body_is_held_to_what_desk_keeps_and_never_sent_back_cut() {
+    let long = "x".repeat(crate::board::BODY_MAX + 50);
+    let l = linear_issue(&json!({ "identifier": "ENG-4", "title": "Four", "description": long,
+        "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" } }))
+    .unwrap();
+    assert!(l.clipped);
+    assert_eq!(
+        l.body.as_ref().unwrap().chars().count(),
+        crate::board::BODY_MAX
+    );
+    let mut t = synced(TicketState::Todo);
+    t.external.as_mut().unwrap().clipped = true;
+    t.body = "edited here".into();
+    assert_eq!(push_of(&t, &[]).body, None);
+    // A label a newer hub wrapped reads as its words.
+    let wrapped = "<<<EXTERNAL_UNTRUSTED_CONTENT_ab12>>>\n[External content from jira.search.label]\nweb\n<<</EXTERNAL_UNTRUSTED_CONTENT_ab12>>>";
+    let j = jira_issue(
+        &json!({ "key": "ACME-1", "summary": "One", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "labels": [wrapped] }),
+        "",
+    )
+    .unwrap();
+    assert_eq!(j.labels, ["web"]);
 }
 
 #[test]
 fn who_the_person_is_comes_from_the_hub_s_identity_tool() {
-    let me = identity_of(
+    let person = |w: Who| match w {
+        Who::Person(me) => me,
+        other => panic!("{other:?}"),
+    };
+    let me = person(identity_of(
         System::Linear,
-        &json!({ "id": "11111111-2222-4333-8444-555555555555", "name": "ana", "display_name": "Ana" }),
-    )
-    .unwrap();
+        &json!({ "id": "11111111-2222-4333-8444-555555555555", "name": "ana", "display_name": "Ana", "personal": true }),
+    ));
     assert_eq!(me.name, "Ana");
-    assert!(identity_of(System::Linear, &json!({ "id": "x\" } }" })).is_none());
-    let me = identity_of(
+    assert_eq!(
+        identity_of(
+            System::Linear,
+            &json!({ "id": "x\" } }", "personal": true })
+        ),
+        Who::Unsaid
+    );
+    // A shared key says who owns the key, never who the person is; an
+    // older hub doesn't say whose key it used.
+    assert_eq!(
+        identity_of(
+            System::Linear,
+            &json!({ "id": "11111111-2222-4333-8444-555555555555", "name": "bot", "personal": false })
+        ),
+        Who::Shared
+    );
+    assert_eq!(
+        identity_of(
+            System::Linear,
+            &json!({ "id": "11111111-2222-4333-8444-555555555555", "name": "ana" })
+        ),
+        Who::Unsaid
+    );
+    assert_eq!(
+        Who::Shared.why_not("Atlas", System::Linear).unwrap(),
+        "Atlas uses a shared Linear key, so it can't say who you are."
+    );
+    let me = person(identity_of(
         System::Jira,
-        &json!({ "account_id": "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077", "display_name": "Sam" }),
-    )
-    .unwrap();
+        &json!({ "account_id": "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077", "display_name": "Sam", "personal": true }),
+    ));
     assert_eq!(me.id, "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077");
     // Take it assigns with the write tool a move already uses.
     let (tool, args) = take_call(System::Jira, "ACME-1", &me.id);

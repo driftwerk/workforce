@@ -48,6 +48,8 @@ pub(crate) struct Jira {
     pub next: u32,
     /// A tool that answers as the hub's policy refusing it.
     pub refuse: Option<&'static str>,
+    /// The hub's Jira token is a shared one, not the person's own.
+    pub shared_key: bool,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -203,7 +205,8 @@ impl Tool for FakeJiraTool {
             }
             "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
             "jira.myself" => {
-                json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com" })
+                json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
+                    "personal": !j.shared_key })
             }
             "jira.get_project" => json!({
                 "key": input["project_key"],
@@ -428,6 +431,8 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         filter,
         me: None,
         me_name: None,
+        me_source: None,
+        me_note: None,
         states: states(),
     }
 }
@@ -1218,7 +1223,7 @@ async fn a_whole_project_comes_in_and_take_it_assigns_it_to_you() {
         assert_eq!(keys, ["ACME-1", "ACME-2", "ACME-3"], "done stays out");
         let by_key = |k: &str| tickets.iter().find(|t| t.key.as_deref() == Some(k)).unwrap();
         assert_eq!(
-            by_key("ACME-2").ticket.external.as_ref().unwrap().assignee.as_ref().unwrap().name,
+            by_key("ACME-2").ticket.external.as_ref().unwrap().assignee.clone().flatten().unwrap().name,
             "Ana"
         );
         // The search carried the descriptions: no issue was read one by one.
@@ -1248,7 +1253,80 @@ async fn a_whole_project_comes_in_and_take_it_assigns_it_to_you() {
         // The next pull agrees with what was taken.
         local.sync.pass_board(b.id, true).await.unwrap();
         let after = desk.ticket(one).await.unwrap();
-        assert_eq!(after.ticket.external.unwrap().assignee.unwrap().id, SAM_ACCOUNT);
+        assert_eq!(after.ticket.external.unwrap().assignee.flatten().unwrap().id, SAM_ACCOUNT);
+    })
+    .await;
+}
+
+/// A hub whose Jira token is shared answers `jira.myself` as the token's
+/// owner: the dialog names no one and says why, the link keeps no one, and
+/// Take it assigns nothing. Checking again once the person has their own
+/// token vouches for them.
+#[tokio::test]
+async fn a_shared_key_never_says_who_you_are() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub(&dir.path().join("remote"), &["jira.*"], &[]).await;
+        remote.jira.lock().unwrap().shared_key = true;
+        seed(&remote.jira, "ACME-1", "Issue 1", &[]);
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let all = json!({ "kind": "all", "value": { "includeDone": false } });
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": all }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["me"], Value::Null);
+        assert_eq!(
+            body["meWhy"],
+            "Atlas uses a shared Jira key, so it can't say who you are."
+        );
+        let b = board(&desk, "Acme").await;
+        // A source given by the asker is never taken.
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                json!({ "system": "jira", "target": "ACME", "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": all, "states": states(), "meSource": "vouched" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], Value::Null);
+        assert_eq!(body["sync"].get("meSource"), None);
+        assert!(body["sync"]["meNote"].as_str().unwrap().contains("shared Jira key"));
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.tickets(b.id, &Default::default()).await.unwrap()[0].ticket.id;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/tickets/{t}/take"), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"],
+            "Atlas uses a shared Jira key, so it can't say who you are."
+        );
+        assert!(!remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(t, _)| t == "jira.update_issue"));
+        // Their own token now: checking again vouches for them.
+        remote.jira.lock().unwrap().shared_key = false;
+        let (status, body) = local
+            .send("POST", &format!("/api/desk/boards/{}/me", b.id), json!(null))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["me"], SAM_ACCOUNT);
+        assert_eq!(body["sync"]["meSource"], "vouched");
+        assert_eq!(body["sync"].get("meNote"), None);
     })
     .await;
 }

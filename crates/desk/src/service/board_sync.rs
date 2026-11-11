@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 
 use super::{Desk, DeskError};
 use crate::board::{
-    self, Assignee, Board, External, Filter, Listing, Paused, Retry, Seen, Sync, System, Ticket,
-    TicketState, Via,
+    self, Board, External, Filter, Listing, Paused, Retry, Seen, Sync, System, Ticket, TicketState,
+    Via,
 };
 use crate::board_sync::{check_filter, check_target, Issue, Remote, RemoteError};
 use crate::board_sync_store::SyncHub;
@@ -45,6 +45,13 @@ pub struct LinkBoard {
     /// Their name there, as the hub said it.
     #[serde(default)]
     pub me_name: Option<String>,
+    /// Where `me` came from: the hub's to say, never the asker's. Without
+    /// it, an id given is one the person typed.
+    #[serde(skip)]
+    pub me_source: Option<board::MeSource>,
+    /// Why the hub can't vouch for who the person is.
+    #[serde(skip)]
+    pub me_note: Option<String>,
     pub states: BTreeMap<TicketState, String>,
 }
 
@@ -233,8 +240,12 @@ impl Desk {
             via: link.via,
             person: person.to_string(),
             filter: link.filter,
+            me_source: link
+                .me_source
+                .or(link.me.is_some().then_some(board::MeSource::Typed)),
             me: link.me,
             me_name: link.me_name,
+            me_note: link.me_note,
             states: link.states,
             group: b.group.clone(),
             cursor: None,
@@ -246,6 +257,7 @@ impl Desk {
             problem: None,
             retry: Default::default(),
             listing: None,
+            assignees_swept: true,
         };
         self.0
             .store
@@ -401,6 +413,10 @@ impl Budget {
     }
 }
 
+/// How far before the latest change a read-through Linear listing saw its
+/// cursor goes.
+const LINEAR_LOOKBACK: chrono::Duration = chrono::Duration::minutes(2);
+
 /// What a listing of a board's issues read.
 struct Listed {
     issues: Vec<Issue>,
@@ -530,6 +546,7 @@ impl Desk {
             s.pulled_at = Some(now);
             if swept {
                 s.swept_at = Some(now);
+                s.assignees_swept = true;
             }
             if cursor.is_some() {
                 s.cursor = cursor;
@@ -562,9 +579,11 @@ impl Desk {
             });
         }
         let mut budget = Budget(crate::board_sync::CALLS_PER_PASS);
-        let sweep = s
-            .swept_at
-            .is_none_or(|at| now - at >= crate::board_sync::SWEEP_EVERY);
+        // A board linked before who has each issue was kept reads it for
+        // every ticket on its first pass.
+        let sweep = !s.assignees_swept
+            || s.swept_at
+                .is_none_or(|at| now - at >= crate::board_sync::SWEEP_EVERY);
         let mut out = Pulled::default();
         let mut retry = s.retry.clone();
         match self
@@ -664,6 +683,12 @@ impl Desk {
                     out.ordered = false;
                     out.issues.extend(found);
                     match crate::board_sync::linear_next_page(&answer) {
+                        // A page that names itself as next would never end.
+                        Some(next) if page.as_deref() == Some(next.as_str()) => {
+                            return Err(RemoteError::Failed(
+                                "Linear gave the same page twice".into(),
+                            ))
+                        }
                         Some(next) => page = Some(next),
                         None => break,
                     }
@@ -740,7 +765,10 @@ impl Desk {
         // A Linear listing goes on where the last pass left it, while it is
         // still the listing from this cursor.
         let resume = s.listing.as_ref().filter(|l| l.since == s.cursor);
-        let listed = self
+        let started = resume
+            .and_then(|l| l.started.clone())
+            .unwrap_or_else(|| now.to_rfc3339());
+        let listed = match self
             .matching(
                 s,
                 remote,
@@ -748,7 +776,17 @@ impl Desk {
                 resume.map(|l| l.after.as_str()),
                 budget,
             )
-            .await?;
+            .await
+        {
+            Ok(listed) => listed,
+            Err(e) => {
+                // A page gone on from that failed starts over next time.
+                if resume.is_some() {
+                    let _ = self.change_sync(b.id, |s| s.listing = None).await;
+                }
+                return Err(e);
+            }
+        };
         let Listed {
             issues: changed,
             complete,
@@ -793,10 +831,20 @@ impl Desk {
                         after,
                         since: s.cursor.clone(),
                         top: top.map(|t| t.to_rfc3339()),
+                        started: Some(started),
                     }),
                 });
             }
-            cursor = top.map(|t| t.to_rfc3339());
+            // Never past when the listing began, and a little before the
+            // latest change it saw: a change made while it was read, or a
+            // clock a little off, comes in next time (unchanged ones are
+            // skipped without a call).
+            let began = chrono::DateTime::parse_from_rfc3339(&started)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc));
+            cursor = top
+                .map(|t| began.map_or(t, |b| t.min(b)) - LINEAR_LOOKBACK)
+                .map(|t| t.to_rfc3339());
         }
         if !complete {
             return Ok(PassEnd {
@@ -941,7 +989,7 @@ impl Desk {
             return Ok(());
         };
         if let Some(e) = t.external.as_mut() {
-            e.assignee = a;
+            e.assignee = Some(a);
         }
         self.save_ticket(&mut t).await?;
         if let Ok(v) = self.view_ticket(t).await {
@@ -1006,7 +1054,10 @@ impl Desk {
         }
         let e = t.external.as_mut().expect("a synced ticket");
         if let Some(a) = p.assignee.clone() {
-            e.assignee = a;
+            e.assignee = Some(a);
+        }
+        if p.body.is_some() || issue.body.is_some() {
+            e.clipped = issue.clipped;
         }
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
         e.synced = true;
@@ -1040,9 +1091,7 @@ impl Desk {
     /// Imports `issue` onto `b`, in the column its state maps to (Backlog
     /// when none). Whether it was imported.
     async fn import(&self, b: &Board, s: &Sync, issue: &Issue) -> Result<bool, DeskError> {
-        let state =
-            crate::board_sync::column_for(&s.states, &issue.state, issue.state_kind.as_deref())
-                .unwrap_or(TicketState::Backlog);
+        let state = issue.column(&s.states).unwrap_or(TicketState::Backlog);
         if state == TicketState::Dropped {
             return Ok(false);
         }
@@ -1077,7 +1126,8 @@ impl Desk {
                     state: Some(state),
                     needs: vec![],
                 },
-                assignee: issue.assignee.clone().flatten(),
+                assignee: issue.assignee.clone(),
+                clipped: issue.clipped,
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -1298,44 +1348,66 @@ impl Desk {
 // ── Taking an issue ──────────────────────────────────────────────────────
 
 impl Desk {
-    /// Who the person is on board `id`'s Jira or Linear: as its link keeps
-    /// it, else as the hub says (kept on the link from then on).
-    pub async fn sync_me(
+    /// Asks the hub afresh who the person is on board `id`'s Jira or Linear
+    /// and keeps its answer on the link: vouched when it answered with their
+    /// own key, else cleared with why (an id they typed stays theirs).
+    /// `hub` names the hub as the board says it.
+    pub async fn recheck_me(
         &self,
         id: Uuid,
-        s: &Sync,
         remote: &dyn Remote,
-    ) -> Result<Option<Assignee>, RemoteError> {
-        if let Some(me) = &s.me {
-            return Ok(Some(Assignee {
-                id: me.clone(),
-                name: s.me_name.clone().unwrap_or_else(|| "You".into()),
-            }));
-        }
-        let Some(me) = crate::board_sync::identify(remote, s.system).await? else {
-            return Ok(None);
+        hub: &str,
+    ) -> Result<crate::board_sync::Who, RemoteError> {
+        let Some((_, s)) = self
+            .board_sync(id)
+            .await
+            .map_err(|e| RemoteError::Failed(e.to_string()))?
+        else {
+            return Ok(crate::board_sync::Who::Unsaid);
         };
-        let kept = me.clone();
-        let _ = self
-            .change_sync(id, move |s| {
-                s.me = Some(kept.id);
-                s.me_name = Some(kept.name);
-            })
-            .await;
-        Ok(Some(me))
+        let who = crate::board_sync::identify(remote, s.system).await?;
+        let note = who.why_not(hub, s.system);
+        let kept = who.clone();
+        self.change_sync(id, move |s| {
+            match kept {
+                crate::board_sync::Who::Person(me) => {
+                    s.me = Some(me.id);
+                    s.me_name = Some(me.name);
+                    s.me_source = Some(board::MeSource::Vouched);
+                }
+                // A vouched id the hub no longer stands behind is dropped;
+                // one the person typed is theirs to keep.
+                _ if s.me_source == Some(board::MeSource::Typed) => {}
+                _ => {
+                    s.me = None;
+                    s.me_name = None;
+                    s.me_source = None;
+                }
+            }
+            s.me_note = note;
+        })
+        .await
+        .map_err(|e| RemoteError::Failed(e.to_string()))?;
+        Ok(who)
     }
 
     /// The person takes ticket `id`'s issue: it is assigned to them there,
-    /// as themselves, through `remote` (the route the board syncs by). Only
-    /// an issue no one has there is taken; one someone took meanwhile is
-    /// left theirs, and the ticket says who has it. Its Desk assignee (a
-    /// session's, an agent's) is left as it is.
+    /// as themselves, through `remote` (the route the board syncs by).
+    ///
+    /// Only ever to them: the hub must vouch for who they are, now, with
+    /// their own key (a shared key says who owns the key), and agree with
+    /// whom the link knows; an id they typed is never assigned to. Only an
+    /// issue the answer says no one has is taken; one someone has, or whose
+    /// assignee the answer doesn't say, is left. It is read again after,
+    /// and a race lost is said. `hub` names the hub as the board says it.
     pub async fn take_ticket(
         &self,
         id: Uuid,
         remote: &dyn Remote,
+        hub: &str,
         by: &By,
     ) -> Result<crate::service::TicketView, DeskError> {
+        use crate::board_sync::Who;
         let mut t = self.ticket_of(id).await?;
         let b = self.board_of(t.board).await?;
         let Some(s) = b.sync.clone() else {
@@ -1356,23 +1428,33 @@ impl Desk {
         let key = e.key.clone();
         let said = |why: RemoteError| match why {
             RemoteError::Waiting { .. } => DeskError::Conflict(format!(
-                "Your hub holds the change for your approval: approve it there, and {key} is yours."
+                "{hub} holds the change for your approval: approve it there, and {key} is yours."
             )),
             why => DeskError::Conflict(format!("{title} said: {why}")),
         };
-        let me = self
-            .sync_me(b.id, &s, remote)
-            .await
-            .map_err(&said)?
-            .ok_or_else(|| {
-                DeskError::Conflict(format!(
-                    "The hub can't say who you are on {title}, so Desk can't assign {} to you. Ask its admin to offer {}.",
-                    e.key,
-                    crate::board_sync::identity_tool(s.system)
+        if s.me_source == Some(board::MeSource::Typed) {
+            return Err(DeskError::Conflict(format!(
+                "You typed your {title} id, so Desk can't vouch it's you: Take it needs {hub} to say who you are."
+            )));
+        }
+        // Who the person is, asked now: never a cached answer.
+        let who = self.recheck_me(b.id, remote, hub).await.map_err(&said)?;
+        let me = match (who, s.me.as_deref()) {
+            (Who::Person(me), Some(known)) if me.id == known => me,
+            (Who::Person(me), Some(_)) => {
+                return Err(DeskError::Conflict(format!(
+                    "{hub} now says you are {} on {title}, not who this board knew: nothing was assigned. Take it again to go by the new answer.",
+                    me.name
+                )))
+            }
+            (Who::Person(me), None) => me,
+            (other, _) => {
+                return Err(DeskError::Conflict(
+                    other.why_not(hub, s.system).unwrap_or_default(),
                 ))
-            })?;
-        // Who has it now, read fresh: never taken from someone else.
-        let mut budget = Budget(2);
+            }
+        };
+        let mut budget = Budget(3);
         let now = self
             .fetch_issue(&s, remote, &mut budget, &e.key)
             .await
@@ -1380,24 +1462,53 @@ impl Desk {
             .ok_or_else(|| {
                 DeskError::Conflict(format!("{} isn't in {} any more.", e.key, s.target))
             })?;
-        match now.assignee.clone().flatten() {
-            Some(a) if a.id == me.id => {}
-            Some(a) => {
+        match now.assignee.clone() {
+            Some(Some(a)) if a.id == me.id => {}
+            Some(Some(a)) => {
                 self.refresh_assignee(t, &now).await?;
                 return Err(DeskError::Conflict(format!(
                     "{} has {} on {title} already.",
                     a.name, e.key
                 )));
             }
-            None => {
+            Some(None) => {
                 let (tool, args) = crate::board_sync::take_call(s.system, &e.key, &me.id);
                 crate::board_sync::call(remote, s.system, tool, args)
                     .await
                     .map_err(&said)?;
+                // Read again: someone may have taken it in the meantime.
+                let after = self
+                    .fetch_issue(&s, remote, &mut budget, &e.key)
+                    .await
+                    .map_err(&said)?;
+                match after.as_ref().and_then(|i| i.assignee.clone()) {
+                    Some(Some(a)) if a.id == me.id => {}
+                    Some(Some(a)) => {
+                        if let Some(i) = &after {
+                            self.refresh_assignee(t, i).await?;
+                        }
+                        return Err(DeskError::Conflict(format!(
+                            "{} took {} on {title} just before you.",
+                            a.name, e.key
+                        )));
+                    }
+                    _ => {
+                        return Err(DeskError::Conflict(format!(
+                            "{title} didn't say {} is yours after assigning it: look at it there.",
+                            e.key
+                        )))
+                    }
+                }
+            }
+            None => {
+                return Err(DeskError::Conflict(format!(
+                    "{hub} can't tell who has {} on {title}, so Desk won't assign it.",
+                    e.key
+                )))
             }
         }
         if let Some(x) = t.external.as_mut() {
-            x.assignee = Some(me);
+            x.assignee = Some(Some(me));
         }
         self.save_ticket(&mut t).await?;
         let text = format!("took {} on {title}: it is assigned to you there", e.key);
@@ -1916,6 +2027,7 @@ impl Desk {
                 needs: vec![],
             },
             assignee: None,
+            clipped: false,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

@@ -12,6 +12,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::desk;
 use super::*;
+use crate::board::Assignee;
 use crate::board_sync::{Remote, RemoteError};
 use crate::service::NewBoard;
 use crate::store::build_pool;
@@ -97,6 +98,8 @@ fn link(hub: Option<&str>) -> LinkBoard {
         filter: Filter::Label("web".into()),
         me: None,
         me_name: None,
+        me_source: None,
+        me_note: None,
         states: BTreeMap::from([(TicketState::Todo, "To Do".to_string())]),
     }
 }
@@ -636,8 +639,10 @@ struct FakeLinear {
     /// key → (state type, updated, assignee id)
     issues: Mutex<BTreeMap<u32, (String, String, Option<String>)>>,
     calls: Mutex<Vec<(String, Value)>>,
-    /// Whether it answers `linear.viewer`.
-    viewer: bool,
+    /// What `linear.viewer` answers; none: the hub doesn't offer it.
+    viewer: Mutex<Option<Value>>,
+    /// Someone who takes an issue just before an assign lands.
+    racer: Mutex<Option<String>>,
 }
 
 impl FakeLinear {
@@ -648,7 +653,11 @@ impl FakeLinear {
             "url": format!("https://linear.example/ENG-{n}"),
             "state": { "name": kind, "type": kind },
             "updatedAt": updated,
-            "assignee": who.as_ref().map(|id| json!({ "id": id, "name": if id == ME { "Sam" } else { "Ana" } })),
+            "assignee": who.as_ref().map(|id| match id.as_str() {
+                // An assignee the answer names without an id.
+                "noid" => json!({ "name": "Someone" }),
+                id => json!({ "id": id, "name": if id == ME { "Sam" } else { "Ana" } }),
+            }),
             "labels": { "nodes": [] },
         })
     }
@@ -693,10 +702,12 @@ impl Remote for FakeLinear {
             .push((tool.to_string(), args.clone()));
         let mut issues = self.issues.lock().unwrap();
         match tool {
-            "linear.viewer" if self.viewer => {
-                Ok(json!({ "id": ME, "name": "sam", "display_name": "Sam" }))
-            }
-            "linear.viewer" => Err(RemoteError::Missing(tool.into())),
+            "linear.viewer" => self
+                .viewer
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| RemoteError::Missing(tool.into())),
             "linear.issue_list" => {
                 let open = args["open_only"].as_bool() == Some(true);
                 let since = args["updated_since"].as_str().map(str::to_string);
@@ -743,7 +754,12 @@ impl Remote for FakeLinear {
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0);
                 let i = issues.get_mut(&n).unwrap();
-                i.2 = args["assignee_id"].as_str().map(str::to_string);
+                i.2 = self
+                    .racer
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(|| args["assignee_id"].as_str().map(str::to_string));
                 i.1 = "2026-11-09T23:00:00.000Z".into();
                 Ok(json!({ "issue": Self::node(n, i) }))
             }
@@ -773,6 +789,8 @@ async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
             },
             me: me.map(str::to_string),
             me_name: me.map(|_| "Sam".to_string()),
+            me_source: None,
+            me_note: None,
             states: BTreeMap::from([
                 (TicketState::Todo, "unstarted".to_string()),
                 (TicketState::Done, "completed".to_string()),
@@ -820,7 +838,7 @@ async fn a_whole_team_comes_in_page_by_page_with_who_has_each() {
         let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
         let unassigned = tickets
             .iter()
-            .filter(|t| t.ticket.external.as_ref().unwrap().assignee.is_none())
+            .filter(|t| t.ticket.external.as_ref().unwrap().assignee == Some(None))
             .count();
         assert_eq!(unassigned, 43);
         let ana = tickets
@@ -829,15 +847,16 @@ async fn a_whole_team_comes_in_page_by_page_with_who_has_each() {
             .unwrap();
         assert_eq!(
             ana.ticket.external.as_ref().unwrap().assignee,
-            Some(Assignee {
+            Some(Some(Assignee {
                 id: ANA.into(),
                 name: "Ana".into()
-            })
+            }))
         );
-        // Read through: the cursor is the latest change it saw.
+        // Read through: the cursor is a little before the latest change it
+        // saw, and never past when the listing began.
         let s = d.board_sync(b.id).await.unwrap().unwrap().1;
         assert!(
-            s.cursor.as_deref().unwrap().starts_with("2026-11-09T12:10"),
+            s.cursor.as_deref().unwrap().starts_with("2026-11-09T12:08"),
             "{:?}",
             s.cursor
         );
@@ -872,6 +891,7 @@ async fn a_whole_team_comes_in_page_by_page_with_who_has_each() {
                 .unwrap()
                 .assignee
                 .unwrap()
+                .unwrap()
                 .id,
             ANA
         );
@@ -884,23 +904,272 @@ async fn a_whole_team_comes_in_page_by_page_with_who_has_each() {
     .await;
 }
 
+fn viewer(personal: bool) -> Value {
+    json!({ "id": ME, "name": "sam", "display_name": "Sam", "personal": personal })
+}
+
+async fn taker(d: &Desk, linear: &FakeLinear) -> Board {
+    let b = whole_team(d, None).await;
+    d.pull_board(b.id, linear).await.unwrap();
+    b
+}
+
+async fn ticket_of(d: &Desk, b: &Board, key: &str) -> crate::service::TicketView {
+    d.tickets(b.id, &Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.key.as_deref() == Some(key))
+        .unwrap()
+}
+
+fn refused(r: Result<crate::service::TicketView, DeskError>, words: &str) {
+    assert!(
+        matches!(&r, Err(DeskError::Conflict(w)) if w.contains(words)),
+        "{words:?}: {r:?}"
+    );
+}
+
 /// Take it assigns an unassigned issue to the person there, as themselves,
-/// with the tool a move uses; who they are comes from the hub when the link
-/// didn't keep it. One someone took meanwhile stays theirs.
+/// with the tool a move uses, once their own key vouches for who they are,
+/// asked afresh; it reads the issue again after. One someone has stays
+/// theirs.
 #[tokio::test]
 async fn take_it_assigns_an_unassigned_issue_to_the_person() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
-        let b = whole_team(&d, None).await;
-        let linear = FakeLinear {
-            viewer: true,
-            ..Default::default()
-        };
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
         linear.set(1, "unstarted", 1, None);
         linear.set(2, "unstarted", 2, None);
+        let b = taker(&d, &linear).await;
+        let you = crate::crew::By::you();
+        let one = ticket_of(&d, &b, "ENG-1").await;
+        let taken = d
+            .take_ticket(one.ticket.id, &linear, "Atlas", &you)
+            .await
+            .unwrap();
+        assert_eq!(
+            taken.ticket.external.unwrap().assignee,
+            Some(Some(Assignee {
+                id: ME.into(),
+                name: "Sam".into()
+            }))
+        );
+        assert_eq!(
+            linear.calls_of("linear.issue_update"),
+            vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
+        );
+        // Read before and after the write, and who the person is asked each time.
+        assert_eq!(linear.calls_of("linear.issue_get").len(), 2);
+        assert_eq!(linear.calls_of("linear.viewer").len(), 1);
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            (s.me.as_deref(), s.me_source),
+            (Some(ME), Some(crate::board::MeSource::Vouched))
+        );
+        // Ana took ENG-2 meanwhile: it stays hers, and the card says so.
+        linear.set(2, "unstarted", 3, Some(ANA));
+        let two = ticket_of(&d, &b, "ENG-2").await;
+        refused(
+            d.take_ticket(two.ticket.id, &linear, "Atlas", &you).await,
+            "Ana has ENG-2",
+        );
+        assert_eq!(linear.calls_of("linear.issue_update").len(), 1);
+        assert_eq!(
+            ticket_of(&d, &b, "ENG-2")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .assignee,
+            Some(Some(Assignee {
+                id: ANA.into(),
+                name: "Ana".into()
+            }))
+        );
+    })
+    .await;
+}
+
+/// A shared key, an older hub, an id the person typed, or a hub that now
+/// says someone else: nothing is assigned, and the person is told why.
+#[tokio::test]
+async fn take_it_goes_only_to_whom_the_person_s_own_key_says() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        let you = crate::crew::By::you();
+        // The hub doesn't offer linear.viewer.
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "linear.viewer",
+        );
+        // An agent's shared key answers as its owner.
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "Atlas uses a shared Linear key, so it can't say who you are.",
+        );
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.me, None);
+        assert!(s.me_note.unwrap().contains("shared Linear key"));
+        // An older hub that doesn't say whose key it used.
+        *linear.viewer.lock().unwrap() = Some(json!({ "id": ME, "name": "sam" }));
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "can't say who you are",
+        );
+        // Vouched once, then the hub answers as someone else.
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        let other = "33333333-2222-4333-8444-555555555555";
+        d.change_sync(b.id, |s| {
+            s.me = Some(other.into());
+            s.me_source = Some(crate::board::MeSource::Vouched);
+        })
+        .await
+        .unwrap();
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "now says you are Sam",
+        );
+        // An id the person typed is never assigned to.
+        d.change_sync(b.id, |s| {
+            s.me = Some(ME.into());
+            s.me_source = Some(crate::board::MeSource::Typed);
+        })
+        .await
+        .unwrap();
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "You typed your Linear id",
+        );
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+    })
+    .await;
+}
+
+/// An answer that doesn't say who has the issue is never read as no one;
+/// a race lost after the write is said.
+#[tokio::test]
+async fn take_it_needs_a_clear_answer_and_says_a_race_lost() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        linear.set(1, "unstarted", 1, None);
+        linear.set(2, "unstarted", 2, None);
+        let b = taker(&d, &linear).await;
+        let you = crate::crew::By::you();
+        // Someone has ENG-1, but the answer gives no id.
+        linear.set(1, "unstarted", 3, Some("noid"));
+        let one = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        refused(
+            d.take_ticket(one, &linear, "Atlas", &you).await,
+            "can't tell who has ENG-1",
+        );
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+        // Ana's assign lands just before ours.
+        *linear.racer.lock().unwrap() = Some(ANA.into());
+        let two = ticket_of(&d, &b, "ENG-2").await.ticket.id;
+        refused(
+            d.take_ticket(two, &linear, "Atlas", &you).await,
+            "Ana took ENG-2 on Linear just before you",
+        );
+        assert_eq!(
+            ticket_of(&d, &b, "ENG-2")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .assignee
+                .unwrap()
+                .unwrap()
+                .id,
+            ANA
+        );
+    })
+    .await;
+}
+
+/// A Linear listing whose next page is the one it just read ends as an
+/// error, and the listing left part read is dropped.
+#[tokio::test]
+async fn a_linear_page_that_repeats_ends_the_listing() {
+    struct Loop;
+    #[async_trait]
+    impl Remote for Loop {
+        async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+            Ok(vec![])
+        }
+        async fn call(&self, _tool: &str, args: Value) -> Result<Value, RemoteError> {
+            let page = args["after"].as_str().unwrap_or("p1").to_string();
+            Ok(json!({ "issues": [], "page_info": { "has_next_page": true, "end_cursor": page } }))
+        }
+    }
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, None).await;
+        let pulled = d.pull_board(b.id, &Loop).await.unwrap();
+        assert!(
+            pulled
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("same page twice"),
+            "{pulled:?}"
+        );
+        d.change_sync(b.id, |s| {
+            s.listing = Some(crate::board::Listing {
+                after: "p1".into(),
+                since: None,
+                top: None,
+                started: None,
+            });
+            s.backoff_until = None;
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &Loop).await.unwrap();
+        assert_eq!(d.board_sync(b.id).await.unwrap().unwrap().1.listing, None);
+    })
+    .await;
+}
+
+/// A board linked before who has each issue was kept learns it for every
+/// ticket on its first pass, even with nothing changed there.
+#[tokio::test]
+async fn an_older_board_learns_who_has_each_issue_on_its_first_pass() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, None).await;
+        let linear = FakeLinear::default();
+        linear.set(1, "unstarted", 1, Some(ANA));
+        linear.set(2, "unstarted", 2, None);
         d.pull_board(b.id, &linear).await.unwrap();
-        let find = |key: &str| {
+        // As a board from before: no assignee known, swept just now.
+        for t in d.tickets(b.id, &Default::default()).await.unwrap() {
+            let mut t = t.ticket;
+            t.external.as_mut().unwrap().assignee = None;
+            d.save_ticket(&mut t).await.unwrap();
+        }
+        d.change_sync(b.id, |s| {
+            s.assignees_swept = false;
+            s.swept_at = Some(crate::crew::now());
+            s.pulled_at = None;
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &linear).await.unwrap();
+        let who = |key: &str| {
             let d = d.clone();
             let key = key.to_string();
             async move {
@@ -910,77 +1179,15 @@ async fn take_it_assigns_an_unassigned_issue_to_the_person() {
                     .into_iter()
                     .find(|t| t.key.as_deref() == Some(key.as_str()))
                     .unwrap()
+                    .ticket
+                    .external
+                    .unwrap()
+                    .assignee
             }
         };
-        let one = find("ENG-1").await;
-        let you = crate::crew::By::you();
-        let taken = d.take_ticket(one.ticket.id, &linear, &you).await.unwrap();
-        assert_eq!(
-            taken.ticket.external.unwrap().assignee,
-            Some(Assignee {
-                id: ME.into(),
-                name: "Sam".into()
-            })
-        );
-        let updates = linear.calls_of("linear.issue_update");
-        assert_eq!(
-            updates,
-            vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
-        );
-        // Who the person is was kept on the link.
-        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
-        assert_eq!(
-            (s.me.as_deref(), s.me_name.as_deref()),
-            (Some(ME), Some("Sam"))
-        );
-        // Ana took ENG-2 meanwhile: it stays hers, and the card says so.
-        linear.set(2, "unstarted", 3, Some(ANA));
-        let two = find("ENG-2").await;
-        let refused = d.take_ticket(two.ticket.id, &linear, &you).await;
-        assert!(
-            matches!(&refused, Err(DeskError::Conflict(w)) if w.contains("Ana has ENG-2")),
-            "{refused:?}"
-        );
-        assert_eq!(linear.calls_of("linear.issue_update").len(), 1);
-        assert_eq!(
-            find("ENG-2")
-                .await
-                .ticket
-                .external
-                .unwrap()
-                .assignee
-                .unwrap()
-                .id,
-            ANA
-        );
-    })
-    .await;
-}
-
-/// A hub that can't say who the person is still syncs; Take it says why it
-/// can't assign.
-#[tokio::test]
-async fn take_it_without_a_viewer_says_why() {
-    with_test_pool(build_pool, |pool| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let d = desk(pool, dir.path()).await;
-        let b = whole_team(&d, None).await;
-        let linear = FakeLinear::default();
-        linear.set(1, "unstarted", 1, None);
-        d.pull_board(b.id, &linear).await.unwrap();
-        let t = d
-            .tickets(b.id, &Default::default())
-            .await
-            .unwrap()
-            .remove(0);
-        let r = d
-            .take_ticket(t.ticket.id, &linear, &crate::crew::By::you())
-            .await;
-        assert!(
-            matches!(&r, Err(DeskError::Conflict(w)) if w.contains("linear.viewer")),
-            "{r:?}"
-        );
-        assert!(linear.calls_of("linear.issue_update").is_empty());
+        assert_eq!(who("ENG-1").await.flatten().unwrap().id, ANA);
+        assert_eq!(who("ENG-2").await, Some(None));
+        assert!(d.board_sync(b.id).await.unwrap().unwrap().1.assignees_swept);
     })
     .await;
 }

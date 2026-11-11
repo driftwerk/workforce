@@ -2180,7 +2180,7 @@ impl Tool for LinearViewerTool {
     }
 
     fn description(&self) -> &str {
-        "Who you are on Linear: your user's id, name and email."
+        "Who the Linear key in use belongs to: its user's id, name and email, and whether it is your own key (personal) or one shared with others."
     }
 
     fn input_schema(&self) -> Value {
@@ -2213,6 +2213,8 @@ impl Tool for LinearViewerTool {
             }
         };
         let query = "query { viewer { id name email displayName } }";
+        // A shared key's viewer is whoever owns the key, not the caller.
+        let personal = client.key_is_personal();
         match client.query(query, serde_json::json!({})).await {
             Ok(data) => {
                 let v = &data["viewer"];
@@ -2222,6 +2224,7 @@ impl Tool for LinearViewerTool {
                         "name": v["name"],
                         "display_name": v["displayName"],
                         "email": v["email"],
+                        "personal": personal,
                     }),
                     start.elapsed().as_millis() as u64,
                 ))

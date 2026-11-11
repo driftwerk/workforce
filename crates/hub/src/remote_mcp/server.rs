@@ -272,7 +272,9 @@ async fn serve(
 /// own Jira, Linear and identity tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
 /// by exact name, within what the hub exposes anyway. Never `agent.*` (a
 /// delegated turn runs with the person's own role), `approval.*`, `vault.*`,
-/// `jira.api`, a delete, an assign or a bulk change.
+/// `jira.api`, a delete, an assign tool or a bulk change. (A board's Take it
+/// assigns an issue only to the person, through `jira.update_issue` or
+/// `linear.issue_update`, which the sync already calls.)
 pub const DEVICE_SURFACE_EXTRA: &[&str] = &["help", "identity.whoami"];
 
 /// `surface` narrowed to the device surface, by exact names only.

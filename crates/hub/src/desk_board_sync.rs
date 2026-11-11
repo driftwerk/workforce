@@ -29,6 +29,8 @@
 //!   [`sync::MATCH_CEILING`] (past it, "or more").
 //! - `PUT|DELETE /api/desk/boards/{id}/link`: links or unlinks a board.
 //! - `POST /api/desk/boards/{id}/pause` `{paused}`: pauses or resumes it.
+//! - `POST /api/desk/boards/{id}/me`: asks the hub again who the person
+//!   is there, and keeps its answer.
 //! - `POST /api/desk/tickets/{id}/take`: Take it. The ticket's issue, no
 //!   one's there, is assigned to the person, as themselves, through the
 //!   route the board syncs by.
@@ -588,6 +590,7 @@ pub fn router(sync: Arc<BoardSync>) -> Router {
         .route("/api/desk/boards/{id}/pause", post(pause_board))
         .route("/api/desk/boards/{id}/sync", post(sync_board))
         .route("/api/desk/tickets/{id}/take", post(take_ticket))
+        .route("/api/desk/boards/{id}/me", post(recheck_me))
         .with_state(Arc::new(Routes { sync }))
 }
 
@@ -911,13 +914,19 @@ async fn check_link(
     out["prefill"] = json!(sync::prefill_states(&states));
     // Who the person is there, when the hub can say: "assigned to me" then
     // needs no id typed in.
+    // Only the person's own key vouches for them: a shared one says who
+    // owns it, so then no one is named, and the dialog says why.
     let me = match body.me.as_deref() {
         Some(id) => Some(workforce_desk::board::Assignee {
             id: id.to_string(),
             name: "You".into(),
         }),
         None => match sync::identify(&*remote, body.system).await {
-            Ok(me) => me,
+            Ok(sync::Who::Person(me)) => Some(me),
+            Ok(other) => {
+                out["meWhy"] = json!(other.why_not(&hub, body.system));
+                None
+            }
             Err(e) => return said(e),
         },
     };
@@ -1086,11 +1095,12 @@ async fn link_board(
             }
         }
         None => match sync::identify(&*remote, link.system).await {
-            Ok(Some(me)) => {
+            Ok(sync::Who::Person(me)) => {
                 link.me = Some(me.id);
                 link.me_name = Some(me.name);
+                link.me_source = Some(workforce_desk::board::MeSource::Vouched);
             }
-            Ok(None) => {}
+            Ok(other) => link.me_note = other.why_not(&hub, link.system),
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
         },
     }
@@ -1201,11 +1211,48 @@ async fn take_ticket(
             return refusal(StatusCode::CONFLICT, &paused_words(&hub, s.system, &p));
         }
     };
+    let hub = r.sync.hub_name(&s.via).await;
     match desk
-        .take_ticket(id, &*remote, &workforce_desk::crew::By::you())
+        .take_ticket(id, &*remote, &hub, &workforce_desk::crew::By::you())
         .await
     {
         Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Asks the hub again who the person is on a board's Jira or Linear (the
+/// board's "that's not me" or "check again"), and keeps its answer.
+async fn recheck_me(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let person = person!(r, h, q);
+    let desk = &r.sync.desk;
+    let s = match desk.board_sync(id).await {
+        Ok(Some((_, s))) => s,
+        Ok(None) => return refusal(StatusCode::CONFLICT, "That board isn't synced."),
+        Err(e) => return e.into_response(),
+    };
+    if s.person != person {
+        return refusal(
+            StatusCode::FORBIDDEN,
+            "Only the person who linked this board checks who they are on it.",
+        );
+    }
+    let hub = r.sync.hub_name(&s.via).await;
+    let remote = match r.sync.remote(s.system, &s.via, &person).await {
+        Ok(remote) => remote,
+        Err(p) => return refusal(StatusCode::CONFLICT, &paused_words(&hub, s.system, &p)),
+    };
+    if let Err(e) = desk.recheck_me(id, &*remote, &hub).await {
+        return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}"));
+    }
+    match desk.board_sync(id).await {
+        Ok(Some((b, _))) => Json(b).into_response(),
+        Ok(None) => refusal(StatusCode::CONFLICT, "That board isn't synced."),
         Err(e) => e.into_response(),
     }
 }
