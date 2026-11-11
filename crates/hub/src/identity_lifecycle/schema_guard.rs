@@ -155,7 +155,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "decided_by",
         NotPersonal("how a call was decided: rule, grant, session, person or classifier"),
     ),
-    ("desk", "access_activity", "person", By(C::RetentionBound)),
+    ("desk", "access_activity", "person", By(C::DeskActivity)),
     (
         "desk",
         "access_grants",

@@ -95,6 +95,9 @@ pub enum Category {
     GameTallies,
     Pictures,
     Signals,
+    /// What agents did on the person's computer through Desk, and the
+    /// browser screenshots that activity names.
+    DeskActivity,
     CostLedger,
     ConfigReferences,
     AuditRecords,
@@ -102,7 +105,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 33] = [
+    pub const ALL: [Category; 34] = [
         Self::IdentityRecord,
         Self::RemoteMcpTokens,
         Self::Devices,
@@ -132,6 +135,7 @@ impl Category {
         Self::GameTallies,
         Self::Pictures,
         Self::Signals,
+        Self::DeskActivity,
         Self::CostLedger,
         Self::ConfigReferences,
         Self::AuditRecords,
@@ -173,7 +177,7 @@ impl Category {
                 },
             ),
             Self::Skills => (M::Move, D::Transfer),
-            Self::Signals => (M::Move, D::Erase),
+            Self::Signals | Self::DeskActivity => (M::Move, D::Erase),
             Self::Pictures => (M::Move, D::Erase),
             Self::CostLedger => (M::Move, D::Keep),
             Self::AuditRecords => (M::Keep, D::Keep),
@@ -191,6 +195,7 @@ impl Category {
             | Self::GameTallies
             | Self::Pictures
             | Self::Signals
+            | Self::DeskActivity
             | Self::CostLedger => OrphanRule::Personal,
             Self::IdentityRecord
             | Self::RemoteMcpTokens
@@ -242,6 +247,7 @@ impl Category {
             | Self::GameTallies
             | Self::Pictures
             | Self::Signals
+            | Self::DeskActivity
             | Self::CostLedger
             | Self::ConfigReferences
             | Self::AuditRecords
@@ -286,6 +292,7 @@ impl Category {
             Self::GameTallies => "game_tallies",
             Self::Pictures => "pictures",
             Self::Signals => "signals",
+            Self::DeskActivity => "desk_activity",
             Self::CostLedger => "cost_ledger",
             Self::ConfigReferences => "config_references",
             Self::AuditRecords => "audit_records",
@@ -642,6 +649,9 @@ pub struct Lifecycle {
     pub artifacts: Option<Arc<workforce_orchestrator::artifact_store::KnowledgeStore>>,
     /// People's pictures.
     pub pictures: Option<Arc<dyn crate::pictures::PictureStore>>,
+    /// What Desk keeps of agents' work on the person's computer, on a hub
+    /// that runs Desk.
+    pub desk_activity: Option<Arc<dyn DeskActivityStore>>,
     pub external_skills: Arc<crate::external_skills::ExternalSkills>,
     pub data_dir: PathBuf,
     pub runs: Runs,
@@ -775,6 +785,18 @@ impl std::ops::Deref for Context<'_> {
     }
 }
 
+/// Desk's access activity, by the name of the person whose turn it was,
+/// with the browser screenshots it names.
+#[async_trait]
+pub trait DeskActivityStore: Send + Sync {
+    /// Everyone it names, with how many rows each.
+    async fn people(&self) -> Result<Vec<(String, u64)>>;
+    async fn held(&self, name: &str) -> Result<u64>;
+    async fn reassign(&self, from: &str, into: &str) -> Result<()>;
+    /// Erases the rows naming `name` and the screenshots they name.
+    async fn erase(&self, name: &str) -> Result<()>;
+}
+
 /// One store keyed by identity.
 #[async_trait]
 pub trait Holding: Send + Sync {
@@ -847,6 +869,7 @@ pub fn pausable(category: Category) -> Option<&'static dyn Pausable> {
         | Category::GameTallies
         | Category::Pictures
         | Category::Signals
+        | Category::DeskActivity
         | Category::CostLedger
         | Category::ConfigReferences
         | Category::AuditRecords
@@ -880,6 +903,7 @@ pub fn holding(category: Category) -> &'static dyn Holding {
         Category::GameTallies => &conversations::GameTallies,
         Category::Pictures => &records::Pictures,
         Category::Signals => &conversations::Signals,
+        Category::DeskActivity => &records::DeskActivity,
         Category::CostLedger => &conversations::CostLedger,
         Category::Vault => &records::Vault,
         Category::KnowHow => &records::KnowHow,

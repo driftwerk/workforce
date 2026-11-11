@@ -400,6 +400,50 @@ impl DeskStore {
             .await?)
     }
 
+    /// Everyone the activity names, with how many rows each: what the
+    /// identity lifecycle diffs against the people it knows.
+    pub async fn activity_people(&self) -> Result<Vec<(String, u64)>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT person, count(*) FROM access_activity
+                  WHERE person IS NOT NULL GROUP BY person ORDER BY person",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let held: i64 = r.try_get(1)?;
+                Ok((r.try_get(0)?, u64::try_from(held).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// How many rows of activity name `person`.
+    pub async fn activity_of(&self, person: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        let held: i64 = client
+            .query_one(
+                "SELECT count(*) FROM access_activity WHERE person = $1",
+                &[&person],
+            )
+            .await?
+            .try_get(0)?;
+        Ok(u64::try_from(held).unwrap_or(0))
+    }
+
+    /// Names `into` on the activity that named `from`: one person merged
+    /// into another.
+    pub async fn move_activity_person(&self, from: &str, into: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE access_activity SET person = $2 WHERE person = $1",
+                &[&from, &into],
+            )
+            .await?)
+    }
+
     /// The screenshots `person`'s browser activity names, for erasing with
     /// it ([`Self::erase_access_person`]).
     pub async fn browser_shots_of(&self, person: &str) -> Result<Vec<String>> {
@@ -703,7 +747,22 @@ mod tests {
                 .add_grant(&new_grant("allan", None, None))
                 .await
                 .unwrap();
+            assert_eq!(
+                store.activity_people().await.unwrap(),
+                [("sarah".to_string(), 2), ("tom".to_string(), 1)]
+            );
+            assert_eq!(store.activity_of("sarah").await.unwrap(), 2);
+            assert_eq!(
+                store.move_activity_person("tom", "thomas").await.unwrap(),
+                1
+            );
+            assert_eq!(store.activity_of("tom").await.unwrap(), 0);
+            assert_eq!(
+                store.move_activity_person("thomas", "tom").await.unwrap(),
+                1
+            );
             assert_eq!(store.erase_access_person("sarah").await.unwrap(), 3);
+            assert_eq!(store.activity_of("sarah").await.unwrap(), 0);
             let left = store.activity(&ActivityFilter::default()).await.unwrap();
             assert_eq!(left.len(), 1);
             assert_eq!(left[0].activity.person.as_deref(), Some("tom"));

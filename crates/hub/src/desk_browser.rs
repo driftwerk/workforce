@@ -253,6 +253,74 @@ pub async fn erase_person(computer: &Computer, shots: &Path, person: &str) -> ey
     computer.store().erase_access_person(person).await
 }
 
+/// Desk's access activity as the identity lifecycle reaches it: through
+/// the hub's Desk once it runs, so nothing is held on a hub without one.
+pub fn lifecycle_activity(
+    config: &WorkforceConfig,
+) -> Arc<dyn crate::identity_lifecycle::DeskActivityStore> {
+    Arc::new(LifecycleActivity {
+        computer: Box::new(|| crate::desk_driver::desk().map(|desk| desk.computer())),
+        shots: shots_dir(config),
+    })
+}
+
+/// Where the browser keeps its screenshots: beside its profiles in Desk's
+/// folder, or beside the hub's data where that isn't Desk's.
+fn shots_dir(config: &WorkforceConfig) -> PathBuf {
+    browser_root(config).join("shots")
+}
+
+fn browser_root(config: &WorkforceConfig) -> PathBuf {
+    crate::desk_folder::browser_profiles(config)
+        .unwrap_or_else(|| PathBuf::from(&config.hub.data_dir).join("browser"))
+}
+
+pub(crate) struct LifecycleActivity {
+    computer: Box<dyn Fn() -> Option<Computer> + Send + Sync>,
+    shots: PathBuf,
+}
+
+impl LifecycleActivity {
+    #[cfg(test)]
+    pub(crate) fn of(computer: Computer, shots: PathBuf) -> Self {
+        Self {
+            computer: Box::new(move || Some(computer.clone())),
+            shots,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::identity_lifecycle::DeskActivityStore for LifecycleActivity {
+    async fn people(&self) -> eyre::Result<Vec<(String, u64)>> {
+        match (self.computer)() {
+            Some(computer) => computer.store().activity_people().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn held(&self, name: &str) -> eyre::Result<u64> {
+        match (self.computer)() {
+            Some(computer) => computer.store().activity_of(name).await,
+            None => Ok(0),
+        }
+    }
+
+    async fn reassign(&self, from: &str, into: &str) -> eyre::Result<()> {
+        if let Some(computer) = (self.computer)() {
+            computer.store().move_activity_person(from, into).await?;
+        }
+        Ok(())
+    }
+
+    async fn erase(&self, name: &str) -> eyre::Result<()> {
+        if let Some(computer) = (self.computer)() {
+            erase_person(&computer, &self.shots, name).await?;
+        }
+        Ok(())
+    }
+}
+
 /// The sentence a browser call the never-list holds is refused with.
 fn persons(never: workforce_desk::never::Never) -> String {
     format!(
@@ -706,9 +774,8 @@ pub fn install(
     computer: Computer,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Router {
-    let root = crate::desk_folder::browser_profiles(config)
-        .unwrap_or_else(|| PathBuf::from(&config.hub.data_dir).join("browser"));
-    let shots = root.join("shots");
+    let root = browser_root(config);
+    let shots = shots_dir(config);
     let settings = Arc::new(SettingsFile::new(root.join("settings.json")));
     let chrome_dir = config
         .skills
