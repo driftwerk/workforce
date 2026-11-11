@@ -69,6 +69,9 @@ pub struct MintedView {
     link_id: Uuid,
     token: String,
     expires_at: DateTime<Utc>,
+    /// The name this hub goes by in an uplink's challenge: the engine dials
+    /// it, and signs it.
+    hub: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +145,7 @@ pub async fn create(
             link_id: minted.link.link_id,
             token: minted.plaintext,
             expires_at: minted.record.expires_at,
+            hub: crate::boss_links::auth::this_hub(&state),
         }),
     ))
 }
