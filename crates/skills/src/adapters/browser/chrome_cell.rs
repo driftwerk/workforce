@@ -40,6 +40,8 @@ pub(super) struct ChromeCell {
     /// The site a call the person allowed opened: it may show without the
     /// gate allowing a visit again.
     visited: StdMutex<Option<String>>,
+    /// The site the call being made now was allowed to open.
+    pending_visit: StdMutex<Option<String>>,
     pub(super) inner: Mutex<Option<MyChrome>>,
     dir: PathBuf,
 }
@@ -78,6 +80,7 @@ impl ChromeCell {
             last_key: StdMutex::new(None),
             last_used: StdMutex::new(Instant::now()),
             visited: StdMutex::new(None),
+            pending_visit: StdMutex::new(None),
             inner: Mutex::new(None),
             dir,
         }
@@ -106,7 +109,14 @@ impl ChromeCell {
             .then(|| kept_away(&host_of(&url).unwrap_or_else(|| "that page".into())).to_string());
         if refused.is_none() {
             let origin = super::address::origin_of(&url);
-            let allowed = origin.is_some() && *self.visited.lock().unwrap() == origin;
+            let allowed = {
+                let mut visited = self.visited.lock().unwrap();
+                // Off the site a call was allowed to open: that allowance goes.
+                if *visited != origin {
+                    *visited = None;
+                }
+                origin.is_some() && *visited == origin
+            };
             if let (Some(origin), Some(h), false) = (origin, hooks::hooks(), allowed) {
                 refused = h.may_visit(&self.agent, &origin).err();
             }
@@ -160,14 +170,16 @@ impl ChromeCell {
             *guard = Some(attached);
         }
         let chrome = guard.as_ref().expect("just attached");
-        let decided = super::client::decided(super::client::Backend::Chrome);
-        // A site the person allowed this call to open may show, in place of
-        // any allowed before, without the gate allowing it again.
-        if let Some(Decided::Visit(origin)) = &decided {
-            *self.visited.lock().unwrap() = origin.clone();
-        }
-        self.keep_page(chrome, decided).await?;
+        let decided = super::client::take_decided(super::client::Backend::Chrome);
+        self.keep_page(chrome, decided.clone()).await?;
+        // The site the person allowed this very call to open: it stays
+        // allowed only if the call lands there ([`Self::navigate`]).
+        *self.pending_visit.lock().unwrap() = match decided {
+            Some(Decided::Visit(origin)) => origin,
+            _ => None,
+        };
         let out = op(chrome).await;
+        *self.pending_visit.lock().unwrap() = None;
         if out.is_err() && !chrome.alive() {
             *guard = None;
         }
@@ -280,6 +292,12 @@ impl ChromeCell {
         }
         self.with(async |c| {
             c.navigate(url).await?;
+            // Opened, by the call the person allowed, exactly the site it was
+            // allowed to: it may stay.
+            let landed = super::address::origin_of(&c.url().await);
+            if landed.is_some() && landed == *self.pending_visit.lock().unwrap() {
+                *self.visited.lock().unwrap() = landed;
+            }
             self.done(c, "browser.navigate", Some(url)).await;
             self.keep_to_sites(c).await?;
             let title = c.evaluate("document.title").await.unwrap_or_default();

@@ -877,6 +877,8 @@ impl ComputerGate for HubComputerGate {
             workforce_skills::adapters::browser::forget_decision(
                 &self.policy.agent,
                 &current_user(),
+                &record.tool,
+                &record.input,
             );
         }
         let activity = self.activity(&record);

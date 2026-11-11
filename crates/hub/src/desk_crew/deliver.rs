@@ -69,8 +69,6 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
-        // The crew's own wake-up, by name, for as long as it runs.
-        let _wake = crate::desk_browser::CrewWake::begin(&sid);
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
         }
@@ -92,6 +90,10 @@ impl CrewHub {
                 bail!("{busy}");
             }
         };
+        // The crew's own wake-up, by name, for as long as its turn runs:
+        // named only once the turn is the crew's (a session busy with the
+        // person's own turn is never named).
+        let _wake = crate::desk_browser::CrewWake::begin(&sid);
         let _ = tx.send(BroadcastMessage::new(sid.clone(), "typing", String::new()));
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
