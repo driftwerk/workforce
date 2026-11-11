@@ -67,6 +67,21 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_LINKS: usize = 16;
 /// The most calls waiting for their results at once, every link's.
 const MAX_OUTSTANDING: usize = 256;
+/// The most of them one link may have, and one person's links together:
+/// one stalled engine can't take every place.
+const MAX_OUTSTANDING_PER_LINK: usize = 16;
+const MAX_OUTSTANDING_PER_PERSON: usize = 64;
+/// The most sockets one link token, and one address, may have open before
+/// they prove a link.
+const MAX_UNPROVED_PER_TOKEN: usize = 2;
+const MAX_UNPROVED_PER_ADDRESS: usize = 8;
+/// The most frames this hub can't use before it closes a socket.
+const MAX_BAD_FRAMES: u32 = 20;
+/// How many checks in a row a link may fail to be checked (the store
+/// unreachable) before it is dropped.
+const MAX_UNCHECKED: u32 = 3;
+/// How long one write to an engine may take before its socket is closed.
+const WRITE_WITHIN: Duration = Duration::from_secs(10);
 /// The most tool names a link may offer, and the longest.
 const MAX_TOOLS: usize = 64;
 const MAX_TOOL_NAME: usize = 64;
@@ -99,28 +114,39 @@ struct OnSocket {
     group_key: String,
     /// The tools its engine offers, `crew.*` alone.
     tools: Vec<String>,
+    /// Checks in a row that couldn't be made.
+    unchecked: u32,
 }
 
 /// One engine's socket.
 struct Socket {
     id: Uuid,
+    /// The person every link on it is for.
+    person: Uuid,
     tx: mpsc::Sender<Message>,
     seq: AtomicU64,
     links: parking_lot::Mutex<HashMap<Uuid, OnSocket>>,
 }
 
 impl Socket {
-    async fn send(&self, v: Value) -> bool {
+    /// Queues `v` without waiting: a socket whose engine stopped reading
+    /// never holds anyone up; what doesn't fit is dropped.
+    fn notify(&self, v: Value) -> bool {
         self.tx
-            .send(Message::Text(v.to_string().into()))
-            .await
+            .try_send(Message::Text(v.to_string().into()))
             .is_ok()
+    }
+
+    /// Asks the socket to close, without waiting.
+    fn close(&self) {
+        let _ = self.tx.try_send(Message::Close(None));
     }
 }
 
 /// A call waiting for its result.
 struct Pending {
     link_id: Uuid,
+    person: Uuid,
     /// The socket it was last sent on.
     socket: Uuid,
     tool: String,
@@ -134,6 +160,8 @@ struct Pending {
 #[derive(Default)]
 pub struct Uplinks {
     links: parking_lot::Mutex<HashMap<Uuid, Arc<Socket>>>,
+    /// Sockets open but not yet proved, by link token and by address.
+    unproved: parking_lot::Mutex<HashMap<String, usize>>,
     pending: parking_lot::Mutex<HashMap<Uuid, Pending>>,
     timing: parking_lot::Mutex<Timing>,
     #[cfg(test)]
@@ -151,7 +179,58 @@ impl std::fmt::Debug for Uplinks {
 /// What a link's call came to.
 pub type CallResult = Result<Value, String>;
 
+/// A place among the unproved sockets, given back when dropped.
+struct Unproved {
+    uplinks: Arc<Uplinks>,
+    keys: Vec<String>,
+}
+
+impl Drop for Unproved {
+    fn drop(&mut self) {
+        let mut u = self.uplinks.unproved.lock();
+        for k in &self.keys {
+            if let Some(n) = u.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    u.remove(k);
+                }
+            }
+        }
+    }
+}
+
 impl Uplinks {
+    /// A place for one more socket of token `token_id` from `address` to
+    /// prove itself, unless either has as many open as it may.
+    fn unproved(
+        self: &Arc<Self>,
+        token_id: Uuid,
+        address: Option<std::net::IpAddr>,
+    ) -> Option<Unproved> {
+        let mut keys = vec![format!("token:{token_id}")];
+        if let Some(a) = address {
+            keys.push(format!("address:{a}"));
+        }
+        let mut u = self.unproved.lock();
+        let full = keys.iter().any(|k| {
+            let most = match k.starts_with("token:") {
+                true => MAX_UNPROVED_PER_TOKEN,
+                false => MAX_UNPROVED_PER_ADDRESS,
+            };
+            u.get(k).copied().unwrap_or(0) >= most
+        });
+        if full {
+            return None;
+        }
+        for k in &keys {
+            *u.entry(k.clone()).or_default() += 1;
+        }
+        Some(Unproved {
+            uplinks: Arc::clone(self),
+            keys,
+        })
+    }
+
     pub fn set_timing(&self, t: Timing) {
         *self.timing.lock() = t;
     }
@@ -214,11 +293,9 @@ impl Uplinks {
                 reg.remove(&link_id);
             }
         }
-        let _ = socket
-            .send(json!({"type": "state", "linkId": link_id, "state": "stopped", "why": why}))
-            .await;
+        socket.notify(json!({"type": "state", "linkId": link_id, "state": "stopped", "why": why}));
         if left == 0 {
-            let _ = socket.tx.send(Message::Close(None)).await;
+            socket.close();
         }
     }
 
@@ -237,14 +314,29 @@ impl Uplinks {
             .map(|l| l.token.clone())
             .ok_or_else(|| "That boss link isn't connected.".to_string())?;
         match authenticate_link(state, &token) {
-            Ok(live) if live.link.link_id == link_id => Ok(live),
+            Ok(live) if live.link.link_id == link_id => {
+                if let Some(l) = socket.links.lock().get_mut(&link_id) {
+                    l.unchecked = 0;
+                }
+                Ok(live)
+            }
             Ok(_) | Err(LinkRefusal::Unauthenticated) => {
                 let why = LinkRefusal::Unauthenticated.to_string();
                 self.drop_link(socket, link_id, &why).await;
                 Err(why)
             }
-            // Couldn't check now: not dropped, not sent.
-            Err(LinkRefusal::Unavailable) => Err(LinkRefusal::Unavailable.to_string()),
+            // Couldn't check now: not sent; dropped once it has gone on.
+            Err(LinkRefusal::Unavailable) => {
+                let unchecked = socket.links.lock().get_mut(&link_id).map_or(0, |l| {
+                    l.unchecked += 1;
+                    l.unchecked
+                });
+                if unchecked >= MAX_UNCHECKED {
+                    self.drop_link(socket, link_id, &LinkRefusal::Unavailable.to_string())
+                        .await;
+                }
+                Err(LinkRefusal::Unavailable.to_string())
+            }
             Err(why) => {
                 let why = why.to_string();
                 self.drop_link(socket, link_id, &why).await;
@@ -277,13 +369,22 @@ impl Uplinks {
         {
             let mut pending = self.pending.lock();
             pending.retain(|_, p| p.sent_at.elapsed() < timing.resend_within);
-            if pending.len() >= MAX_OUTSTANDING {
+            let of_link = pending.values().filter(|p| p.link_id == link_id).count();
+            let of_person = pending
+                .values()
+                .filter(|p| p.person == socket.person)
+                .count();
+            if pending.len() >= MAX_OUTSTANDING
+                || of_link >= MAX_OUTSTANDING_PER_LINK
+                || of_person >= MAX_OUTSTANDING_PER_PERSON
+            {
                 return Err("Too many calls are waiting for their engines; try again soon.".into());
             }
             pending.insert(
                 call_id,
                 Pending {
                     link_id,
+                    person: socket.person,
                     socket: socket.id,
                     tool: tool.to_string(),
                     input: input.clone(),
@@ -292,14 +393,21 @@ impl Uplinks {
                 },
             );
         }
-        let sent = socket
-            .send(call_frame(&socket, call_id, link_id, tool, &input))
-            .await;
-        if !sent {
-            // Its socket went: it is sent again on the link's next one.
-            tracing::info!(%link_id, "a boss call waits for its engine to come back");
-        }
-        let got = tokio::time::timeout(timing.call_within, rx).await;
+        // Sending it and its answer share the one wait: an engine that
+        // stopped reading holds the call no longer than that.
+        let frame = Message::Text(
+            call_frame(&socket, call_id, link_id, tool, &input)
+                .to_string()
+                .into(),
+        );
+        let got = tokio::time::timeout(timing.call_within, async {
+            if socket.tx.send(frame).await.is_err() {
+                // Its socket went: it is sent again on the link's next one.
+                tracing::info!(%link_id, "a boss call waits for its engine to come back");
+            }
+            rx.await
+        })
+        .await;
         self.pending.lock().remove(&call_id);
         match got {
             Ok(Ok(result)) => result,
@@ -344,9 +452,7 @@ impl Uplinks {
                 .collect()
         };
         for (call_id, link_id, tool, input) in again {
-            socket
-                .send(call_frame(socket, call_id, link_id, &tool, &input))
-                .await;
+            socket.notify(call_frame(socket, call_id, link_id, &tool, &input));
         }
     }
 }
@@ -382,6 +488,7 @@ pub(crate) async fn handler(
     headers: HeaderMap,
     Query(q): Query<UplinkQuery>,
     State(state): State<Arc<GatewayState>>,
+    extensions: axum::http::Extensions,
 ) -> Response {
     if q.token.is_some() {
         return refused(
@@ -432,9 +539,24 @@ pub(crate) async fn handler(
         }
         Err(why) => return refused(StatusCode::FORBIDDEN, why.to_string()),
     };
+    let address = extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let Some(place) = state.uplinks.unproved(first.token.id, address) else {
+        audit(
+            &state,
+            &first,
+            "desk_boss.uplink.refused",
+            "too many unproved sockets",
+        );
+        return refused(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many uplinks for this link are still proving themselves; try again shortly.",
+        );
+    };
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| run(socket, state, hub, first))
+        .on_upgrade(move |socket| run(socket, state, hub, first, place))
 }
 
 /// One link of a `hello`.
@@ -493,20 +615,29 @@ fn audit(state: &GatewayState, live: &LiveLink, action: &str, how: &str) {
     );
 }
 
-async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLink) {
+async fn run(
+    ws: WebSocket,
+    state: Arc<GatewayState>,
+    hub: String,
+    first: LiveLink,
+    place: Unproved,
+) {
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::channel::<Message>(64);
+    // Each write gets its time: an engine that stops reading is closed.
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let close = matches!(m, Message::Close(_));
-            if sink.send(m).await.is_err() || close {
-                break;
+            match tokio::time::timeout(WRITE_WITHIN, sink.send(m)).await {
+                Ok(Ok(())) if !close => {}
+                _ => break,
             }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(WRITE_WITHIN, sink.close()).await;
     });
     let socket = Arc::new(Socket {
         id: Uuid::new_v4(),
+        person: first.person.id,
         tx,
         seq: AtomicU64::new(0),
         links: Default::default(),
@@ -517,8 +648,8 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
         let socket = Arc::clone(&socket);
         let why = why.to_string();
         async move {
-            let _ = socket.send(json!({"type": "error", "why": why})).await;
-            let _ = socket.tx.send(Message::Close(None)).await;
+            socket.notify(json!({"type": "error", "why": why}));
+            socket.close();
         }
     };
     let Ok(nonce) = fresh_nonce() else {
@@ -526,20 +657,24 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
         let _ = writer.await;
         return;
     };
-    socket
-        .send(json!({
-            "type": "challenge",
-            "protocol": PROTOCOL,
-            "nonce": b64(&nonce),
-            "hub": hub,
-            "serverTime": chrono::Utc::now(),
-        }))
-        .await;
+    socket.notify(json!({
+        "type": "challenge",
+        "protocol": PROTOCOL,
+        "nonce": b64(&nonce),
+        "hub": hub,
+        "serverTime": chrono::Utc::now(),
+    }));
     let hello = match tokio::time::timeout(timing.hello_within, stream.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<Hello>(&t).ok(),
         _ => None,
     };
     let Some(hello) = hello.filter(|h| h.kind == "hello") else {
+        audit(
+            &state,
+            &first,
+            "desk_boss.uplink.refused",
+            "no hello in time",
+        );
         close("An uplink says hello first, in time.").await;
         let _ = writer.await;
         return;
@@ -547,11 +682,14 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
     let accepted = match handshake(&state, &hub, &nonce, &first, &hello, &socket) {
         Ok(a) => a,
         Err(why) => {
+            audit(&state, &first, "desk_boss.uplink.refused", &why);
             close(&why).await;
             let _ = writer.await;
             return;
         }
     };
+    // Proved: no longer among the unproved.
+    drop(place);
     // One socket per link: this one takes each from any other.
     let mut replaced = Vec::new();
     {
@@ -570,14 +708,12 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
             links.remove(&link_id);
             links.len()
         };
-        let _ = old
-            .send(
-                json!({"type": "state", "linkId": link_id, "state": "replaced",
-                         "why": "This link connected from somewhere new."}),
-            )
-            .await;
+        old.notify(
+            json!({"type": "state", "linkId": link_id, "state": "replaced",
+                          "why": "This link connected from somewhere new."}),
+        );
         if left == 0 {
-            let _ = old.tx.send(Message::Close(None)).await;
+            old.close();
         }
         if let Some((_, live)) = accepted.iter().find(|(id, _)| *id == link_id) {
             audit(&state, live, "desk_boss.uplink.replaced", "replaced");
@@ -590,7 +726,12 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
     let mut ticker = tokio::time::interval(timing.ping_every);
     ticker.tick().await;
     let mut unanswered = 0u32;
+    let mut bad = 0u32;
     loop {
+        if bad > MAX_BAD_FRAMES {
+            tracing::info!("an uplink sent too many frames this hub can't use: closed");
+            break;
+        }
         tokio::select! {
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
@@ -599,14 +740,17 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
                     continue;
                 };
                 let Ok(frame) = serde_json::from_str::<Value>(&t) else {
-                    tracing::info!("an uplink sent a frame that isn't JSON");
+                    bad += 1;
                     continue;
                 };
                 match frame["type"].as_str() {
                     Some("pong") => unanswered = 0,
-                    Some("ping") => { socket.send(json!({"type": "pong"})).await; }
+                    Some("ping") => {
+                        if !socket.notify(json!({"type": "pong"})) { break }
+                    }
                     Some("result") => {
                         let Some(call_id) = frame["callId"].as_str().and_then(|c| c.parse().ok()) else {
+                            bad += 1;
                             continue;
                         };
                         let status = frame["status"].as_str().unwrap_or("refused");
@@ -618,10 +762,13 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
                             _ => Err("The engine's answer couldn't be read.".to_string()),
                         };
                         if !uplinks.take_result(&socket, call_id, result) {
-                            tracing::info!(%call_id, "an uplink's result for no call it was sent was dropped");
+                            bad += 1;
                         }
                     }
-                    other => tracing::info!(frame = ?other, "an uplink frame this hub doesn't know was ignored"),
+                    // Frames of later versions (asks_open, catch_up, …) are
+                    // RB6's and RB7's: not counted against it.
+                    Some("asks_open" | "catch_up" | "event" | "ask" | "ask_closed") => {}
+                    _ => bad += 1,
                 }
             }
             _ = ticker.tick() => {
@@ -636,7 +783,9 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
                 if socket.links.lock().is_empty() {
                     break;
                 }
-                socket.send(json!({"type": "ping"})).await;
+                if !socket.notify(json!({"type": "ping"})) {
+                    break;
+                }
             }
         }
     }
@@ -645,7 +794,7 @@ async fn run(ws: WebSocket, state: Arc<GatewayState>, hub: String, first: LiveLi
         let mut reg = uplinks.links.lock();
         reg.retain(|_, s| s.id != socket.id);
     }
-    let _ = socket.tx.send(Message::Close(None)).await;
+    socket.close();
     drop(socket);
     let _ = writer.await;
 }
@@ -716,6 +865,7 @@ fn handshake(
                         token: Zeroizing::new(l.token.clone()),
                         group_key: live.link.group_key.clone(),
                         tools: tools.clone(),
+                        unchecked: 0,
                     },
                 );
                 accepted.push((live.link.link_id, live));

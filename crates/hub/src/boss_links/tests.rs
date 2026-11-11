@@ -1487,4 +1487,80 @@ mod uplink_tests {
         let _ = s.send(Ws::Text("x".repeat(MAX_FRAME + 1).into())).await;
         assert!(next(&mut s).await.is_none());
     }
+
+    #[tokio::test]
+    async fn one_engine_cant_take_every_place_or_every_socket() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let addr = serve(&hub).await;
+        let held = Held {
+            token: &acme.plaintext,
+            token_id: acme.record.id,
+            key: &devbox,
+            engine_id: "devbox",
+        };
+
+        // Two sockets still proving themselves are as many as a token has.
+        let mut a = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        let mut b = connect(addr, "", &acme.plaintext, Some("1")).await.unwrap();
+        assert_eq!(
+            connect(addr, "", &acme.plaintext, Some("1")).await.err(),
+            Some(429)
+        );
+        let ch = next(&mut a).await.unwrap();
+        send(&mut a, hello(&ch, "devbox", std::slice::from_ref(&held))).await;
+        assert_eq!(next(&mut a).await.unwrap()["type"], "ready");
+        next(&mut b).await.unwrap();
+        drop(b);
+
+        // At most 16 calls of one link wait at once.
+        let state = Arc::clone(&hub.fx.state);
+        let link = acme.link.link_id;
+        let mut waiting = Vec::new();
+        for _ in 0..16 {
+            let state = Arc::clone(&state);
+            waiting.push(tokio::spawn(async move {
+                state
+                    .uplinks
+                    .call(&state, link, "crew.overview", json!({}))
+                    .await
+            }));
+        }
+        for _ in 0..16 {
+            assert_eq!(next(&mut a).await.unwrap()["type"], "call");
+        }
+        let over = state
+            .uplinks
+            .call(&state, link, "crew.overview", json!({}))
+            .await;
+        assert!(over.unwrap_err().contains("Too many calls"));
+        for w in waiting {
+            w.abort();
+        }
+
+        // Frames it can't use, past a few, close the socket.
+        for _ in 0..25 {
+            let _ = a.send(Ws::Text("not json".into())).await;
+        }
+        let mut closed = false;
+        for _ in 0..40 {
+            if next(&mut a).await.is_none() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed);
+        assert!(hub
+            .audited()
+            .iter()
+            .any(|(a, h)| a == "desk_boss.uplink.refused" && h == "too many unproved sockets"));
+    }
 }
