@@ -215,14 +215,8 @@ mod tests {
         assert_eq!(reach_of(None), Reach::Plan);
         assert_eq!(reach_of(Some("five_hour")), Reach::Plan);
         assert_eq!(reach_of(Some("seven_day")), Reach::Plan);
-        assert_eq!(
-            reach_of(Some("seven_day_opus")),
-            Reach::Model("opus".into())
-        );
-        assert_eq!(
-            reach_of(Some("seven_day_sonnet")),
-            Reach::Model("sonnet".into())
-        );
+        assert_eq!(reach_of(Some("seven_day_opus")), Reach::Model("opus"));
+        assert_eq!(reach_of(Some("seven_day_sonnet")), Reach::Model("sonnet"));
         for credit in ["overage", "extra_usage", "monthly", "spend_limit"] {
             assert_eq!(reach_of(Some(credit)), Reach::Credit, "{credit}");
         }
