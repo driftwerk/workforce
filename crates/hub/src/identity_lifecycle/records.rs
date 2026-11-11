@@ -964,7 +964,7 @@ impl Holding for RetentionBound {
 /// What agents did on the person's computer through Desk, by every name
 /// they go by: a merge names the one merged into, a delete erases the rows
 /// and the browser screenshots they name at once, not at the 90 days the
-/// activity is otherwise kept.
+/// activity is otherwise kept, with the grants that name the person.
 pub struct DeskActivity;
 
 #[async_trait]
@@ -996,13 +996,17 @@ impl Holding for DeskActivity {
         into: &Person,
         apply: bool,
     ) -> Result<Tally> {
-        let tally = self.held(cx, from).await?;
-        if let (true, Some(store)) = (apply, cx.desk_activity.as_ref()) {
-            for name in &from.names {
+        let Some(store) = cx.desk_activity.as_ref() else {
+            return Ok(Tally::default());
+        };
+        let mut moved = 0u64;
+        for name in &from.names {
+            moved += store.activity(name).await?;
+            if apply {
                 store.reassign(name, &into.key()).await?;
             }
         }
-        Ok(tally)
+        Ok(Tally::counted(usize::try_from(moved).unwrap_or(usize::MAX)))
     }
 
     async fn delete(

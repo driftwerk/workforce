@@ -789,9 +789,13 @@ impl std::ops::Deref for Context<'_> {
 /// with the browser screenshots it names.
 #[async_trait]
 pub trait DeskActivityStore: Send + Sync {
-    /// Everyone it names, with how many rows each.
+    /// Everyone an erase would take something of, with how many rows each.
     async fn people(&self) -> Result<Vec<(String, u64)>>;
+    /// What an erase of `name` takes: their activity, and the grants that
+    /// name them (the person whose Desk this is).
     async fn held(&self, name: &str) -> Result<u64>;
+    /// What a merge moves: the activity naming `name`.
+    async fn activity(&self, name: &str) -> Result<u64>;
     async fn reassign(&self, from: &str, into: &str) -> Result<()>;
     /// Erases the rows naming `name` and the screenshots they name.
     async fn erase(&self, name: &str) -> Result<()>;

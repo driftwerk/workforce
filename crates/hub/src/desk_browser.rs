@@ -243,24 +243,34 @@ pub async fn stopped(session_id: &str) {
 }
 
 /// Erases what Desk's browser kept of `person`: the screenshots their
-/// activity names, then that activity and their grants.
+/// activity names, then that activity and their grants. A screenshot
+/// already gone is fine; any other failure stops before the rows go, so a
+/// retry finds them and finishes.
 pub async fn erase_person(computer: &Computer, shots: &Path, person: &str) -> eyre::Result<u64> {
     for name in computer.store().browser_shots_of(person).await? {
-        if let Some(name) = shot_name(&name) {
-            let _ = std::fs::remove_file(shots.join(name));
+        let Some(name) = shot_name(&name) else {
+            continue;
+        };
+        match std::fs::remove_file(shots.join(name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(eyre::eyre!("couldn't erase screenshot {name}: {e}"));
+            }
+            _ => {}
         }
     }
     computer.store().erase_access_person(person).await
 }
 
-/// Desk's access activity as the identity lifecycle reaches it: through
-/// the hub's Desk once it runs, so nothing is held on a hub without one.
+/// Desk's access activity as the identity lifecycle reaches it, on a hub
+/// running Desk (`[desk] enabled`); none on a hub without it.
 pub fn lifecycle_activity(
     config: &WorkforceConfig,
-) -> Arc<dyn crate::identity_lifecycle::DeskActivityStore> {
-    Arc::new(LifecycleActivity {
-        computer: Box::new(|| crate::desk_driver::desk().map(|desk| desk.computer())),
-        shots: shots_dir(config),
+) -> Option<Arc<dyn crate::identity_lifecycle::DeskActivityStore>> {
+    config.desk.enabled.then(|| {
+        Arc::new(LifecycleActivity::with(
+            || crate::desk_driver::desk().map(|desk| desk.computer()),
+            shots_dir(config),
+        )) as Arc<dyn crate::identity_lifecycle::DeskActivityStore>
     })
 }
 
@@ -276,47 +286,58 @@ fn browser_root(config: &WorkforceConfig) -> PathBuf {
 }
 
 pub(crate) struct LifecycleActivity {
+    /// The hub's Desk, once it is up.
     computer: Box<dyn Fn() -> Option<Computer> + Send + Sync>,
     shots: PathBuf,
 }
 
 impl LifecycleActivity {
-    #[cfg(test)]
-    pub(crate) fn of(computer: Computer, shots: PathBuf) -> Self {
+    fn with(
+        computer: impl Fn() -> Option<Computer> + Send + Sync + 'static,
+        shots: PathBuf,
+    ) -> Self {
         Self {
-            computer: Box::new(move || Some(computer.clone())),
+            computer: Box::new(computer),
             shots,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn of(computer: Computer, shots: PathBuf) -> Self {
+        Self::with(move || Some(computer.clone()), shots)
+    }
+
+    /// The hub's Desk: on a Desk hub whose Desk hasn't started, the
+    /// category fails, to be run again, rather than report nothing held.
+    fn computer(&self) -> eyre::Result<Computer> {
+        (self.computer)().ok_or_else(|| eyre::eyre!("Desk isn't up yet"))
     }
 }
 
 #[async_trait::async_trait]
 impl crate::identity_lifecycle::DeskActivityStore for LifecycleActivity {
     async fn people(&self) -> eyre::Result<Vec<(String, u64)>> {
-        match (self.computer)() {
-            Some(computer) => computer.store().activity_people().await,
-            None => Ok(Vec::new()),
-        }
+        self.computer()?.store().access_people().await
     }
 
     async fn held(&self, name: &str) -> eyre::Result<u64> {
-        match (self.computer)() {
-            Some(computer) => computer.store().activity_of(name).await,
-            None => Ok(0),
-        }
+        self.computer()?.store().access_of(name).await
+    }
+
+    async fn activity(&self, name: &str) -> eyre::Result<u64> {
+        self.computer()?.store().activity_of(name).await
     }
 
     async fn reassign(&self, from: &str, into: &str) -> eyre::Result<()> {
-        if let Some(computer) = (self.computer)() {
-            computer.store().move_activity_person(from, into).await?;
-        }
+        self.computer()?
+            .store()
+            .move_activity_person(from, into)
+            .await?;
         Ok(())
     }
 
     async fn erase(&self, name: &str) -> eyre::Result<()> {
-        if let Some(computer) = (self.computer)() {
-            erase_person(&computer, &self.shots, name).await?;
-        }
+        erase_person(&self.computer()?, &self.shots, name).await?;
         Ok(())
     }
 }
@@ -843,6 +864,95 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_uuid_and_png_names_a_screenshot() {
+        let good = "0f0e0d0c-0b0a-4909-8807-060504030201.png";
+        assert_eq!(shot_name(good), Some(good));
+        for bad in [
+            "../x.png",
+            "../0f0e0d0c-0b0a-4909-8807-060504030201.png",
+            "0f0e0d0c-0b0a-4909-8807-060504030201.png/..",
+            "/etc/passwd",
+            "x.png",
+            "0f0e0d0c-0b0a-4909-8807-060504030201.jpg",
+            "0f0e0d0c-0b0a-4909-8807-060504030201",
+            "",
+        ] {
+            assert_eq!(shot_name(bad), None, "{bad}");
+        }
+    }
+
+    /// A hub without Desk gives the lifecycle nothing to reach; a Desk hub
+    /// whose Desk isn't up yet fails the category rather than say nothing
+    /// is held.
+    #[tokio::test]
+    async fn a_hub_without_desk_has_no_activity_and_one_not_up_yet_fails() {
+        use crate::identity_lifecycle::DeskActivityStore as _;
+        let config = WorkforceConfig::default();
+        assert!(!config.desk.enabled);
+        assert!(lifecycle_activity(&config).is_none());
+
+        let waiting = LifecycleActivity::with(|| None, PathBuf::from("shots"));
+        for e in [
+            waiting.people().await.map(|_| ()),
+            waiting.held("sarah").await.map(|_| ()),
+            waiting.erase("sarah").await,
+        ] {
+            assert_eq!(e.unwrap_err().to_string(), "Desk isn't up yet");
+        }
+    }
+
+    /// Erasing a person takes the screenshots their activity names and
+    /// nothing a hostile name points at; one that can't be removed stops
+    /// before the rows go, so a retry finds them and finishes.
+    #[tokio::test]
+    async fn erasing_a_person_takes_their_screenshots_only_and_a_retry_finishes() {
+        workforce_postgres::test_support::with_test_pool(
+            workforce_desk::store::build_pool,
+            |pool| async move {
+                let store = Arc::new(workforce_desk::DeskStore::with_pool(pool).await.unwrap());
+                let computer = Computer::new(Arc::clone(&store));
+                let dir = tempfile::tempdir().unwrap();
+                let shots = dir.path().join("shots");
+                std::fs::create_dir_all(&shots).unwrap();
+                let outside = dir.path().join("x.png");
+                std::fs::write(&outside, b"not a screenshot").unwrap();
+                let (kept, stuck) = (
+                    format!("{}.png", Uuid::new_v4()),
+                    format!("{}.png", Uuid::new_v4()),
+                );
+                std::fs::write(shots.join(&kept), b"png").unwrap();
+                // A directory where a screenshot should be: removing it fails.
+                std::fs::create_dir_all(shots.join(&stuck).join("inside")).unwrap();
+                let mut d = done("browser.click", Some("#save"));
+                for shot in [kept.as_str(), "../x.png", stuck.as_str()] {
+                    store
+                        .record_activity(&activity_of(&d, Some(shot)))
+                        .await
+                        .unwrap();
+                }
+                d.user = "tom".into();
+                store.record_activity(&activity_of(&d, None)).await.unwrap();
+
+                let failed = erase_person(&computer, &shots, "sarah").await;
+                assert!(failed.is_err(), "{failed:?}");
+                assert_eq!(
+                    store.activity_of("sarah").await.unwrap(),
+                    3,
+                    "the rows stay for a retry"
+                );
+
+                std::fs::remove_dir_all(shots.join(&stuck)).unwrap();
+                assert_eq!(erase_person(&computer, &shots, "sarah").await.unwrap(), 3);
+                assert_eq!(store.activity_of("sarah").await.unwrap(), 0);
+                assert!(!shots.join(&kept).exists());
+                assert!(outside.exists(), "a name outside the folder is ignored");
+                assert_eq!(store.activity_of("tom").await.unwrap(), 1);
+            },
+        )
+        .await;
+    }
 
     fn done(tool: &str, target: Option<&str>) -> Done {
         Done {

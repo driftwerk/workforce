@@ -1613,6 +1613,21 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
             ] {
                 store.record_activity(&a).await.unwrap();
             }
+            store
+                .add_grant(&workforce_desk::computer::NewGrant {
+                    hub: "local".into(),
+                    agent: "allan".into(),
+                    person: alice.id.to_string(),
+                    ability: workforce_core::computer::Ability::Run,
+                    folder: None,
+                    connector: None,
+                    session_id: None,
+                    expires_at: None,
+                    run: None,
+                    run_name: None,
+                })
+                .await
+                .unwrap();
 
             let merged = hub
                 .lifecycle
@@ -1634,7 +1649,8 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
                 .unwrap();
             assert_eq!(
                 Hub::category(&preview, Category::DeskActivity).tally.count,
-                2
+                3,
+                "the dry run counts the grant the erase takes too"
             );
             assert!(shots.join(&shot).exists(), "a dry run erases nothing");
             assert_eq!(store.activity_of(&alice.id.to_string()).await.unwrap(), 1);
@@ -1653,7 +1669,7 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
             assert_eq!(store.activity_of(&alice.id.to_string()).await.unwrap(), 0);
             assert_eq!(store.activity_of("U-A").await.unwrap(), 0);
             assert_eq!(
-                store.activity_people().await.unwrap(),
+                store.access_people().await.unwrap(),
                 [(bob.id.to_string(), 2)],
                 "another person's activity stays"
             );

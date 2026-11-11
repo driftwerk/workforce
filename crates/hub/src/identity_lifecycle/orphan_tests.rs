@@ -874,7 +874,7 @@ async fn desks_activity_left_by_a_deleted_identity_is_found_and_erased_with_its_
             assert!(report.complete, "{report:#?}");
             assert!(!shots.join(&shot).exists());
             assert_eq!(
-                store.activity_people().await.unwrap(),
+                store.access_people().await.unwrap(),
                 [(bob.id.to_string(), 1)]
             );
             assert!(hub

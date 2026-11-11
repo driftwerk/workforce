@@ -400,14 +400,18 @@ impl DeskStore {
             .await?)
     }
 
-    /// Everyone the activity names, with how many rows each: what the
-    /// identity lifecycle diffs against the people it knows.
-    pub async fn activity_people(&self) -> Result<Vec<(String, u64)>> {
+    /// Everyone [`Self::erase_access_person`] would erase something of,
+    /// with how many rows each (activity and grants): what the identity
+    /// lifecycle diffs against the people it knows.
+    pub async fn access_people(&self) -> Result<Vec<(String, u64)>> {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                "SELECT person, count(*) FROM access_activity
-                  WHERE person IS NOT NULL GROUP BY person ORDER BY person",
+                "SELECT person, count(*) FROM (
+                     SELECT person FROM access_activity WHERE person IS NOT NULL
+                     UNION ALL
+                     SELECT person FROM access_grants
+                 ) held GROUP BY person ORDER BY person",
                 &[],
             )
             .await?;
@@ -417,6 +421,21 @@ impl DeskStore {
                 Ok((r.try_get(0)?, u64::try_from(held).unwrap_or(0)))
             })
             .collect()
+    }
+
+    /// How many rows [`Self::erase_access_person`] would erase of `person`:
+    /// their activity and their grants.
+    pub async fn access_of(&self, person: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        let held: i64 = client
+            .query_one(
+                "SELECT (SELECT count(*) FROM access_activity WHERE person = $1)
+                      + (SELECT count(*) FROM access_grants WHERE person = $1)",
+                &[&person],
+            )
+            .await?
+            .try_get(0)?;
+        Ok(u64::try_from(held).unwrap_or(0))
     }
 
     /// How many rows of activity name `person`.
@@ -461,8 +480,10 @@ impl DeskStore {
             .collect())
     }
 
-    /// Erases what is kept of `person`: their grants and the activity of
-    /// their turns.
+    /// Erases what is kept of `person`: the activity of their turns, and
+    /// their grants too. A grant names the one person whose Desk this is,
+    /// so erasing that person leaves nobody for it to stand for; the
+    /// identity lifecycle's tally counts both ([`Self::access_of`]).
     pub async fn erase_access_person(&self, person: &str) -> Result<u64> {
         let client = self.pool().get().await?;
         self.access_changed();
@@ -748,10 +769,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                store.activity_people().await.unwrap(),
-                [("sarah".to_string(), 2), ("tom".to_string(), 1)]
+                store.access_people().await.unwrap(),
+                [("sarah".to_string(), 3), ("tom".to_string(), 1)],
+                "sarah's two rows of activity and her grant"
             );
             assert_eq!(store.activity_of("sarah").await.unwrap(), 2);
+            assert_eq!(store.access_of("sarah").await.unwrap(), 3);
             assert_eq!(
                 store.move_activity_person("tom", "thomas").await.unwrap(),
                 1
