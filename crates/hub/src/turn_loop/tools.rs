@@ -523,6 +523,48 @@ pub(crate) mod tests {
         );
     }
 
+    /// A turn in a Desk group's boss conversation is offered the agent's
+    /// fenced memory alone of its own tools, whatever the agent has or gains
+    /// mid-turn, and whatever a whitelist names; any other conversation, all
+    /// of them.
+    #[tokio::test]
+    async fn a_boss_conversations_turn_keeps_only_what_neither_sends_nor_reads_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = plain_service(tmp.path()).await;
+        for name in [
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            "crew.overview",
+            "memory.recall",
+        ] {
+            service.tools.register(named(name));
+        }
+        let boss = Session::new("desk:boss:k-acme", "sam", service.agent_id.as_str());
+        let dm = Session::new("desk", "sam", service.agent_id.as_str());
+        for whitelist in [None, Some(&["http".to_string(), "web".to_string()][..])] {
+            let turn = turn_tools(&service, &boss, whitelist).await;
+            assert!(turn.exclusive);
+            let names = names_of(&turn);
+            assert!(
+                names.iter().all(|n| crate::boss_links::hold::kept(n)),
+                "{names:?}"
+            );
+            assert!(names.iter().any(|n| n == "memory.recall"), "{names:?}");
+            service.tools.register(named("http.get"));
+            assert!(turn.registry.adopt(&["http.get".into()]).is_empty());
+        }
+        let plain = turn_tools(&service, &dm, None).await;
+        assert!([
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            "crew.overview"
+        ]
+        .iter()
+        .all(|n| plain.registry.has(n)));
+    }
+
     /// The prod case: an agent not opted in to `code.refactor` runs every
     /// turn on a copy of its registry. A skill enabled mid-turn lands in the
     /// agent's registry; the turn's copy takes its tools when the call loads

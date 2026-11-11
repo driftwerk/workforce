@@ -170,6 +170,7 @@ pub async fn open(
     links::require_enabled(&state).map_err(api::rejection)?;
     let (device, person) =
         crate::api_handlers::remote_mcp_tokens::paired_device(&state, &headers).await?;
+    crate::api_handlers::my_settings::enforce_action_rate_limit(&state, &person.to_string())?;
     let id = Uuid::parse_str(&id).map_err(|_| api::err(StatusCode::NOT_FOUND, "Link not found"))?;
     let (session, channel) =
         ensure(&state, person, &device.id, id).map_err(|(s, why)| api::err(s, why))?;

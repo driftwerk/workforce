@@ -768,6 +768,31 @@ async fn the_routes_are_a_paired_desks_alone() {
         );
     }
 
+    // The link's boss conversation opens for its own Desk alone.
+    let open = |bearer_token: String, id: String| {
+        let state = Arc::clone(&hub.fx.state);
+        async move {
+            crate::boss_links::conversation::open(State(state), bearer(&bearer_token), Path(id))
+                .await
+                .map(|Json(v)| v)
+                .map_err(|(status, _)| status)
+        }
+    };
+    let opened = open(desk.clone(), id.to_string()).await.unwrap();
+    assert!(
+        opened["channel"]
+            .as_str()
+            .unwrap()
+            .starts_with("desk:boss:"),
+        "{opened}"
+    );
+    for (who, which) in [
+        (token.clone(), id.to_string()),
+        (desk.clone(), Uuid::new_v4().to_string()),
+    ] {
+        assert!(open(who, which).await.is_err());
+    }
+
     let revoke = |bearer_token: String, id: String| {
         let state = Arc::clone(&hub.fx.state);
         async move {
