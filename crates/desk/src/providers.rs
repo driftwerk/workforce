@@ -771,7 +771,9 @@ fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> V
             })
             .collect();
         for l in &listed {
-            let offered = models.iter().any(|m| m.id == l.id || m.name == l.name)
+            let offered = models
+                .iter()
+                .any(|m| same_model(&m.id, &l.id) || m.name == l.name)
                 || reached.contains(&l.id.as_str());
             if !offered {
                 models.push(entry(l, false));
@@ -786,7 +788,7 @@ fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> V
         // an account can use models its listing doesn't show.
         let mut models = curated;
         for l in &listed {
-            if !models.iter().any(|m| m.id == l.id) {
+            if !models.iter().any(|m| same_model(&m.id, &l.id)) {
                 models.push(entry(l, false));
             }
         }
@@ -811,6 +813,24 @@ fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> V
             }
         })
         .collect()
+}
+
+/// `id` without a version suffix as Bedrock words one: `-v1:0` or `:0`.
+fn unversioned(id: &str) -> &str {
+    let id = match id.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    };
+    match id.rsplit_once("-v") {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    }
+}
+
+/// Whether two ids name one model, differing at most by a version suffix
+/// (`anthropic.claude-opus-5-5` and `anthropic.claude-opus-5-5-v1:0`).
+fn same_model(a: &str, b: &str) -> bool {
+    a == b || unversioned(a) == unversioned(b)
 }
 
 /// The efforts `listed` takes that the hub honours on its provider, when
@@ -1254,6 +1274,7 @@ mod tests {
                 "bedrock" => Some(vec![
                     listed("anthropic.claude-fable-5-3", "Claude Fable 5.3", &[], None),
                     listed("anthropic.claude-sonnet-5-5", "Sonnet", &[], None),
+                    listed("anthropic.claude-opus-5-5-v1:0", "Opus", &[], None),
                 ]),
                 _ => None,
             };
@@ -1459,6 +1480,30 @@ mod tests {
                 .count(),
             1
         );
+        assert!(
+            bedrock
+                .models
+                .iter()
+                .all(|m| m.id != "anthropic.claude-opus-5-5-v1:0"),
+            "a model listed with a version suffix is the one Desk already offers"
+        );
+    }
+
+    #[test]
+    fn ids_that_differ_only_by_a_version_suffix_are_one_model() {
+        assert!(same_model(
+            "anthropic.claude-opus-5-5",
+            "anthropic.claude-opus-5-5-v1:0"
+        ));
+        assert!(same_model(
+            "qwen.qwen3-coder-480b-a35b-v1:0",
+            "qwen.qwen3-coder-480b-a35b"
+        ));
+        assert!(!same_model(
+            "anthropic.claude-opus-5-5",
+            "anthropic.claude-opus-5-6"
+        ));
+        assert!(!same_model("deepseek.v3.2", "deepseek.v3"));
     }
 
     #[tokio::test]

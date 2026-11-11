@@ -1646,10 +1646,26 @@ fn initialize_models(line: &str) -> Option<Result<Vec<CliModel>>> {
         .collect()))
 }
 
+/// The `claude` Desk was told to run, once it names a path: a hub started by
+/// Desk or a service manager has not the shell's `PATH`, so a bare `claude`
+/// is not found there although Desk's own sessions (which use this path)
+/// start.
+static CLAUDE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Makes `[desk] claude` the program rounds and model listings run, when it
+/// is an absolute path. A bare name is left to `PATH`, as before.
+pub fn use_program_named(configured: &str) -> bool {
+    let path = Path::new(configured.trim());
+    path.is_absolute() && CLAUDE_PATH.set(path.to_path_buf()).is_ok()
+}
+
 /// The `claude` program a round runs.
 #[cfg(not(test))]
 pub(crate) fn claude_program() -> PathBuf {
-    PathBuf::from("claude")
+    CLAUDE_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
 /// The scripted `claude` a test scopes in; outside such a scope, a path
