@@ -5146,3 +5146,212 @@ fn a_served_boss_is_told_whose_switch_it_is() {
         assert!(!why.contains("Desk"), "{why}");
     }
 }
+
+/// An overseer at Act whose sessions start and reuse, and an idle Claude
+/// session `name` in `dir`, run by `boss` when one is given.
+async fn idle_in(
+    d: &Desk,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    boss: Option<&str>,
+) -> workforce_desk::model::SessionView {
+    let s = new_session(d, dir, name).await;
+    let url = hook_url(root, s.id).await;
+    hook(
+        &url,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    hook(
+        &url,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+    )
+    .await;
+    hook(
+        &url,
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+    )
+    .await;
+    if let Some(boss) = boss {
+        d.take_on(
+            s.id,
+            &workforce_desk::crew::Party::manager(boss, "Boss"),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+    }
+    eventually("it idles", async || {
+        matches!(
+            d.view(s.id).ok()?.state,
+            workforce_desk::model::SessionState::Idle | workforce_desk::model::SessionState::Done
+        )
+        .then_some(())
+    })
+    .await;
+    d.view(s.id).unwrap()
+}
+
+const REUSES: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 4\n";
+
+/// Always working in real sessions, a start goes to the idle session the
+/// overseer already runs in that folder: it is told the goal and Activity
+/// says which; asked for a new one, or elsewhere, one starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_goes_to_the_idle_session_it_runs_in_that_folder() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        idle_in(&d, dir.path(), dir.path(), "acme-web", Some("desk")).await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.start_session").then_some(())).await;
+        let start = overseer.tools.get("crew.start_session").unwrap();
+        let before = d.list().len();
+        let folder = format!("{}/", dir.path().to_string_lossy());
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Add the dark mode toggle", "reason": "Sam asked"}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["reused"], "acme-web", "{r:?}");
+        assert_eq!(d.list().len(), before, "no new session");
+        eventually("the reuse in Activity", async || {
+            let page = d.activity(Filter::All, None, 50).await.ok()?;
+            page.events
+                .into_iter()
+                .find(|e| e.text == "gave acme-web the work rather than starting a new session")
+                .filter(|e| e.reason.as_deref().is_some_and(|r| r.contains("Sam asked")))
+        })
+        .await;
+        // Asked for a new one: a new one, whatever is there.
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Write the release notes", "new": true, "reason": "Sam asked for a new one"}))
+            .await
+            .unwrap();
+        assert!(r.output.get("reused").is_none(), "{r:?}");
+        assert_eq!(d.list().len(), before + 1);
+    })
+    .await;
+}
+
+/// Only a session this overseer runs is given a start's work: never the
+/// person's own, nor another boss's; and only on the engine asked for,
+/// the start's own gate first, and one start at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_reuses_only_the_overseers_own_session_on_its_engine_once_and_as_its_gate_says() {
+    use super::actions::Action;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        let mine = dir.path().join("mine");
+        let theirs = dir.path().join("theirs");
+        let others = dir.path().join("others");
+        for f in [&mine, &theirs, &others] {
+            std::fs::create_dir_all(f).unwrap();
+        }
+        let start = |folder: &Path, engine: Option<&str>| {
+            let mut i = json!({"folder": folder.to_string_lossy(), "goal": "Fix the flaky test"});
+            if let Some(e) = engine {
+                i["engine"] = json!(e);
+            }
+            Action::parse("crew.start_session", &i).unwrap()
+        };
+        let (_, o) = crew.overseer_service().unwrap();
+        // The person's own idle session: never.
+        idle_in(&d, dir.path(), &theirs, "theirs", None).await;
+        let mut a = start(&theirs, None);
+        assert!(crew.reuse_instead(&mut a, &o, "desk").await.is_none());
+        assert!(matches!(a, Action::StartSession { .. }));
+        // Another boss's: never.
+        idle_in(&d, dir.path(), &others, "others", Some("sarah")).await;
+        assert!(crew
+            .reuse_instead(&mut start(&others, None), &o, "desk")
+            .await
+            .is_none());
+        // Its own: yes, on its engine, and only once while claimed.
+        let own = idle_in(&d, dir.path(), &mine, "mine", Some("desk")).await;
+        assert!(
+            crew.reuse_instead(&mut start(&mine, Some("codex")), &o, "desk")
+                .await
+                .is_none(),
+            "another engine"
+        );
+        let mut a = start(&mine, None);
+        let (was, name) = crew.reuse_instead(&mut a, &o, "desk").await.unwrap();
+        assert_eq!(name, "mine");
+        assert!(matches!(was, Action::StartSession { .. }));
+        assert!(
+            matches!(a, Action::Nudge { to: super::actions::Target::Session(s), .. } if s == own.id)
+        );
+        assert!(
+            crew.reuse_instead(&mut start(&mine, None), &o, "desk")
+                .await
+                .is_none(),
+            "claimed"
+        );
+        crew.unclaim(own.id);
+        // The start's own gate holds: with handing out work off, no reuse.
+        let mut off = o.clone();
+        off.act.hand_out_work = false;
+        assert!(crew
+            .reuse_instead(&mut start(&mine, None), &off, "desk")
+            .await
+            .is_none());
+        // Nor the nudge's: with nudging off, none.
+        let mut quiet = o.clone();
+        quiet.act.nudge = false;
+        assert!(crew
+            .reuse_instead(&mut start(&mine, None), &quiet, "desk")
+            .await
+            .is_none());
+        let _ = overseer;
+    })
+    .await;
+}
+
+/// A session that can't take the work lets it go, and the start goes ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_a_session_cant_take_starts_a_session_instead() {
+    use super::actions::Action;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        let before = d.list().len();
+        let gone = uuid::Uuid::new_v4();
+        let nudge = Action::Nudge {
+            to: super::actions::Target::Session(gone),
+            message: "Fix the flaky test".into(),
+            reply_to: None,
+        };
+        let start = Action::parse(
+            "crew.start_session",
+            &json!({"folder": dir.path().to_string_lossy(), "goal": "Fix the flaky test"}),
+        )
+        .unwrap();
+        let by = crew.by_overseer("Sam asked").unwrap();
+        let (done, gave) = crew.give_or_start(&nudge, &start, gone, by).await.unwrap();
+        assert!(!gave);
+        assert!(done.starts_with("started "), "{done}");
+        assert_eq!(d.list().len(), before + 1);
+    })
+    .await;
+}
+
+/// The place a session's folder is: that folder, never a sibling worktree.
+#[test]
+fn only_the_same_folder_or_worktree_is_the_same_place() {
+    use super::actions::same_place_key;
+    assert_eq!(same_place_key("/r/acme-web/"), "/r/acme-web");
+    assert_eq!(
+        same_place_key("/r/acme-web/.worktrees/dark-mode/"),
+        "/r/acme-web/.worktrees/dark-mode"
+    );
+    assert_ne!(
+        same_place_key("/r/acme-web/.worktrees/dark-mode"),
+        same_place_key("/r/acme-web")
+    );
+    assert_ne!(same_place_key("/r/acme-api"), same_place_key("/r/acme-web"));
+}
