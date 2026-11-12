@@ -96,6 +96,8 @@ Rules:
 
 The legacy per-field env overrides (`WORKFORCE_NATS_URL`, `WEAVIATE_API_KEY`, `ANTHROPIC_API_KEY`, etc.) still apply on top of this expansion — they're useful when you can't edit the TOML.
 
+The hub trusts your OIDC identity provider's `email_verified` claim: a sign-in it marks verified records that email as the person's verified email, which Desk's board sync uses to find them on a shared Jira or Linear key. Use a provider that only marks emails verified once their owner has proven them.
+
 ---
 
 ## Health & Readiness Endpoints

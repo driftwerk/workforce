@@ -260,6 +260,7 @@ async fn a_desk_total_holds_agents_new_starts_never_the_persons_and_never_runnin
             "Desk is at 83% of its day budget ($9.13 of $11). Agents can't start new sessions for it."
         );
         let start = || NewSession {
+            fresh_worktree: false,
             engine: Engine::Claude,
             view: None,
             name: "more".into(),

@@ -208,6 +208,16 @@ impl Tool for FakeJiraTool {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
                     "personal": !j.shared_key })
             }
+            // The directory, as a shared key sees it: Sam, and two who
+            // share Sam's email but mustn't count (gone; an app).
+            "jira.search_users" => json!({ "users": [
+                { "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
+                  "active": true, "account_type": "atlassian" },
+                { "account_id": "old-sam", "display_name": "Sam (old)", "email": "sam@example.com",
+                  "active": false, "account_type": "atlassian" },
+                { "account_id": "bot", "display_name": "Sam's bot", "email": "SAM@example.com",
+                  "active": true, "account_type": "app" },
+            ] }),
             "jira.get_project" => json!({
                 "key": input["project_key"],
                 "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
@@ -272,7 +282,12 @@ impl Tool for FakeLinearTool {
 pub(crate) struct RemoteHub {
     pub url: String,
     pub token: String,
+    /// The same person's token, as a paired device mints one.
+    pub device_token: String,
     pub jira: Shared,
+    /// The hub's people, and the one the tokens are for.
+    pub identities: Arc<workforce_identity::sqlite::SqliteIdentityStore>,
+    pub person: uuid::Uuid,
 }
 
 pub(crate) async fn remote_hub(
@@ -288,7 +303,7 @@ pub(crate) async fn remote_hub(
     for name in workforce_desk::board_sync::LINEAR_TOOLS {
         service.tools.register(Arc::new(FakeLinearTool(name)));
     }
-    serve_remote(fx, allow, jira).await
+    serve_remote(fx, allow, jira, None).await
 }
 
 /// A remote hub of two agents, each with tools of its own: the default
@@ -297,22 +312,70 @@ pub(crate) async fn remote_hub_of_agents(
     dir: &std::path::Path,
     jira_on: Option<&str>,
 ) -> RemoteHub {
-    let fx = fixture(true);
+    remote_hub_of_agents_with(dir, jira_on, false).await
+}
+
+/// As [`remote_hub_of_agents`]; `lattice_closed`: its access policy admits
+/// someone else only.
+pub(crate) async fn remote_hub_of_agents_with(
+    dir: &std::path::Path,
+    jira_on: Option<&str>,
+    lattice_closed: bool,
+) -> RemoteHub {
+    let (fx, devices) = crate::remote_mcp::testing::fixture_with_devices(true);
     let jira: Shared = Arc::default();
     for (n, id) in ["default", "lattice"].into_iter().enumerate() {
         let service = crate::serve::testing::plain_service(&dir.join(format!("agent-{n}"))).await;
+        // As the gateway gives every agent the hub's people.
+        service.set_identity_store(Arc::clone(&fx.identities) as _);
         if jira_on == Some(id) {
             register_jira(&service.tools, &jira, &[]);
+            // Tools off the board sync's list, which a device never sees:
+            // an assign, and the directory lookups a device must never use
+            // to list who's there.
+            for name in [
+                "jira.assign_issue",
+                "jira.search_users",
+                "linear.members_list",
+            ] {
+                service.tools.register(Arc::new(FakeJiraTool {
+                    name,
+                    jira: Arc::clone(&jira),
+                }));
+            }
         }
         fx.state.registry.insert(id, service);
     }
-    serve_remote(fx, &["jira.*"], jira).await
+    if lattice_closed {
+        use workforce_common::settings::{AccessMode, AgentAccessConfig};
+        fx.state.access_gate.upsert(
+            "lattice".into(),
+            AgentAccessConfig {
+                mode: AccessMode::Allowlist,
+                allow: vec![uuid::Uuid::new_v4().to_string()],
+                ..Default::default()
+            },
+        );
+    }
+    serve_remote(
+        fx,
+        &[
+            "jira.*",
+            "help",
+            "identity.whoami",
+            "identity.jira_user_by_my_email",
+        ],
+        jira,
+        Some(devices),
+    )
+    .await
 }
 
 async fn serve_remote(
     fx: crate::remote_mcp::testing::Fixture,
     allow: &[&str],
     jira: Shared,
+    devices: Option<Arc<workforce_pairing::SqlitePairingStore>>,
 ) -> RemoteHub {
     let state = Arc::try_unwrap(fx.state)
         .ok()
@@ -321,7 +384,7 @@ async fn serve_remote(
         remote_mcp: RemoteMcpConfig {
             enabled: true,
             tools_allow: allow.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
+            ..state.remote_mcp.clone()
         },
         desk_boss: Default::default(),
         uplinks: Default::default(),
@@ -332,9 +395,28 @@ async fn serve_remote(
         identities: fx.identities,
         tokens: fx.tokens,
     };
-    let member = Identity::new("Sam", IdentityRole::Member);
+    let mut member = Identity::new("Sam", IdentityRole::Member);
     fx.identities.create(&member).unwrap();
     let token = issue(&fx, &member, TokenShape::default());
+    // A Desk paired to the hub, and a token it minted.
+    let device_token = match &devices {
+        Some(devices) => {
+            let (device, _) =
+                crate::remote_mcp::testing::pair_device(&fx, devices, &mut member, "Desk");
+            issue(
+                &fx,
+                &member,
+                TokenShape {
+                    scopes: vec![
+                        crate::remote_mcp::tokens::TOKEN_SCOPE.to_string(),
+                        format!("device:{}", device.id),
+                    ],
+                    ..TokenShape::default()
+                },
+            )
+        }
+        None => String::new(),
+    };
     let app = crate::remote_mcp::server::router(crate::remote_mcp::server::RemoteMcpState::new(
         Arc::clone(&fx.state),
     ));
@@ -343,7 +425,14 @@ async fn serve_remote(
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    RemoteHub { url, token, jira }
+    RemoteHub {
+        url,
+        token,
+        device_token,
+        jira,
+        identities: Arc::clone(&fx.identities),
+        person: member.id,
+    }
 }
 
 // ── The local hub ────────────────────────────────────────────────────────
@@ -461,6 +550,7 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
         me_source: None,
         me_note: None,
         not_me: false,
+        keep_tickets: false,
         states: states(),
     }
 }
@@ -1474,4 +1564,151 @@ async fn no_agent_with_jira_is_said_plainly() {
         assert_eq!(body["paused"]["kind"], "missing");
     })
     .await;
+}
+
+// ── The agents a person may reach there ──────────────────────────────────
+
+/// `GET /mcp/agents`: the agents the token's person may reach, the default
+/// marked; an agent whose policy leaves them out isn't named; no token is a
+/// 401. The board's probe never sees a closed agent.
+#[tokio::test]
+async fn a_hub_lists_only_the_agents_its_person_may_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = reqwest::Client::new();
+    let open = remote_hub_of_agents_with(dir.path(), Some("lattice"), false).await;
+    let list = |url: String, token: Option<String>| {
+        let http = http.clone();
+        async move {
+            let mut r = http.get(format!("{url}/mcp/agents"));
+            if let Some(t) = token {
+                r = r.bearer_auth(t);
+            }
+            let resp = r.send().await.unwrap();
+            (
+                resp.status().as_u16(),
+                resp.json::<Value>().await.unwrap_or_default(),
+            )
+        }
+    };
+    let (status, body) = list(open.url.clone(), Some(open.token.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["agents"],
+        json!([{ "default": true, "id": "default" }, { "default": false, "id": "lattice" }])
+    );
+    assert_eq!(list(open.url.clone(), None).await.0, 401);
+    let token = Secret::new(&open.token).unwrap();
+    assert_eq!(
+        hub_agents(&open.url, &token, &http).await.unwrap(),
+        ["default", "lattice"]
+    );
+    let closed_dir = tempfile::tempdir().unwrap();
+    let closed = remote_hub_of_agents_with(closed_dir.path(), Some("lattice"), true).await;
+    let (status, body) = list(closed.url.clone(), Some(closed.token.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["agents"],
+        json!([{ "default": true, "id": "default" }])
+    );
+}
+
+/// A token a paired device minted, on an agent that isn't the default, sees
+/// only the board sync's tools there, as it does on the default agent.
+#[tokio::test]
+async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = remote_hub_of_agents(dir.path(), Some("lattice")).await;
+    let device = HubRemote::new(
+        &remote.url,
+        &Secret::new(&remote.device_token).unwrap(),
+        Arc::new(reqwest::Client::new()),
+        Some("lattice"),
+    )
+    .unwrap();
+    let mut names: Vec<String> = device.tools().await.unwrap();
+    names.sort();
+    // Written out, not taken from the lists the surface is built from.
+    let mut expected = vec![
+        "help",
+        "identity_whoami",
+        "jira_add_comment",
+        "jira_create_issue",
+        "jira_get_issue",
+        "jira_get_project",
+        "jira_list_transitions",
+        "jira_myself",
+        "jira_search",
+        "jira_transition_issue",
+        "jira_update_issue",
+        "identity_jira_user_by_my_email",
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    // The directory lookups are refused to a device token outright.
+    for tool in ["jira.search_users", "linear.members_list"] {
+        let got = device.call(tool, json!({ "query": "a" })).await;
+        assert!(
+            matches!(got, Err(RemoteError::Missing(_))),
+            "{tool}: {got:?}"
+        );
+    }
+    // What it may ask instead: who the person is, by their own verified
+    // email, answered on the hub as one user.
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(asked["user"], Value::Null, "{asked}");
+    assert_eq!(asked["why"], "no_verified_email", "{asked}");
+    {
+        use workforce_identity::store::IdentityStore;
+        let mut sam = remote.identities.get_by_id(remote.person).unwrap().unwrap();
+        sam.linked_ids
+            .insert("oidc_email".into(), "sam@example.com".into());
+        sam.linked_ids
+            .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+        remote.identities.update(&sam).unwrap();
+    }
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        asked["user"],
+        json!({ "id": SAM_ACCOUNT, "name": "Sam" }),
+        "{asked}"
+    );
+}
+
+/// A hub that refuses or slows the list of its agents says so, never as
+/// "no agent has it".
+#[tokio::test]
+async fn a_refused_or_busy_agent_list_is_said_as_such() {
+    use axum::routing::get;
+    for (status, expect) in [(403u16, "refused"), (429, "rate")] {
+        let app = axum::Router::new().route(
+            "/mcp/agents",
+            get(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [(axum::http::header::RETRY_AFTER, "7")],
+                    "no",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let token = Secret::new("wfr_abcdefghijklmnopqrstuvwxyz0123").unwrap();
+        let got = hub_agents(&url, &token, &reqwest::Client::new()).await;
+        match (expect, got) {
+            ("refused", Err(RemoteError::Refused(_))) => {}
+            ("rate", Err(RemoteError::RateLimited { retry_after_secs })) => {
+                assert_eq!(retry_after_secs, Some(7))
+            }
+            (_, other) => panic!("{status}: {other:?}"),
+        }
+    }
 }

@@ -473,6 +473,11 @@ pub struct NewSession {
     pub goal: String,
     #[serde(default)]
     pub worktree: Option<String>,
+    /// The separate copy is a new branch, never an existing one: `worktree`
+    /// is where its name starts, and the first of `name`, `name-2`, … that
+    /// no branch or copy has yet is taken (New session's "separate copy").
+    #[serde(default)]
+    pub fresh_worktree: bool,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]

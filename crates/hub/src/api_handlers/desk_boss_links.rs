@@ -18,13 +18,13 @@ use super::remote_mcp_tokens::paired_device;
 use crate::boss_links::links::{self, LinkError, MintRequest};
 use crate::gateway::GatewayState;
 
-type Rejection = (StatusCode, Json<serde_json::Value>);
+pub(crate) type Rejection = (StatusCode, Json<serde_json::Value>);
 
-fn err(status: StatusCode, msg: &str) -> Rejection {
+pub(crate) fn err(status: StatusCode, msg: &str) -> Rejection {
     (status, Json(serde_json::json!({"error": msg})))
 }
 
-fn rejection(e: LinkError) -> Rejection {
+pub(crate) fn rejection(e: LinkError) -> Rejection {
     let status = match &e {
         LinkError::Disabled => StatusCode::NOT_FOUND,
         LinkError::IdentityNotActive | LinkError::NotAllowed | LinkError::AgentDeclines => {

@@ -605,6 +605,7 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
         let s = d
             .create(
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Codex,
                     view: None,
                     name: "acme-api".into(),
@@ -723,6 +724,7 @@ async fn codex_working(
     let s = d
         .create(
             NewSession {
+                fresh_worktree: false,
                 engine: Engine::Codex,
                 view: None,
                 name: "acme-api".into(),
