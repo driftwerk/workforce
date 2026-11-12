@@ -171,6 +171,77 @@ pub struct GroupMemoryChange {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemorySettingsChange {
     pub paused: Option<bool>,
+    /// Remembering conversations at all.
+    #[serde(default, deserialize_with = "choice")]
+    pub enabled: Option<Choice<bool>>,
+    /// Desk's model noting decisions, facts and to-dos.
+    #[serde(default, deserialize_with = "choice")]
+    pub derive: Option<Choice<bool>>,
+    #[serde(default, deserialize_with = "choice")]
+    pub retain_days: Option<Choice<u32>>,
+    #[serde(default, deserialize_with = "choice")]
+    pub max_disk_mb: Option<Choice<u64>>,
+}
+
+impl MemorySettingsChange {
+    /// Whether it changes what the install's `[desk.memory]` set: the
+    /// person who holds the hub's alone to change.
+    pub fn chooses(&self) -> bool {
+        self.enabled.is_some()
+            || self.derive.is_some()
+            || self.retain_days.is_some()
+            || self.max_disk_mb.is_some()
+    }
+}
+
+/// One of the person's memory choices: a value, or back to the install's
+/// own (`null` or `"default"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice<T> {
+    Set(T),
+    Install,
+}
+
+impl<T: Copy> Choice<T> {
+    fn value(self) -> Option<T> {
+        match self {
+            Choice::Set(v) => Some(v),
+            Choice::Install => None,
+        }
+    }
+}
+
+/// "1 exchange", "3 exchanges".
+fn plural(n: i64, word: &str) -> String {
+    match n {
+        1 => format!("1 {word}"),
+        n => format!("{n} {word}s"),
+    }
+}
+
+fn choice<'de, D, T>(d: D) -> Result<Option<Choice<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error;
+    match Value::deserialize(d)? {
+        Value::Null => Ok(Some(Choice::Install)),
+        Value::String(s) if s == "default" => Ok(Some(Choice::Install)),
+        v => serde_json::from_value(v)
+            .map(|t| Some(Choice::Set(t)))
+            .map_err(D::Error::custom),
+    }
+}
+
+/// What shrinking how long conversations are kept would remove at the next
+/// sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainPreview {
+    pub days: u32,
+    pub exchanges: i64,
+    pub sessions: i64,
 }
 
 /// What the install's `[desk.memory]` sets, for Settings → Memory to show.
@@ -215,7 +286,7 @@ pub struct MemorySettings {
     pub totals: Vec<GroupTotals>,
     /// What the person should know of the change just made, if anything.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<&'static str>,
+    pub notice: Option<String>,
 }
 
 /// What the panel says of a session past its cap.
@@ -271,7 +342,7 @@ impl Desk {
 
     /// Whether `r`'s conversation is harvested now, and if not, why.
     async fn why_not(&self, r: &SessionRecord, records: &[PathBuf]) -> Result<(), Why> {
-        if !self.0.opts.memory.enabled {
+        if !self.memory_now().enabled {
             return Err(Why::Skip(crate::memory::DISABLED.into()));
         }
         if self.0.ledger.redactor.is_none() {
@@ -358,7 +429,7 @@ impl Desk {
         match self
             .0
             .store
-            .sweep_memory(self.0.opts.memory.retain_days)
+            .sweep_memory(self.memory_now().retain_days)
             .await
         {
             Ok(swept) if swept == Default::default() => {}
@@ -652,6 +723,131 @@ impl Desk {
         .await
     }
 
+    /// Session memory's options now: the install's `[desk.memory]` with
+    /// what the person chose in Settings → Memory over it.
+    pub(crate) fn memory_now(&self) -> crate::memory::MemoryOptions {
+        self.0.memory_choices.lock().over(&self.0.opts.memory)
+    }
+
+    /// Reads what the person chose, once at start.
+    pub(super) async fn memory_choices_load(&self) {
+        match self.0.store.memory_settings().await {
+            Ok(set) => {
+                *self.0.memory_choices.lock() = crate::memory::MemoryChoices::from_settings(&set)
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "couldn't read the person's memory choices; using the install's")
+            }
+        }
+    }
+
+    /// Keeps the person's choices in `change`, each checked, then tells
+    /// whatever reads them.
+    async fn choose_memory(
+        &self,
+        change: &MemorySettingsChange,
+    ) -> Result<Option<String>, DeskError> {
+        use crate::memory::{
+            CHOSEN_DERIVE, CHOSEN_ENABLED, CHOSEN_MAX_DISK_MB, CHOSEN_RETAIN_DAYS, MAX_DISK_MB,
+            RETAIN_DAYS,
+        };
+        if let Some(days) = change
+            .retain_days
+            .and_then(Choice::value)
+            .filter(|d| !RETAIN_DAYS.contains(d))
+        {
+            return Err(DeskError::Invalid(format!(
+                "Desk keeps conversations for 1 day to 10 years; {days} days is outside that."
+            )));
+        }
+        if let Some(mb) = change
+            .max_disk_mb
+            .and_then(Choice::value)
+            .filter(|m| !MAX_DISK_MB.contains(m))
+        {
+            return Err(DeskError::Invalid(format!(
+                "Desk Memory may take 100 MB to 1 TB; {mb} MB is outside that."
+            )));
+        }
+        let mut chosen: Vec<(&str, Option<Value>)> = Vec::new();
+        if let Some(c) = change.enabled {
+            chosen.push((CHOSEN_ENABLED, c.value().map(|v| serde_json::json!(v))));
+        }
+        if let Some(c) = change.derive {
+            chosen.push((CHOSEN_DERIVE, c.value().map(|v| serde_json::json!(v))));
+        }
+        if let Some(c) = change.retain_days {
+            chosen.push((CHOSEN_RETAIN_DAYS, c.value().map(|v| serde_json::json!(v))));
+        }
+        if let Some(c) = change.max_disk_mb {
+            chosen.push((CHOSEN_MAX_DISK_MB, c.value().map(|v| serde_json::json!(v))));
+        }
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        // The shrink said first: what the next sweep removes.
+        let before = self.memory_now().retain_days;
+        // One change at a time, written together, and the cache with it.
+        let _one = self.0.memory_choose.lock().await;
+        self.0.store.put_settings(&chosen).await?;
+        {
+            let mut choices = self.0.memory_choices.lock();
+            if let Some(c) = change.enabled {
+                choices.enabled = c.value();
+            }
+            if let Some(c) = change.derive {
+                choices.derive = c.value();
+            }
+            if let Some(c) = change.retain_days {
+                choices.retain_days = c.value();
+            }
+            if let Some(c) = change.max_disk_mb {
+                choices.max_disk_mb = c.value();
+            }
+        }
+        drop(_one);
+        for (key, _) in chosen {
+            self.announce(crate::model::DeskEvent::Setting { key: key.into() });
+        }
+        self.derive_poke();
+        let now = self.memory_now();
+        let mut notices = Vec::new();
+        if now.retain_days < before {
+            let p = self.retain_preview(now.retain_days).await?;
+            if p.exchanges > 0 {
+                notices.push(format!(
+                    "{} older than {} will be removed the next time Desk tidies up.",
+                    plural(p.exchanges, "exchange"),
+                    plural(i64::from(now.retain_days), "day")
+                ));
+            }
+        }
+        if let Some(Choice::Set(asked)) = change.max_disk_mb {
+            if asked > now.max_disk_mb {
+                notices.push(format!(
+                    "This Desk lets Desk Memory take at most {} MB, so that's what it has.",
+                    now.max_disk_mb
+                ));
+            }
+        }
+        Ok((!notices.is_empty()).then(|| notices.join(" ")))
+    }
+
+    /// What keeping conversations `days` would remove at the next sweep.
+    pub async fn retain_preview(&self, days: u32) -> Result<RetainPreview, DeskError> {
+        if !crate::memory::RETAIN_DAYS.contains(&days) {
+            return Err(DeskError::Invalid(format!(
+                "Desk keeps conversations for 1 day to 10 years; {days} days is outside that."
+            )));
+        }
+        let (exchanges, sessions) = self.0.store.older_than(days).await?;
+        Ok(RetainPreview {
+            days,
+            exchanges,
+            sessions,
+        })
+    }
+
     /// The person's memory settings, the install's limits, and what is
     /// kept.
     pub async fn memory_settings(&self) -> Result<MemorySettings, DeskError> {
@@ -666,7 +862,7 @@ impl Desk {
             })
             .collect();
         groups.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-        let m = &self.0.opts.memory;
+        let m = &self.memory_now();
         Ok(MemorySettings {
             paused: set.get(PAUSED).and_then(Value::as_bool).unwrap_or(false),
             groups,
@@ -703,7 +899,8 @@ impl Desk {
         &self,
         change: &MemorySettingsChange,
     ) -> Result<MemorySettings, DeskError> {
-        let mut notice = None;
+        let chose = self.choose_memory(change).await?;
+        let mut notice: Option<String> = None;
         if let Some(paused) = change.paused {
             let d = self.clone();
             notice = self
@@ -729,8 +926,13 @@ impl Desk {
                     d.derive_poke();
                     Ok(notice)
                 })
-                .await?;
+                .await?
+                .map(str::to_string);
         }
+        let notice = match (notice, chose) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
+        };
         Ok(MemorySettings {
             notice,
             ..self.memory_settings().await?
@@ -747,10 +949,10 @@ impl Desk {
         if self.group_name(id).is_none() {
             return Err(DeskError::NotFound);
         }
-        let m = &self.0.opts.memory;
+        let m = &self.memory_now();
         if change.derive == Some(true) && !(m.enabled && m.derive) {
             return Err(DeskError::Invalid(
-                "Desk's model can't note decisions here: noting is turned off for this Desk in the hub's config ([desk.memory] derive).".into(),
+                "Desk's model can't note decisions here: noting is turned off for this Desk. Turn it on in Settings → Memory first.".into(),
             ));
         }
         let key = group_key(id);
@@ -1045,6 +1247,139 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn the_persons_memory_choices_are_kept_over_the_installs_and_outlast_a_restart() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let start = || async {
+                Desk::start(
+                    DeskStore::from_pool(pool.clone()),
+                    crate::testing::options(dir.path()),
+                    super::super::Floor {
+                        redactor: Some(Arc::new(Plain)),
+                        ..Default::default()
+                    },
+                    Default::default(),
+                )
+                .await
+                .unwrap()
+            };
+            let d = start().await;
+            let install = d.memory_settings().await.unwrap().limits;
+            let changed = d
+                .change_memory_settings(&MemorySettingsChange {
+                    enabled: Some(Choice::Set(!install.enabled)),
+                    derive: Some(Choice::Set(!install.derive)),
+                    retain_days: Some(Choice::Set(30)),
+                    max_disk_mb: Some(Choice::Set(2048)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .limits;
+            assert_eq!(
+                (
+                    changed.enabled,
+                    changed.derive,
+                    changed.retain_days,
+                    changed.max_disk_mb
+                ),
+                (!install.enabled, !install.derive, 30, 2048)
+            );
+            assert_eq!(d.memory_now().retain_days, 30);
+            // Kept: a restart reads them back.
+            let again = start().await.memory_settings().await.unwrap().limits;
+            assert_eq!((again.retain_days, again.max_disk_mb), (30, 2048));
+            assert_eq!(again.enabled, !install.enabled);
+
+            // Outside what can work: refused, plainly, and nothing kept.
+            for bad in [
+                MemorySettingsChange {
+                    retain_days: Some(Choice::Set(0)),
+                    ..Default::default()
+                },
+                MemorySettingsChange {
+                    max_disk_mb: Some(Choice::Set(10)),
+                    ..Default::default()
+                },
+            ] {
+                match d.change_memory_settings(&bad).await {
+                    Err(DeskError::Invalid(why)) => assert!(!why.contains("max_disk_mb"), "{why}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(d.memory_now().max_disk_mb, 2048);
+        })
+        .await;
+    }
+
+    #[test]
+    fn the_installs_ceiling_holds_whatever_room_is_chosen() {
+        use crate::memory::{MemoryChoices, MemoryOptions};
+        let base = MemoryOptions {
+            max_disk_mb_ceiling: Some(8192),
+            ..MemoryOptions::default()
+        };
+        let chosen = |mb| {
+            MemoryChoices {
+                max_disk_mb: Some(mb),
+                ..Default::default()
+            }
+            .over(&base)
+            .max_disk_mb
+        };
+        assert_eq!(chosen(2048), 2048);
+        assert_eq!(chosen(100_000), 8192);
+    }
+
+    #[test]
+    fn a_choice_is_a_value_or_back_to_the_installs() {
+        let c: MemorySettingsChange = serde_json::from_value(
+            serde_json::json!({"retainDays": 30, "maxDiskMb": null, "enabled": "default"}),
+        )
+        .unwrap();
+        assert_eq!(c.retain_days, Some(Choice::Set(30)));
+        assert_eq!(c.max_disk_mb, Some(Choice::Install));
+        assert_eq!(c.enabled, Some(Choice::Install));
+        assert_eq!(c.derive, None);
+        assert!(c.chooses());
+        let pause: MemorySettingsChange =
+            serde_json::from_value(serde_json::json!({"paused": true})).unwrap();
+        assert!(!pause.chooses());
+        assert!(serde_json::from_value::<MemorySettingsChange>(
+            serde_json::json!({"retainDays": "forever"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_choice_left_unset_keeps_the_installs_own() {
+        use crate::memory::{MemoryChoices, MemoryOptions};
+        let base = MemoryOptions::default();
+        assert_eq!(MemoryChoices::default().over(&base), base);
+        let chosen = MemoryChoices {
+            derive: Some(!base.derive),
+            ..Default::default()
+        }
+        .over(&base);
+        assert_eq!(chosen.derive, !base.derive);
+        assert_eq!(chosen.retain_days, base.retain_days);
+        let kept = std::collections::HashMap::from([
+            (
+                crate::memory::CHOSEN_RETAIN_DAYS.to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                crate::memory::CHOSEN_ENABLED.to_string(),
+                serde_json::json!(false),
+            ),
+        ]);
+        let read = MemoryChoices::from_settings(&kept);
+        assert_eq!(read.retain_days, None, "out of range: the install's stands");
+        assert_eq!(read.enabled, Some(false));
+    }
+
     /// Adds a copy of the fixture's conversation to `path`, its exchanges
     /// told apart by `tag`.
     fn say(path: &str, tag: &str) {
@@ -1124,7 +1459,10 @@ mod tests {
             say(&path(&own), "own-off");
             d.set_session_memory(own.id, true).await.unwrap();
 
-            let pause = |on: bool| MemorySettingsChange { paused: Some(on) };
+            let pause = |on: bool| MemorySettingsChange {
+                paused: Some(on),
+                ..Default::default()
+            };
             d.change_memory_settings(&pause(true)).await.unwrap();
             say(&path(&paused), "paused-off");
             d.change_memory_settings(&pause(false)).await.unwrap();
@@ -1317,14 +1655,18 @@ mod tests {
             // Resuming the pause fails closed the same way.
             readable(&path, true);
             d.set_session_memory(r.id, true).await.unwrap();
-            d.change_memory_settings(&MemorySettingsChange { paused: Some(true) })
-                .await
-                .unwrap();
+            d.change_memory_settings(&MemorySettingsChange {
+                paused: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
             say(&path, "paused");
             readable(&path, false);
             match d
                 .change_memory_settings(&MemorySettingsChange {
                     paused: Some(false),
+                    ..Default::default()
                 })
                 .await
             {
