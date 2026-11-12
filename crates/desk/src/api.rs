@@ -2028,8 +2028,15 @@ type P = State<Arc<ProvidersApi>>;
 
 impl IntoResponse for AccountError {
     fn into_response(self) -> Response {
+        if let AccountError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            AccountError::Invalid(_) => StatusCode::BAD_REQUEST,
+            AccountError::Invalid(_) | AccountError::Refused(_) => StatusCode::BAD_REQUEST,
             AccountError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AccountError::Internal(e) => {
                 tracing::error!(error = %e, "desk provider credentials failed");
@@ -2167,8 +2174,15 @@ async fn voice_relay(
 
 impl IntoResponse for SpeakError {
     fn into_response(self) -> Response {
+        if let SpeakError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            SpeakError::Invalid(_) => StatusCode::BAD_REQUEST,
+            SpeakError::Invalid(_) | SpeakError::Refused(_) => StatusCode::BAD_REQUEST,
             SpeakError::NoKey(_) => StatusCode::SERVICE_UNAVAILABLE,
             SpeakError::Upstream(e) => {
                 tracing::warn!(error = %e, "desk speech synthesis failed");
@@ -2200,6 +2214,44 @@ async fn voice_speak(
     }
 }
 
+#[derive(Deserialize)]
+struct KeyBody {
+    key: String,
+}
+
+/// Tries a voice key and keeps it, or says why not. The key is never logged
+/// or echoed.
+async fn save_voice_key(
+    State(s): State<Arc<VoiceApi>>,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(name): Path<String>,
+    body: Result<Json<KeyBody>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Some(key) = crate::speech::VoiceKey::parse(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Desk keeps no voice key named {name:?}") })),
+        )
+            .into_response();
+    };
+    let Ok(Json(body)) = body else {
+        return SpeakError::Invalid("the body is {\"key\": \"…\"}".into()).into_response();
+    };
+    let value = body.key.trim();
+    if value.is_empty() {
+        return SpeakError::Invalid(format!("paste the {} key first", key.label())).into_response();
+    }
+    match s.speech.save_key(key, value).await {
+        Ok(()) => {
+            tracing::info!(provider = key.name(), "desk voice key saved");
+            Json(json!({ "saved": true })).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
 pub(crate) fn voice_router(
     auth: Arc<dyn Authorize>,
     realtime: Arc<Realtime>,
@@ -2209,6 +2261,7 @@ pub(crate) fn voice_router(
         .route("/api/desk/voice/session", post(voice_session))
         .route("/api/desk/voice/relay", get(voice_relay))
         .route("/api/desk/voice/speak", post(voice_speak))
+        .route("/api/desk/voice/keys/{provider}", post(save_voice_key))
         .with_state(Arc::new(VoiceApi {
             auth,
             realtime,

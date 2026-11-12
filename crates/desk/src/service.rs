@@ -2179,7 +2179,7 @@ impl Desk {
     /// `engine`'s program, which a session of it can't start without.
     fn program_of(&self, engine: Engine) -> Result<&Path, DeskError> {
         self.program(engine).ok_or_else(|| {
-            DeskError::Invalid(format!("this hub names no program for {}", engine.title()))
+            DeskError::Invalid(format!("Desk has no program set for {}", engine.title()))
         })
     }
 
@@ -3231,7 +3231,7 @@ impl Desk {
         }
         if self.held_untaken(id).await {
             return Err(DeskError::Conflict(
-                "this session is still running in Desk's terminal keeper, which this hub couldn't reach when it started; restart Desk's helper on this computer to take it back"
+                "this session is still running in Desk's terminal keeper, which Desk's helper couldn't reach when it started; restart Desk's helper on this computer to take it back"
                     .into(),
             ));
         }

@@ -1152,7 +1152,7 @@ impl Desk {
             .collect();
         let crew = self
             .crew()
-            .ok_or_else(|| DeskError::Conflict("Desk can't move a boss on this hub.".into()))?;
+            .ok_or_else(|| DeskError::Conflict("Desk can't move a boss here.".into()))?;
         // Nothing of the old scope's runs on under it meanwhile.
         // Nothing of the old scope's runs on under it meanwhile; if any of
         // it can't be stopped, the boss isn't moved.

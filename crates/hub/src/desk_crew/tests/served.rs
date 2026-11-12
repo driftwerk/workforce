@@ -494,7 +494,7 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
         assert!(r.body["error"]
             .as_str()
             .unwrap()
-            .contains("boss on this hub"));
+            .contains("already has a boss here"));
         // A call id sent again by another boss says nothing of the first.
         let call = |boss| ServedCall {
             tool: "crew.overview".into(),
