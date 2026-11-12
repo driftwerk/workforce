@@ -138,35 +138,42 @@ pub struct Listing {
 }
 
 /// The `.git` folder that holds `dir`'s repository's config: its own, or
-/// for a worktree the repository it was made from. Looked for in `dir` and
-/// the folders above it while `may` allows them.
-fn git_dir(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+/// for a worktree the repository it was made from. Looked for in `dir`
+/// (and, with `up`, the folders above it) while `may` allows them; every
+/// path it is led to (a `.git` link, a worktree's `gitdir:`, its
+/// `commondir`) is followed to where it really is and must be one `may`
+/// allows too, so nothing outside is ever read.
+fn git_dir(dir: &Path, up: bool, may: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let allowed = |p: PathBuf| p.canonicalize().ok().filter(|r| may(r));
     let mut at = Some(dir);
     while let Some(d) = at.filter(|d| may(d)) {
         let dot = d.join(".git");
-        if dot.is_dir() {
-            return Some(dot);
-        }
-        if dot.is_file() {
+        if std::fs::symlink_metadata(&dot).is_ok() {
+            let dot = allowed(dot)?;
+            if dot.is_dir() {
+                return Some(dot);
+            }
             // A worktree: `gitdir: <repo>/.git/worktrees/<name>`, whose
             // `commondir` names the repository's own `.git`.
             let text = std::fs::read_to_string(&dot).ok()?;
-            let linked = text.trim().strip_prefix("gitdir:")?.trim();
-            let linked = d.join(linked);
-            return Some(match std::fs::read_to_string(linked.join("commondir")) {
-                Ok(common) => linked.join(common.trim()),
-                Err(_) => linked,
-            });
+            let linked = allowed(d.join(text.trim().strip_prefix("gitdir:")?.trim()))?;
+            return match std::fs::read_to_string(linked.join("commondir")) {
+                Ok(common) => allowed(linked.join(common.trim())),
+                Err(_) => Some(linked),
+            };
+        }
+        if !up {
+            return None;
         }
         at = d.parent();
     }
     None
 }
 
-/// Where `dir`'s repository comes from, if it is in one with a remote
-/// (looked for no higher than `may` allows).
-pub fn remote_of(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<String> {
-    let config = std::fs::read_to_string(git_dir(dir, may)?.join("config")).ok()?;
+/// Where `dir`'s repository comes from, if it is in one with a remote:
+/// looked for above it with `up`, and nowhere `may` doesn't allow.
+pub fn remote_of(dir: &Path, up: bool, may: &dyn Fn(&Path) -> bool) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir(dir, up, may)?.join("config")).ok()?;
     let mut section = String::new();
     let mut first: Option<String> = None;
     for line in config.lines().map(str::trim) {
@@ -194,30 +201,40 @@ pub fn remote_of(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<String> {
 }
 
 /// A remote's URL as a person reads it: `host/owner/repo`, with no scheme,
-/// user, password or `.git`.
+/// user, token, password, query, fragment or `.git`.
 pub fn shown_remote(url: &str) -> Option<String> {
     let u = url.trim();
-    let rest = match u.split_once("://") {
-        Some((_, rest)) => rest.to_string(),
-        // `git@host:owner/repo`
-        None => match u.split_once(':') {
-            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
-            _ => return None,
-        },
-    };
-    // Whoever it signs in as, and any password, never shown.
-    let rest = match rest.split_once('/') {
-        Some((auth, path)) => {
-            let host = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    // Never a query or a fragment: they can carry a token too.
+    let u = u.split(['?', '#']).next().unwrap_or_default();
+    let shown = match u.split_once("://") {
+        // `scheme://[user[:password]@]host[:port]/path`: whoever it signs
+        // in as goes, up to the last `@`, whatever the password holds.
+        Some((_, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+            let (host, path) = rest.split_once('/')?;
             format!("{host}/{path}")
         }
-        None => return None,
+        // `[user@]host:owner/repo`
+        None => {
+            let rest = u.rsplit_once('@').map_or(u, |(_, r)| r);
+            match rest.split_once(':') {
+                Some((host, path)) if !host.is_empty() && !host.contains('/') => {
+                    format!("{host}/{}", path.trim_start_matches('/'))
+                }
+                _ => return None,
+            }
+        }
     };
-    let shown = rest
+    let shown = shown
         .trim_end_matches('/')
         .trim_end_matches(".git")
         .to_string();
-    (shown.len() > 2 && !shown.chars().any(char::is_control)).then_some(shown)
+    let host = shown.split('/').next().unwrap_or_default();
+    (shown.len() > 2
+        && !host.is_empty()
+        && shown.contains('/')
+        && !shown.chars().any(|c| c.is_control() || c.is_whitespace()))
+    .then_some(shown)
 }
 
 /// `~` and `~/x` mean the hub user's home: the part after the `~/` (empty
@@ -287,7 +304,7 @@ pub fn list(
         }
         let git = real.join(".git").exists();
         found.push(Folder {
-            remote: git.then(|| remote_of(&real, &|p| p == real)).flatten(),
+            remote: git.then(|| remote_of(&real, false, &inside)).flatten(),
             git,
             path: real.to_string_lossy().into_owned(),
             name,
@@ -305,8 +322,8 @@ pub fn list(
         path: dir.to_string_lossy().into_owned(),
         folders: found,
         truncated,
-        git: git_dir(&dir, &inside).is_some(),
-        remote: remote_of(&dir, &inside),
+        git: git_dir(&dir, true, &inside).is_some(),
+        remote: remote_of(&dir, true, &inside),
     })
 }
 
@@ -543,6 +560,68 @@ mod remote_tests {
             assert_eq!(shown_remote(url).as_deref(), Some(shown), "{url}");
         }
         assert_eq!(shown_remote("/srv/git/web.git"), None);
+        assert_eq!(shown_remote("https://host-only"), None);
+    }
+
+    /// Nothing a repository points to outside the home is read: not a
+    /// `.git` link, an absolute or `..` `gitdir:`, nor a `commondir` that
+    /// leads out.
+    #[test]
+    fn a_repository_that_points_outside_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("repo/.git/worktrees/x")).unwrap();
+        std::fs::write(
+            outside.join("repo/.git/config"),
+            "[remote \"origin\"]\n\turl = git@secret.example:them/private\n",
+        )
+        .unwrap();
+        let make = |name: &str| {
+            let d = home.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        // A `.git` that is a link out.
+        let linked = make("linked");
+        std::os::unix::fs::symlink(outside.join("repo/.git"), linked.join(".git")).unwrap();
+        // An absolute `gitdir:` out, and a `..` one.
+        let absolute = make("absolute");
+        std::fs::write(
+            absolute.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                outside.join("repo/.git/worktrees/x").display()
+            ),
+        )
+        .unwrap();
+        let dotdot = make("dotdot");
+        std::fs::write(dotdot.join(".git"), "gitdir: ../../outside/repo/.git\n").unwrap();
+        // A worktree inside whose `commondir` leads out.
+        let common = make("common");
+        std::fs::create_dir_all(home.join("inner/.git/worktrees/c")).unwrap();
+        std::fs::write(
+            common.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                home.join("inner/.git/worktrees/c").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("inner/.git/worktrees/c/commondir"),
+            format!("{}\n", outside.join("repo/.git").display()),
+        )
+        .unwrap();
+        let listing = list(None, false, Some(&home), &[]).unwrap();
+        for f in &listing.folders {
+            assert_eq!(f.remote, None, "{} read outside", f.name);
+        }
+        for name in ["linked", "absolute", "dotdot", "common"] {
+            let l = list(Some(&format!("~/{name}")), false, Some(&home), &[]).unwrap();
+            assert_eq!((l.git, l.remote.as_deref()), (false, None), "{name}");
+        }
     }
 
     #[test]

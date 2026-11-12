@@ -998,6 +998,18 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
     }
 }
 
+/// What this hub can do that an older one can't, by name, so a newer Desk
+/// asks for it only here: `fresh-worktree` (a separate copy that is always
+/// a new branch), `folder-remotes` (a listing says its repository and where
+/// it comes from), `keep-tickets` (a board with tickets of its own links
+/// keeping them).
+pub const FEATURES: &[&str] = &["fresh-worktree", "folder-remotes", "keep-tickets"];
+
+async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(json!({ "features": FEATURES })).into_response()
+}
+
 #[derive(Deserialize)]
 struct FolderParams {
     token: Option<String>,
@@ -1793,6 +1805,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/features", get(features))
         .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
         .route(
             "/api/desk/engines/sign-ins/{id}",

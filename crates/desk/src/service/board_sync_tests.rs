@@ -1355,6 +1355,8 @@ async fn a_board_with_tickets_links_and_keeps_them_beside_the_issues() {
         )
         .await
         .unwrap();
+        // Never even queued to go out.
+        assert!(d.nothing_to_push(b.id).await.unwrap());
         d.push_board(b.id, &remote).await.unwrap();
         let after = d.ticket(own.ticket.id).await.unwrap();
         assert!(after.ticket.external.is_none());

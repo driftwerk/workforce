@@ -272,6 +272,8 @@ impl Tool for FakeLinearTool {
 pub(crate) struct RemoteHub {
     pub url: String,
     pub token: String,
+    /// The same person's token, as a paired device mints one.
+    pub device_token: String,
     pub jira: Shared,
 }
 
@@ -288,7 +290,7 @@ pub(crate) async fn remote_hub(
     for name in workforce_desk::board_sync::LINEAR_TOOLS {
         service.tools.register(Arc::new(FakeLinearTool(name)));
     }
-    serve_remote(fx, allow, jira).await
+    serve_remote(fx, allow, jira, None).await
 }
 
 /// A remote hub of two agents, each with tools of its own: the default
@@ -297,22 +299,55 @@ pub(crate) async fn remote_hub_of_agents(
     dir: &std::path::Path,
     jira_on: Option<&str>,
 ) -> RemoteHub {
-    let fx = fixture(true);
+    remote_hub_of_agents_with(dir, jira_on, false).await
+}
+
+/// As [`remote_hub_of_agents`]; `lattice_closed`: its access policy admits
+/// someone else only.
+pub(crate) async fn remote_hub_of_agents_with(
+    dir: &std::path::Path,
+    jira_on: Option<&str>,
+    lattice_closed: bool,
+) -> RemoteHub {
+    let (fx, devices) = crate::remote_mcp::testing::fixture_with_devices(true);
     let jira: Shared = Arc::default();
     for (n, id) in ["default", "lattice"].into_iter().enumerate() {
         let service = crate::serve::testing::plain_service(&dir.join(format!("agent-{n}"))).await;
         if jira_on == Some(id) {
             register_jira(&service.tools, &jira, &[]);
+            // A tool off the board sync's list, which a device never sees.
+            service.tools.register(Arc::new(FakeJiraTool {
+                name: "jira.assign_issue",
+                jira: Arc::clone(&jira),
+            }));
         }
         fx.state.registry.insert(id, service);
     }
-    serve_remote(fx, &["jira.*"], jira).await
+    if lattice_closed {
+        use workforce_common::settings::{AccessMode, AgentAccessConfig};
+        fx.state.access_gate.upsert(
+            "lattice".into(),
+            AgentAccessConfig {
+                mode: AccessMode::Allowlist,
+                allow: vec![uuid::Uuid::new_v4().to_string()],
+                ..Default::default()
+            },
+        );
+    }
+    serve_remote(
+        fx,
+        &["jira.*", "help", "identity.whoami"],
+        jira,
+        Some(devices),
+    )
+    .await
 }
 
 async fn serve_remote(
     fx: crate::remote_mcp::testing::Fixture,
     allow: &[&str],
     jira: Shared,
+    devices: Option<Arc<workforce_pairing::SqlitePairingStore>>,
 ) -> RemoteHub {
     let state = Arc::try_unwrap(fx.state)
         .ok()
@@ -321,7 +356,7 @@ async fn serve_remote(
         remote_mcp: RemoteMcpConfig {
             enabled: true,
             tools_allow: allow.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
+            ..state.remote_mcp.clone()
         },
         desk_boss: Default::default(),
         uplinks: Default::default(),
@@ -332,9 +367,28 @@ async fn serve_remote(
         identities: fx.identities,
         tokens: fx.tokens,
     };
-    let member = Identity::new("Sam", IdentityRole::Member);
+    let mut member = Identity::new("Sam", IdentityRole::Member);
     fx.identities.create(&member).unwrap();
     let token = issue(&fx, &member, TokenShape::default());
+    // A Desk paired to the hub, and a token it minted.
+    let device_token = match &devices {
+        Some(devices) => {
+            let (device, _) =
+                crate::remote_mcp::testing::pair_device(&fx, devices, &mut member, "Desk");
+            issue(
+                &fx,
+                &member,
+                TokenShape {
+                    scopes: vec![
+                        crate::remote_mcp::tokens::TOKEN_SCOPE.to_string(),
+                        format!("device:{}", device.id),
+                    ],
+                    ..TokenShape::default()
+                },
+            )
+        }
+        None => String::new(),
+    };
     let app = crate::remote_mcp::server::router(crate::remote_mcp::server::RemoteMcpState::new(
         Arc::clone(&fx.state),
     ));
@@ -343,7 +397,12 @@ async fn serve_remote(
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    RemoteHub { url, token, jira }
+    RemoteHub {
+        url,
+        token,
+        device_token,
+        jira,
+    }
 }
 
 // ── The local hub ────────────────────────────────────────────────────────
@@ -1475,4 +1534,118 @@ async fn no_agent_with_jira_is_said_plainly() {
         assert_eq!(body["paused"]["kind"], "missing");
     })
     .await;
+}
+
+// ── The agents a person may reach there ──────────────────────────────────
+
+/// `GET /mcp/agents`: the agents the token's person may reach, the default
+/// marked; an agent whose policy leaves them out isn't named; no token is a
+/// 401. The board's probe never sees a closed agent.
+#[tokio::test]
+async fn a_hub_lists_only_the_agents_its_person_may_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = reqwest::Client::new();
+    let open = remote_hub_of_agents_with(dir.path(), Some("lattice"), false).await;
+    let list = |url: String, token: Option<String>| {
+        let http = http.clone();
+        async move {
+            let mut r = http.get(format!("{url}/mcp/agents"));
+            if let Some(t) = token {
+                r = r.bearer_auth(t);
+            }
+            let resp = r.send().await.unwrap();
+            (
+                resp.status().as_u16(),
+                resp.json::<Value>().await.unwrap_or_default(),
+            )
+        }
+    };
+    let (status, body) = list(open.url.clone(), Some(open.token.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["agents"],
+        json!([{ "default": true, "id": "default" }, { "default": false, "id": "lattice" }])
+    );
+    assert_eq!(list(open.url.clone(), None).await.0, 401);
+    let token = Secret::new(&open.token).unwrap();
+    assert_eq!(
+        hub_agents(&open.url, &token, &http).await.unwrap(),
+        ["default", "lattice"]
+    );
+    let closed_dir = tempfile::tempdir().unwrap();
+    let closed = remote_hub_of_agents_with(closed_dir.path(), Some("lattice"), true).await;
+    let (status, body) = list(closed.url.clone(), Some(closed.token.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["agents"],
+        json!([{ "default": true, "id": "default" }])
+    );
+}
+
+/// A token a paired device minted, on an agent that isn't the default, sees
+/// only the board sync's tools there, as it does on the default agent.
+#[tokio::test]
+async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = remote_hub_of_agents(dir.path(), Some("lattice")).await;
+    let device = HubRemote::new(
+        &remote.url,
+        &Secret::new(&remote.device_token).unwrap(),
+        Arc::new(reqwest::Client::new()),
+        Some("lattice"),
+    )
+    .unwrap();
+    let names: Vec<String> = device
+        .tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.replace('_', "."))
+        .collect();
+    let allowed: Vec<String> = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+        .iter()
+        .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
+        .chain(["help", "identity.whoami"].iter())
+        .map(|t| t.replace('_', "."))
+        .collect();
+    assert!(names.contains(&"jira.search".to_string()), "{names:?}");
+    for n in &names {
+        assert!(allowed.contains(n), "a device sees {n}");
+    }
+    assert!(!names
+        .iter()
+        .any(|n| n == "jira.assign.issue" || n == "jira.api"));
+}
+
+/// A hub that refuses or slows the list of its agents says so, never as
+/// "no agent has it".
+#[tokio::test]
+async fn a_refused_or_busy_agent_list_is_said_as_such() {
+    use axum::routing::get;
+    for (status, expect) in [(403u16, "refused"), (429, "rate")] {
+        let app = axum::Router::new().route(
+            "/mcp/agents",
+            get(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [(axum::http::header::RETRY_AFTER, "7")],
+                    "no",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let token = Secret::new("wfr_abcdefghijklmnopqrstuvwxyz0123").unwrap();
+        let got = hub_agents(&url, &token, &reqwest::Client::new()).await;
+        match (expect, got) {
+            ("refused", Err(RemoteError::Refused(_))) => {}
+            ("rate", Err(RemoteError::RateLimited { retry_after_secs })) => {
+                assert_eq!(retry_after_secs, Some(7))
+            }
+            (_, other) => panic!("{status}: {other:?}"),
+        }
+    }
 }
