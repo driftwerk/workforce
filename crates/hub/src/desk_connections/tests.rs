@@ -973,6 +973,49 @@ async fn a_flat_connection_never_moves_over_a_named_one() {
     );
 }
 
+/// What an agent used before the move is what it uses after: its own
+/// connection, kept for it alone, never the person's in its place.
+#[tokio::test]
+async fn an_agents_own_connection_stays_the_one_it_uses() {
+    let h = hub().await;
+    h.global.set(&mine("skills/linear/api_key"), GOOD).unwrap();
+    h.allan.set(&mine("skills/linear/api_key"), GOOD2).unwrap();
+    h.ben.set(&mine("skills/linear/api_key"), GOOD2).unwrap();
+    // Allan named his own; Ben chose none, so his own shadowed Sarah's.
+    h.crew.bind(
+        "allan",
+        Binding {
+            enabled: Some(vec!["linear".into()]),
+            own: vec!["linear".into()],
+            ..Default::default()
+        },
+    );
+    h.c.migrate(SARAH).await;
+    for agent in ["allan", "ben"] {
+        let services = h.c.agent_picks(SARAH, agent).await.unwrap();
+        let linear = services.iter().find(|s| s.id == "linear").unwrap();
+        let used: Vec<(&str, bool)> = linear
+            .connections
+            .iter()
+            .filter(|p| p.picked)
+            .map(|p| (p.level, p.default))
+            .collect();
+        assert_eq!(used, [("agent", true)], "{agent} uses its own, as before");
+    }
+    // Each names its own: `default` is Sarah's for all her agents.
+    let picked = |agent: &str| h.crew.configs.lock().unwrap()[agent].clone();
+    assert!(
+        picked("allan").contains("linear = [\"linear\"]"),
+        "{}",
+        picked("allan")
+    );
+    assert!(
+        picked("ben").contains("linear = [\"linear-2\"]"),
+        "{}",
+        picked("ben")
+    );
+}
+
 #[tokio::test]
 async fn every_setting_an_adapter_reads_moves_with_its_connection() {
     let h = hub().await;

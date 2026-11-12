@@ -795,6 +795,9 @@ impl Connections {
                                     warn!(connector = c.id, error = %format!("{e:#}"), "a moved connection's check stayed behind");
                                 }
                             }
+                            if let Level::Agent(agent) = &level {
+                                self.keep_own(c, agent, &key, person).await;
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -806,6 +809,32 @@ impl Connections {
                     self.reload(c, &level, person).await;
                 }
             }
+        }
+    }
+
+    /// An agent's own connection kept before stays the one it uses once it
+    /// is named, so nothing switches to the person's account under it: an
+    /// agent that read its own connection (one it named in `own_credential`,
+    /// or any, when it had chosen no connectors, since its own shadowed the
+    /// person's) now names it in `[skills.connections]`, as its default.
+    /// One that read only the person's, or has chosen its connections
+    /// already, is left as it is.
+    async fn keep_own(&self, c: &Connector, agent: &str, key: &str, person: &str) {
+        let Some(a) = self.agents.get(agent) else {
+            return;
+        };
+        let b = &a.binding;
+        let used_own = b.own.iter().any(|o| o == c.id) || b.enabled.is_none();
+        if b.picks(c.id).is_some() || !b.is_on(c.id) || !used_own {
+            return;
+        }
+        let choice = picks::Choice {
+            service: c.id,
+            picked: vec![(key.to_string(), !b.reads_only(c.id, key))],
+            default: Some(key.to_string()),
+        };
+        if let Err(e) = self.agents.choose(agent, person, &choice).await {
+            warn!(agent, connector = c.id, error = %e, "an agent's own connection wasn't kept as the one it uses");
         }
     }
 
