@@ -618,6 +618,32 @@ pub fn is_delivery(prompt: &str) -> Option<String> {
         .then(|| mark.to_string())
 }
 
+/// Which question a reply answers: its whole id, or the mark its message
+/// opens with (the first characters of its id), as the session read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyTo {
+    Id(Uuid),
+    Mark(String),
+}
+
+/// The question `given` names, however a session copies it from what it
+/// read: the whole id (with or without hyphens), or the mark, bare
+/// (`0a1b2c3d`), with its `m:` (`m:0a1b2c3d`) or whole (`[Desk m:0a1b2c3d]`).
+/// A longer start of the id is read as its mark. `None` for anything else.
+pub fn reply_to(given: &str) -> Option<ReplyTo> {
+    let t = given.trim();
+    let t = t.strip_prefix('[').unwrap_or(t);
+    let t = t.strip_suffix(']').unwrap_or(t).trim();
+    let t = t.strip_prefix("Desk").map_or(t, str::trim_start);
+    let t = t.strip_prefix("m:").unwrap_or(t).trim();
+    if let Ok(id) = t.parse::<Uuid>() {
+        return Some(ReplyTo::Id(id));
+    }
+    let hex: String = t.chars().filter(|c| *c != '-').collect();
+    (hex.len() >= MARK && hex.len() < 32 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| ReplyTo::Mark(hex[..MARK].to_ascii_lowercase()))
+}
+
 /// Whether `mark` is `id`'s marker.
 pub fn marks(mark: &str, id: Uuid) -> bool {
     id.simple().to_string().starts_with(mark)
@@ -841,7 +867,7 @@ pub enum Call {
         text: String,
     },
     Reply {
-        to: Uuid,
+        to: ReplyTo,
         text: String,
     },
     Inbox,
@@ -919,9 +945,9 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
             text: need("text", "what to tell them")?,
         },
         "reply" => Call::Reply {
-            to: need("message_id", "which question you answer")?
-                .parse()
-                .map_err(|_| "That isn't a message id from Desk's line.".to_string())?,
+            to: reply_to(&need("message_id", "which question you answer")?).ok_or_else(|| {
+                "That isn't a message id from Desk's line: give the id in its [Desk m:…] mark, like \"0a1b2c3d\", or the message_id it names.".to_string()
+            })?,
             text: need("text", "your answer")?,
         },
         "inbox" => Call::Inbox,
@@ -1410,6 +1436,35 @@ mod tests {
             Err("Say what to tell them.".into())
         );
         assert!(call_of("reply", &json!({"message_id": "x", "text": "y"})).is_err());
+        let id = Uuid::new_v4();
+        let mark = &id.simple().to_string()[..MARK];
+        // The id as the line shows it, however it is copied.
+        for given in [
+            id.to_string(),
+            id.simple().to_string(),
+            mark.to_string(),
+            mark.to_uppercase(),
+            format!("m:{mark}"),
+            format!("[Desk m:{mark}]"),
+            format!("  {mark} "),
+            id.simple().to_string()[..12].to_string(),
+        ] {
+            let want = match given.trim().len() >= 32 {
+                true => ReplyTo::Id(id),
+                false => ReplyTo::Mark(mark.to_string()),
+            };
+            assert_eq!(
+                call_of("reply", &json!({"message_id": given, "text": "y"})),
+                Ok(Call::Reply {
+                    to: want,
+                    text: "y".into()
+                }),
+                "{given}"
+            );
+        }
+        for wrong in ["0a1b2c3", "zzzzzzzz", "m:", "[Desk m:]"] {
+            assert!(reply_to(wrong).is_none(), "{wrong}");
+        }
         assert_eq!(call_of("inbox", &json!({})), Ok(Call::Inbox));
         assert!(call_of("shout", &json!({})).is_err());
     }
