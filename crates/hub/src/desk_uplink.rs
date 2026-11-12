@@ -36,7 +36,7 @@
 //! `Authorization` header alone, as grants are: Desk's native side holds it,
 //! and no page, agent or session can ask them.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1030,7 +1030,7 @@ async fn send_asks(
     let mut look = tokio::time::interval(ASKS_EVERY);
     look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut again: HashSet<Uuid> = links.iter().map(|(l, _, _)| *l).collect();
-    let mut unsent: std::collections::VecDeque<(Uuid, Value)> = Default::default();
+    let mut unsent: VecDeque<(Uuid, Value)> = Default::default();
     loop {
         look.tick().await;
         while let Some((link, f)) = unsent.pop_front() {
