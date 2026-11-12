@@ -366,7 +366,7 @@ mod tests {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
         let person = Uuid::new_v4().to_string();
         let scope = |attended, owner: &str| DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended,
             relayed: false,
             owner: owner.into(),
@@ -478,7 +478,7 @@ mod tests {
             ApprovalDecision::SelfServe
         ));
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended: false,
             relayed: false,
             owner: uid.clone(),

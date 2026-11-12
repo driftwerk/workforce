@@ -51,9 +51,30 @@ pub fn is_desk_boss_channel(channel: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(DESK_BOSS_PREFIX))
 }
 
-/// Whether `channel` is one of Desk's: a DM or a room.
+/// What the channel of a thread in a DM starts with:
+/// `desk:thread:<the parent message's id>`. Not a room ([`is_desk_room`]
+/// refuses its `:`).
+pub const DESK_THREAD_PREFIX: &str = "desk:thread:";
+
+/// The id of the DM message the thread on `channel` is about, when `channel`
+/// is a DM thread's: `desk:thread:` and a message id, a hyphenated lowercase
+/// UUID as the hub gives them.
+pub fn dm_thread_parent(channel: &str) -> Option<&str> {
+    let parent = channel.strip_prefix(DESK_THREAD_PREFIX)?;
+    Uuid::try_parse(parent)
+        .ok()
+        .filter(|id| id.hyphenated().to_string() == parent)
+        .map(|_| parent)
+}
+
+/// The channel of the thread on DM message `parent`.
+pub fn dm_thread_channel(parent: &str) -> String {
+    format!("{DESK_THREAD_PREFIX}{parent}")
+}
+
+/// Whether `channel` is one of Desk's: a DM, a thread in one, or a room.
 pub fn is_desk_conversation(channel: &str) -> bool {
-    channel == DESK_CHANNEL || is_desk_room(channel)
+    channel == DESK_CHANNEL || dm_thread_parent(channel).is_some() || is_desk_room(channel)
 }
 
 fn room_slug(channel: &str) -> Option<&str> {
@@ -73,6 +94,8 @@ fn room_slug(channel: &str) -> Option<&str> {
 pub enum DeskAnchor<'a> {
     /// `desk`: the person's DM with the agent.
     Dm,
+    /// `desk:thread:<id>`: a thread on a message of the DM, `<id>` its id.
+    DmThread(&'a str),
     /// `desk:tuple`: requests from a call.
     Call,
     /// `desk:<uuid>`: a room created with its channel frozen to its id.
@@ -86,6 +109,9 @@ impl<'a> DeskAnchor<'a> {
     pub fn of(channel: &'a str) -> Option<Self> {
         if channel == DESK_CHANNEL {
             return Some(Self::Dm);
+        }
+        if let Some(parent) = dm_thread_parent(channel) {
+            return Some(Self::DmThread(parent));
         }
         room_slug(channel).map(|slug| match slug {
             CALL_SLUG => Self::Call,
@@ -101,7 +127,12 @@ impl<'a> DeskAnchor<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeskPlace {
-    Dm,
+    /// The person's DM with the agent, or a thread on one of its messages.
+    Dm {
+        /// The id of the DM message the thread is on; none for the DM.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
+    },
     Room {
         room: Uuid,
         name: String,
@@ -124,14 +155,24 @@ impl DeskPlace {
                 thread: *thread,
                 ..DeskMark::default()
             },
-            Self::Dm | Self::Call | Self::LegacyRoom { .. } => DeskMark::default(),
+            Self::Dm { thread } => DeskMark {
+                thread_of: thread.clone(),
+                ..DeskMark::default()
+            },
+            Self::Call | Self::LegacyRoom { .. } => DeskMark::default(),
         }
     }
 
     /// Whether a turn in this place may run on `anchor`'s conversation.
     fn fits(&self, anchor: DeskAnchor<'_>) -> bool {
         match (self, anchor) {
-            (Self::Dm, DeskAnchor::Dm) | (Self::Call, DeskAnchor::Call) => true,
+            (Self::Dm { thread: None }, DeskAnchor::Dm) | (Self::Call, DeskAnchor::Call) => true,
+            (
+                Self::Dm {
+                    thread: Some(parent),
+                },
+                DeskAnchor::DmThread(anchor),
+            ) => parent == anchor,
             (Self::Room { room, .. }, DeskAnchor::Room(id)) => *room == id,
             (Self::Room { .. }, DeskAnchor::Slug(_)) => true,
             (Self::LegacyRoom { slug }, DeskAnchor::Slug(anchor)) => slug == anchor,
@@ -364,7 +405,7 @@ impl DeskTurn {
         }
         if let Some(edit) = &self.edit {
             let replaces = edit.replaces.trim();
-            if !matches!(self.place, DeskPlace::Dm)
+            if !matches!(self.place, DeskPlace::Dm { .. })
                 || self.is_hand_off()
                 || replaces.is_empty()
                 || replaces.chars().count() > EDIT_ID_CHARS
@@ -435,7 +476,10 @@ impl DeskTurn {
     /// in the DM, on the call, or in a room known by its channel alone.
     pub fn legacy(anchor: &str) -> Option<Self> {
         let place = match DeskAnchor::of(anchor)? {
-            DeskAnchor::Dm => DeskPlace::Dm,
+            DeskAnchor::Dm => DeskPlace::Dm { thread: None },
+            DeskAnchor::DmThread(parent) => DeskPlace::Dm {
+                thread: Some(parent.to_string()),
+            },
             DeskAnchor::Call => DeskPlace::Call,
             DeskAnchor::Room(_) | DeskAnchor::Slug(_) => DeskPlace::LegacyRoom {
                 slug: anchor[DESK_CHANNEL.len() + 1..].to_string(),
@@ -522,7 +566,7 @@ impl DeskTarget {
                 device: None,
                 spoken,
             },
-            DeskPlace::Dm | DeskPlace::Call => Self::dm_of(spoken),
+            DeskPlace::Dm { .. } | DeskPlace::Call => Self::dm_of(spoken),
         }
     }
 
@@ -534,7 +578,7 @@ impl DeskTarget {
 
     fn dm_of(spoken: bool) -> Self {
         Self {
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             channel: DESK_CHANNEL.to_string(),
             device: None,
             spoken,
@@ -591,6 +635,14 @@ pub struct DeskMark {
     /// failed, and folded away once a later answer replaces it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failed: bool,
+    /// The message is in the thread on this DM message (its id): in the
+    /// thread's own conversation, not the DM's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_of: Option<String>,
+    /// The person's reply in a thread, also sent to the DM: the copy there
+    /// carries `thread_of` too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_copy: bool,
     /// The person's message is their edit of an earlier one, which reads
     /// "(edited)".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1038,7 +1090,7 @@ mod tests {
             ROSTER_MAX - 1,
             "capped, the blank one dropped"
         );
-        let wire = serde_json::to_value(turn(DeskPlace::Dm)).unwrap();
+        let wire = serde_json::to_value(turn(DeskPlace::Dm { thread: None })).unwrap();
         assert!(
             wire.get("members").is_none(),
             "a turn naming no one sends none"
@@ -1050,6 +1102,52 @@ mod tests {
             from: format!("p{n}"),
             text: "x".repeat(chars),
         }
+    }
+
+    #[test]
+    fn a_thread_in_the_dm_has_a_channel_of_its_own() {
+        let parent = Uuid::new_v4().to_string();
+        let channel = dm_thread_channel(&parent);
+        assert_eq!(
+            DeskAnchor::of(&channel),
+            Some(DeskAnchor::DmThread(&parent))
+        );
+        assert!(is_desk_conversation(&channel));
+        assert!(!is_desk_room(&channel));
+        for not_one in [
+            "desk:thread:".to_string(),
+            "desk:thread:abc".to_string(),
+            format!("desk:thread:{}", parent.to_uppercase()),
+            format!("desk:thread:{parent}:x"),
+        ] {
+            assert_eq!(dm_thread_parent(&not_one), None, "{not_one}");
+            assert!(!is_desk_conversation(&not_one), "{not_one}");
+        }
+        let place = DeskPlace::Dm {
+            thread: Some(parent.clone()),
+        };
+        assert_eq!(place.mark().thread_of.as_deref(), Some(parent.as_str()));
+        let sent = |place: DeskPlace, channel: &str| turn(place).validated(channel).map(|_| ());
+        assert_eq!(sent(place.clone(), &channel), Ok(()));
+        for wrong in [
+            "desk".to_string(),
+            dm_thread_channel(&Uuid::new_v4().to_string()),
+        ] {
+            assert_eq!(sent(place.clone(), &wrong), Err(DeskTurnError::WrongPlace));
+        }
+        assert_eq!(
+            sent(DeskPlace::Dm { thread: None }, &channel),
+            Err(DeskTurnError::WrongPlace)
+        );
+        assert_eq!(DeskTurn::legacy(&channel).unwrap().place, place);
+        assert_eq!(
+            serde_json::to_value(&place).unwrap(),
+            serde_json::json!({"kind": "dm", "thread": parent})
+        );
+        assert_eq!(
+            serde_json::from_value::<DeskPlace>(serde_json::json!({"kind": "dm"})).unwrap(),
+            DeskPlace::Dm { thread: None }
+        );
     }
 
     #[test]
@@ -1074,11 +1172,19 @@ mod tests {
         let room = format!("desk:{ROOM}");
         let other = format!("desk:{}", Uuid::new_v4());
         let cases = [
-            (DeskPlace::Dm, "desk", Ok(())),
-            (DeskPlace::Dm, room.as_str(), Err(DeskTurnError::WrongPlace)),
+            (DeskPlace::Dm { thread: None }, "desk", Ok(())),
+            (
+                DeskPlace::Dm { thread: None },
+                room.as_str(),
+                Err(DeskTurnError::WrongPlace),
+            ),
             (DeskPlace::Call, "desk:tuple", Ok(())),
             (DeskPlace::Call, "desk", Err(DeskTurnError::WrongPlace)),
-            (DeskPlace::Dm, "desk:tuple", Err(DeskTurnError::WrongPlace)),
+            (
+                DeskPlace::Dm { thread: None },
+                "desk:tuple",
+                Err(DeskTurnError::WrongPlace),
+            ),
             (in_room(None), room.as_str(), Ok(())),
             (
                 in_room(None),
@@ -1102,7 +1208,11 @@ mod tests {
                 "desk:planning",
                 Err(DeskTurnError::WrongPlace),
             ),
-            (DeskPlace::Dm, "ios", Err(DeskTurnError::NotDesk)),
+            (
+                DeskPlace::Dm { thread: None },
+                "ios",
+                Err(DeskTurnError::NotDesk),
+            ),
         ];
         for (place, anchor, expected) in cases {
             let got = turn(place.clone()).validated(anchor).map(|_| ());
@@ -1117,7 +1227,7 @@ mod tests {
             speaker: DeskSpeaker::Agent {
                 name: "helper".into(),
             },
-            ..turn(DeskPlace::Dm)
+            ..turn(DeskPlace::Dm { thread: None })
         };
         assert!(hop(MAX_HOPS).validated("desk").unwrap().is_hand_off());
         assert_eq!(
@@ -1151,7 +1261,7 @@ mod tests {
             serde_json::json!(true)
         );
         // An ordinary turn says nothing of an edit, on the turn or its mark.
-        let plain = turn(DeskPlace::Dm);
+        let plain = turn(DeskPlace::Dm { thread: None });
         assert!(serde_json::to_value(&plain).unwrap().get("edit").is_none());
         assert!(serde_json::to_value(plain.mark())
             .unwrap()
@@ -1187,7 +1297,7 @@ mod tests {
             edit: Some(DeskEdit {
                 replaces: asked.to_string(),
             }),
-            ..turn(DeskPlace::Dm)
+            ..turn(DeskPlace::Dm { thread: None })
         };
         assert_eq!(reused.validated("desk"), Err(DeskTurnError::EditReusesId));
     }
@@ -1202,7 +1312,7 @@ mod tests {
                     text: "   ".into(),
                 }])
                 .collect(),
-            ..turn(DeskPlace::Dm)
+            ..turn(DeskPlace::Dm { thread: None })
         }
         .validated("desk")
         .unwrap();
@@ -1212,7 +1322,7 @@ mod tests {
 
         let long = DeskTurn {
             context: (10..25).map(|n| line(n, 900)).collect(),
-            ..turn(DeskPlace::Dm)
+            ..turn(DeskPlace::Dm { thread: None })
         }
         .validated("desk")
         .unwrap();
@@ -1226,7 +1336,10 @@ mod tests {
 
     #[test]
     fn an_old_desk_s_turn_is_the_person_in_the_conversation_it_was_sent_on() {
-        assert_eq!(DeskTurn::legacy("desk").unwrap().place, DeskPlace::Dm);
+        assert_eq!(
+            DeskTurn::legacy("desk").unwrap().place,
+            DeskPlace::Dm { thread: None }
+        );
         assert_eq!(
             DeskTurn::legacy("desk:tuple").unwrap().place,
             DeskPlace::Call
@@ -1251,7 +1364,7 @@ mod tests {
                 ..DeskMark::default()
             }
         );
-        assert_eq!(DeskPlace::Dm.mark(), DeskMark::default());
+        assert_eq!(DeskPlace::Dm { thread: None }.mark(), DeskMark::default());
         assert_eq!(
             turn(in_room(None)).mark(),
             DeskMark {
@@ -1273,7 +1386,7 @@ mod tests {
         assert_eq!(
             dm,
             DeskTarget {
-                place: DeskPlace::Dm,
+                place: DeskPlace::Dm { thread: None },
                 channel: DESK_CHANNEL.into(),
                 device: None,
                 spoken: true,
