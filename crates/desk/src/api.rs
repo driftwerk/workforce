@@ -2576,6 +2576,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_engines_and_signing_accounts_in_again_are_the_admins_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let (status, _) = call(&denied, "POST", "/api/desk/engines/read", None).await;
+            assert!(status == 401 || status == 403, "{status}");
+            let path = format!("/api/desk/accounts/{}/sign-in", uuid::Uuid::new_v4());
+            let (status, body) = call(
+                &denied,
+                "POST",
+                &path,
+                Some(json!({ "token": "sk-ant-oat01-anything-0123456789012345678901234567" })),
+            )
+            .await;
+            assert!(status == 401 || status == 403, "{status}");
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            assert!(desk.accounts().is_empty(), "nothing added");
+
+            // An id that isn't one is refused before anything else.
+            let app = super::sessions_router(desk.clone(), allow_all());
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/accounts/not-an-id/sign-in",
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, 400);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engines_asked_to_be_read_without_end_are_read_a_few_times_a_minute() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let app = super::sessions_router(desk.clone(), allow_all());
+            for _ in 0..crate::service::ENGINES_READS_A_MINUTE + 8 {
+                let (status, engines) = call(&app, "POST", "/api/desk/engines/read", None).await;
+                assert_eq!(status, 200, "still answered: {engines}");
+                assert!(engines.as_array().is_some_and(|e| !e.is_empty()));
+            }
+            assert_eq!(
+                desk.engines_reads_this_minute(),
+                crate::service::ENGINES_READS_A_MINUTE,
+                "only so many read"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn every_engine_is_listed_and_one_desk_cant_start_is_refused_in_plain_words() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
