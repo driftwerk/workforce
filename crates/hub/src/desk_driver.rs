@@ -412,7 +412,7 @@ fn is_own(url: &str, ports: &[u16]) -> bool {
 }
 
 /// The ports in listen addresses like `0.0.0.0:8080`.
-fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
+pub(crate) fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
     listens
         .into_iter()
         .filter_map(|l| l.rsplit(':').next()?.parse().ok())

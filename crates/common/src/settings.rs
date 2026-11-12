@@ -10434,40 +10434,34 @@ pub struct SkillsConfig {
     pub browser: BrowserSkillsConfig,
 }
 
-/// `[skills.browser]`: where the browser skill keeps its profiles and
-/// whether its window shows.
+/// `[skills.browser]`: the headless browser a server hub runs (a hub
+/// without Desk): where it keeps its profiles, whether its window shows,
+/// and which Chromium runs.
 ///
 /// ```toml
 /// [skills.browser]
 /// # profile_root = "/var/lib/workforce/browser"
 /// # show = true
 /// # chrome_binary = "/usr/bin/chromium"
-/// # chrome_user_data_dir = "/Users/me/Library/Application Support/Google/Chrome"
 /// ```
 ///
-/// On a hub with `[desk]`, profiles live in Desk's own folder
-/// (`…/Desk/browser`), which every agent's tools are kept from, they are
-/// never reaped (the person signs in to them once, by hand), and the window
-/// shows. Elsewhere they live in the system's temp folder and are reaped
-/// after a week, headless, as before.
+/// Profiles live in the system's temp folder and are reaped after a week,
+/// headless, unless set otherwise here. A hub with `[desk]` launches no
+/// browser: Desk browses in the person's own Chrome, through Desk's
+/// extension, and these keys change nothing there. `chrome_user_data_dir`
+/// (the old remote-debugging My Chrome) is still read, and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSkillsConfig {
     /// Where profiles live, in place of the default above. Profiles under a
     /// root named here are never reaped.
     #[serde(default)]
     pub profile_root: Option<String>,
-    /// Show the window (`true`) or run headless (`false`); unset, it shows
-    /// on Desk only.
+    /// Show the window (`true`) or run headless (`false`, the default).
     #[serde(default)]
     pub show: Option<bool>,
     /// The Chrome or Chromium to run; found on `PATH` where unset.
     #[serde(default)]
     pub chrome_binary: Option<String>,
-    /// The person's own Chrome's user data folder, where it writes
-    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
-    /// own for this platform.
-    #[serde(default)]
-    pub chrome_user_data_dir: Option<String>,
 }
 
 impl Default for SkillsConfig {

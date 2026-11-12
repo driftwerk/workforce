@@ -79,9 +79,17 @@ pub fn choice_name(choice: PermissionChoice) -> &'static str {
     }
 }
 
-/// Whether a prompt offers `choice`; an `always_ask` rule withholds
-/// `allow_always`, and a caller must not be able to type it back in.
+/// What a client trying to answer a card only the person answers is told.
+pub const PERSON_ONLY: &str = "Only the person answers this, in Desk on their computer: it waits while they sign in to a site there.";
+
+/// Whether a prompt offers `choice` to a client; an `always_ask` rule
+/// withholds `allow_always`, and a caller must not be able to type it back
+/// in. A card only the person in Desk answers ("Sign in for me") offers a
+/// client nothing.
 pub fn offered(options: &PermissionPromptOptions, choice: PermissionChoice) -> bool {
+    if options.person_only() {
+        return false;
+    }
     match choice {
         PermissionChoice::AllowOnce => options.allow_once,
         PermissionChoice::DenyOnce => options.deny_once,
@@ -1017,6 +1025,22 @@ pub(crate) fn install_tool_access(service: &AgentService, runner: AgentRunner) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client can't answer the sign-in card: only the person in Desk.
+    #[test]
+    fn a_client_is_offered_nothing_on_the_sign_in_card() {
+        let mut options = PermissionPromptOptions::ask(false);
+        assert!(offered(&options, PermissionChoice::AllowOnce));
+        options.facts = Some(Box::new(workforce_core::computer::ComputerFacts {
+            effect: "sign_in".into(),
+            why: "Waits while you sign in".into(),
+            ..Default::default()
+        }));
+        assert!(options.person_only());
+        for choice in [PermissionChoice::AllowOnce, PermissionChoice::DenyOnce] {
+            assert!(!offered(&options, choice), "{choice:?}");
+        }
+    }
 
     #[test]
     fn choice_names_follow_the_prompt_options() {
