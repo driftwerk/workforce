@@ -16,7 +16,7 @@ use super::tests::options;
 use super::{Added, Desk, DeskError, Options};
 use crate::engine::Engine;
 use crate::engine_accounts::{
-    AccountPatch, Keys, MemoryKeys, NewAccount, SignInState, CLAUDE_TOKEN_ENV,
+    AccountPatch, Keys, MemoryKeys, NewAccount, SignInAgain, SignInState, CLAUDE_TOKEN_ENV,
 };
 use crate::model::{NewSession, SessionState};
 use crate::store::{build_pool, DeskStore};
@@ -688,7 +688,7 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .create(session(dir.path(), Some(Some(work))), None)
             .await
             .unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         let work_view = d.accounts().into_iter().find(|a| a.id == work).unwrap();
         assert!(
             !work_view.signed_in,
@@ -1529,7 +1529,7 @@ async fn an_accounts_sign_in_is_handed_over_whole_and_said_nowhere_else() {
         // Gone from the store: said, never an empty token.
         keys.delete(personal).unwrap();
         let gone = d.hand_over_account(personal).await.unwrap_err();
-        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        assert!(gone.to_string().contains("sign it in again"), "{gone}");
         // No such account.
         assert!(d.hand_over_account(Uuid::new_v4()).await.is_err());
     })
@@ -2570,7 +2570,7 @@ async fn a_machine_told_an_account_is_full_starts_new_sessions_on_the_next_and_s
                 .unwrap_err()
                 .to_string();
             assert!(
-                refused.contains("every Claude Code account here is at its limit")
+                refused.contains("every Claude Code account here is at its plan limit")
                     && refused.contains("Work")
                     && refused.contains("Personal"),
                 "{refused}"
@@ -3592,6 +3592,184 @@ async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_curre
         d.read_engine_now(Engine::Claude).await;
         assert!(d.0.state.lock().own_read);
         assert!(d.current_plan_keys().is_some(), "the filter is on");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_whose_sign_in_is_gone_is_signed_in_again_and_keeps_everything_else() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        // Its sign-in goes from the store: Desk finds out when it reads it.
+        keys.delete(work).unwrap();
+        d.change(s.id, |r, _| r.state = SessionState::Idle);
+        assert!(d.switch_account(s.id, Some(work), None).await.is_err());
+        assert_eq!(d.sign_in_problems().len(), 1);
+        assert!(!d.accounts()[0].signed_in);
+
+        // Through the engine's own sign-in: its token goes to the same account.
+        let Added::SignIn { sign_in } = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: None,
+                    remote: false,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("no token: it signs in");
+        };
+        assert_eq!(sign_in.name, "Work");
+        let state = || {
+            d.account_sign_ins()
+                .into_iter()
+                .find(|x| x.id == sign_in.id)
+                .map(|x| x.state)
+        };
+        for _ in 0..200 {
+            if matches!(state(), Some(SignInState::Code { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        d.sign_in_code(sign_in.id, "c0de").unwrap();
+        for _ in 0..200 {
+            if matches!(state(), Some(SignInState::Done { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(state(), Some(SignInState::Done { account: work }));
+        let views = d.accounts();
+        assert_eq!(views.len(), 1, "no new account");
+        assert!(
+            views[0].id == work
+                && views[0].name == "Work"
+                && views[0].is_default
+                && views[0].signed_in
+        );
+        assert!(d.sign_in_problems().is_empty());
+        assert_eq!(
+            keys.get(work).unwrap().map(|t| t.expose().to_string()),
+            Some("sk-ant-oat01-good-c0de-0123456789012345678901234567890123".to_string())
+        );
+
+        // By a pasted token: checked, then kept for it.
+        let refused = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: Some("sk-ant-oat01-bad".into()),
+                    remote: false,
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        let Added::Account { account } = d
+            .sign_in_again(
+                work,
+                SignInAgain {
+                    token: Some(OTHER.into()),
+                    remote: false,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a pasted token signs in at once");
+        };
+        assert_eq!((account.id, account.name.as_str()), (work, "Work"));
+        assert_eq!(
+            keys.get(work).unwrap().map(|t| t.expose().to_string()),
+            Some(OTHER.to_string())
+        );
+        assert!(matches!(
+            d.sign_in_again(Uuid::new_v4(), SignInAgain::default())
+                .await,
+            Err(DeskError::Invalid(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_start_goes_ahead() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let december = now + chrono::Duration::days(20);
+        let week = now + chrono::Duration::days(3);
+        // The session at 34% and the week at 41%.
+        d.report_usage(both(34.0, 41.0, (3600, 86_400)), Some(a));
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            let hit = |window: &str, resets| crate::limit::LimitHit {
+                window: Some(window.into()),
+                resets_at: Some(resets),
+            };
+            // Extra usage spent until 1 Dec; Opus's weekly window spent.
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit("overage", december)));
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit("seven_day_opus", week)));
+        }
+        let standing = work_standing(&d, work);
+        assert_eq!(standing.full(now), None, "{standing:?}");
+        assert_eq!(standing.hit_until, None);
+        // A new session starts on the account.
+        d.create(session(dir.path(), None), None).await.unwrap();
+        // Extra usage spent while a reading shows the weekly window at
+        // 100%: the plan is full after all, until that window resets.
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.read_at = Some(chrono::Utc::now());
+            s.windows = vec![crate::usage::LimitWindow {
+                used_percent: 100.0,
+                resets_at: Some(week),
+                minutes: 10_080,
+            }];
+            let raw = Desk::raw_running(&st, a);
+            let hit = crate::limit::LimitHit {
+                window: Some("overage".into()),
+                resets_at: Some(december),
+            };
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
+        }
+        let standing = work_standing(&d, work);
+        assert_eq!(standing.hit_until, Some(week), "not December: {standing:?}");
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.windows.clear();
+            s.hit_at = None;
+            s.hit_until = None;
+            s.hit_window = None;
+        }
+        // The plan's own weekly window is a stop that fills it, and the
+        // refusal says which and when.
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            let hit = crate::limit::LimitHit {
+                window: Some("seven_day".into()),
+                resets_at: Some(week),
+            };
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
+        }
+        assert_eq!(work_standing(&d, work).full(now), Some(Some(week)));
     })
     .await;
 }

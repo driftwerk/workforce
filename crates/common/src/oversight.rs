@@ -12,7 +12,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! ```
@@ -31,6 +31,15 @@
 //! spend is under that budget; short of any of it, it acts as `act` and
 //! says why ([`Oversight::fully`]). What no overseer does at any level, Act
 //! fully included, is Desk's own list (`workforce_desk::never`).
+//!
+//! `anywhere = true` takes the lists away: Act fully ships in any
+//! repository and runs any workflow, and `budget_usd_per_day` is optional.
+//! With `level = "full"`, `anywhere` and every `[oversight.act]` switch on,
+//! the overseer is **unbound** ([`Oversight::unbound`]): it answers every
+//! request and question itself, does every crew action, and checks in as
+//! often as the work needs; the never-list doesn't hold it. Only its
+//! budget (when set), the person's Stop and kill switches, the hold while
+//! they type, and the activity log remain. A remote boss is never unbound.
 //!
 //! `group` is the sidebar group it oversees, as that group's boss: it sees
 //! only that group, and the main overseer (no `group`) sees nothing inside
@@ -167,6 +176,55 @@ pub struct Act {
     /// only ever a suggestion, since its brief goes to that engine's
     /// vendor; off, it isn't even suggested.
     pub hand_off: bool,
+    /// Changing a session's permission mode (`crew.set_mode`): at `act`,
+    /// to manual, accept edits or plan, never one that asks for less;
+    /// unbound, to any.
+    pub set_mode: bool,
+}
+
+/// The `[oversight.act]` switches as Desk's settings name them ("What it
+/// may do without asking"), so what the overseer tells the person matches
+/// what they see there.
+pub mod switch {
+    pub const NUDGE: &str = "Nudge";
+    pub const RESUME_RESTART: &str = "Resume and restart";
+    pub const READ_ONLY_APPROVALS: &str = "Allow read-only requests";
+    pub const HAND_OUT_WORK: &str = "Hand out work";
+    pub const INTERRUPT: &str = "Interrupt";
+    pub const MESSAGE_AGENTS: &str = "Message agents";
+    pub const ANSWER_SESSIONS: &str = "Answer sessions’ questions";
+    pub const MESSAGE_TERMINAL_SESSIONS: &str = "Message sessions from other terminals";
+    pub const SET_MODE: &str = "Change sessions’ permission mode";
+
+    /// Why something waits on the person because the switch `label` is
+    /// off, said so the overseer tells them which one to turn on.
+    pub fn off(label: &str) -> String {
+        format!("“{label}” is off in Desk; tell the person turning “{label}” on lets you do this")
+    }
+}
+
+impl Act {
+    /// The switches that are off, by the names Desk shows them under.
+    pub fn off(&self) -> Vec<&'static str> {
+        [
+            (self.nudge, switch::NUDGE),
+            (self.resume_restart, switch::RESUME_RESTART),
+            (self.read_only_approvals, switch::READ_ONLY_APPROVALS),
+            (self.hand_out_work, switch::HAND_OUT_WORK),
+            (self.interrupt, switch::INTERRUPT),
+            (self.message_agents, switch::MESSAGE_AGENTS),
+            (self.answer_sessions, switch::ANSWER_SESSIONS),
+            (
+                self.message_terminal_sessions,
+                switch::MESSAGE_TERMINAL_SESSIONS,
+            ),
+            (self.set_mode, switch::SET_MODE),
+        ]
+        .into_iter()
+        .filter(|(on, _)| !on)
+        .map(|(_, label)| label)
+        .collect()
+    }
 }
 
 /// `[oversight.full]`: where, and on what budget, Act fully ships.
@@ -180,6 +238,9 @@ pub struct Full {
     /// The GitHub workflows it may run (`gh workflow run`), by their file
     /// names exactly (`deploy.yml`); none, it runs none.
     pub workflows: Vec<String>,
+    /// Not limited to `repos` and `workflows`: it ships in any repository
+    /// and runs any workflow, and its budget is optional.
+    pub anywhere: bool,
 }
 
 impl Full {
@@ -309,12 +370,15 @@ impl Default for Oversight {
                 nudge: true,
                 resume_restart: true,
                 read_only_approvals: false,
-                hand_out_work: false,
+                // At Act it starts the sessions its work needs: with
+                // `prefer_sessions` on too, that is how it does any.
+                hand_out_work: true,
                 interrupt: false,
                 message_agents: false,
                 message_terminal_sessions: false,
                 answer_sessions: true,
                 hand_off: false,
+                set_mode: false,
             },
             work: Work {
                 prefer_sessions: true,
@@ -471,10 +535,12 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
         }
         Some(_) => return Err(budget_wrong()),
     };
+    let anywhere = switch(t, "anywhere", false, "Act fully anywhere")?;
     Ok(Full {
         repos,
         budget_cents_per_day,
         workflows,
+        anywhere,
     })
 }
 
@@ -698,6 +764,12 @@ impl Oversight {
                     d.act.hand_off,
                     "suggesting a session continue in another engine",
                 )?,
+                set_mode: switch(
+                    act,
+                    "set_mode",
+                    d.act.set_mode,
+                    "changing a session's permission mode",
+                )?,
             },
             work: Work {
                 prefer_sessions: switch(
@@ -739,6 +811,11 @@ impl Oversight {
         if self.level != Level::Full {
             return Err(None);
         }
+        // Anywhere, no list limits it, and a budget is the person's to set
+        // or leave blank.
+        if self.full.anywhere {
+            return Ok(&self.full);
+        }
         if self.full.repos.is_empty() {
             return Err(Some(FULL_NO_REPOS));
         }
@@ -746,6 +823,29 @@ impl Oversight {
             return Err(Some(FULL_NO_BUDGET));
         }
         Ok(&self.full)
+    }
+
+    /// Whether it is **unbound**: Act fully, anywhere, with every
+    /// `[oversight.act]` switch on. Unbound, no word or list holds the
+    /// overseer back and it answers every request itself; only the person's
+    /// budget, their Stop and kill switches, the hold while they type, and
+    /// the activity log remain. `local`: the overseer is an agent of this
+    /// hub. A remote boss is never unbound.
+    pub fn unbound(&self, local: bool) -> bool {
+        let a = &self.act;
+        local
+            && self.level == Level::Full
+            && self.full.anywhere
+            && a.nudge
+            && a.resume_restart
+            && a.read_only_approvals
+            && a.hand_out_work
+            && a.interrupt
+            && a.message_agents
+            && a.message_terminal_sessions
+            && a.answer_sessions
+            && a.hand_off
+            && a.set_mode
     }
 
     /// `[oversight]` as a config holds it: absent is the defaults (off).
@@ -1136,5 +1236,66 @@ mod tests {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }
+    }
+
+    /// At Act it starts the sessions its work needs unless the person
+    /// turns that off, and each switch that is off is named as Desk shows it.
+    #[test]
+    fn act_hands_out_work_by_default_and_names_what_is_off() {
+        let o = Oversight::default();
+        assert!(o.act.hand_out_work);
+        assert!(!o.act.off().contains(&switch::HAND_OUT_WORK));
+        let off = Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o
+        };
+        assert!(off.act.off().contains(&switch::HAND_OUT_WORK));
+        assert!(switch::off(switch::HAND_OUT_WORK).contains("turning “Hand out work” on"));
+    }
+
+    /// Every `[oversight.act]` switch on, Act fully anywhere.
+    pub(crate) const UNBOUND: &str = "[oversight]\nlevel = \"full\"\n\
+        act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
+        interrupt = true, message_agents = true, message_terminal_sessions = true, answer_sessions = true, \
+        hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
+
+    #[test]
+    fn unbound_is_act_fully_anywhere_with_every_switch_on_and_never_remote() {
+        let o = parse(UNBOUND).unwrap();
+        assert!(o.full.anywhere);
+        assert!(o.unbound(true));
+        assert!(!o.unbound(false), "a remote boss is never unbound");
+        // Anywhere needs no repositories, and no budget.
+        assert!(o.fully().is_ok());
+        for off in [
+            "nudge",
+            "resume_restart",
+            "read_only_approvals",
+            "hand_out_work",
+            "interrupt",
+            "message_agents",
+            "message_terminal_sessions",
+            "answer_sessions",
+            "hand_off",
+            "set_mode",
+        ] {
+            let one = UNBOUND.replace(&format!("{off} = true"), &format!("{off} = false"));
+            assert!(!parse(&one).unwrap().unbound(true), "{off} off");
+        }
+        let listed = UNBOUND.replace("anywhere = true", "anywhere = false");
+        assert!(!parse(&listed).unwrap().unbound(true), "not anywhere");
+        assert_eq!(
+            parse(&listed).unwrap().fully().unwrap_err(),
+            Some(FULL_NO_REPOS)
+        );
+        let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+        assert!(!parse(&act).unwrap().unbound(true), "at act");
+        assert_eq!(
+            parse("[oversight.full]\nanywhere = 1\n").unwrap_err(),
+            "Whether Act fully anywhere is on or off must be true or false."
+        );
     }
 }

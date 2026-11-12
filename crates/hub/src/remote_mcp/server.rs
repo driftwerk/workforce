@@ -27,7 +27,7 @@ use crate::mcp::{build_mcp_registry, matches_any, McpEndpoint, Surface};
 use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor, PendingCalls};
 use crate::serve::AgentService;
 
-use super::access::{reachable, Unreachable};
+use super::access::{reachable, reachable_ids, Unreachable};
 use super::agent_tools::{agent_tools, AgentToolsContext, ChatTurns};
 use super::approvals::approval_tools;
 use super::auth::authenticate;
@@ -127,6 +127,7 @@ pub fn router(remote: Arc<RemoteMcpState>) -> Router {
                 .get(method_not_allowed)
                 .delete(session_closed),
         )
+        .route("/mcp/agents", axum::routing::get(list_agents))
         .route(
             "/mcp/agents/{agent_id}",
             post(serve_agent)
@@ -135,6 +136,39 @@ pub fn router(remote: Arc<RemoteMcpState>) -> Router {
         )
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(remote)
+}
+
+/// `GET /mcp/agents`: the agents the token's person may reach here, each
+/// served at `/mcp/agents/{id}`, and which is the default (`/mcp`). What a
+/// client (a Desk's board sync) picks from when the default agent lacks the
+/// tools it needs. Ids only: each agent's tools are its own `tools/list`.
+async fn list_agents(State(remote): State<Arc<RemoteMcpState>>, headers: HeaderMap) -> Response {
+    let gateway = &remote.gateway;
+    if !gateway.remote_mcp.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            "remote MCP is not enabled on this install",
+        )
+            .into_response();
+    }
+    let caller = match authenticate(gateway, &headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let identity_id = caller.identity.id.to_string();
+    let limited = CallerContext {
+        identity_id: Some(identity_id.clone()),
+        ..Default::default()
+    };
+    if let Err(retry_after) = check_action_rate_limit(gateway.action_limiter.as_ref(), &limited) {
+        return too_many_requests_err(retry_after).into_response();
+    }
+    let default_id = gateway.registry.default_id().to_string();
+    let agents: Vec<serde_json::Value> = reachable_ids(gateway, &identity_id)
+        .into_iter()
+        .map(|id| serde_json::json!({ "default": id == default_id, "id": id }))
+        .collect();
+    axum::Json(serde_json::json!({ "agents": agents })).into_response()
 }
 
 async fn method_not_allowed() -> StatusCode {
@@ -269,10 +303,12 @@ async fn serve(
 }
 
 /// What a token a paired device minted may call besides the board sync's
-/// own Jira and Linear tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
+/// own Jira, Linear and identity tools (`workforce_core::desk::BOARD_SYNC_*_TOOLS`),
 /// by exact name, within what the hub exposes anyway. Never `agent.*` (a
 /// delegated turn runs with the person's own role), `approval.*`, `vault.*`,
-/// `jira.api`, a delete, an assign or a bulk change.
+/// `jira.api`, a delete, an assign tool or a bulk change. (A board's Take it
+/// assigns an issue only to the person, through `jira.update_issue` or
+/// `linear.issue_update`, which the sync already calls.)
 pub const DEVICE_SURFACE_EXTRA: &[&str] = &["help", "identity.whoami"];
 
 /// `surface` narrowed to the device surface, by exact names only.
@@ -281,6 +317,7 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
     workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
         .iter()
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
         .chain(DEVICE_SURFACE_EXTRA)
         .filter_map(|name| surface.get(name))
         .for_each(|tool| narrowed.register(tool));
@@ -360,6 +397,28 @@ mod tests {
     use workforce_agent::tools::dispatch::ToolGates;
     use workforce_common::sentinel_config::SentinelConfig;
     use workforce_common::settings::RemoteMcpConfig;
+
+    /// The default surface offers every tool Desk's board sync calls, by
+    /// exact name, and none of either system's raw, delete or bulk tools.
+    #[test]
+    fn the_default_surface_offers_board_sync_by_name() {
+        let allow = RemoteMcpConfig::DEFAULT_TOOLS_ALLOW;
+        for tool in workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
+            .iter()
+            .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        {
+            assert!(allow.contains(tool), "{tool} is not offered by default");
+        }
+        for wide in [
+            "jira.*",
+            "linear.*",
+            "jira.api",
+            "jira.delete_issue",
+            "linear.issue_bulk_update",
+        ] {
+            assert!(!allow.contains(&wide), "{wide} is offered by default");
+        }
+    }
     use workforce_policy::engine::PolicyEngine;
 
     use crate::mcp_turn::testing::text_of;
@@ -998,7 +1057,9 @@ mod tests {
             "jira.api",
             "jira.delete_issue",
             "jira.assign_issue",
+            "jira.myself",
             "linear.issue_list",
+            "linear.viewer",
             "linear.issue_bulk_update",
             "linear.document_delete",
             "vault.get",
@@ -1012,7 +1073,16 @@ mod tests {
         let full = curated_surface(&source, &extra, &["*".to_string()]);
         let mut names = device_surface(&full).names();
         names.sort();
-        assert_eq!(names, ["help", "jira.search", "linear.issue_list"]);
+        assert_eq!(
+            names,
+            [
+                "help",
+                "jira.myself",
+                "jira.search",
+                "linear.issue_list",
+                "linear.viewer"
+            ]
+        );
     }
 
     #[tokio::test]

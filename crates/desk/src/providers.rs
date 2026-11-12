@@ -262,7 +262,7 @@ pub const PROVIDERS: &[Spec] = &[
         description: "Your Pro or Max subscription",
         connect: login("Sign in with your Claude account"),
         models: &[
-            (("fable", "Fable 5.1", FABLE), false),
+            (("fable", "Fable 5.2", FABLE), false),
             (("opus", "Opus 5.5", OPUS), false),
             (("sonnet", "Sonnet 5.5", SONNET), true),
             (("haiku", "Haiku 5.5", HAIKU), false),
@@ -300,6 +300,30 @@ pub const PROVIDERS: &[Spec] = &[
                 false,
             ),
             (("gpt-6-luna", "GPT-6 Luna", HAIKU), false),
+            (
+                (
+                    "gpt-5.6-sol",
+                    "GPT-5.6 Sol",
+                    "Older generation workhorse model",
+                ),
+                false,
+            ),
+            (
+                (
+                    "gpt-5.6-terra",
+                    "GPT-5.6 Terra",
+                    "Older balanced model for straightforward work",
+                ),
+                false,
+            ),
+            (
+                (
+                    "gpt-5.6-luna",
+                    "GPT-5.6 Luna",
+                    "Older fast and efficient model",
+                ),
+                false,
+            ),
         ],
     },
     Spec {
@@ -309,6 +333,7 @@ pub const PROVIDERS: &[Spec] = &[
         description: "Claude on an Anthropic API key, billed per use",
         connect: keyed("Create a key at console.anthropic.com under API keys"),
         models: &[
+            (("claude-fable-5-2", "Claude Fable 5.2", FABLE), false),
             (("claude-fable-5-1", "Claude Fable 5.1", FABLE), false),
             (("claude-opus-5-5", "Claude Opus 5.5", OPUS), false),
             (("claude-sonnet-5-5", "Claude Sonnet 5.5", SONNET), true),
@@ -347,9 +372,17 @@ pub const PROVIDERS: &[Spec] = &[
         models: &[
             (
                 (
+                    "anthropic.claude-fable-5-2",
+                    "Claude Fable 5.2",
+                    "Anthropic's most capable model; served through global routing",
+                ),
+                false,
+            ),
+            (
+                (
                     "anthropic.claude-fable-5-1",
                     "Claude Fable 5.1",
-                    "Anthropic's most capable model; served through global routing",
+                    "The previous Fable; served through global routing",
                 ),
                 false,
             ),
@@ -704,7 +737,7 @@ impl Entry {
     }
 }
 
-/// `spec`'s models with what its plan lists now. A ChatGPT plan's list is
+/// `spec`'s models with what its plan or key lists now. A ChatGPT plan's list is
 /// the one it serves: Desk's table only words the models it knows, and its
 /// default stays the default while listed. A Claude plan's aliases always
 /// run (each names the newest of its line), so they stay first, named as
@@ -738,9 +771,24 @@ fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> V
             })
             .collect();
         for l in &listed {
-            let offered = models.iter().any(|m| m.id == l.id || m.name == l.name)
+            let offered = models
+                .iter()
+                .any(|m| same_model(&m.id, &l.id) || m.name == l.name)
                 || reached.contains(&l.id.as_str());
             if !offered {
+                models.push(entry(l, false));
+            }
+        }
+        return models;
+    }
+    if spec.group == Group::Key {
+        // A key's list adds to Desk's table: the models Desk words keep its
+        // words and place, and a model released since follows them by the
+        // name its provider gives it. Nothing Desk offers is taken away, as
+        // an account can use models its listing doesn't show.
+        let mut models = curated;
+        for l in &listed {
+            if !models.iter().any(|m| same_model(&m.id, &l.id)) {
                 models.push(entry(l, false));
             }
         }
@@ -765,6 +813,24 @@ fn with_listed(spec: &Spec, listed: Vec<Listed>, honoured: &[&'static str]) -> V
             }
         })
         .collect()
+}
+
+/// `id` without a version suffix as Bedrock words one: `-v1:0` or `:0`.
+fn unversioned(id: &str) -> &str {
+    let id = match id.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    };
+    match id.rsplit_once("-v") {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    }
+}
+
+/// Whether two ids name one model, differing at most by a version suffix
+/// (`anthropic.claude-opus-5-5` and `anthropic.claude-opus-5-5-v1:0`).
+fn same_model(a: &str, b: &str) -> bool {
+    a == b || unversioned(a) == unversioned(b)
 }
 
 /// The efforts `listed` takes that the hub honours on its provider, when
@@ -1013,7 +1079,7 @@ mod tests {
                 .map(|m| (m.id.as_str(), m.name.as_str(), m.default))
                 .collect::<Vec<_>>(),
             [
-                ("fable", "Fable 5.1", false),
+                ("fable", "Fable 5.2", false),
                 ("opus", "Opus 5.5", false),
                 ("sonnet", "Sonnet 5.5", true),
                 ("haiku", "Haiku 5.5", false),
@@ -1030,7 +1096,11 @@ mod tests {
                 ("gpt-6.1-sol", true),
                 ("gpt-6-sol", false),
                 ("gpt-6-luna", false),
-            ]
+                ("gpt-5.6-sol", false),
+                ("gpt-5.6-terra", false),
+                ("gpt-5.6-luna", false),
+            ],
+            "Terra is offered when the plan can't be asked"
         );
     }
 
@@ -1197,6 +1267,15 @@ mod tests {
                     listed("claude-fable-5-2", "Fable 5.2", &all, None),
                     listed("claude-haiku-4-5-20251001", "Haiku 4.5", &[], None),
                 ]),
+                "anthropic" => Some(vec![
+                    listed("claude-fable-5-3", "Claude Fable 5.3", &[], None),
+                    listed("claude-opus-5-5", "Opus 5.5 as the account says", &[], None),
+                ]),
+                "bedrock" => Some(vec![
+                    listed("anthropic.claude-fable-5-3", "Claude Fable 5.3", &[], None),
+                    listed("anthropic.claude-sonnet-5-5", "Sonnet", &[], None),
+                    listed("anthropic.claude-opus-5-5-v1:0", "Opus", &[], None),
+                ]),
                 _ => None,
             };
             Standing {
@@ -1286,13 +1365,14 @@ mod tests {
         assert_eq!(
             shown,
             [
-                ("fable", "Fable 5.1", false),
+                ("fable", "Fable 5.2", false),
                 ("opus", "Opus 5.5", false),
                 ("sonnet", "Sonnet 5.5", true),
                 ("haiku", "Haiku 5.5", false),
-                ("claude-fable-5-2", "Fable 5.2", false),
+                ("claude-fable-5-1", "Fable 5.1", false),
                 ("claude-haiku-4-5-20251001", "Haiku 4.5", false),
-            ]
+            ],
+            "Fable 5.2 is the fable alias's; the previous Fable is offered by its id"
         );
         assert_eq!(entry.models[2].description, SONNET, "Desk's words kept");
         assert_eq!(
@@ -1309,13 +1389,138 @@ mod tests {
         );
     }
 
+    /// [`Listing`] with a ChatGPT plan whose catalogue lists both Terras.
+    struct WithTerra;
+
+    #[async_trait]
+    impl Accounts for WithTerra {
+        async fn standing(&self, spec: &Spec) -> Standing {
+            let all = ["low", "medium", "high"];
+            Standing {
+                connected: true,
+                installed: Vec::new(),
+                listed: Some(vec![
+                    listed("gpt-6.1-sol", "GPT-6.1-Sol", &all, None),
+                    listed("gpt-6.1-terra", "GPT-6.1 Terra", &all, None),
+                    listed("gpt-5.6-terra", "GPT-5.6-Terra", &all, None),
+                ])
+                .filter(|_| spec.id == "chatgpt"),
+            }
+        }
+
+        fn efforts(&self, provider: &str) -> Vec<&'static str> {
+            Listing.efforts(provider)
+        }
+
+        async fn connect(&self, _: &Spec, _: &Fields) -> Result<(), AccountError> {
+            Ok(())
+        }
+
+        async fn disconnect(&self, _: &Spec) -> Result<(), AccountError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_plan_that_lists_terra_offers_it_in_every_generation_it_lists() {
+        let entry = Entry::of(spec("chatgpt").unwrap(), &WithTerra).await;
+        let ids: Vec<&str> = entry.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-terra"]);
+        let terra = &entry.models[1];
+        assert_eq!(terra.name, "GPT-6.1 Terra", "worded as the plan words it");
+        assert_eq!(terra.provider, "chatgpt");
+        assert!(entry.models[0].default, "Sol stays the default");
+    }
+
+    #[tokio::test]
+    async fn a_key_adds_what_its_account_lists_to_desks_table_and_takes_nothing_away() {
+        let anthropic = Entry::of(spec("anthropic").unwrap(), &Listing).await;
+        let shown: Vec<(&str, &str, bool)> = anthropic
+            .models
+            .iter()
+            .map(|m| (m.id.as_str(), m.name.as_str(), m.default))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("claude-fable-5-2", "Claude Fable 5.2", false),
+                ("claude-fable-5-1", "Claude Fable 5.1", false),
+                ("claude-opus-5-5", "Claude Opus 5.5", false),
+                ("claude-sonnet-5-5", "Claude Sonnet 5.5", true),
+                ("claude-haiku-5-5", "Claude Haiku 5.5", false),
+                ("claude-fable-5-3", "Claude Fable 5.3", false),
+            ],
+            "Desk's names and order kept; the model released since follows"
+        );
+        assert_eq!(anthropic.models[2].description, OPUS, "Desk's words kept");
+        assert_eq!(
+            anthropic.models[5].description, "Claude Fable 5.3 as the plan says",
+            "a new model has its provider's words"
+        );
+
+        let bedrock = Entry::of(spec("bedrock").unwrap(), &Listing).await;
+        let new = bedrock
+            .models
+            .iter()
+            .find(|m| m.id == "anthropic.claude-fable-5-3")
+            .expect("offered");
+        assert_eq!(
+            new.provider, "bedrock:anthropic",
+            "routed by its family, never a region"
+        );
+        assert!(
+            bedrock.models.iter().any(|m| m.id == "zai.glm-5"),
+            "a curated model the listing lacks stays"
+        );
+        assert_eq!(
+            bedrock
+                .models
+                .iter()
+                .filter(|m| m.id == "anthropic.claude-sonnet-5-5")
+                .count(),
+            1
+        );
+        assert!(
+            bedrock
+                .models
+                .iter()
+                .all(|m| m.id != "anthropic.claude-opus-5-5-v1:0"),
+            "a model listed with a version suffix is the one Desk already offers"
+        );
+    }
+
+    #[test]
+    fn ids_that_differ_only_by_a_version_suffix_are_one_model() {
+        assert!(same_model(
+            "anthropic.claude-opus-5-5",
+            "anthropic.claude-opus-5-5-v1:0"
+        ));
+        assert!(same_model(
+            "qwen.qwen3-coder-480b-a35b-v1:0",
+            "qwen.qwen3-coder-480b-a35b"
+        ));
+        assert!(!same_model(
+            "anthropic.claude-opus-5-5",
+            "anthropic.claude-opus-5-6"
+        ));
+        assert!(!same_model("deepseek.v3.2", "deepseek.v3"));
+    }
+
     #[tokio::test]
     async fn a_plan_that_couldnt_be_asked_offers_desks_own_table() {
         let entry = Entry::of(spec("chatgpt").unwrap(), &Held::default()).await;
         let ids: Vec<&str> = entry.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
+            [
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna"
+            ]
         );
         assert!(entry.models.iter().all(|m| m.fast.is_none()));
     }
@@ -1357,7 +1562,7 @@ mod tests {
         );
         let bedrock = providers.iter().find(|p| p["id"] == "bedrock").unwrap();
         assert_eq!(bedrock["defaultEffort"], "medium");
-        let opus = &bedrock["models"][1];
+        let opus = &bedrock["models"][2];
         assert_eq!(opus["id"], "anthropic.claude-opus-5-5");
         assert!(
             opus.get("efforts").is_none() && opus.get("defaultEffort").is_none(),

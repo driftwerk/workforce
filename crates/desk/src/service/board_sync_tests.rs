@@ -12,6 +12,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::desk;
 use super::*;
+use crate::board::Assignee;
 use crate::board_sync::{Remote, RemoteError};
 use crate::service::NewBoard;
 use crate::store::build_pool;
@@ -94,8 +95,13 @@ fn link(hub: Option<&str>) -> LinkBoard {
             Some(h) => Via::Hub { hub: h.into() },
             None => Via::ThisHub,
         },
+        agent: None,
         filter: Filter::Label("web".into()),
         me: None,
+        me_name: None,
+        me_source: None,
+        me_note: None,
+        not_me: false,
         states: BTreeMap::from([(TicketState::Todo, "To Do".to_string())]),
     }
 }
@@ -618,6 +624,659 @@ async fn a_synced_ticket_is_released_when_its_session_moves_group() {
         let after = d.ticket(t).await.unwrap().ticket;
         assert_eq!(after.board, b.id, "it stays on its board");
         assert_eq!(after.assignee, None, "and no one in another group has it");
+    })
+    .await;
+}
+
+// ── A whole Linear team ──────────────────────────────────────────────────
+
+const TEAM: &str = "8a7b6c5d-0000-4000-8000-000000000001";
+const ME: &str = "11111111-2222-4333-8444-555555555555";
+const ANA: &str = "22222222-2222-4333-8444-555555555555";
+
+/// A Linear team as a newer hub's tools answer it: newest change first,
+/// fifty a page with a cursor, and the open ones only when asked.
+#[derive(Default)]
+struct FakeLinear {
+    /// key → (state type, updated, assignee id)
+    issues: Mutex<BTreeMap<u32, (String, String, Option<String>)>>,
+    calls: Mutex<Vec<(String, Value)>>,
+    /// What `linear.viewer` answers; none: the hub doesn't offer it.
+    viewer: Mutex<Option<Value>>,
+    /// Someone who takes an issue just before an assign lands.
+    racer: Mutex<Option<String>>,
+}
+
+impl FakeLinear {
+    fn node(n: u32, (kind, updated, who): &(String, String, Option<String>)) -> Value {
+        json!({
+            "id": format!("id-{n}"), "identifier": format!("ENG-{n}"),
+            "title": format!("Issue {n}"), "description": "About it.",
+            "url": format!("https://linear.example/ENG-{n}"),
+            "state": { "name": kind, "type": kind },
+            "updatedAt": updated,
+            "assignee": who.as_ref().map(|id| match id.as_str() {
+                // An assignee the answer names without an id.
+                "noid" => json!({ "name": "Someone" }),
+                id => json!({ "id": id, "name": if id == ME { "Sam" } else { "Ana" } }),
+            }),
+            "labels": { "nodes": [] },
+        })
+    }
+
+    fn set(&self, n: u32, kind: &str, minute: u32, who: Option<&str>) {
+        self.issues.lock().unwrap().insert(
+            n,
+            (
+                kind.into(),
+                format!(
+                    "2026-11-09T{:02}:{:02}:00.000Z",
+                    10 + minute / 60,
+                    minute % 60
+                ),
+                who.map(str::to_string),
+            ),
+        );
+    }
+
+    fn calls_of(&self, tool: &str) -> Vec<Value> {
+        let c = self.calls.lock().unwrap();
+        c.iter()
+            .filter(|(t, _)| t == tool)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Remote for FakeLinear {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::LINEAR_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
+        let mut issues = self.issues.lock().unwrap();
+        match tool {
+            "linear.viewer" => self
+                .viewer
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| RemoteError::Missing(tool.into())),
+            "linear.issue_list" => {
+                let open = args["open_only"].as_bool() == Some(true);
+                let since = args["updated_since"].as_str().map(str::to_string);
+                let mut all: Vec<(u32, (String, String, Option<String>))> = issues
+                    .iter()
+                    .filter(|(_, (k, u, _))| {
+                        (!open || !matches!(k.as_str(), "completed" | "canceled"))
+                            && since.as_ref().is_none_or(|s| {
+                                chrono::DateTime::parse_from_rfc3339(u).unwrap()
+                                    >= chrono::DateTime::parse_from_rfc3339(s).unwrap()
+                            })
+                    })
+                    .map(|(n, i)| (*n, i.clone()))
+                    .collect();
+                all.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                let from: usize = args["after"]
+                    .as_str()
+                    .map_or(0, |c| c.trim_start_matches("p").parse().unwrap());
+                let page: Vec<Value> = all
+                    .iter()
+                    .skip(from)
+                    .take(50)
+                    .map(|(n, i)| Self::node(*n, i))
+                    .collect();
+                let more = from + 50 < all.len();
+                Ok(json!({ "count": page.len(), "issues": page,
+                    "page_info": { "has_next_page": more, "end_cursor": format!("p{}", from + 50) } }))
+            }
+            "linear.issue_get" => {
+                let n: u32 = args["identifier"]
+                    .as_str()
+                    .and_then(|k| k.strip_prefix("ENG-"))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                match issues.get(&n) {
+                    Some(i) => Ok(json!({ "issue": Self::node(n, i) })),
+                    None => Err(RemoteError::Failed("404 not found".into())),
+                }
+            }
+            "linear.issue_update" => {
+                let n: u32 = args["identifier"]
+                    .as_str()
+                    .and_then(|k| k.strip_prefix("ENG-"))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let i = issues.get_mut(&n).unwrap();
+                i.2 = self
+                    .racer
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(|| args["assignee_id"].as_str().map(str::to_string));
+                i.1 = "2026-11-09T23:00:00.000Z".into();
+                Ok(json!({ "issue": Self::node(n, i) }))
+            }
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
+    let b = d
+        .create_board(NewBoard {
+            name: "Eng".into(),
+            group: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+    d.link_board(
+        b.id,
+        LinkBoard {
+            system: System::Linear,
+            target: "ENG".into(),
+            target_id: Some(TEAM.into()),
+            via: Via::ThisHub,
+            agent: None,
+            filter: Filter::All {
+                include_done: false,
+            },
+            me: me.map(str::to_string),
+            me_name: me.map(|_| "Sam".to_string()),
+            me_source: None,
+            me_note: None,
+            not_me: false,
+            states: BTreeMap::from([
+                (TicketState::Todo, "unstarted".to_string()),
+                (TicketState::Done, "completed".to_string()),
+            ]),
+        },
+        "sam",
+    )
+    .await
+    .unwrap()
+}
+
+/// A whole team comes in page by page, whoever has each issue and none,
+/// with no done issue; who has each is kept, and a card whose issue is
+/// done there moves to Done.
+#[tokio::test]
+async fn a_whole_team_comes_in_page_by_page_with_who_has_each() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, Some(ME)).await;
+        let linear = FakeLinear::default();
+        for n in 1..=130 {
+            let who = match n % 3 {
+                0 => None,
+                1 => Some(ME),
+                _ => Some(ANA),
+            };
+            linear.set(n, "unstarted", n, who);
+        }
+        for n in 131..=140 {
+            linear.set(n, "completed", n, Some(ANA));
+        }
+        let pulled = d.pull_board(b.id, &linear).await.unwrap();
+        assert_eq!(
+            (pulled.imported, pulled.skipped.clone()),
+            (130, None),
+            "{pulled:?}"
+        );
+        // Three pages, the open ones only, and no member id asked for.
+        let lists = linear.calls_of("linear.issue_list");
+        assert_eq!(lists.len(), 3, "{lists:?}");
+        assert!(lists
+            .iter()
+            .all(|a| a["open_only"] == json!(true) && a.get("assignee_id").is_none()));
+        let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
+        let unassigned = tickets
+            .iter()
+            .filter(|t| t.ticket.external.as_ref().unwrap().assignee == Some(None))
+            .count();
+        assert_eq!(unassigned, 43);
+        let ana = tickets
+            .iter()
+            .find(|t| t.key.as_deref() == Some("ENG-2"))
+            .unwrap();
+        assert_eq!(
+            ana.ticket.external.as_ref().unwrap().assignee,
+            Some(Some(Assignee {
+                id: ANA.into(),
+                name: "Ana".into()
+            }))
+        );
+        // Read through: the cursor is a little before the latest change it
+        // saw, and never past when the listing began.
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert!(
+            s.cursor.as_deref().unwrap().starts_with("2026-11-09T12:08"),
+            "{:?}",
+            s.cursor
+        );
+        assert_eq!(s.listing, None);
+
+        // ENG-3 is done there, ENG-4 changes hands: the next pull follows.
+        linear.set(3, "completed", 200, None);
+        linear.set(4, "unstarted", 201, Some(ANA));
+        linear.calls.lock().unwrap().clear();
+        let pulled = d.pull_board(b.id, &linear).await.unwrap();
+        assert_eq!(pulled.updated, 2, "{pulled:?}");
+        let since = linear.calls_of("linear.issue_list");
+        assert!(since[0]["updated_since"].is_string() && since[0].get("open_only").is_none());
+        let t = |key: &str| {
+            let d = d.clone();
+            let key = key.to_string();
+            async move {
+                d.tickets(b.id, &Default::default())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.key.as_deref() == Some(key.as_str()))
+                    .unwrap()
+            }
+        };
+        assert_eq!(t("ENG-3").await.ticket.state, TicketState::Done);
+        assert_eq!(
+            t("ENG-4")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .assignee
+                .unwrap()
+                .unwrap()
+                .id,
+            ANA
+        );
+        // No done issue that wasn't on the board came on.
+        assert_eq!(
+            d.tickets(b.id, &Default::default()).await.unwrap().len(),
+            130
+        );
+    })
+    .await;
+}
+
+fn viewer(personal: bool) -> Value {
+    json!({ "id": ME, "name": "sam", "display_name": "Sam", "personal": personal })
+}
+
+/// A whole team pulled, and who the person is asked of the hub (as the
+/// link does), when it can say.
+async fn taker(d: &Desk, linear: &FakeLinear) -> Board {
+    let b = whole_team(d, None).await;
+    d.pull_board(b.id, linear).await.unwrap();
+    d.recheck_me(b.id, linear, "Atlas").await.unwrap();
+    b
+}
+
+async fn ticket_of(d: &Desk, b: &Board, key: &str) -> crate::service::TicketView {
+    d.tickets(b.id, &Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.key.as_deref() == Some(key))
+        .unwrap()
+}
+
+fn refused(r: Result<crate::service::TicketView, DeskError>, words: &str) {
+    assert!(
+        matches!(&r, Err(DeskError::Conflict(w)) if w.contains(words)),
+        "{words:?}: {r:?}"
+    );
+}
+
+/// Take it assigns an unassigned issue to the person there, as themselves,
+/// with the tool a move uses, once their own key vouches for who they are,
+/// asked afresh; it reads the issue again after. One someone has stays
+/// theirs.
+#[tokio::test]
+async fn take_it_assigns_an_unassigned_issue_to_the_person() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        linear.set(1, "unstarted", 1, None);
+        linear.set(2, "unstarted", 2, None);
+        let b = taker(&d, &linear).await;
+        let you = crate::crew::By::you();
+        let one = ticket_of(&d, &b, "ENG-1").await;
+        let taken = d
+            .take_ticket(one.ticket.id, &linear, "Atlas", &you)
+            .await
+            .unwrap();
+        assert_eq!(
+            taken.ticket.external.unwrap().assignee,
+            Some(Some(Assignee {
+                id: ME.into(),
+                name: "Sam".into()
+            }))
+        );
+        assert_eq!(
+            linear.calls_of("linear.issue_update"),
+            vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
+        );
+        // Read before and after the write; who the person is asked when the
+        // board checked, and again by Take it.
+        assert_eq!(linear.calls_of("linear.issue_get").len(), 2);
+        assert_eq!(linear.calls_of("linear.viewer").len(), 2);
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            (s.me.as_deref(), s.me_source),
+            (Some(ME), Some(crate::board::MeSource::Vouched))
+        );
+        // Ana took ENG-2 meanwhile: it stays hers, and the card says so.
+        linear.set(2, "unstarted", 3, Some(ANA));
+        let two = ticket_of(&d, &b, "ENG-2").await;
+        refused(
+            d.take_ticket(two.ticket.id, &linear, "Atlas", &you).await,
+            "Ana has ENG-2",
+        );
+        assert_eq!(linear.calls_of("linear.issue_update").len(), 1);
+        assert_eq!(
+            ticket_of(&d, &b, "ENG-2")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .assignee,
+            Some(Some(Assignee {
+                id: ANA.into(),
+                name: "Ana".into()
+            }))
+        );
+    })
+    .await;
+}
+
+/// A shared key, an older hub, an id the person typed, or a hub that now
+/// says someone else: nothing is assigned, and the person is told why.
+#[tokio::test]
+async fn take_it_goes_only_to_whom_the_person_s_own_key_says() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        let you = crate::crew::By::you();
+        // The hub doesn't offer linear.viewer: no one is known, so check
+        // who you are first.
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "Use Check who you are on the board, then take it.",
+        );
+        // An agent's shared key answers as its owner: checking says so, and
+        // Take it still won't.
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.me, None);
+        assert!(s.me_note.unwrap().contains("shared Linear key"));
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "Use Check who you are on the board, then take it.",
+        );
+        // Vouched, then the key becomes a shared one: nothing is assigned,
+        // and the board's answer isn't changed by Take it.
+        d.change_sync(b.id, |s| {
+            s.me = Some(ME.into());
+            s.me_source = Some(crate::board::MeSource::Vouched);
+        })
+        .await
+        .unwrap();
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "Atlas uses a shared Linear key, so it can't say who you are.",
+        );
+        // An older hub that doesn't say whose key it used.
+        *linear.viewer.lock().unwrap() = Some(json!({ "id": ME, "name": "sam" }));
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "can't say who you are",
+        );
+        assert_eq!(
+            d.board_sync(b.id).await.unwrap().unwrap().1.me_source,
+            Some(crate::board::MeSource::Vouched)
+        );
+        // Vouched once, then the hub answers as someone else.
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        let other = "33333333-2222-4333-8444-555555555555";
+        d.change_sync(b.id, |s| {
+            s.me = Some(other.into());
+            s.me_source = Some(crate::board::MeSource::Vouched);
+        })
+        .await
+        .unwrap();
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "now says you are Sam",
+        );
+        // An id the person typed is never assigned to.
+        d.change_sync(b.id, |s| {
+            s.me = Some(ME.into());
+            s.me_source = Some(crate::board::MeSource::Typed);
+        })
+        .await
+        .unwrap();
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &you).await,
+            "You typed your Linear id",
+        );
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+    })
+    .await;
+}
+
+/// An answer that doesn't say who has the issue is never read as no one;
+/// a race lost after the write is said.
+#[tokio::test]
+async fn take_it_needs_a_clear_answer_and_says_a_race_lost() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        linear.set(1, "unstarted", 1, None);
+        linear.set(2, "unstarted", 2, None);
+        let b = taker(&d, &linear).await;
+        let you = crate::crew::By::you();
+        // Someone has ENG-1, but the answer gives no id.
+        linear.set(1, "unstarted", 3, Some("noid"));
+        let one = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        refused(
+            d.take_ticket(one, &linear, "Atlas", &you).await,
+            "can't tell who has ENG-1",
+        );
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+        // Ana's assign lands just before ours.
+        *linear.racer.lock().unwrap() = Some(ANA.into());
+        let two = ticket_of(&d, &b, "ENG-2").await.ticket.id;
+        refused(
+            d.take_ticket(two, &linear, "Atlas", &you).await,
+            "Ana took ENG-2 on Linear just before you",
+        );
+        assert_eq!(
+            ticket_of(&d, &b, "ENG-2")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .assignee
+                .unwrap()
+                .unwrap()
+                .id,
+            ANA
+        );
+    })
+    .await;
+}
+
+/// A Linear listing whose next page is the one it just read ends as an
+/// error, and the listing left part read is dropped.
+#[tokio::test]
+async fn a_linear_page_that_repeats_ends_the_listing() {
+    struct Loop;
+    #[async_trait]
+    impl Remote for Loop {
+        async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+            Ok(vec![])
+        }
+        async fn call(&self, _tool: &str, args: Value) -> Result<Value, RemoteError> {
+            // p1 names itself; p2 and p3 name each other.
+            let next = match args["after"].as_str() {
+                None => "p1",
+                Some("p1") => "p1",
+                Some("p2") => "p3",
+                Some(_) => "p2",
+            };
+            Ok(json!({ "issues": [], "page_info": { "has_next_page": true, "end_cursor": next } }))
+        }
+    }
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, None).await;
+        let pulled = d.pull_board(b.id, &Loop).await.unwrap();
+        assert!(
+            pulled
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("same page twice"),
+            "{pulled:?}"
+        );
+        d.change_sync(b.id, |s| {
+            s.listing = Some(crate::board::Listing {
+                after: "p1".into(),
+                since: None,
+                top: None,
+                started: None,
+                seen: vec![],
+            });
+            s.backoff_until = None;
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &Loop).await.unwrap();
+        assert_eq!(d.board_sync(b.id).await.unwrap().unwrap().1.listing, None);
+        // Two pages that name each other, one pass apart: the second pass
+        // knows the first's pages.
+        d.change_sync(b.id, |s| {
+            s.listing = Some(crate::board::Listing {
+                after: "p2".into(),
+                since: None,
+                top: None,
+                started: None,
+                seen: vec!["p3".into()],
+            });
+            s.backoff_until = None;
+        })
+        .await
+        .unwrap();
+        let pulled = d.pull_board(b.id, &Loop).await.unwrap();
+        assert!(
+            pulled
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("same page twice"),
+            "{pulled:?}"
+        );
+    })
+    .await;
+}
+
+/// A board linked before who has each issue was kept learns it for every
+/// ticket on its first pass, even with nothing changed there.
+#[tokio::test]
+async fn an_older_board_learns_who_has_each_issue_on_its_first_pass() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, None).await;
+        let linear = FakeLinear::default();
+        linear.set(1, "unstarted", 1, Some(ANA));
+        linear.set(2, "unstarted", 2, None);
+        d.pull_board(b.id, &linear).await.unwrap();
+        // As a board from before: no assignee known, swept just now.
+        for t in d.tickets(b.id, &Default::default()).await.unwrap() {
+            let mut t = t.ticket;
+            t.external.as_mut().unwrap().assignee = None;
+            d.save_ticket(&mut t).await.unwrap();
+        }
+        d.change_sync(b.id, |s| {
+            s.assignees_swept = false;
+            s.swept_at = Some(crate::crew::now());
+            s.pulled_at = None;
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &linear).await.unwrap();
+        let who = |key: &str| {
+            let d = d.clone();
+            let key = key.to_string();
+            async move {
+                d.tickets(b.id, &Default::default())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.key.as_deref() == Some(key.as_str()))
+                    .unwrap()
+                    .ticket
+                    .external
+                    .unwrap()
+                    .assignee
+            }
+        };
+        assert_eq!(who("ENG-1").await.flatten().unwrap().id, ANA);
+        assert_eq!(who("ENG-2").await, Some(None));
+        assert!(d.board_sync(b.id).await.unwrap().unwrap().1.assignees_swept);
+    })
+    .await;
+}
+
+/// A link the person said isn't them: Take it refuses without asking the
+/// hub, and leaves their choice and its note as they were.
+#[tokio::test]
+async fn take_it_leaves_a_not_me_link_as_it_was() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(true));
+        linear.set(1, "unstarted", 1, None);
+        let b = whole_team(&d, None).await;
+        d.pull_board(b.id, &linear).await.unwrap();
+        let note = "You said Atlas's answer of who you are on Linear isn't you: check again once it's right.";
+        d.change_sync(b.id, |s| s.me_note = Some(note.into()))
+            .await
+            .unwrap();
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        let r = d
+            .take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+            .await;
+        refused(
+            r,
+            "Desk doesn't know who you are on Linear yet. Use Check who you are on the board, then take it.",
+        );
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_source, s.me_note.as_deref()), (None, None, Some(note)));
+        assert!(linear.calls_of("linear.viewer").is_empty());
+        assert!(linear.calls_of("linear.issue_update").is_empty());
     })
     .await;
 }

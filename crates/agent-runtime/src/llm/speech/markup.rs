@@ -272,8 +272,9 @@ const MAX_CHARS: usize = 48;
 
 impl Markup {
     /// The markup of `provider` (any spelling [`super::canonical_speech_provider`]
-    /// takes) speaking with `model`. Fish without a model is `s1`, the
-    /// hub's and the mobile app's default. A Fish model this table doesn't
+    /// takes) speaking with `model`. Fish without a model is `s1`, what
+    /// a client that names none (the mobile app) speaks with; the hub's own
+    /// speech always names its model ([`super::fish`]). A Fish model this table doesn't
     /// know is [`Markup::Plain`]: stripping a direction it would have
     /// performed costs some expression, keeping one it would read costs the
     /// listener a word in brackets.

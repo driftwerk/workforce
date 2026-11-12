@@ -26,13 +26,18 @@ use tracing::{debug, warn};
 
 use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactDescriptor, ContentType};
-use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID, SYSTEM_USER_ID};
+use workforce_agent::runner::{
+    CURRENT_AGENT_ID, CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID, SYSTEM_USER_ID,
+};
 use workforce_agent::tools::image_gen::GENERATED_IMAGES_KEY;
 use workforce_common::settings::SecretStore;
 
 use crate::adapters::credential_resolver::resolve_vault_refs;
 
+use super::chrome_cell::ChromeCell;
 use super::config::{BrowserSkillConfig, MAX_WAIT_MS};
+use super::hooks::{self, Done, OnPage, Uses};
+use super::untrusted::{self, Seen};
 
 const VAULT_PREFIX: &str = "browser_creds/";
 const MIN_SCREENSHOT_BYTES: usize = 200;
@@ -40,7 +45,7 @@ const SIZE_DELTA_WARN_RATIO: f64 = 0.5;
 
 const RESPAWN_WINDOW_MS: u64 = 60_000;
 const RESPAWN_LIMIT: usize = 3;
-const POLL_BACKOFF_MS: u64 = 100;
+pub(super) const POLL_BACKOFF_MS: u64 = 100;
 /// Consecutive timed-out calls after which a session is torn down. A CDP
 /// connection that has silently died answers nothing, so every call times out;
 /// two in a row is the signal, while a single slow page is not.
@@ -48,13 +53,478 @@ const TIMEOUT_RECYCLE_LIMIT: usize = 2;
 
 /// The polling budget a `browser.wait` call gets: the requested `timeout_ms`,
 /// else the configured call timeout, never more than [`MAX_WAIT_MS`].
-fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
+pub(super) fn wait_budget_ms(requested: Option<u64>, default_ms: u64) -> u64 {
     requested.unwrap_or(default_ms).min(MAX_WAIT_MS)
 }
 
 const DEFAULT_AGENT: &str = "default";
 const PROFILE_ROOT_NAME: &str = "workforce-browser";
 const LEGACY_PROFILE_DIR: &str = "chromiumoxide-runner";
+
+/// Every browser client in this process, so Desk can see and stop them.
+static CLIENTS: std::sync::LazyLock<StdMutex<Vec<std::sync::Weak<BrowserClient>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keeps `client` where [`live`] and [`close`] find it.
+pub(super) fn register(client: &Arc<BrowserClient>) {
+    let mut clients = CLIENTS.lock().unwrap();
+    clients.retain(|c| c.strong_count() > 0);
+    clients.push(Arc::downgrade(client));
+    // The person's Chrome is let go after its idle time, on a clock: no
+    // later call is needed to notice.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let weak = Arc::downgrade(client);
+        let every = Duration::from_millis(client.config.session_idle_ttl_ms.clamp(1_000, 60_000));
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(client) = weak.upgrade() else { return };
+                client.detach_idle().await;
+            }
+        });
+    }
+}
+
+fn clients() -> Vec<Arc<BrowserClient>> {
+    CLIENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect()
+}
+
+/// A browser open now, as Desk's indicator shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Live {
+    pub agent: String,
+    pub user: String,
+    /// The session (its id) its last call came from.
+    pub session: Option<String>,
+    pub url: String,
+    pub host: Option<String>,
+    /// `desk` (Desk's own) or `chrome` (the person's).
+    pub backend: &'static str,
+    /// Seconds since its last call.
+    pub idle_secs: u64,
+}
+
+/// Every browser open now, most recently used first.
+pub async fn live() -> Vec<Live> {
+    let mut out = Vec::new();
+    for client in clients() {
+        let cells: Vec<Arc<SessionCell>> = client.sessions.lock().await.values().cloned().collect();
+        for cell in cells {
+            let open = match cell.inner.try_lock() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            };
+            if !open {
+                continue;
+            }
+            let url = untrusted::state(&cell.key)
+                .map(|s| s.url)
+                .unwrap_or_default();
+            out.push(Live {
+                agent: cell.agent.clone(),
+                user: cell.user.clone(),
+                session: cell.last_session.lock().unwrap().clone(),
+                host: host_of(&url).filter(|_| !url.starts_with("about:")),
+                url,
+                backend: "desk",
+                idle_secs: cell.last_used.lock().unwrap().elapsed().as_secs(),
+            });
+        }
+        let chromes: Vec<Arc<ChromeCell>> = client.chromes.lock().await.values().cloned().collect();
+        for cell in chromes.into_iter().filter(|c| c.attached()) {
+            let url = untrusted::state(&cell.key)
+                .map(|s| s.url)
+                .unwrap_or_default();
+            out.push(Live {
+                agent: cell.agent.clone(),
+                user: cell.user.clone(),
+                session: cell.last_session.lock().unwrap().clone(),
+                host: host_of(&url).filter(|_| !url.starts_with("about:")),
+                url,
+                backend: "chrome",
+                idle_secs: cell.last_used.lock().unwrap().elapsed().as_secs(),
+            });
+        }
+    }
+    out.sort_by_key(|l| l.idle_secs);
+    out
+}
+
+/// Which browsers [`close`] closes.
+#[derive(Debug, Clone, Copy)]
+pub enum Which<'a> {
+    All,
+    Agent(&'a str),
+    /// Those whose last call came from this session (its id).
+    Session(&'a str),
+}
+
+/// Closes the browsers `which` names now, a call in flight included, and
+/// forgets what they read. How many were open.
+pub async fn close(which: Which<'_>) -> usize {
+    let mut closed = 0;
+    for client in clients() {
+        let taken: Vec<Arc<SessionCell>> = {
+            let mut sessions = client.sessions.lock().await;
+            let ids: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, cell)| match which {
+                    Which::All => true,
+                    Which::Agent(agent) => cell.agent == agent,
+                    Which::Session(session) => {
+                        cell.last_session.lock().unwrap().as_deref() == Some(session)
+                    }
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| sessions.remove(id)).collect()
+        };
+        for cell in taken {
+            if cell.inner.lock().await.take().is_some() {
+                closed += 1;
+            }
+            // The person stopped it: a hostile page it read holds it back
+            // no longer. Nothing else lifts that.
+            untrusted::calm(&cell.key);
+            untrusted::forget(&cell.key);
+        }
+        closed += detach(&client, which, true).await;
+    }
+    closed
+}
+
+/// Lets go of the person's Chrome where `which` names it: Desk's tab there
+/// closes, nothing else of theirs is touched.
+async fn detach(client: &BrowserClient, which: Which<'_>, stopped: bool) -> usize {
+    let taken: Vec<Arc<ChromeCell>> = {
+        let mut chromes = client.chromes.lock().await;
+        let ids: Vec<SessionId> = chromes
+            .iter()
+            .filter(|(_, cell)| match which {
+                Which::All => true,
+                Which::Agent(agent) => cell.agent == agent,
+                Which::Session(session) => {
+                    cell.last_session.lock().unwrap().as_deref() == Some(session)
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.iter().filter_map(|id| chromes.remove(id)).collect()
+    };
+    let mut n = 0;
+    for cell in taken {
+        // The person stopped it: a hostile page it read holds it back no
+        // longer. A turn's end alone lifts nothing.
+        if stopped {
+            untrusted::calm(&cell.key);
+        }
+        if cell.detach().await {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Closes every browser of one kind now: the person turned it off.
+pub async fn close_backend(backend: Backend) -> usize {
+    let mut n = 0;
+    for client in clients() {
+        n += match backend {
+            Backend::Chrome => detach(&client, Which::All, true).await,
+            Backend::Desk => {
+                let taken: Vec<Arc<SessionCell>> = client
+                    .sessions
+                    .lock()
+                    .await
+                    .drain()
+                    .map(|(_, c)| c)
+                    .collect();
+                let mut closed = 0;
+                for cell in taken {
+                    if cell.inner.lock().await.take().is_some() {
+                        closed += 1;
+                    }
+                    untrusted::forget(&cell.key);
+                }
+                closed
+            }
+        };
+    }
+    n
+}
+
+/// At the end of a turn: lets go of the person's Chrome the turn's session
+/// (its id) was using. Desk's own browser stays open for the next.
+pub async fn turn_ended(session: &str) -> usize {
+    let mut n = 0;
+    for client in clients() {
+        n += detach(&client, Which::Session(session), false).await;
+    }
+    n
+}
+
+/// Closes the browsers whose last call came from session `id` now, and
+/// says, for each, its agent and the conversation's key (what its
+/// allowances are kept under).
+pub async fn stop_session(id: &str) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    for client in clients() {
+        let sessions = client.sessions.lock().await;
+        for cell in sessions.values() {
+            if cell.last_session.lock().unwrap().as_deref() == Some(id) {
+                if let Some(key) = cell.last_key.lock().unwrap().clone() {
+                    keys.push((cell.agent.clone(), key));
+                }
+            }
+        }
+        let chromes = client.chromes.lock().await;
+        for cell in chromes.values() {
+            if cell.last_session.lock().unwrap().as_deref() == Some(id) {
+                if let Some(key) = cell.last_key.lock().unwrap().clone() {
+                    keys.push((cell.agent.clone(), key));
+                }
+            }
+        }
+    }
+    close(Which::Session(id)).await;
+    keys
+}
+
+/// What a call was decided for, carried from the gate's decision to the
+/// call: the origin it acts on, or the file it opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Decided {
+    /// Acts on this origin (`None`: a page with none), or not at all.
+    Origin(Option<String>),
+    /// Opens this file (real path), which the person allowed for this call.
+    File(PathBuf),
+    /// Opens this origin in the person's Chrome, which the person allowed
+    /// for this call (`None`: a page with none).
+    Visit(Option<String>),
+}
+
+/// What each call was decided for, by the identity making it and the
+/// call itself ([`call_key`]): taken by that call alone.
+static EXPECTED: std::sync::LazyLock<StdMutex<HashMap<(SessionId, String), Decided>>> =
+    std::sync::LazyLock::new(Default::default);
+
+tokio::task_local! {
+    /// The call being made ([`call_key`]), for the length of its tool's run.
+    pub(super) static CALL_KEY: Call;
+}
+
+/// The call being made: its key, and whether it changes the page.
+#[derive(Debug, Clone)]
+pub(super) struct Call {
+    pub(super) key: String,
+    pub(super) write: bool,
+}
+
+/// The fields of a call's input that name what it acts on: the gate and
+/// the call read them alike. What is typed (`value`, `text`) is left out,
+/// since a credential may be put in for it between the two.
+const KEYED: &[&str] = &[
+    "url",
+    "selector",
+    "key",
+    "expression",
+    "artifact_id",
+    "filename",
+    "format",
+    "browser",
+    "timeout_ms",
+];
+
+/// Which call this is, as both the gate's decision and the call itself
+/// name it: the tool and its input, less what a credential may be put in
+/// for between the two (`value`, `text`).
+pub(super) fn call_key(tool: &str, input: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(tool.as_bytes());
+    for field in KEYED {
+        hasher.update([0x1f]);
+        hasher.update(field.as_bytes());
+        hasher.update([0x1e]);
+        match &input[field] {
+            Value::Null => {}
+            Value::String(v) => hasher.update(v.as_bytes()),
+            other => hasher.update(other.to_string().as_bytes()),
+        }
+    }
+    lower_hex(&hasher.finalize())
+}
+
+/// Notes what the call `key`, about to be made by the identity in scope in
+/// `backend`, was decided for; `None` clears it.
+pub(super) fn expect(backend: Backend, key: &str, decided: Option<Decided>) {
+    let mut expected = EXPECTED.lock().unwrap();
+    let at = (backend_id(backend), key.to_string());
+    match decided {
+        Some(d) => expected.insert(at, d),
+        None => expected.remove(&at),
+    };
+}
+
+/// Where Desk's gate decides every browser call, a write it decided nothing
+/// for isn't made: the page or the call changed since.
+pub(super) fn undecided_write(decided: &Option<Decided>) -> Result<()> {
+    let gated = hooks::hooks().is_some_and(|h| h.gate_decides());
+    let write = CALL_KEY.try_with(|c| c.write).unwrap_or(false);
+    match (gated, write, decided) {
+        (true, true, None) => Err(eyre!(
+            "The page or the call changed since this was decided, so nothing was done. Call again."
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Takes what the call in scope, in `backend`, was decided for, if it was.
+pub(super) fn take_decided(backend: Backend) -> Option<Decided> {
+    let key = CALL_KEY.try_with(|c| c.key.clone()).ok()?;
+    EXPECTED.lock().unwrap().remove(&(backend_id(backend), key))
+}
+
+/// Forgets what `agent`'s call of `tool` with `input` for `user` was
+/// decided for: it was refused or declined, so it never comes.
+pub fn forget_decision(agent: &str, user: &str, tool: &str, input: &Value) {
+    let key = call_key(tool, input);
+    let mut expected = EXPECTED.lock().unwrap();
+    expected.remove(&(SessionId::derive(agent, user), key.clone()));
+    expected.remove(&(chrome_id(agent, user), key));
+}
+
+fn backend_id(backend: Backend) -> SessionId {
+    let (agent, user) = current_identity();
+    match backend {
+        Backend::Desk => SessionId::derive(&agent, &user),
+        Backend::Chrome => chrome_id(&agent, &user),
+    }
+}
+
+/// The origin the identity in scope's page in `backend` was last seen on.
+pub(super) fn origin_now(backend: Backend) -> Option<String> {
+    let url = untrusted::state(&backend_id(backend).0)?.url;
+    super::address::origin_of(&url)
+}
+
+/// What the browser session of `agent` for `user` has read, if it has a
+/// page: the hub's gate reads it.
+pub fn page_state(agent: &str, user: &str) -> Option<untrusted::PageState> {
+    let desk = untrusted::state(&SessionId::derive(agent, user).0);
+    let chrome = untrusted::state(&chrome_id(agent, user).0);
+    let on_chrome = STICKY
+        .lock()
+        .unwrap()
+        .get(&SessionId::derive(agent, user))
+        .copied()
+        == Some(Backend::Chrome);
+    let hostile =
+        desk.as_ref().is_some_and(|s| s.hostile) || chrome.as_ref().is_some_and(|s| s.hostile);
+    let mut now = if on_chrome {
+        chrome.or(desk)
+    } else {
+        desk.or(chrome)
+    }?;
+    now.hostile = hostile;
+    Some(now)
+}
+
+/// Which browser a call works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Desk's own browser.
+    Desk,
+    /// The person's Chrome.
+    Chrome,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Desk => "desk",
+            Self::Chrome => "chrome",
+        }
+    }
+}
+
+/// The browser each `(agent, user)` worked in last, so a call that names
+/// none carries on where the last one was.
+static STICKY: std::sync::LazyLock<StdMutex<HashMap<SessionId, Backend>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The key of `(agent, user)`'s tab in the person's Chrome.
+fn chrome_id(agent: &str, user: &str) -> SessionId {
+    SessionId::derive(agent, &format!("{user}\u{1f}chrome"))
+}
+
+/// Which browser a call works in: the one it names (`browser`), where the
+/// person's settings allow it; else the last one used; else the person's
+/// Chrome for an unbound overseer when both are on, and Desk's own for
+/// everyone else.
+pub(super) fn pick(requested: Option<&str>, peek: bool) -> Result<Backend> {
+    let settings = hooks::settings();
+    let id = current_session_id();
+    let (agent, _) = current_identity();
+    let allowed = |b: Backend| {
+        matches!(
+            (settings.uses, b),
+            (Uses::Both, _) | (Uses::Desk, Backend::Desk) | (Uses::Chrome, Backend::Chrome)
+        )
+    };
+    let chosen = match requested.map(str::trim).filter(|r| !r.is_empty()) {
+        _ if settings.uses == Uses::Off => {
+            return Err(eyre!(
+                "The browser is off on this Desk. The person can turn it on in Settings → Browser."
+            ))
+        }
+        Some("desk") if allowed(Backend::Desk) => Backend::Desk,
+        Some("chrome") if allowed(Backend::Chrome) => Backend::Chrome,
+        Some("desk") => {
+            return Err(eyre!(
+                "Desk uses only the person's Chrome (Settings → Browser)."
+            ))
+        }
+        Some("chrome") => {
+            return Err(eyre!(
+            "Desk doesn't use the person's Chrome (Settings → Browser); use Desk's own browser."
+        ))
+        }
+        Some(other) => return Err(eyre!("`browser` is `desk` or `chrome`, not `{other}`")),
+        None => match STICKY
+            .lock()
+            .unwrap()
+            .get(&id)
+            .copied()
+            .filter(|b| allowed(*b))
+        {
+            Some(last) => last,
+            None => match settings.uses {
+                Uses::Chrome => Backend::Chrome,
+                Uses::Both if hooks::hooks().is_some_and(|h| h.unbound(&agent)) => Backend::Chrome,
+                _ => Backend::Desk,
+            },
+        },
+    };
+    if !peek {
+        STICKY.lock().unwrap().insert(id, chosen);
+    }
+    Ok(chosen)
+}
+
+/// The browser the identity in scope works in now, without choosing.
+fn current_backend() -> Backend {
+    STICKY
+        .lock()
+        .unwrap()
+        .get(&current_session_id())
+        .copied()
+        .unwrap_or(Backend::Desk)
+}
 
 /// Stable, filesystem-safe handle for one `(agent, user)` browser session. The
 /// digest both keys the in-memory cell registry and names the on-disk Chromium
@@ -87,6 +557,12 @@ fn lower_hex(bytes: &[u8]) -> String {
 /// real users always carry a uid) and to a fixed agent segment outside an agent
 /// context (legacy construction, tests).
 fn current_session_id() -> SessionId {
+    let (agent, user) = current_identity();
+    SessionId::derive(&agent, &user)
+}
+
+/// The `(agent, user)` in scope, with the same fallbacks.
+fn current_identity() -> (String, String) {
     let agent = CURRENT_AGENT_ID
         .try_with(|a| a.clone())
         .ok()
@@ -97,7 +573,7 @@ fn current_session_id() -> SessionId {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| SYSTEM_USER_ID.to_string());
-    SessionId::derive(&agent, &user)
+    (agent, user)
 }
 
 /// Snapshot of a cell taken under the registry lock, fed to the pure eviction
@@ -175,6 +651,8 @@ struct Active {
     page: Page,
     _browser: Browser,
     _handler_task: JoinHandle<()>,
+    _dialog_task: JoinHandle<()>,
+    _file_task: JoinHandle<()>,
     _network_task: JoinHandle<()>,
     _console_log_task: JoinHandle<()>,
     _console_api_task: JoinHandle<()>,
@@ -188,6 +666,18 @@ struct Active {
 /// Chromium lifecycle bound to an isolated on-disk `profile_dir`.
 struct SessionCell {
     config: Arc<BrowserSkillConfig>,
+    /// Its [`SessionId`], which keys what it has read ([`untrusted`]).
+    key: String,
+    agent: String,
+    user: String,
+    /// The session (id) its last call came from, for a Stop there.
+    last_session: StdMutex<Option<String>>,
+    /// That conversation's key, which its allowances are kept under.
+    last_key: Arc<StdMutex<Option<String>>>,
+    /// The file a call the person allowed opened, and the one such a call
+    /// is opening now: each may show (and load) without the gate allowing it
+    /// again, and only while the page is on it.
+    files: Arc<StdMutex<FileAllowance>>,
     profile_dir: PathBuf,
     inner: Mutex<Option<Active>>,
     respawn: Mutex<RespawnBudget>,
@@ -196,10 +686,27 @@ struct SessionCell {
     consecutive_timeouts: AtomicUsize,
 }
 
+impl Drop for SessionCell {
+    fn drop(&mut self) {
+        untrusted::forget(&self.key);
+    }
+}
+
 impl SessionCell {
-    fn new(config: Arc<BrowserSkillConfig>, profile_dir: PathBuf, now: Instant) -> Self {
+    fn new(
+        config: Arc<BrowserSkillConfig>,
+        (key, agent, user): (String, String, String),
+        profile_dir: PathBuf,
+        now: Instant,
+    ) -> Self {
         Self {
             config,
+            key,
+            agent,
+            user,
+            last_session: StdMutex::new(None),
+            last_key: Arc::new(StdMutex::new(None)),
+            files: Arc::new(StdMutex::new(FileAllowance::default())),
             profile_dir,
             inner: Mutex::new(None),
             respawn: Mutex::new(RespawnBudget::new(RESPAWN_WINDOW_MS, RESPAWN_LIMIT)),
@@ -224,6 +731,225 @@ impl SessionCell {
 
     fn touch(&self, now: Instant) {
         *self.last_used.lock().unwrap() = now;
+        let local = |k: &'static tokio::task::LocalKey<String>| {
+            k.try_with(|v| v.clone()).ok().filter(|v| !v.is_empty())
+        };
+        if let Some(id) = local(&CURRENT_SESSION_ID) {
+            *self.last_session.lock().unwrap() = Some(id);
+        }
+        if let Some(key) = local(&CURRENT_SESSION_KEY) {
+            *self.last_key.lock().unwrap() = Some(key);
+        }
+    }
+
+    /// Whose turn the cell's file checks are made as.
+    fn scope(&self) -> Scope {
+        self.scope_cell()
+    }
+
+    fn scope_cell(&self) -> Scope {
+        Scope {
+            user: self.user.clone(),
+            key: Arc::clone(&self.last_key),
+        }
+    }
+
+    /// Keeps the page to what may be open, before and after every call: a
+    /// file page only while the agent may read that file, never another
+    /// kind of page (a script, the browser's own) — any such is blanked.
+    /// And a call decided for one origin acts there or not at all.
+    async fn keep_page(&self, page: &Page, decided: Option<Decided>) -> Result<()> {
+        use super::address::{kind, openable, In, Kind};
+        let url = self.current_url(page).await;
+        let refused = match kind(&url) {
+            Kind::File(path) => {
+                let real = workforce_agent::tools::paths::resolve_real(&path);
+                self.files.lock().unwrap().keep_only(Some(&real));
+                file_refusal(&self.agent, &self.files, &real, &self.scope())
+            }
+            k if openable(&k, In::Desk) => {
+                // Off the file: what was allowed for it is gone.
+                self.files.lock().unwrap().keep_only(None);
+                None
+            }
+            Kind::Other(what) => Some(format!(
+                "The page went to {what}, which the browser doesn't open."
+            )),
+            _ => None,
+        };
+        if let Some(why) = refused {
+            blank(page).await;
+            untrusted::on(&self.key, "about:blank");
+            return Err(eyre!("{why} The page is blank now."));
+        }
+        if let Some(Decided::Origin(decided)) = decided {
+            if super::address::origin_of(&url) != decided {
+                return Err(eyre!(
+                    "The page moved since this was decided, so nothing was done. Call again."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Where `selector` (the focused element where none) is, and what the
+    /// page shows of it, read in a world of Desk's own that the page's
+    /// scripts can't reach, and whether the point Desk would press is that
+    /// element and not something laid over it.
+    async fn probe(
+        &self,
+        page: &Page,
+        selector: Option<&str>,
+        form: bool,
+        press: bool,
+    ) -> Result<Probe> {
+        use chromiumoxide::cdp::browser_protocol::dom::{
+            GetBoxModelParams, ScrollIntoViewIfNeededParams,
+        };
+        use chromiumoxide::cdp::browser_protocol::page::CreateIsolatedWorldParams;
+        use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+        let frame = page
+            .mainframe()
+            .await?
+            .ok_or_else(|| eyre!("the page has no frame"))?;
+        let world = page
+            .execute(
+                CreateIsolatedWorldParams::builder()
+                    .frame_id(frame)
+                    .world_name("desk-browser")
+                    .build()
+                    .map_err(|e| eyre!("{e}"))?,
+            )
+            .await?;
+        let context = world.result.execution_context_id;
+        let read = |expression: String| {
+            EvaluateParams::builder()
+                .expression(expression)
+                .context_id(context)
+                .return_by_value(true)
+                .build()
+                .map_err(|e| eyre!("{e}"))
+        };
+        let shown = page
+            .execute(read(shown_expression(selector, form))?)
+            .await?
+            .result
+            .result
+            .value
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let Some(sel) = selector.filter(|_| press) else {
+            return Ok(Probe { at: None, shown });
+        };
+        let element = page
+            .find_element(sel)
+            .await
+            .wrap_err_with(|| format!("element not found for selector `{sel}`"))?;
+        let _ = page
+            .execute(
+                ScrollIntoViewIfNeededParams::builder()
+                    .backend_node_id(element.backend_node_id)
+                    .build(),
+            )
+            .await;
+        let model = page
+            .execute(
+                GetBoxModelParams::builder()
+                    .backend_node_id(element.backend_node_id)
+                    .build(),
+            )
+            .await
+            .wrap_err("the element has no box on the page")?;
+        let quad = model.result.model.content.inner();
+        let (x, y) = (
+            quad.iter().step_by(2).sum::<f64>() / 4.0,
+            quad.iter().skip(1).step_by(2).sum::<f64>() / 4.0,
+        );
+        let sel_js = serde_json::to_string(sel)?;
+        let hit = page
+            .execute(read(format!(
+                "(() => {{ const el = document.querySelector({sel_js}); \
+                   const at = document.elementFromPoint({x}, {y}); \
+                   return !!el && !!at && (el === at || el.contains(at)); }})()"
+            ))?)
+            .await?
+            .result
+            .result
+            .value;
+        if hit != Some(Value::Bool(true)) {
+            return Err(eyre!(
+                "Something on the page covers `{sel}`, so nothing was pressed."
+            ));
+        }
+        Ok(Probe {
+            at: Some((x, y)),
+            shown,
+        })
+    }
+
+    /// Refuses what `tool` would do on the element `selector` names (the
+    /// focused one where none) when the hub says it is the person's: paying,
+    /// signing in or out, a credential's file. `form`: what submits its form
+    /// is read by the form's action too.
+    async fn hold(
+        &self,
+        page: &Page,
+        tool: &str,
+        target: Option<&str>,
+        selector: Option<&str>,
+        form: bool,
+        files: &[&str],
+    ) -> Result<Probe> {
+        let probe = self
+            .probe(page, selector, form, tool == "browser.click")
+            .await?;
+        let Some(hooks) = hooks::hooks() else {
+            return Ok(probe);
+        };
+        if hooks.unbound(&self.agent) {
+            return Ok(probe);
+        }
+        let what = OnPage {
+            tool: tool.to_string(),
+            url: self.current_url(page).await,
+            target: target.map(str::to_string),
+            shown: probe.shown.clone(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        };
+        match hooks.holds(&self.agent, &what) {
+            Some(why) => Err(eyre!("{why}")),
+            None => Ok(probe),
+        }
+    }
+
+    /// Records what `tool` did, with the page as it looks now; never a
+    /// picture of what was just typed (a credential, perhaps).
+    async fn done(&self, page: &Page, tool: &str, target: Option<&str>) {
+        let Some(hooks) = hooks::hooks() else {
+            return;
+        };
+        let url = self.current_url(page).await;
+        let typed = matches!(tool, "browser.fill" | "browser.type");
+        let screenshot = match typed {
+            true => None,
+            false => timeout(
+                Duration::from_secs(10),
+                page.screenshot(ScreenshotParams::default()),
+            )
+            .await
+            .ok()
+            .and_then(|s| s.ok()),
+        };
+        hooks.record(Done {
+            agent: self.agent.clone(),
+            user: self.user.clone(),
+            session: self.last_session.lock().unwrap().clone(),
+            tool: tool.to_string(),
+            backend: "desk",
+            url,
+            target: target.map(str::to_string),
+            screenshot,
+        });
     }
 
     fn call_timeout(&self) -> Duration {
@@ -253,7 +979,9 @@ impl SessionCell {
 
     async fn start(&self) -> Result<Active> {
         ensure_profile_dir(&self.profile_dir)?;
-        let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir).await?;
+        // On screen as the person's settings say, else as configured.
+        let show = hooks::settings().show.unwrap_or(self.config.show);
+        let (browser, mut handler) = launch_chromium(&self.config, &self.profile_dir, show).await?;
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -281,6 +1009,18 @@ impl SessionCell {
             self.config.console_log_capacity,
         )));
 
+        // Nothing a page offers is saved to this computer.
+        {
+            use chromiumoxide::cdp::browser_protocol::browser::{
+                SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
+            };
+            browser
+                .execute(SetDownloadBehaviorParams::new(
+                    SetDownloadBehaviorBehavior::Deny,
+                ))
+                .await
+                .wrap_err("couldn't turn the browser's downloads off")?;
+        }
         let network_task =
             spawn_network_listener(&page, network_log.clone(), self.config.network_log_capacity)
                 .await?;
@@ -288,10 +1028,22 @@ impl SessionCell {
             spawn_console_listeners(&page, console_log.clone(), self.config.console_log_capacity)
                 .await?;
 
+        let dialog_task =
+            spawn_dialog_dismisser(&page, console_log.clone(), self.config.console_log_capacity)
+                .await?;
+        let file_task = spawn_file_keeper(
+            &page,
+            self.agent.clone(),
+            Arc::clone(&self.files),
+            self.scope_cell(),
+        )
+        .await?;
         Ok(Active {
             page,
             _browser: browser,
             _handler_task: handler_task,
+            _dialog_task: dialog_task,
+            _file_task: file_task,
             _network_task: network_task,
             _console_log_task: console_log_task,
             _console_api_task: console_api_task,
@@ -322,9 +1074,24 @@ impl SessionCell {
             )
         };
         let _serial = call_lock.lock().await;
-        match timeout(timeout_dur, op(page, network_log, console_log)).await {
+        let decided = take_decided(Backend::Desk);
+        undecided_write(&decided)?;
+        self.keep_page(&page, decided.clone()).await?;
+        // The file the person allowed this very call to open may load
+        // while it opens it, and no longer unless it did.
+        let opening = match decided {
+            Some(Decided::File(path)) => Some(path),
+            _ => None,
+        };
+        self.files.lock().unwrap().pending = opening;
+        // Cleared however the call ends: done, failed, cancelled or panicked.
+        let _pending = PendingFile(&self.files);
+        let after = page.clone();
+        let ran = timeout(timeout_dur, op(page, network_log, console_log)).await;
+        match ran {
             Ok(Ok(v)) => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                self.keep_page(&after, None).await?;
                 Ok(v)
             }
             Ok(Err(e)) => {
@@ -362,16 +1129,33 @@ impl SessionCell {
             page.goto(url.as_str())
                 .await
                 .wrap_err("navigation failed")?;
+            // Opened, by this call the person allowed, exactly the file it
+            // was allowed to: it may stay.
+            let landed = page.url().await.ok().flatten();
+            let by = CURRENT_SESSION_KEY.try_with(Clone::clone).ok();
+            self.files.lock().unwrap().opened_now(landed.as_deref(), by);
             let title = page
                 .evaluate("document.title")
                 .await
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok())
                 .unwrap_or_default();
-            let final_url = page.url().await.ok().flatten().unwrap_or(url);
-            Ok(json!({ "url": final_url, "title": title }))
+            let final_url = page.url().await.ok().flatten().unwrap_or(url.clone());
+            untrusted::on(&self.key, &final_url);
+            self.done(&page, "browser.navigate", Some(&url)).await;
+            let mut seen = Seen::at(&final_url);
+            // The address is the page's to choose too (its path, its query).
+            let (shown_url, title) = (seen.text(&final_url), seen.text(&title));
+            Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
         })
         .await
+    }
+
+    /// The page's address as the browser has it now, noted for the gate.
+    async fn current_url(&self, page: &Page) -> String {
+        let url = page.url().await.ok().flatten().unwrap_or_default();
+        untrusted::on(&self.key, &url);
+        url
     }
 
     async fn snapshot(&self) -> Result<Value> {
@@ -388,8 +1172,14 @@ impl SessionCell {
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok())
                 .unwrap_or_default();
-            let url = page.url().await.ok().flatten().unwrap_or_default();
-            Ok(json!({ "url": url, "title": title, "body_text": body_text }))
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let (url, title, body_text) =
+                (seen.text(&url), seen.text(&title), seen.text(&body_text));
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "url": url, "title": title, "body_text": body_text }),
+            ))
         })
         .await
     }
@@ -455,7 +1245,23 @@ impl SessionCell {
                 .find_element(selector.as_str())
                 .await
                 .wrap_err_with(|| format!("element not found for selector `{selector}`"))?;
-            element.click().await.wrap_err("click failed")?;
+            let probe = self
+                .hold(
+                    &page,
+                    "browser.click",
+                    Some(&selector),
+                    Some(&selector),
+                    true,
+                    &[],
+                )
+                .await?;
+            match probe.at {
+                Some((x, y)) => press_at(&page, x, y).await?,
+                None => {
+                    element.click().await.wrap_err("click failed")?;
+                }
+            }
+            self.done(&page, "browser.click", Some(&selector)).await;
             Ok(json!({ "clicked": selector }))
         })
         .await
@@ -465,12 +1271,15 @@ impl SessionCell {
         let key = key.to_string();
         let selector = selector.map(str::to_string);
         self.with_page(|page, _n, _c| async move {
+            self.hold(&page, "browser.press_key", Some(&key), selector.as_deref(), true, &[])
+                .await?;
             match selector {
                 Some(sel) => {
                     let element = page
                         .find_element(sel.as_str())
                         .await
                         .wrap_err_with(|| format!("element not found for selector `{sel}`"))?;
+                    focus_on(&page, &element, &sel).await?;
                     element
                         .press_key(key.as_str())
                         .await
@@ -487,6 +1296,7 @@ impl SessionCell {
                     .wrap_err("press_key (no selector) failed")?;
                 }
             }
+            self.done(&page, "browser.press_key", Some(&key)).await;
             Ok(json!({ "pressed": key }))
         })
         .await
@@ -494,7 +1304,17 @@ impl SessionCell {
 
     async fn select_option(&self, selector: &str, value: &str) -> Result<Value> {
         let expr = select_option_expression(selector, value);
+        let selector = selector.to_string();
         self.with_page(|page, _n, _c| async move {
+            self.hold(
+                &page,
+                "browser.select_option",
+                Some(&selector),
+                Some(&selector),
+                false,
+                &[],
+            )
+            .await?;
             let ok = page
                 .evaluate(expr)
                 .await
@@ -504,6 +1324,8 @@ impl SessionCell {
             if !ok {
                 return Err(eyre!("element or option not found"));
             }
+            self.done(&page, "browser.select_option", Some(&selector))
+                .await;
             Ok(json!({ "selected": true }))
         })
         .await
@@ -512,12 +1334,23 @@ impl SessionCell {
     async fn evaluate(&self, expression: &str) -> Result<Value> {
         let expression = expression.to_string();
         self.with_page(|page, _n, _c| async move {
-            let result = page
-                .evaluate(expression.as_str())
-                .await
-                .wrap_err("evaluate failed")?;
+            // What a page's script throws is the page's words: fenced.
+            let result = match page.evaluate(expression.as_str()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let url = self.current_url(&page).await;
+                    let mut seen = Seen::at(&url);
+                    let thrown = seen.text(&e.to_string());
+                    seen.keep(&self.key);
+                    return Err(eyre!("evaluate failed: {thrown}"));
+                }
+            };
             let value = result.into_value::<Value>().unwrap_or(Value::Null);
-            Ok(json!({ "result": value }))
+            self.done(&page, "browser.evaluate", None).await;
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let value = seen.value(value);
+            Ok(seen.into_output(&self.key, json!({ "result": value })))
         })
         .await
     }
@@ -558,25 +1391,37 @@ impl SessionCell {
                 .into_value::<String>()
                 .unwrap_or_default();
             let len = content.len();
-            Ok(json!({ "format": format, "content": content, "size_bytes": len }))
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let content = seen.text(&content);
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "format": format, "content": content, "size_bytes": len }),
+            ))
         })
         .await
     }
 
     async fn network_requests(&self) -> Result<Value> {
-        self.with_page(|_p, network_log, _c| async move {
-            let log = network_log.lock().await;
-            let entries: Vec<Value> = log.iter().cloned().collect();
-            Ok(json!({ "count": entries.len(), "requests": entries }))
+        self.with_page(|page, network_log, _c| async move {
+            let entries: Vec<Value> = network_log.lock().await.iter().cloned().collect();
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let count = entries.len();
+            let requests = seen.value(Value::Array(entries));
+            Ok(seen.into_output(&self.key, json!({ "count": count, "requests": requests })))
         })
         .await
     }
 
     async fn console_messages(&self) -> Result<Value> {
-        self.with_page(|_p, _n, console_log| async move {
-            let log = console_log.lock().await;
-            let entries: Vec<Value> = log.iter().cloned().collect();
-            Ok(json!({ "count": entries.len(), "messages": entries }))
+        self.with_page(|page, _n, console_log| async move {
+            let entries: Vec<Value> = console_log.lock().await.iter().cloned().collect();
+            let url = self.current_url(&page).await;
+            let mut seen = Seen::at(&url);
+            let count = entries.len();
+            let messages = seen.value(Value::Array(entries));
+            Ok(seen.into_output(&self.key, json!({ "count": count, "messages": messages })))
         })
         .await
     }
@@ -591,6 +1436,10 @@ pub struct BrowserClient {
     config: Arc<BrowserSkillConfig>,
     profile_root: PathBuf,
     sessions: Mutex<HashMap<SessionId, Arc<SessionCell>>>,
+    /// Each identity's tab in the person's Chrome.
+    chromes: Mutex<HashMap<SessionId, Arc<ChromeCell>>>,
+    /// Where the person's Chrome writes `DevToolsActivePort`.
+    chrome_dir: Option<PathBuf>,
     last_reap: StdMutex<Instant>,
     store: Option<Arc<dyn SecretStore>>,
 }
@@ -614,10 +1463,18 @@ impl BrowserClient {
         let last_reap = now
             .checked_sub(Duration::from_millis(config.reap_interval_ms))
             .unwrap_or(now);
+        let chrome_dir = config
+            .chrome_user_data_dir
+            .clone()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(super::chrome::default_user_data_dir);
         Self {
             config: Arc::new(config),
             profile_root,
             sessions: Mutex::new(HashMap::new()),
+            chromes: Mutex::new(HashMap::new()),
+            chrome_dir,
             last_reap: StdMutex::new(last_reap),
             store,
         }
@@ -691,8 +1548,10 @@ impl BrowserClient {
             let cell = sessions
                 .entry(target.clone())
                 .or_insert_with(|| {
+                    let (agent, user) = current_identity();
                     Arc::new(SessionCell::new(
                         self.config.clone(),
+                        (target.0.clone(), agent, user),
                         self.profile_root.join(&target.0),
                         now,
                     ))
@@ -703,7 +1562,8 @@ impl BrowserClient {
             let live_dirs: HashSet<PathBuf> =
                 sessions.values().map(|c| c.profile_dir.clone()).collect();
 
-            let reap = {
+            // Kept profiles (Desk's, signed in by hand) are never reaped.
+            let reap = !self.config.keep_profiles && {
                 let mut last = self.last_reap.lock().unwrap();
                 let due = should_reap(
                     *last,
@@ -732,31 +1592,106 @@ impl BrowserClient {
         tokio::task::spawn_blocking(move || reap_blocking(&root, &live_dirs, retention));
     }
 
+    /// The tab in the person's Chrome for the identity in scope, made if
+    /// needed (it attaches on its first call).
+    async fn chrome(&self) -> Result<Arc<ChromeCell>> {
+        let dir = self.chrome_dir.clone().ok_or_else(|| {
+            eyre!("Desk can't find where Chrome keeps its data on this computer.")
+        })?;
+        let (agent, user) = current_identity();
+        let id = chrome_id(&agent, &user);
+        let mut chromes = self.chromes.lock().await;
+        let cell = chromes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(ChromeCell::new(
+                    self.config.clone(),
+                    (id.0.clone(), agent, user),
+                    dir,
+                ))
+            })
+            .clone();
+        Ok(cell)
+    }
+
+    /// Lets go of the person's Chrome where it has been idle its idle time.
+    pub(super) async fn detach_idle(&self) -> usize {
+        let idle = Duration::from_millis(self.config.session_idle_ttl_ms);
+        let cells: Vec<Arc<ChromeCell>> = self.chromes.lock().await.values().cloned().collect();
+        let mut n = 0;
+        for cell in cells {
+            let quiet = cell.last_used.lock().unwrap().elapsed() >= idle;
+            if quiet && cell.attached() && cell.detach().await {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn on_chrome(&self) -> bool {
+        current_backend() == Backend::Chrome
+    }
+
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.navigate(url).await;
+        }
         self.acquire().await?.navigate(url).await
     }
 
     pub(super) async fn snapshot(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.snapshot().await;
+        }
         self.acquire().await?.snapshot().await
     }
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.screenshot().await;
+        }
         self.acquire().await?.screenshot().await
     }
 
     pub(super) async fn pdf(&self, filename: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return Err(eyre!(
+                "The person's Chrome can't render a PDF for Desk; use Desk's own browser (`browser: \"desk\"`)."
+            ));
+        }
         self.acquire().await?.pdf(filename).await
     }
 
     pub(super) async fn click(&self, selector: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.click(selector).await;
+        }
         self.acquire().await?.click(selector).await
     }
 
     pub(super) async fn fill(&self, selector: &str, value: &str) -> Result<Value> {
+        if self.on_chrome() {
+            let cell = self.chrome().await?;
+            return cell
+                .fill(selector, value, |raw, host| {
+                    self.resolve_credential(raw, host)
+                })
+                .await;
+        }
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let value = value.to_string();
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.fill",
+                Some(&selector),
+                Some(&selector),
+                false,
+                &[],
+            )
+            .await?;
             // Resolve the credential against the page we're about to fill, so the
             // egress allowlist is checked against the real destination host.
             let host = page.url().await.ok().flatten().and_then(|u| host_of(&u));
@@ -771,37 +1706,63 @@ impl BrowserClient {
             if !ok {
                 return Err(eyre!("element not found for selector"));
             }
+            on.done(&page, "browser.fill", Some(&selector)).await;
             Ok(json!({ "filled": true }))
         })
         .await
     }
 
     pub(super) async fn type_text(&self, selector: &str, text: &str) -> Result<Value> {
+        if self.on_chrome() {
+            let cell = self.chrome().await?;
+            return cell
+                .type_text(selector, text, |raw, host| {
+                    self.resolve_credential(raw, host)
+                })
+                .await;
+        }
         let cell = self.acquire().await?;
         let selector = selector.to_string();
         let text = text.to_string();
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.type",
+                Some(&selector),
+                Some(&selector),
+                false,
+                &[],
+            )
+            .await?;
             let host = page.url().await.ok().flatten().and_then(|u| host_of(&u));
             let resolved = self.resolve_credential(&text, host.as_deref())?;
             let element = page
                 .find_element(selector.as_str())
                 .await
                 .wrap_err_with(|| format!("element not found for selector `{selector}`"))?;
-            element.focus().await.wrap_err("focus failed")?;
+            focus_on(&page, &element, &selector).await?;
             element
                 .type_str(resolved.as_str())
                 .await
                 .wrap_err("type failed")?;
+            on.done(&page, "browser.type", Some(&selector)).await;
             Ok(json!({ "typed_chars": resolved.chars().count() }))
         })
         .await
     }
 
     pub(super) async fn select_option(&self, selector: &str, value: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.select_option(selector, value).await;
+        }
         self.acquire().await?.select_option(selector, value).await
     }
 
     pub(super) async fn evaluate(&self, expression: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.evaluate(expression).await;
+        }
         self.acquire().await?.evaluate(expression).await
     }
 
@@ -810,6 +1771,13 @@ impl BrowserClient {
         selector: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
+        if self.on_chrome() {
+            return self
+                .chrome()
+                .await?
+                .wait_for_selector(selector, timeout_ms)
+                .await;
+        }
         self.acquire()
             .await?
             .wait_for_selector(selector, timeout_ms)
@@ -817,18 +1785,30 @@ impl BrowserClient {
     }
 
     pub(super) async fn get_content(&self, format: &str) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.get_content(format).await;
+        }
         self.acquire().await?.get_content(format).await
     }
 
     pub(super) async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.press_key(key, selector).await;
+        }
         self.acquire().await?.press_key(key, selector).await
     }
 
     pub(super) async fn network_requests(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.network_requests().await;
+        }
         self.acquire().await?.network_requests().await
     }
 
     pub(super) async fn console_messages(&self) -> Result<Value> {
+        if self.on_chrome() {
+            return self.chrome().await?.console_messages().await;
+        }
         self.acquire().await?.console_messages().await
     }
 
@@ -848,6 +1828,7 @@ impl BrowserClient {
             .unwrap_or_default();
         let staged = crate::adapters::utils::resolve_staged_file(&agent_id, artifact_id)
             .wrap_err_with(|| format!("could not read artifact {artifact_id}"))?;
+        let staged_name = staged.filename.clone();
         let name = filename
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -857,10 +1838,32 @@ impl BrowserClient {
         // disk; the OS temp sweep reclaims it.
         let path = write_upload_temp(&name, &staged.bytes)?;
         let path_str = path.to_string_lossy().to_string();
+        if self.on_chrome() {
+            return self
+                .chrome()
+                .await?
+                .upload_file(
+                    selector,
+                    &path_str,
+                    &name,
+                    &[staged_name.as_str(), name.as_str()],
+                )
+                .await;
+        }
 
         let selector = selector.to_string();
         let cell = self.acquire().await?;
+        let on = cell.clone();
         cell.with_page(move |page, _n, _c| async move {
+            on.hold(
+                &page,
+                "browser.upload_file",
+                Some(&selector),
+                Some(&selector),
+                false,
+                &[staged_name.as_str(), name.as_str()],
+            )
+            .await?;
             let element = page
                 .find_element(selector.as_str())
                 .await
@@ -873,6 +1876,7 @@ impl BrowserClient {
             page.execute(params)
                 .await
                 .wrap_err("setFileInputFiles failed (is the selector an <input type=\"file\">?)")?;
+            on.done(&page, "browser.upload_file", Some(&selector)).await;
             Ok(json!({ "uploaded": name, "selector": selector }))
         })
         .await
@@ -939,10 +1943,18 @@ fn reap_blocking(profile_root: &Path, live: &HashSet<PathBuf>, retention: Durati
 async fn launch_chromium(
     config: &BrowserSkillConfig,
     profile_dir: &Path,
+    show: bool,
 ) -> Result<(Browser, Handler)> {
-    let builder: BrowserConfigBuilder = BrowserConfig::builder()
-        .no_sandbox()
-        .user_data_dir(profile_dir)
+    let builder: BrowserConfigBuilder = BrowserConfig::builder().user_data_dir(profile_dir);
+    // Chrome's sandbox stays on, unless it can't start here: as root in a
+    // container, or where the install says so (a build box without user
+    // namespaces).
+    let builder = if config.no_sandbox || root_in_container() {
+        builder.no_sandbox()
+    } else {
+        builder
+    };
+    let builder = builder
         .viewport(Viewport {
             width: config.viewport_width,
             height: config.viewport_height,
@@ -962,12 +1974,282 @@ async fn launch_chromium(
         Some(path) => builder.chrome_executable(path),
         None => builder,
     };
+    // On screen, so the person can watch it and sign in once by hand.
+    let builder = if show { builder.with_head() } else { builder };
     let cfg = builder
         .build()
         .map_err(|e| eyre!("invalid chromium config: {e}"))?;
     Browser::launch(cfg)
         .await
         .wrap_err("failed to launch chromium")
+}
+
+/// Whether this process runs as root in a container, where Chrome's
+/// sandbox can't start.
+fn root_in_container() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+        let contained =
+            Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        root && contained
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Where a click lands and what the page shows of it.
+struct Probe {
+    /// The middle of the element's box, when it was pressed for.
+    at: Option<(f64, f64)>,
+    shown: String,
+}
+
+/// Clears the file a call was opening when the call ends, any way it ends.
+struct PendingFile<'a>(&'a StdMutex<FileAllowance>);
+
+impl Drop for PendingFile<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut files) = self.0.lock() {
+            files.pending = None;
+        }
+    }
+}
+
+/// What files a page may have without the gate allowing them again.
+#[derive(Debug, Default)]
+struct FileAllowance {
+    /// The file a call the person allowed opened, while the page is on it.
+    opened: Option<PathBuf>,
+    /// The file the call being made now was allowed to open.
+    pending: Option<PathBuf>,
+    /// The conversation whose call opened `opened`: what pulls in more
+    /// files is asked about as that conversation's.
+    key: Option<String>,
+}
+
+impl FileAllowance {
+    fn allows(&self, real: &Path) -> bool {
+        self.opened.as_deref() == Some(real) || self.pending.as_deref() == Some(real)
+    }
+
+    /// The page is on `file` (or no file): an allowance for another goes.
+    fn keep_only(&mut self, file: Option<&Path>) {
+        if self.opened.as_deref() != file {
+            self.opened = None;
+            self.key = None;
+        }
+    }
+
+    /// The navigation made by the call allowed to open `pending` landed on
+    /// `url`: exactly that file, and it stays allowed.
+    fn opened_now(&mut self, url: Option<&str>, key: Option<String>) {
+        let landed = match url.map(super::address::kind) {
+            Some(super::address::Kind::File(p)) => {
+                Some(workforce_agent::tools::paths::resolve_real(&p))
+            }
+            _ => None,
+        };
+        if landed.is_some() && landed == self.pending {
+            self.opened = landed;
+            self.key = key;
+        }
+    }
+}
+
+/// Whose page the file keeper checks for: the person and the conversation
+/// key the cell's last call came from, so the gate reads their allowances.
+#[derive(Clone)]
+struct Scope {
+    user: String,
+    key: Arc<StdMutex<Option<String>>>,
+}
+
+/// Why `agent` may not have the file at `real` open, if it may not: a call
+/// the person allowed opened it (or is opening it now), or the gate, asked
+/// as `scope`'s turn, allows it now.
+fn file_refusal(
+    agent: &str,
+    files: &StdMutex<FileAllowance>,
+    real: &Path,
+    scope: &Scope,
+) -> Option<String> {
+    if files.lock().unwrap().allows(real) {
+        return None;
+    }
+    let hooks = hooks::hooks()?;
+    // Pinned to the conversation that opened the file, else the last one.
+    let pinned = files.lock().unwrap().key.clone();
+    let key = pinned
+        .or_else(|| scope.key.lock().unwrap().clone())
+        .unwrap_or_default();
+    CURRENT_USER_ID.sync_scope(scope.user.clone(), || {
+        CURRENT_SESSION_KEY.sync_scope(key, || hooks.may_open_file(agent, real).err())
+    })
+}
+
+/// Holds every file the page loads (an iframe, an image, a script, the
+/// page itself) to the same rule as the page: what a file page pulls in
+/// from this computer is read too.
+async fn spawn_file_keeper(
+    page: &Page,
+    agent: String,
+    files: Arc<StdMutex<FileAllowance>>,
+    scope: Scope,
+) -> Result<JoinHandle<()>> {
+    use chromiumoxide::cdp::browser_protocol::fetch::{
+        ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams, RequestPattern,
+    };
+    use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+    let mut paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .wrap_err("failed to watch the files a page loads")?;
+    page.execute(
+        EnableParams::builder()
+            .pattern(RequestPattern::builder().url_pattern("file://*").build())
+            .build(),
+    )
+    .await
+    .wrap_err("failed to watch the files a page loads")?;
+    let page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(event) = paused.next().await {
+            let id = event.request_id.clone();
+            let refused = match super::address::kind(&event.request.url) {
+                super::address::Kind::File(path) => {
+                    let real = workforce_agent::tools::paths::resolve_real(&path);
+                    file_refusal(&agent, &files, &real, &scope)
+                }
+                _ => None,
+            };
+            let _ = match refused {
+                None => page
+                    .execute(ContinueRequestParams::new(id))
+                    .await
+                    .map(|_| ()),
+                Some(_) => page
+                    .execute(FailRequestParams::new(id, ErrorReason::BlockedByClient))
+                    .await
+                    .map(|_| ()),
+            };
+        }
+    }))
+}
+
+/// The value of `expression` in a world of Desk's own on the page, which
+/// the page's scripts can't reach or reshape.
+async fn isolated(page: &Page, expression: String) -> Result<Option<Value>> {
+    use chromiumoxide::cdp::browser_protocol::page::CreateIsolatedWorldParams;
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    let frame = page
+        .mainframe()
+        .await?
+        .ok_or_else(|| eyre!("the page has no frame"))?;
+    let world = page
+        .execute(
+            CreateIsolatedWorldParams::builder()
+                .frame_id(frame)
+                .world_name("desk-browser")
+                .build()
+                .map_err(|e| eyre!("{e}"))?,
+        )
+        .await?;
+    let params = EvaluateParams::builder()
+        .expression(expression)
+        .context_id(world.result.execution_context_id)
+        .return_by_value(true)
+        .build()
+        .map_err(|e| eyre!("{e}"))?;
+    Ok(page.execute(params).await?.result.result.value)
+}
+
+/// Keys go only where `selector` has focus, as Desk's own world reads it.
+async fn focus_on(page: &Page, element: &chromiumoxide::Element, selector: &str) -> Result<()> {
+    element.focus().await.wrap_err("focus failed")?;
+    let sel = serde_json::to_string(selector)?;
+    let focused = isolated(
+        page,
+        format!("document.activeElement === document.querySelector({sel})"),
+    )
+    .await?;
+    if focused != Some(Value::Bool(true)) {
+        return Err(eyre!(
+            "`{selector}` didn't take the focus, so nothing was typed."
+        ));
+    }
+    Ok(())
+}
+
+/// Sends the page to about:blank, not waiting on whatever it was loading.
+async fn blank(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
+    let _ = timeout(
+        Duration::from_secs(5),
+        page.execute(NavigateParams::new("about:blank")),
+    )
+    .await;
+}
+
+/// A real click at `(x, y)` on the page.
+async fn press_at(page: &Page, x: f64, y: f64) -> Result<()> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+    };
+    for kind in [
+        DispatchMouseEventType::MousePressed,
+        DispatchMouseEventType::MouseReleased,
+    ] {
+        page.execute(
+            DispatchMouseEventParams::builder()
+                .r#type(kind)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| eyre!("{e}"))?,
+        )
+        .await
+        .wrap_err("click failed")?;
+    }
+    // A click that opens another page: let it settle, briefly.
+    let _ = timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+    Ok(())
+}
+
+/// Dismisses every alert, confirm and prompt a page opens (none waits on
+/// the person, and none is accepted for them), noting each, fenced as the
+/// page's words, in the console log.
+async fn spawn_dialog_dismisser(
+    page: &Page,
+    log: Arc<Mutex<VecDeque<Value>>>,
+    capacity: usize,
+) -> Result<JoinHandle<()>> {
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
+    };
+    let mut events = page
+        .event_listener::<EventJavascriptDialogOpening>()
+        .await
+        .wrap_err("failed to subscribe to dialogs")?;
+    let page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            let _ = page.execute(HandleJavaScriptDialogParams::new(false)).await;
+            let entry = json!({
+                "source": "dialog",
+                "level": format!("{:?}", event.r#type),
+                "text": event.message,
+                "url": event.url,
+                "dismissed": true,
+            });
+            push_bounded(&mut *log.lock().await, capacity, entry);
+        }
+    }))
 }
 
 struct RespawnBudget {
@@ -1144,7 +2426,7 @@ fn stage_for_delivery(
 
 /// Stage a screenshot PNG for auto-delivery, or fall back to inline base64 when
 /// no artifact store is in scope. See [`stage_for_delivery`].
-fn stage_screenshot_artifact(bytes: Vec<u8>, size: usize) -> Result<Value> {
+pub(super) fn stage_screenshot_artifact(bytes: Vec<u8>, size: usize) -> Result<Value> {
     tracing::info!(target: "browser", size_bytes = size, "screenshot captured");
     match stage_for_delivery(bytes, "browser.screenshot", "image/png", "screenshot.png")? {
         Ok(entry) => Ok(json!({
@@ -1192,18 +2474,35 @@ fn stage_pdf_artifact(bytes: Vec<u8>, filename: &str) -> Result<Value> {
 /// Extract the lowercase host from a URL for egress matching. Strips the
 /// scheme, any `userinfo@`, the path/query/fragment, and the `:port`. Returns
 /// `None` for an empty or scheme-only string.
-fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+pub(super) fn host_of(url: &str) -> Option<String> {
+    super::address::host_of(url)
 }
 
-fn fill_expression(selector: &str, value: &str) -> String {
+/// What the page shows of the element `selector` names (the focused one
+/// where none): its text, a button's value, its label, title, type, name,
+/// autocomplete hint and placeholder, and with `form` its form's action.
+/// Never what a field holds.
+pub(super) fn shown_expression(selector: Option<&str>, form: bool) -> String {
+    let el = match selector {
+        Some(sel) => format!(
+            "document.querySelector({})",
+            serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".to_string())
+        ),
+        None => "document.activeElement".to_string(),
+    };
+    format!(
+        "(() => {{ const el = {el}; if (!el) return ''; \
+          const button = el.tagName === 'BUTTON' || (el.tagName === 'INPUT' && /^(submit|button|reset)$/i.test(el.type || '')); \
+          const label = el.labels && el.labels.length ? el.labels[0].innerText : ''; \
+          const form = {form} && el.form ? (el.form.getAttribute('action') || '') : ''; \
+          return [button || !('value' in el) ? (el.innerText || '') : '', button ? el.value : '', \
+            el.getAttribute('aria-label'), el.title, el.getAttribute('type'), el.getAttribute('name'), \
+            el.getAttribute('autocomplete'), el.getAttribute('placeholder'), label, form] \
+            .filter(Boolean).join(' ').slice(0, 500); }})()"
+    )
+}
+
+pub(super) fn fill_expression(selector: &str, value: &str) -> String {
     let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     format!(
@@ -1215,7 +2514,7 @@ fn fill_expression(selector: &str, value: &str) -> String {
     )
 }
 
-fn select_option_expression(selector: &str, value: &str) -> String {
+pub(super) fn select_option_expression(selector: &str, value: &str) -> String {
     let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     format!(
@@ -1294,7 +2593,7 @@ mod tests {
             host_of("https://user:pw@host.example.com:8443/p").as_deref(),
             Some("host.example.com")
         );
-        assert_eq!(host_of("about:blank").as_deref(), Some("about"));
+        assert_eq!(host_of("about:blank").as_deref(), None);
         assert_eq!(host_of(""), None);
     }
 
@@ -1643,6 +2942,7 @@ mod tests {
         let client = BrowserClient::new(BrowserSkillConfig {
             profile_root: Some(dir.path().display().to_string()),
             chrome_binary: std::env::var("BROWSER_E2E_CHROMIUM").ok(),
+            no_sandbox: std::env::var("BROWSER_E2E_NO_SANDBOX").is_ok(),
             ..Default::default()
         });
 

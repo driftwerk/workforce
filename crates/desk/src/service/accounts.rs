@@ -17,7 +17,7 @@ use crate::crew::{self, By};
 use crate::engine::{self, Engine};
 use crate::engine_accounts::{
     self as accounts, Account, AccountPatch, AccountRef, AccountToken, AccountView, AccountsVia,
-    NewAccount, SignInState, SignInView, SwitchWhen,
+    NewAccount, SignInAgain, SignInState, SignInView, SwitchWhen,
 };
 use crate::floor::Outcome;
 use crate::model::{DeskEvent, SessionState, SessionView, View};
@@ -79,6 +79,9 @@ fn exposed<S: serde::Serializer>(t: &AccountToken, s: S) -> Result<S::Ok, S::Err
 pub(super) struct SignInRun {
     view: SignInView,
     make_default: bool,
+    /// Signing an account in again (its sign-in gone from the store): the
+    /// token goes to it, keeping it as it is, rather than to a new one.
+    again: Option<Uuid>,
     pty: Arc<Pty>,
     /// For a sign-in made from another computer: where the page that comes
     /// back by itself is caught.
@@ -362,7 +365,7 @@ impl Desk {
             .map_err(DeskError::Internal)?
             .ok_or_else(|| {
                 DeskError::Conflict(format!(
-                    "{}'s sign-in is no longer in {}: add the account again",
+                    "{}'s sign-in is no longer in {}: sign it in again",
                     a.name,
                     self.accounts_store().unwrap_or("the store")
                 ))
@@ -442,24 +445,47 @@ impl Desk {
         Err(Self::all_full(st, engine, &sides))
     }
 
-    /// "Every Claude account here is at its limit: Work until 12 Nov 09:00
-    /// UTC, Personal until …".
+    /// "Every Claude account here is at its plan limit: Work (its 5-hour
+    /// limit, resets 12 Nov 09:00 UTC), Personal (its weekly limit, resets
+    /// …)". Names the window each is full on, and says that extra usage and
+    /// one model's own limit aren't what stops a session starting.
     fn all_full(st: &super::State, engine: Engine, sides: &[Option<Uuid>]) -> DeskError {
+        let now = Utc::now();
         let until: Vec<String> = sides
             .iter()
             .map(|s| {
                 let name = accounts::Side::of(&st.accounts, *s).name;
-                match Self::full_now(st, *s).flatten() {
-                    Some(at) => format!("{name} until {}", at.format("%-d %b %H:%M UTC")),
+                match Self::standing_of(st, Self::canonical(st, *s)).full_by(now) {
+                    Some(f) => match f.until {
+                        Some(at) => format!(
+                            "{name} (its {}, resets {})",
+                            f.window_name(),
+                            at.format("%-d %b %H:%M UTC")
+                        ),
+                        None => format!("{name} (its {}, no reset time yet)", f.window_name()),
+                    },
                     None => format!("{name} (no reset time yet)"),
                 }
             })
             .collect();
         DeskError::Conflict(format!(
-            "every {} account here is at its limit: {}",
+            "every {} account here is at its plan limit: {}",
             engine.title(),
             until.join(", ")
         ))
+    }
+
+    /// A session was started on `account` (`None`: the CLI's own sign-in)
+    /// just now: a reading of the account taken before can't alone say it is
+    /// full from here on.
+    pub(super) fn started_on(&self, account: Option<Uuid>) {
+        let mut st = self.0.state.lock();
+        // A start pinned to an account known to be full says nothing of it.
+        if Self::full_now(&st, account).is_some() {
+            return;
+        }
+        let raw = Self::raw_of(&st, account);
+        Self::standing_mut(&mut st, &raw).started_at = Some(Utc::now());
     }
 
     /// The person's Claude accounts for the hub's own model calls (the
@@ -729,7 +755,7 @@ impl Desk {
         self.announce_accounts();
         Err(DeskError::Conflict(match problem {
             accounts::SignInProblem::Gone => format!(
-                "{}'s sign-in is no longer in {store}: add the account again in Settings → Engines",
+                "{}'s sign-in is no longer in {store}: sign it in again in Settings → Engines",
                 a.name
             ),
             accounts::SignInProblem::Unreadable | accounts::SignInProblem::NotRemoved => format!(
@@ -839,9 +865,65 @@ impl Desk {
                 Ok(Added::Account { account: view })
             }
             None => self
-                .start_sign_in(new.engine, name, new.make_default, new.remote)
+                .start_sign_in(new.engine, name, new.make_default, new.remote, None)
                 .map(|sign_in| Added::SignIn { sign_in }),
         }
+    }
+
+    /// Signs account `id` in again, its sign-in gone from the store (or
+    /// replaced): a pasted token is checked and kept for it; without one,
+    /// the engine's own sign-in begins and its token goes to the account.
+    /// The account keeps its id, name, default and plan, and its sessions
+    /// carry on with it.
+    pub async fn sign_in_again(&self, id: Uuid, again: SignInAgain) -> Result<Added, DeskError> {
+        let keys = Arc::clone(self.keys()?);
+        let account = self.account(id)?;
+        match again
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(pasted) => {
+                let token = AccountToken::new(pasted).map_err(DeskError::Invalid)?;
+                self.check_claude_token(&token)
+                    .await
+                    .map_err(DeskError::Invalid)?;
+                self.renew_account(keys, id, &token).await?;
+                let view = self
+                    .accounts()
+                    .into_iter()
+                    .find(|a| a.id == id)
+                    .ok_or_else(|| DeskError::Invalid("there is no such account".into()))?;
+                Ok(Added::Account { account: view })
+            }
+            None => self
+                .start_sign_in(account.engine, account.name, false, again.remote, Some(id))
+                .map(|sign_in| Added::SignIn { sign_in }),
+        }
+    }
+
+    /// Keeps a checked token for account `id`, which is signed in again.
+    async fn renew_account(
+        &self,
+        keys: Arc<dyn accounts::Keys>,
+        id: Uuid,
+        token: &AccountToken,
+    ) -> Result<Account, DeskError> {
+        let account = self.account(id)?;
+        let kept = token.clone();
+        tokio::task::spawn_blocking(move || keys.set(id, &kept))
+            .await
+            .map_err(|e| DeskError::Internal(e.into()))?
+            .map_err(DeskError::Internal)?;
+        {
+            let mut st = self.0.state.lock();
+            st.signed_in_accounts.insert(id);
+            st.sign_in_problems.remove(&id);
+        }
+        self.announce_accounts();
+        tracing::info!(account = %id, "engine account signed in again");
+        Ok(account)
     }
 
     /// Keeps a checked token and its account, the token first: an account
@@ -900,6 +982,7 @@ impl Desk {
         name: String,
         make_default: bool,
         remote: bool,
+        again: Option<Uuid>,
     ) -> Result<SignInView, DeskError> {
         let program = self.program_of(engine)?.to_path_buf();
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
@@ -947,6 +1030,7 @@ impl Desk {
             SignInRun {
                 view: view.clone(),
                 make_default,
+                again,
                 pty: Arc::new(pty),
                 relay,
             },
@@ -1009,7 +1093,7 @@ impl Desk {
         let mut refused: Option<String> = None;
         let mut exited = false;
         let outcome = loop {
-            let Some((pty, make_default, engine, name, relay)) = ({
+            let Some((pty, make_default, engine, name, relay, again)) = ({
                 let st = self.0.state.lock();
                 st.sign_in_runs.get(&id).map(|r| {
                     (
@@ -1018,6 +1102,7 @@ impl Desk {
                         r.view.engine,
                         r.view.name.clone(),
                         r.relay.clone(),
+                        r.again,
                     )
                 })
             }) else {
@@ -1048,8 +1133,13 @@ impl Desk {
                 let kept = match self.keys() {
                     Ok(keys) => {
                         let keys = Arc::clone(keys);
-                        self.keep_account(keys, engine, name.clone(), make_default, &token)
-                            .await
+                        match again {
+                            Some(account) => self.renew_account(keys, account, &token).await,
+                            None => {
+                                self.keep_account(keys, engine, name.clone(), make_default, &token)
+                                    .await
+                            }
+                        }
                     }
                     Err(e) => Err(e),
                 };

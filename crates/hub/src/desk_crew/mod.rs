@@ -171,6 +171,17 @@ pub(crate) fn for_service(service: &AgentService) -> Option<Arc<CrewHub>> {
     })
 }
 
+/// What a turn of `service`'s in its Desk DM is told of how much it may do
+/// on its own, when it oversees the crew: its level now and the switches
+/// that are off. `None` for an agent that doesn't oversee.
+pub(crate) fn dm_oversight_hint(service: &AgentService) -> Option<String> {
+    let crew = for_service(service)?;
+    let (service, o) = crew.overseer_named(service.agent_id.as_str())?;
+    let (level, _) = crew.level_now(service.agent_id.as_str(), &o);
+    let unbound = o.level != Level::Watch && crew.unbound_given(&service, &o);
+    Some(CrewHub::dm_hint(level, &o, unbound))
+}
+
 /// Puts what `service`'s own check-in found into its Desk DM, when Desk
 /// is on for its hub. Whether it was delivered.
 pub(crate) async fn heartbeat_found(service: &Arc<AgentService>, found: &str) -> bool {
@@ -392,7 +403,10 @@ pub(crate) fn fully_given(
         why.unwrap_or("It acts within Desk: Act fully isn't chosen.")
             .to_string()
     })?;
-    let budget = full.budget_usd_per_day().unwrap_or_default();
+    // Anywhere with no budget set, nothing it spends holds it.
+    let Some(budget) = full.budget_usd_per_day() else {
+        return Ok(full);
+    };
     match spent {
         None => Err(
             "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
@@ -567,6 +581,8 @@ impl CrewHub {
                         workforce_desk::charge::FullGrant {
                             repos: full.repos.clone(),
                             workflows: full.workflows.clone(),
+                            anywhere: full.anywhere && self.boss_is_local(s),
+                            unbound: self.unbound_given(s, o),
                         },
                     ))
                 })
@@ -611,6 +627,16 @@ impl CrewHub {
     /// `by`, the overseer `agent` acting on its own, as Activity records
     /// it: what it does while Act fully is in force says so.
     pub(crate) fn by_at_level(&self, mut by: By, o: &Oversight) -> By {
+        let unbound = self
+            .overseer_named(&by.party.id)
+            .is_some_and(|(s, _)| self.unbound_given(&s, o));
+        if unbound {
+            by.reason = Some(match by.reason.take() {
+                Some(r) => format!("{} (unbound: no limits)", r.trim_end()),
+                None => "Unbound: no limits.".into(),
+            });
+            return by;
+        }
         if self.level_now(&by.party.id, o).0 == Level::Full {
             by.reason = Some(match by.reason.take() {
                 Some(r) => format!("{} (at Act fully)", r.trim_end()),
@@ -618,6 +644,29 @@ impl CrewHub {
             });
         }
         by
+    }
+
+    /// Whether `service`, an overseer, is an agent this hub runs. A boss
+    /// served from a grant (a remote boss) never is, and is never unbound
+    /// nor anywhere: what it does is the remote hub's to judge, not this
+    /// one's to wave through.
+    pub(crate) fn boss_is_local(&self, service: &AgentService) -> bool {
+        let id = service.agent_id.as_str();
+        !workforce_desk::grant::is_served(id)
+            && self.services().iter().any(|s| s.agent_id.as_str() == id)
+    }
+
+    /// Whether `service`, overseeing with `o`, is unbound now: it chose
+    /// it ([`Oversight::unbound`]), it is local, and Act fully is in force
+    /// (its budget, when set, isn't spent).
+    pub(crate) fn unbound_given(&self, service: &AgentService, o: &Oversight) -> bool {
+        o.unbound(self.boss_is_local(service)) && self.fully(service.agent_id.as_str(), o).is_ok()
+    }
+
+    /// Whether the overseer of `o`'s scope is unbound now.
+    pub(crate) fn unbound(&self, o: &Oversight) -> bool {
+        self.overseer_for(&o.scope)
+            .is_some_and(|(s, _)| self.unbound_given(&s, o))
     }
 
     /// Whether the overseer of `o`'s scope acts fully in the repository

@@ -862,8 +862,10 @@ pub struct TurnEnd {
 }
 
 /// The Jira tools a Desk board's sync may call on a hub, and nothing else:
-/// no raw API, no delete, no reassigning. A token a paired device minted
-/// reaches exactly these, the Linear ones, `help` and `identity.whoami`.
+/// no raw API, no delete. An issue is only ever assigned to the person
+/// themselves, unassigned before ("Take it"), by `jira.update_issue`. A
+/// token a paired device minted reaches exactly these, the Linear ones, the
+/// identity ones below, `help` and `identity.whoami`.
 pub const BOARD_SYNC_JIRA_TOOLS: &[&str] = &[
     "jira.search",
     "jira.get_issue",
@@ -887,6 +889,12 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
     "linear.states_list",
     "linear.teams_list",
 ];
+
+/// Who the person is on Jira (`jira.myself`) and on Linear
+/// (`linear.viewer`): what "assigned to me", Mine and Take it go by. A
+/// board's sync calls them when its hub offers them and never needs them:
+/// a hub without them still syncs, and its board asks for the id instead.
+pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &["jira.myself", "linear.viewer"];
 
 #[cfg(test)]
 mod tests {

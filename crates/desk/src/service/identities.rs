@@ -788,7 +788,10 @@ impl Desk {
             None => !others,
             Some(_) => false,
         };
-        let hit_before = hit_before.filter(|(at, _)| *at < since);
+        // Only the plan's own limit: a model's, or extra usage, fills nothing.
+        let hit_before = hit_before
+            .filter(|(at, _)| *at < since)
+            .filter(|(_, hit)| hit.reach() == crate::limit::Reach::Plan);
         let s = st.standing.entry(Some(account)).or_default();
         let mut exact = None;
         if s.read_at.is_some_and(|r| r >= since) && its(by.read) {

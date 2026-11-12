@@ -833,6 +833,62 @@ async fn what_a_deleted_identity_left_under_its_old_names_is_erased_and_its_bill
     assert_eq!(kinds, ["orphan_delete", "delete"]);
 }
 
+/// Desk's activity left under a hand-deleted identity is found by the scan
+/// and erased by the clean-up with the screenshots it names; another
+/// person's stays.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn desks_activity_left_by_a_deleted_identity_is_found_and_erased_with_its_screenshots() {
+    workforce_postgres::test_support::with_test_pool(
+        workforce_desk::store::build_pool,
+        |pool| async move {
+            let mut hub = hub().await;
+            let (store, shots) = super::tests::with_desk(&mut hub, pool).await;
+            let admin = hub.admin();
+            let bob = hub.person("Bob", "U-B");
+            let lost = gone(&hub, "Lost", "U-L");
+            let l = lost.id.to_string();
+            spend(&hub, &l);
+            let shot = super::tests::desk_shot(&shots);
+            for a in [
+                super::tests::desk_row(&l, Some(&shot)),
+                super::tests::desk_row(&bob.id.to_string(), None),
+            ] {
+                store.record_activity(&a).await.unwrap();
+            }
+
+            let scan = hub.lifecycle.orphans(&admin).await.unwrap();
+            assert_eq!(found(&scan, lost.id).held[&Category::DeskActivity], 1);
+            assert_eq!(
+                OrphanAction::of(Category::DeskActivity, false),
+                OrphanAction::Keep,
+                "a hand-over keeps it unless asked"
+            );
+
+            let report = hub
+                .lifecycle
+                .delete_orphan(lost.id, &DeletePlan::default(), &admin, false)
+                .await
+                .unwrap();
+
+            assert!(report.complete, "{report:#?}");
+            assert!(!shots.join(&shot).exists());
+            assert_eq!(
+                store.access_people().await.unwrap(),
+                [(bob.id.to_string(), 1)]
+            );
+            assert!(hub
+                .lifecycle
+                .orphans(&admin)
+                .await
+                .unwrap()
+                .orphans
+                .is_empty());
+        },
+    )
+    .await;
+}
+
 /// The scan and the clean-up re-read who is live: a name a live identity
 /// has taken on is theirs, and an id that is an identity again is refused,
 /// before the operation and before each category under its lease.

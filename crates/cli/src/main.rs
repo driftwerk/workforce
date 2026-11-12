@@ -5237,6 +5237,7 @@ rules:
                         defs: gateway_state.def_store.clone(),
                         artifacts: gateway_state.artifact_store.clone(),
                         pictures,
+                        desk_activity: workforce_hub::desk_browser::lifecycle_activity(&wf_config),
                         external_skills: Arc::clone(&gateway_state.external_skills),
                         data_dir: std::path::PathBuf::from(&wf_config.hub.data_dir),
                         runs: workforce_hub::identity_lifecycle::Runs::until(

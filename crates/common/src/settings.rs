@@ -5898,7 +5898,7 @@ pub struct LlmSpeechConfig {
     /// "soniox".
     pub provider: String,
     /// Provider model. Defaults per provider: openai `gpt-4o-mini-tts`,
-    /// elevenlabs `eleven_multilingual_v2`, fish_audio `s1`, soniox
+    /// elevenlabs `eleven_multilingual_v2`, fish_audio `s2.1-pro-free`, soniox
     /// `tts-rt-v1`. Unused by `builtin` (the voice id names the model file).
     #[serde(default)]
     pub model: Option<String>,
@@ -9104,8 +9104,9 @@ pub struct AgentDeskBossConfig {
 impl RemoteMcpConfig {
     /// Tool patterns exposed by default: authoring and running workflows,
     /// playbooks, schedules and skills of both kinds, vault access, the `agent.*`
-    /// collaboration tools, the `approval.*` bridge and `help`. Shell, code
-    /// and delivery tools stay opt-in.
+    /// collaboration tools, the `approval.*` bridge, `help`, and the Linear
+    /// and Jira tools Desk's board sync reads and writes through (by name).
+    /// Shell, code and delivery tools stay opt-in.
     pub const DEFAULT_TOOLS_ALLOW: &'static [&'static str] = &[
         "workflow",
         "playbook",
@@ -9127,6 +9128,27 @@ impl RemoteMcpConfig {
         "skill.*",
         "pipeline.*",
         "hubspot.*",
+        // Desk's board sync, by name: the raw, delete and bulk tools of
+        // both stay opt-in.
+        "jira.search",
+        "jira.get_issue",
+        "jira.create_issue",
+        "jira.update_issue",
+        "jira.list_transitions",
+        "jira.transition_issue",
+        "jira.add_comment",
+        "jira.get_project",
+        "jira.myself",
+        "linear.issue_list",
+        "linear.issue_get",
+        "linear.issue_search",
+        "linear.issue_create",
+        "linear.issue_update",
+        "linear.issue_link",
+        "linear.comment_add",
+        "linear.states_list",
+        "linear.teams_list",
+        "linear.viewer",
         "help",
     ];
 
@@ -10393,6 +10415,45 @@ pub struct SkillsConfig {
     /// binary; each install opts in by pointing at one or more catalogs.
     #[serde(default)]
     pub catalogs: Vec<CatalogSource>,
+    /// The browser skill. See [`BrowserSkillsConfig`].
+    #[serde(default)]
+    pub browser: BrowserSkillsConfig,
+}
+
+/// `[skills.browser]`: where the browser skill keeps its profiles and
+/// whether its window shows.
+///
+/// ```toml
+/// [skills.browser]
+/// # profile_root = "/var/lib/workforce/browser"
+/// # show = true
+/// # chrome_binary = "/usr/bin/chromium"
+/// # chrome_user_data_dir = "/Users/me/Library/Application Support/Google/Chrome"
+/// ```
+///
+/// On a hub with `[desk]`, profiles live in Desk's own folder
+/// (`…/Desk/browser`), which every agent's tools are kept from, they are
+/// never reaped (the person signs in to them once, by hand), and the window
+/// shows. Elsewhere they live in the system's temp folder and are reaped
+/// after a week, headless, as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSkillsConfig {
+    /// Where profiles live, in place of the default above. Profiles under a
+    /// root named here are never reaped.
+    #[serde(default)]
+    pub profile_root: Option<String>,
+    /// Show the window (`true`) or run headless (`false`); unset, it shows
+    /// on Desk only.
+    #[serde(default)]
+    pub show: Option<bool>,
+    /// The Chrome or Chromium to run; found on `PATH` where unset.
+    #[serde(default)]
+    pub chrome_binary: Option<String>,
+    /// The person's own Chrome's user data folder, where it writes
+    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
+    /// own for this platform.
+    #[serde(default)]
+    pub chrome_user_data_dir: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -10404,6 +10465,7 @@ impl Default for SkillsConfig {
             metabase: MetabaseSyncConfig::default(),
             auto_load: true,
             catalogs: Vec::new(),
+            browser: BrowserSkillsConfig::default(),
         }
     }
 }

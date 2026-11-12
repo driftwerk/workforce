@@ -94,6 +94,7 @@ mod memory_line;
 #[cfg(test)]
 mod memory_line_tests;
 mod memory_recall;
+mod modes;
 mod moves;
 #[cfg(test)]
 mod moves_tests;
@@ -603,6 +604,12 @@ impl Drop for CodexLink {
 
 #[derive(Default)]
 struct State {
+    /// The permission mode each Claude Code session last said it runs in
+    /// ([`crate::mode`]).
+    modes_seen: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode that doesn't ask each session was last started in, as a
+    /// boss kept it ([`SessionView::mode`]).
+    modes_started: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -905,6 +912,13 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while the modes Desk keeps are read and written
+    /// ([`crate::mode`]).
+    modes_write: tokio::sync::Mutex<()>,
+    /// Held while sessions are put back in their own modes.
+    modes_restoring: tokio::sync::Mutex<()>,
+    /// Something changed that may end a mode since the restore last looked.
+    modes_dirty: std::sync::atomic::AtomicBool,
     /// Held while a move is made: two previews of one item never both go
     /// through, the second finding what it does changed.
     move_write: tokio::sync::Mutex<()>,
@@ -1558,6 +1572,9 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            modes_write: tokio::sync::Mutex::new(()),
+            modes_restoring: tokio::sync::Mutex::new(()),
+            modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
             grants: Mutex::default(),
@@ -1892,6 +1909,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.mode = live.and(state.modes_started.get(&r.id).copied());
         view
     }
 
@@ -1964,11 +1982,28 @@ impl Desk {
             // When Claude Code said it resets; else what a reading says. The
             // account it stopped on, whichever credential of it it ran on.
             let raw = Self::raw_running(st, id);
+            // What Claude Code said; else what the words name, if not the
+            // plan's own window.
+            let in_words = view
+                .failure
+                .is_none()
+                .then(|| {
+                    transitions.iter().find_map(|t| match t {
+                        Transition::Finished { reply } => {
+                            Some(crate::limit::LimitHit::in_words(reply))
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
             Self::mark_hit(
                 st,
                 id,
                 &raw,
-                view.failure.as_ref().and_then(|f| f.limit()),
+                view.failure
+                    .as_ref()
+                    .and_then(|f| f.limit())
+                    .or(in_words.as_ref()),
                 Utc::now(),
             );
             let desk = self.clone();
@@ -2063,6 +2098,18 @@ impl Desk {
                 .map(|(e, i)| (*e, i.sign_in.clone()))
                 .collect(),
         }
+    }
+
+    /// Every engine read again now (one read under way is shared), as after
+    /// Desk installed one or signed one in: then as [`Desk::engines`].
+    pub async fn engines_read_now(&self) -> Vec<engine::EngineView> {
+        let asked = std::time::Instant::now();
+        let reads = Engine::ALL
+            .into_iter()
+            .map(|e| self.read_engine_since(e, asked, Since::Ended));
+        futures::future::join_all(reads).await;
+        self.spend_signed_in();
+        self.engines()
     }
 
     /// Every engine as Settings → Engines and the new session dialog show
@@ -2843,6 +2890,9 @@ impl Desk {
             ));
         }
         let account = self.account_for(new.engine, new.account)?;
+        if new.engine == Engine::Claude {
+            self.started_on(account);
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -3107,6 +3157,8 @@ impl Desk {
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
         self.boss_holds(id, by.as_ref())?;
+        self.mode_lets(id, by.as_ref())?;
+        self.person_resumes(id, by.as_ref()).await;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -3229,8 +3281,10 @@ impl Desk {
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
         self.boss_holds(id, Some(&by))?;
+        self.mode_lets(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
+        self.person_resumes(id, Some(&by)).await;
         let running = self.0.state.lock().live.contains_key(&id);
         if running {
             self.0.state.lock().acted.insert(id);
@@ -3394,6 +3448,11 @@ impl Desk {
         {
             self.boss_decides(id, approval, decision, boss)?;
         }
+        // Allowing what it asks drives it: in a mode that doesn't ask, only
+        // the person's or its unbound boss's.
+        if decision != Decision::Deny && decision != Decision::Cancel {
+            self.mode_lets_anyone(id, by.as_ref())?;
+        }
         let codex = self
             .0
             .state
@@ -3479,12 +3538,14 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        // The boss of a session it runs, checked in `decide`.
+        // The boss of a session it runs, checked in `decide`; an unbound
+        // boss answers Codex too, wherever it asks.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
-                && self
-                    .charge_of(id)
-                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
         };
         let by = by
             .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
@@ -3564,6 +3625,7 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.mode_lets_anyone(id, by.as_ref())?;
         let view = self.type_prompt(id, text, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(
@@ -4227,6 +4289,16 @@ impl Desk {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         let mut fixed_ground = None;
+        // The mode Desk keeps for it, as an overseer set it; one that
+        // doesn't ask is shown on its card while it runs in it.
+        let mode = self.mode_to_start(r.id).await;
+        {
+            let mut st = self.0.state.lock();
+            match mode.filter(|m| !m.asks()) {
+                Some(m) => st.modes_started.insert(r.id, m),
+                None => st.modes_started.remove(&r.id),
+            };
+        }
         // A boss served from a grant runs it: Desk's check of each call fails
         // closed. Kept with its process, so a hub that takes it back knows.
         let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
@@ -4257,6 +4329,7 @@ impl Desk {
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
                     theme,
+                    mode,
                     fail_closed,
                 });
                 (spec, None)
@@ -4281,6 +4354,7 @@ impl Desk {
                     prompt,
                     approve_for_me: r.approve_for_me,
                     fast: r.fast,
+                    mode,
                     env: &env,
                 });
                 let link =
@@ -4578,6 +4652,9 @@ impl Desk {
             .is_some_and(|l| l.token == token);
         if !authorised {
             return None;
+        }
+        if let Some(mode) = crate::mode::of_hook(body) {
+            self.0.state.lock().modes_seen.insert(id, mode);
         }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,
@@ -5335,6 +5412,39 @@ impl Desk {
             identities::Waiting::Hit(id, hit.cloned(), now).wait(st);
             return None;
         }
+        // Only the plan's own window fills the account. A model's weekly
+        // window holds that model alone; extra usage or credits spent stops
+        // no plan session.
+        let mut crossed = None;
+        match hit.map(|h| h.reach()) {
+            Some(crate::limit::Reach::Credit) => {
+                // Extra usage is spent only once the plan's own windows are
+                // too: if the last reading shows one at 100%, the account is
+                // full on it; else (or no reading) it isn't.
+                let full = Self::standing_mut(st, raw).plan_window_full(now);
+                let Some(full) = full else {
+                    tracing::info!(session = %id, window = hit.and_then(|h| h.window.as_deref()), "a session stopped on extra usage; no plan window reads full");
+                    return None;
+                };
+                tracing::info!(session = %id, "a session stopped on extra usage with a plan window full: the account is full");
+                let kind = match full.minutes {
+                    Some(300) => "five_hour",
+                    _ => "seven_day",
+                };
+                crossed = Some(crate::limit::LimitHit {
+                    window: Some(kind.into()),
+                    resets_at: full.until,
+                });
+            }
+            Some(crate::limit::Reach::Model(model)) => {
+                // Desk has no model of its own per session to hold, and the
+                // plan has room for the others.
+                tracing::info!(session = %id, %model, "a session stopped on one model's weekly limit; the account isn't full");
+                return None;
+            }
+            _ => {}
+        }
+        let hit = crossed.as_ref().or(hit);
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
@@ -5441,6 +5551,20 @@ impl Desk {
         });
     }
 
+    /// Takes back the stop session `id` marked on its account, when it was
+    /// the account's last: back to what the stop before it said.
+    fn undo_mark(st: &mut State, id: Uuid) {
+        if let Some(mark) = st.limit_marks.remove(&id) {
+            let s = Self::standing_mut(st, &mark.side);
+            if s.hit_at == Some(mark.at) {
+                (s.hit_at, s.hit_until, s.hit_window) = mark.before;
+                if let Some(by) = st.written_by.get_mut(&mark.side) {
+                    by.hit = None;
+                }
+            }
+        }
+    }
+
     /// What the transcript said of the API error session `id`'s turn ended
     /// on, on `account`; it decides over the hook's words. The plan's limit
     /// makes the account full until its reset, though the words didn't say
@@ -5460,9 +5584,16 @@ impl Desk {
             let current = st.turn_failures.get(&id).cloned();
             match (current, said) {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
-                    let standing = Self::standing_mut(&mut st, &account);
-                    standing.hit_until = hit.resets_at.or(standing.hit_until);
-                    standing.hit_window = hit.minutes().or(standing.hit_window);
+                    if hit.reach() == crate::limit::Reach::Plan {
+                        let standing = Self::standing_mut(&mut st, &account);
+                        standing.hit_until = hit.resets_at.or(standing.hit_until);
+                        standing.hit_window = hit.minutes().or(standing.hit_window);
+                    } else {
+                        // Words read as the plan's; the transcript names a
+                        // model's or extra usage: the account isn't full.
+                        Self::undo_mark(&mut st, id);
+                        Self::mark_session_hit(&mut st, id, &account, Some(&hit));
+                    }
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     false
                 }
@@ -5476,22 +5607,13 @@ impl Desk {
                     tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
                     // Only the stop this session marked: another session's
                     // stop on the same account since stands.
-                    if let Some(mark) = st.limit_marks.remove(&id) {
-                        let s = Self::standing_mut(&mut st, &mark.side);
-                        if s.hit_at == Some(mark.at) {
-                            // Back to what the last stop before it said.
-                            (s.hit_at, s.hit_until, s.hit_window) = mark.before;
-                            if let Some(by) = st.written_by.get_mut(&mark.side) {
-                                by.hit = None;
-                            }
-                        }
-                    }
+                    Self::undo_mark(&mut st, id);
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
                     true
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
-                    if standing.hit_at.is_some() {
+                    if standing.hit_at.is_some() && hit.reach() == crate::limit::Reach::Plan {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                         standing.hit_window = hit.minutes().or(standing.hit_window);
                     }

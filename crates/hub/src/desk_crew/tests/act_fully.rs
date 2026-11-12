@@ -11,7 +11,7 @@ use workforce_common::oversight::{Level, Oversight, FULL_NO_BUDGET, FULL_NO_REPO
 const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\nworkflows = [\"deploy.yml\", \"promote.yml\"]\nbudget_usd_per_day = 25\n";
 
-fn git(dir: &Path, args: &[&str]) {
+pub(super) fn git(dir: &Path, args: &[&str]) {
     // Hub-side git is hardened, a test's too.
     let mut git = crate::git_hardening::hardened_git();
     let out = git
@@ -32,7 +32,7 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// A checkout at `dir` on `main`, at the commit `origin`'s `main` is at
 /// (tagged v1.2.0 there), its `origin` at `origin`, holding a deploy script.
-fn repo(dir: &Path, origin: &str) {
+pub(super) fn repo(dir: &Path, origin: &str) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "-q", "-b", "main"]);
     std::fs::write(

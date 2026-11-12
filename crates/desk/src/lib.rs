@@ -52,6 +52,7 @@ pub mod memory;
 pub mod memory_derive_store;
 pub mod memory_index_store;
 pub mod memory_store;
+pub mod mode;
 pub mod model;
 mod move_api;
 pub mod move_store;

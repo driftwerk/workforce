@@ -100,18 +100,40 @@ struct Kept {
     models: Option<Arc<Vec<PlanModel>>>,
     read_at: Option<Instant>,
     tried_at: Instant,
+    /// When a caller last asked for this list.
+    asked_at: Instant,
 }
 
 /// The lists read so far, by plan and login.
 #[derive(Default)]
 pub struct PlanCatalog {
-    lists: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Kept>>,
+    lists: parking_lot::Mutex<HashMap<(&'static str, String), Kept>>,
     /// One read at a time per login: a caller that finds one running waits
     /// for it and takes its list, so cold callers start one CLI, not many.
-    reading: parking_lot::Mutex<HashMap<(SubscriptionKind, String), Arc<tokio::sync::Mutex<()>>>>,
+    reading: parking_lot::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl PlanCatalog {
+    /// Drops the lists nobody has asked for in [`FRESH_FOR`] (a login or key
+    /// since removed), so the catalogue doesn't hold a list, and its read
+    /// gate, for every account it ever saw. `asking` is kept.
+    fn forget_unasked(&self, asking: &(&'static str, String)) {
+        let mut lists = self.lists.lock();
+        let gone: Vec<_> = lists
+            .iter()
+            .filter(|(key, kept)| *key != asking && kept.asked_at.elapsed() >= FRESH_FOR)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let mut reading = self.reading.lock();
+        for key in gone {
+            lists.remove(&key);
+            reading.remove(&key);
+        }
+    }
+
     /// The hub's one catalogue.
     pub fn global() -> &'static Self {
         static CATALOG: LazyLock<PlanCatalog> = LazyLock::new(PlanCatalog::default);
@@ -132,8 +154,28 @@ impl PlanCatalog {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<PlanModel>>>,
     {
-        let key = (kind, login.to_string());
-        let settled = |lists: &HashMap<(SubscriptionKind, String), Kept>| {
+        self.models_of(kind.label(), login, read).await
+    }
+
+    /// [`Self::models`] for any service with a list to keep, by `service`
+    /// name (`"anthropic"` for the models an Anthropic key lists) and the
+    /// account's fingerprint.
+    pub async fn models_of<F, Fut>(
+        &self,
+        service: &'static str,
+        login: &str,
+        read: F,
+    ) -> Option<Arc<Vec<PlanModel>>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<PlanModel>>>,
+    {
+        let key = (service, login.to_string());
+        self.forget_unasked(&key);
+        if let Some(kept) = self.lists.lock().get_mut(&key) {
+            kept.asked_at = Instant::now();
+        }
+        let settled = |lists: &HashMap<(&'static str, String), Kept>| {
             lists.get(&key).and_then(|kept| {
                 let fresh = kept.read_at.is_some_and(|at| at.elapsed() < FRESH_FOR);
                 (fresh || kept.tried_at.elapsed() < RETRY_AFTER).then(|| kept.models.clone())
@@ -155,6 +197,7 @@ impl PlanCatalog {
             models: None,
             read_at: None,
             tried_at: now,
+            asked_at: now,
         });
         kept.tried_at = now;
         match result {
@@ -163,11 +206,11 @@ impl PlanCatalog {
                 kept.read_at = Some(now);
             }
             Ok(_) => tracing::warn!(
-                plan = kind.label(),
+                plan = service,
                 "the plan listed no models: keeping the list Desk had"
             ),
             Err(e) => tracing::warn!(
-                plan = kind.label(),
+                plan = service,
                 error = %format!("{e:#}"),
                 "the plan's models couldn't be read: keeping the list Desk had"
             ),
@@ -226,6 +269,26 @@ pub async fn read_claude(login: &Login, root: &Path) -> Result<Vec<PlanModel>> {
         .collect())
 }
 
+/// `resolved` as a login, or None with the reason in the log: a plan whose
+/// login isn't found lists nothing, and Desk then offers its own table
+/// without saying why. The reason names the plan, never a credential.
+fn unresolved<T, E: std::fmt::Display>(
+    kind: SubscriptionKind,
+    resolved: std::result::Result<T, E>,
+) -> Option<T> {
+    match resolved {
+        Ok(login) => Some(login),
+        Err(e) => {
+            tracing::warn!(
+                plan = kind.label(),
+                reason = %e,
+                "the plan's models weren't asked: its login didn't resolve, so Desk's own list stands"
+            );
+            None
+        }
+    }
+}
+
 /// The ChatGPT models `scope`'s login lists, while the hub calls the
 /// backend at all (`[subscription] chatgpt_direct`).
 pub async fn chatgpt_models(
@@ -235,7 +298,10 @@ pub async fn chatgpt_models(
     if !shared.chatgpt().enabled() {
         return None;
     }
-    let login = scope.resolve(SubscriptionKind::ChatGpt).ok()?;
+    let login = unresolved(
+        SubscriptionKind::ChatGpt,
+        scope.resolve(SubscriptionKind::ChatGpt),
+    )?;
     let key = login.key.fingerprint.clone();
     PlanCatalog::global()
         .models(SubscriptionKind::ChatGpt, &key, || {
@@ -250,7 +316,10 @@ pub async fn claude_models(
     shared: &SharedSubscriptions,
     scope: &CredentialScope,
 ) -> Option<Arc<Vec<PlanModel>>> {
-    let login = scope.resolve(SubscriptionKind::Claude).ok()?;
+    let login = unresolved(
+        SubscriptionKind::Claude,
+        scope.resolve(SubscriptionKind::Claude),
+    )?;
     let key = login.key.fingerprint.clone();
     PlanCatalog::global()
         .models(SubscriptionKind::Claude, &key, || {
@@ -275,6 +344,38 @@ mod tests {
             context_window: None,
             fast: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_list_nobody_has_asked_for_in_a_while_is_forgotten() {
+        let catalog = PlanCatalog::default();
+        let list = |id: &'static str| async move { Ok(vec![model(id)]) };
+        catalog
+            .models_of("anthropic", "key:old", || list("claude-old"))
+            .await
+            .expect("read");
+        catalog
+            .models_of("anthropic", "key:new", || list("claude-new"))
+            .await
+            .expect("read");
+        assert_eq!(catalog.lists.lock().len(), 2);
+        catalog.lists.lock().values_mut().for_each(|kept| {
+            if kept
+                .models
+                .as_ref()
+                .is_some_and(|m| m[0].id == "claude-old")
+            {
+                kept.asked_at = Instant::now().checked_sub(FRESH_FOR * 2).unwrap();
+            }
+        });
+        catalog
+            .models_of("anthropic", "key:new", || list("never-read"))
+            .await
+            .expect("kept");
+        let lists = catalog.lists.lock();
+        assert_eq!(lists.len(), 1, "the unasked list went");
+        assert!(lists.contains_key(&("anthropic", "key:new".to_string())));
+        assert_eq!(catalog.reading.lock().len(), 1, "and its gate");
     }
 
     #[tokio::test]

@@ -36,6 +36,8 @@ const FAMILY_TOPICS: &[(&str, &str)] = &[
     ("help", "reference/remote-mcp"),
     ("pipeline", "concepts/pipelines"),
     ("hubspot", "adapters/hubspot"),
+    ("linear", "adapters/linear"),
+    ("jira", "adapters/jira"),
 ];
 
 #[derive(Debug)]

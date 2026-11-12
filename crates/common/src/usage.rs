@@ -55,6 +55,84 @@ pub fn claude_window(kind: &str) -> Option<u32> {
     }
 }
 
+/// What a limit window stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The plan: every session on the account.
+    Plan,
+    /// One model's own weekly window (`opus`, `sonnet`): that model only.
+    Model(&'static str),
+    /// Extra usage, monthly credits or a spend cap: pay-as-you-go used up,
+    /// which stops no plan session.
+    Credit,
+}
+
+/// Windows that are pay-as-you-go, not the plan's: a closed list, so a name
+/// not known here fails closed as the plan's.
+const CREDIT_WINDOWS: &[&str] = &["overage", "extra_usage", "monthly", "spend_limit"];
+
+/// The models that have a weekly window of their own.
+const MODEL_WINDOWS: &[&str] = &["opus", "sonnet"];
+
+/// What the window a provider names stops. `five_hour`, `seven_day`, Codex's
+/// `primary`/`secondary`, an unnamed window and any name not known here are
+/// the plan's. Shared by the hub and Desk.
+pub fn window_reach(name: Option<&str>) -> Reach {
+    let Some(name) = name else {
+        return Reach::Plan;
+    };
+    if CREDIT_WINDOWS.contains(&name) {
+        return Reach::Credit;
+    }
+    match name.strip_prefix("seven_day_") {
+        Some(model) => MODEL_WINDOWS
+            .iter()
+            .find(|m| **m == model)
+            .map_or(Reach::Plan, |m| Reach::Model(m)),
+        None => Reach::Plan,
+    }
+}
+
+/// Whether a limit window, by name, stops the whole plan.
+pub fn window_stops_plan(name: Option<&str>) -> bool {
+    window_reach(name) == Reach::Plan
+}
+
+/// The non-plan window a Claude Code limit notice names, read only from the
+/// notice's own opening (a line that starts "You're out of extra usage",
+/// "You're out of usage credits", "You've hit your Opus limit"): a plan
+/// limit that merely mentions extra usage ("… /extra-usage to keep going")
+/// or a model anywhere in its text is the plan's.
+pub fn claude_notice_window(text: &str) -> Option<&'static str> {
+    let normal = text.replace(['\u{2018}', '\u{2019}'], "'").to_lowercase();
+    normal.lines().find_map(|line| {
+        let line = line
+            .trim()
+            .trim_start_matches('…')
+            .trim_start_matches("> ")
+            .trim_start();
+        let line = line
+            .strip_prefix("api error:")
+            .map_or(line, str::trim_start);
+        if line.starts_with("you're out of extra usage")
+            || line.starts_with("you're out of usage credits")
+        {
+            return Some("overage");
+        }
+        let rest = line
+            .strip_prefix("you've hit your ")
+            .or_else(|| line.strip_prefix("you've reached your "))?;
+        MODEL_WINDOWS.iter().find_map(|m| {
+            let tail = rest.strip_prefix(m)?;
+            let tail = tail.trim_start();
+            (tail.starts_with("limit") || tail.starts_with("weekly limit")).then_some(match *m {
+                "opus" => "seven_day_opus",
+                _ => "seven_day_sonnet",
+            })
+        })
+    })
+}
+
 /// `windows`, shortest first.
 pub fn ordered(mut windows: Vec<Window>) -> Vec<Window> {
     windows.sort_by_key(|w| w.minutes);
@@ -205,6 +283,36 @@ mod tests {
             "a window without its reset"
         );
         assert!(claude_mod_usage(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn only_the_plans_own_windows_stop_the_plan() {
+        for plan in [None, Some("five_hour"), Some("seven_day"), Some("primary")] {
+            assert!(window_stops_plan(plan), "{plan:?}");
+        }
+        for not in [
+            "overage",
+            "seven_day_opus",
+            "seven_day_sonnet",
+            "extra_usage",
+            "monthly",
+        ] {
+            assert!(!window_stops_plan(Some(not)), "{not}");
+        }
+    }
+
+    #[test]
+    fn extra_usage_and_model_windows_are_not_the_plans_windows() {
+        // The windows Claude Code reports, as the Desk plugin passes them.
+        let limits = json!([
+            {"kind": "five_hour", "percentUsed": 34, "resetsAt": "2026-11-11T13:39:00Z"},
+            {"kind": "seven_day", "percentUsed": 41, "resetsAt": "2026-11-16T09:00:00Z"},
+            {"kind": "seven_day_opus", "percentUsed": 100, "resetsAt": "2026-11-16T09:00:00Z"},
+            {"kind": "extra_usage", "percentUsed": 100, "resetsAt": "2026-12-01T00:00:00Z"}
+        ]);
+        let windows = claude_mod_usage(&limits);
+        assert_eq!(windows.len(), 2, "only the plan's own: {windows:?}");
+        assert!(windows.iter().all(|w| w.used_percent < 100.0));
     }
 
     #[test]

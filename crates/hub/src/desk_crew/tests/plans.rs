@@ -53,7 +53,10 @@ async fn hub_with(
     (overseer, state, d, llm)
 }
 
-const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n";
+/// Act, with `hand_out_work` off: what a plan the person approved starts
+/// runs whatever it says.
+const ACTS: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n";
 
 fn tickets(dir: &Path, n: usize) -> Vec<Value> {
     (1..=n)
@@ -101,7 +104,7 @@ fn started(d: &Desk) -> Vec<workforce_desk::model::SessionView> {
 async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        // `hand_out_work` is off, as it is by default.
+        // `hand_out_work` is off.
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
         let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         eventually("the plan tools", async || {
@@ -182,6 +185,71 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
         })
         .await;
         assert!(d.plan(id).await.unwrap().summary.progress.next.is_empty());
+    })
+    .await;
+}
+
+/// Unbound, a boss's plan is its own to approve: it starts at once, four
+/// of five tickets up to its limit, the fifth when one finishes, and its
+/// changes to the plan apply as they are made.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) =
+            hub_with(dir.path(), pool, super::unbound::UNBOUND).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty(), "nothing waits on the person");
+        let four = eventually("four sessions", async || {
+            let s = started(&d);
+            (s.len() == 4).then_some(s)
+        })
+        .await;
+        let one = four[0].id;
+        let url = hook_url(dir.path(), one).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": one.to_string()}),
+        )
+        .await;
+        eventually("the fifth session", async || {
+            (started(&d).len() == 5).then_some(())
+        })
+        .await;
+
+        // A change of scope applies at once, as the person's would.
+        let before = d.plan(id).await.unwrap().summary.plan.revision;
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id.to_string(), "goal": "Make the whole suite green", "why": "Wider." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], true, "{r:?}");
+        let p = d.plan(id).await.unwrap();
+        assert!(p.summary.plan.revision > before);
+        assert_eq!(p.summary.plan.approved_revision, Some(p.summary.plan.revision));
+        assert!(d.plan_needs().is_empty());
     })
     .await;
 }
@@ -458,7 +526,7 @@ async fn the_approval_counts_only_for_a_running_plan_of_the_bosss_own_and_where_
         let (_overseer, state, d, _llm) = hub_with(
             dir.path(),
             pool,
-            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n[oversight.work]\nparallel = 1\n",
         )
         .await;
         let p = proposed(&d, dir.path(), 2).await;
@@ -642,7 +710,7 @@ async fn the_boss_is_told_in_plain_words_when_the_person_turns_its_change_down()
         let (_overseer, state, d, llm) = hub_with(
             dir.path(),
             pool,
-            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n[oversight.work]\nparallel = 1\n",
         )
         .await;
         let p = proposed(&d, dir.path(), 1).await;

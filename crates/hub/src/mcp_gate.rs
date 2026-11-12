@@ -777,11 +777,14 @@ impl GatedExecutor {
 
     /// `reply` followed by the definitions of the tools its call made
     /// callable on this surface, which the client then reaches through
-    /// `tool.call`. Read after the call, which is what registered them.
+    /// `tool.call`. Read after the call, which is what registered them, and
+    /// taken into the turn's registry first when that only follows the
+    /// agent's.
     fn with_loads(&self, reply: McpReply, loads: &[String]) -> McpReply {
         if loads.is_empty() {
             return reply;
         }
+        self.site.surface.adopt(loads);
         let tools = self.site.surface.now();
         let reachable: Vec<String> = loads.iter().filter(|l| tools.has(l)).cloned().collect();
         match (reachable.is_empty(), reply.content.as_slice()) {

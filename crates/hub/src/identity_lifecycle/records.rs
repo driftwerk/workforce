@@ -927,7 +927,7 @@ impl Holding for AuditRecords {
 /// Stores that keep nothing past a fixed window and cannot be read by
 /// person: traces (keyed by session, rotated), the chat request stream
 /// (7 days), OAuth redirect state (10 minutes), browser profiles (reaped
-/// when idle), task telemetry and Desk's access activity (90 days each).
+/// when idle) and task telemetry (90 days).
 pub struct RetentionBound;
 
 #[async_trait]
@@ -958,6 +958,71 @@ impl Holding for RetentionBound {
         _apply: bool,
     ) -> Result<Tally> {
         Ok(Tally::default())
+    }
+}
+
+/// What agents did on the person's computer through Desk, by every name
+/// they go by: a merge names the one merged into, a delete erases the rows
+/// and the browser screenshots they name at once, not at the 90 days the
+/// activity is otherwise kept, with the grants that name the person.
+pub struct DeskActivity;
+
+#[async_trait]
+impl Holding for DeskActivity {
+    async fn owners(&self, cx: &Context<'_>) -> Result<Owners> {
+        let Some(store) = cx.desk_activity.as_ref() else {
+            return Ok(Owners::default());
+        };
+        Ok(Owners::counted(store.people().await?.into_iter().map(
+            |(name, held)| (name, usize::try_from(held).unwrap_or(usize::MAX)),
+        )))
+    }
+
+    async fn held(&self, cx: &Context<'_>, who: &Person) -> Result<Tally> {
+        let Some(store) = cx.desk_activity.as_ref() else {
+            return Ok(Tally::default());
+        };
+        let mut held = 0u64;
+        for name in &who.names {
+            held += store.held(name).await?;
+        }
+        Ok(Tally::counted(usize::try_from(held).unwrap_or(usize::MAX)))
+    }
+
+    async fn merge(
+        &self,
+        cx: &Context<'_>,
+        from: &Person,
+        into: &Person,
+        apply: bool,
+    ) -> Result<Tally> {
+        let Some(store) = cx.desk_activity.as_ref() else {
+            return Ok(Tally::default());
+        };
+        let mut moved = 0u64;
+        for name in &from.names {
+            moved += store.activity(name).await?;
+            if apply {
+                store.reassign(name, &into.key()).await?;
+            }
+        }
+        Ok(Tally::counted(usize::try_from(moved).unwrap_or(usize::MAX)))
+    }
+
+    async fn delete(
+        &self,
+        cx: &Context<'_>,
+        who: &Person,
+        _: Option<&Person>,
+        apply: bool,
+    ) -> Result<Tally> {
+        let tally = self.held(cx, who).await?;
+        if let (true, Some(store)) = (apply, cx.desk_activity.as_ref()) {
+            for name in &who.names {
+                store.erase(name).await?;
+            }
+        }
+        Ok(tally)
     }
 }
 

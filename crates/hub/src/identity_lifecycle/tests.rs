@@ -38,6 +38,7 @@ pub(super) async fn hub() -> Hub {
         defs: None,
         artifacts: None,
         pictures: None,
+        desk_activity: None,
         external_skills: crate::external_skills::ExternalSkills::shared(&dir.path().join("skills")),
         data_dir: dir.path().to_path_buf(),
         runs: Runs::default(),
@@ -1522,4 +1523,157 @@ async fn a_deleted_persons_check_is_paused_and_a_merged_ones_keeps_running() {
     let merged = check("carols");
     assert_eq!(merged.meta.creator, Some(bob.id.to_string()));
     assert!(merged.meta.enabled);
+}
+
+/// Desk's activity store on `pool`, given to the lifecycle, with the folder
+/// its browser screenshots are kept in.
+#[cfg(feature = "postgres")]
+pub(super) async fn with_desk(
+    hub: &mut Hub,
+    pool: workforce_postgres::PostgresPool,
+) -> (Arc<workforce_desk::DeskStore>, std::path::PathBuf) {
+    let store = Arc::new(workforce_desk::DeskStore::with_pool(pool).await.unwrap());
+    let shots = hub._dir.path().join("shots");
+    std::fs::create_dir_all(&shots).unwrap();
+    hub.lifecycle_mut().desk_activity = Some(Arc::new(crate::desk_browser::LifecycleActivity::of(
+        workforce_desk::computer::Computer::new(Arc::clone(&store)),
+        shots.clone(),
+    )));
+    (store, shots)
+}
+
+/// A row of Desk's activity on `person`'s turn, naming `screenshot` when
+/// it was the browser's.
+#[cfg(feature = "postgres")]
+pub(super) fn desk_row(
+    person: &str,
+    screenshot: Option<&str>,
+) -> workforce_desk::computer::Activity {
+    workforce_desk::computer::Activity {
+        hub: "local".into(),
+        agent: "allan".into(),
+        person: Some(person.into()),
+        session_id: None,
+        request_id: None,
+        kind: if screenshot.is_some() {
+            "browser"
+        } else {
+            "exec"
+        }
+        .into(),
+        doing: "Clicked #save on shop.example".into(),
+        folder: None,
+        connector: None,
+        tool: "browser.click".into(),
+        vault_source: None,
+        decided_by: "rule".into(),
+        outcome: serde_json::json!({"outcome": "ran"}),
+        reason: None,
+        exit_code: None,
+        duration_ms: None,
+        arguments: match screenshot {
+            Some(shot) => serde_json::json!({"tool": "browser.click", "screenshot": shot}),
+            None => serde_json::json!({}),
+        },
+        device: None,
+    }
+}
+
+/// A screenshot kept under `shots`, by the name the browser gives one.
+#[cfg(feature = "postgres")]
+pub(super) fn desk_shot(shots: &std::path::Path) -> String {
+    let shot = format!("{}.png", Uuid::new_v4());
+    std::fs::write(shots.join(&shot), b"png").unwrap();
+    shot
+}
+
+/// What agents did on a person's computer through Desk follows a merge, and
+/// a delete erases it with the browser screenshots it names at once, not at
+/// the 90 days it is otherwise kept; a dry run touches neither.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
+    workforce_postgres::test_support::with_test_pool(
+        workforce_desk::store::build_pool,
+        |pool| async move {
+            let mut hub = hub().await;
+            let (store, shots) = with_desk(&mut hub, pool).await;
+            let (alice, bob, carol) = (
+                hub.person("Alice", "U-A"),
+                hub.person("Bob", "U-B"),
+                hub.person("Carol", "U-C"),
+            );
+            let admin = hub.admin();
+            let shot = desk_shot(&shots);
+            for a in [
+                desk_row(&alice.id.to_string(), Some(&shot)),
+                desk_row("U-A", None),
+                desk_row(&bob.id.to_string(), None),
+                desk_row(&carol.id.to_string(), None),
+            ] {
+                store.record_activity(&a).await.unwrap();
+            }
+            store
+                .add_grant(&workforce_desk::computer::NewGrant {
+                    hub: "local".into(),
+                    agent: "allan".into(),
+                    person: alice.id.to_string(),
+                    ability: workforce_core::computer::Ability::Run,
+                    folder: None,
+                    connector: None,
+                    session_id: None,
+                    expires_at: None,
+                    run: None,
+                    run_name: None,
+                })
+                .await
+                .unwrap();
+
+            let merged = hub
+                .lifecycle
+                .merge(carol.id, bob.id, &admin, false)
+                .await
+                .unwrap();
+            assert!(merged.complete, "{merged:#?}");
+            assert_eq!(
+                Hub::category(&merged, Category::DeskActivity).tally.count,
+                1
+            );
+            assert_eq!(store.activity_of(&bob.id.to_string()).await.unwrap(), 2);
+            assert_eq!(store.activity_of(&carol.id.to_string()).await.unwrap(), 0);
+
+            let preview = hub
+                .lifecycle
+                .delete(alice.id, &DeletePlan::default(), &admin, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                Hub::category(&preview, Category::DeskActivity).tally.count,
+                3,
+                "the dry run counts the grant the erase takes too"
+            );
+            assert!(shots.join(&shot).exists(), "a dry run erases nothing");
+            assert_eq!(store.activity_of(&alice.id.to_string()).await.unwrap(), 1);
+
+            let report = hub
+                .lifecycle
+                .delete(alice.id, &DeletePlan::default(), &admin, false)
+                .await
+                .unwrap();
+            assert!(report.complete, "{report:#?}");
+            assert_eq!(
+                Hub::category(&report, Category::DeskActivity).rules.delete,
+                DeleteRule::Erase
+            );
+            assert!(!shots.join(&shot).exists(), "the screenshot goes with it");
+            assert_eq!(store.activity_of(&alice.id.to_string()).await.unwrap(), 0);
+            assert_eq!(store.activity_of("U-A").await.unwrap(), 0);
+            assert_eq!(
+                store.access_people().await.unwrap(),
+                [(bob.id.to_string(), 2)],
+                "another person's activity stays"
+            );
+        },
+    )
+    .await;
 }

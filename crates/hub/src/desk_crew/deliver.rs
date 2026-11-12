@@ -90,6 +90,10 @@ impl CrewHub {
                 bail!("{busy}");
             }
         };
+        // The crew's own wake-up, by name, for as long as its turn runs:
+        // named only once the turn is the crew's (a session busy with the
+        // person's own turn is never named).
+        let _wake = crate::desk_browser::CrewWake::begin(&sid);
         let _ = tx.send(BroadcastMessage::new(sid.clone(), "typing", String::new()));
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),

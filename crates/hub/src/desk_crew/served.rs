@@ -95,6 +95,7 @@ pub fn act_of(act: &Value) -> Act {
         message_terminal_sessions: on("message_terminal_sessions"),
         answer_sessions: on("answer_sessions"),
         hand_off: on("hand_off"),
+        set_mode: on("set_mode"),
     }
 }
 
@@ -205,11 +206,15 @@ pub fn served_oversight(g: &Grant) -> Oversight {
             message_agents: false,
             message_terminal_sessions: false,
             hand_off: false,
+            // A session's mode is this hub's person's to loosen.
+            set_mode: false,
         },
         full: Full {
             repos: g.repos.clone(),
             budget_cents_per_day: None,
             workflows: Vec::new(),
+            // Never anywhere: a served boss ships only where it is granted.
+            anywhere: false,
         },
         ..Oversight::default()
     };
@@ -641,7 +646,7 @@ impl CrewHub {
             }
         }
         let by = By::manager(boss, &boss_name(g), reason);
-        match self.gate_as(&action, o, Some(boss)) {
+        match self.gate_as(&action, o, Some(boss), true) {
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }

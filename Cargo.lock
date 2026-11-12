@@ -11972,6 +11972,7 @@ dependencies = [
  "uuid",
  "vt100",
  "workforce-build-support",
+ "workforce-common",
  "workforce-core",
  "workforce-postgres",
 ]
@@ -12643,6 +12644,7 @@ dependencies = [
  "http 1.4.0",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "lru 0.18.5",
  "mailparse",
  "open",

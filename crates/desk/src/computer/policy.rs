@@ -114,6 +114,42 @@ pub struct Connectors {
     pub read_only: Vec<String>,
 }
 
+/// Where the agent stands in a browser (`browser.*`): reading is free at
+/// every level; what changes a page asks first below unbound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Browsing {
+    /// Changing a page asks first, unless a session allowance for the site
+    /// or Full access that never asks covers it. Every agent but an
+    /// overseer, and an overseer at Act or Act fully short of unbound.
+    #[default]
+    Asks,
+    /// An overseer at Watch or Suggest: it only suggests what to do on a
+    /// page, so changing one is refused.
+    Suggests,
+    /// An unbound overseer (Act fully, anywhere, every switch on): it acts
+    /// on pages freely, recorded, until a page it reads turns hostile.
+    Unbound,
+}
+
+/// The agent's browser, as the gate found it for this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Browser {
+    pub browsing: Browsing,
+    /// A page its browser read scanned as hostile: it is back to asking,
+    /// once each time, whatever its standing or allowances.
+    pub hostile: bool,
+}
+
+/// The connector a browser call is kept under: `browser:<origin>`
+/// (`browser:https://shop.example`), so "Allow for this session" holds for
+/// one origin; `browser` alone for a page with none.
+pub fn browser_site(origin: Option<&str>) -> String {
+    match origin.filter(|o| !o.is_empty()) {
+        Some(o) => format!("browser:{o}"),
+        None => "browser".to_string(),
+    }
+}
+
 /// Everything the verdict knows about the agent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPolicy {
@@ -146,6 +182,8 @@ pub struct AgentPolicy {
     pub contained: bool,
     /// `None` keeps today's behaviour: every connector is on.
     pub connectors: Option<Connectors>,
+    /// Its browser: how far it acts on pages.
+    pub browser: Browser,
 }
 
 /// The job or workflow run a call is made in, for a grant held by one.
@@ -451,6 +489,11 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     if call.effect == Effect::None {
         return Verdict::Run { by: By::Rule };
     }
+    // A browser: its own rules, by where the agent stands.
+    // (A browser opening a file reads it: the rules below decide that.)
+    if call.tool.starts_with("browser.") && matches!(call.effect, Effect::Connector { .. }) {
+        return browsing(p, grants, call);
+    }
     let connector = match &call.effect {
         Effect::Connector { connector, write } => Some((connector.as_str(), *write)),
         _ => None,
@@ -661,4 +704,125 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     }
     choices.push(Choice::Deny);
     ask(choices, why)
+}
+
+/// The grant that covers writes to exactly `connector` for this call, if
+/// one does: a standing one first, then a session's.
+fn site_granted(
+    p: &AgentPolicy,
+    grants: &[Grant],
+    call: &CallFacts,
+    connector: &str,
+) -> Option<By> {
+    let mut found = grants.iter().filter(|g| {
+        g.hub == p.hub
+            && g.agent == p.agent
+            && call.person.as_deref() == Some(g.person.as_str())
+            && g.ability == Ability::ConnectorWrite
+            && g.connector.as_deref() == Some(connector)
+            && g.run
+                .as_ref()
+                .is_none_or(|run| call.run.as_ref() == Some(run))
+            && g.session_id
+                .as_ref()
+                .is_none_or(|s| call.session_id.as_ref() == Some(s))
+    });
+    let standing = found.clone().find(|g| g.session_id.is_none());
+    standing
+        .or_else(|| found.next())
+        .map(|g| match g.session_id {
+            Some(_) => By::Session(g.id),
+            None => By::Grant(g.id),
+        })
+}
+
+/// Allow once, for this session where there is one, or Deny.
+fn once_or_session(call: &CallFacts, why: Why) -> Verdict {
+    let mut choices = vec![Choice::AllowOnce];
+    if call.session_id.is_some() {
+        choices.push(Choice::AllowSession);
+    }
+    choices.push(Choice::Deny);
+    ask(choices, why)
+}
+
+/// The verdict on a `browser.*` call. Reading (a snapshot, a screenshot, a
+/// navigation) runs. Changing a page (a click, typing, a key, a script, an
+/// upload) runs for an unbound overseer, is refused for one that only
+/// suggests, and otherwise asks, unless Full access that never asks or a
+/// session allowance for the site covers it. After a hostile page it asks
+/// every time, offering Allow once only.
+///
+/// In the person's own Chrome (`chrome…`) it asks first, once a session,
+/// before using it at all ("Desk wants to use your Chrome"), and before
+/// opening each new site there; an overseer that only suggests doesn't use
+/// it, and an unbound one asks nothing.
+fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
+    let (connector, write) = match &call.effect {
+        Effect::Connector { connector, write } => (connector.as_str(), *write),
+        _ => ("browser", true),
+    };
+    let theirs = connector == "chrome"
+        || connector.starts_with("chrome:")
+        || connector.starts_with("chrome-visit:");
+    let hostile = p.browser.hostile;
+    // After a hostile page, going anywhere new asks too: the page may be
+    // sending it there. Allow once only, unbound included.
+    if hostile && (write || call.tool == "browser.navigate") {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
+    }
+    match p.browser.browsing {
+        Browsing::Unbound => return Verdict::Run { by: By::Rule },
+        Browsing::Suggests if theirs => {
+            return refuse(
+                Refused::OutsideLevel,
+                format!(
+                    "{} doesn't use the person's own Chrome at its oversight level. Use Desk's own browser to look, and say what you would do.",
+                    p.name
+                ),
+            )
+        }
+        Browsing::Suggests if write => {
+            return refuse(
+                Refused::OutsideLevel,
+                format!(
+                    "{} only suggests what to do on a page at its oversight level, so nothing was clicked or typed. Say what you would do instead.",
+                    p.name
+                ),
+            )
+        }
+        _ => {}
+    }
+    if theirs {
+        if site_granted(p, grants, call, "chrome").is_none() {
+            return once_or_session(call, Why::TheirChrome);
+        }
+        if connector.starts_with("chrome-visit:") {
+            return match site_granted(p, grants, call, connector) {
+                Some(by) => Verdict::Run { by },
+                None => once_or_session(call, Why::NewSite),
+            };
+        }
+    }
+    if !write {
+        return Verdict::Run { by: By::Rule };
+    }
+    // A script can do anything on the page, past what a site's allowance
+    // and the never-list read: below unbound it is asked about each time,
+    // whatever else would let it run.
+    if call.tool == "browser.evaluate" {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::Unclear);
+    }
+    if p.access.access == Access::Full && p.access.asks == Asking::Never {
+        return Verdict::Run { by: By::Rule };
+    }
+    if let Some(by) = site_granted(p, grants, call, connector) {
+        return Verdict::Run { by };
+    }
+    // An allowance for the session holds for one origin; a page with none
+    // of its own (blank, inline, a file) shares none.
+    match connector.contains("://") {
+        true => once_or_session(call, Why::OnAPage),
+        false => ask(vec![Choice::AllowOnce, Choice::Deny], Why::OnAPage),
+    }
 }

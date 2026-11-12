@@ -291,6 +291,25 @@ impl DeskStore {
             .await?)
     }
 
+    /// Drops every "Allow for this session" a browser holds, for `agent` or
+    /// for every agent: the person pressed Stop on it.
+    pub async fn forget_browser_grants(&self, agent: Option<&str>) -> Result<u64> {
+        let client = self.pool().get().await?;
+        self.access_changed();
+        Ok(client
+            .execute(
+                "DELETE FROM access_grants
+                  WHERE session_id IS NOT NULL
+                    AND (connector IN ('browser', 'chrome')
+                         OR connector LIKE 'browser:%'
+                         OR connector LIKE 'chrome:%'
+                         OR connector LIKE 'chrome-visit:%')
+                    AND ($1::TEXT IS NULL OR agent = $1)",
+                &[&agent],
+            )
+            .await?)
+    }
+
     pub async fn record_activity(&self, a: &Activity) -> Result<Uuid> {
         let id = Uuid::new_v4();
         let client = self.pool().get().await?;
@@ -363,8 +382,108 @@ impl DeskStore {
         Ok(activity + grants)
     }
 
-    /// Erases what is kept of `person`: their grants and the activity of
-    /// their turns.
+    /// Drops the browser's "Allow for this session" answers `agent` holds in
+    /// the conversation keyed `session`: the person pressed Stop there.
+    pub async fn forget_browser_grants_in(&self, agent: &str, session: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        self.access_changed();
+        Ok(client
+            .execute(
+                "DELETE FROM access_grants
+                  WHERE agent = $1 AND session_id = $2
+                    AND (connector IN ('browser', 'chrome')
+                         OR connector LIKE 'browser:%'
+                         OR connector LIKE 'chrome:%'
+                         OR connector LIKE 'chrome-visit:%')",
+                &[&agent, &session],
+            )
+            .await?)
+    }
+
+    /// Everyone [`Self::erase_access_person`] would erase something of,
+    /// with how many rows each (activity and grants): what the identity
+    /// lifecycle diffs against the people it knows.
+    pub async fn access_people(&self) -> Result<Vec<(String, u64)>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT person, count(*) FROM (
+                     SELECT person FROM access_activity WHERE person IS NOT NULL
+                     UNION ALL
+                     SELECT person FROM access_grants
+                 ) held GROUP BY person ORDER BY person",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let held: i64 = r.try_get(1)?;
+                Ok((r.try_get(0)?, u64::try_from(held).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// How many rows [`Self::erase_access_person`] would erase of `person`:
+    /// their activity and their grants.
+    pub async fn access_of(&self, person: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        let held: i64 = client
+            .query_one(
+                "SELECT (SELECT count(*) FROM access_activity WHERE person = $1)
+                      + (SELECT count(*) FROM access_grants WHERE person = $1)",
+                &[&person],
+            )
+            .await?
+            .try_get(0)?;
+        Ok(u64::try_from(held).unwrap_or(0))
+    }
+
+    /// How many rows of activity name `person`.
+    pub async fn activity_of(&self, person: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        let held: i64 = client
+            .query_one(
+                "SELECT count(*) FROM access_activity WHERE person = $1",
+                &[&person],
+            )
+            .await?
+            .try_get(0)?;
+        Ok(u64::try_from(held).unwrap_or(0))
+    }
+
+    /// Names `into` on the activity that named `from`: one person merged
+    /// into another.
+    pub async fn move_activity_person(&self, from: &str, into: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE access_activity SET person = $2 WHERE person = $1",
+                &[&from, &into],
+            )
+            .await?)
+    }
+
+    /// The screenshots `person`'s browser activity names, for erasing with
+    /// it ([`Self::erase_access_person`]).
+    pub async fn browser_shots_of(&self, person: &str) -> Result<Vec<String>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT arguments->>'screenshot' FROM access_activity
+                  WHERE person = $1 AND kind = 'browser' AND arguments ? 'screenshot'",
+                &[&person],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.try_get::<_, Option<String>>(0).ok().flatten())
+            .collect())
+    }
+
+    /// Erases what is kept of `person`: the activity of their turns, and
+    /// their grants too. A grant names the one person whose Desk this is,
+    /// so erasing that person leaves nobody for it to stand for; the
+    /// identity lifecycle's tally counts both ([`Self::access_of`]).
     pub async fn erase_access_person(&self, person: &str) -> Result<u64> {
         let client = self.pool().get().await?;
         self.access_changed();
@@ -503,6 +622,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_the_browser_forgets_its_session_allowances_only() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let site = |agent: &str, connector: &str, session: Option<&str>| NewGrant {
+                ability: Ability::ConnectorWrite,
+                folder: None,
+                connector: Some(connector.into()),
+                ..new_grant(agent, session, Some(Utc::now() + Duration::hours(12)))
+            };
+            store
+                .add_grant(&site("allan", "browser:shop.example", Some("s1")))
+                .await
+                .unwrap();
+            store
+                .add_grant(&site("ben", "browser:docs.example", Some("s2")))
+                .await
+                .unwrap();
+            for theirs in ["chrome", "chrome-visit:bank.test"] {
+                store
+                    .add_grant(&site("ben", theirs, Some("s2")))
+                    .await
+                    .unwrap();
+            }
+            let linear = store
+                .add_grant(&site("allan", "linear", Some("s1")))
+                .await
+                .unwrap();
+            let standing = store
+                .add_grant(&new_grant("allan", None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(store.forget_browser_grants(Some("allan")).await.unwrap(), 1);
+            assert_eq!(store.forget_browser_grants(None).await.unwrap(), 3);
+            let mut left: Vec<Uuid> = store
+                .live_grants("local", "allan")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+            left.sort();
+            let mut kept = vec![linear.id, standing.id];
+            kept.sort();
+            assert_eq!(left, kept, "another connector and standing grants stay");
+        })
+        .await;
+    }
+
+    /// A turn's own Stop drops what that conversation allowed the browser,
+    /// and nothing else; a person's browser screenshots are found to erase.
+    #[tokio::test]
+    async fn a_turns_stop_forgets_its_conversations_browser_allowances_only() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let site = |agent: &str, connector: &str, session: &str| NewGrant {
+                ability: Ability::ConnectorWrite,
+                folder: None,
+                connector: Some(connector.into()),
+                ..new_grant(agent, Some(session), Some(Utc::now() + Duration::hours(12)))
+            };
+            for g in [
+                site("allan", "browser:https://shop.example", "desk:allan"),
+                site("allan", "browser:https://shop.example", "desk:other"),
+                site("allan", "linear", "desk:allan"),
+                site("ben", "browser:https://shop.example", "desk:allan"),
+            ] {
+                store.add_grant(&g).await.unwrap();
+            }
+            assert_eq!(
+                store
+                    .forget_browser_grants_in("allan", "desk:allan")
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(store.live_grants("local", "allan").await.unwrap().len(), 2);
+            assert_eq!(store.live_grants("local", "ben").await.unwrap().len(), 1);
+
+            let mut shot = activity("allan", "browser", "sarah");
+            shot.arguments = json!({"tool": "browser.click", "screenshot": "a.png"});
+            store.record_activity(&shot).await.unwrap();
+            store
+                .record_activity(&activity("allan", "exec", "sarah"))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.browser_shots_of("sarah").await.unwrap(),
+                vec!["a.png".to_string()]
+            );
+            assert!(store.browser_shots_of("tom").await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn activity_pages_newest_first_prunes_and_erases_by_person() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
@@ -551,7 +768,24 @@ mod tests {
                 .add_grant(&new_grant("allan", None, None))
                 .await
                 .unwrap();
+            assert_eq!(
+                store.access_people().await.unwrap(),
+                [("sarah".to_string(), 3), ("tom".to_string(), 1)],
+                "sarah's two rows of activity and her grant"
+            );
+            assert_eq!(store.activity_of("sarah").await.unwrap(), 2);
+            assert_eq!(store.access_of("sarah").await.unwrap(), 3);
+            assert_eq!(
+                store.move_activity_person("tom", "thomas").await.unwrap(),
+                1
+            );
+            assert_eq!(store.activity_of("tom").await.unwrap(), 0);
+            assert_eq!(
+                store.move_activity_person("thomas", "tom").await.unwrap(),
+                1
+            );
             assert_eq!(store.erase_access_person("sarah").await.unwrap(), 3);
+            assert_eq!(store.activity_of("sarah").await.unwrap(), 0);
             let left = store.activity(&ActivityFilter::default()).await.unwrap();
             assert_eq!(left.len(), 1);
             assert_eq!(left[0].activity.person.as_deref(), Some("tom"));
