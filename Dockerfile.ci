@@ -3,8 +3,8 @@ FROM debian:trixie-slim
 # ─── Layer-cache contract ─────────────────────────────────────────────────────
 # Every layer down to "Application" is cached in the registry
 # (the release pipeline's build cache) and only rebuilds when its instruction
-# changes. That FREEZES the unpinned installs below (apt packages, claude-code,
-# chromium) at whatever version the cache holds — bump CACHE_EPOCH to force a
+# changes. That FREEZES the unpinned installs below (apt packages, claude-code)
+# at whatever version the cache holds — bump CACHE_EPOCH to force a
 # full tooling rebuild and pick up new versions.
 ARG CACHE_EPOCH=2026-06-04
 
@@ -77,11 +77,6 @@ RUN set -eux; \
     install -m 0755 "/tmp/typst-${target}/typst" /usr/local/bin/typst; \
     rm -rf /tmp/typst.tar.xz "/tmp/typst-${target}" /var/lib/apt/lists/*; \
     typst --version
-
-# ─── Chromium (headless browser for the `browser` skill via CDP) ─────────────
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium \
-    && rm -rf /var/lib/apt/lists/*
 
 # ─── Claude Code CLI (used by coding.claude tool + claude-code workflow engine) ─
 # Pinned: an unpinned install silently crossing CC's 2.1.69 schema-deferral
