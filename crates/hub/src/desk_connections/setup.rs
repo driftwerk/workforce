@@ -184,7 +184,6 @@ fn site_origin(service: &str, raw: &str) -> Result<String, String> {
     })
 }
 
-
 fn metabase_origin(fields: &BTreeMap<String, String>) -> Option<String> {
     let site = super::check::address(fields.get("site_url")?);
     workforce_skills::adapters::browser::origin_of(&site)
