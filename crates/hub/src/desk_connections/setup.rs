@@ -111,8 +111,11 @@ struct Recipe {
     page: fn(&BTreeMap<String, String>) -> Option<String>,
     /// The origins a key of it may be read on.
     origins: fn(&BTreeMap<String, String>) -> Vec<String>,
-    /// The paths there, by prefix.
+    /// The paths there: each, or one below it, whole segments only.
     paths: &'static [&'static str],
+    /// Whether a path may start with one segment of the account's own (a
+    /// Linear workspace's) before them.
+    workspace_segment: bool,
     /// Whether a value is shaped like `field`'s.
     shaped: fn(&str, &str) -> bool,
     where_label: Option<&'static str>,
@@ -195,6 +198,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             page: |_| Some("https://id.atlassian.com/manage-profile/security/api-tokens".into()),
             origins: |_| vec!["https://id.atlassian.com".into()],
             paths: &["/manage-profile/security/api-tokens"],
+            workspace_segment: false,
             shaped: |_, v| plain_token(v, 24),
             where_label: Some("Find your Atlassian site"),
             page_label: "Open id.atlassian.com › Security › API tokens",
@@ -204,7 +208,10 @@ fn recipe(service: &str) -> Option<Recipe> {
         "linear" => Recipe {
             page: |_| Some("https://linear.app/settings/account/security".into()),
             origins: |_| vec!["https://linear.app".into()],
+            // Linear's settings sit under the workspace's own segment:
+            // `/acme/settings/account/security`.
             paths: &["/settings/account/security", "/settings/api"],
+            workspace_segment: true,
             shaped: |_, v| v.starts_with("lin_api_") && plain_token(v, 20),
             where_label: None,
             page_label: "Open Linear › Settings › Security & access",
@@ -219,6 +226,7 @@ fn recipe(service: &str) -> Option<Recipe> {
                 "/organization-settings/application-keys",
                 "/personal-settings/application-keys",
             ],
+            workspace_segment: false,
             shaped: |field, v| {
                 let hex = v.chars().all(|c| c.is_ascii_hexdigit());
                 match field {
@@ -237,6 +245,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             },
             origins: |f| metabase_origin(f).into_iter().collect(),
             paths: &["/admin/settings/authentication/api-keys"],
+            workspace_segment: false,
             shaped: |_, v| v.starts_with("mb_") && plain_token(v, 16),
             where_label: Some("Find your Metabase address"),
             page_label: "Open Metabase › Admin › Authentication › API keys",
@@ -247,6 +256,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             page: |_| Some("https://github.com/settings/personal-access-tokens/new".into()),
             origins: |_| vec!["https://github.com".into()],
             paths: &["/settings/tokens", "/settings/personal-access-tokens"],
+            workspace_segment: false,
             shaped: |_, v| {
                 (v.starts_with("github_pat_") || v.starts_with("ghp_")) && plain_token(v, 20)
             },
@@ -382,7 +392,41 @@ pub struct Caller {
 pub struct KeyPage {
     pub origin: String,
     pub paths: Vec<&'static str>,
+    /// Whether one segment of the account's own may come first (Linear's
+    /// `/acme/settings/account/security`).
+    pub workspace_segment: bool,
     pub fields: Vec<&'static str>,
+}
+
+impl KeyPage {
+    /// Whether `path` is one of this page's: one of [`Self::paths`] or
+    /// below it, by whole segments, after the account's own segment where
+    /// one may come first.
+    pub fn holds(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        let under = |path: &str| {
+            self.paths.iter().any(|p| {
+                path == *p
+                    || path
+                        .strip_prefix(p)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        if under(path) {
+            return true;
+        }
+        self.workspace_segment
+            && path
+                .strip_prefix('/')
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(segment, rest)| {
+                    !segment.is_empty()
+                        && segment
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                        && under(&format!("/{rest}"))
+                })
+    }
 }
 
 /// What a key handed to [`Setups::keep_key`] came to: never any of it.
@@ -392,9 +436,13 @@ pub struct KeptKey {
     pub connector: &'static str,
     pub field: &'static str,
     pub length: usize,
-    /// `passed`, `failed`, or `still needs <field>`.
+    /// `ready`: every key is held, for the agent to check with
+    /// `connections.test`; or `still needs <field>`.
     pub test: String,
 }
+
+/// What the gate's question says of what the hub couldn't resolve.
+const UNKNOWN: &str = "unknown";
 
 /// The hub's facts about callers.
 pub trait Callers: Send + Sync {
@@ -645,8 +693,8 @@ impl Setups {
         format!(
             "1. Keep {} with connections.keep (ask the person if you can't tell).\n\
              2. Open {} in your browser. If it asks to sign in, mark step sign_in waiting with connections.step and tell the person: they sign in themselves. Never type or read a password.\n\
-             3. Once signed in, make the key (name it like \"Desk · {}\") with browser.click. The page hides keys from you: read {} with browser.capture_key (the element that shows it, and this service), which keeps it for this setup and tests it. The key never comes back to you.\n\
-             4. Then connections.use to turn it on.",
+             3. Once signed in, make the key (name it like \"Desk · {}\") with browser.click. The page hides keys from you: read {} with browser.capture_key (the element that shows it, and this service), which keeps it for this setup. The key never comes back to you.\n\
+             4. Check it with connections.test (the person allows it), then connections.use to turn it on.",
             if plain.is_empty() { "nothing".to_string() } else { plain.join(", ") },
             page.unwrap_or_else(|| "the service's key page".into()),
             view.name,
@@ -779,6 +827,7 @@ impl Setups {
             Ok(KeyPage {
                 origin,
                 paths: recipe.paths.to_vec(),
+                workspace_segment: recipe.workspace_segment,
                 fields: c
                     .fields
                     .iter()
@@ -794,8 +843,9 @@ impl Setups {
     /// `read_path` for the setup `caller`'s conversation is running for
     /// `connector`: its `field` (the next one still to read where none is
     /// named). The page must be the setup's key page, and the value shaped
-    /// like that service's key; otherwise it is dropped. Once every key is
-    /// held, the connection is tested and kept on a pass. What comes back
+    /// like that service's key; otherwise it is dropped. Nothing is sent
+    /// anywhere: once every key is held, the agent checks it with
+    /// `connections.test`, which asks the person first. What comes back
     /// holds none of it.
     pub async fn keep_key(
         &self,
@@ -814,7 +864,7 @@ impl Setups {
         let page = self
             .key_page(caller, connector)
             .ok_or("That setup has ended.")?;
-        if read_origin != page.origin || !page.paths.iter().any(|p| read_path.starts_with(p)) {
+        if read_origin != page.origin || !page.holds(read_path) {
             return Err("That wasn't the service's own key page, so nothing was kept.".into());
         }
         let c = catalog::find(connector).expect("in the catalog");
@@ -874,10 +924,7 @@ impl Setups {
                     .unwrap_or_default();
                 format!("still needs {}", left.join(" and "))
             }
-            true => match self.test(caller, &id).await {
-                Ok(_) => "passed".into(),
-                Err(_) => "failed".into(),
-            },
+            true => format!("ready: check it with connections.test (setup {id})"),
         };
         Ok(KeptKey {
             kept: true,
@@ -1187,20 +1234,24 @@ impl Setups {
         let setups = self.setups.lock().expect("setups poisoned");
         let s = setups.get(id)?;
         let c = catalog::find(s.service)?;
+        // Where its key goes, as the hub checks it: never the words it
+        // was kept with.
         let host = recipe(s.service)
             .and_then(|r| match s.service {
-                "jira" => s.fields.get("site").cloned(),
-                "metabase" => s.fields.get("site_url").cloned(),
+                "jira" => s
+                    .fields
+                    .get("site")
+                    .and_then(|f| site_origin("jira", f).ok()),
+                "metabase" => s
+                    .fields
+                    .get("site_url")
+                    .and_then(|f| site_origin("metabase", f).ok()),
                 "datadog" => Some(datadog_web(&s.fields)),
                 _ => (r.origins)(&s.fields).into_iter().next(),
             })
             .map(|h| h.trim_start_matches("https://").to_string());
         let whom = match &s.for_agent {
-            Some(a) => self
-                .connections
-                .agents
-                .get(a)
-                .map_or_else(|| a.clone(), |a| a.name),
+            Some(a) => self.agent_name(a),
             None => "all the person's agents".into(),
         };
         Some(Described {
@@ -1210,6 +1261,86 @@ impl Setups {
             whom,
             for_agent: s.for_agent.clone(),
         })
+    }
+
+    /// Agent `id`'s name as the hub has it; `unknown` for none.
+    fn agent_name(&self, id: &str) -> String {
+        self.connections
+            .agents
+            .get(id)
+            .map_or_else(|| UNKNOWN.to_string(), |a| a.name)
+    }
+
+    /// What `connections.use` named, as the hub resolves it, for the
+    /// gate's question: the connection (`Linear · acme`) and the agent;
+    /// `unknown` for what doesn't resolve.
+    pub(super) fn use_described(
+        &self,
+        caller: Option<&Caller>,
+        service: Option<&str>,
+        connection: Option<&str>,
+        agent: Option<&str>,
+    ) -> (String, String) {
+        let c = service.and_then(catalog::find);
+        let what = match (c, caller, connection) {
+            (Some(c), Some(caller), Some(named)) => match self.find(c, &caller.person, named) {
+                Ok(id) => format!("{} · {}", c.name, id.rsplit('~').next().unwrap_or(UNKNOWN)),
+                Err(_) => format!("{} · {UNKNOWN}", c.name),
+            },
+            (Some(c), _, _) => format!("{} · {UNKNOWN}", c.name),
+            _ => UNKNOWN.to_string(),
+        };
+        let whom = match agent.map(str::trim).filter(|a| !a.is_empty()) {
+            None | Some("me") => match caller {
+                Some(caller) => self.agent_name(&caller.agent),
+                None => UNKNOWN.into(),
+            },
+            Some(name) => self
+                .callers
+                .agent_named(name)
+                .map_or_else(|| UNKNOWN.to_string(), |id| self.agent_name(&id)),
+        };
+        (what, whom)
+    }
+
+    /// What `connections.keep` would keep, as the hub resolves it, for the
+    /// gate's question: the field's label and, for where the key goes, the
+    /// address it checks; any other value by its length.
+    pub(super) fn keep_described(
+        &self,
+        id: &str,
+        field: Option<&str>,
+        value: Option<&str>,
+    ) -> String {
+        let setups = self.setups.lock().expect("setups poisoned");
+        let Some(s) = setups.get(id) else {
+            return UNKNOWN.into();
+        };
+        let Some(f) = catalog::find(s.service)
+            .and_then(|c| c.fields.iter().find(|f| Some(f.name) == field && !f.secret))
+        else {
+            return UNKNOWN.into();
+        };
+        let value = value.unwrap_or_default();
+        let shown = match (s.service, f.name) {
+            ("jira", "site") | ("metabase", "site_url") => site_origin(s.service, value)
+                .map_or_else(
+                    |_| UNKNOWN.to_string(),
+                    |o| o.trim_start_matches("https://").to_string(),
+                ),
+            ("datadog", "site") => {
+                let mut fields = BTreeMap::new();
+                fields.insert("site".to_string(), value.to_string());
+                match DATADOG_SITES.contains(&value.trim()) {
+                    true => datadog_web(&fields)
+                        .trim_start_matches("https://")
+                        .to_string(),
+                    false => UNKNOWN.into(),
+                }
+            }
+            _ => format!("{} characters", value.chars().count()),
+        };
+        format!("{}: {shown}", f.label)
     }
 
     /// The person's setups, for the card: every one of `agent`'s, or all.
@@ -1577,20 +1708,23 @@ impl Tool for SetupTool {
     /// The question names what is set up, where its key goes, and for
     /// whom, from the setup's own record.
     fn approval_summary(&self, input: &Value) -> Option<String> {
-        let d = text(input, "setup").and_then(|id| installed().and_then(|s| s.described(&id)));
+        let setups = installed();
+        let d = text(input, "setup").and_then(|id| setups.as_ref().and_then(|s| s.described(&id)));
         let what = |d: &Described| format!("{} · {}", d.service, d.name);
-        let to = |d: &Described| d.host.clone().unwrap_or_else(|| d.service.to_lowercase());
+        let to = |d: &Described| d.host.clone().unwrap_or_else(|| UNKNOWN.into());
         Some(match (self.name, &d) {
             ("connections.keep", Some(d)) => format!(
-                "Keep {} for {}'s setup ({}): {}",
-                text(input, "field").unwrap_or_default(),
+                "Keep {} for {}'s setup ({})",
+                setups.as_ref().map_or_else(
+                    || UNKNOWN.to_string(),
+                    |s| s.keep_described(
+                        &text(input, "setup").unwrap_or_default(),
+                        text(input, "field").as_deref(),
+                        text(input, "value").as_deref(),
+                    )
+                ),
                 what(d),
                 d.whom,
-                text(input, "value")
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect::<String>()
             ),
             ("connections.test", Some(d)) => format!(
                 "Send the new {} key to {} to check it, and keep it for {}",
@@ -1598,21 +1732,31 @@ impl Tool for SetupTool {
                 to(d),
                 d.whom
             ),
-            ("connections.use", _) => format!(
-                "Turn {} on for {}{}",
-                d.as_ref()
-                    .map(what)
-                    .or_else(|| text(input, "connection"))
-                    .or_else(|| text(input, "service"))
-                    .unwrap_or_else(|| "the connection".into()),
-                text(input, "agent")
-                    .or_else(|| d.as_ref().map(|d| d.whom.clone()))
-                    .unwrap_or_else(|| "itself".into()),
-                match input.get("write").and_then(Value::as_bool) {
-                    Some(true) => ", read and write",
-                    _ => ", read only",
-                }
-            ),
+            ("connections.use", _) => {
+                let (named, whom) = setups.as_ref().map_or_else(
+                    || (UNKNOWN.to_string(), UNKNOWN.to_string()),
+                    |s| {
+                        s.use_described(
+                            self.caller(s).as_ref(),
+                            text(input, "service").as_deref(),
+                            text(input, "connection").as_deref(),
+                            text(input, "agent").as_deref(),
+                        )
+                    },
+                );
+                format!(
+                    "Turn {} on for {}{}",
+                    d.as_ref().map(what).unwrap_or(named),
+                    match (&d, text(input, "agent")) {
+                        (Some(d), None) => d.whom.clone(),
+                        _ => whom,
+                    },
+                    match input.get("write").and_then(Value::as_bool) {
+                        Some(true) => ", read and write",
+                        _ => ", read only",
+                    }
+                )
+            }
             ("connections.setup", _) if text(input, "service").as_deref() == Some("github") => {
                 "Start GitHub's sign-in for a new connection".into()
             }

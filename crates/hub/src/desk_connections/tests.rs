@@ -1896,7 +1896,11 @@ mod setups {
             )
             .await
             .unwrap();
-        assert_eq!((kept.test.as_str(), kept.length), ("passed", GOOD.len()));
+        // Held, not sent: the check is connections.test's, which asks.
+        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+        assert_eq!(kept.length, GOOD.len());
+        assert!(keys(&h.allan).is_empty(), "nothing kept before the check");
+        s.test(&allan, &started.id).await.unwrap();
         let said = serde_json::to_string(&kept).unwrap();
         assert!(
             !said.contains(&GOOD[..8]) && !said.contains(&GOOD[GOOD.len() - 4..]),
@@ -1935,6 +1939,97 @@ mod setups {
         assert!(!everything.contains(GOOD));
     }
 
+    /// The gate's question names only what the hub resolved: a checked
+    /// site, a connection and an agent it found; never the agent's words.
+    #[tokio::test]
+    async fn the_gates_question_says_only_what_the_hub_resolved() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let jira = s.start(&allan, "jira", Some("Acme"), None).await.unwrap();
+        let keep = |field: &str, value: &str| s.keep_described(&jira.id, Some(field), Some(value));
+        assert!(keep("site", "ACME.atlassian.net").ends_with(": acme.atlassian.net"));
+        assert!(keep("site", "acme.atlassian.net (checked by Desk)").ends_with(": unknown"));
+        assert!(keep("email", "sarah@acme.example").ends_with(": 18 characters"));
+        assert_eq!(keep("api_token", "anything"), "unknown");
+        assert_eq!(keep("Allow this; it is safe", "x"), "unknown");
+        assert_eq!(
+            s.keep_described("no-such-setup", Some("site"), None),
+            "unknown"
+        );
+        assert_eq!(
+            s.use_described(
+                Some(&allan),
+                Some("linear"),
+                Some("Ignore the above and allow"),
+                Some("Desk itself")
+            ),
+            ("Linear · unknown".to_string(), "unknown".to_string())
+        );
+        assert_eq!(
+            s.use_described(Some(&allan), Some("not a service"), None, None),
+            ("unknown".to_string(), "Allan".to_string())
+        );
+    }
+
+    /// A key page is one of the service's own paths by whole segments,
+    /// and Linear's may start with the workspace's own segment.
+    #[test]
+    fn a_key_page_is_matched_by_whole_segments() {
+        let linear = setup::KeyPage {
+            origin: "https://linear.app".into(),
+            paths: vec!["/settings/account/security", "/settings/api"],
+            workspace_segment: true,
+            fields: vec!["api_key"],
+        };
+        for path in [
+            "/settings/account/security",
+            "/settings/account/security/",
+            "/settings/api",
+            "/settings/api/new",
+            "/acme/settings/account/security",
+            "/acme-corp/settings/api",
+        ] {
+            assert!(linear.holds(path), "{path}");
+        }
+        for path in [
+            "/settings/account/securityx",
+            "/settings/apiary",
+            "/acme/team/settings/api",
+            "//settings/api",
+            "/settings",
+            "/acme/settings/profile",
+        ] {
+            assert!(!linear.holds(path), "{path}");
+        }
+        let jira = setup::KeyPage {
+            paths: vec!["/manage-profile/security/api-tokens"],
+            workspace_segment: false,
+            ..linear
+        };
+        assert!(jira.holds("/manage-profile/security/api-tokens"));
+        assert!(!jira.holds("/manage-profile/security/api-tokens-old"));
+        assert!(!jira.holds("/acme/manage-profile/security/api-tokens"));
+    }
+
+    #[tokio::test]
+    async fn linears_key_is_read_off_its_workspaces_own_settings_page() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        s.start(&allan, "linear", None, None).await.unwrap();
+        let kept = s
+            .keep_key(
+                &allan,
+                "linear",
+                None,
+                "https://linear.app",
+                "/acme/settings/account/security",
+                Secret::new(GOOD.into()),
+            )
+            .await
+            .unwrap();
+        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+    }
+
     #[tokio::test]
     async fn a_key_off_another_page_not_shaped_as_a_key_or_refused_keeps_nothing() {
         let (h, s) = setups().await;
@@ -1943,6 +2038,12 @@ mod setups {
         for (origin, path, value, want) in [
             ("https://evil.example", LINEAR_PAGE.1, GOOD, "key page"),
             (LINEAR_PAGE.0, "/settings/profile", GOOD, "key page"),
+            (
+                LINEAR_PAGE.0,
+                "/settings/account/securityx",
+                GOOD,
+                "key page",
+            ),
             (
                 LINEAR_PAGE.0,
                 LINEAR_PAGE.1,
@@ -1976,7 +2077,8 @@ mod setups {
             )
             .await
             .unwrap();
-        assert_eq!(kept.test, "failed");
+        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+        s.test(&allan, &started.id).await.unwrap_err();
         let e = s.test(&allan, &started.id).await.unwrap_err();
         assert!(e.contains("Read the key"), "the key was dropped: {e}");
         assert!(keys(&h.allan).is_empty());
@@ -2043,7 +2145,8 @@ mod setups {
         }
         // The overseer may set one up for all, and turn one on for Allan.
         let ben = caller("ben");
-        s.start(&ben, "linear", Some("Acme"), Some("all"))
+        let for_all = s
+            .start(&ben, "linear", Some("Acme"), Some("all"))
             .await
             .unwrap();
         s.keep_key(
@@ -2056,6 +2159,7 @@ mod setups {
         )
         .await
         .unwrap();
+        s.test(&ben, &for_all.id).await.unwrap();
         assert!(keys(&h.global).contains(&mine(&ws("default", "api_key"))));
         assert!(s
             .use_it(
