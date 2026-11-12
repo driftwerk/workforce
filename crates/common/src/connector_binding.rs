@@ -134,6 +134,50 @@ impl ConnectorBinding {
     }
 }
 
+/// What `after` lets an agent reach that `before` didn't, in words, one
+/// line each: a connector turned on, a connection it now uses, a connector
+/// or connection it may now change, a change of whose connection it uses.
+/// Empty when the change only narrows what it reaches, or changes nothing.
+pub fn widened(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<String> {
+    let mut said = Vec::new();
+    for c in CONNECTORS {
+        if !after.is_on(c) {
+            continue;
+        }
+        if !before.is_on(c) {
+            said.push(format!("{c}: turned on"));
+            continue;
+        }
+        match (before.picks(c), after.picks(c)) {
+            (Some(was), Some(now)) => {
+                for k in now.iter().filter(|k| !was.contains(k)) {
+                    said.push(format!("{c}: now uses the `{k}` connection"));
+                }
+            }
+            (Some(_), None) => said.push(format!("{c}: now uses every connection")),
+            _ => {}
+        }
+        if before.own(c) != after.own(c) {
+            said.push(format!("{c}: uses a different connection"));
+        }
+        let writes = |b: &ConnectorBinding, k: Option<&str>| match k {
+            Some(k) => !b.reads_only_instance(c, k),
+            None => !b.reads_only(c),
+        };
+        if !writes(before, None) && writes(after, None) && after.picks(c).is_none() {
+            said.push(format!("{c}: may now change things"));
+        }
+        if let Some(now) = after.picks(c) {
+            for k in now {
+                if !writes(before, Some(k)) && writes(after, Some(k)) {
+                    said.push(format!("{c}: may now change things through `{k}`"));
+                }
+            }
+        }
+    }
+    said
+}
+
 fn names(t: &Table, key: &str, what: &str) -> Result<Option<Vec<String>>, String> {
     let wrong = || format!("{what} must be a list of connector names.");
     match t.get(key) {
@@ -407,6 +451,32 @@ mod tests {
         assert!(parse("[skills.connections]\njira = \"acme\"\n")
             .unwrap_err()
             .contains("list of connection names"));
+    }
+
+    #[test]
+    fn what_widens_an_agents_reach_is_told_apart_from_what_narrows_it() {
+        let b = |src: &str| parse(src).unwrap();
+        let base = b("[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n\n[skills.connections]\njira = [\"acme\", \"globex\"]\n");
+        // Narrowing, or no change: nothing to tell.
+        assert!(widened(&base, &base).is_empty());
+        assert!(widened(&base, &b("[skills]\nenabled = []\n")).is_empty());
+        assert!(widened(
+            &base,
+            &b("[skills]\nenabled = [\"jira\"]\nread_only = [\"jira\"]\n\n[skills.connections]\njira = [\"acme\"]\n")
+        )
+        .is_empty());
+        // Widening: each said.
+        let more = b("[skills]\nenabled = [\"jira\", \"linear\"]\n\n[skills.connections]\njira = [\"acme\", \"globex\", \"initech\"]\n");
+        assert_eq!(
+            widened(&base, &more),
+            [
+                "jira: now uses the `initech` connection",
+                "jira: may now change things through `globex`",
+                "linear: turned on",
+            ]
+        );
+        let every = b("[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n");
+        assert_eq!(widened(&base, &every), ["jira: now uses every connection"]);
     }
 
     #[test]

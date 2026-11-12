@@ -4,6 +4,13 @@
 //!
 //! The text is edited in place, so comments and keys the agent does not
 //! model survive. Credentials never pass through it: they live in the vault.
+//!
+//! An agent sets itself up, so it may change its own `[skills]`. A change
+//! that widens what it reaches (a connector on, a connection it now uses,
+//! one it may now change things through) is a connection write to Desk's
+//! gate: below unbound it asks first, Allow once or Deny, as
+//! `connections.use` does, and is kept in Desk's Activity; once saved, the
+//! person is told in the agent's conversation.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -47,6 +54,49 @@ struct Input {
     value: Option<serde_json::Value>,
 }
 
+impl ConfigTool {
+    /// The file as it is, and as `input` would leave it; `None` for a read,
+    /// or a change that can't be made.
+    fn proposed(&self, input: &serde_json::Value) -> Option<(String, String)> {
+        let input: Input = serde_json::from_value(input.clone()).ok()?;
+        let key = input.key.as_deref()?;
+        let path = key_path(key).ok()?;
+        let read = self.read().ok()?.unwrap_or_default();
+        let mut doc = parse_document(&read).ok()?;
+        match input.action {
+            Action::Get => return None,
+            Action::Set => assign(
+                doc.as_table_mut(),
+                &path,
+                toml_value(input.value.as_ref()?).ok()?,
+            )
+            .ok()?,
+            Action::Unset => {
+                remove(doc.as_table_mut(), &path);
+            }
+        }
+        Some((read, doc.to_string()))
+    }
+
+    /// What `input` would widen of this agent's reach, in words.
+    fn widens(&self, input: &serde_json::Value) -> Vec<String> {
+        self.proposed(input)
+            .map(|(was, now)| widened_between(&was, &now))
+            .unwrap_or_default()
+    }
+}
+
+/// What going from config `was` to `now` widens of an agent's reach.
+fn widened_between(was: &str, now: &str) -> Vec<String> {
+    let binding = |body: &str| {
+        AgentWorkspaceConfig::parse(body)
+            .ok()
+            .and_then(|c| c.connectors().ok())
+            .unwrap_or_default()
+    };
+    workforce_common::connector_binding::widened(&binding(was), &binding(now))
+}
+
 #[async_trait]
 impl Tool for ConfigTool {
     fn name(&self) -> &str {
@@ -76,8 +126,32 @@ impl Tool for ConfigTool {
         })
     }
 
+    /// A change that widens what the agent reaches is a connection write
+    /// to Desk's gate; any other change touches nothing it decides.
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        match self.widens(input).is_empty() {
+            true => workforce_core::computer::Effect::None,
+            false => workforce_core::computer::Effect::Connector {
+                connector: "connections".into(),
+                write: true,
+            },
+        }
+    }
+
+    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
+        let widens = self.widens(input);
+        (!widens.is_empty()).then(|| {
+            format!(
+                "Let {} reach more: {}",
+                self.service.agent_id,
+                widens.join("; ")
+            )
+        })
+    }
+
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
+        let widening = self.widens(&input);
         let input: Input = serde_json::from_value(input)?;
         let outcome = match input.action {
             Action::Get => self.get(input.key.as_deref()),
@@ -90,6 +164,9 @@ impl Tool for ConfigTool {
                 None => Err("unset needs a `key`".to_string()),
             },
         };
+        if outcome.is_ok() && !widening.is_empty() {
+            self.tell_the_person(&widening).await;
+        }
         let ms = start.elapsed().as_millis() as u64;
         Ok(match outcome {
             Ok(result) => ToolResult::success(result, ms),
@@ -161,6 +238,42 @@ impl ConfigTool {
             return Ok(serde_json::json!({ "key": key, "changed": false, "note": "was not set" }));
         }
         self.save(read.as_deref(), &doc.to_string()).await
+    }
+
+    /// Tells the person, in this agent's Desk conversation, what it just
+    /// let itself reach.
+    async fn tell_the_person(&self, widened: &[String]) {
+        tracing::info!(agent = %self.service.agent_id, widened = ?widened, "an agent widened its own connectors");
+        #[cfg(feature = "postgres")]
+        {
+            use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+            let Some(person) = crate::user_config::current_identity_id() else {
+                return;
+            };
+            if !self.service.config.desk.enabled {
+                return;
+            }
+            let text = format!(
+                "I changed my own connectors, so I reach more now: {}. Change it back in my Connectors.",
+                widened.join("; ")
+            );
+            let target = DeskTarget::of_turn(
+                &DeskPlace::Dm,
+                workforce_common::channels::DESK_CHANNEL,
+                None,
+                false,
+            );
+            if let Err(e) = crate::desk_surface::deliver(
+                &*self.service,
+                &person,
+                &target,
+                crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
+            )
+            .await
+            {
+                tracing::warn!(error = %format!("{e:#}"), "telling the person an agent widened its connectors failed");
+            }
+        }
     }
 
     /// Save `body` over the file this tool read as `read`.
@@ -386,6 +499,37 @@ fn toml_value(value: &serde_json::Value) -> Result<toml_edit::Value, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_change_to_its_own_skills_that_widens_its_reach_is_told_apart() {
+        let was = "[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n\n[skills.connections]\njira = [\"acme\", \"globex\"]\n";
+        let mut doc = parse_document(was).unwrap();
+        assign(
+            doc.as_table_mut(),
+            &["skills", "read_only"],
+            toml_value(&serde_json::json!([])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            widened_between(was, &doc.to_string()),
+            ["jira: may now change things through `globex`"]
+        );
+        let mut doc = parse_document(was).unwrap();
+        assign(
+            doc.as_table_mut(),
+            &["llm", "voice_model"],
+            toml_value(&serde_json::json!("x")).unwrap(),
+        )
+        .unwrap();
+        assert!(widened_between(was, &doc.to_string()).is_empty());
+        let mut doc = parse_document(was).unwrap();
+        remove(doc.as_table_mut(), &["skills", "connections"]);
+        assert_eq!(
+            widened_between(was, &doc.to_string()),
+            ["jira: now uses every connection"]
+        );
+    }
+
     use super::*;
 
     const SCREENSHOT: &str = "# Per-agent configuration — change it in the agent's settings.\n\

@@ -1695,3 +1695,82 @@ fn a_page_with_no_origin_offers_no_session_allowance() {
     };
     assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
 }
+
+#[test]
+fn widening_an_agents_connections_asks_each_time_below_unbound() {
+    let widen = CallFacts {
+        tool: "system.config".into(),
+        effect: Effect::Connector {
+            connector: "connections".into(),
+            write: true,
+        },
+        ..call(Effect::None)
+    };
+    let once = Verdict::Ask {
+        choices: vec![Choice::AllowOnce, Choice::Deny],
+        why: Why::ConnectorWrite,
+    };
+    // Below unbound: each time, whatever the access, Full that never asks
+    // included, and a session's allowance doesn't hold.
+    let mut never = browsing_as(Browsing::Asks, Access::Full, false);
+    never.access.asks = Asking::Never;
+    let session = Grant {
+        id: Uuid::new_v4(),
+        hub: "local".into(),
+        agent: "allan".into(),
+        person: "sarah".into(),
+        ability: Ability::ConnectorWrite,
+        folder: None,
+        connector: Some("connections".into()),
+        session_id: Some("s1".into()),
+        run: None,
+    };
+    for p_ in [browsing_as(Browsing::Asks, Access::OwnFolder, false), never] {
+        assert_eq!(
+            verdict(&p_, false, std::slice::from_ref(&session), &widen),
+            once
+        );
+    }
+    // Unbound: it runs; after a hostile page it asks once at a time.
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Unbound, Access::Full, false),
+            false,
+            &[],
+            &widen
+        ),
+        Verdict::Run { by: By::Rule }
+    );
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Unbound, Access::Full, true),
+            false,
+            &[],
+            &widen
+        ),
+        Verdict::Ask {
+            choices: vec![Choice::AllowOnce, Choice::Deny],
+            why: Why::HostilePage,
+        }
+    );
+    // An overseer that only suggests changes nothing.
+    assert!(matches!(
+        verdict(
+            &browsing_as(Browsing::Suggests, Access::Full, false),
+            false,
+            &[],
+            &widen
+        ),
+        Verdict::Refuse { .. }
+    ));
+    // The kill switch stops what touches this computer, not this.
+    assert_eq!(
+        verdict(
+            &browsing_as(Browsing::Unbound, Access::Full, false),
+            true,
+            &[],
+            &widen
+        ),
+        Verdict::Run { by: By::Rule }
+    );
+}
