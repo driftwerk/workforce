@@ -5638,7 +5638,9 @@ async fn desk_dm_ask(
 
 /// A Desk DM edit of the person's latest message: the reply to the old
 /// version is set aside, and the agent answers the new one, told so, which
-/// reads "(edited)". Only the latest message may be edited.
+/// reads "(edited)". Only the latest message may be edited, and an edit
+/// whose first try saved its new version but never answered it answers it
+/// where it is when sent again, setting nothing more aside.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_desk_edit_sets_aside_the_old_reply_and_asks_again() {
     use workforce_common::channels::desk::DESK_CHANNEL;
@@ -5695,6 +5697,31 @@ async fn a_desk_edit_sets_aside_the_old_reply_and_asks_again() {
         crate::desk_surface::edit::ONLY_THE_LATEST
     );
     assert_eq!(said(&service), before);
+
+    // A first try saved the new version in the old one's place, then died
+    // before answering it: sent again, the edit answers it where it is.
+    let mut saved = workforce_common::session::SessionMessage::user(
+        "second, edited",
+        Some(&edited.to_string()),
+        None,
+        None,
+    );
+    saved.desk = Some(workforce_common::channels::desk::DeskMark {
+        speaker: Some(workforce_common::channels::desk::DeskSpeaker::Person),
+        edited: true,
+        ..Default::default()
+    });
+    let replaces = workforce_common::channels::desk::DeskEdit {
+        replaces: second.to_string(),
+    };
+    let first_try =
+        crate::desk_surface::edit::set_aside(service.sessions.as_ref(), &sid, &replaces, &saved)
+            .unwrap();
+    assert!(matches!(
+        first_try,
+        crate::desk_surface::edit::Edited::Note(_)
+    ));
+    assert_eq!(said(&service).1, ["first ask", "done", "second, edited"]);
 
     desk_dm_ask(&service, "second, edited", edited, Some(second.to_string()))
         .await

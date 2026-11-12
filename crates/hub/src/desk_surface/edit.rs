@@ -3,7 +3,11 @@
 //! told what that reply already did, since none of it can be undone.
 
 use workforce_common::channels::desk::{one_line, DeskEdit, DeskStep, STEP_TOOL_CHARS};
-use workforce_common::session::{SessionStore, TranscriptEntry};
+use workforce_common::session::{
+    SessionMessage, SessionStore, SetAside, SetAsideStale, TranscriptEntry,
+};
+
+use super::persons;
 
 /// What Desk is told when an edit names anything but the person's latest
 /// message in the conversation.
@@ -30,41 +34,74 @@ impl std::fmt::Display for EditRefused {
 
 impl std::error::Error for EditRefused {}
 
+/// What came of an edit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Edited {
+    /// The old version and its reply were set aside and the new version
+    /// saved in their place; what the agent is told of it.
+    Note(String),
+    /// The same edit, sent again: its new version is the person's latest
+    /// message already, so nothing is set aside twice.
+    Already,
+}
+
 /// Set aside, in `session_id`, the message `edit` replaces and everything
-/// said after it, returning what the agent is told about it. The caller
-/// holds the session's turn claim, so no turn adds to it meanwhile.
+/// said after it, saving `asked`, the edit's new version, in their place in
+/// the same step. The caller holds the session's turn claim, so no turn
+/// adds to it meanwhile; anything else saved there since it was read (a
+/// delivery) refuses the edit rather than being set aside unread.
 /// [`EditRefused`] unless `edit` names the person's latest message there,
-/// by its id or the client's own id for it.
+/// by its id or the client's own id for it. [`Edited::Already`] when the
+/// person's latest message is `asked`'s own client id: the edit was saved
+/// before, and the caller answers it where it is.
 pub(crate) fn set_aside(
     sessions: &dyn SessionStore,
     session_id: &str,
     edit: &DeskEdit,
-) -> eyre::Result<String> {
-    let latest = latest_persons(sessions, session_id)?.ok_or(EditRefused)?;
+    asked: &SessionMessage,
+) -> eyre::Result<Edited> {
+    let (latest, newest) = latest_persons(sessions, session_id)?.ok_or(EditRefused)?;
+    if asked.external_id.is_some() && latest.external_id == asked.external_id {
+        return Ok(Edited::Already);
+    }
     let named =
         latest.id == edit.replaces || latest.external_id.as_deref() == Some(edit.replaces.as_str());
     if !named {
         return Err(EditRefused.into());
     }
-    let set_aside = sessions.set_aside_from(session_id, &latest.id)?;
-    let steps: Vec<&DeskStep> = set_aside
+    let aside = SetAside {
+        from: &latest.id,
+        newest: &newest,
+        replacement: Some(asked),
+    };
+    let rows = match sessions.set_aside_from(session_id, &aside) {
+        Err(e) if e.is::<SetAsideStale>() => return Err(EditRefused.into()),
+        rows => rows?,
+    };
+    let steps: Vec<&DeskStep> = rows
+        .entries
         .iter()
         .filter_map(|entry| entry.desk.as_ref())
         .flat_map(|mark| &mark.steps)
         .collect();
-    Ok(edit_note(&steps))
+    Ok(Edited::Note(edit_note(&steps, rows.compacted)))
 }
 
-/// The person's latest message in the session's archive, if it holds one.
+/// The person's latest message in the session's archive, if it holds one,
+/// and the id of the newest message there.
 fn latest_persons(
     sessions: &dyn SessionStore,
     session_id: &str,
-) -> eyre::Result<Option<TranscriptEntry>> {
+) -> eyre::Result<Option<(TranscriptEntry, String)>> {
     let mut before: Option<String> = None;
+    let mut newest: Option<String> = None;
     for _ in 0..MOST_PAGES {
         let page = sessions.read_archive_page(session_id, before.as_deref(), PAGE)?;
+        if newest.is_none() {
+            newest = page.messages.last().map(|entry| entry.id.clone());
+        }
         if let Some(found) = page.messages.iter().rev().find(|entry| persons(entry)) {
-            return Ok(Some(found.clone()));
+            return Ok(newest.map(|newest| (found.clone(), newest)));
         }
         match page.messages.first() {
             Some(oldest) if page.has_more => before = Some(oldest.id.clone()),
@@ -74,28 +111,22 @@ fn latest_persons(
     Ok(None)
 }
 
-/// Whether `entry` is something the person said, as their conversation
-/// reads it back.
-fn persons(entry: &TranscriptEntry) -> bool {
-    #[cfg(feature = "postgres")]
-    {
-        crate::desk_conversations::persons(entry)
-    }
-    // No conversation reads without Postgres: a user row no tool wrote.
-    #[cfg(not(feature = "postgres"))]
-    {
-        entry.role == workforce_common::session::MessageRole::User && entry.tool_metadata.is_none()
-    }
-}
-
 /// What the agent is told of an edit: the message it reads is the new
 /// version, its earlier reply is gone, and what that reply did stands.
-pub(crate) fn edit_note(steps: &[&DeskStep]) -> String {
+/// `compacted`: the old version had been folded into a summary of the
+/// conversation, which may still speak of it.
+pub(crate) fn edit_note(steps: &[&DeskStep], compacted: bool) -> String {
     let mut note = String::from(
         "[EDITED MESSAGE]\n\
          The person edited their last message. This is the new version; your earlier reply to \
          it has been set aside.",
     );
+    if compacted {
+        note.push_str(
+            " The conversation's summary above was written before the edit and may still \
+             mention the old version or that reply; go by this one.",
+        );
+    }
     if steps.is_empty() {
         return note;
     }
@@ -196,28 +227,72 @@ mod tests {
 
     fn an_edit_sets_aside_the_reply_and_tells_what_it_did(store: &dyn SessionStore) {
         let (sid, second) = conversation(store);
+        let asked = SessionMessage::user("second, edited", Some("client-3"), None, None);
         // Only the latest: an earlier message, by either id, is refused and
         // nothing is set aside.
         for earlier in ["client-1", "nobody"] {
-            let refused = set_aside(store, &sid, &edit(earlier)).unwrap_err();
+            let refused = set_aside(store, &sid, &edit(earlier), &asked).unwrap_err();
             assert!(refused.downcast_ref::<EditRefused>().is_some(), "{refused}");
         }
         assert_eq!(texts(store, &sid).0.len(), 4);
 
-        let note = set_aside(store, &sid, &edit("client-2")).unwrap();
+        let note = set_aside(store, &sid, &edit("client-2"), &asked).unwrap();
         assert_eq!(
             note,
-            "[EDITED MESSAGE]\nThe person edited their last message. This is the new version; \
-             your earlier reply to it has been set aside. That reply already did these, which \
-             were not undone:\n- email.send (ok)\n- calendar.create (failed)"
+            Edited::Note(
+                "[EDITED MESSAGE]\nThe person edited their last message. This is the new \
+                 version; your earlier reply to it has been set aside. That reply already did \
+                 these, which were not undone:\n- email.send (ok)\n- calendar.create (failed)"
+                    .into()
+            )
         );
-        let (archived, live) = texts(store, &sid);
-        assert_eq!(archived, ["first", "hello"]);
-        assert_eq!(live, ["first", "hello"]);
-        // The message was the latest; now it is gone, so naming it again
-        // (by its hub id this time) is refused.
-        let gone = set_aside(store, &sid, &edit(&second)).unwrap_err();
+        let after = texts(store, &sid);
+        assert_eq!(after.0, ["first", "hello", "second, edited"]);
+        assert_eq!(after.1, ["first", "hello", "second, edited"]);
+        // Sent again, by either id it named, it is saved already: nothing
+        // more is set aside.
+        for replaces in ["client-2", second.as_str()] {
+            assert_eq!(
+                set_aside(store, &sid, &edit(replaces), &asked).unwrap(),
+                Edited::Already
+            );
+        }
+        assert_eq!(texts(store, &sid), after);
+        // Another edit of the gone version is refused.
+        let other = SessionMessage::user("second, again", Some("client-4"), None, None);
+        let gone = set_aside(store, &sid, &edit(&second), &other).unwrap_err();
         assert!(gone.downcast_ref::<EditRefused>().is_some());
+    }
+
+    #[test]
+    fn the_person_s_messages_leave_out_hub_notes_and_hand_offs() {
+        let entry = |text: &str, speaker: Option<DeskSpeaker>| {
+            let mut message = said(MessageRole::User, text, None);
+            message.desk = speaker.map(|speaker| DeskMark {
+                speaker: Some(speaker),
+                ..DeskMark::default()
+            });
+            workforce_common::session::message_to_transcript_entry("s", &message)
+        };
+        assert!(persons(&entry("hello", None)));
+        assert!(persons(&entry("hello", Some(DeskSpeaker::Person))));
+        for note in [
+            "[System note: context trimmed]",
+            "[SYSTEM] overflow",
+            "[Desk check-in] what happened",
+        ] {
+            assert!(!persons(&entry(note, None)), "{note}");
+        }
+        let handed = DeskSpeaker::Agent {
+            name: "helper".into(),
+        };
+        assert!(!persons(&entry("over to you", Some(handed))));
+        assert!(!persons(
+            &workforce_common::session::message_to_transcript_entry(
+                "s",
+                &said(MessageRole::Assistant, "hi", None)
+            )
+        ));
     }
 
     #[test]
@@ -235,14 +310,15 @@ mod tests {
     #[test]
     fn a_reply_that_ran_nothing_is_said_set_aside_and_no_more() {
         assert_eq!(
-            edit_note(&[]),
+            edit_note(&[], false),
             "[EDITED MESSAGE]\nThe person edited their last message. This is the new version; \
              your earlier reply to it has been set aside."
         );
+        assert!(edit_note(&[], true).contains("may still mention the old version"));
         let many: Vec<DeskStep> = (0..25)
             .map(|n| DeskStep::of(&format!("tool.{n}\nnext"), true, 1))
             .collect();
-        let note = edit_note(&many.iter().collect::<Vec<_>>());
+        let note = edit_note(&many.iter().collect::<Vec<_>>(), false);
         assert_eq!(note.lines().filter(|l| l.starts_with("- ")).count(), 21);
         assert!(note.contains("- tool.0 next (ok)"), "{note}");
         assert!(note.ends_with("- and 5 more"), "{note}");

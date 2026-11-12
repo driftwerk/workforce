@@ -59,7 +59,7 @@ pub use plan::{plan_channel, PLAN};
 
 /// What a check-in's prompt starts with: the person never typed it, so the
 /// DM's history leaves it out.
-pub const CHECK_IN: &str = "[Desk check-in]";
+pub const CHECK_IN: &str = crate::desk_surface::CHECK_IN;
 
 /// Hand-offs between agents allowed from one thing that happened, as in
 /// rooms.

@@ -2783,10 +2783,10 @@ async fn handle_ws(
                             // under its own id): once its turn has answered it,
                             // or while that turn runs, it is not asked twice. Its
                             // turn just ends, and the Desk reads what was kept.
-                            // An edit is asked anew, whatever id it names.
+                            // So is an edit sent again: it is sent under an
+                            // id of its own, which its first try saved.
                             if let Some(asked) = desk.as_ref().filter(|d| {
                                 matches!(d.turn.place, DeskPlace::Dm)
-                                    && d.turn.edit.is_none()
                                     && d.turn.message.is_some_and(|id| {
                                         asked_already(
                                             &service,

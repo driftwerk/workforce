@@ -59,8 +59,8 @@ use crate::session::{
     redact_message_secrets, redact_messages_in_place, search_terms, tool_calls_for, ArchivePage,
     InterruptedTurn, JournalEntry, MessageRole, Reassigned, RedactionStats, Session,
     SessionAttachment, SessionContextType, SessionContextUsage, SessionExport, SessionKind,
-    SessionMessage, SessionSearchResult, SessionStats, SessionStore, ToolCallRecord,
-    TranscriptEntry, TurnPrincipal,
+    SessionMessage, SessionSearchResult, SessionStats, SessionStore, SetAside, SetAsideRows,
+    SetAsideStale, ToolCallRecord, TranscriptEntry, TurnPrincipal,
 };
 
 mod embedded {
@@ -1828,9 +1828,11 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
-    fn set_aside_from(&self, session_id: &str, message_id: &str) -> Result<Vec<TranscriptEntry>> {
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> Result<SetAsideRows> {
         let id = parse_uuid(session_id)?;
-        let message_id = message_id.to_string();
+        let from_id = aside.from.to_string();
+        let newest_id = aside.newest.to_string();
+        let replacement = aside.replacement.cloned();
         let session_id_owned = session_id.to_string();
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -1850,78 +1852,125 @@ impl SessionStore for PostgresSessionStore {
             let messages_json: serde_json::Value = cur.get(0);
             let mut messages: Vec<SessionMessage> =
                 serde_json::from_value(messages_json).context("decode messages for set-aside")?;
-            let archived: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*)::BIGINT FROM session_archive
-                     WHERE session_id = $1 AND tenant_id = $2",
+            let newest = tx
+                .query_opt(
+                    "SELECT seq, message_id FROM session_archive
+                     WHERE session_id = $1 AND tenant_id = $2
+                     ORDER BY seq DESC LIMIT 1",
                     &[&id, &self.tenant_id()],
                 )
-                .await?
-                .get(0);
-            // A session from before archive seeding reads its live messages
-            // (as `read_archive_page` does), so those are what is set aside.
-            let set_aside: Vec<TranscriptEntry> = if archived == 0 {
-                let from = messages
-                    .iter()
-                    .position(|m| m.id == message_id)
-                    .ok_or_else(|| eyre::eyre!("Message not found: {message_id}"))?;
-                messages[from..]
-                    .iter()
-                    .map(|m| message_to_transcript_entry(&session_id_owned, m))
-                    .collect()
-            } else {
-                // `seq` runs across the thread's sessions; this session's
-                // rows from the message on are the ones at or past its seq.
-                let rows = tx
-                    .query(
-                        "DELETE FROM session_archive
-                         WHERE session_id = $1 AND tenant_id = $2
-                           AND seq >= (SELECT MIN(seq) FROM session_archive
-                                       WHERE session_id = $1 AND tenant_id = $2
-                                         AND message_id = $3)
-                         RETURNING seq, message_id, role, content, tool_data, ts, tokens, desk,
-                                   external_id",
-                        &[&id, &self.tenant_id(), &message_id],
-                    )
-                    .await?;
-                if rows.is_empty() {
-                    eyre::bail!("Message not found: {message_id}");
+                .await?;
+            let set_aside: Vec<TranscriptEntry> = match newest {
+                // A session from before archive seeding reads its live
+                // messages (as `read_archive_page` does), so those are what
+                // is set aside.
+                None => {
+                    if messages.last().map(|m| m.id.as_str()) != Some(newest_id.as_str()) {
+                        return Err(SetAsideStale.into());
+                    }
+                    let from = messages
+                        .iter()
+                        .position(|m| m.id == from_id)
+                        .ok_or_else(|| eyre::eyre!("Message not found: {from_id}"))?;
+                    messages[from..]
+                        .iter()
+                        .map(|m| message_to_transcript_entry(&session_id_owned, m))
+                        .collect()
                 }
-                let mut entries: Vec<TranscriptEntry> = rows
-                    .iter()
-                    .map(|r| archive_row_to_entry(&session_id_owned, r))
-                    .collect();
-                entries.sort_by_key(|e| e.seq);
-                entries
+                Some(row) => {
+                    if row.get::<_, &str>(1) != newest_id {
+                        return Err(SetAsideStale.into());
+                    }
+                    let newest_seq: i64 = row.get(0);
+                    // `seq` runs across the thread's sessions; this session's
+                    // rows from the message on are the ones at or past its
+                    // seq, and none past the newest the caller saw: one
+                    // archived since stays.
+                    let rows = tx
+                        .query(
+                            "DELETE FROM session_archive
+                             WHERE session_id = $1 AND tenant_id = $2 AND seq <= $4
+                               AND seq >= (SELECT MIN(seq) FROM session_archive
+                                           WHERE session_id = $1 AND tenant_id = $2
+                                             AND message_id = $3)
+                             RETURNING seq, message_id, role, content, tool_data, ts, tokens, desk,
+                                       external_id",
+                            &[&id, &self.tenant_id(), &from_id, &newest_seq],
+                        )
+                        .await?;
+                    if rows.is_empty() {
+                        eyre::bail!("Message not found: {from_id}");
+                    }
+                    let mut entries: Vec<TranscriptEntry> = rows
+                        .iter()
+                        .map(|r| archive_row_to_entry(&session_id_owned, r))
+                        .collect();
+                    entries.sort_by_key(|e| e.seq);
+                    entries
+                }
             };
-            // The live context may have compacted the message away: it is cut
-            // from the first set-aside message it still holds, if any.
-            let ids: Vec<&str> = set_aside.iter().map(|e| e.id.as_str()).collect();
-            if let Some(from) = messages.iter().position(|m| ids.contains(&m.id.as_str())) {
-                let removed_tokens: u64 = messages[from..].iter().map(|m| m.tokens as u64).sum();
-                messages.truncate(from);
-                let total_tokens: i64 = cur.get(1);
-                let new_total = (total_tokens as u64).saturating_sub(removed_tokens) as i64;
-                let count = messages.len() as i32;
-                let json =
-                    serde_json::to_value(&messages).context("encode messages after set-aside")?;
+            if let Some(replacement) = &replacement {
+                let (content, tool_data, desk) = archive_values(replacement)?;
                 tx.execute(
-                    "UPDATE sessions SET messages = $1, message_count = $2, total_tokens = $3,
-                         updated_at = $4, revision = revision + 1
-                     WHERE id = $5 AND tenant_id = $6",
+                    ARCHIVE_INSERT,
                     &[
-                        &json,
-                        &count,
-                        &new_total,
-                        &Utc::now(),
                         &id,
+                        &replacement.id,
+                        &role_to_str(&replacement.role),
+                        &content,
+                        &tool_data,
+                        &replacement.timestamp,
+                        &(replacement.tokens as i32),
                         &self.tenant_id(),
+                        &desk,
+                        &replacement.external_id,
                     ],
                 )
                 .await?;
             }
+            // The live context loses what it still holds of them, from the
+            // first to the last; compaction may have folded the first away.
+            let ids: Vec<&str> = set_aside.iter().map(|e| e.id.as_str()).collect();
+            let compacted = !messages.iter().any(|m| m.id == from_id);
+            let held = |m: &SessionMessage| ids.contains(&m.id.as_str());
+            let mut removed_tokens: u64 = 0;
+            if let (Some(first), Some(last)) = (
+                messages.iter().position(held),
+                messages.iter().rposition(held),
+            ) {
+                removed_tokens = messages
+                    .drain(first..=last)
+                    .map(|m| u64::from(m.tokens))
+                    .sum();
+            }
+            let added = replacement.as_ref().map_or(0, |m| u64::from(m.tokens));
+            if let Some(replacement) = replacement {
+                messages.push(replacement);
+            }
+            let total_tokens: i64 = cur.get(1);
+            let new_total = ((total_tokens as u64).saturating_sub(removed_tokens) + added) as i64;
+            let count = messages.len() as i32;
+            let json =
+                serde_json::to_value(&messages).context("encode messages after set-aside")?;
+            tx.execute(
+                "UPDATE sessions SET messages = $1, message_count = $2, total_tokens = $3,
+                     updated_at = $4, revision = revision + 1
+                 WHERE id = $5 AND tenant_id = $6",
+                &[
+                    &json,
+                    &count,
+                    &new_total,
+                    &Utc::now(),
+                    &id,
+                    &self.tenant_id(),
+                ],
+            )
+            .await?;
             tx.commit().await?;
-            Ok(set_aside)
+            Ok(SetAsideRows {
+                entries: set_aside,
+                compacted,
+            })
         })
     }
 
@@ -1987,33 +2036,15 @@ impl SessionStore for PostgresSessionStore {
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
             let scoped = self.scope(&mut conn).await?;
-            let content = crate::pg_text::strip_nuls_str(&message.content);
-            let tool_data = message.tool_data.map(|mut v| {
-                crate::pg_text::strip_nuls_json(&mut v);
-                v
-            });
-            let desk = message
-                .desk
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()?;
-            // DO NOTHING: a CAS-losing post-turn save can replay an archive
-            // append for a message another writer already archived. No
-            // target, for the same reason as `get_or_create`: a hub keeps
-            // the single-tenant message index beside the tenant-first one,
-            // and the primary key's `seq` never conflicts.
+            let (content, tool_data, desk) = archive_values(&message)?;
             scoped
                 .execute(
-                    "INSERT INTO session_archive
-                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk,
-                      external_id)
-                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9, $10)
-                     ON CONFLICT DO NOTHING",
+                    ARCHIVE_INSERT,
                     &[
                         &id,
                         &message.id,
                         &role_to_str(&message.role),
-                        &content.as_ref(),
+                        &content,
                         &tool_data,
                         &message.timestamp,
                         &(message.tokens as i32),
@@ -2494,6 +2525,36 @@ fn role_from_str(s: &str) -> MessageRole {
         "tool" => MessageRole::Tool,
         _ => MessageRole::User,
     }
+}
+
+/// One message into the archive. Its parameters: session, message id,
+/// role, content, tool data, time, tokens, tenant, Desk mark, client id.
+///
+/// DO NOTHING: a CAS-losing post-turn save can replay an archive append for
+/// a message another writer already archived. No target, for the same
+/// reason as `get_or_create`: a hub keeps the single-tenant message index
+/// beside the tenant-first one, and the primary key's `seq` never conflicts.
+const ARCHIVE_INSERT: &str = "INSERT INTO session_archive
+     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk, external_id)
+     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9, $10)
+     ON CONFLICT DO NOTHING";
+
+/// A message's content, tool data and Desk mark as the archive keeps them:
+/// without the NULs Postgres refuses.
+fn archive_values(
+    message: &SessionMessage,
+) -> Result<(String, Option<serde_json::Value>, Option<serde_json::Value>)> {
+    let content = crate::pg_text::strip_nuls_str(&message.content).into_owned();
+    let tool_data = message.tool_data.clone().map(|mut v| {
+        crate::pg_text::strip_nuls_json(&mut v);
+        v
+    });
+    let desk = message
+        .desk
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    Ok((content, tool_data, desk))
 }
 
 fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> TranscriptEntry {
