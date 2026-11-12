@@ -98,6 +98,7 @@ impl Tool for McpTool {
             Ok(_) => "ok",
             Err(McpError::Cancelled) => "cancelled",
             Err(McpError::AuthExpired(_)) => "auth_expired",
+            Err(McpError::Forbidden { .. }) => "forbidden",
             Err(McpError::RateLimited { .. }) => "rate_limited",
             Err(McpError::BodyTooLarge { .. }) => "body_too_large",
             Err(McpError::SchemaViolation(_)) => "schema_violation",
@@ -136,7 +137,7 @@ impl Tool for McpTool {
             });
         }
 
-        if matches!(result, Err(McpError::AuthExpired(_))) {
+        if matches!(result, Err(ref e) if e.is_auth()) {
             warn!(server = %self.server_id, "MCP auth expired — operator should re-authorize");
         }
         Ok(map_call_result(result, duration_ms))
