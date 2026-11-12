@@ -108,7 +108,9 @@ impl DatadogClient {
                 .map_err(|e| eyre!("Invalid Datadog app_key: {}", e))?,
         };
 
-        let client = reqwest::Client::builder().build()?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::adapters::auth::same_origin_redirects())
+            .build()?;
 
         Ok(Self {
             client,
@@ -130,7 +132,9 @@ impl DatadogClient {
             Some(url) => url.to_string(),
             None => site_to_base_url(site).map_err(|e| eyre!(e))?,
         };
-        let client = reqwest::Client::builder().build()?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::adapters::auth::same_origin_redirects())
+            .build()?;
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),

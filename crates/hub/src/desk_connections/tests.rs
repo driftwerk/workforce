@@ -1127,6 +1127,70 @@ async fn no_field_of_a_named_connection_is_ever_written_over() {
 }
 
 #[tokio::test]
+async fn a_flat_setting_without_the_connections_key_never_joins_it() {
+    let h = hub().await;
+    for (f, v) in [
+        ("api_token", "named-token"),
+        ("email", "sarah@acme.example"),
+        ("site", "acme.atlassian.net"),
+    ] {
+        h.global
+            .set(&mine(&format!("skills/jira/workspaces/default/{f}")), v)
+            .unwrap();
+    }
+    // Another account's key and project: neither joins.
+    h.global
+        .set(&mine("skills/jira/api_token"), "other-token")
+        .unwrap();
+    h.global
+        .set(&mine("skills/jira/default_project"), "OTH")
+        .unwrap();
+    h.c.migrate(SARAH).await;
+    let at = |path: &str| h.global.get(&mine(path));
+    assert!(at("skills/jira/workspaces/default/default_project").is_none());
+    assert_eq!(at("skills/jira/api_token").as_deref(), Some("other-token"));
+    // A project alone, with no key: it doesn't join either.
+    h.global.delete(&mine("skills/jira/api_token")).unwrap();
+    h.c.migrate(SARAH).await;
+    assert!(at("skills/jira/workspaces/default/default_project").is_none());
+    assert_eq!(at("skills/jira/default_project").as_deref(), Some("OTH"));
+}
+
+#[tokio::test]
+async fn a_persons_and_a_shared_flat_connection_both_show() {
+    let h = hub().await;
+    h.global.set(&mine("skills/linear/api_key"), GOOD).unwrap();
+    h.global.set("skills/linear/api_key", GOOD2).unwrap();
+    let list = h.c.list(SARAH).await;
+    let ids: Vec<(String, VaultSource)> = connector(&list, "linear")
+        .connections
+        .iter()
+        .map(|c| (c.id.clone(), c.source))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("all~~default".into(), VaultSource::GlobalPerUser),
+            ("all~~shared".into(), VaultSource::Global),
+        ]
+    );
+    // A key written by hand that isn't one Connections makes isn't listed
+    // or named.
+    h.global
+        .set(&mine("skills/linear/workspaces/Odd_Key/api_key"), GOOD)
+        .unwrap();
+    assert_eq!(
+        connector(&h.c.list(SARAH).await, "linear")
+            .connections
+            .len(),
+        2
+    );
+    for id in ["all~~Odd_Key", "all~~a b", "all~~../x"] {
+        assert!(h.c.test(SARAH, "linear", id).await.is_err(), "{id}");
+    }
+}
+
+#[tokio::test]
 async fn a_new_connection_moves_a_flat_one_first_so_neither_is_hidden() {
     let h = hub().await;
     h.global.set(&mine("skills/linear/api_key"), GOOD).unwrap();

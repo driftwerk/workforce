@@ -29,11 +29,24 @@ pub struct ConfigTool {
     service: Arc<AgentService>,
     /// Where each change is recorded as a revision; `None` without Postgres.
     revisions: Option<Arc<WorkflowStore>>,
+    /// The file each call was decided on (by its input), as the gate saw it
+    /// in [`Tool::effect`]: a call that widens the agent's reach runs only
+    /// while the file is still that one, so what is changed is what was
+    /// asked.
+    seen: parking_lot::Mutex<std::collections::HashMap<String, String>>,
 }
+
+/// How many decided calls [`ConfigTool::seen`] holds before it forgets
+/// them; a call it forgot runs on a fresh look, as it would off Desk.
+const SEEN_HELD: usize = 64;
 
 impl ConfigTool {
     pub fn new(service: Arc<AgentService>, revisions: Option<Arc<WorkflowStore>>) -> Self {
-        Self { service, revisions }
+        Self {
+            service,
+            revisions,
+            seen: Default::default(),
+        }
     }
 }
 
@@ -58,11 +71,57 @@ impl ConfigTool {
     /// The file as it is, and as `input` would leave it; `None` for a read,
     /// or a change that can't be made.
     fn proposed(&self, input: &serde_json::Value) -> Option<(String, String)> {
-        let input: Input = serde_json::from_value(input.clone()).ok()?;
-        let key = input.key.as_deref()?;
-        let path = key_path(key).ok()?;
         let read = self.read().ok()?.unwrap_or_default();
-        let mut doc = parse_document(&read).ok()?;
+        let now = self.proposed_from(&read, input)?;
+        Some((read, now))
+    }
+
+    /// What `input` would widen of this agent's reach, in words.
+    fn widens(&self, input: &serde_json::Value) -> Vec<String> {
+        self.proposed(input)
+            .map(|(was, now)| widened_between(&was, &now))
+            .unwrap_or_default()
+    }
+
+    /// Keeps the file as the gate saw it for `input`.
+    fn saw(&self, input: &serde_json::Value) {
+        let Some((was, _)) = self.proposed(input) else {
+            return;
+        };
+        let mut seen = self.seen.lock();
+        if seen.len() >= SEEN_HELD {
+            seen.clear();
+        }
+        seen.insert(input.to_string(), was);
+    }
+
+    /// Refuses a call that widens the agent's reach (or was asked as one)
+    /// when the file changed after the gate decided it: what would change
+    /// now isn't what was asked.
+    fn still_as_asked(&self, input: &serde_json::Value, widening: &[String]) -> Result<(), String> {
+        let Some(was) = self.seen.lock().remove(&input.to_string()) else {
+            return Ok(());
+        };
+        let asked = self
+            .proposed_from(&was, input)
+            .map(|now| widened_between(&was, &now))
+            .unwrap_or_default();
+        let now = self.read().ok().flatten().unwrap_or_default();
+        if now != was && (!asked.is_empty() || !widening.is_empty()) {
+            return Err(
+                "config.toml changed after this change was asked, so it wasn't made; \
+                 ask again for what it should be now"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Self::proposed`]'s file after `input`, from `body`.
+    fn proposed_from(&self, body: &str, input: &serde_json::Value) -> Option<String> {
+        let input: Input = serde_json::from_value(input.clone()).ok()?;
+        let path = key_path(input.key.as_deref()?).ok()?;
+        let mut doc = parse_document(body).ok()?;
         match input.action {
             Action::Get => return None,
             Action::Set => assign(
@@ -75,14 +134,7 @@ impl ConfigTool {
                 remove(doc.as_table_mut(), &path);
             }
         }
-        Some((read, doc.to_string()))
-    }
-
-    /// What `input` would widen of this agent's reach, in words.
-    fn widens(&self, input: &serde_json::Value) -> Vec<String> {
-        self.proposed(input)
-            .map(|(was, now)| widened_between(&was, &now))
-            .unwrap_or_default()
+        Some(doc.to_string())
     }
 }
 
@@ -129,6 +181,7 @@ impl Tool for ConfigTool {
     /// A change that widens what the agent reaches is a connection write
     /// to Desk's gate; any other change touches nothing it decides.
     fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        self.saw(input);
         match self.widens(input).is_empty() {
             true => workforce_core::computer::Effect::None,
             false => workforce_core::computer::Effect::Connector {
@@ -152,6 +205,12 @@ impl Tool for ConfigTool {
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
         let widening = self.widens(&input);
+        if let Err(reason) = self.still_as_asked(&input, &widening) {
+            return Ok(ToolResult::failure(
+                reason,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
         let input: Input = serde_json::from_value(input)?;
         let outcome = match input.action {
             Action::Get => self.get(input.key.as_deref()),
