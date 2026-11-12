@@ -49,6 +49,8 @@ fn only_a_full_member_of_the_bot_s_workspace_vouches() {
         (vec![("is_restricted", Value::Null)], "a guest"),
         (vec![("deleted", Value::Null)], "deactivated"),
         (vec![("profile", json!({}))], "no email shown"),
+        (vec![("is_invited_user", json!(true))], "not joined yet"),
+        (vec![("is_email_confirmed", json!(false))], "email not confirmed"),
     ] {
         assert_eq!(
             judge(&with(&change), home),

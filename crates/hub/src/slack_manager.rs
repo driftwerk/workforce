@@ -1933,6 +1933,11 @@ async fn resolve_slack_identity(
                     .get("slack")
                     .is_none_or(|id| id != slack_user_id)
                 {
+                    // The email Slack vouched for was the old account's.
+                    crate::verified_email::forget(
+                        &mut existing,
+                        crate::verified_email::Source::Slack,
+                    );
                     existing.link_id("slack", slack_user_id);
                     if let Err(e) = store.update(&existing) {
                         warn!(
