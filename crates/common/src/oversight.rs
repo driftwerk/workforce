@@ -26,14 +26,20 @@
 //! `gh workflow run` of a workflow `workflows` lists (by its file name
 //! exactly) on the default branch, with no inputs. Deploys run through
 //! those workflows: deploy tools and the project's own release, deploy and
-//! promote scripts stay the person's. It needs both named
-//! repositories and `budget_usd_per_day`, and holds only while today's
-//! spend is under that budget; short of any of it, it acts as `act` and
+//! promote scripts stay the person's. It needs named repositories;
+//! `budget_usd_per_day` is optional (with none, only the check-in
+//! ceilings and Stop bound it), and when set it holds only while today's
+//! spend is under it. The budget counts real money only: calls
+//! paid by an API key or a cloud vendor (Bedrock, Vertex), never those on
+//! the person's Claude or ChatGPT plans, whose API-equivalent value the
+//! ledger keeps but nobody is billed for. `budget_cleared_at` (an RFC 3339
+//! time, written when the person clears a spent budget) starts today's
+//! count again from then. Short of any of it, it acts as `act` and
 //! says why ([`Oversight::fully`]). What no overseer does at any level, Act
 //! fully included, is Desk's own list (`workforce_desk::never`).
 //!
 //! `anywhere = true` takes the lists away: Act fully ships in any
-//! repository and runs any workflow, and `budget_usd_per_day` is optional.
+//! repository and runs any workflow.
 //! With `level = "full"`, `anywhere` and every `[oversight.act]` switch on,
 //! the overseer is **unbound** ([`Oversight::unbound`]): it answers every
 //! request and question itself, does every crew action, and checks in as
@@ -241,6 +247,9 @@ pub struct Full {
     /// Not limited to `repos` and `workflows`: it ships in any repository
     /// and runs any workflow, and its budget is optional.
     pub anywhere: bool,
+    /// When the person last cleared a spent budget: today's spend is
+    /// counted from then (from midnight, when that is later).
+    pub budget_cleared_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Full {
@@ -253,7 +262,8 @@ impl Full {
 /// Why Act fully isn't in force though chosen: no repositories named.
 pub const FULL_NO_REPOS: &str =
     "Act fully needs at least one repository named, so it acts within Desk for now.";
-/// Why Act fully isn't in force though chosen: no daily budget.
+/// Why a boss served from a grant doesn't act fully: its grant gives no
+/// daily budget (one of this hub's own may leave it blank).
 pub const FULL_NO_BUDGET: &str = "Act fully needs a daily budget, so it acts within Desk for now.";
 /// The most workflows Act fully may name.
 pub const MAX_FULL_WORKFLOWS: usize = 20;
@@ -536,11 +546,27 @@ fn full_of(t: Option<&Table>) -> Result<Full, String> {
         Some(_) => return Err(budget_wrong()),
     };
     let anywhere = switch(t, "anywhere", false, "Act fully anywhere")?;
+    let cleared_wrong = || "When its budget was last cleared must be a time.".to_string();
+    let budget_cleared_at = match t.and_then(|t| t.get("budget_cleared_at")) {
+        None => None,
+        Some(Value::String(at)) => Some(
+            chrono::DateTime::parse_from_rfc3339(at.trim())
+                .map_err(|_| cleared_wrong())?
+                .with_timezone(&chrono::Utc),
+        ),
+        Some(Value::Datetime(at)) => Some(
+            chrono::DateTime::parse_from_rfc3339(&at.to_string())
+                .map_err(|_| cleared_wrong())?
+                .with_timezone(&chrono::Utc),
+        ),
+        Some(_) => return Err(cleared_wrong()),
+    };
     Ok(Full {
         repos,
         budget_cents_per_day,
         workflows,
         anywhere,
+        budget_cleared_at,
     })
 }
 
@@ -804,9 +830,12 @@ impl Oversight {
     }
 
     /// Whether Act fully is in force by its settings, or why not: it is
-    /// chosen, with repositories named and a daily budget. (Whether today's
-    /// spend is under that budget is the hub's to read.) `Err(None)` when
-    /// it isn't chosen at all.
+    /// chosen, with repositories named (or anywhere). Its daily budget is
+    /// optional: with none, only the check-in ceilings and Stop bound it,
+    /// as on plans alone, where no real money is spent. (Whether today's
+    /// spend is under a budget is the hub's to read; a boss served from a
+    /// grant needs one, which the hub holds it to.) `Err(None)` when it
+    /// isn't chosen at all.
     pub fn fully(&self) -> Result<&Full, Option<&'static str>> {
         if self.level != Level::Full {
             return Err(None);
@@ -818,9 +847,6 @@ impl Oversight {
         }
         if self.full.repos.is_empty() {
             return Err(Some(FULL_NO_REPOS));
-        }
-        if self.full.budget_cents_per_day.is_none() {
-            return Err(Some(FULL_NO_BUDGET));
         }
         Ok(&self.full)
     }
@@ -923,6 +949,17 @@ mod tests {
         assert_eq!(f.budget_usd_per_day(), Some(25.0));
         let cents = parse("[oversight.full]\nbudget_usd_per_day = 7.5\n").unwrap();
         assert_eq!(cents.full.budget_cents_per_day, Some(750));
+        assert_eq!(cents.full.budget_cleared_at, None);
+        let cleared =
+            parse("[oversight.full]\nbudget_cleared_at = \"2026-11-11T14:02:00Z\"\n").unwrap();
+        assert_eq!(
+            cleared.full.budget_cleared_at.map(|t| t.to_rfc3339()),
+            Some("2026-11-11T14:02:00+00:00".into())
+        );
+        assert_eq!(
+            parse("[oversight.full]\nbudget_cleared_at = \"today\"\n").unwrap_err(),
+            "When its budget was last cleared must be a time."
+        );
 
         // Short of either, it acts as act and says why; not chosen, it's
         // nothing to say.
@@ -932,7 +969,7 @@ mod tests {
         let no_budget =
             parse("[oversight]\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n")
                 .unwrap();
-        assert_eq!(no_budget.fully(), Err(Some(FULL_NO_BUDGET)));
+        assert!(no_budget.fully().is_ok(), "a budget is optional");
         let act = parse("[oversight]\nlevel = \"act\"\nfull = { repos = [\"acme/acme-web\"], budget_usd_per_day = 5 }\n").unwrap();
         assert_eq!(act.fully(), Err(None));
 

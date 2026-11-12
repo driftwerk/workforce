@@ -129,7 +129,87 @@ fn tokens_of(row: &tokio_postgres::Row, at: usize) -> Result<Tokens> {
     })
 }
 
+/// An engine's sign-in as the ledger keeps it across restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptSignIn {
+    pub engine: Engine,
+    pub via: crate::engine::Via,
+    pub who: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
 impl DeskStore {
+    /// Keeps `s` as its engine's sign-in now: the same sign-in as kept
+    /// keeps the earlier `since`; another replaces it. And notes its way of
+    /// signing in as one the engine has been seen with.
+    pub async fn keep_sign_in(&self, s: &KeptSignIn) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO ledger_sign_ins (engine, via, who, since) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (engine) DO UPDATE SET \
+                   since = CASE WHEN ledger_sign_ins.via = EXCLUDED.via \
+                                 AND ledger_sign_ins.who IS NOT DISTINCT FROM EXCLUDED.who \
+                            THEN LEAST(ledger_sign_ins.since, EXCLUDED.since) \
+                            ELSE EXCLUDED.since END, \
+                   via = EXCLUDED.via, who = EXCLUDED.who",
+                &[&s.engine.as_str(), &s.via.as_str(), &s.who, &s.since],
+            )
+            .await
+            .context("keeping an engine's sign-in")?;
+        client
+            .execute(
+                "INSERT INTO ledger_billings_seen (engine, via, since) VALUES ($1, $2, $3) \
+                 ON CONFLICT (engine, via) DO UPDATE SET since = LEAST(ledger_billings_seen.since, EXCLUDED.since)",
+                &[&s.engine.as_str(), &s.via.as_str(), &s.since],
+            )
+            .await
+            .context("noting how an engine was signed in")?;
+        Ok(())
+    }
+
+    /// Each engine's sign-in as last kept.
+    pub async fn kept_sign_ins(&self) -> Result<Vec<KeptSignIn>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query("SELECT engine, via, who, since FROM ledger_sign_ins", &[])
+            .await
+            .context("reading the engines' sign-ins")?;
+        rows.iter()
+            .filter_map(|r| {
+                let engine: String = r.get(0);
+                let via: String = r.get(1);
+                Some(Ok(KeptSignIn {
+                    engine: Engine::parse(&engine).ok()?,
+                    via: crate::engine::Via::parse(&via).ok()?,
+                    who: r.get(2),
+                    since: r.get(3),
+                }))
+            })
+            .collect()
+    }
+
+    /// Every way each engine has been seen signed in.
+    pub async fn billings_seen(
+        &self,
+    ) -> Result<std::collections::BTreeMap<Engine, std::collections::BTreeSet<crate::engine::Via>>>
+    {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query("SELECT engine, via FROM ledger_billings_seen", &[])
+            .await
+            .context("reading how the engines were signed in")?;
+        let mut seen: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> =
+            Default::default();
+        for r in &rows {
+            let (engine, via): (String, String) = (r.get(0), r.get(1));
+            if let (Ok(e), Ok(v)) = (Engine::parse(&engine), crate::engine::Via::parse(&via)) {
+                seen.entry(e).or_default().insert(v);
+            }
+        }
+        Ok(seen)
+    }
+
     /// How far `source` of `session` has been read; `None` before it was.
     pub async fn ledger_cursor(&self, session: Uuid, source: &str) -> Result<Option<Cursor>> {
         let client = self.pool().get().await?;
