@@ -14,7 +14,7 @@ use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
 use workforce_desk::mode::Mode;
-use workforce_desk::model::{Engine, NewSession, Origin};
+use workforce_desk::model::{Engine, NewSession, Origin, SessionState, SessionView};
 use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
@@ -91,6 +91,9 @@ pub(crate) enum Action {
         view: Option<View>,
         /// A new branch to work on, in a worktree of its own.
         worktree: Option<String>,
+        /// The person asked for a new session: none already there is
+        /// given the work instead.
+        fresh: bool,
     },
     Assign {
         agent: String,
@@ -167,6 +170,9 @@ struct Input {
     engine: Option<Engine>,
     view: Option<View>,
     worktree: Option<String>,
+    /// `crew.start_session`'s `new`: a new session, whatever is there.
+    #[serde(rename = "new")]
+    fresh: Option<bool>,
     task: Option<String>,
     ticket: Option<String>,
     ticket_id: Option<String>,
@@ -333,6 +339,7 @@ impl Action {
                 engine: i.engine,
                 view: i.view,
                 worktree: blank_none(i.worktree),
+                fresh: i.fresh.unwrap_or(false),
             },
             "crew.assign" => Self::Assign {
                 agent: text(i.agent_id, "which agent")?,
@@ -1439,6 +1446,7 @@ impl CrewHub {
             engine,
             view,
             worktree,
+            ..
         } = action
         else {
             return Err("That isn't a session to start.".into());
@@ -1500,6 +1508,80 @@ impl CrewHub {
             v.label(),
             v.id
         ))
+    }
+
+    /// With "always work in real sessions", the session already there to
+    /// give a start's work to instead of starting another: `action` becomes
+    /// a nudge to it with the goal, said so in `by`'s reason, and the
+    /// session's name is what it answers. None when the person asked for a
+    /// new one, a worktree of its own was asked for, or none fits.
+    pub(crate) fn reuse_instead(
+        &self,
+        action: &mut Action,
+        o: &Oversight,
+        boss: &str,
+    ) -> Option<String> {
+        let Action::StartSession {
+            folder,
+            goal,
+            worktree: None,
+            fresh: false,
+            ..
+        } = action
+        else {
+            return None;
+        };
+        if !o.work.prefer_sessions {
+            return None;
+        }
+        let v = self.reusable(folder, goal, o, boss)?;
+        let name = v.label().to_string();
+        *action = Action::Nudge {
+            to: Target::Session(v.id),
+            message: goal.clone(),
+            reply_to: None,
+        };
+        Some(name)
+    }
+
+    /// A session in `o`'s scope that `goal` in `folder` can go to: in that
+    /// folder or another worktree of its repository, running and between
+    /// turns (idle or done), not the person's to drive now, not another
+    /// boss's, and one Desk started (or, with that switch on, one in
+    /// another terminal). One already on that goal first, then one `boss`
+    /// runs, then the one used last.
+    pub(crate) fn reusable(
+        &self,
+        folder: &str,
+        goal: &str,
+        o: &Oversight,
+        boss: &str,
+    ) -> Option<SessionView> {
+        let place = same_place_key(folder);
+        let seen = self.desk.seen_by(&o.scope);
+        let goal = goal.trim().to_lowercase();
+        self.desk
+            .list()
+            .into_iter()
+            .filter(|v| {
+                v.live
+                    && matches!(v.state, SessionState::Idle | SessionState::Done)
+                    && seen.sees(v.group.as_ref().map(|g| g.id.as_str()))
+                    && same_place_key(&v.cwd) == place
+                    && (v.origin == Origin::Desk || o.act.message_terminal_sessions)
+                    && !self.desk.wheel_of(v.id).is_some_and(|w| w.person())
+                    && self
+                        .desk
+                        .charge_of(v.id)
+                        .is_none_or(|c| !c.live() || c.boss == boss)
+            })
+            .max_by_key(|v| {
+                (
+                    v.goal.trim().to_lowercase() == goal,
+                    self.runs(v.id, boss),
+                    v.updated_at,
+                )
+            })
     }
 
     /// `engine`, or the overseer's default one.
@@ -2020,6 +2102,20 @@ impl CrewHub {
         ));
         Ok(suggestion)
     }
+}
+
+/// Where a folder's work is, to tell two sessions in one place: its
+/// repository's main folder for a worktree of it, without a trailing
+/// slash, `~` read as the home folder.
+pub(crate) fn same_place_key(folder: &str) -> String {
+    let f = folder.trim().trim_end_matches('/');
+    let f = match (f.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+        _ => f.to_string(),
+    };
+    workforce_desk::project_of(&f)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]

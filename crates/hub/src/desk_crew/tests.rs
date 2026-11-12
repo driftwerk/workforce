@@ -5143,3 +5143,81 @@ fn a_served_boss_is_told_whose_switch_it_is() {
         assert!(!why.contains("Desk"), "{why}");
     }
 }
+
+/// Always working in real sessions, a start goes to the session already
+/// there for it: idle in the same folder, it is told the goal and Activity
+/// says which; asked for a new one, or with none fitting, one starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_goes_to_the_idle_session_already_in_that_folder() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 4\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(&url, json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()})).await;
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"})).await;
+        hook(&url, json!({"hook_event_name": "Stop", "last_assistant_message": "Done."})).await;
+        eventually("it idles", async || {
+            matches!(d.view(s.id).ok()?.state, workforce_desk::model::SessionState::Idle | workforce_desk::model::SessionState::Done).then_some(())
+        })
+        .await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.start_session").then_some(())).await;
+        let start = overseer.tools.get("crew.start_session").unwrap();
+        let before = d.list().len();
+        // The same folder, written with a trailing slash.
+        let folder = format!("{}/", dir.path().to_string_lossy());
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Add the dark mode toggle", "reason": "Sam asked"}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["reused"], "acme-web", "{r:?}");
+        assert!(r.output["done"].as_str().unwrap().starts_with("told acme-web"), "{r:?}");
+        assert_eq!(d.list().len(), before, "no new session");
+        // Activity says which session it reused, and why.
+        eventually("the reuse in Activity", async || {
+            let page = d.activity(Filter::All, None, 50).await.ok()?;
+            page.events
+                .into_iter()
+                .find(|e| e.text == "gave acme-web the work rather than starting a new session")
+                .filter(|e| e.reason.as_deref().is_some_and(|r| r.contains("Sam asked")))
+        })
+        .await;
+        // Asked for a new one: a new one, whatever is there.
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Write the release notes", "new": true, "reason": "Sam asked for a new one"}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(r.output.get("reused").is_none(), "{r:?}");
+        assert_eq!(d.list().len(), before + 1);
+        // Elsewhere: nothing there, so it starts.
+        let other = tempfile::tempdir().unwrap();
+        let r = start
+            .execute(json!({"folder": other.path().to_string_lossy(), "goal": "Fix the build", "reason": "Sam asked"}))
+            .await
+            .unwrap();
+        assert!(r.output.get("reused").is_none(), "{r:?}");
+    })
+    .await;
+}
+
+/// The place a session's folder is: its repository's for a worktree of it,
+/// with no trailing slash.
+#[test]
+fn a_worktree_is_the_same_place_as_its_repository() {
+    use super::actions::same_place_key;
+    assert_eq!(same_place_key("/r/acme-web/"), "/r/acme-web");
+    assert_eq!(
+        same_place_key("/r/acme-web/.worktrees/dark-mode"),
+        "/r/acme-web"
+    );
+    assert_ne!(same_place_key("/r/acme-api"), same_place_key("/r/acme-web"));
+}

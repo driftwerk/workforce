@@ -600,7 +600,7 @@ impl CrewHub {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
-            Level::Act => "You act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
+            Level::Act => "You act: do the work yourself with the crew.* tools (hand work to a session already there before starting one, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
             Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's. Give a reason each time.",
         }
     }
