@@ -372,6 +372,8 @@ const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 
 /// Build the gateway router.
 pub fn router(state: Arc<GatewayState>) -> Router {
+    // The boss tools of this hub's turns call its uplinks.
+    crate::boss_links::tools::serve_for(&state);
     let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
@@ -1071,6 +1073,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
         .route("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
         .route("/api/me/desk-boss-links/{id}", axum::routing::delete(crate::api_handlers::desk_boss_links::revoke))
+        .route("/api/me/desk-boss-links/{id}/conversation", post(crate::boss_links::conversation::open))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──
@@ -4493,6 +4496,15 @@ async fn chat_handler(
         return Err((status, Json(serde_json::json!({ "error": said }))).into_response());
     }
     let channel = req.channel.as_deref().unwrap_or("rest");
+    // A Desk group's boss conversation is talked in only once its link
+    // opened it, by its own person.
+    if let Some(said) = crate::boss_links::conversation::refused_for(&service, channel, &owner) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": said })),
+        )
+            .into_response());
+    }
     let task_id = req
         .turn_id
         .as_deref()

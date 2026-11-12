@@ -223,6 +223,25 @@ impl Tool for MemoryTool {
             }
         };
 
+        // In a Desk group's boss conversation, what is remembered stays the
+        // person's and the group's: private, and never the team's or the
+        // organisation's, which reach people outside it.
+        let mut input = input;
+        if crate::memory_fence::in_boss_conversation() {
+            let shared = matches!(
+                input.layer.as_deref().and_then(parse_layer),
+                Some(MemoryLayer::Team | MemoryLayer::Organisation)
+            );
+            if shared {
+                return Ok(ToolResult::failure(
+                    "The team and organisation memory layers aren't reached from a Desk group's \
+                     boss conversation: what you remember here stays with this group.",
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+            input.visibility = Some("private".into());
+        }
+
         match input.action.as_str() {
             "remember" => self.handle_remember(input, start).await,
             "recall" => self.handle_recall(input, start).await,
@@ -1263,6 +1282,62 @@ mod tests {
 
             assert!(result.success);
             assert_eq!(result.output["layer"], "team");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_a_boss_conversation_memory_stays_private_and_off_the_shared_layers() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new(
+            Arc::clone(&store),
+            AgentId::new("test"),
+            dir.path().to_path_buf(),
+        );
+        let boss = format!(
+            "test\t{}",
+            workforce_memory::group_tagged::link_boss_tag("k-acme")
+        );
+        with_test_user(|| async {
+            let refused = |layer: &'static str| {
+                let tool = &tool;
+                workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(boss.clone(), async move {
+                    tool.execute(serde_json::json!({
+                        "action": "remember", "content": "acme pricing", "layer": layer,
+                    }))
+                    .await
+                    .unwrap()
+                })
+            };
+            for layer in ["team", "organisation", "organization"] {
+                assert!(!refused(layer).await.success, "{layer}");
+            }
+            let kept = workforce_agent::runner::CURRENT_MEMORY_FENCE
+                .scope(boss.clone(), async {
+                    tool.execute(serde_json::json!({
+                        "action": "remember", "content": "acme pricing", "visibility": "global",
+                    }))
+                    .await
+                    .unwrap()
+                })
+                .await;
+            assert!(kept.success, "{:?}", kept.error);
+            let id = kept.output["memory_id"]
+                .as_str()
+                .or(kept.output["id"].as_str())
+                .unwrap()
+                .to_string();
+            let m = store.get(&MemoryId(id)).await.unwrap().unwrap();
+            assert_eq!(m.visibility, Visibility::Private);
+            // Anywhere else, as asked.
+            let elsewhere = tool
+                .execute(serde_json::json!({
+                    "action": "remember", "content": "team note", "layer": "team",
+                }))
+                .await
+                .unwrap();
+            assert!(elsewhere.success);
         })
         .await;
     }

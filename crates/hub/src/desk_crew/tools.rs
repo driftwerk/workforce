@@ -631,14 +631,10 @@ impl CrewTool {
     }
 }
 
-#[async_trait]
-impl Tool for CrewTool {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
-        match self.name {
+/// What the `crew.*` tool `name` is for, as the agent reads it: this hub's
+/// own words, the same whether its crew is here or on a linked engine.
+pub(crate) fn describe(name: &str) -> &'static str {
+    match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
@@ -666,143 +662,155 @@ impl Tool for CrewTool {
             "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
             _ => "",
         }
+}
+
+/// The input of the `crew.*` tool `name`; `engines` are the engines a
+/// session may be started on.
+pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Value {
+    let act = |mut props: serde_json::Map<String, Value>, required: &[&str]| {
+        props.insert("reason".into(), reason_schema());
+        let mut req: Vec<&str> = required.to_vec();
+        req.push("reason");
+        json!({ "type": "object", "properties": props, "required": req })
+    };
+    let props = |v: Value| v.as_object().cloned().unwrap_or_default();
+    match name {
+        "crew.overview" => json!({ "type": "object", "properties": {} }),
+        super::spend::NAME => super::spend::schema(),
+        super::board::NAME => super::board::schema(),
+        super::plan::NAME => super::plan::schema(),
+        super::plan::UPDATE => super::plan::update_schema(),
+        super::handover::NAME => super::handover::schema(),
+        super::own_settings::NAME => super::own_settings::schema(),
+        "crew.activity" => json!({ "type": "object", "properties": {
+            "subject_id": { "type": "string", "description": "An agent or session id" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }}),
+        "crew.history" => json!({ "type": "object", "properties": {
+            "agent_id": { "type": "string" },
+            "session_id": session_schema(),
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }}),
+        "crew.nudge" => act(
+            props(json!({
+                "agent_id": { "type": "string" },
+                "session_id": session_schema(),
+                "message": { "type": "string" },
+                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
+            })),
+            &["message"],
+        ),
+        "crew.escalate" => act(
+            props(json!({
+                "message_id": { "type": "string", "description": "The message id of the session's question" },
+                "options": { "type": "array", "items": { "type": "string" }, "maxItems": 6 },
+                "draft": { "type": "string", "description": "The answer you would give, for the person to send or change" }
+            })),
+            &["message_id"],
+        ),
+        "crew.approve" | "crew.deny" => act(
+            props(json!({
+                "session_id": session_schema(),
+                "approval_id": { "type": "string" }
+            })),
+            &["session_id", "approval_id"],
+        ),
+        "crew.stop" | "crew.interrupt" | "crew.take_on" | "crew.release" => act(
+            props(json!({ "session_id": session_schema() })),
+            &["session_id"],
+        ),
+        "crew.resume" | "crew.restart" => act(
+            props(json!({
+                "session_id": session_schema(),
+                "prompt": { "type": "string" }
+            })),
+            &["session_id"],
+        ),
+        "crew.set_mode" => act(
+            props(json!({
+                "session_id": session_schema(),
+                "mode": { "type": "string", "enum": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"], "description": "The mode to run in" }
+            })),
+            &["session_id", "mode"],
+        ),
+        "crew.handoff" => act(
+            props(json!({
+                "session_id": session_schema(),
+                "engine": { "type": "string", "enum": ["claude", "codex"], "description": "The engine to continue in" },
+                "account": { "type": "string", "description": "Optional: an account's id from crew.overview, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
+            })),
+            &["session_id", "engine"],
+        ),
+        "crew.start_session" => {
+            let engines = engines();
+            act(
+                props(json!({
+                    "folder": { "type": "string", "description": "Absolute path of the project folder" },
+                    "goal": { "type": "string", "description": "What it is to do: its first prompt" },
+                    "name": { "type": "string" },
+                    "engine": { "type": "string", "enum": engines },
+                    "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
+                    "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
+                    "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
+                })),
+                &["folder", "goal"],
+            )
+        }
+        "crew.assign" => act(
+            props(json!({
+                "agent_id": { "type": "string" },
+                "task": { "type": "string" }
+            })),
+            &["agent_id", "task"],
+        ),
+        "crew.assign_ticket" => {
+            let engines = engines();
+            act(
+                props(json!({
+                    "ticket": ticket_schema(),
+                    "to": { "type": "object", "description": "Who gets it: exactly one of session, agent or newSession",
+                        "properties": {
+                            "session": session_schema(),
+                            "agent": { "type": "string", "description": "An agent id from crew.overview" },
+                            "newSession": { "type": "object", "properties": {
+                                "folder": { "type": "string", "description": "Absolute path of the project folder" },
+                                "engine": { "type": "string", "enum": engines }
+                            }, "required": ["folder"] }
+                        }
+                    }
+                })),
+                &["ticket", "to"],
+            )
+        }
+        "crew.move_ticket" => act(
+            props(json!({
+                "ticket": ticket_schema(),
+                "state": { "type": "string", "enum": ["backlog", "todo", "doing", "review", "done", "dropped"] }
+            })),
+            &["ticket", "state"],
+        ),
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
+#[async_trait]
+impl Tool for CrewTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        describe(self.name)
     }
 
     fn input_schema(&self) -> Value {
-        let act = |mut props: serde_json::Map<String, Value>, required: &[&str]| {
-            props.insert("reason".into(), reason_schema());
-            let mut req: Vec<&str> = required.to_vec();
-            req.push("reason");
-            json!({ "type": "object", "properties": props, "required": req })
-        };
-        let props = |v: Value| v.as_object().cloned().unwrap_or_default();
-        match self.name {
-            "crew.overview" => json!({ "type": "object", "properties": {} }),
-            super::spend::NAME => super::spend::schema(),
-            super::board::NAME => super::board::schema(),
-            super::plan::NAME => super::plan::schema(),
-            super::plan::UPDATE => super::plan::update_schema(),
-            super::handover::NAME => super::handover::schema(),
-            super::own_settings::NAME => super::own_settings::schema(),
-            "crew.activity" => json!({ "type": "object", "properties": {
-                "subject_id": { "type": "string", "description": "An agent or session id" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-            }}),
-            "crew.history" => json!({ "type": "object", "properties": {
-                "agent_id": { "type": "string" },
-                "session_id": session_schema(),
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-            }}),
-            "crew.nudge" => act(
-                props(json!({
-                    "agent_id": { "type": "string" },
-                    "session_id": session_schema(),
-                    "message": { "type": "string" },
-                    "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
-                })),
-                &["message"],
-            ),
-            "crew.escalate" => act(
-                props(json!({
-                    "message_id": { "type": "string", "description": "The message id of the session's question" },
-                    "options": { "type": "array", "items": { "type": "string" }, "maxItems": 6 },
-                    "draft": { "type": "string", "description": "The answer you would give, for the person to send or change" }
-                })),
-                &["message_id"],
-            ),
-            "crew.approve" | "crew.deny" => act(
-                props(json!({
-                    "session_id": session_schema(),
-                    "approval_id": { "type": "string" }
-                })),
-                &["session_id", "approval_id"],
-            ),
-            "crew.stop" | "crew.interrupt" | "crew.take_on" | "crew.release" => act(
-                props(json!({ "session_id": session_schema() })),
-                &["session_id"],
-            ),
-            "crew.resume" | "crew.restart" => act(
-                props(json!({
-                    "session_id": session_schema(),
-                    "prompt": { "type": "string" }
-                })),
-                &["session_id"],
-            ),
-            "crew.set_mode" => act(
-                props(json!({
-                    "session_id": session_schema(),
-                    "mode": { "type": "string", "enum": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"], "description": "The mode to run in" }
-                })),
-                &["session_id", "mode"],
-            ),
-            "crew.handoff" => act(
-                props(json!({
-                    "session_id": session_schema(),
-                    "engine": { "type": "string", "enum": ["claude", "codex"], "description": "The engine to continue in" },
-                    "account": { "type": "string", "description": "Optional: an account's id from crew.overview, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
-                })),
-                &["session_id", "engine"],
-            ),
-            "crew.start_session" => {
-                let engines = self
-                    .crew
-                    .upgrade()
-                    .map(|c| c.engines_to_start())
-                    .filter(|e| !e.is_empty())
-                    .unwrap_or_else(workforce_desk::engine::startable);
-                act(
-                    props(json!({
-                        "folder": { "type": "string", "description": "Absolute path of the project folder" },
-                        "goal": { "type": "string", "description": "What it is to do: its first prompt" },
-                        "name": { "type": "string" },
-                        "engine": { "type": "string", "enum": engines },
-                        "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
-                        "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
-                        "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
-                    })),
-                    &["folder", "goal"],
-                )
-            }
-            "crew.assign" => act(
-                props(json!({
-                    "agent_id": { "type": "string" },
-                    "task": { "type": "string" }
-                })),
-                &["agent_id", "task"],
-            ),
-            "crew.assign_ticket" => {
-                let engines = self
-                    .crew
-                    .upgrade()
-                    .map(|c| c.engines_to_start())
-                    .filter(|e| !e.is_empty())
-                    .unwrap_or_else(workforce_desk::engine::startable);
-                act(
-                    props(json!({
-                        "ticket": ticket_schema(),
-                        "to": { "type": "object", "description": "Who gets it: exactly one of session, agent or newSession",
-                            "properties": {
-                                "session": session_schema(),
-                                "agent": { "type": "string", "description": "An agent id from crew.overview" },
-                                "newSession": { "type": "object", "properties": {
-                                    "folder": { "type": "string", "description": "Absolute path of the project folder" },
-                                    "engine": { "type": "string", "enum": engines }
-                                }, "required": ["folder"] }
-                            }
-                        }
-                    })),
-                    &["ticket", "to"],
-                )
-            }
-            "crew.move_ticket" => act(
-                props(json!({
-                    "ticket": ticket_schema(),
-                    "state": { "type": "string", "enum": ["backlog", "todo", "doing", "review", "done", "dropped"] }
-                })),
-                &["ticket", "state"],
-            ),
-            _ => json!({ "type": "object", "properties": {} }),
-        }
+        schema(self.name, || {
+            self.crew
+                .upgrade()
+                .map(|c| c.engines_to_start())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(workforce_desk::engine::startable)
+        })
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
