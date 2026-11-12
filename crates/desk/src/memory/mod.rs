@@ -55,6 +55,68 @@ pub struct MemoryOptions {
     /// The most tokens a handoff's brief may take, whatever the target's
     /// window.
     pub brief_max_tokens: u32,
+    /// The most room the person may give Desk Memory from Settings, when
+    /// the install sets a ceiling (`[desk.memory] max_disk_mb_ceiling`).
+    pub max_disk_mb_ceiling: Option<u64>,
+}
+
+/// What the person chose in Settings → Memory, over the install's
+/// `[desk.memory]`: each one unset leaves the install's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryChoices {
+    pub enabled: Option<bool>,
+    pub derive: Option<bool>,
+    pub retain_days: Option<u32>,
+    pub max_disk_mb: Option<u64>,
+}
+
+/// Where each choice is kept, in the desk's settings.
+pub const CHOSEN_ENABLED: &str = "memory.choice.enabled";
+pub const CHOSEN_DERIVE: &str = "memory.choice.derive";
+pub const CHOSEN_RETAIN_DAYS: &str = "memory.choice.retain_days";
+pub const CHOSEN_MAX_DISK_MB: &str = "memory.choice.max_disk_mb";
+
+/// The days a conversation may be kept, and the MB Desk Memory may take,
+/// as the person may set them.
+pub const RETAIN_DAYS: std::ops::RangeInclusive<u32> = 1..=3650;
+pub const MAX_DISK_MB: std::ops::RangeInclusive<u64> = 100..=1_000_000;
+
+impl MemoryChoices {
+    /// The choices kept in `settings` (the `memory.*` ones, by key); one
+    /// that isn't what it should be is left out.
+    pub fn from_settings(settings: &std::collections::HashMap<String, serde_json::Value>) -> Self {
+        Self {
+            enabled: settings
+                .get(CHOSEN_ENABLED)
+                .and_then(serde_json::Value::as_bool),
+            derive: settings
+                .get(CHOSEN_DERIVE)
+                .and_then(serde_json::Value::as_bool),
+            retain_days: settings
+                .get(CHOSEN_RETAIN_DAYS)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|d| u32::try_from(d).ok())
+                .filter(|d| RETAIN_DAYS.contains(d)),
+            max_disk_mb: settings
+                .get(CHOSEN_MAX_DISK_MB)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|m| MAX_DISK_MB.contains(m)),
+        }
+    }
+
+    /// `base` with these choices over it.
+    pub fn over(&self, base: &MemoryOptions) -> MemoryOptions {
+        MemoryOptions {
+            enabled: self.enabled.unwrap_or(base.enabled),
+            derive: self.derive.unwrap_or(base.derive),
+            retain_days: self.retain_days.unwrap_or(base.retain_days),
+            max_disk_mb: self
+                .max_disk_mb
+                .map(|mb| base.max_disk_mb_ceiling.map_or(mb, |c| mb.min(c)))
+                .unwrap_or(base.max_disk_mb),
+            ..base.clone()
+        }
+    }
 }
 
 impl Default for MemoryOptions {
@@ -71,6 +133,7 @@ impl Default for MemoryOptions {
             derive_calls_per_day: 200,
             machine: false,
             brief_max_tokens: 20_000,
+            max_disk_mb_ceiling: None,
         }
     }
 }
@@ -92,11 +155,11 @@ pub const DISABLED: &str = "Remembering conversations is turned off for this Des
 /// What the person reads of a session Desk no longer has.
 pub const CLEARED: &str = "Desk no longer has this session; this is what it remembered of it.";
 /// What the person reads while Desk Memory is out of room.
-pub const FULL: &str = "Desk Memory is full, so Desk isn't remembering new conversations. Forget some sessions or raise max_disk_mb, and it carries on where it stopped.";
+pub const FULL: &str = "Desk Memory is full, so Desk isn't remembering new conversations. Forget some sessions or give it more room in Settings → Memory, and it carries on where it stopped.";
 /// What the Floor says while deletions from the search index are set aside.
 pub const PURGES_SET_ASIDE: &str = "Desk couldn't take some conversations you asked it to forget out of its search, though they're gone from everything else. Rebuild the search in Settings → Memory to clear them.";
 /// What the Floor says as Desk Memory nears its limit.
-pub const NEARLY_FULL: &str = "Desk Memory is nearly full. When it is, Desk stops remembering new conversations until you forget some sessions or raise max_disk_mb.";
+pub const NEARLY_FULL: &str = "Desk Memory is nearly full. When it is, Desk stops remembering new conversations until you forget some sessions or give it more room in Settings → Memory.";
 /// What a search says while some of what it covers isn't in the index yet.
 pub const CATCHING_UP: &str = "Desk is still adding some conversations to its search; until it has, those are found by keyword.";
 /// What a keyword search says of itself until the search index is ready.

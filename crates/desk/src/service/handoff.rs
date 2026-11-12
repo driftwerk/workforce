@@ -565,7 +565,7 @@ impl Desk {
 
     /// Whether Desk may note decisions from `id` in `group` now.
     async fn notes_allowed(&self, id: Uuid, group: Option<&str>) -> Result<bool, DeskError> {
-        if !self.0.opts.memory.derive || self.0.derive.deriver.is_none() {
+        if !self.memory_now().derive || self.0.derive.deriver.is_none() {
             return Ok(false);
         }
         let f = self.0.store.derive_facts(id, group).await?;
