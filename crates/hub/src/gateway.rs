@@ -374,6 +374,8 @@ const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 pub fn router(state: Arc<GatewayState>) -> Router {
     // The boss tools of this hub's turns call its uplinks.
     crate::boss_links::tools::serve_for(&state);
+    // And what happens in their groups wakes them.
+    crate::boss_links::wake::start(&state);
     let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))

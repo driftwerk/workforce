@@ -666,6 +666,15 @@ impl Uplink {
             }
             let _ = sink.close().await;
         });
+        // What happens in each accepted link's group wakes its boss.
+        let events = tokio::spawn(send_events(
+            Arc::clone(&self.crew),
+            accepted
+                .values()
+                .map(|l| (l.link_id, l.group.clone()))
+                .collect(),
+            tx.clone(),
+        ));
         let mut last_seq = 0u64;
         let rates = Arc::clone(&self.rates);
         let ended = loop {
@@ -775,6 +784,7 @@ impl Uplink {
                 _ => {}
             }
         };
+        events.abort();
         drop(tx);
         let _ = writer.await;
         ended
@@ -807,6 +817,53 @@ impl Uplink {
             })
             .collect();
         json!({"type": "catch_up", "links": parts})
+    }
+}
+
+/// The most `event` frames one link sends an hour: past it, what happens
+/// is counted and said with the next one sent.
+pub const EVENTS_PER_HOUR: usize = 120;
+
+/// Sends `event` frames up `tx` for what happens in each of `links`' groups
+/// ([`CrewHub::served_event`] decides what, and what of it the boss sees),
+/// at most [`EVENTS_PER_HOUR`] a link; until the socket ends.
+async fn send_events(
+    crew: Arc<CrewHub>,
+    links: Vec<(Uuid, String)>,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let (_, mut rx) = crew.desk().subscribe();
+    let mut sent: HashMap<Uuid, VecDeque<Instant>> = HashMap::new();
+    let mut skipped: HashMap<Uuid, u64> = HashMap::new();
+    loop {
+        let event = match rx.recv().await {
+            Ok(workforce_desk::model::DeskEvent::Activity { event }) => event,
+            Ok(_) | Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return,
+        };
+        for (link, group) in &links {
+            let Some(mut frame) = crew.served_event(group, &event) else {
+                continue;
+            };
+            let recent = sent.entry(*link).or_default();
+            while recent
+                .front()
+                .is_some_and(|at| at.elapsed() > Duration::from_secs(3_600))
+            {
+                recent.pop_front();
+            }
+            if recent.len() >= EVENTS_PER_HOUR {
+                *skipped.entry(*link).or_default() += 1;
+                continue;
+            }
+            frame["type"] = json!("event");
+            frame["linkId"] = json!(link);
+            frame["skipped"] = json!(skipped.remove(link).unwrap_or(0));
+            if tx.try_send(frame).is_ok() {
+                recent.push_back(Instant::now());
+            }
+        }
     }
 }
 

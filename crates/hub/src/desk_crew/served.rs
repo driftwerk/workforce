@@ -407,6 +407,64 @@ impl CrewHub {
         result.unwrap_or_else(refused)
     }
 
+    /// What `event` tells the remote boss of `group` as a wake-up (an
+    /// uplink's `event` frame), or nothing: only while `group`'s grant is
+    /// live and its boss is remote; only a turn's end, a question, a failure
+    /// or a limit of one of the grant's own sessions, had while it was in the
+    /// grant's group; never what the boss itself or the person did, nor past
+    /// the hand-off limit. Its words only when the grant's Sees shows them
+    /// (`crew.activity`'s rule), and never a terminal.
+    pub(crate) fn served_event(
+        &self,
+        group: &str,
+        event: &workforce_desk::crew::Event,
+    ) -> Option<Value> {
+        use workforce_desk::crew::{Kind, PartyKind};
+        let g = self.desk.grant_live(group).ok()?;
+        if !matches!(g.boss, Some(BossRef::Remote { .. })) {
+            return None;
+        }
+        if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You)
+            || event.hop >= i16::from(workforce_core::desk::MAX_HOPS)
+        {
+            return None;
+        }
+        if !matches!(
+            event.kind,
+            Kind::Finished | Kind::Question | Kind::NeedsYou | Kind::Failed | Kind::Limit
+        ) {
+            return None;
+        }
+        let subject = event.subject.as_ref()?;
+        let id: Uuid = subject.id.parse().ok()?;
+        if !self.in_grant(&g, id) || event.group.as_deref() != stamped_as(&g) {
+            return None;
+        }
+        let words = sees::shows(g.sees, Part::Words);
+        let line = match words {
+            true => format!(
+                "{} {} ({}): {}{}",
+                subject.name,
+                event.kind.as_str(),
+                subject.id,
+                event.text,
+                event
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default()
+            ),
+            false => format!("{} {} ({})", subject.name, event.kind.as_str(), subject.id),
+        };
+        Some(json!({
+            "kind": event.kind.as_str(),
+            "subject": subject.id,
+            "line": sees::capped(&line, 2_000),
+            "at": event.at,
+            "hop": event.hop,
+        }))
+    }
+
     /// Whether `id` is one of this engine's sessions in `g`.
     fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
         (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()

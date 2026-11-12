@@ -169,6 +169,9 @@ pub struct Uplinks {
     unproved: parking_lot::Mutex<HashMap<String, usize>>,
     pending: parking_lot::Mutex<HashMap<Uuid, Pending>>,
     timing: parking_lot::Mutex<Timing>,
+    /// Where the links' wake-ups go ([`super::wake`]), once this hub wakes
+    /// bosses.
+    wakes: std::sync::OnceLock<tokio::sync::mpsc::Sender<super::wake::Wake>>,
     #[cfg(test)]
     pub(crate) hub: parking_lot::Mutex<Option<String>>,
 }
@@ -272,6 +275,20 @@ impl Uplinks {
             })
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Sends this hub's links' wake-ups to `tx`: once.
+    pub fn wake_into(&self, tx: tokio::sync::mpsc::Sender<super::wake::Wake>) {
+        let _ = self.wakes.set(tx);
+    }
+
+    /// Hands `wake` on, when this hub wakes bosses; never waits.
+    fn wake(&self, wake: super::wake::Wake) {
+        if let Some(tx) = self.wakes.get() {
+            if tx.try_send(wake).is_err() {
+                tracing::warn!("a boss's wake-up was dropped: its queue is full");
+            }
+        }
     }
 
     /// The links on a socket now of the group `group_key` minted for
@@ -799,9 +816,26 @@ async fn run(
                         // counted against the engine.
                         let _ = uplinks.take_result(&socket, call_id, result);
                     }
+                    // A wake-up for the link's boss: bound to the link this
+                    // socket proved and still holds, its person, agent and
+                    // group the link's, whatever the frame says.
+                    Some("event") => {
+                        let Some(link) = frame["linkId"].as_str().and_then(|l| l.parse::<Uuid>().ok()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        let Ok(live) = uplinks.recheck(&state, &socket, link).await else {
+                            bad += 1;
+                            continue;
+                        };
+                        match super::wake::Wake::of(&live, &frame) {
+                            Some(wake) => uplinks.wake(wake),
+                            None => bad += 1,
+                        }
+                    }
                     // Frames of later versions (asks_open, catch_up, …) are
-                    // RB6's and RB7's: not counted against it.
-                    Some("asks_open" | "catch_up" | "event" | "ask" | "ask_closed") => {}
+                    // RB7's: not counted against it.
+                    Some("asks_open" | "catch_up" | "ask" | "ask_closed") => {}
                     _ => bad += 1,
                 }
             }

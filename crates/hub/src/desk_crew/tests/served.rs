@@ -519,3 +519,116 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
     })
     .await;
 }
+
+/// What happens in a grant's group wakes its remote boss with what its
+/// Sees shows and no more: never its own actions or the person's, never
+/// another group's or another session's, never past the hand-off limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
+    use workforce_desk::crew::{Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let other = new_session(&d, dir.path(), "globex-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let put = |sees: &'static str, revision: u64| {
+            let (d, acme_api) = (d.clone(), acme_api.clone());
+            async move {
+                let mut body = grant(&[mine.id], &acme_api, "act", sees);
+                body["revision"] = json!(revision);
+                let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", body).await;
+                assert_eq!(code, StatusCode::OK, "{out}");
+            }
+        };
+        put("status", 1).await;
+        let event =
+            |kind, actor: Party, about: &workforce_desk::model::SessionView, group: &str| {
+                let mut e = Event::new(
+                    kind,
+                    actor,
+                    Some(Party::session(about)),
+                    "deployed to prod with the secret plan",
+                );
+                e.group = Some(group.into());
+                e.reason = Some("because the hidden reason".into());
+                e
+            };
+        let session = Party::session(&mine);
+
+        // At Status: the kind and the session, no words.
+        let woke = crew
+            .served_event(
+                "acme",
+                &event(Kind::Finished, session.clone(), &mine, "acme"),
+            )
+            .expect("a turn's end wakes it");
+        let line = woke["line"].as_str().unwrap();
+        assert!(
+            line.contains("acme-web") && line.contains("finished"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("secret") && !line.contains("hidden"),
+            "{line}"
+        );
+        assert_eq!(woke["subject"], json!(mine.id.to_string()));
+
+        // Nothing it or the person did, nor what isn't its group's or its
+        // session's, nor past the hand-off limit, nor what wakes nobody.
+        let quiet = [
+            event(
+                Kind::Finished,
+                Party::manager("driftwerk/allan", "Allan"),
+                &mine,
+                "acme",
+            ),
+            event(Kind::Finished, Party::you(), &mine, "acme"),
+            event(Kind::Finished, session.clone(), &other, "acme"),
+            event(Kind::Finished, session.clone(), &mine, "globex"),
+            {
+                let mut e = event(Kind::Question, session.clone(), &mine, "acme");
+                e.hop = i16::from(workforce_core::desk::MAX_HOPS);
+                e
+            },
+            event(Kind::Nudged, session.clone(), &mine, "acme"),
+        ];
+        for e in &quiet {
+            assert!(crew.served_event("acme", e).is_none(), "{e:?}");
+        }
+        // Nor for a group with no grant.
+        assert!(crew
+            .served_event(
+                "globex",
+                &event(Kind::Finished, session.clone(), &mine, "globex")
+            )
+            .is_none());
+
+        // At Replies, its words too.
+        put("replies", 2).await;
+        let woke = crew
+            .served_event(
+                "acme",
+                &event(Kind::Question, session.clone(), &mine, "acme"),
+            )
+            .unwrap();
+        let line = woke["line"].as_str().unwrap();
+        assert!(
+            line.contains("secret plan") && line.contains("hidden reason"),
+            "{line}"
+        );
+    })
+    .await;
+}
