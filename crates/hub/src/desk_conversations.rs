@@ -599,6 +599,38 @@ pub fn router(state: Arc<GatewayState>) -> axum::Router {
 /// The most threads one listing holds: the ones with the newest replies.
 const THREADS_MAX: usize = 200;
 
+/// Parents already found in a person's DM, by person and message: a message
+/// stays in its conversation, so a listing needn't walk the chain for it
+/// again. Only found ones are kept; a stray thread is looked for every time.
+static PARENTS_FOUND: std::sync::LazyLock<std::sync::Mutex<HashSet<(String, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The most parents remembered before they are forgotten and found again.
+const PARENTS_REMEMBERED: usize = 50_000;
+
+/// Whether `parent` is a message of the DM whose head is `dm`.
+fn parent_in_dm(
+    store: &dyn SessionStore,
+    dm: &str,
+    owner: &str,
+    parent: &str,
+) -> eyre::Result<bool> {
+    let key = (owner.to_string(), parent.to_string());
+    if PARENTS_FOUND.lock().is_ok_and(|found| found.contains(&key)) {
+        return Ok(true);
+    }
+    let found = crate::desk_surface::message_in_chain(store, dm, parent)?.is_some();
+    if found {
+        if let Ok(mut seen) = PARENTS_FOUND.lock() {
+            if seen.len() >= PARENTS_REMEMBERED {
+                seen.clear();
+            }
+            seen.insert(key);
+        }
+    }
+    Ok(found)
+}
+
 /// The threads on messages of `owner`'s DM with `service`'s agent: each
 /// thread's conversation is a session of its own on its channel.
 fn threads_of(
@@ -622,9 +654,7 @@ fn threads_of(
     for head in heads {
         let parent = workforce_core::desk::dm_thread_parent(&head.channel).unwrap_or_default();
         let on_a_message = match &dm {
-            Some(dm) => crate::desk_surface::message_in_chain(store, &dm.id, parent)
-                .map_err(internal)?
-                .is_some(),
+            Some(dm) => parent_in_dm(store, &dm.id, owner, parent).map_err(internal)?,
             None => false,
         };
         if on_a_message {
