@@ -259,8 +259,10 @@ async fn an_issue_s_files_are_kept_in_step_and_the_cache_lets_go_of_the_oldest()
                 &Party::you(),
             )
             .await
-            .unwrap()
             .unwrap();
+        let Uploaded::Added(upload) = upload else {
+            panic!("{upload:?}")
+        };
         let files = &store.files_of(&[t]).await.unwrap()[&t];
         let (a, b) = (files[0].id, files[1].id);
         store
@@ -297,17 +299,67 @@ async fn an_issue_s_files_are_kept_in_step_and_the_cache_lets_go_of_the_oldest()
         );
         // A ticket holds so many uploads.
         for _ in 1..UPLOADS_PER_TICKET {
-            store
+            let added = store
                 .add_upload(t, "x", "text/plain", b"x", &Party::you())
                 .await
-                .unwrap()
                 .unwrap();
+            assert!(matches!(added, Uploaded::Added(_)), "{added:?}");
         }
-        assert!(store
-            .add_upload(t, "one more", "text/plain", b"x", &Party::you())
+        assert!(matches!(
+            store
+                .add_upload(t, "one more", "text/plain", b"x", &Party::you())
+                .await
+                .unwrap(),
+            Uploaded::TicketFull
+        ));
+    })
+    .await;
+}
+
+/// A board's uploads together stay within their cap, across its tickets:
+/// the one that would pass it is refused, and another board isn't held to it.
+#[tokio::test]
+async fn a_board_s_uploads_stay_within_their_cap() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let one = a_ticket(&store).await;
+        let board: Uuid = store
+            .pool()
+            .get()
             .await
             .unwrap()
-            .is_none());
+            .query_one("SELECT board FROM tickets WHERE id = $1", &[&one])
+            .await
+            .unwrap()
+            .get(0);
+        let two = Uuid::new_v4();
+        store
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO tickets (id, board, number, title, state, rank, created_by, state_at, created_at, updated_at) \
+                 VALUES ($1, $2, 2, 'T2', 'todo', 2, '{\"kind\":\"you\",\"id\":\"you\",\"name\":\"You\"}', now(), now(), now())",
+                &[&two, &board],
+            )
+            .await
+            .unwrap();
+        let other = a_ticket(&store).await;
+        let add = |t: Uuid, n: usize| {
+            let store = &store;
+            async move {
+                store
+                    .add_upload_within(t, "f", "text/plain", &vec![1u8; n], &Party::you(), 1000)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(matches!(add(one, 600).await, Uploaded::Added(_)));
+        assert!(matches!(add(two, 400).await, Uploaded::Added(_)), "up to the cap");
+        assert!(matches!(add(two, 1).await, Uploaded::BoardFull), "past it, on any ticket of the board");
+        assert!(matches!(add(other, 900).await, Uploaded::Added(_)), "another board's own");
     })
     .await;
 }

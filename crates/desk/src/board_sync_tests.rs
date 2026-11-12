@@ -58,22 +58,23 @@ fn synced(state: TicketState) -> Ticket {
 #[test]
 fn a_filter_is_jql_inside_the_project_whatever_it_says() {
     assert_eq!(
-        jql("ACME", &Filter::AssignedToMe, None),
+        jql("ACME", &Filter::AssignedToMe, None, None),
         "project = \"ACME\" AND (assignee = currentUser()) ORDER BY updated ASC"
     );
     assert_eq!(
-        jql("ACME", &Filter::CurrentCycle, None),
+        jql("ACME", &Filter::CurrentCycle, None, None),
         "project = \"ACME\" AND (sprint in openSprints()) ORDER BY updated ASC"
     );
     assert_eq!(
-        jql("ACME", &Filter::Label("web".into()), None),
+        jql("ACME", &Filter::Label("web".into()), None, None),
         "project = \"ACME\" AND (labels = \"web\") ORDER BY updated ASC"
     );
     assert_eq!(
         jql(
             "ACME",
             &Filter::Query("status = \"In Progress\"".into()),
-            Some("2026-11-09T10:42:00Z")
+            Some("2026-11-09T10:42:00Z"),
+            None
         ),
         "project = \"ACME\" AND (status = \"In Progress\") AND updated >= \"2026-11-08 19:42\" ORDER BY updated ASC"
     );
@@ -473,16 +474,16 @@ fn a_whole_board_lists_what_is_open_and_follows_every_change() {
         include_done: false,
     };
     assert_eq!(
-        jql("ACME", &all, None),
+        jql("ACME", &all, None, None),
         "project = \"ACME\" AND (statusCategory != Done) ORDER BY updated ASC"
     );
     let with_done = Filter::All { include_done: true };
-    assert!(jql("ACME", &with_done, None)
+    assert!(jql("ACME", &with_done, None, None)
         .contains("statusCategory != Done OR statusCategoryChangedDate >= -14d"));
     // A change since the cursor comes in whatever its state, so a card on
     // the board moves to Done when its issue is done there.
     let since = "2026-11-09T10:00:00+00:00";
-    let q = jql("ACME", &all, Some(since));
+    let q = jql("ACME", &all, Some(since), None);
     assert!(q.starts_with("project = \"ACME\" AND updated >= \""), "{q}");
     assert!(!q.contains("statusCategory"), "{q}");
     // Linear: the open issues, page by page; a change since, whatever its
@@ -680,7 +681,7 @@ fn who_the_person_is_comes_from_the_hub_s_identity_tool() {
             System::Linear,
             &json!({ "id": "11111111-2222-4333-8444-555555555555", "name": "bot", "personal": false })
         ),
-        Who::Shared
+        Who::Shared(NoMatch::Unasked)
     );
     assert_eq!(
         identity_of(
@@ -690,8 +691,45 @@ fn who_the_person_is_comes_from_the_hub_s_identity_tool() {
         Who::Unsaid
     );
     assert_eq!(
-        Who::Shared.why_not("Atlas", System::Linear).unwrap(),
+        Who::Shared(NoMatch::Nobody)
+            .why_not("Atlas", System::Linear)
+            .unwrap(),
         "Atlas uses a shared Linear key, so it can't say who you are."
+    );
+    // Jira hiding the email, and a verified email gone old, are said as such.
+    assert_eq!(
+        Who::Shared(NoMatch::EmailHidden).why_not("Atlas", System::Jira).unwrap(),
+        "Atlas uses a shared Jira key, and Jira doesn't show your email to the shared key, so it can't say who you are."
+    );
+    assert!(Who::Shared(NoMatch::Stale)
+        .why_not("Atlas", System::Jira)
+        .unwrap()
+        .contains("sign in to Atlas again"));
+    // What the hub's by-email tool answers.
+    assert_eq!(
+        by_email_of(
+            System::Jira,
+            &json!({ "user": { "id": "557058:abc", "name": "Sam" }, "why": null })
+        ),
+        Who::ByEmail(Assignee {
+            id: "557058:abc".into(),
+            name: "Sam".into()
+        })
+    );
+    assert_eq!(
+        by_email_of(
+            System::Jira,
+            &json!({ "user": null, "why": "email_hidden" })
+        ),
+        Who::Shared(NoMatch::EmailHidden)
+    );
+    assert_eq!(
+        by_email_of(
+            System::Linear,
+            &json!({ "user": { "id": "x\" }", "name": "Sam" } })
+        ),
+        Who::Shared(NoMatch::Unasked),
+        "an id the sync can't put in a query is no one"
     );
     let me = person(identity_of(
         System::Jira,
@@ -773,4 +811,14 @@ fn a_jira_html_body_keeps_its_marks_and_loses_its_scripts() {
     );
     assert_eq!(md, "## Why\nMake **it** fast, `now`.\n* one\n* two");
     assert!(!md.contains("alert") && !md.contains("<script"));
+}
+
+#[test]
+fn a_shared_jira_key_s_assigned_to_me_is_the_matched_account() {
+    assert_eq!(
+        jql("ACME", &Filter::AssignedToMe, None, Some("557058:abc")),
+        "project = \"ACME\" AND (assignee = \"557058:abc\") ORDER BY updated ASC"
+    );
+    // An account id that isn't one is never put in the query.
+    assert!(jql("ACME", &Filter::AssignedToMe, None, Some("x\" OR \"1")).contains("currentUser()"));
 }

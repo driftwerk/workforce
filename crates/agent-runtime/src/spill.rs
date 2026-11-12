@@ -23,8 +23,22 @@ use crate::tools::image_gen::GENERATED_IMAGES_KEY;
 const VIEWED_IMAGES_KEY: &str = "viewed_images";
 
 /// The `kind` of a chunk of a file a program reads a piece at a time (Desk's
-/// board sync reading a ticket's attachment): bytes, never staged.
+/// board sync reading a ticket's attachment): bytes, never staged, from
+/// [`FILE_BYTES_TOOLS`] only.
 pub const FILE_BYTES_KIND: &str = "file_bytes";
+
+/// The tools whose `file_bytes` chunks are never staged; any other tool's
+/// output saying so is staged as usual.
+pub const FILE_BYTES_TOOLS: &[&str] = &["jira.attachment_read", "linear.upload_read"];
+
+/// Whether `output` is a file chunk from a tool allowed to answer one, by
+/// its registry or its wire name (`jira_attachment_read`).
+fn is_file_chunk(tool_name: &str, output: &Value) -> bool {
+    output.get("kind").and_then(Value::as_str) == Some(FILE_BYTES_KIND)
+        && FILE_BYTES_TOOLS
+            .iter()
+            .any(|t| *t == tool_name || t.replace('.', "_") == tool_name)
+}
 
 /// Where the row table sits inside a tool output.
 #[derive(Debug)]
@@ -132,7 +146,10 @@ pub fn spill_tool_output(
     if !config.enabled || is_error || output_str.len() < config.threshold_bytes {
         return (output_str, output);
     }
-    if is_content_tool(tool_name, &config.skip_tools) || manages_own_staging(&output) {
+    if is_content_tool(tool_name, &config.skip_tools)
+        || manages_own_staging(&output)
+        || is_file_chunk(tool_name, &output)
+    {
         return (output_str, output);
     }
     let Some(store) = global_store() else {
@@ -372,7 +389,7 @@ fn manages_own_staging(output: &Value) -> bool {
         || obj.contains_key(VIEWED_IMAGES_KEY)
         || matches!(
             obj.get("kind").and_then(Value::as_str),
-            Some(TABULAR_ARTIFACT_KIND | CLIPPED_ARTIFACT_KIND | FILE_BYTES_KIND)
+            Some(TABULAR_ARTIFACT_KIND | CLIPPED_ARTIFACT_KIND)
         )
 }
 
@@ -509,7 +526,7 @@ mod tests {
     /// A chunk of a file a program reads in pieces is never staged, however
     /// large: its reader needs the bytes, not a handle.
     #[test]
-    fn a_file_chunk_is_never_staged() {
+    fn a_file_chunk_is_never_staged_but_only_from_its_own_tools() {
         install_test_global_store();
         let chunk = json!({
             "kind": FILE_BYTES_KIND,
@@ -519,9 +536,32 @@ mod tests {
             "length": 600_000,
             "data": "A".repeat(800_000),
         });
-        let (s, v) = spill_scoped("spill-chunk", chunk.clone(), false, &SpillConfig::default());
-        assert_eq!(v, chunk);
-        assert_eq!(s, chunk.to_string());
+        let spill_as = |tool: &str| {
+            CURRENT_AGENT_ID.sync_scope("spill-chunk".to_string(), || {
+                CURRENT_SESSION_ID.sync_scope("spill-session".to_string(), || {
+                    spill_tool_output(
+                        tool,
+                        chunk.to_string(),
+                        chunk.clone(),
+                        false,
+                        &SpillConfig::default(),
+                        RetrievalSurface::FULL,
+                    )
+                })
+            })
+        };
+        for tool in [
+            "jira.attachment_read",
+            "linear.upload_read",
+            "jira_attachment_read",
+        ] {
+            let (s, v) = spill_as(tool);
+            assert_eq!(v, chunk, "{tool}");
+            assert_eq!(s, chunk.to_string(), "{tool}");
+        }
+        // Any other tool saying it is a file chunk is staged as usual.
+        let (_, v) = spill_as("mcp.fetch_rows");
+        assert_ne!(v, chunk, "another tool's output is no file chunk");
     }
 
     #[test]

@@ -27,8 +27,12 @@
 //! [`Capability::DeskBoss`]: crate::authz::Capability::DeskBoss
 
 pub mod auth;
+pub mod conversation;
 pub mod engine_key;
+pub mod hold;
 pub mod links;
+pub mod merge;
+pub mod tools;
 pub mod uplink;
 
 #[cfg(test)]

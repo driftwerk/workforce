@@ -240,6 +240,16 @@ impl Tool for FakeJiraTool {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
                     "personal": !j.shared_key })
             }
+            // The directory, as a shared key sees it: Sam, and two who
+            // share Sam's email but mustn't count (gone; an app).
+            "jira.search_users" => json!({ "users": [
+                { "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
+                  "active": true, "account_type": "atlassian" },
+                { "account_id": "old-sam", "display_name": "Sam (old)", "email": "sam@example.com",
+                  "active": false, "account_type": "atlassian" },
+                { "account_id": "bot", "display_name": "Sam's bot", "email": "SAM@example.com",
+                  "active": true, "account_type": "app" },
+            ] }),
             "jira.get_project" => json!({
                 "key": input["project_key"],
                 "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
@@ -345,6 +355,9 @@ pub(crate) struct RemoteHub {
     /// The same person's token, as a paired device mints one.
     pub device_token: String,
     pub jira: Shared,
+    /// The hub's people, and the one the tokens are for.
+    pub identities: Arc<workforce_identity::sqlite::SqliteIdentityStore>,
+    pub person: uuid::Uuid,
 }
 
 pub(crate) async fn remote_hub(
@@ -383,13 +396,23 @@ pub(crate) async fn remote_hub_of_agents_with(
     let jira: Shared = Arc::default();
     for (n, id) in ["default", "lattice"].into_iter().enumerate() {
         let service = crate::serve::testing::plain_service(&dir.join(format!("agent-{n}"))).await;
+        // As the gateway gives every agent the hub's people.
+        service.set_identity_store(Arc::clone(&fx.identities) as _);
         if jira_on == Some(id) {
             register_jira(&service.tools, &jira, &[]);
-            // A tool off the board sync's list, which a device never sees.
-            service.tools.register(Arc::new(FakeJiraTool {
-                name: "jira.assign_issue",
-                jira: Arc::clone(&jira),
-            }));
+            // Tools off the board sync's list, which a device never sees:
+            // an assign, and the directory lookups a device must never use
+            // to list who's there.
+            for name in [
+                "jira.assign_issue",
+                "jira.search_users",
+                "linear.members_list",
+            ] {
+                service.tools.register(Arc::new(FakeJiraTool {
+                    name,
+                    jira: Arc::clone(&jira),
+                }));
+            }
         }
         fx.state.registry.insert(id, service);
     }
@@ -406,7 +429,12 @@ pub(crate) async fn remote_hub_of_agents_with(
     }
     serve_remote(
         fx,
-        &["jira.*", "help", "identity.whoami"],
+        &[
+            "jira.*",
+            "help",
+            "identity.whoami",
+            "identity.jira_user_by_my_email",
+        ],
         jira,
         Some(devices),
     )
@@ -472,6 +500,8 @@ async fn serve_remote(
         token,
         device_token,
         jira,
+        identities: Arc::clone(&fx.identities),
+        person: member.id,
     }
 }
 
@@ -1665,27 +1695,60 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         Some("lattice"),
     )
     .unwrap();
-    let names: Vec<String> = device
-        .tools()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|n| n.replace('_', "."))
-        .collect();
-    let allowed: Vec<String> = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
-        .iter()
-        .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
-        .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
-        .chain(["help", "identity.whoami"].iter())
-        .map(|t| t.replace('_', "."))
-        .collect();
-    assert!(names.contains(&"jira.search".to_string()), "{names:?}");
-    for n in &names {
-        assert!(allowed.contains(n), "a device sees {n}");
+    let mut names: Vec<String> = device.tools().await.unwrap();
+    names.sort();
+    // Written out, not taken from the lists the surface is built from.
+    let mut expected = vec![
+        "help",
+        "identity_whoami",
+        "jira_add_comment",
+        "jira_attachment_read",
+        "jira_create_issue",
+        "jira_get_issue",
+        "jira_get_project",
+        "jira_list_transitions",
+        "jira_myself",
+        "jira_search",
+        "jira_transition_issue",
+        "jira_update_issue",
+        "identity_jira_user_by_my_email",
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    // The directory lookups are refused to a device token outright.
+    for tool in ["jira.search_users", "linear.members_list"] {
+        let got = device.call(tool, json!({ "query": "a" })).await;
+        assert!(
+            matches!(got, Err(RemoteError::Missing(_))),
+            "{tool}: {got:?}"
+        );
     }
-    assert!(!names
-        .iter()
-        .any(|n| n == "jira.assign.issue" || n == "jira.api"));
+    // What it may ask instead: who the person is, by their own verified
+    // email, answered on the hub as one user.
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(asked["user"], Value::Null, "{asked}");
+    assert_eq!(asked["why"], "no_verified_email", "{asked}");
+    {
+        use workforce_identity::store::IdentityStore;
+        let mut sam = remote.identities.get_by_id(remote.person).unwrap().unwrap();
+        sam.linked_ids
+            .insert("oidc_email".into(), "sam@example.com".into());
+        sam.linked_ids
+            .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+        remote.identities.update(&sam).unwrap();
+    }
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        asked["user"],
+        json!({ "id": SAM_ACCOUNT, "name": "Sam" }),
+        "{asked}"
+    );
 }
 
 /// A hub that refuses or slows the list of its agents says so, never as

@@ -358,7 +358,7 @@ impl JiraSkill {
                             "offset": { "type": "integer" },
                             "length": { "type": "integer" }
                         },
-                        "required": ["attachment_id"]
+                        "required": ["issue_key", "attachment_id"]
                     }),
                 ),
                 mk_tool(

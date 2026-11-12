@@ -176,13 +176,21 @@ impl Desk {
             .store
             .add_upload(id, &name, media_type, bytes, &by.party)
             .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                DeskError::Invalid(format!(
-                    "A ticket holds at most {} files.",
+            .map_err(internal)?;
+        let f = match f {
+            ticket_files::Uploaded::Added(f) => f,
+            ticket_files::Uploaded::TicketFull => {
+                return Err(DeskError::Invalid(format!(
+                    "A ticket holds at most {} files: take one off first.",
                     ticket_files::UPLOADS_PER_TICKET
+                )))
+            }
+            ticket_files::Uploaded::BoardFull => {
+                return Err(DeskError::Invalid(
+                    "This board's files already take 1 GB, the most a board keeps: take some off first.".into(),
                 ))
-            })?;
+            }
+        };
         let key = self.key_of(&t).await?;
         let text = format!("added {} to {key}", quoted(&f.name));
         self.ticket_changed(t, by, Kind::TicketEdited, None, text)

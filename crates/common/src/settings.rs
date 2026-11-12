@@ -9146,6 +9146,7 @@ impl RemoteMcpConfig {
         "jira.add_comment",
         "jira.get_project",
         "jira.myself",
+        "identity.jira_user_by_my_email",
         "linear.issue_list",
         "linear.issue_get",
         "linear.issue_search",
@@ -9160,6 +9161,7 @@ impl RemoteMcpConfig {
         "jira.list_comments",
         "linear.upload_read",
         "linear.comment_list",
+        "identity.linear_member_by_my_email",
         "help",
     ];
 

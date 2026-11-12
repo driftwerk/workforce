@@ -507,6 +507,7 @@ impl LinearSkill {
                         "type": "object",
                         "properties": {
                             "limit": { "type": "integer" },
+                            "email": { "type": "string" },
                             "workspace": { "type": "string" }
                         }
                     }),
@@ -536,7 +537,7 @@ impl LinearSkill {
                             "length": { "type": "integer" },
                             "workspace": { "type": "string" }
                         },
-                        "required": ["url"]
+                        "required": ["identifier", "url"]
                     }),
                 },
                 SkillTool {

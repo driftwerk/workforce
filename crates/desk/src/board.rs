@@ -149,7 +149,18 @@ pub struct Assignee {
 #[serde(rename_all = "camelCase")]
 pub enum MeSource {
     Vouched,
+    /// The hub's key is shared: the one user there with the email the
+    /// person's sign-in provider verified.
+    VouchedByEmail,
     Typed,
+}
+
+impl MeSource {
+    /// Whether the hub stood behind it (by the person's own key, or by
+    /// their verified email): only then is anything assigned to them.
+    pub fn vouched(self) -> bool {
+        matches!(self, Self::Vouched | Self::VouchedByEmail)
+    }
 }
 
 /// A field that can be absent (not known), null (known to be none) or a
