@@ -86,6 +86,18 @@ impl AccountRun {
     }
 }
 
+/// What a question about a session found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountAnswer {
+    /// From its account and conversation, as the model said it.
+    Answered(String),
+    /// Its account and recent conversation don't say.
+    NotInRecord,
+    /// No model could be asked just now: none, past the day's share of
+    /// questions, or it failed or took too long.
+    Unavailable,
+}
+
 /// A session's account as a reader is given it.
 #[derive(Debug, Clone)]
 pub struct AccountRead {
@@ -185,9 +197,11 @@ impl Desk {
     pub async fn account_read(&self, id: Uuid) -> Result<AccountRead, DeskError> {
         let kept = self.0.store.session_account(id).await?;
         let now = crate::crew::now();
-        let working = self
-            .view(id)
-            .is_ok_and(|v| v.state == crate::model::SessionState::Working);
+        // Mid-turn: working, or blocked or asking within its turn.
+        let working = self.view(id).is_ok_and(|v| {
+            use crate::model::SessionState as S;
+            matches!(v.state, S::Working | S::Blocked | S::Asking)
+        });
         let ended = self.0.accounts.ended.lock().get(&id).copied();
         let stale = |a: &Option<Account>| match a {
             None => true,
@@ -213,7 +227,10 @@ impl Desk {
                 }
             }
         };
-        if !due {
+        // Within the floor, a reader still waits for a refresh under way
+        // rather than read the account it is about to replace.
+        let running = self.0.accounts.flights.lock().contains_key(&id);
+        if !due && !running {
             let stale = kept.is_some() && stale(&kept);
             return Ok(AccountRead {
                 account: kept,
@@ -221,18 +238,25 @@ impl Desk {
                 stale,
             });
         }
+        let started = now;
         let within = account::WRITE_WITHIN + Duration::from_secs(5);
         match tokio::time::timeout(within, self.account_refresh(id, Moment::Read)).await {
-            Ok(Ok(Some(a))) => Ok(AccountRead {
-                account: Some(a),
-                refreshed: true,
-                stale: false,
-            }),
-            Ok(Ok(None)) => Ok(AccountRead {
-                account: kept,
-                refreshed: false,
-                stale: false,
-            }),
+            Ok(Ok(Some(a))) => {
+                self.account_caught_up(id, started);
+                Ok(AccountRead {
+                    account: Some(a),
+                    refreshed: true,
+                    stale: false,
+                })
+            }
+            Ok(Ok(None)) => {
+                self.account_caught_up(id, started);
+                Ok(AccountRead {
+                    account: kept,
+                    refreshed: false,
+                    stale: false,
+                })
+            }
             Ok(Err(e)) => {
                 tracing::info!(session = %id, error = %e, "a session's account couldn't be refreshed for a reader; the kept one is given");
                 Ok(AccountRead {
@@ -251,13 +275,12 @@ impl Desk {
 
     /// The answer to `question` about session `id`, from its account and
     /// up to about 12k tokens of its recent conversation, by the cheap
-    /// model within the day's share of questions. None when no model may
-    /// be asked or the record doesn't say.
+    /// model within the day's share of questions.
     pub async fn account_question(
         &self,
         id: Uuid,
         question: &str,
-    ) -> Result<Option<String>, DeskError> {
+    ) -> Result<AccountAnswer, DeskError> {
         let v = self.view(id)?;
         let kept = self.0.store.session_account(id).await?;
         let recent: Vec<account::Exchange> = self
@@ -272,7 +295,7 @@ impl Desk {
             .map(|(x, _)| x)
             .collect();
         if recent.is_empty() && kept.is_none() {
-            return Ok(None);
+            return Ok(AccountAnswer::NotInRecord);
         }
         let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
         let prompt = account::question_prompt(kept.as_ref(), v.label(), &recent, question, &nonce);
@@ -286,10 +309,20 @@ impl Desk {
                 &prompt,
             )
             .await?;
-        let answer = answer
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty() && !a.contains(account::NOT_IN_RECORD));
-        Ok(answer.map(|a| self.account_redacted_text(a)))
+        let Some(answer) = answer.map(|a| a.trim().to_string()) else {
+            // No model could be asked: none, past the day's share, or it
+            // failed or took too long.
+            return Ok(AccountAnswer::Unavailable);
+        };
+        let said = answer
+            .to_ascii_uppercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if answer.is_empty() || said.contains(account::NOT_IN_RECORD) {
+            return Ok(AccountAnswer::NotInRecord);
+        }
+        Ok(AccountAnswer::Answered(self.account_redacted_text(answer)))
     }
 
     /// A turn of session `id` ended and the harvest read it: its account
@@ -299,13 +332,27 @@ impl Desk {
             return;
         }
         self.0.accounts.mid_turn.lock().remove(&id);
-        self.0.accounts.ended.lock().insert(id, crate::crew::now());
+        let at = crate::crew::now();
+        self.0.accounts.ended.lock().insert(id, at);
         let desk = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = desk.account_refresh(id, Moment::TurnEnd).await {
-                tracing::info!(session = %id, error = %e, "couldn't refresh a session's account");
+            match desk.account_refresh(id, Moment::TurnEnd).await {
+                Ok(_) => desk.account_caught_up(id, at),
+                Err(e) => {
+                    tracing::info!(session = %id, error = %e, "couldn't refresh a session's account")
+                }
             }
         });
+    }
+
+    /// A refresh begun at `since` read every turn that had ended by then:
+    /// those turn ends no longer make the account stale, whether or not it
+    /// found anything new to write.
+    fn account_caught_up(&self, id: Uuid, since: DateTime<Utc>) {
+        let mut ended = self.0.accounts.ended.lock();
+        if ended.get(&id).is_some_and(|e| *e <= since) {
+            ended.remove(&id);
+        }
     }
 
     /// Refreshes session `id`'s account for `moment`, once at a time: a
