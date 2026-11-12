@@ -1380,7 +1380,12 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     // before the private-context gate (it's channel state, not user-private
     // data) and only when a workspace exists. Reads the session's override
     // map directly — prompt assembly runs before ACTIVE_MCP_ENVS is scoped.
-    if workforce_agent::llm::mcp_workspace::any_workspaces() {
+    // Neither note in a Desk group's boss conversation: its turns reach no
+    // workspace or environment, only the group's engines.
+    let boss_turn = session_id
+        .and_then(|sid| service.sessions.get(sid).ok().flatten())
+        .is_some_and(|s| s.claims_desk_boss());
+    if workforce_agent::llm::mcp_workspace::any_workspaces() && !boss_turn {
         let overrides = session_id
             .and_then(|sid| service.sessions.get(sid).ok().flatten())
             .map(|s| s.active_mcp_envs())
@@ -1395,7 +1400,9 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     let override_name = session_id
         .and_then(|sid| service.sessions.get(sid).ok().flatten())
         .and_then(|s| s.active_environment());
-    if let Some(note) = render_environment_note(service, override_name.as_deref()) {
+    if let Some(note) =
+        render_environment_note(service, override_name.as_deref()).filter(|_| !boss_turn)
+    {
         prompt.push_str(&note);
     }
 
@@ -3498,7 +3505,7 @@ pub(crate) async fn process_admitted(
     let needs_urgent = session.needs_urgent_compaction(&model_aware_config, reserved);
 
     if needs_compaction {
-        let memory_writer = crate::notes_tool::memory_writer(service);
+        let memory_writer = crate::notes_tool::memory_writer(service, &session);
         let compaction_engine = runner.compaction_engine_with_writer(memory_writer);
 
         if needs_urgent {
@@ -3879,14 +3886,13 @@ pub(crate) async fn process_admitted(
                 Ok(Some(s)) => s,
                 _ => return,
             };
-            let writer: Arc<dyn workforce_agent::compaction::MemoryWriter> = match bg_memory_store {
-                Some(store) => Arc::new(crate::notes_tool::DailyNotesMemoryWriter::with_store(
+            let writer: Arc<dyn workforce_agent::compaction::MemoryWriter> =
+                Arc::new(crate::notes_tool::memory_writer_of(
                     bg_workspace,
-                    store,
+                    bg_memory_store,
                     bg_agent_id.clone(),
-                )),
-                None => Arc::new(crate::notes_tool::DailyNotesMemoryWriter::new(bg_workspace)),
-            };
+                    &fresh,
+                ));
             let engine = workforce_agent::compaction::CompactionEngine::with_memory_writer(
                 bg_config, bg_llm, bg_model, writer,
             )
@@ -5043,7 +5049,7 @@ pub(crate) async fn stream_admitted(
     // for tens of seconds and an interrupted turn must not burn it.
     turn_claim.unless_cancelled(&cancel_token).await?;
     if needs_compaction {
-        let memory_writer = crate::notes_tool::memory_writer(service);
+        let memory_writer = crate::notes_tool::memory_writer(service, &session);
         let compaction_engine = runner.compaction_engine_with_writer(memory_writer);
 
         if needs_urgent {
@@ -5784,18 +5790,12 @@ pub(crate) async fn stream_admitted(
                             };
                             let memory_writer: Arc<
                                 dyn workforce_agent::compaction::MemoryWriter,
-                            > = match bg_memory_store2 {
-                                Some(ref store) => Arc::new(
-                                    crate::notes_tool::DailyNotesMemoryWriter::with_store(
-                                        bg_workspace,
-                                        Arc::clone(store),
-                                        bg_agent_id2.clone(),
-                                    ),
-                                ),
-                                None => Arc::new(
-                                    crate::notes_tool::DailyNotesMemoryWriter::new(bg_workspace),
-                                ),
-                            };
+                            > = Arc::new(crate::notes_tool::memory_writer_of(
+                                bg_workspace,
+                                bg_memory_store2.clone(),
+                                bg_agent_id2.clone(),
+                                &fresh,
+                            ));
                             let engine =
                             workforce_agent::compaction::CompactionEngine::with_memory_writer(
                                 bg_config,

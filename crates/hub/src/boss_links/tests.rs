@@ -1589,8 +1589,9 @@ mod uplink_tests {
             .any(|(a, h)| a == "desk_boss.uplink.refused" && h == "too many unproved sockets"));
     }
 
-    /// The tools of a turn of `agent` as `person` in `session`, from an
-    /// agent registry that holds a few tools of each kind.
+    /// The tools of a turn of `agent` as `person` in `session`, from the
+    /// agent's own registry (its real memory tool among them) with a few
+    /// tools of each kind added, a shadow of a kept name too.
     fn turn_tools(
         hub: &Hub,
         agent: &str,
@@ -1598,21 +1599,24 @@ mod uplink_tests {
         person: &str,
     ) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
         use crate::turn_loop::tools::tests::named;
-        let base = Arc::new(workforce_agent::tools::registry::ToolRegistry::from_tools(
-            [
-                "crew.overview",
-                "crew.nudge",
-                "http.request",
-                "messaging.send",
-                "web.fetch",
-                "subagent",
-                "memory.recall",
-                "memory.remember",
-            ]
-            .into_iter()
-            .map(named),
-        ));
         let service = hub.fx.state.registry.get(agent).unwrap();
+        assert!(service.tools.is_builtin("memory"), "the real memory tool");
+        let base = Arc::new(workforce_agent::tools::registry::ToolRegistry::follow(
+            &service.tools,
+            |_| true,
+        ));
+        for name in [
+            "crew.overview",
+            "crew.nudge",
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            "subagent",
+            // An MCP server's tool taking a kept name.
+            workforce_agent::spill::RETRIEVE_TOOL_NAME,
+        ] {
+            base.register(named(name));
+        }
         crate::boss_links::tools::for_turn_on(
             Some(&hub.fx.state),
             &service,
@@ -1632,9 +1636,21 @@ mod uplink_tests {
         }
     }
 
+    /// What a turn has besides the agent's own kept tools, and whether the
+    /// kept ones it has are exactly the hub's memory and data tools.
     fn sorted(r: &workforce_agent::tools::registry::ToolRegistry) -> Vec<String> {
         let mut n = r.names();
         n.sort();
+        let kept: Vec<&String> = n
+            .iter()
+            .filter(|t| crate::boss_links::hold::kept_name(t))
+            .collect();
+        assert_eq!(
+            kept,
+            ["data.inspect", "data.query", "memory"],
+            "the hub's own, never a shadow"
+        );
+        n.retain(|t| !crate::boss_links::hold::kept_name(t));
         n
     }
 
@@ -1724,7 +1740,7 @@ mod uplink_tests {
             .unwrap();
         assert!(BossConversation::of(&forged, "allan", &person).is_none());
         let none = turn_tools(&hub, "allan", &forged, &person);
-        assert_eq!(sorted(&none), ["memory.recall", "memory.remember"]);
+        assert!(sorted(&none).is_empty());
 
         let (_, opened) = ensure(hub.state(), sam.id, &device.id, acme.record.id).unwrap();
         assert_eq!(opened, channel);
@@ -1737,15 +1753,7 @@ mod uplink_tests {
         // In the group's conversation: the boss tools the engine serves and
         // the agent's memory, nothing that sends, and no crew of this hub's.
         let tools = turn_tools(&hub, "allan", &session, &person);
-        assert_eq!(
-            sorted(&tools),
-            [
-                "crew.nudge",
-                "crew.overview",
-                "memory.recall",
-                "memory.remember"
-            ]
-        );
+        assert_eq!(sorted(&tools), ["crew.nudge", "crew.overview"]);
         for name in ["crew.overview", "crew.nudge"] {
             let t = tools.get(name).unwrap();
             assert_eq!(

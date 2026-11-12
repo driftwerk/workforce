@@ -18,7 +18,14 @@
 //! Memory is kept: in a boss conversation everything the agent remembers
 //! is tagged with the group's tag and nothing else is recalled
 //! ([`crate::memory_fence::fence_for_turn`]), so no memory write leaves the
-//! fence.
+//! fence; the `memory` tool also keeps it private there and refuses the
+//! team and organisation layers.
+//!
+//! A tool is kept by what it is, not only by its name: it must be the hub's
+//! own, as registered ([`ToolRegistry::is_builtin`]). A skill, an MCP server
+//! or anything else registered under a kept name is not kept.
+
+use workforce_agent::tools::registry::ToolRegistry;
 
 /// The design's hold list, as tool names: refused in a boss conversation
 /// whatever [`KEPT`] says.
@@ -34,10 +41,7 @@ pub const HELD: &[&str] = &[
 /// The agent's own tools a boss conversation keeps: its memory (fenced to
 /// the group) and reading back what this turn's tools returned.
 pub const KEPT: &[&str] = &[
-    "memory.recall",
-    "memory.search",
-    "memory.remember",
-    "memory.forget",
+    "memory",
     workforce_agent::spill::RETRIEVE_TOOL_NAME,
     workforce_agent::tools::data::DATA_INSPECT_TOOL_NAME,
     workforce_agent::tools::data::DATA_QUERY_TOOL_NAME,
@@ -58,9 +62,15 @@ pub fn held(tool: &str) -> bool {
     HELD.iter().any(|p| names(p, tool))
 }
 
-/// Whether a boss conversation's turn keeps the agent's own tool `tool`.
-pub fn kept(tool: &str) -> bool {
+/// Whether `tool` is a name a boss conversation's turn may keep.
+pub fn kept_name(tool: &str) -> bool {
     KEPT.contains(&tool) && !held(tool)
+}
+
+/// Whether a boss conversation's turn keeps `registry`'s tool `tool`: a
+/// kept name, held by the hub's own tool.
+pub fn kept(registry: &ToolRegistry, tool: &str) -> bool {
+    kept_name(tool) && registry.is_builtin(tool)
 }
 
 #[cfg(test)]
@@ -92,11 +102,29 @@ mod tests {
             "crew.overview",
             "crew.nudge",
         ] {
-            assert!(!kept(t), "{t}");
+            assert!(!kept_name(t), "{t}");
         }
-        for t in ["memory.recall", "memory.remember", "tool.retrieve"] {
-            assert!(kept(t), "{t}");
+        for t in ["memory", "tool.retrieve", "data.query"] {
+            assert!(kept_name(t), "{t}");
         }
+    }
+
+    #[test]
+    fn a_kept_name_is_kept_only_while_the_hub_holds_it() {
+        use crate::turn_loop::tools::tests::named;
+        let registry = ToolRegistry::new();
+        // A skill or an MCP server taking a kept name isn't kept.
+        registry.register(named("memory"));
+        assert!(!kept(&registry, "memory"));
+        registry.register_builtin(named("memory"));
+        assert!(kept(&registry, "memory"));
+        registry.register(named("memory"));
+        assert!(!kept(&registry, "memory"), "a shadow registered after it");
+        registry.register_builtin(named("web.fetch"));
+        assert!(
+            !kept(&registry, "web.fetch"),
+            "built in, but not a kept name"
+        );
     }
 
     #[test]

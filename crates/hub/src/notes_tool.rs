@@ -136,6 +136,11 @@ pub struct DailyNotesMemoryWriter {
     workspace: PathBuf,
     store: Option<Arc<dyn MemoryStore>>,
     agent_id: AgentId,
+    /// What it flushes is kept apart (a Desk group's boss conversation, or
+    /// a conversation a boss left behind): only its fenced memory store may
+    /// take it, and what the store refuses is dropped, never written to the
+    /// daily notes or files any other conversation reads.
+    contained: bool,
 }
 
 impl DailyNotesMemoryWriter {
@@ -144,6 +149,7 @@ impl DailyNotesMemoryWriter {
             workspace,
             store: None,
             agent_id: AgentId::new("default"),
+            contained: false,
         }
     }
 
@@ -152,7 +158,22 @@ impl DailyNotesMemoryWriter {
             workspace,
             store: Some(store),
             agent_id,
+            contained: false,
         }
+    }
+
+    /// Flushing a session that is kept apart when `yes`
+    /// ([`Session::kept_apart`](workforce_common::session::Session::kept_apart)).
+    pub fn containing(mut self, yes: bool) -> Self {
+        self.contained = yes;
+        self
+    }
+
+    /// Whether what it flushes now must stay in the fenced store: its
+    /// session's kept apart, or the turn flushing runs in a boss
+    /// conversation.
+    fn contained(&self) -> bool {
+        self.contained || crate::memory_fence::in_boss_conversation()
     }
 }
 
@@ -198,6 +219,10 @@ impl workforce_agent::compaction::MemoryWriter for DailyNotesMemoryWriter {
                 }
             }
         }
+        if self.contained() {
+            tracing::warn!(label, "a kept-apart conversation's memory flush wasn't taken by its fenced store, so it was dropped");
+            return Ok(());
+        }
 
         let mgr = match crate::user_config::current_identity_id() {
             Some(uid) => MemoryManager::for_user(&self.workspace, &uid),
@@ -222,6 +247,10 @@ impl workforce_agent::compaction::MemoryWriter for DailyNotesMemoryWriter {
                     return Ok(());
                 }
             }
+        }
+        if self.contained() {
+            tracing::warn!(label, "a kept-apart conversation's technical log wasn't taken by its fenced store, so it was dropped");
+            return Ok(());
         }
 
         append_technical_log(&self.workspace, content, label)
@@ -945,17 +974,30 @@ impl Tool for NotesTool {
     }
 }
 
-pub fn memory_writer(service: &AgentService) -> Arc<dyn workforce_agent::compaction::MemoryWriter> {
-    match &service.memory_store {
-        Some(store) => Arc::new(crate::notes_tool::DailyNotesMemoryWriter::with_store(
-            service.workspace.clone(),
-            Arc::clone(store),
-            service.agent_id.clone(),
-        )),
-        None => Arc::new(crate::notes_tool::DailyNotesMemoryWriter::new(
-            service.workspace.clone(),
-        )),
+pub fn memory_writer(
+    service: &AgentService,
+    session: &workforce_common::session::Session,
+) -> Arc<dyn workforce_agent::compaction::MemoryWriter> {
+    Arc::new(memory_writer_of(
+        service.workspace.clone(),
+        service.memory_store.clone(),
+        service.agent_id.clone(),
+        session,
+    ))
+}
+
+/// The memory writer for flushing `session` of the agent `agent_id`.
+pub fn memory_writer_of(
+    workspace: PathBuf,
+    store: Option<Arc<dyn MemoryStore>>,
+    agent_id: AgentId,
+    session: &workforce_common::session::Session,
+) -> DailyNotesMemoryWriter {
+    match store {
+        Some(store) => DailyNotesMemoryWriter::with_store(workspace, store, agent_id),
+        None => DailyNotesMemoryWriter::new(workspace),
     }
+    .containing(session.kept_apart())
 }
 
 #[cfg(test)]
@@ -983,6 +1025,72 @@ mod tests {
             std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
             "soul"
         );
+    }
+
+    /// A kept-apart conversation's flush goes to its fenced store or
+    /// nowhere: what the store refuses never lands in the notes or files
+    /// every other conversation reads.
+    #[tokio::test]
+    async fn a_kept_apart_flush_the_store_refuses_is_dropped() {
+        use workforce_agent::compaction::MemoryWriter as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let store: Arc<dyn MemoryStore> =
+            Arc::new(workforce_memory::group_tagged::GroupTagged::new(
+                Arc::new(workforce_memory::in_memory::InMemoryStore::new()),
+                AgentId::new("a"),
+                Arc::new(|| workforce_memory::group_tagged::Fence::Unknown),
+            ));
+        let mut boss = workforce_common::session::Session::new("desk:boss:k", "sam", "a");
+        boss.metadata = serde_json::json!({ "desk_boss": { "groupKey": "k" } });
+        let dm = workforce_common::session::Session::new("desk", "sam", "a");
+        let files = |w: &std::path::Path| {
+            walk(&w.join("memory"))
+                .into_iter()
+                .chain(walk(&w.join("users")))
+                .count()
+        };
+        workforce_agent::runner::CURRENT_USER_ID
+            .scope("sam".to_string(), async {
+                for writer in [
+                    memory_writer_of(
+                        workspace.clone(),
+                        Some(Arc::clone(&store)),
+                        AgentId::new("a"),
+                        &boss,
+                    ),
+                    memory_writer_of(workspace.clone(), None, AgentId::new("a"), &boss),
+                ] {
+                    writer.write_flush("acme pricing", "flush").await.unwrap();
+                    writer.write_technical_log("acme log", "log").await.unwrap();
+                }
+                assert_eq!(files(&workspace), 0, "nothing written");
+                // Any other conversation falls back as before.
+                memory_writer_of(
+                    workspace.clone(),
+                    Some(Arc::clone(&store)),
+                    AgentId::new("a"),
+                    &dm,
+                )
+                .write_technical_log("dm log", "log")
+                .await
+                .unwrap();
+                assert!(files(&workspace) > 0);
+            })
+            .await;
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .flat_map(|e| match e.path().is_dir() {
+                true => walk(&e.path()),
+                false => vec![e.path()],
+            })
+            .collect()
     }
 
     #[test]

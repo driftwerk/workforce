@@ -60,6 +60,7 @@ pub mod context_fuse_tool;
 pub mod context_tool;
 pub(crate) mod conversation_seed;
 pub mod cost_analytics_tools;
+pub mod tool_session;
 pub use hub_core::cost_forecast;
 pub use hub_core::cost_governor;
 pub mod credentials;

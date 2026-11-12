@@ -956,7 +956,17 @@ impl Session {
     /// conversations: [left behind](Self::left_behind) by a boss, or a Desk
     /// group's boss conversation on a boss hub, whose talk is that group's.
     pub fn kept_apart(&self) -> bool {
-        self.left_behind() || workforce_core::desk::is_desk_boss_channel(&self.channel)
+        self.left_behind() || self.claims_desk_boss()
+    }
+
+    /// Whether this session is, or claims to be, a Desk group's boss
+    /// conversation: on a `desk:boss:` channel, or carrying the link's
+    /// [`DESK_BOSS_KEY`] (a Slack DM thread mapped to one). Every such
+    /// session's turns get the boss conversation's narrow surface and fence,
+    /// whether or not it proves to be a real one.
+    pub fn claims_desk_boss(&self) -> bool {
+        workforce_core::desk::is_desk_boss_channel(&self.channel)
+            || self.metadata.get(DESK_BOSS_KEY).is_some()
     }
 
     /// Whether this session has been sealed by a thread rollover. A sealed

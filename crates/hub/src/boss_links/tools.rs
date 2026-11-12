@@ -250,9 +250,11 @@ pub fn for_turn_on(
     if !is_desk_boss_channel(&session.channel) {
         return base;
     }
-    let registry = ToolRegistry::follow(&base, super::hold::kept);
+    // Adopted mid-turn only when it is still the hub's own tool upstream.
+    let source = Arc::clone(&base);
+    let registry = ToolRegistry::follow(&base, move |name| super::hold::kept(&source, name));
     for name in registry.names() {
-        if !super::hold::kept(&name) {
+        if !super::hold::kept(&registry, &name) {
             registry.unregister(&name);
         }
     }

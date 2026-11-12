@@ -536,10 +536,13 @@ pub(crate) mod tests {
             "messaging.send",
             "web.fetch",
             "crew.overview",
-            "memory.recall",
         ] {
             service.tools.register(named(name));
         }
+        // The real memory tool, as the hub registers it.
+        let memory = service.tools.get("memory").expect("the hub's memory tool");
+        assert!(service.tools.is_builtin("memory"));
+        assert_ne!(memory.description(), "stub");
         let boss = Session::new("desk:boss:k-acme", "sam", service.agent_id.as_str());
         let dm = Session::new("desk", "sam", service.agent_id.as_str());
         for whitelist in [None, Some(&["http".to_string(), "web".to_string()][..])] {
@@ -547,13 +550,27 @@ pub(crate) mod tests {
             assert!(turn.exclusive);
             let names = names_of(&turn);
             assert!(
-                names.iter().all(|n| crate::boss_links::hold::kept(n)),
+                names
+                    .iter()
+                    .all(|n| crate::boss_links::hold::kept(&turn.registry, n)),
                 "{names:?}"
             );
-            assert!(names.iter().any(|n| n == "memory.recall"), "{names:?}");
+            assert!(names.iter().any(|n| n == "memory"), "{names:?}");
+            assert!(std::ptr::addr_eq(
+                Arc::as_ptr(&turn.registry.get("memory").unwrap()),
+                Arc::as_ptr(&memory)
+            ));
             service.tools.register(named("http.get"));
             assert!(turn.registry.adopt(&["http.get".into()]).is_empty());
         }
+        // An MCP server or a skill shadowing it: no memory in a boss turn.
+        service.tools.register(named("memory"));
+        let shadowed = turn_tools(&service, &boss, None).await;
+        assert!(
+            !shadowed.registry.has("memory"),
+            "{:?}",
+            names_of(&shadowed)
+        );
         let plain = turn_tools(&service, &dm, None).await;
         assert!([
             "http.request",
