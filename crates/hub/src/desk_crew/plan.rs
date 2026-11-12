@@ -451,7 +451,8 @@ impl CrewHub {
         let Some(owner) = self.person(Some(service)) else {
             return;
         };
-        let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         let delivered = match crate::desk_surface::deliver(
             service,
             &owner,

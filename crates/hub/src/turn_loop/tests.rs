@@ -1220,7 +1220,7 @@ fn dm_turn(asked: uuid::Uuid) -> workforce_common::channels::desk::DeskTurnConte
         DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext, DESK_CHANNEL,
     };
     let turn = DeskTurn {
-        place: DeskPlace::Dm,
+        place: DeskPlace::Dm { thread: None },
         speaker: DeskSpeaker::Person,
         hop: 0,
         context: Vec::new(),
@@ -1272,7 +1272,7 @@ async fn steered_turn(
             TurnControl::FollowUp {
                 text: follow_up.into(),
                 user: owner.into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: false,
                 id: Some(steered.to_string()),
             }
@@ -1783,7 +1783,7 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
             TurnControl::FollowUp {
                 text: "we talked about it previously".into(),
                 user: "identity-1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: false,
                 id: Some(steered.to_string()),
             }

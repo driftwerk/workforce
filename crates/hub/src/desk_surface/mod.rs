@@ -19,7 +19,7 @@ use workforce_common::trust::TrustLevel;
 #[cfg(feature = "postgres")]
 pub(crate) use close::{close, is_room, message_in_chain};
 pub(crate) use context::{desk_context, person_name};
-pub(crate) use deliver::{deliver, deliver_file, resumed, Delivery, Outbox};
+pub(crate) use deliver::{deliver, deliver_file, resumed, save_on_head, Delivery, Outbox};
 pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
 
@@ -183,7 +183,7 @@ mod tests {
 
     fn from(speaker: DeskSpeaker) -> DeskTurn {
         DeskTurn {
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             speaker,
             hop: 1,
             context: Vec::new(),
@@ -202,7 +202,7 @@ mod tests {
         use workforce_common::delivery::DeliveryTarget;
         let desk = || {
             Some(DeskScope {
-                target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+                target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
                 attended: true,
                 relayed: false,
                 owner: "person-1".into(),
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(
             with_desk(desk(), async { origin() }).await,
             Some(DeliveryTarget::desk(DeskTarget::of_turn(
-                &DeskPlace::Dm,
+                &DeskPlace::Dm { thread: None },
                 "desk",
                 None,
                 false

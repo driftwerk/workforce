@@ -5582,7 +5582,7 @@ async fn desk_dm_ask(
         DeskEdit, DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext, DESK_CHANNEL,
     };
     let turn = DeskTurn {
-        place: DeskPlace::Dm,
+        place: DeskPlace::Dm { thread: None },
         speaker: DeskSpeaker::Person,
         hop: 0,
         context: Vec::new(),
@@ -5877,7 +5877,7 @@ async fn a_streamed_turn_answers_to_the_desk_scope_it_was_started_in() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (service, _server) = service_on_mock_llm(tmp.path()).await;
-    let target = DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false);
+    let target = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false);
     let MessageProgress {
         mut progress_rx,
         handle,
@@ -6053,7 +6053,12 @@ async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
     let (service, _server) = service_on_mock_llm(tmp.path()).await;
     let agent = service.agent_id.to_string();
     let mut dm = service.sessions.get_or_create("desk", BOB, &agent).unwrap();
-    dm.set_desk_origin(&DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false));
+    dm.set_desk_origin(&DeskTarget::of_turn(
+        &DeskPlace::Dm { thread: None },
+        "desk",
+        None,
+        false,
+    ));
     service.sessions.save(&dm).unwrap();
     let row = crate::approvals::PendingApproval {
         request_id: "r-desk".into(),

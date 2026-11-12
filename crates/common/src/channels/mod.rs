@@ -59,7 +59,9 @@ pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CH
 /// platform-scoped (`slack:…`) or internal (`workflow:…`, `scheduler:…`)
 /// sessions. These are the channels where stale-resume rollover applies.
 pub fn is_conversational(channel: &str) -> bool {
-    CONVERSATIONAL_CHANNELS.contains(&channel) || is_desk_room(channel)
+    CONVERSATIONAL_CHANNELS.contains(&channel)
+        || is_desk_room(channel)
+        || workforce_core::desk::dm_thread_parent(channel).is_some()
 }
 
 // ── Channel surface trait ───────────────────────────────────────────────────

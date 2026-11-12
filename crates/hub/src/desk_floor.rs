@@ -66,7 +66,7 @@ impl Origin<'_> {
 /// knows only by its slug has no id to open, and its answers go to the DM.
 pub(crate) fn place_in_desk(place: &DeskPlace) -> Place {
     match place {
-        DeskPlace::Dm | DeskPlace::LegacyRoom { .. } => Place::Dm,
+        DeskPlace::Dm { .. } | DeskPlace::LegacyRoom { .. } => Place::Dm,
         DeskPlace::Room { room, thread, .. } => Place::Room {
             room: *room,
             thread: *thread,
