@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use eyre::{eyre, Result};
 use serde_json::{json, Value};
 
-use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
+use workforce_agent::runner::{
+    CURRENT_AGENT_ID, CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID,
+};
 
 use super::*;
 
@@ -39,6 +41,24 @@ struct World {
     /// What fills and types put in.
     typed: Vec<String>,
     connected: bool,
+    /// How the extension answers a hand-over.
+    hand_over: HandOver,
+    /// The pages handed to the person: theirs, no session's.
+    handed: Vec<String>,
+}
+
+/// How the stand-in answers `hand_over`.
+#[derive(Default, Clone, Copy)]
+enum HandOver {
+    /// In front: the active tab of the focused window.
+    #[default]
+    Front,
+    /// Moved to the person's window, but Chrome didn't say it's in front.
+    Behind,
+    /// Chrome failed.
+    Fails,
+    /// An extension older than the hub: it answers with nothing.
+    Unknown,
 }
 
 static WORLD: LazyLock<Mutex<World>> = LazyLock::new(|| {
@@ -116,6 +136,17 @@ impl ExtensionLink for Stand {
                 w.tabs.remove(&session);
                 json!({ "closed": true })
             }
+            "hand_over" => match w.hand_over {
+                HandOver::Fails => return Err(eyre!("No Chrome window took the tab.")),
+                HandOver::Unknown => Value::Null,
+                how => {
+                    // The tab leaves the session: it's the person's now.
+                    w.tabs.remove(&session);
+                    w.handed.push(url.clone());
+                    let front = matches!(how, HandOver::Front);
+                    json!({ "handed": true, "active": front, "focused": front, "url": url, "title": page.title })
+                }
+            },
             other => return Err(eyre!("unknown command {other}")),
         })
     }
@@ -133,6 +164,15 @@ struct TestHooks {
 }
 
 impl BrowserHooks for TestHooks {
+    fn settings(&self) -> Settings {
+        Settings {
+            on: true,
+            sites: Sites {
+                allow: Vec::new(),
+                block: vec!["never.example".into()],
+            },
+        }
+    }
     fn unbound(&self, agent: &str) -> bool {
         agent == "unbound"
     }
@@ -196,6 +236,17 @@ async fn run(
     tool: &str,
     input: Value,
 ) -> workforce_agent::tools::ToolResult {
+    run_in("", agent, user, tool, input).await
+}
+
+/// [`run`], in the session (its id) `session`, as a turn makes the call.
+async fn run_in(
+    session: &str,
+    agent: &str,
+    user: &str,
+    tool: &str,
+    input: Value,
+) -> workforce_agent::tools::ToolResult {
     // One skill, as a hub keeps one: its tabs outlive each call.
     static SKILL: LazyLock<BrowserSkill> =
         LazyLock::new(|| BrowserSkill::new(BrowserSkillConfig::default()).unwrap());
@@ -209,11 +260,14 @@ async fn run(
             agent.to_string(),
             CURRENT_USER_ID.scope(
                 user.to_string(),
-                CURRENT_SESSION_KEY.scope("conv-1".into(), async move {
-                    // As the gate does before a call: what it acts on.
-                    let _ = t.effect(&input);
-                    t.execute(input).await.unwrap()
-                }),
+                CURRENT_SESSION_ID.scope(
+                    session.to_string(),
+                    CURRENT_SESSION_KEY.scope("conv-1".into(), async move {
+                        // As the gate does before a call: what it acts on.
+                        let _ = t.effect(&input);
+                        t.execute(input).await.unwrap()
+                    }),
+                ),
             ),
         )
         .await
@@ -671,4 +725,209 @@ async fn a_fill_names_the_origin_it_was_resolved_for() {
     .await;
     assert!(filled.success, "{:?}", filled.error);
     assert!(WORLD.lock().unwrap().typed.contains(&"hello".to_string()));
+}
+
+fn calls_of(cmd: &str) -> usize {
+    WORLD
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c.starts_with(&format!("{cmd} ")))
+        .count()
+}
+
+/// A page opened for the person is handed to them: it isn't closed at the
+/// turn's end, and the agent's next call works in a tab of its own, not
+/// theirs.
+#[tokio::test]
+async fn a_page_opened_for_the_person_outlives_the_turn_and_is_not_the_agents() {
+    let _serial = setup().await;
+    WORLD.lock().unwrap().hand_over = HandOver::Front;
+    page(
+        "https://staging.example.com/",
+        Page {
+            title: "Staging",
+            text: "Staging home".into(),
+            ..Page::default()
+        },
+    );
+    let opened = run_in(
+        "turn-hand",
+        "shower",
+        "sarah",
+        "browser.open_for_me",
+        json!({ "url": "https://staging.example.com/" }),
+    )
+    .await;
+    assert!(opened.success, "{:?}", opened.error);
+    assert_eq!(opened.output["shown"], true);
+    assert!(WORLD
+        .lock()
+        .unwrap()
+        .handed
+        .contains(&"https://staging.example.com/".to_string()));
+    assert!(!live().await.iter().any(|l| l.agent == "shower"));
+    // In the same turn, a call on "the page" is told it's theirs, and
+    // Chrome isn't asked (which would open the agent a blank tab).
+    let asked = WORLD.lock().unwrap().calls.len();
+    let read = run_in(
+        "turn-hand",
+        "shower",
+        "sarah",
+        "browser.snapshot",
+        json!({}),
+    )
+    .await;
+    assert_eq!(read.error.as_deref(), Some(extension::HANDED_ALREADY));
+    assert_eq!(
+        WORLD.lock().unwrap().calls.len(),
+        asked,
+        "Chrome isn't asked"
+    );
+    let closes = calls_of("close");
+    assert_eq!(turn_ended("turn-hand").await, 0);
+    assert_eq!(calls_of("close"), closes, "the person's tab isn't closed");
+    // A page of its own it may still open, which closes with its turn; the
+    // person's page is never touched.
+    let own = run_in(
+        "turn-next",
+        "shower",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://own.example/" }),
+    )
+    .await;
+    assert!(own.success, "{:?}", own.error);
+    assert_eq!(turn_ended("turn-next").await, 1, "its own tab closes");
+    assert!(!WORLD
+        .lock()
+        .unwrap()
+        .handed
+        .contains(&"https://own.example/".to_string()));
+    let rows = HOOKS.done.lock().unwrap();
+    assert!(rows
+        .iter()
+        .any(|d| d.agent == "shower" && d.tool == "browser.open_for_me"));
+}
+
+/// The agent's own browsing still closes at the turn's end.
+#[tokio::test]
+async fn a_tab_the_agent_browses_in_is_closed_at_the_turns_end() {
+    let _serial = setup().await;
+    page(
+        "https://own.example/",
+        Page {
+            title: "Own",
+            ..Page::default()
+        },
+    );
+    let went = run_in(
+        "turn-own",
+        "browser-own",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://own.example/" }),
+    )
+    .await;
+    assert!(went.success, "{:?}", went.error);
+    let closes = calls_of("close");
+    assert_eq!(turn_ended("turn-own").await, 1);
+    assert_eq!(calls_of("close"), closes + 1);
+    assert!(!live().await.iter().any(|l| l.agent == "browser-own"));
+}
+
+/// A hand-over that Chrome doesn't confirm is never reported as shown.
+#[tokio::test]
+async fn a_hand_over_chrome_does_not_confirm_is_a_plain_failure() {
+    let _serial = setup().await;
+    page(
+        "https://staging.example.com/",
+        Page {
+            title: "Staging",
+            ..Page::default()
+        },
+    );
+    let open = |session: &'static str| {
+        run_in(
+            session,
+            "unshown",
+            "sarah",
+            "browser.open_for_me",
+            json!({ "url": "https://staging.example.com/" }),
+        )
+    };
+    WORLD.lock().unwrap().hand_over = HandOver::Fails;
+    let failed = open("turn-fail").await;
+    assert!(!failed.success);
+    let why = failed.error.unwrap();
+    assert!(
+        why.contains("wasn't shown") && why.contains("No Chrome window"),
+        "{why}"
+    );
+    // Still the agent's tab: closed at the turn's end.
+    assert_eq!(turn_ended("turn-fail").await, 1);
+
+    WORLD.lock().unwrap().hand_over = HandOver::Unknown;
+    let old = open("turn-old").await;
+    assert_eq!(old.error.as_deref(), Some(extension::EXTENSION_TOO_OLD));
+    assert_eq!(turn_ended("turn-old").await, 1);
+
+    // Nothing shown, so nothing is recorded as opened for them.
+    assert!(!HOOKS
+        .done
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|d| d.agent == "unshown" && d.tool == "browser.open_for_me"));
+
+    WORLD.lock().unwrap().hand_over = HandOver::Behind;
+    let behind = open("turn-behind").await;
+    assert_eq!(behind.error.as_deref(), Some(extension::NOT_IN_FRONT));
+    // Moved to the person's window all the same: theirs, not closed.
+    assert_eq!(turn_ended("turn-behind").await, 0);
+    WORLD.lock().unwrap().hand_over = HandOver::Front;
+}
+
+/// What navigate refuses, opening a page for the person refuses too: not a
+/// web page, a site the person's never-list names, a redirect to a site the
+/// session wasn't allowed. Nothing is handed over.
+#[tokio::test]
+async fn a_page_kept_away_from_is_not_opened_for_the_person() {
+    let _serial = setup().await;
+    let handed = calls_of("hand_over");
+    let file = run(
+        "kept",
+        "sarah",
+        "browser.open_for_me",
+        json!({ "url": "file:///etc/passwd" }),
+    )
+    .await;
+    assert!(!file.success);
+    let never = run(
+        "kept",
+        "sarah",
+        "browser.open_for_me",
+        json!({ "url": "https://app.never.example/" }),
+    )
+    .await;
+    let why = never.error.unwrap();
+    assert!(why.contains("keeps away from app.never.example"), "{why}");
+    page(
+        "https://bounce.example/",
+        Page {
+            redirect: Some("https://elsewhere.example/secret-path"),
+            ..Page::default()
+        },
+    );
+    let bounced = run(
+        "kept",
+        "sarah",
+        "browser.open_for_me",
+        json!({ "url": "https://bounce.example/" }),
+    )
+    .await;
+    let why = bounced.error.unwrap();
+    assert!(why.contains("hasn't been allowed"), "{why}");
+    assert_eq!(calls_of("hand_over"), handed);
 }

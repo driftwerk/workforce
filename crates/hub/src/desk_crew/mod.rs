@@ -59,7 +59,7 @@ pub use plan::{plan_channel, PLAN};
 
 /// What a check-in's prompt starts with: the person never typed it, so the
 /// DM's history leaves it out.
-pub const CHECK_IN: &str = "[Desk check-in]";
+pub const CHECK_IN: &str = crate::desk_surface::CHECK_IN;
 
 /// Hand-offs between agents allowed from one thing that happened, as in
 /// rooms.
@@ -637,6 +637,24 @@ impl CrewHub {
                             unbound: self.unbound_given(s, o),
                         },
                     ))
+                })
+                .collect(),
+        );
+        // Who won't answer what the sessions it runs ask, and why: the
+        // badge of such a session says it waits on the person.
+        self.desk.set_unanswering(
+            list.iter()
+                .filter_map(|(s, o)| {
+                    let name = name_of(s);
+                    let why = match o.level {
+                        Level::Watch => format!("{name} only watches."),
+                        Level::Suggest => format!("{name} only suggests: you decide."),
+                        Level::Act | Level::Full => {
+                            let held = self.desk.agent_held_why(s.agent_id.as_str())?;
+                            format!("{name} is {held}.")
+                        }
+                    };
+                    Some((s.agent_id.as_str().to_string(), why))
                 })
                 .collect(),
         );

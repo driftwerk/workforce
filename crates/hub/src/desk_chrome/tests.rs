@@ -136,6 +136,7 @@ fn the_protocol_is_the_extensions() {
         "capture",
         "capture_key",
         "front",
+        "hand_over",
         "close",
         "stop",
     ] {

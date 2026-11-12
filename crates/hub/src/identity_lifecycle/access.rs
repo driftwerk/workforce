@@ -71,6 +71,11 @@ impl Holding for IdentityRecord {
                 }
                 continue;
             }
+            // Whom the source chose to be is its own; the target chooses
+            // for itself.
+            if crate::chosen_me::is_chosen_key(platform) {
+                continue;
+            }
             match target.linked_ids.get(platform) {
                 Some(kept) if kept != id => tally
                     .conflicts

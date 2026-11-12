@@ -117,6 +117,7 @@ fn held_by_sign_in(tool: &str) -> bool {
 /// The tools that only read a page; the rest change one.
 pub const READS: &[&str] = &[
     "browser.navigate",
+    super::extension::OPEN_FOR_ME,
     "browser.sign_in",
     "browser.snapshot",
     "browser.screenshot",
@@ -173,7 +174,7 @@ fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "browser.navigate",
             description:
-                "Open a web page in the person's own Chrome (signed in as them), in Desk's window of its own. Returns once it has loaded.",
+                "Browse for yourself: open a web page in your own tab of the person's Chrome (signed in as them), to read it or act on it with the other browser tools. Your tab is in Desk's window, which may be out of the person's sight, and it closes when your turn ends. To show the person a page (\"open X for me\", \"show me X\", \"open my Chrome to X\"), use browser.open_for_me instead. Returns once it has loaded.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -183,6 +184,21 @@ fn specs() -> Vec<ToolSpec> {
             }),
             handler: handler(|c, input| {
                 async move { c.navigate(require_str(&input, "url")?).await }.boxed()
+            }),
+        },
+        ToolSpec {
+            name: super::extension::OPEN_FOR_ME,
+            description:
+                "Open a page for the person to see: use it when they ask you to open, show or pull up a page for them (\"open X for me\", \"show me X\", \"open my Chrome to X\"). It opens as the front tab of their current Chrome window, signed in as them, and stays open after your turn. It is theirs from then on: you can't read or act on it, so open it last, once you've done any browsing of your own with browser.navigate. Succeeds only once Chrome confirms it is in front of them; if it fails, tell them plainly it wasn't shown.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The page to show them (https://…)" }
+                },
+                "required": ["url"]
+            }),
+            handler: handler(|c, input| {
+                async move { c.open_for_person(require_str(&input, "url")?).await }.boxed()
             }),
         },
         ToolSpec {
@@ -531,6 +547,13 @@ mod tests {
             find("browser.navigate").effect(&json!({ "url": "https://shop.example/cart" })),
             Effect::Connector {
                 connector: "chrome-visit:https://shop.example".into(),
+                write: false
+            }
+        );
+        assert_eq!(
+            find("browser.open_for_me").effect(&json!({ "url": "https://staging.example.com/" })),
+            Effect::Connector {
+                connector: "chrome-visit:https://staging.example.com".into(),
                 write: false
             }
         );
