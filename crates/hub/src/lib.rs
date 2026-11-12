@@ -111,6 +111,8 @@ pub mod desk_conversations;
 #[cfg(feature = "postgres")]
 pub mod desk_crew;
 #[cfg(feature = "postgres")]
+pub(crate) mod desk_delete;
+#[cfg(feature = "postgres")]
 pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]

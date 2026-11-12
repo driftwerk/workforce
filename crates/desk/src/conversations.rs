@@ -3,7 +3,12 @@
 //! one conversation's messages either side of a cursor
 //! (`GET /api/desk/conversations/{agent}`), and closing a room's
 //! conversation once the room is gone
-//! (`POST /api/desk/conversations/{agent}/close`). The hub reads them from
+//! (`POST /api/desk/conversations/{agent}/close`), and deleting one of the
+//! person's own messages in their DM
+//! (`DELETE /api/desk/conversations/{agent}/messages/{id}`), with what the
+//! agent remembered from it
+//! (`GET /api/desk/conversations/{agent}/messages/{id}/memories`) to forget
+//! too. The hub reads them from
 //! the sessions each Desk channel keeps for that person and agent, and only
 //! the person they belong to may read them, so the hub decides who is
 //! asking from the request itself.
@@ -198,6 +203,28 @@ pub struct Closed {
     pub copied: usize,
 }
 
+/// Something the agent remembered from a message: `{id, text}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SavedMemory {
+    pub id: String,
+    pub text: String,
+}
+
+/// What deleting a message asks to forget with it: memories the agent saved
+/// from it, by id. Any other id is left alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Delete {
+    #[serde(default)]
+    pub forget: Vec<String>,
+}
+
+/// What a delete did: the message is gone, and these memories with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Deleted {
+    pub deleted: bool,
+    pub forgot: Vec<String>,
+}
+
 /// A page of the conversation, oldest first; `more` when messages remain
 /// beyond it in the direction it was read.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -218,6 +245,9 @@ pub enum ConversationError {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    /// Not now: the agent is answering in the conversation.
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Unavailable(String),
     #[error("{0}")]
@@ -231,6 +261,7 @@ impl IntoResponse for ConversationError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "desk conversation read failed");
@@ -288,6 +319,36 @@ pub trait Conversations: Send + Sync {
     ) -> Result<ConversationRead, ConversationError> {
         Err(ConversationError::Unavailable(
             "Desk keeps no read points here yet".into(),
+        ))
+    }
+
+    /// What the agent remembered from the caller's own message `message` in
+    /// their DM with `agent`: `message` is its id in the conversation, or
+    /// the client's own id for it.
+    async fn message_memories(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+        _message: &str,
+    ) -> Result<Vec<SavedMemory>, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "messages can't be deleted here yet".into(),
+        ))
+    }
+
+    /// Deletes the caller's own message `message` in their DM with `agent`,
+    /// and forgets those of `delete.forget` the agent saved from it.
+    async fn delete_message(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+        _message: &str,
+        _delete: Delete,
+    ) -> Result<Deleted, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "messages can't be deleted here yet".into(),
         ))
     }
 }
@@ -376,6 +437,42 @@ async fn put_read(
         .into_response()
 }
 
+async fn message_memories(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path((agent, message)): Path<(String, String)>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    c.message_memories(&headers, q.token.as_deref(), &agent, &message)
+        .await
+        .map(|memories| Json(json!({ "memories": memories })))
+        .into_response()
+}
+
+/// The body is optional: without one, nothing is forgotten.
+async fn delete_message(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path((agent, message)): Path<(String, String)>,
+    Query(q): Query<TokenQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let delete = match body.iter().all(u8::is_ascii_whitespace) {
+        true => Delete::default(),
+        false => match serde_json::from_slice::<Delete>(&body) {
+            Ok(delete) => delete,
+            Err(e) => {
+                return ConversationError::Invalid(format!("the body is not a delete: {e}"))
+                    .into_response()
+            }
+        },
+    };
+    c.delete_message(&headers, q.token.as_deref(), &agent, &message, delete)
+        .await
+        .map(Json)
+        .into_response()
+}
+
 /// The Desk conversation routes on `conversations`.
 pub fn router(conversations: Arc<dyn Conversations>) -> Router {
     Router::new()
@@ -385,6 +482,14 @@ pub fn router(conversations: Arc<dyn Conversations>) -> Router {
         .route(
             "/api/desk/conversations/{agent}/read",
             axum::routing::put(put_read),
+        )
+        .route(
+            "/api/desk/conversations/{agent}/messages/{message}",
+            axum::routing::delete(delete_message),
+        )
+        .route(
+            "/api/desk/conversations/{agent}/messages/{message}/memories",
+            get(message_memories),
         )
         .with_state(conversations)
 }
@@ -406,6 +511,8 @@ mod tests {
         Page(String, String, String, usize),
         Active(Option<DateTime<Utc>>),
         Close(String, Close),
+        Memories(String, String),
+        Delete(String, String, Delete),
     }
 
     /// Answers fixed values, and remembers what it was asked.
@@ -495,6 +602,47 @@ mod tests {
             let copied = close.undelivered.len();
             self.0.lock().unwrap().push(Ask::Close(agent.into(), close));
             Ok(Closed { copied })
+        }
+
+        async fn message_memories(
+            &self,
+            headers: &HeaderMap,
+            token: Option<&str>,
+            agent: &str,
+            message: &str,
+        ) -> Result<Vec<SavedMemory>, ConversationError> {
+            self.check(headers, token)?;
+            self.0
+                .lock()
+                .unwrap()
+                .push(Ask::Memories(agent.into(), message.into()));
+            Ok(vec![SavedMemory {
+                id: "mem-1".into(),
+                text: "Likes pineapple".into(),
+            }])
+        }
+
+        async fn delete_message(
+            &self,
+            headers: &HeaderMap,
+            token: Option<&str>,
+            agent: &str,
+            message: &str,
+            delete: Delete,
+        ) -> Result<Deleted, ConversationError> {
+            self.check(headers, token)?;
+            if message == "busy" {
+                return Err(ConversationError::Conflict("Scout is answering".into()));
+            }
+            let forgot = delete.forget.clone();
+            self.0
+                .lock()
+                .unwrap()
+                .push(Ask::Delete(agent.into(), message.into(), delete));
+            Ok(Deleted {
+                deleted: true,
+                forgot,
+            })
         }
     }
 
@@ -645,6 +793,62 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_s_memories_are_listed_and_it_is_deleted_with_those_asked() {
+        let asked = Arc::new(Asked::default());
+        let (status, body) = get(
+            Arc::clone(&asked),
+            "/api/desk/conversations/scout/messages/m1/memories",
+            Some("Bearer device-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"memories": [{"id": "mem-1", "text": "Likes pineapple"}]})
+        );
+        assert_eq!(asked.last(), Ask::Memories("scout".into(), "m1".into()));
+
+        let delete = |uri: &str, body: &'static str| {
+            let request = Request::delete(uri.to_string())
+                .header("authorization", "Bearer device-token")
+                .header("content-type", "application/json");
+            call(Arc::clone(&asked), request, Body::from(body))
+        };
+        let (status, body) = delete(
+            "/api/desk/conversations/scout/messages/m1",
+            r#"{"forget": ["mem-1"]}"#,
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::OK,
+                json!({"deleted": true, "forgot": ["mem-1"]})
+            )
+        );
+        assert_eq!(
+            asked.last(),
+            Ask::Delete(
+                "scout".into(),
+                "m1".into(),
+                Delete {
+                    forget: vec!["mem-1".into()]
+                }
+            )
+        );
+        let (status, body) = delete("/api/desk/conversations/scout/messages/m2", "").await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"deleted": true, "forgot": []}))
+        );
+        let (status, _) = delete("/api/desk/conversations/scout/messages/m2", "{nope").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = delete("/api/desk/conversations/scout/messages/busy", "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "Scout is answering");
     }
 
     #[tokio::test]

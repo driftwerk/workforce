@@ -333,7 +333,7 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     // The hub link needs the conversation routes, which a hub built
     // without Postgres doesn't serve.
     let link: &[&str] = if cfg!(feature = "postgres") {
-        &["desk.deliveries"]
+        &["desk.delete", "desk.deliveries"]
     } else {
         &[]
     };

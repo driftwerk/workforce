@@ -37,9 +37,11 @@ const MAX_READS: usize = 25;
 
 /// User-role rows the hub writes for the model, never typed by anyone: a
 /// rolled-over thread's carry-over, compaction's orientation note, and the
-/// overflow notes the runner leaves when it drops context.
+/// overflow notes the runner leaves when it drops context, and what a
+/// message the person deleted leaves in its place.
 const HUB_NOTES: &[&str] = &[
     CARRYOVER_PREFIX,
+    workforce_common::session::DELETED_MESSAGE_NOTE,
     "[System note:",
     "[SYSTEM]",
     crate::desk_crew::CHECK_IN,
@@ -155,6 +157,12 @@ fn said(
         client_id: entry.external_id.clone(),
         seq: entry.seq,
     })
+}
+
+/// What `entry` shows in the conversation, if it is one of its messages
+/// ([`said`]), without the files it holds.
+pub(crate) fn shown_as(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
+    said(entry, agent, None)
 }
 
 /// The time a page of a conversation covers, which the files that are
@@ -568,6 +576,57 @@ impl Conversations for HubConversations {
             .map_err(unkept)?
             .map(|p| ConversationRead::of(&p))
             .ok_or_else(|| ConversationError::Internal("the read point was not kept".into()))
+    }
+
+    async fn message_memories(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+    ) -> Result<Vec<workforce_desk::SavedMemory>, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        let saved = crate::desk_delete::memories_of(&service, &owner, &found).await?;
+        Ok(crate::desk_delete::listed(&saved))
+    }
+
+    async fn delete_message(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+        delete: workforce_desk::Delete,
+    ) -> Result<workforce_desk::Deleted, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        // Read before the delete: a memory names the message it came from.
+        let saved = match delete.forget.is_empty() {
+            true => Vec::new(),
+            false => crate::desk_delete::memories_of(&service, &owner, &found).await?,
+        };
+        crate::desk_delete::delete(&service, &speaker, &found, &saved, delete).await
     }
 }
 
