@@ -570,18 +570,20 @@ async fn a_question_is_answered_from_the_conversation_or_not_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::answering(&[
             "It signed in with the key named DEPLOY_TOKEN: \"using DEPLOY_TOKEN from the vault\".",
-            "NOT IN THE RECORD",
+            "Not in the record.",
         ]);
         let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
         let store = DeskStore::from_pool(pool.clone());
         let mut x = exchange("x1", 10, "Deployed, using DEPLOY_TOKEN from the vault.", 1);
         x.ask = "Deploy the login fix".into();
         harvested(&store, id, &[x]).await;
-        let answer = d
+        let crate::AccountAnswer::Answered(answer) = d
             .account_question(id, "Which API key did it use?")
             .await
             .unwrap()
-            .expect("answered");
+        else {
+            panic!("answered")
+        };
         assert!(answer.contains("DEPLOY_TOKEN"));
         let (_, call, asked) = fake.asked.lock()[0].clone();
         assert_eq!(call, Call::Question);
@@ -590,19 +592,21 @@ async fn a_question_is_answered_from_the_conversation_or_not_at_all() {
             "from the exchanges"
         );
         assert!(asked.contains("Which API key did it use?"));
-        assert!(
-            d.account_question(id, "What did it eat?")
-                .await
-                .unwrap()
-                .is_none(),
-            "what the record doesn't say isn't answered"
+        assert_eq!(
+            d.account_question(id, "What did it eat?").await.unwrap(),
+            crate::AccountAnswer::NotInRecord,
+            "what the record doesn't say isn't answered, however it is said"
         );
         // Past the questions' share no model is asked.
         d.set_account_limits(Limits {
             cheap_calls_per_day: 500,
             account_questions_per_day: 0,
         });
-        assert!(d.account_question(id, "Again?").await.unwrap().is_none());
+        assert_eq!(
+            d.account_question(id, "Again?").await.unwrap(),
+            crate::AccountAnswer::Unavailable,
+            "past the share it couldn't be looked up, which isn't the record saying nothing"
+        );
         assert_eq!(fake.calls(), 2);
     })
     .await;

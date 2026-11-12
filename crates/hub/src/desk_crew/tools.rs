@@ -433,21 +433,23 @@ impl CrewTool {
             }
         };
         if let Some(q) = question.map(str::trim).filter(|q| !q.is_empty()) {
-            match crew.desk.account_question(id, q).await {
-                Ok(Some(answer)) => {
-                    out["answer"] = json!(reported(
-                        &answer,
-                        "an answer from the session's own conversation"
-                    ));
-                }
-                Ok(None) => {
-                    out["answer"] = json!("Its account and recent conversation don't say. If it matters, ask the session with crew.ask_session.");
-                }
+            use workforce_desk::AccountAnswer;
+            out["answer"] = match crew.desk.account_question(id, q).await {
+                Ok(AccountAnswer::Answered(answer)) => json!(reported(
+                    &answer,
+                    "an answer from the session's own conversation"
+                )),
+                Ok(AccountAnswer::NotInRecord) => json!(
+                    "Its account and recent conversation don't say. If it matters, ask the session (crew.ask_session, if you may act)."
+                ),
+                Ok(AccountAnswer::Unavailable) => json!(
+                    "That couldn't be looked up just now (Desk's notes are thin today, or its model is busy): answer from the account, and say so."
+                ),
                 Err(e) => {
                     tracing::warn!(session = %id, error = %e, "a question about a session couldn't be answered");
-                    out["answer"] = json!("That couldn't be looked up just now. If it matters, ask the session with crew.ask_session.");
+                    json!("That couldn't be looked up just now: answer from the account, and say so.")
                 }
-            }
+            };
         }
         Ok(out)
     }
@@ -653,7 +655,13 @@ impl CrewTool {
     ) -> Option<Result<Value, String>> {
         let named = input["session_id"].as_str()?;
         let (machine, id) = super::relay::machine_session(named)?;
-        if !RELAYED.contains(&self.name) {
+        // A machine keeps no account of its sessions here: what it gives
+        // is its history of one, as crew.history reads it.
+        let name = match self.name {
+            "crew.account" => "crew.history",
+            n => n,
+        };
+        if !RELAYED.contains(&name) {
             return Some(Err(format!(
                 "{} can't be done to a session on {machine} yet; tell the person instead.",
                 self.name
@@ -672,8 +680,7 @@ impl CrewTool {
         }
         // What its own level here doesn't let it do, it doesn't ask of a
         // machine either; the machine decides at no more than it.
-        if self.name != "crew.history"
-            && b.oversight.level == workforce_common::oversight::Level::Watch
+        if name != "crew.history" && b.oversight.level == workforce_common::oversight::Level::Watch
         {
             return Some(Err(
                 "You only watch the crew: tell the person what you would do instead.".into(),
@@ -687,10 +694,7 @@ impl CrewTool {
         sent["session_id"] = json!(id.to_string());
         let agent = b.service.agent_id.as_str();
         Some(
-            match crew
-                .relay(machine, g, self.name, sent, agent, &ceiling)
-                .await
-            {
+            match crew.relay(machine, g, name, sent, agent, &ceiling).await {
                 Ok(a) => {
                     let said = reported(
                         &workforce_desk::sees::capped(
