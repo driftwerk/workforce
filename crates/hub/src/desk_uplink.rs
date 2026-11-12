@@ -36,7 +36,7 @@
 //! `Authorization` header alone, as grants are: Desk's native side holds it,
 //! and no page, agent or session can ask them.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -642,8 +642,23 @@ impl Uplink {
             .filter_map(|l| l["linkId"].as_str()?.parse().ok())
             .filter_map(|id: Uuid| links.iter().find(|l| l.link_id == id).map(|l| (id, l)))
             .collect();
-        // What it asks open (none until asks, RB7), and what happened in
-        // each group while it was away.
+        // Each link's person, as the boss hub says: who may answer its
+        // asks. A hub that doesn't say is sent none.
+        let persons: HashMap<Uuid, String> = ready["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| {
+                let id: Uuid = l["linkId"].as_str()?.parse().ok()?;
+                let person = l["identityId"].as_str().filter(|p| !p.is_empty())?;
+                accepted.contains_key(&id).then(|| (id, person.to_string()))
+            })
+            .collect();
+        let asks_taken = ready["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|x| x == "asks"));
+        // What it asks open goes up again with the first look, and what
+        // happened in each group while it was away now.
         let _ = sink
             .send(Ws::Text(
                 json!({"type": "asks_open", "asks": []}).to_string().into(),
@@ -676,6 +691,20 @@ impl Uplink {
                 .collect(),
             tx.clone(),
         ));
+        // What its sessions ask the person goes up each link whose person
+        // the hub named, when the hub takes asks.
+        let asks = tokio::spawn(send_asks(
+            Arc::clone(&self.crew),
+            accepted
+                .values()
+                .filter(|l| asks_taken && persons.contains_key(&l.link_id))
+                .map(|l| (l.link_id, l.group.clone(), l.boss()))
+                .collect(),
+            tx.clone(),
+        ));
+        // At most a few answers are worked on at once; the rest are refused
+        // to be sent again.
+        let deciding = Arc::new(tokio::sync::Semaphore::new(DECIDING_AT_ONCE));
         let mut last_seq = 0u64;
         let rates = Arc::clone(&self.rates);
         let ended = loop {
@@ -779,6 +808,45 @@ impl Uplink {
                         let _ = tx.send(result).await;
                     });
                 }
+                // An answer to one of this engine's asks: taken only on the
+                // link it came on, from its person, once.
+                Some("decision") => {
+                    let link = frame["linkId"]
+                        .as_str()
+                        .and_then(|l| l.parse::<Uuid>().ok())
+                        .and_then(|l| accepted.get(&l).copied());
+                    let Some(link) = link else {
+                        let _ = tx
+                            .send(json!({"type": "decision_refused", "askId": frame["askId"],
+                                         "code": "other_link",
+                                         "why": "That answer isn't for this request."}))
+                            .await;
+                        continue;
+                    };
+                    let Ok(permit) = Arc::clone(&deciding).try_acquire_owned() else {
+                        let _ = tx
+                            .send(json!({"type": "decision_refused", "askId": frame["askId"],
+                                         "code": "busy", "why": "Busy: answer again."}))
+                            .await;
+                        continue;
+                    };
+                    let person = persons.get(&link.link_id).cloned();
+                    let (crew, tx, link) = (Arc::clone(&self.crew), tx.clone(), link.clone());
+                    let frame = frame.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let back = crew
+                            .remote_decision(
+                                link.link_id,
+                                &link.group,
+                                &link.boss(),
+                                person.as_deref(),
+                                &frame,
+                            )
+                            .await;
+                        let _ = tx.send(back).await;
+                    });
+                }
                 Some("state") => {
                     tracing::info!(state = ?frame["state"], "a boss hub said a link's state");
                 }
@@ -786,6 +854,7 @@ impl Uplink {
             }
         };
         events.abort();
+        asks.abort();
         drop(tx);
         let _ = writer.await;
         ended
@@ -931,6 +1000,67 @@ async fn send_events(
                 skipped.remove(link);
             } else {
                 unsent(&mut offered);
+            }
+        }
+    }
+}
+
+/// How often what each link's sessions ask the person is looked at.
+const ASKS_EVERY: Duration = Duration::from_secs(2);
+
+/// How many answers from a boss hub are worked on at once.
+const DECIDING_AT_ONCE: usize = 4;
+
+/// The most frames kept to send again once the socket has room.
+const UNSENT_KEPT: usize = 256;
+
+/// Sends `ask` and `ask_closed` frames up `tx` for each of `links`
+/// ([`CrewHub::asks_up`]): the first look sends every ask still open again
+/// with a new nonce; a frame the socket had no room for is sent again as it
+/// was, and only when more wait than are kept do a link's asks go up again
+/// with new nonces; until the socket ends.
+async fn send_asks(
+    crew: Arc<CrewHub>,
+    links: Vec<(Uuid, String, BossRef)>,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let mut look = tokio::time::interval(ASKS_EVERY);
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut again: HashSet<Uuid> = links.iter().map(|(l, _, _)| *l).collect();
+    let mut unsent: VecDeque<(Uuid, Value)> = Default::default();
+    loop {
+        look.tick().await;
+        while let Some((link, f)) = unsent.pop_front() {
+            if let Err(e) = tx.try_send(f) {
+                let tokio::sync::mpsc::error::TrySendError::Full(f) = e else {
+                    return;
+                };
+                unsent.push_front((link, f));
+                break;
+            }
+        }
+        for (link, group, boss) in &links {
+            let frames = crew.asks_up(*link, group, boss, again.remove(link)).await;
+            for f in frames {
+                if !unsent.is_empty() {
+                    unsent.push_back((*link, f));
+                    continue;
+                }
+                match tx.try_send(f) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(f)) => {
+                        unsent.push_back((*link, f));
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+        if unsent.len() > UNSENT_KEPT {
+            for (link, _) in unsent.drain(..) {
+                again.insert(link);
             }
         }
     }
