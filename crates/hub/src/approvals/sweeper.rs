@@ -68,6 +68,10 @@ async fn finalise_expired(
     // Any service shares the surface/identity registries used by the
     // rewrite; resolve the requesting agent so resume runs on the right one.
     if let Some(svc) = resume_service(registry, row) {
+        if row.tool_name == crate::boss_links::asks::TOOL {
+            crate::boss_links::asks::rewrite_expired(&svc, store, row).await;
+            return;
+        }
         rewrite_all_targets(&svc, store, row, ApprovalOutcome::Expired, "").await;
     }
     launch_resume(registry, row, ApprovalOutcome::Expired, "the request").await;

@@ -2546,4 +2546,193 @@ mod uplink_tests {
             assert!(wake(steers).is_none(), "{steers}");
         }
     }
+
+    /// The next frame of `type`, skipping others.
+    async fn next_of(s: &mut Stream, kind: &str) -> Option<Value> {
+        for _ in 0..20 {
+            let f = next(s).await?;
+            if f["type"] == kind {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn a_linked_sessions_ask_is_the_links_person_s_to_answer_and_goes_back_down_with_its_nonce(
+    ) {
+        use crate::approvals::decide::{decide, DecideError, Decided, Decider};
+        use workforce_core::policy::PermissionChoice;
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let person = sam.id.to_string();
+        let store: Arc<dyn crate::approvals::store::PendingApprovalStore> =
+            Arc::new(crate::approvals::SqlitePendingApprovalStore::in_memory().unwrap());
+        for agent in ["allan", "bea"] {
+            hub.state()
+                .registry
+                .get(agent)
+                .unwrap()
+                .set_pending_approval_store(Arc::clone(&store));
+        }
+        // Routed approvals are read through the default agent, as on a hub.
+        let registry = &hub.state().registry;
+        registry.insert(registry.default_id(), registry.get("allan").unwrap());
+        let devbox = key();
+        let mac = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let globex = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&mac, "globex", "mac"),
+        )
+        .unwrap();
+        let addr = serve(&hub).await;
+        let mut a = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        let mut b = open_link(addr, &globex.plaintext, globex.record.id, &mac, "mac").await;
+        let ask = |link: Uuid, id: Uuid, nonce: &str, class: &str| {
+            json!({"type": "ask", "askId": id, "nonce": nonce, "linkId": link, "class": class,
+                   "summary": "acme-api asks to use Bash", "detail": "cargo build",
+                   "options": ["allow", "deny", "stop"],
+                   "expiresAt": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+                   "subject": Uuid::new_v4()})
+        };
+        let row = |id: Uuid| store.get(&crate::boss_links::asks::request_id(id)).unwrap();
+        let kept = |id: Uuid| async move {
+            for _ in 0..50 {
+                if row(id).is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("no approval kept for {id}");
+        };
+        let registry = Arc::clone(&hub.state().registry);
+        let answer = |id: Uuid, who: String, choice: PermissionChoice| {
+            let registry = Arc::clone(&registry);
+            async move {
+                decide(
+                    &registry,
+                    &crate::boss_links::asks::request_id(id),
+                    Decider::Person(&who),
+                    choice,
+                )
+                .await
+            }
+        };
+
+        // An ask is kept as the link's person's, whatever the frame says.
+        let first = Uuid::new_v4();
+        let n1 = "a1".repeat(32);
+        send(&mut a, ask(acme.link.link_id, first, &n1, "anywhere")).await;
+        kept(first).await;
+        let r = row(first).unwrap();
+        assert!(r.is_pending());
+        assert_eq!(r.tool_name, crate::boss_links::asks::TOOL);
+        assert_eq!(r.agent_id, "allan");
+        let targets = store.targets(&r.request_id).unwrap();
+        assert!(
+            targets.iter().all(|t| t.approver_id == person),
+            "{targets:?}"
+        );
+        // Another link can't take it over.
+        send(
+            &mut b,
+            ask(globex.link.link_id, first, &"b2".repeat(32), "anywhere"),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            row(first).unwrap().tool_input["linkId"],
+            json!(acme.link.link_id)
+        );
+
+        // Someone else can't answer it; its person can, and the answer goes
+        // down its own link with its nonce.
+        let other = hub.person(IdentityRole::Member);
+        assert!(matches!(
+            answer(first, other.id.to_string(), PermissionChoice::AllowOnce).await,
+            Err(DecideError::NotAnApprover)
+        ));
+        assert!(matches!(
+            answer(first, person.clone(), PermissionChoice::AllowOnce).await,
+            Ok(Decided::Resolved(_))
+        ));
+        let down = next_of(&mut a, "decision").await.expect("a decision");
+        assert_eq!(down["askId"], json!(first));
+        assert_eq!(down["nonce"], json!(n1));
+        assert_eq!(down["choice"], "allow");
+        assert_eq!(down["decider"]["identityId"], json!(person));
+        assert_eq!(down["decider"]["via"], "desk");
+        // Sent again with the ask's new nonce, until the engine closes it.
+        let n2 = "c3".repeat(32);
+        send(&mut a, ask(acme.link.link_id, first, &n2, "anywhere")).await;
+        let again = next_of(&mut a, "decision").await.expect("sent again");
+        assert_eq!(again["nonce"], json!(n2));
+        assert_eq!(again["choice"], "allow");
+
+        // Desk only: no Allow from here; Stop is taken.
+        let second = Uuid::new_v4();
+        send(
+            &mut a,
+            ask(acme.link.link_id, second, &"d4".repeat(32), "desk_only"),
+        )
+        .await;
+        kept(second).await;
+        assert_eq!(
+            row(second).unwrap().tool_input["options"],
+            json!(["deny", "stop"])
+        );
+        assert!(matches!(
+            answer(second, person.clone(), PermissionChoice::AllowOnce).await,
+            Err(DecideError::NotOffered(_))
+        ));
+        assert!(row(second).unwrap().is_pending());
+        assert!(answer(second, person.clone(), PermissionChoice::DenyAlways)
+            .await
+            .is_ok());
+        let down = next_of(&mut a, "decision").await.expect("a decision");
+        assert_eq!(down["askId"], json!(second));
+        assert_eq!(down["choice"], "stop");
+
+        // Answered in Desk on the engine: closed here, and no longer
+        // answerable.
+        let third = Uuid::new_v4();
+        send(
+            &mut a,
+            ask(acme.link.link_id, third, &"e5".repeat(32), "anywhere"),
+        )
+        .await;
+        kept(third).await;
+        send(
+            &mut a,
+            json!({"type": "ask_closed", "askId": third, "linkId": acme.link.link_id,
+                            "how": "answered_in_desk"}),
+        )
+        .await;
+        for _ in 0..50 {
+            if !row(third).unwrap().is_pending() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!row(third).unwrap().is_pending());
+        assert!(matches!(
+            answer(third, person.clone(), PermissionChoice::AllowOnce).await,
+            Ok(Decided::AlreadyResolved(_))
+        ));
+
+        // What isn't an ask is a bad frame, and nothing is kept.
+        let fourth = Uuid::new_v4();
+        send(&mut a, ask(acme.link.link_id, fourth, "short", "anywhere")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(row(fourth).is_none());
+    }
 }
