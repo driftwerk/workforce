@@ -703,7 +703,7 @@ impl Tool for AgentRenameTool {
         "Rename yourself, when the person you work with asks you to. Your new name goes \
          everywhere you're shown and into your own files (IDENTITY.md and the rest), and \
          you answer to it from your next message. Refused when another agent has the \
-         name. The person approves it first."
+         name. The person approves it first, and needs the right to manage agents."
     }
 
     fn input_schema(&self) -> serde_json::Value {

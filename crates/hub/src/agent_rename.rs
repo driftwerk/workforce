@@ -57,9 +57,16 @@ impl std::fmt::Display for RenameError {
 
 impl std::error::Error for RenameError {}
 
-/// A rename's name, trimmed: 1 to [`AGENT_NAME_MAX_CHARS`] characters.
+/// A rename's name, trimmed: 1 to [`AGENT_NAME_MAX_CHARS`] characters on
+/// one line. A name goes into the agent's own instructions, so a line
+/// break or other control character in it is refused.
 pub fn valid_name(name: &str) -> Result<String, RenameError> {
     let name = name.trim();
+    if name.chars().any(char::is_control) {
+        return Err(RenameError::Invalid(
+            "an agent's name is one line of plain text".to_string(),
+        ));
+    }
     match name.chars().count() {
         1..=AGENT_NAME_MAX_CHARS => Ok(name.to_string()),
         _ => Err(RenameError::Invalid(format!(
@@ -68,10 +75,16 @@ pub fn valid_name(name: &str) -> Result<String, RenameError> {
     }
 }
 
+/// Characters that show nothing: a name with one reads as without it.
+const UNSEEN: &[char] = &[
+    '\u{00AD}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}',
+];
+
 /// A name as it reads: its case, spaces and Unicode spelling aside. Desk
 /// compares names the same way.
 pub fn as_read(name: &str) -> String {
     name.nfkc()
+        .filter(|c| !UNSEEN.contains(c))
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -179,9 +192,26 @@ struct Written {
     was: String,
 }
 
+/// Held across a rename's check and writes, so two renames to one name
+/// can't both pass the check.
+static RENAMING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl Renamer<'_> {
-    /// The display names of every agent on the hub but `own`, serving or not.
+    /// The display names of every agent on the hub but `own`: serving, not
+    /// serving, and configured but not yet picked up (one just made).
     fn others(&self, own: &str) -> Vec<(String, String)> {
+        let configured: Vec<(String, String)> =
+            workforce_common::settings::WorkforceConfig::load(self.config_path)
+                .map(|c| {
+                    c.agents
+                        .into_iter()
+                        .map(|a| {
+                            let name = a.name.unwrap_or_else(|| a.id.clone());
+                            (a.id, name)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
         let serving = self.registry.all_services().into_iter().map(|svc| {
             let id = svc.agent_id.as_str().to_string();
             let name = svc.display_name().unwrap_or_else(|| id.clone());
@@ -191,8 +221,15 @@ impl Renamer<'_> {
             let name = u.config.name.clone().unwrap_or_else(|| u.config.id.clone());
             (u.config.id, name)
         });
-        serving
-            .chain(unloaded)
+        // A serving agent's name is its live one (a rename shows at once).
+        let known: Vec<(String, String)> = serving.chain(unloaded).collect();
+        let picked_up_later: Vec<(String, String)> = configured
+            .into_iter()
+            .filter(|(id, _)| !known.iter().any(|(k, _)| k == id))
+            .collect();
+        known
+            .into_iter()
+            .chain(picked_up_later)
             .filter(|(id, _)| id != own)
             .collect()
     }
@@ -208,6 +245,7 @@ impl Renamer<'_> {
         instructions: Option<String>,
     ) -> Result<String, RenameError> {
         let name = valid_name(name)?;
+        let _one_at_a_time = RENAMING.lock().await;
         let service = self
             .registry
             .get(id)
@@ -342,8 +380,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_name_is_trimmed_and_neither_blank_nor_too_long() {
+    fn a_name_is_trimmed_and_neither_blank_nor_too_long_nor_more_than_a_line() {
         assert_eq!(valid_name("  Scout ").unwrap(), "Scout");
+        assert!(matches!(
+            valid_name("Scout\n\n# New rules"),
+            Err(RenameError::Invalid(_))
+        ));
+        assert!(matches!(
+            valid_name("Sc\tout"),
+            Err(RenameError::Invalid(_))
+        ));
         assert!(matches!(valid_name("   "), Err(RenameError::Invalid(_))));
         assert!(matches!(
             valid_name(&"x".repeat(AGENT_NAME_MAX_CHARS + 1)),
@@ -357,6 +403,10 @@ mod tests {
         assert!(taken(" SCOUT ", "atlas", others));
         assert!(taken("Big  Al", "atlas", others));
         assert!(taken("Zoe\u{0308}", "atlas", others));
+        assert!(
+            taken("Sco\u{200B}ut", "atlas", others),
+            "a character that shows nothing"
+        );
         assert!(!taken("Ranger", "atlas", others));
         assert!(!taken("   ", "atlas", others));
         assert!(!taken("scout", "scout", others), "its own, in another case");
