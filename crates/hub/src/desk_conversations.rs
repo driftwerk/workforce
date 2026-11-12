@@ -615,7 +615,26 @@ fn threads_of(
         .filter(|s| !s.is_sealed() && workforce_core::desk::dm_thread_parent(&s.channel).is_some())
         .collect();
     heads.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-    heads.truncate(THREADS_MAX);
+    // A thread is on a message of the DM: one whose parent the DM doesn't
+    // hold is no thread of it.
+    let dm = store.find(DESK_CHANNEL, owner).map_err(internal)?;
+    let mut held = Vec::new();
+    for head in heads {
+        let parent = workforce_core::desk::dm_thread_parent(&head.channel).unwrap_or_default();
+        let on_a_message = match &dm {
+            Some(dm) => crate::desk_surface::message_in_chain(store, &dm.id, parent)
+                .map_err(internal)?
+                .is_some(),
+            None => false,
+        };
+        if on_a_message {
+            held.push(head);
+        }
+        if held.len() == THREADS_MAX {
+            break;
+        }
+    }
+    let heads = held;
     let mut threads = Vec::new();
     for head in heads {
         let Some(parent) = workforce_core::desk::dm_thread_parent(&head.channel) else {
@@ -923,7 +942,12 @@ impl Conversations for HubConversations {
     ) -> Result<Copied, ConversationError> {
         let owner = self.person(headers, token).await?;
         let service = self.agent(agent)?;
-        copy_to_dm(service.sessions.as_ref(), service.agent_id.as_str(), &owner, copy)
+        copy_to_dm(
+            service.sessions.as_ref(),
+            service.agent_id.as_str(),
+            &owner,
+            copy,
+        )
     }
 
     /// The point is the caller's own, so no one moves another's; every
@@ -1090,7 +1114,15 @@ mod tests {
         for m in &thread.messages {
             store.append_to_archive(&thread.id, m).unwrap();
         }
-        // Another person's thread, and a room, are not this person's threads.
+        // A thread on no message of the DM is none; nor are another person's,
+        // or a room.
+        let stray = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+        let mut stray = store.get_or_create(&stray, ME, "scout").unwrap();
+        stray.add_user_message("on nothing", None);
+        store.save(&stray).unwrap();
+        store
+            .append_to_archive(&stray.id, &stray.messages[0])
+            .unwrap();
         let mut theirs = store
             .get_or_create(&channel, "identity-2", "scout")
             .unwrap();

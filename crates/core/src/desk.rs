@@ -549,7 +549,8 @@ pub struct DeskTarget {
 }
 
 impl DeskTarget {
-    /// Where output of a turn in `place` on `channel` goes. A call is over
+    /// Where output of a turn in `place` on `channel` goes: a thread's own
+    /// conversation stays in its thread. A call is over
     /// by the time anything arrives later, and a room too old to name its id
     /// cannot be posted to, so both go to the DM.
     pub fn of_turn(place: &DeskPlace, channel: &str, device: Option<&str>, spoken: bool) -> Self {
@@ -566,7 +567,15 @@ impl DeskTarget {
                 device: None,
                 spoken,
             },
-            DeskPlace::Dm { .. } | DeskPlace::Call => Self::dm_of(spoken),
+            DeskPlace::Dm {
+                thread: Some(parent),
+            } => Self {
+                place: place.clone(),
+                channel: dm_thread_channel(parent),
+                device: None,
+                spoken,
+            },
+            DeskPlace::Dm { thread: None } | DeskPlace::Call => Self::dm_of(spoken),
         }
     }
 
@@ -1102,6 +1111,21 @@ mod tests {
             from: format!("p{n}"),
             text: "x".repeat(chars),
         }
+    }
+
+    #[test]
+    fn what_a_thread_turn_starts_comes_back_to_its_thread() {
+        let parent = Uuid::new_v4().to_string();
+        let place = DeskPlace::Dm {
+            thread: Some(parent.clone()),
+        };
+        let target = DeskTarget::of_turn(&place, "whatever", Some("mac"), true);
+        assert_eq!(target.place, place);
+        assert_eq!(target.channel, dm_thread_channel(&parent));
+        assert!(target.spoken);
+        let dm = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+        assert_eq!(dm.channel, DESK_CHANNEL);
+        assert_eq!(target.dm().place, DeskPlace::Dm { thread: None });
     }
 
     #[test]
