@@ -792,6 +792,10 @@ pub(super) struct EngineRead {
     ended: std::time::Instant,
 }
 
+/// How many times a minute asking for every engine to be read again
+/// ([`Desk::engines_read_now`]) reads them.
+pub(crate) const ENGINES_READS_A_MINUTE: usize = 12;
+
 /// Which read since a moment serves a caller: one that began after it
 /// (what changed just before is in it), or one that ended after it (a read
 /// under way when it asked is shared).
@@ -860,6 +864,9 @@ struct Inner {
     engines: Mutex<BTreeMap<Engine, Installed>>,
     /// Each engine's reads, one at a time: when the last began and ended.
     engine_reads: BTreeMap<Engine, Arc<tokio::sync::Mutex<Option<EngineRead>>>>,
+    /// When every engine was last asked to be read again, in the last
+    /// minute ([`Desk::engines_read_now`]).
+    engines_read_asked: Mutex<std::collections::VecDeque<std::time::Instant>>,
     /// While the sessions running at the last stop are restored: since
     /// when a read of an engine serves them all.
     restoring_since: Mutex<Option<std::time::Instant>>,
@@ -1549,6 +1556,7 @@ impl Desk {
                 .into_iter()
                 .map(|e| (e, Arc::default()))
                 .collect(),
+            engines_read_asked: Mutex::default(),
             restoring_since: Mutex::new(restoring_since),
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
@@ -1982,11 +1990,28 @@ impl Desk {
             // When Claude Code said it resets; else what a reading says. The
             // account it stopped on, whichever credential of it it ran on.
             let raw = Self::raw_running(st, id);
+            // What Claude Code said; else what the words name, if not the
+            // plan's own window.
+            let in_words = view
+                .failure
+                .is_none()
+                .then(|| {
+                    transitions.iter().find_map(|t| match t {
+                        Transition::Finished { reply } => {
+                            Some(crate::limit::LimitHit::in_words(reply))
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
             Self::mark_hit(
                 st,
                 id,
                 &raw,
-                view.failure.as_ref().and_then(|f| f.limit()),
+                view.failure
+                    .as_ref()
+                    .and_then(|f| f.limit())
+                    .or(in_words.as_ref()),
                 Utc::now(),
             );
             let desk = self.clone();
@@ -2081,6 +2106,42 @@ impl Desk {
                 .map(|(e, i)| (*e, i.sign_in.clone()))
                 .collect(),
         }
+    }
+
+    /// Every engine read again now (one read under way is shared), as after
+    /// Desk installed one or signed one in: then as [`Desk::engines`].
+    ///
+    /// Asked more than [`ENGINES_READS_A_MINUTE`] times in a minute, it
+    /// answers what was last read without reading: each read runs every
+    /// engine's program, which asking without end mustn't do.
+    pub async fn engines_read_now(&self) -> Vec<engine::EngineView> {
+        let asked = std::time::Instant::now();
+        {
+            let mut recent = self.0.engines_read_asked.lock();
+            while recent
+                .front()
+                .is_some_and(|t| asked.duration_since(*t) >= Duration::from_secs(60))
+            {
+                recent.pop_front();
+            }
+            if recent.len() >= ENGINES_READS_A_MINUTE {
+                tracing::debug!("engines asked to be read too often: answering the last read");
+                return self.engines();
+            }
+            recent.push_back(asked);
+        }
+        let reads = Engine::ALL
+            .into_iter()
+            .map(|e| self.read_engine_since(e, asked, Since::Ended));
+        futures::future::join_all(reads).await;
+        self.spend_signed_in();
+        self.engines()
+    }
+
+    /// How many reads of every engine were asked for in the last minute.
+    #[cfg(test)]
+    pub(crate) fn engines_reads_this_minute(&self) -> usize {
+        self.0.engines_read_asked.lock().len()
     }
 
     /// Every engine as Settings → Engines and the new session dialog show
@@ -2861,6 +2922,9 @@ impl Desk {
             ));
         }
         let account = self.account_for(new.engine, new.account)?;
+        if new.engine == Engine::Claude {
+            self.started_on(account);
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -5380,6 +5444,39 @@ impl Desk {
             identities::Waiting::Hit(id, hit.cloned(), now).wait(st);
             return None;
         }
+        // Only the plan's own window fills the account. A model's weekly
+        // window holds that model alone; extra usage or credits spent stops
+        // no plan session.
+        let mut crossed = None;
+        match hit.map(|h| h.reach()) {
+            Some(crate::limit::Reach::Credit) => {
+                // Extra usage is spent only once the plan's own windows are
+                // too: if the last reading shows one at 100%, the account is
+                // full on it; else (or no reading) it isn't.
+                let full = Self::standing_mut(st, raw).plan_window_full(now);
+                let Some(full) = full else {
+                    tracing::info!(session = %id, window = hit.and_then(|h| h.window.as_deref()), "a session stopped on extra usage; no plan window reads full");
+                    return None;
+                };
+                tracing::info!(session = %id, "a session stopped on extra usage with a plan window full: the account is full");
+                let kind = match full.minutes {
+                    Some(300) => "five_hour",
+                    _ => "seven_day",
+                };
+                crossed = Some(crate::limit::LimitHit {
+                    window: Some(kind.into()),
+                    resets_at: full.until,
+                });
+            }
+            Some(crate::limit::Reach::Model(model)) => {
+                // Desk has no model of its own per session to hold, and the
+                // plan has room for the others.
+                tracing::info!(session = %id, %model, "a session stopped on one model's weekly limit; the account isn't full");
+                return None;
+            }
+            _ => {}
+        }
+        let hit = crossed.as_ref().or(hit);
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
@@ -5486,6 +5583,20 @@ impl Desk {
         });
     }
 
+    /// Takes back the stop session `id` marked on its account, when it was
+    /// the account's last: back to what the stop before it said.
+    fn undo_mark(st: &mut State, id: Uuid) {
+        if let Some(mark) = st.limit_marks.remove(&id) {
+            let s = Self::standing_mut(st, &mark.side);
+            if s.hit_at == Some(mark.at) {
+                (s.hit_at, s.hit_until, s.hit_window) = mark.before;
+                if let Some(by) = st.written_by.get_mut(&mark.side) {
+                    by.hit = None;
+                }
+            }
+        }
+    }
+
     /// What the transcript said of the API error session `id`'s turn ended
     /// on, on `account`; it decides over the hook's words. The plan's limit
     /// makes the account full until its reset, though the words didn't say
@@ -5505,9 +5616,16 @@ impl Desk {
             let current = st.turn_failures.get(&id).cloned();
             match (current, said) {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
-                    let standing = Self::standing_mut(&mut st, &account);
-                    standing.hit_until = hit.resets_at.or(standing.hit_until);
-                    standing.hit_window = hit.minutes().or(standing.hit_window);
+                    if hit.reach() == crate::limit::Reach::Plan {
+                        let standing = Self::standing_mut(&mut st, &account);
+                        standing.hit_until = hit.resets_at.or(standing.hit_until);
+                        standing.hit_window = hit.minutes().or(standing.hit_window);
+                    } else {
+                        // Words read as the plan's; the transcript names a
+                        // model's or extra usage: the account isn't full.
+                        Self::undo_mark(&mut st, id);
+                        Self::mark_session_hit(&mut st, id, &account, Some(&hit));
+                    }
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     false
                 }
@@ -5521,22 +5639,13 @@ impl Desk {
                     tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
                     // Only the stop this session marked: another session's
                     // stop on the same account since stands.
-                    if let Some(mark) = st.limit_marks.remove(&id) {
-                        let s = Self::standing_mut(&mut st, &mark.side);
-                        if s.hit_at == Some(mark.at) {
-                            // Back to what the last stop before it said.
-                            (s.hit_at, s.hit_until, s.hit_window) = mark.before;
-                            if let Some(by) = st.written_by.get_mut(&mark.side) {
-                                by.hit = None;
-                            }
-                        }
-                    }
+                    Self::undo_mark(&mut st, id);
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
                     true
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
-                    if standing.hit_at.is_some() {
+                    if standing.hit_at.is_some() && hit.reach() == crate::limit::Reach::Plan {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                         standing.hit_window = hit.minutes().or(standing.hit_window);
                     }

@@ -111,15 +111,35 @@ fn read_token(vault: &Vault, person: &str, hub: &str) -> Option<Secret> {
 
 // ── A hub, through its remote MCP ────────────────────────────────────────
 
-/// A linked hub's tools, called through its `/mcp` as the person.
+/// Whether `id` can name an agent in a path: what a hub's agent ids are.
+pub fn agent_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// A linked hub's tools, called through its remote MCP as the person: its
+/// default agent's (`/mcp`), or one agent's (`/mcp/agents/{id}`).
 pub struct HubRemote {
     client: McpClient,
     ready: tokio::sync::OnceCell<()>,
 }
 
 impl HubRemote {
-    pub fn new(url: &str, token: &Secret, http: Arc<reqwest::Client>) -> Result<Self, RemoteError> {
-        let endpoint = url::Url::parse(&format!("{}/mcp", url.trim_end_matches('/')))
+    pub fn new(
+        url: &str,
+        token: &Secret,
+        http: Arc<reqwest::Client>,
+        agent: Option<&str>,
+    ) -> Result<Self, RemoteError> {
+        let base = url.trim_end_matches('/');
+        let path = match agent {
+            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}"),
+            Some(_) => return Err(RemoteError::Refused("that isn't an agent's id".into())),
+            None => format!("{base}/mcp"),
+        };
+        let endpoint = url::Url::parse(&path)
             .map_err(|_| RemoteError::Offline("the hub's address isn't one".into()))?;
         Ok(Self {
             client: McpClient::new(
@@ -192,6 +212,48 @@ impl Remote for HubRemote {
         })?;
         sync::mcp_answer(&result)
     }
+}
+
+/// The agents `token`'s person may reach on the hub at `url`
+/// (`GET /mcp/agents`), default first; none from a hub without the route.
+pub async fn hub_agents(
+    url: &str,
+    token: &Secret,
+    http: &reqwest::Client,
+) -> Result<Vec<String>, RemoteError> {
+    let at = format!("{}/mcp/agents", url.trim_end_matches('/'));
+    let resp = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        http.get(&at).bearer_auth(token.expose()).send(),
+    )
+    .await
+    .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
+    .map_err(|e| RemoteError::Offline(e.without_url().to_string()))?;
+    match resp.status().as_u16() {
+        401 => return Err(RemoteError::NoToken),
+        404 | 405 => return Ok(vec![]),
+        s if s >= 400 => return Ok(vec![]),
+        _ => {}
+    }
+    let body: Value = resp.json().await.unwrap_or_default();
+    let mut agents: Vec<(bool, String)> = body["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let id = a["id"].as_str().filter(|i| agent_id_ok(i))?;
+            Some((a["default"].as_bool() != Some(true), id.to_string()))
+        })
+        .collect();
+    agents.sort();
+    Ok(agents.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Where a board's tools were found: what reaches them, and the agent
+/// there that offers them (none: the default, or this hub).
+pub struct Reached {
+    pub remote: Arc<dyn Remote>,
+    pub agent: Option<String>,
 }
 
 // ── This hub's own tools ─────────────────────────────────────────────────
@@ -372,13 +434,44 @@ impl BoardSync {
         if !(due || now || queued) {
             return Ok(());
         }
-        let remote = match self.remote(s.system, &s.via, &s.person).await {
-            Ok(r) => r,
-            Err(p) => {
-                if s.paused.as_ref() != Some(&p) {
-                    self.desk.set_sync_paused(id, Some(p)).await?;
+        // An agent that stopped offering the tools: the agents there are
+        // asked again, and the board goes on through one that offers them.
+        let remote = if matches!(s.paused, Some(Paused::Missing { .. })) {
+            match self
+                .offered(s.system, &s.via, &s.person, s.agent.as_deref())
+                .await
+            {
+                Ok(r) => {
+                    let agent = r.agent.clone();
+                    self.desk
+                        .change_sync(id, move |s| {
+                            s.agent = agent;
+                            s.paused = None;
+                            s.backoff_until = None;
+                            s.failures = 0;
+                        })
+                        .await?;
+                    r.remote
                 }
-                return Ok(());
+                Err(p) => {
+                    if s.paused.as_ref() != Some(&p) {
+                        self.desk.set_sync_paused(id, Some(p)).await?;
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            match self
+                .remote(s.system, &s.via, &s.person, s.agent.as_deref())
+                .await
+            {
+                Ok(r) => r,
+                Err(p) => {
+                    if s.paused.as_ref() != Some(&p) {
+                        self.desk.set_sync_paused(id, Some(p)).await?;
+                    }
+                    return Ok(());
+                }
             }
         };
         // What changed here goes out first, so the pull that follows finds
@@ -406,6 +499,7 @@ impl BoardSync {
         system: System,
         via: &Via,
         person: &str,
+        agent: Option<&str>,
     ) -> Result<Arc<dyn Remote>, Paused> {
         match via {
             Via::ThisHub => Ok(Arc::new(LocalRemote::new(
@@ -423,7 +517,7 @@ impl BoardSync {
                     .ok_or(Paused::HubUnpaired)?;
                 let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
                 let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
-                HubRemote::new(&h.url, &token, Arc::clone(&self.http))
+                HubRemote::new(&h.url, &token, Arc::clone(&self.http), agent)
                     .map(|r| Arc::new(r) as Arc<dyn Remote>)
                     .map_err(|e| Paused::Refused {
                         reason: e.to_string(),
@@ -432,21 +526,81 @@ impl BoardSync {
         }
     }
 
-    /// `remote`, once it has said it offers every tool `system`'s sync
-    /// needs.
+    /// What reaches every tool `system`'s sync needs, and the agent that
+    /// offers them: on a hub, `prefer` (the board's agent) first, then its
+    /// default agent, then every other agent the person may reach there,
+    /// since a hub offers each agent's own tools. None of them: `Missing`.
     pub async fn offered(
         &self,
         system: System,
         via: &Via,
         person: &str,
-    ) -> Result<Arc<dyn Remote>, Paused> {
-        let remote = self.remote(system, via, person).await?;
-        let tools = remote.tools().await.map_err(|e| paused_by(&e))?;
-        let missing = sync::missing_tools(system, &tools);
-        match missing.is_empty() {
-            true => Ok(remote),
-            false => Err(Paused::Missing { tools: missing }),
+        prefer: Option<&str>,
+    ) -> Result<Reached, Paused> {
+        let probe = |agent: Option<String>| async move {
+            let remote = self.remote(system, via, person, agent.as_deref()).await?;
+            let tools = tokio::time::timeout(PROBE_TIMEOUT * 2, remote.tools())
+                .await
+                .map_err(|_| Paused::HubOffline {
+                    since: chrono::Utc::now(),
+                })?
+                .map_err(|e| paused_by(&e))?;
+            match sync::missing_tools(system, &tools) {
+                missing if missing.is_empty() => Ok(Reached { remote, agent }),
+                missing => Err(Paused::Missing { tools: missing }),
+            }
+        };
+        let Via::Hub { hub } = via else {
+            return probe(None).await;
+        };
+        // The board's own agent, then the default.
+        let mut tried: Vec<Option<String>> = vec![];
+        let mut missing = None;
+        for agent in prefer
+            .map(|a| Some(a.to_string()))
+            .into_iter()
+            .chain([None])
+        {
+            if tried.contains(&agent) {
+                continue;
+            }
+            tried.push(agent.clone());
+            match probe(agent).await {
+                Ok(r) => return Ok(r),
+                // A token refused or a hub away: no agent there will do.
+                Err(p @ (Paused::NoToken | Paused::HubOffline { .. } | Paused::HubUnpaired)) => {
+                    return Err(p)
+                }
+                Err(p) => missing = missing.or(Some(p)),
+            }
         }
+        // Every other agent the person may reach there, asked at once.
+        let h = self
+            .desk
+            .sync_hub(hub)
+            .await
+            .ok()
+            .flatten()
+            .ok_or(Paused::HubUnpaired)?;
+        let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
+        let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
+        let agents = hub_agents(&h.url, &token, &self.http)
+            .await
+            .map_err(|e| paused_by(&e))?;
+        let rest: Vec<String> = agents
+            .into_iter()
+            .filter(|a| !tried.contains(&Some(a.clone())))
+            .collect();
+        let found = futures::future::join_all(rest.into_iter().map(|a| probe(Some(a)))).await;
+        if let Some(r) = found.into_iter().flatten().next() {
+            return Ok(r);
+        }
+        Err(missing.unwrap_or(Paused::Missing {
+            tools: sync::tools_of(system)
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        }))
     }
 
     /// The linked hub that offers `system`'s tools to `person`, if any: a
@@ -457,7 +611,8 @@ impl BoardSync {
         let probes = hubs.into_iter().map(|h| async move {
             let via = Via::Hub { hub: h.id.clone() };
             let offered =
-                tokio::time::timeout(PROBE_TIMEOUT, self.offered(system, &via, person)).await;
+                tokio::time::timeout(PROBE_TIMEOUT * 4, self.offered(system, &via, person, None))
+                    .await;
             matches!(offered, Ok(Ok(_))).then_some(h.name)
         });
         futures::future::join_all(probes)
@@ -504,12 +659,10 @@ pub fn paused_by(e: &RemoteError) -> Paused {
 
 /// What a hub's admin must do for a board to link through it, in plain
 /// words.
-fn missing_words(hub: &str, system: System, tools: &[String]) -> String {
+fn missing_words(hub: &str, system: System, _tools: &[String]) -> String {
     format!(
-        "{hub} doesn't offer its {} tools to your own apps ({} missing). Ask its admin to add `{}.*` to remote MCP.",
-        system.title(),
-        tools.join(", "),
-        system.as_str()
+        "No agent on {hub} you can reach has {} switched on.",
+        system.title()
     )
 }
 
@@ -676,7 +829,7 @@ async fn put_hub(
     // kept.
     let offers = match &token {
         Some(t) => {
-            let remote = match HubRemote::new(url.as_str(), t, Arc::clone(&r.sync.http)) {
+            let remote = match HubRemote::new(url.as_str(), t, Arc::clone(&r.sync.http), None) {
                 Ok(remote) => remote,
                 Err(e) => return refusal(StatusCode::BAD_REQUEST, &e.to_string()),
             };
@@ -721,12 +874,18 @@ async fn put_hub(
         }
         tracing::info!(target: "sentinel.audit", hub = %hub, person = %person, "a hub's token for board sync was kept");
     }
-    let offers = offers.map(|tools| {
-        json!({
-            "jira": sync::missing_tools(System::Jira, &tools).is_empty(),
-            "linear": sync::missing_tools(System::Linear, &tools).is_empty(),
-        })
-    });
+    // What it offers through any agent the person may reach there.
+    let offers = match offers {
+        Some(_) => {
+            let via = Via::Hub { hub: hub.clone() };
+            let (jira, linear) = futures::join!(
+                r.sync.offered(System::Jira, &via, &person, None),
+                r.sync.offered(System::Linear, &via, &person, None)
+            );
+            Some(json!({ "jira": jira.is_ok(), "linear": linear.is_ok() }))
+        }
+        None => None,
+    };
     Json(json!({ "id": kept.id, "name": kept.name, "url": kept.url, "offers": offers }))
         .into_response()
 }
@@ -878,8 +1037,8 @@ async fn check_link(
         }
     }
     let hub = r.sync.hub_name(&body.via).await;
-    let remote = match r.sync.offered(body.system, &body.via, &person).await {
-        Ok(remote) => remote,
+    let reached = match r.sync.offered(body.system, &body.via, &person, None).await {
+        Ok(reached) => reached,
         Err(p) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -888,7 +1047,12 @@ async fn check_link(
                 .into_response()
         }
     };
-    let mut out = json!({ "offered": true });
+    let remote = reached.remote;
+    // Which agent there offers the tools: "Jira through Lattice".
+    let mut out = json!({
+        "offered": true,
+        "agent": reached.agent.as_deref().map(|a| json!({ "id": a, "name": workforce_desk::board::agent_title(a) })),
+    });
     let said = |e: RemoteError| {
         (
             StatusCode::BAD_GATEWAY,
@@ -1076,8 +1240,11 @@ async fn link_board(
         }
     }
     let hub = r.sync.hub_name(&link.via).await;
-    let remote = match r.sync.offered(link.system, &link.via, &person).await {
-        Ok(remote) => remote,
+    let remote = match r.sync.offered(link.system, &link.via, &person, None).await {
+        Ok(reached) => {
+            link.agent = reached.agent;
+            reached.remote
+        }
         Err(p) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1210,7 +1377,11 @@ async fn take_ticket(
             "Only the person who linked this board takes its issues.",
         );
     }
-    let remote = match r.sync.remote(s.system, &s.via, &person).await {
+    let remote = match r
+        .sync
+        .remote(s.system, &s.via, &person, s.agent.as_deref())
+        .await
+    {
         Ok(remote) => remote,
         Err(p) => {
             let hub = r.sync.hub_name(&s.via).await;
@@ -1249,7 +1420,11 @@ async fn recheck_me(
         );
     }
     let hub = r.sync.hub_name(&s.via).await;
-    let remote = match r.sync.remote(s.system, &s.via, &person).await {
+    let remote = match r
+        .sync
+        .remote(s.system, &s.via, &person, s.agent.as_deref())
+        .await
+    {
         Ok(remote) => remote,
         Err(p) => return refusal(StatusCode::CONFLICT, &paused_words(&hub, s.system, &p)),
     };

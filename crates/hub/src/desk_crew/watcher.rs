@@ -553,11 +553,54 @@ impl CrewHub {
             .is_ok_and(|v| v.items.iter().any(|i| i.id != overseer))
     }
 
-    fn level_hint(level: Level) -> &'static str {
+    /// What the overseer is told it may do at `level`, under `o`'s
+    /// switches: at Act and Act fully, also which of them are off, so what
+    /// becomes a suggestion is said with the switch that would let it act.
+    pub(super) fn level_hint(level: Level, o: &Oversight) -> String {
+        let hint = Self::level_words(level);
+        let off = o.act.off();
+        if !level.acts() || off.is_empty() {
+            return hint.to_string();
+        }
+        let named: Vec<String> = off.iter().map(|label| format!("“{label}”")).collect();
+        format!(
+            "{hint} Off: {}; for those, say which to turn on.",
+            named.join(", ")
+        )
+    }
+
+    /// The short line a turn the person asks the overseer in its Desk DM
+    /// carries: its level now and, where it acts, the switches that are off,
+    /// so it acts within them from the first request.
+    pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
+        let says = match level {
+            _ if unbound => {
+                return "You oversee the crew, unbound: do everything yourself with the crew.* tools.".into();
+            }
+            Level::Watch => "at Watch: don't act; say what you would do.",
+            Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
+            Level::Act => "at Act: do the work yourself with the crew.* tools, don't offer it.",
+            Level::Full => "at Act fully: do the work yourself with the crew.* tools, and ship in the repos the person named.",
+        };
+        let off = o.act.off();
+        let off = match level.acts() && !off.is_empty() {
+            true => format!(
+                " Off: {}; for those, say which to turn on.",
+                off.iter()
+                    .map(|label| format!("“{label}”"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            false => String::new(),
+        };
+        format!("You oversee the crew {says}{off}")
+    }
+
+    fn level_words(level: Level) -> &'static str {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
-            Level::Act => "You may act with the crew.* tools within what the person allowed; anything else becomes a suggestion they can do or dismiss. Give a reason each time.",
+            Level::Act => "You act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
             Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's. Give a reason each time.",
         }
     }
@@ -579,7 +622,7 @@ impl CrewHub {
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
         let hint = match self.unbound_given(&service, &o) {
             true => Self::boss_hint(&o),
-            false => Self::level_hint(level).to_string(),
+            false => Self::level_hint(level, &o),
         };
         let prompt = format!(
             "{CHECK_IN} Here is what happened on the crew since you last looked (you oversee it at level {}):\n{}\n\n\
@@ -699,7 +742,7 @@ impl CrewHub {
             } else {
                 reported(&lines.join("\n"), "the crew's activity")
             },
-            Self::level_hint(self.level_now(service.agent_id.as_str(), &o).0),
+            Self::level_hint(self.level_now(service.agent_id.as_str(), &o).0, &o),
         );
         let reply = self
             .check_in(service, &owner, which, &prompt, 0, None)

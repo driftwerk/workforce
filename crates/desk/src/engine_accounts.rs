@@ -387,6 +387,27 @@ impl std::fmt::Debug for NewAccount {
     }
 }
 
+/// What the person asks for to sign an account in again: a pasted token,
+/// or none to sign in through the engine's own command; `remote` as for
+/// [`NewAccount`]. Its `Debug` leaves out the token.
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignInAgain {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub remote: bool,
+}
+
+impl std::fmt::Debug for SignInAgain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInAgain")
+            .field("token", &self.token.as_ref().map(|_| "…"))
+            .field("remote", &self.remote)
+            .finish()
+    }
+}
+
 /// A change to an account.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -651,6 +672,32 @@ pub struct Standing {
     pub hit_until: Option<DateTime<Utc>>,
     /// The length of the window it stopped on, in minutes, when said.
     pub hit_window: Option<u32>,
+    /// When a session was last started on the account. A reading taken
+    /// before it can't alone say the account is full now.
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// The longest window that is the plan's own: the weekly one. A longer one
+/// (monthly extra usage, credits) is pay-as-you-go, never the plan's.
+const PLAN_WINDOW_MAX: u32 = 10_080;
+
+/// An account at its plan's limit: when that ends, and which window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Full {
+    pub until: Option<DateTime<Utc>>,
+    /// The window's length in minutes, when known.
+    pub minutes: Option<u32>,
+}
+
+impl Full {
+    /// "its 5-hour limit", "its weekly limit", "its usage limit".
+    pub fn window_name(&self) -> &'static str {
+        match self.minutes {
+            Some(300) => "5-hour limit",
+            Some(10_080) => "weekly limit",
+            _ => "usage limit",
+        }
+    }
 }
 
 impl Standing {
@@ -665,7 +712,13 @@ impl Standing {
             self.read_at = other.read_at;
             self.windows = other.windows.clone();
         }
+        self.take_holds(other);
         self
+    }
+
+    /// The last start `other` knows, where later.
+    fn take_holds(&mut self, other: &Standing) {
+        self.started_at = self.started_at.max(other.started_at);
     }
 }
 
@@ -676,13 +729,53 @@ impl Standing {
     /// Whether the account is at its limit `now`, and when that ends (`None`
     /// inside: not said).
     pub fn full(&self, now: DateTime<Utc>) -> Option<Option<DateTime<Utc>>> {
+        self.full_by(now).map(|f| f.until)
+    }
+
+    /// The plan window the readings show at 100% and not yet reset,
+    /// whatever started since: what a stop on extra usage is checked against.
+    pub fn plan_window_full(&self, now: DateTime<Utc>) -> Option<Full> {
+        self.windows
+            .iter()
+            .filter(|w| {
+                w.minutes <= PLAN_WINDOW_MAX
+                    && w.used_percent >= 100.0
+                    && w.resets_at.is_some_and(|r| r > now)
+            })
+            .max_by_key(|w| w.resets_at)
+            .map(|w| Full {
+                until: w.resets_at,
+                minutes: Some(w.minutes),
+            })
+    }
+
+    /// [`Self::full`], with the window it is full on. Only the plan's own
+    /// windows (5-hour, weekly) count: a longer one is extra usage, and a
+    /// model's own weekly stop holds that model alone, which
+    /// Desk can't tell at a start (a session has no model of its own here),
+    /// so it fills nothing.
+    pub fn full_by(&self, now: DateTime<Utc>) -> Option<Full> {
+        // A reading taken before the last session started here can't say
+        // alone that the account is full now.
+        let fresh = match (self.read_at, self.started_at) {
+            (Some(read), Some(started)) => read >= started,
+            _ => true,
+        };
         let full_window = self
             .windows
             .iter()
-            .filter(|w| w.used_percent >= 100.0 && w.resets_at.is_none_or(|r| r > now))
+            .filter(|w| {
+                fresh
+                    && w.minutes <= PLAN_WINDOW_MAX
+                    && w.used_percent >= 100.0
+                    && w.resets_at.is_none_or(|r| r > now)
+            })
             .max_by_key(|w| w.resets_at);
         if let Some(w) = full_window {
-            return Some(w.resets_at);
+            return Some(Full {
+                until: w.resets_at,
+                minutes: Some(w.minutes),
+            });
         }
         // Claude Code said when: full until then, unless a reading of this
         // account since shows that window begun again with room.
@@ -693,20 +786,26 @@ impl Standing {
                         && w.used_percent < 100.0
                         && w.resets_at.is_some_and(|r| r > until)
                 });
-            return (until > now && !began_again).then_some(Some(until));
+            return (until > now && !began_again).then_some(Full {
+                until: Some(until),
+                minutes: self.hit_window,
+            });
         }
         let hit = self.hit_at.filter(|at| now - *at < HIT_FOR)?;
         // A reading after the stop that shows room: it has reset.
         if self.read_at.is_some_and(|r| r > hit) && !self.windows.is_empty() {
             return None;
         }
-        Some(
-            self.windows
+        Some(Full {
+            until: self
+                .windows
                 .iter()
+                .filter(|w| w.minutes <= PLAN_WINDOW_MAX)
                 .filter_map(|w| w.resets_at)
                 .filter(|r| *r > now)
                 .min(),
-        )
+            minutes: None,
+        })
     }
 }
 
@@ -736,7 +835,10 @@ impl Standing {
         let mut s = self.clone();
         s.read_at = shift(s.read_at);
         s.hit_at = shift(s.hit_at);
+        s.started_at = shift(s.started_at);
         let soon = now + chrono::Duration::minutes(2);
+        // A start in the future can only be a wrong clock: not kept.
+        s.started_at = s.started_at.filter(|t| *t <= soon);
         if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
             return None;
         }
@@ -759,6 +861,7 @@ impl Standing {
             self.read_at = other.read_at;
             self.windows = other.windows.clone();
         }
+        self.take_holds(other);
         *self != before
     }
 
@@ -1212,6 +1315,7 @@ mod tests {
             hit_at: hit_at.map(at),
             hit_until: None,
             hit_window: None,
+            ..Default::default()
         }
     }
 
@@ -1266,6 +1370,75 @@ mod tests {
         let after = standing(&[(10.0, Some(900))], 300, Some(150));
         assert_eq!(after.full(at(310)), None, "read with room since");
         assert_eq!(standing(&[(40.0, None)], 100, None).full(at(200)), None);
+    }
+
+    /// A Claude plan as Desk reads it: the 5-hour window at 34%, the weekly
+    /// well under, and (when `extra`) a monthly extra-usage window spent.
+    fn plan_with(extra: Option<(f64, i64)>) -> Standing {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let w = |used, reset, minutes| crate::usage::LimitWindow {
+            used_percent: used,
+            resets_at: Some(at(reset)),
+            minutes,
+        };
+        let mut windows = vec![w(34.0, 800, 300), w(41.0, 9_000, 10_080)];
+        windows.extend(extra.map(|(used, reset)| w(used, reset, 43_200)));
+        Standing {
+            windows,
+            read_at: Some(at(100)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_monthly_extra_usage_window_spent_never_fills_a_plan_with_room() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        // The session at 34%, the month's extra usage at 100% until 1 Dec.
+        let s = plan_with(Some((100.0, 40_000)));
+        assert_eq!(s.full(at(200)), None);
+        assert_eq!(s.full_by(at(200)), None);
+        // The 5-hour window itself at 100%: full, and it says which and when.
+        let mut five = plan_with(None);
+        five.windows[0].used_percent = 100.0;
+        let full = five.full_by(at(200)).unwrap();
+        assert_eq!((full.until, full.minutes), (Some(at(800)), Some(300)));
+        assert_eq!(full.window_name(), "5-hour limit");
+        let mut week = plan_with(None);
+        week.windows[1].used_percent = 100.0;
+        let full = week.full_by(at(200)).unwrap();
+        assert_eq!((full.until, full.minutes), (Some(at(9_000)), Some(10_080)));
+        assert_eq!(full.window_name(), "weekly limit");
+    }
+
+    #[test]
+    fn a_start_in_the_future_or_on_another_clock_is_shifted_or_dropped() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let mut s = plan_with(None);
+        s.started_at = Some(at(90));
+        let seen = s.as_seen(chrono::Duration::minutes(5), at(200)).unwrap();
+        assert_eq!(seen.started_at, Some(at(95)));
+        s.started_at = Some(at(500));
+        let seen = s.as_seen(chrono::Duration::zero(), at(200)).unwrap();
+        assert_eq!(seen.started_at, None, "later than now: a wrong clock");
+    }
+
+    #[test]
+    fn a_reading_older_than_the_last_start_does_not_fill_the_account_alone() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let mut s = plan_with(None);
+        s.windows[0].used_percent = 100.0;
+        assert!(s.full(at(200)).is_some());
+        // A session started since the reading: the reading alone isn't it.
+        s.started_at = Some(at(150));
+        assert_eq!(s.full(at(200)), None);
+        // A later reading that says full again is.
+        s.read_at = Some(at(160));
+        assert!(s.full(at(200)).is_some());
+        // And a stop Claude Code said holds regardless.
+        s.read_at = Some(at(100));
+        s.hit_at = Some(at(170));
+        s.hit_until = Some(at(800));
+        assert_eq!(s.full(at(200)), Some(Some(at(800))));
     }
 
     #[test]

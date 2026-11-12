@@ -5898,7 +5898,7 @@ pub struct LlmSpeechConfig {
     /// "soniox".
     pub provider: String,
     /// Provider model. Defaults per provider: openai `gpt-4o-mini-tts`,
-    /// elevenlabs `eleven_multilingual_v2`, fish_audio `s1`, soniox
+    /// elevenlabs `eleven_multilingual_v2`, fish_audio `s2.1-pro-free`, soniox
     /// `tts-rt-v1`. Unused by `builtin` (the voice id names the model file).
     #[serde(default)]
     pub model: Option<String>,

@@ -2180,6 +2180,16 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     if let Some(line) = works_in_line(&service.workspace) {
         meta_lines.push(line);
     }
+    // An overseer asked in its Desk DM acts within its switches from the
+    // first request, not after a suggestion comes back.
+    #[cfg(feature = "postgres")]
+    if let Some(hint) = session_id
+        .and_then(|sid| service.sessions.get(sid).ok().flatten())
+        .filter(|s| s.channel == workforce_common::channels::DESK_CHANNEL)
+        .and_then(|_| crate::desk_crew::dm_oversight_hint(service))
+    {
+        meta_lines.push(format!("- Oversight: {hint}"));
+    }
 
     turn_context.push_str("\n\n");
     turn_context.push_str(&meta_lines.join("\n"));

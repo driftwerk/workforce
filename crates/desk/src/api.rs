@@ -340,6 +340,13 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.engines()).into_response()
 }
 
+/// Every engine read again now, as after Desk installed one or signed one
+/// in, rather than at the hourly read.
+async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.engines_read_now().await).into_response()
+}
+
 #[derive(Deserialize)]
 struct EngineBody {
     engine: crate::engine::Engine,
@@ -392,6 +399,27 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "ownPlanKey": s.desk.own_plan_key(),
     }))
     .into_response()
+}
+
+/// Signs an account in again: with a pasted token, kept for it once Claude
+/// Code signs in by it (201); without one, its sign-in begins (202).
+async fn sign_in_again(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(again): Json<crate::engine_accounts::SignInAgain>,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.sign_in_again(id, again).await {
+        Ok(added @ crate::service::Added::Account { .. }) => {
+            (StatusCode::CREATED, Json(added)).into_response()
+        }
+        Ok(added @ crate::service::Added::SignIn { .. }) => {
+            (StatusCode::ACCEPTED, Json(added)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Adds an account: with a pasted token, kept once Claude Code signs in by
@@ -1793,6 +1821,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/engines/read", post(engines_read))
         .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
         .route(
             "/api/desk/engines/sign-ins/{id}",
@@ -1804,6 +1833,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_account).delete(remove_account),
         )
         .route("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
+        .route("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
         .route(
             "/api/desk/accounts/sign-ins/{id}/direct",
@@ -2546,6 +2576,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_engines_and_signing_accounts_in_again_are_the_admins_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let (status, _) = call(&denied, "POST", "/api/desk/engines/read", None).await;
+            assert!(status == 401 || status == 403, "{status}");
+            let path = format!("/api/desk/accounts/{}/sign-in", uuid::Uuid::new_v4());
+            let (status, body) = call(
+                &denied,
+                "POST",
+                &path,
+                Some(json!({ "token": "sk-ant-oat01-anything-0123456789012345678901234567" })),
+            )
+            .await;
+            assert!(status == 401 || status == 403, "{status}");
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            assert!(desk.accounts().is_empty(), "nothing added");
+
+            // An id that isn't one is refused before anything else.
+            let app = super::sessions_router(desk.clone(), allow_all());
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/accounts/not-an-id/sign-in",
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, 400);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engines_asked_to_be_read_without_end_are_read_a_few_times_a_minute() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let app = super::sessions_router(desk.clone(), allow_all());
+            for _ in 0..crate::service::ENGINES_READS_A_MINUTE + 8 {
+                let (status, engines) = call(&app, "POST", "/api/desk/engines/read", None).await;
+                assert_eq!(status, 200, "still answered: {engines}");
+                assert!(engines.as_array().is_some_and(|e| !e.is_empty()));
+            }
+            assert_eq!(
+                desk.engines_reads_this_minute(),
+                crate::service::ENGINES_READS_A_MINUTE,
+                "only so many read"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn every_engine_is_listed_and_one_desk_cant_start_is_refused_in_plain_words() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
@@ -2567,6 +2651,14 @@ mod tests {
             assert_eq!(engines[0]["caps"]["terminal"]["state"], "hooks");
             assert_eq!(engines[2]["views"], json!([]));
             assert_eq!(engines[7]["program"], Value::Null);
+            // Read again now, as after Desk installs or signs one in: the
+            // same list, as each engine reads now.
+            let (status, again) = call(&app, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                again.as_array().map(Vec::len),
+                engines.as_array().map(Vec::len)
+            );
             let cwd = dir.path().to_string_lossy().into_owned();
             let (status, refused) = call(
                 &app,
