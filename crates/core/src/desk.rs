@@ -595,6 +595,10 @@ pub struct DeskMark {
     /// "(edited)".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
+    /// The agent's reply answers a message the person has since deleted:
+    /// the reply stays, and Desk says what it answered is gone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answered_deleted: bool,
 }
 
 /// How far a person has read a place: through `at`, the item seen last

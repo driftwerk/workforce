@@ -54,13 +54,13 @@ use crate::postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
 use crate::session::{
-    compute_stats, context_usage_for, coordination_score, format_excerpt_rows,
+    compute_stats, context_usage_for, coordination_score, delete_live_message, format_excerpt_rows,
     message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
-    redact_message_secrets, redact_messages_in_place, search_terms, tool_calls_for, ArchivePage,
-    InterruptedTurn, JournalEntry, MessageRole, Reassigned, RedactionStats, Session,
-    SessionAttachment, SessionContextType, SessionContextUsage, SessionExport, SessionKind,
-    SessionMessage, SessionSearchResult, SessionStats, SessionStore, SetAside, SetAsideRows,
-    SetAsideStale, ToolCallRecord, TranscriptEntry, TurnPrincipal,
+    redact_message_secrets, redact_messages_in_place, replies_to, search_terms, tool_calls_for,
+    ArchivePage, DeletedMessage, InterruptedTurn, JournalEntry, MessageRole, Reassigned,
+    RedactionStats, Session, SessionAttachment, SessionContextType, SessionContextUsage,
+    SessionExport, SessionKind, SessionMessage, SessionSearchResult, SessionStats, SessionStore,
+    SetAside, SetAsideRows, SetAsideStale, ToolCallRecord, TranscriptEntry, TurnPrincipal,
 };
 
 mod embedded {
@@ -1778,6 +1778,102 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    /// One transaction: the live row locked first, so a turn's save can't
+    /// slip between the archive's change and the live context's.
+    fn delete_person_message(&self, session_id: &str, message_id: &str) -> Result<DeletedMessage> {
+        /// The most later archive rows read for the message's replies.
+        const REPLIES_SCANNED: i64 = 500;
+        let id = parse_uuid(session_id)?;
+        let message_id = message_id.to_string();
+        let session_id_owned = session_id.to_string();
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let tx = conn.transaction().await?;
+            self.bind_tenant(&tx).await?;
+            let Some(cur) = tx
+                .query_opt(
+                    "SELECT messages, total_tokens FROM sessions
+                     WHERE id = $1 AND agent_id = $2 AND tenant_id = $3
+                     FOR UPDATE",
+                    &[&id, &self.agent_id, &self.tenant_id()],
+                )
+                .await?
+            else {
+                eyre::bail!("Session not found: {session_id_owned}");
+            };
+            let mut session = Session {
+                messages: serde_json::from_value(cur.get(0))
+                    .context("decode messages for a person's delete")?,
+                total_tokens: cur.get::<_, i64>(1).max(0) as u64,
+                ..Session::new("", "", "")
+            };
+            let asked = tx
+                .query_opt(
+                    "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk, external_id
+                     FROM session_archive
+                     WHERE session_id = $1 AND tenant_id = $2 AND message_id = $3
+                     ORDER BY seq ASC LIMIT 1",
+                    &[&id, &self.tenant_id(), &message_id],
+                )
+                .await?;
+            // A session from before archive seeding reads its live messages
+            // (as `read_archive_page` does), so those alone change.
+            let mut archived = None;
+            if let Some(asked) = asked {
+                let seq: i64 = asked.get(0);
+                let later: Vec<SessionMessage> = tx
+                    .query(
+                        "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk,
+                                external_id
+                         FROM session_archive
+                         WHERE session_id = $1 AND tenant_id = $2 AND seq > $3
+                         ORDER BY seq ASC LIMIT $4",
+                        &[&id, &self.tenant_id(), &seq, &REPLIES_SCANNED],
+                    )
+                    .await?
+                    .iter()
+                    .map(archive_row_to_message)
+                    .collect();
+                let replies = replies_to(&archive_row_to_message(&asked), &later);
+                tx.execute(
+                    "DELETE FROM session_archive
+                     WHERE session_id = $1 AND tenant_id = $2 AND message_id = $3",
+                    &[&id, &self.tenant_id(), &message_id],
+                )
+                .await?;
+                if !replies.is_empty() {
+                    tx.execute(
+                        "UPDATE session_archive
+                         SET desk = jsonb_set(COALESCE(desk, '{}'::jsonb),
+                                              '{answered_deleted}', 'true'::jsonb)
+                         WHERE session_id = $1 AND tenant_id = $2 AND message_id = ANY($3)",
+                        &[&id, &self.tenant_id(), &replies],
+                    )
+                    .await?;
+                }
+                archived = Some(replies);
+            }
+            let was_archived = archived.is_some();
+            let mut deleted = delete_live_message(&mut session, &message_id, archived);
+            deleted.archived = was_archived;
+            if deleted.live || !deleted.replies.is_empty() {
+                let count = session.messages.len() as i32;
+                let total = session.total_tokens as i64;
+                let json = serde_json::to_value(&session.messages)
+                    .context("encode messages after a person's delete")?;
+                tx.execute(
+                    "UPDATE sessions SET messages = $1, message_count = $2, total_tokens = $3,
+                         updated_at = $4, revision = revision + 1
+                     WHERE id = $5 AND tenant_id = $6",
+                    &[&json, &count, &total, &Utc::now(), &id, &self.tenant_id()],
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(deleted)
+        })
+    }
+
     fn truncate_from_message(&self, session_id: &str, message_id: &str) -> Result<()> {
         let id = parse_uuid(session_id)?;
         let message_id = message_id.to_string();
@@ -2558,7 +2654,16 @@ fn archive_values(
 }
 
 fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> TranscriptEntry {
-    let msg = SessionMessage {
+    TranscriptEntry {
+        seq: Some(r.get(0)),
+        ..message_to_transcript_entry(session_id, &archive_row_to_message(r))
+    }
+}
+
+/// An archive row (`seq, message_id, role, content, tool_data, ts, tokens,
+/// desk, external_id`) as the message it keeps.
+fn archive_row_to_message(r: &tokio_postgres::Row) -> SessionMessage {
+    SessionMessage {
         id: r.get(1),
         role: role_from_str(r.get::<_, &str>(2)),
         content: r.get(3),
@@ -2572,10 +2677,6 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
         desk: r
             .get::<_, Option<serde_json::Value>>(7)
             .and_then(|mark| serde_json::from_value(mark).ok()),
-    };
-    TranscriptEntry {
-        seq: Some(r.get(0)),
-        ..message_to_transcript_entry(session_id, &msg)
     }
 }
 
@@ -2655,6 +2756,14 @@ pub(crate) mod tests {
     async fn reassigning_owners_keeps_both_on_a_shared_channel_in_one_transaction() {
         with_store(|store| async move {
             crate::session::assert_reassign_owner_contract(store.as_ref());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_person_s_message_takes_its_archive_row_in_one_transaction() {
+        with_store(|store| async move {
+            crate::session::assert_delete_person_message_contract(store.as_ref(), true);
         })
         .await;
     }

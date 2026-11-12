@@ -146,6 +146,16 @@ fn said(
     })
 }
 
+/// What `entry` of `store` shows in the conversation, if it is one of its
+/// messages ([`said`]), a person's files their message holds included.
+pub(crate) fn shown_as(
+    store: &dyn SessionStore,
+    entry: &TranscriptEntry,
+    agent: &Speaker,
+) -> Option<Said> {
+    said(entry, agent, Some(&mut HeldFiles::of(store)))
+}
+
 /// The time a page of a conversation covers, which the files that are
 /// messages of their own are placed in: from its first message when older
 /// ones remain before it, else from the start; up to the message after its
@@ -557,6 +567,60 @@ impl Conversations for HubConversations {
             .map_err(unkept)?
             .map(|p| ConversationRead::of(&p))
             .ok_or_else(|| ConversationError::Internal("the read point was not kept".into()))
+    }
+
+    async fn message_memories(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+    ) -> Result<Vec<workforce_desk::SavedMemory>, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        let saved = crate::desk_delete::memories_of(&service, &owner, &found).await?;
+        Ok(crate::desk_delete::listed(&saved))
+    }
+
+    async fn delete_message(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+        delete: workforce_desk::Delete,
+    ) -> Result<workforce_desk::Deleted, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        crate::desk_delete::delete(
+            &service,
+            service.memory_store.as_deref(),
+            &speaker,
+            &owner,
+            &found,
+            delete,
+        )
+        .await
     }
 }
 
