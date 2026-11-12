@@ -1087,6 +1087,10 @@ async fn check_link(
         }),
         None => match sync::identify(&*remote, body.system).await {
             Ok(sync::Who::Person(me)) => Some(me),
+            Ok(sync::Who::ByEmail(me)) => {
+                out["meBy"] = json!("email");
+                Some(me)
+            }
             Ok(other) => {
                 out["meWhy"] = json!(other.why_not(&hub, body.system));
                 None
@@ -1272,6 +1276,11 @@ async fn link_board(
                 link.me = Some(me.id);
                 link.me_name = Some(me.name);
                 link.me_source = Some(workforce_desk::board::MeSource::Vouched);
+            }
+            Ok(sync::Who::ByEmail(me)) => {
+                link.me = Some(me.id);
+                link.me_name = Some(me.name);
+                link.me_source = Some(workforce_desk::board::MeSource::VouchedByEmail);
             }
             Ok(other) => link.me_note = other.why_not(&hub, link.system),
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),

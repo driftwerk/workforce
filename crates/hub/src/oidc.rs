@@ -41,6 +41,35 @@ use workforce_identity::types::{Identity, IdentityRole, IdentityStatus, Provisio
 /// Key under which the OIDC `sub` is stored in `Identity::linked_ids`.
 pub const OIDC_LINKED_ID_KEY: &str = "oidc";
 
+/// Where an identity keeps the email its OIDC provider last verified for it
+/// (`linked_ids`): set only here, on a sign-in whose email the provider
+/// says is verified, never from what anyone typed. What a board's sync may
+/// match a shared Jira or Linear key's users by ([`verified_email`]).
+pub const OIDC_VERIFIED_EMAIL_KEY: &str = "oidc_email";
+
+/// The email `identity`'s OIDC provider verified, lowercased; none for one
+/// that never signed in through OIDC, whatever its `email` says.
+pub fn verified_email(identity: &Identity) -> Option<String> {
+    identity
+        .linked_ids
+        .get(OIDC_VERIFIED_EMAIL_KEY)
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| e.contains('@'))
+}
+
+/// Keeps `email` (verified by the provider) as `identity`'s verified email;
+/// whether it changed.
+fn keep_verified_email(identity: &mut Identity, email: &str) -> bool {
+    let email = email.trim().to_ascii_lowercase();
+    let changed = identity.linked_ids.get(OIDC_VERIFIED_EMAIL_KEY) != Some(&email);
+    if changed {
+        identity
+            .linked_ids
+            .insert(OIDC_VERIFIED_EMAIL_KEY.to_string(), email);
+    }
+    changed
+}
+
 /// Maximum age of an unclaimed CSRF/PKCE state entry before it is pruned.
 const STATE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -341,21 +370,27 @@ pub fn resolve_identity(
         return Err(eyre!("email domain not allowed by OIDC config"));
     }
 
-    if let Some(identity) = store.get_by_linked_id(OIDC_LINKED_ID_KEY, &claims.sub)? {
+    if let Some(mut identity) = store.get_by_linked_id(OIDC_LINKED_ID_KEY, &claims.sub)? {
         ensure_active(&identity)?;
+        if keep_verified_email(&mut identity, &claims.email) {
+            identity.updated_at = chrono::Utc::now();
+            store.update(&identity)?;
+        }
         return Ok(IdentityResolution::Found(identity));
     }
 
     if let Some(mut identity) = store.get_by_email(&claims.email)? {
         ensure_active(&identity)?;
-        if identity
+        let relinked = identity
             .linked_ids
             .get(OIDC_LINKED_ID_KEY)
-            .is_none_or(|existing| existing != &claims.sub)
-        {
+            .is_none_or(|existing| existing != &claims.sub);
+        if relinked {
             identity
                 .linked_ids
                 .insert(OIDC_LINKED_ID_KEY.to_string(), claims.sub.clone());
+        }
+        if keep_verified_email(&mut identity, &claims.email) || relinked {
             identity.updated_at = chrono::Utc::now();
             store.update(&identity)?;
         }
@@ -378,6 +413,7 @@ pub fn resolve_identity(
     identity
         .linked_ids
         .insert(OIDC_LINKED_ID_KEY.to_string(), claims.sub.clone());
+    keep_verified_email(&mut identity, &claims.email);
 
     store.create(&identity)?;
     Ok(IdentityResolution::Created(identity))
@@ -491,6 +527,39 @@ mod tests {
         assert!(is_email_allowed(&cfg, "a@harbor.example"));
         assert!(is_email_allowed(&cfg, "b@driftwerk.com"));
         assert!(!is_email_allowed(&cfg, "c@example.com"));
+    }
+
+    /// The email kept as verified is only ever the one the provider said is
+    /// verified, at sign-in: an identity's own (typed) email never is, and
+    /// a later sign-in with a new verified email replaces it.
+    #[test]
+    fn only_a_provider_verified_email_is_kept_as_verified() {
+        let store = SqliteIdentityStore::in_memory().unwrap();
+        let cfg = test_config(vec![], true);
+        let mut typed = Identity::new("Typed", IdentityRole::Member);
+        typed.email = Some("typed@example.com".to_string());
+        store.create(&typed).unwrap();
+        assert_eq!(verified_email(&typed), None);
+        // Signing in links it, and keeps the provider's verified email.
+        let found =
+            match resolve_identity(&cfg, &store, &claims("typed@example.com", true)).unwrap() {
+                IdentityResolution::Found(i) => i,
+                IdentityResolution::Created(_) => panic!("expected Found"),
+            };
+        assert_eq!(verified_email(&found).as_deref(), Some("typed@example.com"));
+        let stored = store.get_by_id(typed.id).unwrap().unwrap();
+        assert_eq!(
+            verified_email(&stored).as_deref(),
+            Some("typed@example.com")
+        );
+        // An unverified sign-in is refused, and changes nothing.
+        assert!(resolve_identity(&cfg, &store, &claims("typed@example.com", false)).is_err());
+        // A new user's is kept as they're made.
+        let made = match resolve_identity(&cfg, &store, &claims("new@example.com", true)).unwrap() {
+            IdentityResolution::Created(i) => i,
+            IdentityResolution::Found(_) => panic!("expected Created"),
+        };
+        assert_eq!(verified_email(&made).as_deref(), Some("new@example.com"));
     }
 
     #[test]

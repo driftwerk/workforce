@@ -645,6 +645,10 @@ struct FakeLinear {
     viewer: Mutex<Option<Value>>,
     /// Someone who takes an issue just before an assign lands.
     racer: Mutex<Option<String>>,
+    /// What the hub's `identity.whoami` says of the person's verified email.
+    verified_email: Mutex<Option<String>>,
+    /// The workspace's members: (id, name, email).
+    members: Mutex<Vec<(String, String, String)>>,
 }
 
 impl FakeLinear {
@@ -710,6 +714,25 @@ impl Remote for FakeLinear {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| RemoteError::Missing(tool.into())),
+            "identity.whoami" => Ok(json!({
+                "identity_id": "p1",
+                "verified_email": *self.verified_email.lock().unwrap(),
+            })),
+            "linear.members_list" => {
+                let want = args["email"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let members: Vec<Value> = self
+                    .members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, e)| e.eq_ignore_ascii_case(&want))
+                    .map(|(id, name, email)| json!({ "id": id, "name": name, "email": email, "active": true }))
+                    .collect();
+                Ok(json!({ "count": members.len(), "members": members }))
+            }
             "linear.issue_list" => {
                 let open = args["open_only"].as_bool() == Some(true);
                 let since = args["updated_since"].as_str().map(str::to_string);
@@ -1276,6 +1299,102 @@ async fn take_it_leaves_a_not_me_link_as_it_was() {
         let s = d.board_sync(b.id).await.unwrap().unwrap().1;
         assert_eq!((s.me, s.me_source, s.me_note.as_deref()), (None, None, Some(note)));
         assert!(linear.calls_of("linear.viewer").is_empty());
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+    })
+    .await;
+}
+
+// ── A shared key, and the person's verified email ────────────────────────
+
+/// A hub whose Linear key is shared names the person by the one member with
+/// the email their sign-in provider verified: Take it assigns that member,
+/// with the shared key. No member, several, or no verified email: no one.
+#[tokio::test]
+async fn a_shared_key_names_the_one_member_with_the_verified_email() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        *linear.verified_email.lock().unwrap() = Some("sam@example.com".into());
+        linear.members.lock().unwrap().extend([
+            (
+                ME.to_string(),
+                "Sam".to_string(),
+                "Sam@Example.com".to_string(),
+            ),
+            (
+                ANA.to_string(),
+                "Ana".to_string(),
+                "ana@example.com".to_string(),
+            ),
+        ]);
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            (s.me.as_deref(), s.me_source, s.me_note),
+            (Some(ME), Some(crate::board::MeSource::VouchedByEmail), None)
+        );
+        // Asked by the exact email, never a page of everyone.
+        assert_eq!(
+            linear.calls_of("linear.members_list"),
+            vec![json!({ "email": "sam@example.com", "limit": 10 })]
+        );
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        d.take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+            .await
+            .unwrap();
+        assert_eq!(
+            linear.calls_of("linear.issue_update"),
+            vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_member_several_or_an_unverified_email_names_no_one() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        let shared = "Atlas uses a shared Linear key, so it can't say who you are.";
+        // No verified email: nothing is looked up.
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_note.as_deref()), (None, Some(shared)));
+        assert!(linear.calls_of("linear.members_list").is_empty());
+        // A verified email no member has.
+        *linear.verified_email.lock().unwrap() = Some("sam@example.com".into());
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_note.as_deref()), (None, Some(shared)));
+        // Two members with it: neither.
+        linear.members.lock().unwrap().extend([
+            (
+                ME.to_string(),
+                "Sam".to_string(),
+                "sam@example.com".to_string(),
+            ),
+            (
+                ANA.to_string(),
+                "Sam A".to_string(),
+                "SAM@example.com".to_string(),
+            ),
+        ]);
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_note.as_deref()), (None, Some(shared)));
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+                .await,
+            "Use Check who you are on the board",
+        );
         assert!(linear.calls_of("linear.issue_update").is_empty());
     })
     .await;

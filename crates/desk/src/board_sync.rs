@@ -33,11 +33,23 @@ pub fn identity_tool(system: System) -> &'static str {
     }
 }
 
-/// Every tool `system`'s sync may call: the ones it needs and the one that
-/// says who the person is.
+/// The tool that finds `system`'s users by email, for a shared key.
+pub fn users_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "jira.search_users",
+        System::Linear => "linear.members_list",
+    }
+}
+
+/// The hub's own tool that says the email its sign-in provider verified for
+/// the person.
+pub const WHOAMI: &str = "identity.whoami";
+
+/// Every tool `system`'s sync may call: the ones it needs, and the ones
+/// that say who the person is there.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
-    all.push(identity_tool(system));
+    all.extend([identity_tool(system), users_tool(system), WHOAMI]);
     all
 }
 
@@ -438,6 +450,9 @@ pub fn linear_pages(answer: &Value) -> bool {
 pub enum Who {
     /// Their own key answered: this is them.
     Person(Assignee),
+    /// The key is shared, and exactly one user there has the email the
+    /// person's sign-in provider verified: this is them.
+    ByEmail(Assignee),
     /// The key is shared (an agent's, the hub's): it says who owns the key,
     /// never who the person is.
     Shared,
@@ -451,7 +466,7 @@ impl Who {
     pub fn why_not(&self, hub: &str, system: System) -> Option<String> {
         let title = system.title();
         match self {
-            Self::Person(_) => None,
+            Self::Person(_) | Self::ByEmail(_) => None,
             Self::Shared => Some(format!(
                 "{hub} uses a shared {title} key, so it can't say who you are."
             )),
@@ -463,15 +478,107 @@ impl Who {
     }
 }
 
-/// Who the person is on `system`, as the hub's identity tool says. Only an
-/// offline hub or a refused token is an error.
+impl Who {
+    /// The person, when it says who they are.
+    pub fn person(&self) -> Option<&Assignee> {
+        match self {
+            Self::Person(a) | Self::ByEmail(a) => Some(a),
+            Self::Shared | Self::Unsaid => None,
+        }
+    }
+}
+
+/// Whether `e` stops the asking: the hub is away, or the token refused.
+fn stops(e: &RemoteError) -> bool {
+    matches!(
+        e,
+        RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }
+    )
+}
+
+/// Who the person is on `system`, as the hub's identity tool says: their own
+/// key's user; else, where the key is shared, the one user there with the
+/// email the person's sign-in provider verified. Only an offline hub or a
+/// refused token is an error.
 pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
-    match call(remote, system, identity_tool(system), json!({})).await {
-        Ok(answer) => Ok(identity_of(system, &answer)),
-        Err(
-            e @ (RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }),
-        ) => Err(e),
-        Err(_) => Ok(Who::Unsaid),
+    let who = match call(remote, system, identity_tool(system), json!({})).await {
+        Ok(answer) => identity_of(system, &answer),
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => Who::Unsaid,
+    };
+    match who {
+        Who::Shared => by_email(remote, system).await,
+        who => Ok(who),
+    }
+}
+
+/// The one user on `system` with the email the hub's sign-in provider
+/// verified for the person: `Shared` when there's no such email (never one
+/// they typed), no user with it, or more than one.
+async fn by_email(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
+    let email = match call(remote, system, WHOAMI, json!({})).await {
+        Ok(me) => me["verified_email"]
+            .as_str()
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| e.contains('@') && !e.chars().any(char::is_whitespace)),
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => None,
+    };
+    let Some(email) = email else {
+        return Ok(Who::Shared);
+    };
+    let args = match system {
+        System::Jira => json!({ "query": email, "max_results": 10 }),
+        System::Linear => json!({ "email": email, "limit": 10 }),
+    };
+    let answer = match call(remote, system, users_tool(system), args).await {
+        Ok(a) => a,
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => return Ok(Who::Shared),
+    };
+    Ok(match one_with_email(system, &answer, &email) {
+        Some(a) => Who::ByEmail(a),
+        None => Who::Shared,
+    })
+}
+
+/// The one active user in a users answer whose email is exactly `email`;
+/// none for none, or for more than one.
+pub fn one_with_email(system: System, answer: &Value, email: &str) -> Option<Assignee> {
+    let (list, id, name) = match system {
+        System::Jira => ("users", "account_id", "display_name"),
+        System::Linear => ("members", "id", "name"),
+    };
+    let found: Vec<Assignee> = answer[list]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|u| u["active"].as_bool() != Some(false))
+        .filter(|u| {
+            u["email"]
+                .as_str()
+                .is_some_and(|e| e.trim().eq_ignore_ascii_case(email))
+        })
+        .filter_map(|u| {
+            let id = u[id].as_str()?.trim().to_string();
+            check_me(system, &id).ok()?;
+            let shown = match system {
+                System::Linear => u["displayName"]
+                    .as_str()
+                    .filter(|n| !n.trim().is_empty())
+                    .map(|_| &u["displayName"])
+                    .unwrap_or(&u[name]),
+                System::Jira => &u[name],
+            };
+            Some(Assignee {
+                name: name_of(shown).unwrap_or_else(|| "You".into()),
+                id,
+            })
+        })
+        .collect();
+    match found.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
     }
 }
 

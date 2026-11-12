@@ -39,7 +39,8 @@ impl Tool for WhoAmIIdentityTool {
         "Report who you are talking to and what they are allowed to do: returns \
          identity_id, display_name, role (member / system_admin), and a \
          per-capability decision view (allow / ask / deny) from the live \
-         authorization matrix. Use it to answer 'what can I do' or to check \
+         authorization matrix, and the email their sign-in provider verified \
+         (verified_email; null when none). Use it to answer 'what can I do' or to check \
          whether the current user may perform an admin action before you try."
     }
 
@@ -116,6 +117,8 @@ impl Tool for WhoAmIIdentityTool {
                 "display_name": identity.display_name,
                 "role": identity.effective_role_key(),
                 "capabilities": capabilities.capabilities,
+                // Only what an OIDC provider verified: never a typed email.
+                "verified_email": crate::oidc::verified_email(&identity),
             }),
             elapsed(),
         ))
