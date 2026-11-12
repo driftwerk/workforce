@@ -78,6 +78,7 @@ fn ask(id: i64, decisions: Option<Value>) -> Value {
 
 fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
     NewSession {
+        fresh_worktree: false,
         engine: Engine::Codex,
         view: None,
         name: "cleanup".into(),

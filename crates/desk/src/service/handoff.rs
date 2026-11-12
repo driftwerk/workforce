@@ -858,6 +858,7 @@ impl Desk {
             })
             .await?;
         let new = NewSession {
+            fresh_worktree: false,
             engine: c.target,
             view: None,
             name: r.name.clone(),

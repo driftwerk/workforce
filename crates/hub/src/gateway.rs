@@ -5543,6 +5543,8 @@ async fn get_me(
         "device_id": caller.device_id,
         "linked_ios_device": linked_ios_device(&identity, caller.device_id.as_deref()),
         "picture": picture_info(&state, &crate::pictures::Owner::identity(identity.id.to_string())).await,
+        // What a device calls this workspace (Desk names it so).
+        "workspace": workspace_name(&state, &headers),
     })))
 }
 
@@ -8404,12 +8406,132 @@ async fn pair_device_request_unauthenticated(
             "device_name": pairing_req.device_name,
             "approve_url": pair_approve_url(&state, &headers, &pairing_req.code),
             "expires_at": pairing_req.expires_at.to_rfc3339(),
+            // What the device calls this workspace: only what the hub
+            // says of itself, before anyone signed in.
+            "name": published_name(&state),
         }))),
         Err(e) => {
             tracing::warn!("Device pairing initiation failed: {e}");
             Err(StatusCode::BAD_REQUEST)
         }
     }
+}
+
+/// The longest name a workspace gives itself; longer is cut.
+pub(crate) const WORKSPACE_NAME_MAX: usize = 60;
+
+/// Second-level labels that, under a two-letter country code, are part of
+/// the public suffix (`acme.co.uk`, `globex.com.au`): never a name.
+const SECOND_LEVEL: [&str; 12] = [
+    "co", "com", "net", "org", "gov", "ac", "edu", "ltd", "plc", "ne", "or", "gen",
+];
+
+/// `name` trimmed and cut to [`WORKSPACE_NAME_MAX`] characters; none when
+/// it's empty.
+fn capped(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| {
+        name.chars()
+            .take(WORKSPACE_NAME_MAX)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    })
+}
+
+/// The first part of the address `host` (a host name, with or without its
+/// port) that says whose workspace it is, as a name: `workforce.driftwerk.xyz`
+/// → "Driftwerk", `hub.acme.co.uk` → "Acme". The words a hub's address often
+/// starts with (`workforce`, `hub`, `www`…) and the public suffix (`xyz`,
+/// `co.uk`) are passed over; an address that's only those, an IP or
+/// `localhost` is itself. None for an empty host.
+pub(crate) fn name_of_host(host: &str) -> Option<String> {
+    const GENERIC: [&str; 9] = [
+        "www",
+        "workforce",
+        "hub",
+        "app",
+        "desk",
+        "api",
+        "gateway",
+        "agents",
+        "ai",
+    ];
+    let host = host.trim().trim_end_matches('.');
+    // An IPv6 address keeps its brackets and loses its port; anything else
+    // loses its port.
+    let bare = if host.starts_with('[') {
+        host.find(']').map_or(host, |end| &host[..=end])
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    if bare.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = bare.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() < 2 || labels.iter().all(|l| l.chars().all(|c| c.is_ascii_digit())) {
+        return capped(bare);
+    }
+    let lower = |l: &str| l.to_ascii_lowercase();
+    // The public suffix: the top-level label, and the one before it when
+    // it's a country's second level (`co.uk`).
+    let n = labels.len();
+    let suffix = if n >= 3
+        && labels[n - 1].len() == 2
+        && SECOND_LEVEL.contains(&lower(labels[n - 2]).as_str())
+    {
+        2
+    } else {
+        1
+    };
+    let named = labels[..n - suffix]
+        .iter()
+        .find(|l| !GENERIC.contains(&lower(l).as_str()));
+    match named {
+        Some(label) => {
+            let mut chars = label.chars();
+            let word: String = chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default();
+            capped(&word)
+        }
+        None => capped(bare),
+    }
+}
+
+/// `[hub].name`, when the operator set one.
+fn configured_name(state: &GatewayState) -> Option<String> {
+    let hub = state
+        .registry
+        .host()
+        .map(|service| service.config.hub.clone())?;
+    hub.name.as_deref().and_then(capped)
+}
+
+/// What this workspace calls itself to anyone, signed in or not:
+/// `[hub].name`, else the name its public URL says ([`name_of_host`]).
+/// Never the Host a request came in on, which the asker chose.
+fn published_name(state: &GatewayState) -> Option<String> {
+    configured_name(state).or_else(|| {
+        let hub = state
+            .registry
+            .host()
+            .map(|service| service.config.hub.clone())?;
+        let url = url::Url::parse(hub.public_url.as_deref()?).ok()?;
+        name_of_host(url.host_str()?)
+    })
+}
+
+/// What this workspace is called to a signed-in device: as
+/// [`published_name`], else the name of the host the request reached it at.
+fn workspace_name(state: &GatewayState, headers: &axum::http::HeaderMap) -> Option<String> {
+    published_name(state).or_else(|| {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())?;
+        name_of_host(host)
+    })
 }
 
 /// Where the device's person approves `code`: the hub's `/pair` page.
@@ -17532,5 +17654,43 @@ mod desk_link_vault_tests {
         let said = listed.0.to_string();
         assert!(said.contains("skills/jira/site"), "{said}");
         assert!(!said.contains("desk/hubs"), "{said}");
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_tests {
+    use super::{name_of_host, WORKSPACE_NAME_MAX};
+
+    /// The same table Desk names an older hub's workspace by
+    /// (`src/hubs/pairing.ts`'s `nameOfHost`): the two say the same.
+    #[test]
+    fn a_workspace_is_named_by_the_part_of_its_address_that_says_whose_it_is() {
+        for (host, name) in [
+            ("workforce.driftwerk.xyz", "Driftwerk"),
+            ("hub.acme.io", "Acme"),
+            ("acme.example.com", "Acme"),
+            ("www.globex.co", "Globex"),
+            ("workforce.driftwerk.xyz:8443", "Driftwerk"),
+            ("agents.hub.initech.com", "Initech"),
+            ("hub.acme.co.uk", "Acme"),
+            ("globex.com.au", "Globex"),
+            ("workforce.co.uk", "workforce.co.uk"),
+            ("localhost", "localhost"),
+            ("localhost:4000", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.0.1.20:8080", "10.0.1.20"),
+            ("[::1]:8080", "[::1]"),
+            ("[fe80::1]", "[fe80::1]"),
+            ("workforce.app", "workforce.app"),
+        ] {
+            assert_eq!(name_of_host(host).as_deref(), Some(name), "{host}");
+        }
+        assert_eq!(name_of_host(""), None);
+        assert_eq!(name_of_host("  "), None);
+        let long = format!("hub.{}.com", "a".repeat(80));
+        assert_eq!(
+            name_of_host(&long).map(|n| n.chars().count()),
+            Some(WORKSPACE_NAME_MAX)
+        );
     }
 }

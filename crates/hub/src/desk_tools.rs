@@ -241,6 +241,7 @@ impl DeskTool {
                 out(d
                     .create(
                         NewSession {
+                            fresh_worktree: false,
                             engine,
                             view: None,
                             name: i.name,

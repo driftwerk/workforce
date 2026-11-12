@@ -35,7 +35,7 @@ fn failed(e: eyre::Report) -> Response {
     tracing::error!(error = %e, "desk crew request failed");
     error(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "the hub could not read the crew",
+        "Desk could not read the crew",
     )
 }
 
@@ -160,6 +160,13 @@ async fn answer(
         }
         Err(e) => return failed(e),
     };
+    // An overseer's own limits are the holder's to change, as plans and
+    // breakers are: nobody else's accept (or dismiss) of that card counts.
+    if crate::crew::holder_only(&suggestion) {
+        if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+            return error(status, "not allowed");
+        }
+    }
     match suggestion.state {
         SuggestionState::Open => {}
         SuggestionState::Done => {
@@ -501,6 +508,87 @@ mod tests {
             assert_eq!(dismissed["text"], "dismissed the suggestion about Scout");
             let (status, _) = call(&app, "POST", "/api/desk/suggestions/nope/dismiss").await;
             assert_eq!(status, StatusCode::NOT_FOUND);
+        })
+        .await;
+    }
+
+    /// Signed in, but not the person who holds the hub.
+    struct NotHolder;
+
+    #[async_trait::async_trait]
+    impl Authorize for NotHolder {
+        async fn authorize(
+            &self,
+            h: &HeaderMap,
+            q: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Bearer
+                .authorize(h, q)
+                .await
+                .map(|_| Some("someone-else".into()))
+        }
+        async fn authorize_holder(
+            &self,
+            _: &HeaderMap,
+            _: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+
+    /// An overseer's own limits are the holder's alone to change: anyone
+    /// else's accept or dismiss of that card is refused and changes
+    /// nothing; their answers to other suggestions stand as before.
+    #[tokio::test]
+    async fn only_the_holder_answers_a_card_that_changes_an_overseers_own_limits() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let hub = Arc::new(Hub::default());
+            let app = crew_router(d.clone(), Arc::new(NotHolder), hub.clone());
+            let card = |tool: &str| Suggestion {
+                id: crate::crew::new_id(),
+                at: crate::crew::now(),
+                text: "Set Act fully's daily budget to $5,000.00".into(),
+                action: json!({"tool": tool, "input": {"agent_id": "desk", "budget_usd_per_day": 5000}}),
+                state: SuggestionState::Open,
+                subject: None,
+                agent_id: "desk".into(),
+            };
+            let own = card(crate::crew::OWN_OVERSIGHT_TOOL);
+            let other = card("crew.nudge");
+            for s in [&own, &other] {
+                d.store().put_suggestion(s).await.unwrap();
+            }
+            for answer in ["accept", "dismiss"] {
+                let (status, _) = call(
+                    &app,
+                    "POST",
+                    &format!("/api/desk/suggestions/{}/{answer}", own.id),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+            }
+            assert!(hub.0.lock().is_empty(), "nothing was done");
+            let kept = d.store().suggestion(&own.id).await.unwrap().unwrap();
+            assert_eq!(kept.state, SuggestionState::Open);
+            let (status, _) = call(
+                &app,
+                "POST",
+                &format!("/api/desk/suggestions/{}/accept", other.id),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            // The holder accepts it.
+            let holder = crew_router(d.clone(), Arc::new(Bearer), hub.clone());
+            let (status, done) = call(
+                &holder,
+                "POST",
+                &format!("/api/desk/suggestions/{}/accept", own.id),
+            )
+            .await;
+            assert_eq!((status, done["state"].as_str()), (StatusCode::OK, Some("done")));
         })
         .await;
     }

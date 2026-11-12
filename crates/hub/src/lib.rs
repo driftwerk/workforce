@@ -112,6 +112,8 @@ pub mod desk_crew;
 pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]
+pub(crate) mod desk_key_check;
+#[cfg(feature = "postgres")]
 pub mod desk_key_models;
 #[cfg(feature = "postgres")]
 pub mod desk_ledger;

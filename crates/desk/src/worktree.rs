@@ -106,6 +106,51 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
     Ok(path)
 }
 
+/// The most names [`create_fresh`] tries.
+pub const FRESH_TRIES: usize = 50;
+
+/// Creates a separate copy of `cwd`'s repository on a new branch named from
+/// `base`: the first of `base`, `base-2`, `base-3`, … that is neither a
+/// branch nor a copy yet, from HEAD. Returns its path and branch. A folder
+/// outside any repository says so plainly.
+pub async fn create_fresh(cwd: &Path, base: &str) -> Result<(PathBuf, String)> {
+    if !in_repo(cwd).await {
+        eyre::bail!(
+            "{} isn't in a git repository, so Desk can't make a separate copy of it",
+            cwd.display()
+        );
+    }
+    let base = base.trim().trim_end_matches('/');
+    if slug(base).is_empty() {
+        eyre::bail!("branch name {base:?} has no usable characters");
+    }
+    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await?);
+    for n in 1..=FRESH_TRIES {
+        let branch = match n {
+            1 => base.to_string(),
+            n => format!("{base}-{n}"),
+        };
+        let taken = root.join(".worktrees").join(slug(&branch)).exists()
+            || git(
+                &root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+            .await
+            .is_ok();
+        if taken {
+            continue;
+        }
+        let path = create_from(cwd, &branch, Some("HEAD")).await?;
+        return Ok((path, branch));
+    }
+    eyre::bail!("every name from {base} to {base}-{FRESH_TRIES} is taken")
+}
+
 /// Whether `cwd` is in a git repository: only one can have a worktree.
 pub async fn in_repo(cwd: &Path) -> bool {
     git(cwd, &["rev-parse", "--show-toplevel"]).await.is_ok()
@@ -255,5 +300,43 @@ mod tests {
             "/dev/acme-web/.worktrees/x/crates"
         );
         assert_eq!(super::project_of("/dev/atlas"), "/dev/atlas");
+    }
+
+    /// A separate copy is a new branch every time: a name taken by a branch
+    /// or a copy goes on to the next, and a folder outside any repository
+    /// says so.
+    #[tokio::test]
+    async fn a_fresh_copy_takes_the_first_name_no_branch_or_copy_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.email=d@e",
+                "-c",
+                "user.name=d",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+            // Someone's own branch of that name, with no copy.
+            vec!["branch", "desk/fix-login"],
+        ] {
+            git(repo, &args).await.unwrap();
+        }
+        let (first, branch) = create_fresh(repo, "desk/fix-login").await.unwrap();
+        assert_eq!(branch, "desk/fix-login-2");
+        assert!(first.ends_with(".worktrees/desk-fix-login-2"));
+        let (_, again) = create_fresh(repo, "desk/fix-login").await.unwrap();
+        assert_eq!(again, "desk/fix-login-3");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let refused = create_fresh(elsewhere.path(), "desk/x").await.unwrap_err();
+        assert!(
+            refused.to_string().contains("isn't in a git repository"),
+            "{refused}"
+        );
     }
 }
