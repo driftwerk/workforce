@@ -63,6 +63,14 @@ pub fn judge(answer: &Value, home_team: Option<&str>) -> SlackSays {
     if !no("is_restricted") || !no("is_ultra_restricted") {
         return SlackSays::NotMember("a guest");
     }
+    // An invite not yet taken up, or an address Slack hasn't confirmed,
+    // isn't a member's email yet. Older answers leave these out.
+    if user["is_invited_user"].as_bool() == Some(true) {
+        return SlackSays::NotMember("not joined yet");
+    }
+    if user["is_email_confirmed"].as_bool() == Some(false) {
+        return SlackSays::NotMember("email not confirmed");
+    }
     match user["profile"]["email"]
         .as_str()
         .map(|e| e.trim().to_ascii_lowercase())
