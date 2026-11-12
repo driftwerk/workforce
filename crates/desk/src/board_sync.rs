@@ -71,6 +71,9 @@ pub fn callable(system: System) -> Vec<&'static str> {
         members_tool(system),
         choose_tool(system),
     ]);
+    if system == System::Jira {
+        all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
+    }
     all
 }
 
@@ -140,6 +143,35 @@ pub trait Remote: Send + Sync {
     async fn tools(&self) -> Result<Vec<String>, RemoteError>;
     /// Calls `tool` (a registry name) with `args`; its answer as JSON.
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError>;
+    /// The same for a call made only to fill in a dialog: one that would
+    /// need an approval is not parked or routed to anyone, it just fails.
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.call(tool, args).await
+    }
+}
+
+/// `call`, quietly (see `Remote::call_quiet`): a call that would wait on an
+/// approval is `Waiting`, as ever, but nothing was asked of anyone.
+pub async fn call_quiet(
+    remote: &dyn Remote,
+    system: System,
+    tool: &str,
+    args: Value,
+) -> Result<Value, RemoteError> {
+    if !callable(system).contains(&tool) {
+        return Err(RemoteError::NotAllowed(tool.to_string()));
+    }
+    let answer = remote.call_quiet(tool, args).await?;
+    if answer.get("status").and_then(Value::as_str) == Some("approval_pending") {
+        return Err(RemoteError::Waiting {
+            request_id: answer
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(answer)
 }
 
 /// `remote`'s answer to `tool`, refusing any tool the sync may not call.
