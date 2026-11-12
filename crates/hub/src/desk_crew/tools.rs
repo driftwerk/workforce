@@ -21,7 +21,7 @@ use workforce_desk::scope::Seen;
 
 use crate::serve::AgentService;
 
-use super::actions::{Action, Gate};
+use super::actions::{Action, Gate, Target};
 use super::watcher::reported;
 use super::CrewHub;
 
@@ -407,9 +407,21 @@ impl CrewTool {
             o.insert("ticket_id".into(), json!(id.to_string()));
             o.insert("ticket".into(), json!(key));
         }
-        let input = &kept;
         let oversight = &b.oversight;
-        let by = crew.by_boss(&b.service, reason);
+        // Always working in real sessions, a start goes to the session it
+        // already runs for it when one fits, as the start would have run:
+        // told the goal, not a new one.
+        let reused = crew
+            .reuse_instead(&mut action, oversight, b.service.agent_id.as_str())
+            .await;
+        let reason = match &reused {
+            Some((_, name)) => format!(
+                "{reason} (gave it to {name}, already there, rather than starting a new session)"
+            ),
+            None => reason.to_string(),
+        };
+        let input = &kept;
+        let by = crew.by_boss(&b.service, &reason);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
             Gate::Refuse => match &action {
@@ -423,8 +435,36 @@ impl CrewTool {
             },
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
-                let done = crew.perform(&action, by).await?;
-                Ok(json!({ "done": done }))
+                let actor = by.party.clone();
+                let Some((start, name)) = reused else {
+                    let done = crew.perform(&action, by).await?;
+                    return Ok(json!({ "done": done }));
+                };
+                let Action::Nudge { to: Target::Session(s), .. } = &action else {
+                    return Err("That isn't a session to give work to.".into());
+                };
+                let s = *s;
+                let (done, gave) = crew.give_or_start(&action, &start, s, by).await?;
+                if !gave {
+                    return Ok(json!({ "done": done }));
+                }
+                // Activity, and the Floor's rail, say which session got the
+                // work instead of a new one, and why.
+                if let Ok(v) = crew.desk.view(s) {
+                    let mut e = crew::Event::new(
+                        crew::Kind::Nudged,
+                        actor,
+                        Some(crew::Party::session(&v)),
+                        format!("gave {name} the work rather than starting a new session"),
+                    );
+                    e.reason = Some(reason.clone());
+                    crew.desk.note(e);
+                }
+                Ok(json!({
+                    "done": done,
+                    "reused": name,
+                    "note": format!("{name} was already there for this, idle in the same folder, so it got the work instead of a new session. Pass new: true only when the person asks for a new one."),
+                }))
             }
             Gate::Suggest(why) => {
                 if action.starts_session() {
@@ -607,7 +647,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots).",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you always work in real sessions, a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
@@ -705,7 +745,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "name": { "type": "string" },
                     "engine": { "type": "string", "enum": engines },
                     "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
-                    "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" }
+                    "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
+                    "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
                 })),
                 &["folder", "goal"],
             )

@@ -936,7 +936,8 @@ impl Session {
         }
     }
 
-    fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+    /// The metadata as an object, made one when it isn't yet.
+    pub fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
         if !self.metadata.is_object() {
             self.metadata = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1013,12 +1014,20 @@ impl Session {
     }
 
     /// The thread's next position: same conversation identity and label,
-    /// `seq + 1`, nothing carried. A rollover additionally records the
+    /// `seq + 1`, nothing carried but a Desk boss conversation's link
+    /// ([`DESK_BOSS_KEY`]). A rollover additionally records the
     /// carry-over with [`Self::set_prev_session_id`].
     pub fn successor(&self) -> Session {
         let mut next = Session::new(&self.channel, &self.owner, &self.agent_id);
         next.label = self.label.clone();
         next.set_seq(self.seq().saturating_add(1));
+        // A Desk group's boss conversation stays its group's when started
+        // afresh: its place (a Desk channel, a Slack thread) is the link's.
+        if let Some(boss) = self.metadata.get(DESK_BOSS_KEY) {
+            next.metadata_object_mut()
+                .insert(DESK_BOSS_KEY.into(), boss.clone());
+            next.context_type = self.context_type.clone();
+        }
         next
     }
 

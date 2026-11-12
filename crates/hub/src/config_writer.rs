@@ -254,6 +254,72 @@ pub async fn overlay_upsert_agent(
     .await
 }
 
+/// An agent of that id is already in the merged config: a new one must take
+/// another.
+#[derive(Debug)]
+pub struct AgentExists(pub String);
+
+impl std::fmt::Display for AgentExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent '{}' already exists", self.0)
+    }
+}
+
+impl std::error::Error for AgentExists {}
+
+impl AgentExists {
+    /// Whether `e` is, or wraps, an [`AgentExists`].
+    pub fn is(e: &eyre::Report) -> bool {
+        e.chain().any(|c| c.is::<AgentExists>())
+    }
+}
+
+/// Add a new agent entry to the overlay, refusing with [`AgentExists`] when
+/// the merged config has one of that id already. The check is made under
+/// the overlay's lock, so two creates of one id can't both pass it and the
+/// second overwrite the first.
+#[allow(clippy::too_many_arguments)]
+pub async fn overlay_create_agent(
+    base_config_path: &Path,
+    data_dir: &Path,
+    agent: toml::Table,
+    actor: Option<&str>,
+    via: &str,
+    def_store: Option<&WorkflowStore>,
+    lock_manager: &LockManager,
+) -> Result<()> {
+    let id = agent
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| eyre!("agent entry needs an id"))?
+        .to_string();
+    let key_path = format!("agents.{id}");
+    let base_path = base_config_path.to_path_buf();
+    mutate_overlay(
+        base_config_path,
+        data_dir,
+        OverlayWrite {
+            actor,
+            via,
+            action: "set",
+            key_path: &key_path,
+        },
+        def_store,
+        lock_manager,
+        |ov| {
+            let raw = overlay::load_raw(&base_path)?;
+            let cfg = WorkforceConfig::from_base_and_overlay(raw.base, Some(ov))?;
+            if cfg.agents.iter().any(|a| a.id == id) {
+                return Err(AgentExists(id.clone()).into());
+            }
+            let before = ov.clone();
+            upsert_agent_in(ov, &id, agent);
+            overlay::ensure_agent_entry_scope(&before, ov)
+        },
+    )
+    .await
+}
+
 /// Remove an agent: drop any overlay entry and tombstone the id in
 /// `agents_remove` so a base-defined agent stays gone across deploys.
 /// Refuses to remove the default agent (an infra-base change) or the last
@@ -421,6 +487,34 @@ name = "Quill"
         let cfg = WorkforceConfig::load(&base_path).unwrap();
         let ids: Vec<_> = cfg.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["allan", "quill", "maple"]);
+    }
+
+    #[tokio::test]
+    async fn create_agent_refuses_an_id_already_there_under_the_lock() {
+        let (_tmp, base_path, data_dir) = setup();
+        let locks = Arc::new(LockManager::new());
+        let maple = || {
+            "id = \"maple\"\nname = \"Maple\"\n"
+                .parse::<toml::Table>()
+                .unwrap()
+        };
+        // The second create of one id, made before the first is live, is
+        // refused rather than overwriting it.
+        overlay_create_agent(&base_path, &data_dir, maple(), None, "web", None, &locks)
+            .await
+            .unwrap();
+        let err = overlay_create_agent(&base_path, &data_dir, maple(), None, "web", None, &locks)
+            .await
+            .unwrap_err();
+        assert!(AgentExists::is(&err), "{err}");
+        // One in the base config is there already too.
+        let quill: toml::Table = "id = \"quill\"\n".parse().unwrap();
+        let err = overlay_create_agent(&base_path, &data_dir, quill, None, "web", None, &locks)
+            .await
+            .unwrap_err();
+        assert!(AgentExists::is(&err), "{err}");
+        let cfg = WorkforceConfig::load(&base_path).unwrap();
+        assert_eq!(cfg.agents.iter().filter(|a| a.id == "maple").count(), 1);
     }
 
     #[tokio::test]

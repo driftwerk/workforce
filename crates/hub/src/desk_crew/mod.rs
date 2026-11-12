@@ -49,7 +49,7 @@ mod work;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use tools::{describe as crew_describe, schema as crew_schema};
+pub(crate) use tools::schema as crew_schema;
 pub(crate) use watcher::reported;
 
 pub(crate) use extras::mentions_for;
@@ -148,6 +148,9 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Sessions a start's work was given to, held from other starts until
+    /// [`actions::REUSE_CLAIM`] has passed.
+    reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     /// Calls for the person's machines, waiting for Desk's native side
     /// ([`relay`]), and who waits for each answer.
     relays: Mutex<relay::Relays>,
@@ -502,6 +505,7 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),
             relay_wait: Mutex::new(Duration::from_secs(30)),

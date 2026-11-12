@@ -1437,7 +1437,10 @@ async fn ws_handler(
     // no channel, otherwise the conversational channel it names.
     let anchor_channel = match query.channel.as_deref() {
         None => IOS_CHANNEL.to_string(),
-        Some(channel) if workforce_common::channels::is_conversational(channel) => {
+        Some(channel)
+            if workforce_common::channels::is_conversational(channel)
+                || workforce_common::channels::is_desk_boss_channel(channel) =>
+        {
             channel.to_string()
         }
         Some(channel) => return invalid_ws_channel(channel),
@@ -1452,6 +1455,29 @@ async fn ws_handler(
         Err(refused) => return refused,
     };
     let agent_id = query.agent_id;
+    // A Desk group's boss conversation anchors only its own person's
+    // connection, with its own agent, once its link has opened it.
+    if workforce_common::channels::is_desk_boss_channel(&anchor_channel) {
+        let owner = caller
+            .identity_id
+            .as_deref()
+            .or(caller.device_id.as_deref());
+        if !crate::boss_links::conversation::anchors(
+            &state,
+            owner,
+            agent_id.as_deref(),
+            &anchor_channel,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "boss_conversation",
+                    "message": crate::boss_links::conversation::REFUSED,
+                })),
+            )
+                .into_response();
+        }
+    }
     ws.on_upgrade(move |socket| {
         handle_ws(
             socket,
@@ -6409,7 +6435,9 @@ async fn create_agent(
         agent.insert("memory".to_string(), toml::Value::Table(memory));
     }
 
-    if let Err(e) = crate::config_writer::overlay_upsert_agent(
+    // Made only where no agent of that id is: checked again under the
+    // overlay's lock, so two creates of one id can't both be made.
+    if let Err(e) = crate::config_writer::overlay_create_agent(
         &config_path,
         &data_dir,
         agent,
@@ -6420,6 +6448,12 @@ async fn create_agent(
     )
     .await
     {
+        if crate::config_writer::AgentExists::is(&e) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("agent '{}' already exists", body.id)})),
+            ));
+        }
         // F8 (2026-05-15): log paths server-side but don't echo FS layout
         // back to the client.
         warn!(agent_id = %body.id, error = %e, "Failed to write agent to config overlay");
