@@ -272,6 +272,43 @@ mod tests {
         assert!(policy.snapshot().is_empty());
     }
 
+    /// A widening the gate decided runs only on the file it was decided
+    /// on: changed in between, it is refused and nothing is written.
+    #[tokio::test]
+    async fn a_widening_runs_only_on_the_config_it_was_asked_on() {
+        use workforce_agent::tools::Tool;
+        let service = crate::environments::test_service().await;
+        let config = service
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        std::fs::write(&config, "[skills]\nenabled = [\"linear\"]\n").unwrap();
+        let tool = crate::config_tool::ConfigTool::new(Arc::clone(&service), None);
+        let widen = serde_json::json!({
+            "action": "set",
+            "key": "skills.enabled",
+            "value": ["linear", "github"],
+        });
+        assert!(matches!(
+            tool.effect(&widen),
+            workforce_core::computer::Effect::Connector { write: true, .. }
+        ));
+        // Something else changes the file after the gate decided.
+        let between = "[skills]\nenabled = [\"linear\"]\nread_only = [\"linear\"]\n";
+        std::fs::write(&config, between).unwrap();
+        let refused = tool.execute(widen.clone()).await.unwrap();
+        assert!(!refused.success);
+        assert!(refused
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), between);
+        // Asked again on the file as it is, it runs.
+        tool.effect(&widen);
+        let ran = tool.execute(widen).await.unwrap();
+        assert!(ran.success, "{:?}", ran.error);
+    }
+
     #[test]
     fn on_a_desk_hub_the_agents_registry_is_what_is_hidden() {
         let dir = tempfile::tempdir().unwrap();

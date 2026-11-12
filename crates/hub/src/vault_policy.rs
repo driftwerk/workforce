@@ -107,6 +107,11 @@ pub enum AgentReadDenial {
     /// the agent with `connections.*`, which asks first; an agent writing it
     /// here could send the person's key to a host of its choosing.
     ConnectionAddress,
+    /// On a hub running Desk, the path is inside one of its connections
+    /// (`skills/jira/...`), which the vault tools don't rename, copy or
+    /// move: a key moved beside an address the agent chose would be sent
+    /// there. Setting or deleting one is still the agent's own setup.
+    ConnectionRelocate,
     /// No `CURRENT_USER_ID` is in scope but the path is per-user. System
     /// jobs must opt into a synthetic identity via
     /// `workforce_agent::runner::with_system_identity` rather than read
@@ -168,6 +173,12 @@ impl std::fmt::Display for AgentReadDenial {
                 "vault path says where a connection sends its key, which the agent vault \
                  tools don't change on Desk. Set the connection up with connections.setup, \
                  or ask the person to change it in Settings → Connections"
+            ),
+            AgentReadDenial::ConnectionRelocate => write!(
+                f,
+                "vault path is inside one of Desk's connections, which the agent vault \
+                 tools don't rename, copy or move. Set a connection up with \
+                 connections.setup, or ask the person to change it in Settings → Connections"
             ),
             AgentReadDenial::NoUserIdentity => write!(
                 f,
@@ -261,30 +272,65 @@ const ADDRESS_FIELDS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The connectors Desk's Connections keeps, whose paths the agent vault
+/// tools never rename, copy or move there.
+const CONNECTION_CONNECTORS: &[&str] = &[
+    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase",
+];
+
+/// `path` below `skills/`, however its case, slashes or `.` segments are
+/// spelled, without a `users/{uid}/` prefix: `["jira", "workspaces",
+/// "acme", "site"]`. `None` when it isn't under `skills/`. A `..` segment
+/// is kept, for the callers to treat as matching.
+fn skill_segments(path: &str) -> Option<Vec<String>> {
+    let segments: Vec<String> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_lowercase)
+        .collect();
+    let logical = match segments.first().map(String::as_str) {
+        Some("users") => segments.get(2..).unwrap_or_default(),
+        _ => &segments[..],
+    };
+    match logical.split_first() {
+        Some((first, rest)) if first == "skills" => Some(rest.to_vec()),
+        _ => None,
+    }
+}
+
 /// Whether `path` (shared or under `users/{uid}/`) says where one of Desk's
 /// connections sends its key: flat (`skills/jira/site`) or an instance's
-/// (`skills/jira/workspaces/acme/site`).
+/// (`skills/jira/workspaces/acme/site`). Case, doubled slashes and `.`
+/// segments don't hide one, and a `..` segment counts as one.
 pub fn is_connection_address(path: &str) -> bool {
-    let logical = path
-        .strip_prefix("users/")
-        .and_then(|rest| rest.split_once('/'))
-        .map_or(path, |(_, rest)| rest);
-    let Some(rest) = logical.strip_prefix("skills/") else {
+    let Some(segments) = skill_segments(path) else {
         return false;
     };
-    let Some((connector, tail)) = rest.split_once('/') else {
+    let Some((connector, tail)) = segments.split_first() else {
         return false;
     };
-    let Some((_, fields)) = ADDRESS_FIELDS.iter().find(|(c, _)| *c == connector) else {
+    let Some((_, fields)) = ADDRESS_FIELDS.iter().find(|(c, _)| c == connector) else {
         return false;
     };
-    let field = match tail.rsplit_once('/') {
-        // An instance's: `<collection>/<key>/<field>`, one level deep.
-        Some((within, field)) if within.split('/').count() == 2 => field,
-        Some(_) => return false,
-        None => tail,
-    };
-    fields.contains(&field)
+    if tail.iter().any(|s| s == "..") {
+        return true;
+    }
+    match tail {
+        // Flat, or an instance's: `<collection>/<key>/<field>`.
+        [field] | [_, _, field] => fields.contains(&field.as_str()),
+        _ => false,
+    }
+}
+
+/// Whether `path` is inside one of Desk's connections (`skills/jira/...`,
+/// shared or a person's), however it is spelled.
+pub fn is_connection_path(path: &str) -> bool {
+    skill_segments(path).is_some_and(|segments| {
+        segments
+            .first()
+            .is_some_and(|c| CONNECTION_CONNECTORS.contains(&c.as_str()))
+    })
 }
 
 /// [`agent_can_read`] for a tool that writes `path` (sets, deletes, or moves
@@ -298,6 +344,21 @@ pub fn agent_can_write(
     agent_can_read(path, current_uid)?;
     if desk && is_connection_address(path) {
         return Err(AgentReadDenial::ConnectionAddress);
+    }
+    Ok(())
+}
+
+/// [`agent_can_write`] for a tool that renames, copies or moves `path`: on
+/// Desk, nothing inside a connection moves, since a key moved beside an
+/// address the agent chose would be sent there.
+pub fn agent_can_relocate(
+    path: &str,
+    current_uid: Option<&str>,
+    desk: bool,
+) -> Result<(), AgentReadDenial> {
+    agent_can_write(path, current_uid, desk)?;
+    if desk && is_connection_path(path) {
+        return Err(AgentReadDenial::ConnectionRelocate);
     }
     Ok(())
 }
@@ -683,5 +744,108 @@ mod tests {
             agent_can_write("users/ben/skills/jira/site", Some("sam"), true),
             Err(AgentReadDenial::CrossUser)
         );
+    }
+
+    #[test]
+    fn however_an_address_is_spelled_it_is_still_an_address() {
+        for path in [
+            "Skills/Jira/Site",
+            "skills//jira/site",
+            "./skills/jira/./site",
+            "/skills/jira/workspaces/acme/site/",
+            "users/sam//skills/JIRA/workspaces/acme/SITE",
+        ] {
+            assert!(is_connection_address(path), "{path}");
+            assert_eq!(
+                agent_can_write(path, Some("sam"), true),
+                Err(AgentReadDenial::ConnectionAddress),
+                "{path}"
+            );
+        }
+        // A `..` counts as an address too (the namespace check refuses it
+        // before that).
+        for path in [
+            "skills/jira/workspaces/../site",
+            "skills/metabase/instances/acme/../../site_url",
+        ] {
+            assert!(is_connection_address(path), "{path}");
+            assert!(agent_can_write(path, Some("sam"), true).is_err(), "{path}");
+        }
+    }
+
+    /// Every address an adapter reads from the vault is one the agent
+    /// vault tools leave alone on Desk. Linear's address is fixed in its
+    /// client and Google's comes from its sign-in, so neither has one.
+    #[test]
+    fn every_address_an_adapter_reads_is_kept_from_the_vault_tools() {
+        let read = [
+            ("github", "base_url"),
+            ("jira", "site"),
+            ("datadog", "site"),
+            ("datadog", "base_url"),
+            ("metabase", "site_url"),
+            ("email", "imap_host"),
+            ("email", "imap_port"),
+            ("email", "smtp_host"),
+            ("email", "smtp_port"),
+            ("email", "tls"),
+        ];
+        for (connector, field) in read {
+            assert!(is_connection_address(&format!(
+                "skills/{connector}/{field}"
+            )));
+            let collection = workforce_common::connector_binding::INSTANCE_PREFIXES
+                .iter()
+                .find(|(c, _)| *c == connector)
+                .map(|(_, p)| *p)
+                .unwrap_or_else(|| panic!("{connector} has no instances"));
+            let at = format!("{}acme/{field}", collection);
+            assert!(is_connection_address(&at), "{at}");
+        }
+        let listed: usize = ADDRESS_FIELDS.iter().map(|(_, f)| f.len()).sum();
+        assert_eq!(listed, read.len(), "an address field isn't checked here");
+    }
+
+    #[test]
+    fn on_desk_nothing_inside_a_connection_is_renamed_copied_or_moved() {
+        for path in [
+            "skills/jira/api_token",
+            "skills/jira/workspaces/acme/api_token",
+            "users/sam/skills/github/workspaces/acme/token",
+            "Skills//Linear/./api_key",
+            "skills/datadog/accounts/prod/api_key",
+            "skills/metabase/instances/acme/api_key",
+            "users/sam/skills/email/accounts/work/password",
+            "skills/google/workspaces/acme/refresh_token",
+            "skills/slack/bot_token",
+        ] {
+            assert!(is_connection_path(path), "{path}");
+            assert_eq!(
+                agent_can_relocate(path, Some("sam"), true),
+                Err(AgentReadDenial::ConnectionRelocate),
+                "{path}"
+            );
+            assert_eq!(
+                agent_can_relocate(path, Some("sam"), false),
+                Ok(()),
+                "{path}"
+            );
+            // Setting or deleting it is still the agent's own setup.
+            if !is_connection_address(path) {
+                assert_eq!(agent_can_write(path, Some("sam"), true), Ok(()), "{path}");
+            }
+        }
+        for path in [
+            "skills/postmark/api_key",
+            "notes/jira/api_token",
+            "skillsx/jira/a",
+        ] {
+            assert!(!is_connection_path(path), "{path}");
+            assert_eq!(
+                agent_can_relocate(path, Some("sam"), true),
+                Ok(()),
+                "{path}"
+            );
+        }
     }
 }

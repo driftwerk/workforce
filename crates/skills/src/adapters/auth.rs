@@ -203,6 +203,26 @@ pub fn resolve_host(
         .map(|url| url.trim_end_matches('/').to_string())
 }
 
+/// The redirect policy for a client that sends its key in a header of its
+/// own (Metabase's `x-api-key`, Datadog's `DD-API-KEY`), which reqwest keeps
+/// on every hop: a redirect within the origin first asked is followed, one
+/// to any other origin is not, so the key never reaches a host it wasn't
+/// set up for. (`Authorization` is dropped by reqwest on a cross-host hop,
+/// so the clients that send only that keep its default.)
+#[cfg(any(feature = "metabase", feature = "datadog"))]
+pub fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let asked = attempt.previous().first().map(|u| u.origin());
+        if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else if asked.as_ref() == Some(&attempt.url().origin()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +451,62 @@ mod tests {
             Some("https://evil.example"),
             "an unpinned store keeps its rule"
         );
+    }
+
+    #[cfg(any(feature = "metabase", feature = "datadog"))]
+    #[tokio::test]
+    async fn a_key_in_its_own_header_never_follows_a_redirect_to_another_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let asked = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(path("/away"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/steal", elsewhere.uri())),
+            )
+            .mount(&asked)
+            .await;
+        Mock::given(path("/moved"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/here"))
+            .mount(&asked)
+            .await;
+        Mock::given(path("/here"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&asked)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirects())
+            .build()
+            .unwrap();
+        let away = client
+            .get(format!("{}/away", asked.uri()))
+            .header("x-api-key", "mb_key")
+            .header("DD-API-KEY", "dd_key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            away.status(),
+            302,
+            "the hop away is handed back, not followed"
+        );
+        let moved = client
+            .get(format!("{}/moved", asked.uri()))
+            .header("x-api-key", "mb_key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            moved.text().await.unwrap(),
+            "ok",
+            "a hop within the origin is followed"
+        );
+        elsewhere.verify().await;
     }
 }
