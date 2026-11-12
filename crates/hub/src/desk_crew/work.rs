@@ -10,12 +10,13 @@
 //! can as it appears, but never one the person released; and the sessions
 //! a boss that no longer oversees ran pass to the one that does.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight, TakeOn};
 use workforce_desk::charge::{self, Wheel};
-use workforce_desk::crew::{By, Event, Kind, Party, PartyKind};
+use workforce_desk::crew::{self, By, Event, Kind, Party, PartyKind};
 
 use super::{name_of, CrewHub};
 
@@ -70,7 +71,9 @@ impl CrewHub {
     /// handing one back to it. A turn that ended asking the person waits on
     /// them (its line holds what the overseer says until they answer), so
     /// it reaches the overseer as any session's question does.
-    /// [`super::watcher`]'s check-ins leave out the same turn ends.
+    /// [`super::watcher`]'s check-ins leave out the same turn ends. What it
+    /// asks Desk to allow reaches the boss by [`Self::owed_asks`], which
+    /// looks at what is open rather than at what just happened.
     pub(crate) fn work_line(&self, event: &Event) -> Option<(Uuid, String)> {
         let subject = event.subject.as_ref()?;
         if subject.kind != PartyKind::Session {
@@ -88,19 +91,6 @@ impl CrewHub {
                 (self.desk.wheel_of(session) == Some(Wheel::Boss))
                     .then(|| (session, format!("{} {}", subject.name, event.text)))
             }
-            // It waits on a request Desk can answer: the boss answers for it.
-            Kind::NeedsYou if event.actor.kind == PartyKind::Session => {
-                let approval = event.approval_id.as_deref()?;
-                let open = self.desk.view(session).ok()?.pending.is_some_and(|p| {
-                    p.id.to_string() == approval && p.answerable && p.request.is_some()
-                });
-                (open && self.desk.wheel_of(session) == Some(Wheel::Boss)).then(|| {
-                    (
-                        session,
-                        format!("{} {} (approval_id {approval})", subject.name, event.text),
-                    )
-                })
-            }
             Kind::HandedBack => Some((
                 session,
                 format!(
@@ -110,6 +100,64 @@ impl CrewHub {
             )),
             _ => None,
         }
+    }
+
+    /// The requests the boss owes an answer to and hasn't been given yet,
+    /// as `(session, approval_id, line)`: in each session a boss runs and
+    /// drives ([`Self::still_works`]), at a level that does more than
+    /// watch, the front request Desk can answer. Each is given once:
+    /// `offered` keeps the ones given, and only while they are still open.
+    /// Looking at what is open, not at the event that raised it, a request
+    /// raised while the person held the wheel, one that became answerable
+    /// after it was raised, one whose event was lost, and one open when the
+    /// boss took the session on or the hub started all reach the boss.
+    pub(crate) fn owed_asks(
+        &self,
+        offered: &mut HashSet<(Uuid, String)>,
+    ) -> Vec<(Uuid, Uuid, String)> {
+        let mut open = HashSet::new();
+        let mut owed = Vec::new();
+        for c in self.desk.charges() {
+            let Ok(view) = self.desk.view(c.session) else {
+                continue;
+            };
+            let Some(p) = view.pending.as_ref() else {
+                continue;
+            };
+            open.insert(p.id);
+            let given = (p.id, c.boss.clone());
+            if offered.contains(&given)
+                || !p.answerable
+                || p.request.is_none()
+                || !self.still_works(c.session)
+            {
+                continue;
+            }
+            offered.insert(given);
+            let what = match p.detail.trim() {
+                "" => p.tool.clone(),
+                detail => format!("{}: {}", p.tool, crew::clip(detail, 300)),
+            };
+            owed.push((
+                c.session,
+                p.id,
+                format!(
+                    "{} waits on a request: {what} (approval_id {})",
+                    view.label(),
+                    p.id
+                ),
+            ));
+        }
+        offered.retain(|(id, _)| open.contains(id));
+        owed
+    }
+
+    /// The boss that runs `session` now, if one does.
+    pub(crate) fn boss_of(&self, session: Uuid) -> Option<String> {
+        self.desk
+            .charge_of(session)
+            .filter(|c| c.live())
+            .map(|c| c.boss)
     }
 
     /// Whether a work turn for `session` is still wanted: the overseer runs

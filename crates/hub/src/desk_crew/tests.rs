@@ -3705,7 +3705,7 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             dir.path(),
             pool,
             "Answered.",
-            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
             &[],
         )
         .await;
@@ -3778,6 +3778,181 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             woke.content
         );
         assert!(woke.content.contains("crew.approve"), "{}", woke.content);
+    })
+    .await;
+}
+
+/// A session the overseer runs, ready to ask it things: the overseer
+/// acting, its tools in place, and the session handed to it.
+async fn handed_session(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+) -> (
+    Arc<AgentService>,
+    Arc<CrewHub>,
+    Desk,
+    wiremock::MockServer,
+    uuid::Uuid,
+    String,
+) {
+    // What waits on the person isn't a check-in (the test's minutes are
+    // short): only the session's line gives the overseer its requests.
+    let (overseer, crew, d, llm) = overseeing(
+        dir,
+        pool,
+        "Answered.",
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
+        &[],
+    )
+    .await;
+    eventually("the overseer's tools", async || {
+        overseer.tools.has("crew.approve").then_some(())
+    })
+    .await;
+    d.boss_bounds_with(workforce_desk::charge::Bounds {
+        home: dir.to_path_buf(),
+        ..Default::default()
+    });
+    let s = new_session(&d, dir, "acme-web").await;
+    let url = hook_url(dir, s.id).await;
+    hook(
+        &url,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    (overseer, crew, d, llm, s.id, url)
+}
+
+/// Asks Desk, as the session's `PermissionRequest` hook, to allow
+/// `command`; what the hook hears.
+fn ask_to_run(url: &str, command: &str) -> tokio::task::JoinHandle<Value> {
+    let url = url.to_string();
+    let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+        "tool_input": {"command": command}});
+    tokio::spawn(async move { hook(&url, body).await })
+}
+
+/// The `[Desk work]` turn on `session`'s line naming `approval`, once
+/// there is one.
+async fn work_turn_naming(
+    overseer: &AgentService,
+    session: uuid::Uuid,
+    approval: uuid::Uuid,
+) -> Option<String> {
+    let line = overseer
+        .sessions
+        .find(&super::line::line_channel(session), PERSON)
+        .unwrap()?;
+    line.messages
+        .iter()
+        .find(|m| {
+            m.content.starts_with(super::work::WORK)
+                && m.content.contains(&format!("approval_id {approval}"))
+        })
+        .map(|m| m.content.clone())
+}
+
+/// The bug of 12 Nov: a session the overseer runs asked while the person
+/// had its wheel, and nothing gave the request to the overseer once the
+/// wheel was its again, so it sat while the badge said the overseer had
+/// it. Now the request waits for the person while they drive, and is the
+/// overseer's, by its `approval_id`, the moment they stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_raised_while_the_person_drives_is_the_overseers_once_they_stop() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, llm, id, url) = handed_session(dir.path(), pool).await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.drive(id).await.unwrap();
+        let mut asked = ask_to_run(&url, "cat /tmp/out.txt; ls");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        calls_tool_once(
+            &llm,
+            &pending.id.to_string(),
+            "crew_approve",
+            json!({"session_id": id.to_string(), "approval_id": pending.id.to_string(),
+                "reason": "Reading its own output."}),
+        )
+        .await;
+        // The person drives: it waits for them, and the overseer is told
+        // nothing (well past the line's gathering).
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            work_turn_naming(&overseer, id, pending.id).await.is_none(),
+            "no work turn while the person drives"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut asked)
+                .await
+                .is_err(),
+            "unanswered while the person drives"
+        );
+        d.hand_back(id).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("the overseer answers it once it drives again")
+            .unwrap();
+        assert_eq!(
+            answered["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        let woke = eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
+        assert!(woke.contains("crew.approve"), "{woke}");
+    })
+    .await;
+}
+
+/// A request already open when the overseer takes a session on is its to
+/// answer: nothing new has to happen in the session first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_open_when_the_overseer_takes_a_session_on_is_its_to_answer() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, llm, id, url) = handed_session(dir.path(), pool).await;
+        let asked = ask_to_run(&url, "cargo test -p acme");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        calls_tool_once(
+            &llm,
+            &pending.id.to_string(),
+            "crew_approve",
+            json!({"session_id": id.to_string(), "approval_id": pending.id.to_string(),
+                "reason": "Running the tests is the plan."}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("the overseer answers it")
+            .unwrap();
+        assert_eq!(
+            answered["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
     })
     .await;
 }
