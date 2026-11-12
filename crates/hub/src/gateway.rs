@@ -5531,6 +5531,8 @@ async fn get_me(
         "device_id": caller.device_id,
         "linked_ios_device": linked_ios_device(&identity, caller.device_id.as_deref()),
         "picture": picture_info(&state, &crate::pictures::Owner::identity(identity.id.to_string())).await,
+        // What a device calls this workspace (Desk names it so).
+        "workspace": workspace_name(&state, &headers),
     })))
 }
 
@@ -8392,12 +8394,89 @@ async fn pair_device_request_unauthenticated(
             "device_name": pairing_req.device_name,
             "approve_url": pair_approve_url(&state, &headers, &pairing_req.code),
             "expires_at": pairing_req.expires_at.to_rfc3339(),
+            // What the device calls this workspace.
+            "name": workspace_name(&state, &headers),
         }))),
         Err(e) => {
             tracing::warn!("Device pairing initiation failed: {e}");
             Err(StatusCode::BAD_REQUEST)
         }
     }
+}
+
+/// The first part of the address `host` (a host name, with or without its
+/// port) that says whose workspace it is, as a name: `workforce.driftwerk.xyz`
+/// → "Driftwerk", `hub.acme.io` → "Acme". The words a hub's address often
+/// starts with (`workforce`, `hub`, `www`…) and the top-level domain are
+/// passed over; an address that's only those, an IP or `localhost` is
+/// itself.
+pub(crate) fn name_of_host(host: &str) -> String {
+    const GENERIC: [&str; 9] = [
+        "www",
+        "workforce",
+        "hub",
+        "app",
+        "desk",
+        "api",
+        "gateway",
+        "agents",
+        "ai",
+    ];
+    let host = host.trim().trim_end_matches('.');
+    // An IPv6 address keeps its brackets; anything else loses its port.
+    let bare = if host.starts_with('[') {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let labels: Vec<&str> = bare.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() < 2 || labels.iter().all(|l| l.chars().all(|c| c.is_ascii_digit())) {
+        return bare.to_string();
+    }
+    let named = labels[..labels.len() - 1]
+        .iter()
+        .find(|l| !GENERIC.contains(&l.to_ascii_lowercase().as_str()));
+    match named {
+        Some(label) => {
+            let mut chars = label.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+        None => bare.to_string(),
+    }
+}
+
+/// What this workspace is called where people connect to it: `[hub].name`,
+/// else the name its address says ([`name_of_host`]), its public URL's or
+/// the host the request reached it at.
+fn workspace_name(state: &GatewayState, headers: &axum::http::HeaderMap) -> String {
+    let hub = state
+        .registry
+        .host()
+        .map(|service| service.config.hub.clone());
+    if let Some(name) = hub
+        .as_ref()
+        .and_then(|h| h.name.as_deref())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        return name.to_string();
+    }
+    let host = hub
+        .as_ref()
+        .and_then(|h| h.public_url.as_deref())
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "localhost".into());
+    name_of_host(&host)
 }
 
 /// Where the device's person approves `code`: the hub's `/pair` page.
@@ -17520,5 +17599,31 @@ mod desk_link_vault_tests {
         let said = listed.0.to_string();
         assert!(said.contains("skills/jira/site"), "{said}");
         assert!(!said.contains("desk/hubs"), "{said}");
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_tests {
+    use super::name_of_host;
+
+    /// The same table Desk names an older hub's workspace by
+    /// (`src/hubs/pairing.ts`'s `nameOfHost`): the two say the same.
+    #[test]
+    fn a_workspace_is_named_by_the_part_of_its_address_that_says_whose_it_is() {
+        for (host, name) in [
+            ("workforce.driftwerk.xyz", "Driftwerk"),
+            ("hub.acme.io", "Acme"),
+            ("acme.example.com", "Acme"),
+            ("www.globex.co", "Globex"),
+            ("workforce.driftwerk.xyz:8443", "Driftwerk"),
+            ("agents.hub.initech.com", "Initech"),
+            ("localhost", "localhost"),
+            ("localhost:4000", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.0.1.20:8080", "10.0.1.20"),
+            ("workforce.app", "workforce.app"),
+        ] {
+            assert_eq!(name_of_host(host), name, "{host}");
+        }
     }
 }
