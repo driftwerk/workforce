@@ -350,48 +350,16 @@ impl CompactionTool {
     }
 
     async fn handle_status(&self, input: CompactionInput, start: Instant) -> Result<ToolResult> {
-        let session = if let Some(session_id) = &input.session_id {
-            // Direct session lookup by ID
-            match self.service.sessions.get(session_id)? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        format!("Session not found: {}", session_id),
-                        start.elapsed().as_millis() as u64,
-                    ))
-                }
-            }
-        } else {
-            // Smart session discovery via channel/user
-            let channel = input
+        let session = match crate::tool_session::resolve(
+            self.service.sessions.as_ref(),
+            input.session_id.as_deref(),
+            input
                 .session_channel
                 .as_deref()
-                .or(input.channel.as_deref())
-                .unwrap_or("unknown");
-            let user = input.user.as_deref().unwrap_or("unknown");
-
-            match self.service.sessions.list(Some(channel), 1) {
-                Ok(mut sessions) if !sessions.is_empty() => {
-                    // Use the most recent session for this channel
-                    sessions.remove(0)
-                }
-                _ => {
-                    // No existing session found, create one
-                    match self.service.sessions.get_or_create(
-                        channel,
-                        user,
-                        self.service.agent_id.as_str(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Ok(ToolResult::failure(
-                                format!("Session error: {}", e),
-                                start.elapsed().as_millis() as u64,
-                            ))
-                        }
-                    }
-                }
-            }
+                .or(input.channel.as_deref()),
+        ) {
+            Ok(s) => s,
+            Err(why) => return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64)),
         };
 
         let resolved_model = self.service.resolve_model(&session, None, None);
@@ -456,52 +424,20 @@ impl CompactionTool {
     }
 
     async fn handle_compact(&self, input: CompactionInput, start: Instant) -> Result<ToolResult> {
-        let mut session = if let Some(session_id) = &input.session_id {
-            // Direct session lookup by ID
-            match self.service.sessions.get(session_id)? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        format!("Session not found: {}", session_id),
-                        start.elapsed().as_millis() as u64,
-                    ))
-                }
-            }
-        } else {
-            // Smart session discovery via channel/user
-            let channel = input
+        let mut session = match crate::tool_session::resolve(
+            self.service.sessions.as_ref(),
+            input.session_id.as_deref(),
+            input
                 .session_channel
                 .as_deref()
-                .or(input.channel.as_deref())
-                .unwrap_or("unknown");
-            let user = input.user.as_deref().unwrap_or("unknown");
-
-            match self.service.sessions.list(Some(channel), 1) {
-                Ok(mut sessions) if !sessions.is_empty() => {
-                    // Use the most recent session for this channel
-                    sessions.remove(0)
-                }
-                _ => {
-                    // No existing session found, create one
-                    match self.service.sessions.get_or_create(
-                        channel,
-                        user,
-                        self.service.agent_id.as_str(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Ok(ToolResult::failure(
-                                format!("Session error: {}", e),
-                                start.elapsed().as_millis() as u64,
-                            ))
-                        }
-                    }
-                }
-            }
+                .or(input.channel.as_deref()),
+        ) {
+            Ok(s) => s,
+            Err(why) => return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64)),
         };
 
         let compaction_config = self.service.current_compaction_config();
-        let memory_writer = crate::notes_tool::memory_writer(&self.service);
+        let memory_writer = crate::notes_tool::memory_writer(&self.service, &session);
         let engine = workforce_agent::compaction::CompactionEngine::with_memory_writer(
             compaction_config,
             Arc::clone(&self.service.llm),
@@ -541,7 +477,64 @@ impl CompactionTool {
 
 #[cfg(test)]
 mod tests {
+    use workforce_agent::tools::Tool as _;
     use workforce_common::session::CompactionConfig;
+
+    /// The compaction tool reaches the caller's own conversations alone:
+    /// never another person's, never a boss conversation from outside it,
+    /// and naming a channel makes nothing.
+    #[tokio::test]
+    async fn compaction_reaches_only_the_callers_own_conversations() {
+        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_USER_ID};
+        let tmp = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(tmp.path()).await;
+        let tool = super::CompactionTool::new(std::sync::Arc::clone(&service));
+        let agent = service.agent_id.as_str();
+        let sams = service
+            .sessions
+            .get_or_create("desk", "sam", agent)
+            .unwrap();
+        let mias = service
+            .sessions
+            .get_or_create("desk", "mia", agent)
+            .unwrap();
+        let boss = service
+            .sessions
+            .get_or_create("desk:boss:k", "sam", agent)
+            .unwrap();
+        let run = |input: serde_json::Value| {
+            let tool = &tool;
+            let current = sams.id.clone();
+            CURRENT_USER_ID.scope(
+                "sam".to_string(),
+                CURRENT_SESSION_ID
+                    .scope(current, async move { tool.execute(input).await.unwrap() }),
+            )
+        };
+        let ok = run(serde_json::json!({ "action": "status" })).await;
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!(ok.output["session_id"], sams.id);
+        for input in [
+            serde_json::json!({ "action": "status", "session_id": mias.id }),
+            serde_json::json!({ "action": "compact", "session_id": mias.id }),
+            serde_json::json!({ "action": "status", "session_id": boss.id }),
+            serde_json::json!({ "action": "compact", "session_channel": "desk:boss:k" }),
+            serde_json::json!({ "action": "status", "channel": "slack:T1:C9", "user": "mia" }),
+        ] {
+            let refused = run(input.clone()).await;
+            assert!(!refused.success, "{input}");
+        }
+        assert!(service
+            .sessions
+            .find("slack:T1:C9", "mia")
+            .unwrap()
+            .is_none());
+        assert!(service
+            .sessions
+            .find("slack:T1:C9", "sam")
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn config_get_returns_defaults() {

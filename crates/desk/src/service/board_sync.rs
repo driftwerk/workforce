@@ -652,6 +652,11 @@ impl Desk {
         };
         match s.system {
             System::Jira => {
+                // A shared key's "assigned to me" is whom the person's
+                // verified email names, never the key's owner.
+                let shared_me =
+                    s.me.as_deref()
+                        .filter(|_| s.me_source == Some(board::MeSource::VouchedByEmail));
                 let mut page: Option<String> = None;
                 for n in 0.. {
                     if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
@@ -659,7 +664,7 @@ impl Desk {
                         break;
                     }
                     let mut args = json!({
-                        "jql": crate::board_sync::jql(&s.target, &s.filter, since),
+                        "jql": crate::board_sync::jql(&s.target, &s.filter, since, shared_me),
                         "max_results": crate::board_sync::PAGE,
                         "fields": crate::board_sync::JIRA_FIELDS,
                     });
@@ -1443,6 +1448,11 @@ impl Desk {
                     s.me_name = Some(me.name);
                     s.me_source = Some(board::MeSource::Vouched);
                 }
+                crate::board_sync::Who::ByEmail(me) => {
+                    s.me = Some(me.id);
+                    s.me_name = Some(me.name);
+                    s.me_source = Some(board::MeSource::VouchedByEmail);
+                }
                 // A vouched id the hub no longer stands behind is dropped;
                 // one the person typed is theirs to keep.
                 _ if s.me_source == Some(board::MeSource::Typed) => {}
@@ -1509,7 +1519,7 @@ impl Desk {
         // never one first learnt here, so a link the person said isn't them
         // (or one the hub couldn't vouch for) stays as they left it.
         let known = match (s.me_source, s.me.as_deref()) {
-            (Some(board::MeSource::Vouched), Some(known)) => known.to_string(),
+            (Some(source), Some(known)) if source.vouched() => known.to_string(),
             _ => {
                 tracing::info!(
                     board = %b.id,
@@ -1527,8 +1537,8 @@ impl Desk {
             .await
             .map_err(&said)?;
         let me = match who {
-            Who::Person(me) if me.id == known => me,
-            Who::Person(me) => {
+            Who::Person(me) | Who::ByEmail(me) if me.id == known => me,
+            Who::Person(me) | Who::ByEmail(me) => {
                 return Err(DeskError::Conflict(format!(
                     "{hub} now says you are {} on {title}, not who this board knew: nothing was assigned. Check who you are on the board, then take it.",
                     me.name

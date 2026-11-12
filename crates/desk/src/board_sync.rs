@@ -33,6 +33,16 @@ pub fn identity_tool(system: System) -> &'static str {
     }
 }
 
+/// The hub's tool that names the one user on `system` with the email the
+/// person's sign-in verified, for a shared key: no arguments, zero or one
+/// user, matched on the hub.
+pub fn by_email_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "identity.jira_user_by_my_email",
+        System::Linear => "identity.linear_member_by_my_email",
+    }
+}
+
 /// The tools a ticket's view of `system`'s issue calls when the hub offers
 /// them ([`workforce_core::desk::BOARD_SYNC_VIEW_TOOLS`]).
 pub fn view_tools(system: System) -> Vec<&'static str> {
@@ -44,11 +54,11 @@ pub fn view_tools(system: System) -> Vec<&'static str> {
         .collect()
 }
 
-/// Every tool `system`'s sync may call: the ones it needs, the one that
-/// says who the person is, and the ones a ticket's view reads with.
+/// Every tool `system`'s sync may call: the ones it needs, the ones that
+/// say who the person is there, and the ones a ticket's view reads with.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
-    all.push(identity_tool(system));
+    all.extend([identity_tool(system), by_email_tool(system)]);
     all.extend(view_tools(system));
     all
 }
@@ -336,7 +346,10 @@ fn linear_query(q: &str) -> Result<serde_json::Map<String, Value>, String> {
 /// The JQL a filter means for `project`, from `since` (a cursor, which is
 /// an `updated` time): the project clause outside the filter's own
 /// parentheses, oldest change first.
-pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
+/// `shared_me`: the person's Jira accountId when the hub's key is shared
+/// (matched by their verified email): "assigned to me" is then them, never
+/// `currentUser()`, which is whoever owns the key.
+pub fn jql(project: &str, f: &Filter, since: Option<&str>, shared_me: Option<&str>) -> String {
     let filter = match f {
         // A change since the cursor comes in whatever its state, so an
         // issue on the board that is done or cancelled there moves here;
@@ -349,7 +362,10 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
             "statusCategory != Done OR statusCategoryChangedDate >= -{}d",
             crate::board::DONE_WITHIN_DAYS
         ),
-        Filter::AssignedToMe => "assignee = currentUser()".to_string(),
+        Filter::AssignedToMe => match shared_me.filter(|m| check_me(System::Jira, m).is_ok()) {
+            Some(me) => format!("assignee = \"{me}\""),
+            None => "assignee = currentUser()".to_string(),
+        },
         Filter::CurrentCycle => "sprint in openSprints()".to_string(),
         Filter::Label(l) => format!("labels = \"{}\"", l.trim()),
         Filter::Query(q) => q.trim().to_string(),
@@ -465,9 +481,13 @@ pub fn linear_pages(answer: &Value) -> bool {
 pub enum Who {
     /// Their own key answered: this is them.
     Person(Assignee),
+    /// The key is shared, and exactly one user there has the email the
+    /// person's sign-in provider verified: this is them.
+    ByEmail(Assignee),
     /// The key is shared (an agent's, the hub's): it says who owns the key,
-    /// never who the person is.
-    Shared,
+    /// never who the person is; and no one user there has their verified
+    /// email, for this reason.
+    Shared(NoMatch),
     /// The hub doesn't offer the tool, held it, or didn't say whose key it
     /// used (an older hub).
     Unsaid,
@@ -478,8 +498,14 @@ impl Who {
     pub fn why_not(&self, hub: &str, system: System) -> Option<String> {
         let title = system.title();
         match self {
-            Self::Person(_) => None,
-            Self::Shared => Some(format!(
+            Self::Person(_) | Self::ByEmail(_) => None,
+            Self::Shared(NoMatch::EmailHidden) => Some(format!(
+                "{hub} uses a shared {title} key, and {title} doesn't show your email to the shared key, so it can't say who you are."
+            )),
+            Self::Shared(NoMatch::Stale) => Some(format!(
+                "{hub} uses a shared {title} key, and it hasn't confirmed your email lately: sign in to {hub} again so it can say who you are."
+            )),
+            Self::Shared(_) => Some(format!(
                 "{hub} uses a shared {title} key, so it can't say who you are."
             )),
             Self::Unsaid => Some(format!(
@@ -490,16 +516,90 @@ impl Who {
     }
 }
 
-/// Who the person is on `system`, as the hub's identity tool says. Only an
-/// offline hub or a refused token is an error.
-pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
-    match call(remote, system, identity_tool(system), json!({})).await {
-        Ok(answer) => Ok(identity_of(system, &answer)),
-        Err(
-            e @ (RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }),
-        ) => Err(e),
-        Err(_) => Ok(Who::Unsaid),
+impl Who {
+    /// The person, when it says who they are.
+    pub fn person(&self) -> Option<&Assignee> {
+        match self {
+            Self::Person(a) | Self::ByEmail(a) => Some(a),
+            Self::Shared(_) | Self::Unsaid => None,
+        }
     }
+}
+
+/// Whether `e` stops the asking: the hub is away, or the token refused.
+fn stops(e: &RemoteError) -> bool {
+    matches!(
+        e,
+        RemoteError::Offline(_) | RemoteError::NoToken | RemoteError::RateLimited { .. }
+    )
+}
+
+/// Who the person is on `system`, as the hub's identity tool says: their own
+/// key's user; else, where the key is shared, the one user there with the
+/// email the person's sign-in provider verified. Only an offline hub or a
+/// refused token is an error.
+pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
+    let who = match call(remote, system, identity_tool(system), json!({})).await {
+        Ok(answer) => identity_of(system, &answer),
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => Who::Unsaid,
+    };
+    match who {
+        Who::Shared(_) => by_email(remote, system).await,
+        who => Ok(who),
+    }
+}
+
+/// Why a shared key named no one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoMatch {
+    /// The hub can't match by email (an older one, or its tool failed).
+    Unasked,
+    /// The person has no verified email there.
+    NoVerifiedEmail,
+    /// Their verified email is too old: a sign-in renews it.
+    Stale,
+    /// No user there has it.
+    Nobody,
+    /// More than one user there has it.
+    Several,
+    /// The system hides users' emails from the shared key (Jira, often).
+    EmailHidden,
+}
+
+/// The one user on `system` with the email the hub's sign-in provider
+/// verified for the person, as the hub's own tool finds them (matched there:
+/// the directory never leaves the hub): `Shared` with why when there's
+/// none.
+async fn by_email(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
+    let answer = match call(remote, system, by_email_tool(system), json!({})).await {
+        Ok(a) => a,
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => return Ok(Who::Shared(NoMatch::Unasked)),
+    };
+    Ok(by_email_of(system, &answer))
+}
+
+/// What the hub's by-email tool answered, as who the person is.
+pub fn by_email_of(system: System, answer: &Value) -> Who {
+    let user = &answer["user"];
+    if let Some(id) = user["id"].as_str() {
+        let id = id.trim().to_string();
+        if check_me(system, &id).is_ok() {
+            return Who::ByEmail(Assignee {
+                name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
+                id,
+            });
+        }
+    }
+    Who::Shared(match answer["why"].as_str() {
+        Some("no_verified_email") => NoMatch::NoVerifiedEmail,
+        Some("stale") => NoMatch::Stale,
+        Some("several") => NoMatch::Several,
+        Some("email_hidden") => NoMatch::EmailHidden,
+        Some("none") => NoMatch::Nobody,
+        _ => NoMatch::Unasked,
+    })
 }
 
 /// The person as `system`'s identity tool answered: them only when it says
@@ -508,7 +608,7 @@ pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, Remote
 pub fn identity_of(system: System, answer: &Value) -> Who {
     match answer.get("personal").and_then(Value::as_bool) {
         Some(true) => {}
-        Some(false) => return Who::Shared,
+        Some(false) => return Who::Shared(NoMatch::Unasked),
         None => return Who::Unsaid,
     }
     let (id, name) = match system {

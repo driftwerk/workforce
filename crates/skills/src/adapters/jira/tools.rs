@@ -1618,6 +1618,7 @@ impl Tool for JiraSearchUsersTool {
                             "display_name": u["displayName"],
                             "email": u["emailAddress"],
                             "active": u["active"],
+                            "account_type": u["accountType"],
                         })
                     })
                     .collect();

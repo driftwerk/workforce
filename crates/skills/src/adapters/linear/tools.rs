@@ -2523,6 +2523,10 @@ impl Tool for LinearMembersListTool {
                     "minimum": 1,
                     "maximum": 250
                 },
+                "email": {
+                    "type": "string",
+                    "description": "Only the members with exactly this email (any case)"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -2552,7 +2556,29 @@ impl Tool for LinearMembersListTool {
 
         let limit = coerce_to_u64(&input["limit"]).unwrap_or(100).min(250);
 
-        let query = r#"
+        // An email, when given, is a variable: never written into the query.
+        let email = input["email"]
+            .as_str()
+            .map(str::trim)
+            .filter(|e| !e.is_empty());
+        let query = match email {
+            Some(_) => {
+                r#"
+            query($first: Int!, $email: String!) {
+                users(first: $first, filter: { email: { eqIgnoreCase: $email } }) {
+                    nodes {
+                        id
+                        name
+                        email
+                        displayName
+                        active
+                    }
+                }
+            }
+        "#
+            }
+            None => {
+                r#"
             query($first: Int!) {
                 users(first: $first) {
                     nodes {
@@ -2564,9 +2590,14 @@ impl Tool for LinearMembersListTool {
                     }
                 }
             }
-        "#;
+        "#
+            }
+        };
 
-        let variables = serde_json::json!({ "first": limit });
+        let variables = match email {
+            Some(e) => serde_json::json!({ "first": limit, "email": e }),
+            None => serde_json::json!({ "first": limit }),
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match client.query(query, variables).await {

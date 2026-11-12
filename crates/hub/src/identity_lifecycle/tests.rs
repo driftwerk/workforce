@@ -1677,3 +1677,61 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
     )
     .await;
 }
+
+/// A merge moves a verified email only together with the sign-in it came
+/// from; suspending someone forgets theirs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension() {
+    use crate::oidc::{OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY, OIDC_VERIFIED_EMAIL_KEY};
+    let hub = hub().await;
+    let admin = hub.admin();
+    let at = chrono::Utc::now().to_rfc3339();
+    let signed_in = |name: &str, sub: Option<&str>, email: &str| {
+        let mut who = Identity::new(name, IdentityRole::Member)
+            .with_linked_id(OIDC_VERIFIED_EMAIL_KEY, email)
+            .with_linked_id(OIDC_VERIFIED_AT_KEY, &at);
+        if let Some(sub) = sub {
+            who = who.with_linked_id(OIDC_LINKED_ID_KEY, sub);
+        }
+        hub.identities.create(&who).unwrap();
+        who
+    };
+    // Into someone with no sign-in of their own: it moves with the sign-in.
+    let ada = signed_in("Ada", Some("sub-ada"), "ada@example.com");
+    let bo = hub.person("Bo", "U-BO");
+    hub.lifecycle
+        .merge(ada.id, bo.id, &admin, false)
+        .await
+        .unwrap();
+    let bo = hub.identities.get_by_id(bo.id).unwrap().unwrap();
+    assert_eq!(
+        bo.linked_ids.get(OIDC_LINKED_ID_KEY).map(String::as_str),
+        Some("sub-ada")
+    );
+    assert_eq!(
+        crate::oidc::verified_email(&bo).as_deref(),
+        Some("ada@example.com")
+    );
+    // Into someone with their own sign-in: theirs stands, and the source's
+    // verified email doesn't come with nothing to vouch for it.
+    let cy = signed_in("Cy", Some("sub-cy"), "cy@example.com");
+    let di = signed_in("Di", None, "di@example.com");
+    let ed = hub.person("Ed", "U-ED");
+    hub.lifecycle
+        .merge(di.id, ed.id, &admin, false)
+        .await
+        .unwrap();
+    let ed = hub.identities.get_by_id(ed.id).unwrap().unwrap();
+    assert_eq!(
+        crate::oidc::verified_email(&ed),
+        None,
+        "no sign-in moved, so no email"
+    );
+    // Suspending forgets it.
+    hub.lifecycle.suspend(cy.id, &admin).await.unwrap();
+    let cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();
+    assert!(!cy
+        .linked_ids
+        .keys()
+        .any(|k| crate::oidc::is_verified_key(k)));
+}
