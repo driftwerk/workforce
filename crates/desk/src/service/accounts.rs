@@ -878,6 +878,13 @@ impl Desk {
     pub async fn sign_in_again(&self, id: Uuid, again: SignInAgain) -> Result<Added, DeskError> {
         let keys = Arc::clone(self.keys()?);
         let account = self.account(id)?;
+        // As adding one: only an engine whose accounts sign in by a token.
+        if engine::caps(account.engine, View::Terminal).accounts != AccountsVia::Token {
+            return Err(DeskError::Invalid(format!(
+                "Desk can't sign {} accounts in yet",
+                account.engine.title()
+            )));
+        }
         match again
             .token
             .as_deref()
@@ -904,24 +911,62 @@ impl Desk {
     }
 
     /// Keeps a checked token for account `id`, which is signed in again.
-    async fn renew_account(
+    ///
+    /// The new sign-in may be another Anthropic account than the one it
+    /// was, so what Desk knew of which one it is goes: its link (the
+    /// person's word, or a match by usage), its usage prints and its plan's
+    /// standing. They are learned again from what it reports next.
+    ///
+    /// An account removed while it signed in leaves no sign-in behind:
+    /// [`Desk::remove_account`] takes it out of the list before it deletes
+    /// its sign-in, and this keeps the token before it looks at the list,
+    /// so either the removal deletes what this kept, or this sees it gone
+    /// and deletes it itself.
+    pub(super) async fn renew_account(
         &self,
         keys: Arc<dyn accounts::Keys>,
         id: Uuid,
         token: &AccountToken,
     ) -> Result<Account, DeskError> {
         let account = self.account(id)?;
-        let kept = token.clone();
-        tokio::task::spawn_blocking(move || keys.set(id, &kept))
+        let (kept, store) = (token.clone(), Arc::clone(&keys));
+        tokio::task::spawn_blocking(move || store.set(id, &kept))
             .await
             .map_err(|e| DeskError::Internal(e.into()))?
             .map_err(DeskError::Internal)?;
-        {
+        let still = {
             let mut st = self.0.state.lock();
-            st.signed_in_accounts.insert(id);
-            st.sign_in_problems.remove(&id);
+            let still = st.accounts.iter().any(|a| a.id == id);
+            if still {
+                st.signed_in_accounts.insert(id);
+                st.sign_in_problems.remove(&id);
+                st.links.remove(&id);
+                st.prints.remove(&super::identities::Raw::Account(id));
+                st.standing.remove(&Some(id));
+            }
+            still
+        };
+        if !still {
+            if let Err(e) = tokio::task::spawn_blocking(move || keys.delete(id))
+                .await
+                .map_err(|e| eyre::eyre!(e))
+                .and_then(|r| r)
+            {
+                tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't delete the sign-in of an account removed while it signed in");
+            }
+            return Err(DeskError::Invalid(
+                "that account was removed while it signed in".into(),
+            ));
         }
+        self.0
+            .store
+            .put_account_link(id, None)
+            .await
+            .map_err(DeskError::Internal)?;
+        self.keep_prints();
+        self.keep_standing();
         self.announce_accounts();
+        self.accounts_moved().await;
         tracing::info!(account = %id, "engine account signed in again");
         Ok(account)
     }
@@ -1311,6 +1356,9 @@ impl Desk {
             .await
             .map_err(DeskError::Internal)?;
         let store = self.accounts_store().unwrap_or("the store");
+        // Out of the list before its sign-in is deleted: a sign-in again
+        // finishing meanwhile then sees it gone ([`Desk::renew_account`]).
+        self.0.state.lock().accounts.retain(|o| o.id != id);
         // Why its sign-in couldn't be deleted, if it couldn't.
         let not_deleted: Option<String> = match self.keys().map(Arc::clone) {
             Ok(keys) => match tokio::task::spawn_blocking(move || keys.delete(id)).await {
