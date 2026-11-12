@@ -370,6 +370,12 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                 true,
             ),
         ],
+        // Only ever its own settings, whichever boss it names: a card for
+        // the person, never another scope's boss changed.
+        super::super::own_settings::NAME => vec![(
+            json!({ "agent_id": other.boss, "budget_usd_per_day": 50, "reason": r }),
+            false,
+        )],
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }
@@ -441,8 +447,18 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
         kept_out(&c.desk, &c.acme, ACME_SECRET, main, dir.path()).await;
         kept_out(&c.desk, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
 
-        // Nothing it was refused became a suggestion, a message or a move.
+        // Nothing it was refused became a suggestion, a message or a move;
+        // asking for settings asked for its own.
         let after = c.d.store().suggestions(100).await.unwrap();
+        for s in after.iter().skip(suggestions) {
+            if s.action["tool"] == super::super::own_settings::NAME {
+                assert_eq!(
+                    s.action["input"]["agent_id"].as_str(),
+                    Some(s.agent_id.as_str()),
+                    "{s:?}"
+                );
+            }
+        }
         let outside = [
             c.acme.session.id.to_string(),
             c.atlas.session.id.to_string(),

@@ -701,6 +701,48 @@ const GATED_TOOLS: [&str; 11] = [
     "playbook",
 ];
 
+/// A boss conversation's turn is told nothing of the agent's environments
+/// or MCP workspaces; any other conversation's is.
+#[tokio::test]
+async fn a_boss_turn_hears_of_no_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let service = plain_service(tmp.path()).await;
+    std::fs::create_dir_all(&service.workspace).unwrap();
+    std::fs::write(
+        service
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG),
+        "[environments]\nenabled = true\ndefault = \"staging\"\n\n[environments.defs.staging]\ndescription = \"Staging\"\n",
+    )
+    .unwrap();
+    crate::reconfigure::apply_config(&service).await.unwrap();
+    let prompt = |session: Session| {
+        let service = Arc::clone(&service);
+        async move {
+            service.sessions.save(&session).unwrap();
+            let p = crate::turn_loop::build_enhanced_prompt_with_context(
+                &service,
+                Some(&session.id),
+                Some("alice"),
+                true,
+                Some("hello"),
+                None,
+                PromptPrivacy::Private,
+                false,
+                PromptSurface::Full,
+            )
+            .await;
+            format!("{}{}", p.stable, p.turn_context)
+        }
+    };
+    let dm = prompt(Session::new("desk", "alice", service.agent_id.as_str())).await;
+    assert!(dm.contains("Active environment: staging"), "{dm}");
+    let mut boss = Session::new("desk:boss:k", "alice", service.agent_id.as_str());
+    boss.metadata = serde_json::json!({ "desk_boss": { "groupKey": "k" } });
+    let boss = prompt(boss).await;
+    assert!(!boss.contains("Active environment"), "{boss}");
+}
+
 async fn stable_prompt(service: &AgentService, surface: PromptSurface<'_>) -> String {
     crate::turn_loop::build_enhanced_prompt_with_context(
         service,

@@ -38,6 +38,19 @@ pub fn is_desk_room(channel: &str) -> bool {
     room_slug(channel).is_some()
 }
 
+/// What the channel of a Desk group's boss conversation on a boss hub
+/// starts with (remote bosses): `desk:boss:<the hub's group key>`. Not a
+/// room ([`is_desk_room`] refuses its `:`), and only a link makes one.
+pub const DESK_BOSS_PREFIX: &str = "desk:boss:";
+
+/// Whether `channel` is, or claims to be, a Desk group's boss conversation:
+/// any case of [`DESK_BOSS_PREFIX`].
+pub fn is_desk_boss_channel(channel: &str) -> bool {
+    channel
+        .get(..DESK_BOSS_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(DESK_BOSS_PREFIX))
+}
+
 /// Whether `channel` is one of Desk's: a DM or a room.
 pub fn is_desk_conversation(channel: &str) -> bool {
     channel == DESK_CHANNEL || is_desk_room(channel)
@@ -878,10 +891,19 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
 ];
 
 /// Who the person is on Jira (`jira.myself`) and on Linear
-/// (`linear.viewer`): what "assigned to me", Mine and Take it go by. A
-/// board's sync calls them when its hub offers them and never needs them:
-/// a hub without them still syncs, and its board asks for the id instead.
-pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &["jira.myself", "linear.viewer"];
+/// (`linear.viewer`): what "assigned to me", Mine and Take it go by. Where
+/// the hub's key is shared, the one user there with the email the person's
+/// sign-in provider verified (`identity.jira_user_by_my_email`,
+/// `identity.linear_member_by_my_email`: no arguments, zero or one user, matched on
+/// the hub, never the directory). A board's sync calls them when its hub
+/// offers them and never needs them: a hub without them still syncs, and its
+/// board asks for the id instead. All read-only.
+pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &[
+    "jira.myself",
+    "identity.jira_user_by_my_email",
+    "linear.viewer",
+    "identity.linear_member_by_my_email",
+];
 
 #[cfg(test)]
 mod tests {
@@ -892,6 +914,17 @@ mod tests {
 
     fn room_id() -> Uuid {
         Uuid::parse_str(ROOM).unwrap()
+    }
+
+    #[test]
+    fn a_boss_channel_is_no_room_and_is_told_in_any_case() {
+        for c in ["desk:boss:abc", "DESK:Boss:abc", "desk:boss:"] {
+            assert!(is_desk_boss_channel(c), "{c}");
+            assert!(!is_desk_conversation(c), "{c}");
+        }
+        for c in ["desk", "desk:boss", "desk:bossy", "slack:desk:boss:x", "dé"] {
+            assert!(!is_desk_boss_channel(c), "{c}");
+        }
     }
 
     fn in_room(thread: Option<Uuid>) -> DeskPlace {

@@ -159,7 +159,7 @@ pub fn select_visible_other_sessions<'a>(
         .filter(|s| s.message_count() > 0)
         .filter(|s| s.updated_at > cutoff)
         // A boss's talk in a group it has left stays with that group.
-        .filter(|s| !s.left_behind())
+        .filter(|s| !s.kept_apart())
         .collect()
 }
 

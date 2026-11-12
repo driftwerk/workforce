@@ -30,7 +30,23 @@ pub const GROUP_TAG_PREFIX: &str = "desk-group:";
 
 /// The tag of the scope of `group` (none: everything ungrouped).
 pub fn group_tag(group: Option<&str>) -> String {
-    format!("{GROUP_TAG_PREFIX}{}", group.unwrap_or("ungrouped"))
+    match group {
+        // Never a boss conversation's tag ([`link_boss_tag`]).
+        Some(g) if g.starts_with("boss/") => format!("{GROUP_TAG_PREFIX}_{g}"),
+        g => format!("{GROUP_TAG_PREFIX}{}", g.unwrap_or("ungrouped")),
+    }
+}
+
+/// What the tags of a Desk group's boss conversations on a boss hub start
+/// with (remote bosses, RB6a).
+pub const LINK_BOSS_TAG_PREFIX: &str = "desk-group:boss/";
+
+/// The tag of the Desk group `group_key`'s boss conversations on a boss
+/// hub. A fence of it is strict: it admits only memories with its tag, never
+/// untagged ones, so what the agent learned elsewhere doesn't reach the
+/// group's work (decision 3).
+pub fn link_boss_tag(group_key: &str) -> String {
+    format!("{LINK_BOSS_TAG_PREFIX}{group_key}")
 }
 
 /// Whose memory an agent's is now.
@@ -60,6 +76,11 @@ impl Fence {
     pub fn admits(&self, tags: &[String]) -> bool {
         let mut scoped = tags.iter().filter(|t| t.starts_with(GROUP_TAG_PREFIX));
         match self {
+            // A boss conversation's: its own tag alone, never untagged.
+            Fence::Boss(own) if own.starts_with(LINK_BOSS_TAG_PREFIX) => {
+                let scoped: Vec<&String> = scoped.collect();
+                !scoped.is_empty() && scoped.iter().all(|t| *t == own)
+            }
             Fence::Boss(own) => scoped.all(|t| t == own),
             Fence::Open | Fence::Unknown => scoped.next().is_none(),
         }
@@ -449,6 +470,23 @@ mod tests {
             1,
             "a count under Open skips scoped ones"
         );
+    }
+
+    #[test]
+    fn a_boss_conversations_fence_admits_its_own_tag_alone() {
+        let acme = Fence::Boss(link_boss_tag("k-acme"));
+        assert!(acme.admits(&[link_boss_tag("k-acme")]));
+        assert!(!acme.admits(&[]), "nothing learned elsewhere");
+        assert!(!acme.admits(&["notes".into()]));
+        assert!(!acme.admits(&[link_boss_tag("k-globex")]));
+        assert!(!acme.admits(&[group_tag(Some("acme"))]));
+        assert!(acme.own_only());
+        // No local group's tag is ever one.
+        assert_ne!(group_tag(Some("boss/k-acme")), link_boss_tag("k-acme"));
+        // Every other turn of the agent recalls nothing a boss conversation
+        // learned.
+        assert!(!Fence::Open.admits(&[link_boss_tag("k-acme")]));
+        assert!(!Fence::Boss(group_tag(Some("acme"))).admits(&[link_boss_tag("k-acme")]));
     }
 
     #[test]

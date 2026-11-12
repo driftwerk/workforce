@@ -1752,7 +1752,7 @@ async fn execute_compact(service: &Arc<AgentService>, channel: &str, user: &str)
 
     // Build compaction engine with memory writer
     let compaction_config = service.current_compaction_config();
-    let memory_writer = crate::notes_tool::memory_writer(service);
+    let memory_writer = crate::notes_tool::memory_writer(service, &session);
     let engine = workforce_agent::compaction::CompactionEngine::with_memory_writer(
         compaction_config,
         Arc::clone(&service.llm),

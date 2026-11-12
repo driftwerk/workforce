@@ -283,6 +283,7 @@ impl Desk {
                 state: floor::boss_state(view, &b.agent),
                 paused: self.agent_held(&b.agent).filter(|why| !why.is_empty()),
                 spend: b.scope.group().and_then(|g| spend.get(g).cloned()),
+                act_fully: self.full_budget_of(&b.agent),
                 scope: b.scope,
                 agent: b.agent,
                 name: b.name,

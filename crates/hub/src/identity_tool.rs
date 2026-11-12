@@ -39,7 +39,8 @@ impl Tool for WhoAmIIdentityTool {
         "Report who you are talking to and what they are allowed to do: returns \
          identity_id, display_name, role (member / system_admin), and a \
          per-capability decision view (allow / ask / deny) from the live \
-         authorization matrix. Use it to answer 'what can I do' or to check \
+         authorization matrix, and the email their sign-in provider verified \
+         (verified_email; null when none). Use it to answer 'what can I do' or to check \
          whether the current user may perform an admin action before you try."
     }
 
@@ -116,6 +117,8 @@ impl Tool for WhoAmIIdentityTool {
                 "display_name": identity.display_name,
                 "role": identity.effective_role_key(),
                 "capabilities": capabilities.capabilities,
+                // Only what an OIDC provider verified: never a typed email.
+                "verified_email": crate::oidc::verified_email(&identity),
             }),
             elapsed(),
         ))
@@ -220,6 +223,35 @@ mod tests {
         assert_eq!(decision_for(&out, "own_data_rw"), "allow");
         assert_eq!(decision_for(&out, "agents_manage"), "deny");
         assert_eq!(decision_for(&out, "vault_shared_delete"), "deny");
+    }
+
+    /// Only the email the sign-in provider verified, lately, is reported;
+    /// an identity's own (typed) email never is.
+    #[tokio::test]
+    async fn whoami_reports_only_the_verified_email() {
+        let store = Arc::new(InMemoryStore::default());
+        let mut identity = Identity::new("Sam", IdentityRole::Member);
+        identity.email = Some("typed@example.com".into());
+        identity.linked_ids.insert(
+            crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+            "sam@example.com".into(),
+        );
+        identity.linked_ids.insert(
+            crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        let mut typed = Identity::new("Typed", IdentityRole::Member);
+        typed.email = Some("typed@example.com".into());
+        store.create(&identity).unwrap();
+        store.create(&typed).unwrap();
+        let tool = make_tool(store as Arc<dyn IdentityStore>);
+        let ask = |id: Uuid| {
+            workforce_agent::runner::CURRENT_USER_ID.scope(id.to_string(), async {
+                tool.execute(json!({})).await.unwrap().output
+            })
+        };
+        assert_eq!(ask(identity.id).await["verified_email"], "sam@example.com");
+        assert_eq!(ask(typed.id).await["verified_email"], Value::Null);
     }
 
     #[tokio::test]
