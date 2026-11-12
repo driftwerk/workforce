@@ -1107,6 +1107,7 @@ mod tests {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         };
         DeskTurnContext::new(
             turn,

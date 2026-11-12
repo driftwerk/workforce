@@ -835,6 +835,29 @@ pub const DESK_CLOSED_KEY: &str = "desk_closed";
 pub const SHARED_OWNER_PREFIX: &str = "shared:";
 
 impl SessionMessage {
+    /// A person's message, new now, under the client's own id when it has
+    /// one.
+    pub fn user(
+        content: &str,
+        external_id: Option<&str>,
+        attachments: Option<Vec<SessionAttachment>>,
+        trust_level: Option<crate::trust::TrustLevel>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: MessageRole::User,
+            content: content.to_string(),
+            tool_data: None,
+            timestamp: Utc::now(),
+            tokens: estimate_tokens(content),
+            external_id: external_id.map(String::from),
+            attachments,
+            trust_level,
+            actor: None,
+            desk: None,
+        }
+    }
+
     /// The row recording one tool call: its input shrunk to the storage cap,
     /// its output, and how it went.
     pub fn tool(
@@ -1652,19 +1675,7 @@ impl Session {
         attachments: Option<Vec<SessionAttachment>>,
         trust_level: Option<crate::trust::TrustLevel>,
     ) -> String {
-        let msg = SessionMessage {
-            id: Uuid::new_v4().to_string(),
-            role: MessageRole::User,
-            content: content.to_string(),
-            tool_data: None,
-            timestamp: Utc::now(),
-            tokens: estimate_tokens(content),
-            external_id: external_id.map(String::from),
-            attachments,
-            trust_level,
-            actor: None,
-            desk: None,
-        };
+        let msg = SessionMessage::user(content, external_id, attachments, trust_level);
         let id = msg.id.clone();
         self.total_tokens += msg.tokens as u64;
         self.messages.push(msg);
@@ -3142,6 +3153,26 @@ pub trait SessionStore: Send + Sync {
     /// re-processing. Returns an error if the session or message is not found.
     fn truncate_from_message(&self, session_id: &str, message_id: &str) -> eyre::Result<()>;
 
+    /// Set aside `aside.from` and everything archived after it in the
+    /// session, up to `aside.newest`: gone from the archive, so no one reads
+    /// them again, and from the live context, so the agent doesn't either.
+    /// `aside.replacement`, when given, is saved in their place, in the
+    /// archive and the live context, in the same step: no reader ever finds
+    /// the old version gone and the new one missing. A Desk edit of the
+    /// person's latest message uses this for the reply to the old version.
+    ///
+    /// Refused with [`SetAsideStale`] when the newest archived message is no
+    /// longer `aside.newest`: something was said since the caller looked.
+    /// The live context loses the stretch from the first set-aside message
+    /// it still holds to the last; whatever it holds after that (a delivery
+    /// saved meanwhile) stays. Compaction may have folded `aside.from` into
+    /// a summary: its archive rows go all the same, the live context loses
+    /// only what it still holds of them, and the result says so
+    /// ([`SetAsideRows::compacted`]). A store with no separate archive sets
+    /// aside from the live messages. An unknown session or message is an
+    /// error.
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows>;
+
     /// Redact secrets at rest in a session's stored messages (and, for
     /// stores that keep one, its archive), reusing the ingress pattern
     /// catalogue. Idempotent. With `dry_run`, computes the stats without
@@ -3773,6 +3804,33 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
+        // No archive of its own: the live messages are what is read.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        let from = set_aside_start(&session.messages, aside)?;
+        let removed: Vec<SessionMessage> = session.messages.drain(from..).collect();
+        let removed_tokens: u64 = removed.iter().map(|m| u64::from(m.tokens)).sum();
+        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
+        if let Some(replacement) = aside.replacement {
+            session.total_tokens += u64::from(replacement.tokens);
+            session.messages.push(replacement.clone());
+        }
+        session.updated_at = chrono::Utc::now();
+        Ok(SetAsideRows {
+            entries: removed
+                .iter()
+                .map(|m| message_to_transcript_entry(session_id, m))
+                .collect(),
+            compacted: false,
+        })
+    }
+
     fn append_to_archive(&self, _session_id: &str, _message: &SessionMessage) -> eyre::Result<()> {
         Ok(())
     }
@@ -3814,6 +3872,69 @@ impl SessionStore for InMemorySessionStore {
             .and_then(|session| session.messages.iter().find(|m| m.id == message_id))
             .map(|msg| message_to_transcript_entry(session_id, msg)))
     }
+}
+
+/// What [`SessionStore::set_aside_from`] sets aside, and in its place.
+#[derive(Debug, Clone, Copy)]
+pub struct SetAside<'a> {
+    /// The first message set aside.
+    pub from: &'a str,
+    /// The newest message the caller saw archived: the last set aside.
+    pub newest: &'a str,
+    /// Saved in their place, in the same step.
+    pub replacement: Option<&'a SessionMessage>,
+}
+
+/// What [`SessionStore::set_aside_from`] set aside.
+#[derive(Debug, Clone)]
+pub struct SetAsideRows {
+    /// The archive rows set aside, oldest first, each with its Desk mark.
+    pub entries: Vec<TranscriptEntry>,
+    /// The live context no longer held the first of them: compaction had
+    /// folded it into a summary, which may still speak of it.
+    pub compacted: bool,
+}
+
+/// Something was archived after the newest message a set-aside named.
+#[derive(Debug)]
+pub struct SetAsideStale;
+
+impl std::fmt::Display for SetAsideStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the conversation changed since it was read")
+    }
+}
+
+impl std::error::Error for SetAsideStale {}
+
+/// Cut from the live `messages` the stretch from the first one in
+/// `set_aside` to the last, returning the tokens it took and whether the
+/// first set-aside message was among them (else compaction folded it away).
+fn cut_set_aside(messages: &mut Vec<SessionMessage>, set_aside: &[String]) -> (u64, bool) {
+    let held = |m: &SessionMessage| set_aside.contains(&m.id);
+    let compacted = !messages.iter().any(|m| set_aside.first() == Some(&m.id));
+    let (Some(first), Some(last)) = (
+        messages.iter().position(held),
+        messages.iter().rposition(held),
+    ) else {
+        return (0, compacted);
+    };
+    let tokens = messages
+        .drain(first..=last)
+        .map(|m| u64::from(m.tokens))
+        .sum();
+    (tokens, compacted)
+}
+
+/// Where `from` is among `messages`, the newest of which must be `newest`.
+fn set_aside_start(messages: &[SessionMessage], aside: &SetAside<'_>) -> eyre::Result<usize> {
+    if messages.last().map(|m| m.id.as_str()) != Some(aside.newest) {
+        return Err(SetAsideStale.into());
+    }
+    messages
+        .iter()
+        .position(|m| m.id == aside.from)
+        .ok_or_else(|| eyre::eyre!("Message not found: {}", aside.from))
 }
 
 // ─── Transcript Operations for InMemorySessionStore ───
@@ -4905,6 +5026,55 @@ impl SessionStore for JsonlSessionStore {
         self.write_to_disk(&session_clone)
     }
 
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
+        self.hydrate_in_cache(session_id)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
+        let session = cache
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        let path = self.archive_path(session_id);
+        // A session from before its archive was seeded reads its live
+        // messages instead, so those are what is set aside.
+        let set_aside: Vec<SessionMessage> = if path.exists() {
+            let archived = self.read_archive_messages(session_id)?;
+            let from = set_aside_start(&archived, aside)?;
+            let mut kept = String::new();
+            for message in archived[..from].iter().chain(aside.replacement) {
+                kept.push_str(
+                    &serde_json::to_string(message)
+                        .map_err(|e| eyre::eyre!("Failed to serialize archive message: {e}"))?,
+                );
+                kept.push('\n');
+            }
+            atomic_write(&path, kept.as_bytes())?;
+            archived[from..].to_vec()
+        } else {
+            let from = set_aside_start(&session.messages, aside)?;
+            session.messages[from..].to_vec()
+        };
+        let ids: Vec<String> = set_aside.iter().map(|m| m.id.clone()).collect();
+        let (removed_tokens, compacted) = cut_set_aside(&mut session.messages, &ids);
+        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
+        if let Some(replacement) = aside.replacement {
+            session.total_tokens += u64::from(replacement.tokens);
+            session.messages.push(replacement.clone());
+        }
+        session.updated_at = chrono::Utc::now();
+        let session_clone = session.clone();
+        drop(cache);
+        self.write_to_disk(&session_clone)?;
+        Ok(SetAsideRows {
+            entries: set_aside
+                .iter()
+                .map(|m| message_to_transcript_entry(session_id, m))
+                .collect(),
+            compacted,
+        })
+    }
+
     fn append_to_archive(&self, session_id: &str, message: &SessionMessage) -> eyre::Result<()> {
         let path = self.archive_path(session_id);
         let mut file = crate::private_fs::private_file_options()
@@ -5433,6 +5603,154 @@ pub(crate) fn assert_owners_contract(store: &dyn SessionStore) {
     );
 }
 
+/// Setting aside from a message takes it and every later row out of the
+/// archive and the live context, keeps the earlier ones, saves the
+/// replacement in their place, and returns those set aside with their
+/// marks; refused, changing nothing, when the newest archived row is no
+/// longer the one named. With `archived`, the store keeps an archive apart
+/// from the live context: the message's live copy may have been compacted
+/// away (its archive rows go, the live context loses only what it holds of
+/// them, and says so), and a row the live context gained after them stays.
+#[cfg(test)]
+pub(crate) fn assert_set_aside_contract(store: &dyn SessionStore, archived: bool) {
+    use crate::channels::desk::{DeskMark, DeskStep};
+    let say = |role: MessageRole, text: &str| SessionMessage {
+        id: Uuid::new_v4().to_string(),
+        role,
+        content: text.to_string(),
+        tool_data: None,
+        timestamp: Utc::now(),
+        tokens: 3,
+        external_id: None,
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: None,
+    };
+    let contents = |store: &dyn SessionStore, id: &str| {
+        let archive: Vec<String> = store
+            .read_archive_page(id, None, 50)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|e| e.content)
+            .collect();
+        let live: Vec<String> = store
+            .get(id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        (archive, live)
+    };
+    let strings = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let mut session = store.get_or_create("desk", "alice", "agent-a").unwrap();
+    let second = say(MessageRole::User, "second");
+    let mut reply = say(MessageRole::Assistant, "sent");
+    reply.desk = Some(DeskMark {
+        steps: vec![DeskStep::of("email.send", true, 4)],
+        ..DeskMark::default()
+    });
+    for message in [
+        say(MessageRole::User, "first"),
+        say(MessageRole::Assistant, "hello"),
+        second.clone(),
+        reply.clone(),
+    ] {
+        store.append_to_archive(&session.id, &message).unwrap();
+        session.messages.push(message);
+    }
+    session.total_tokens = 12;
+    store.save(&session).unwrap();
+    let before = contents(store, &session.id);
+
+    // Something was said after the newest the caller saw: nothing changes.
+    let stale = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &second.id,
+                newest: &second.id,
+                replacement: None,
+            },
+        )
+        .unwrap_err();
+    assert!(stale.is::<SetAsideStale>(), "{stale}");
+    assert_eq!(contents(store, &session.id), before);
+
+    let edited = SessionMessage::user("second, edited", Some("client-3"), None, None);
+    let set_aside = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &second.id,
+                newest: &reply.id,
+                replacement: Some(&edited),
+            },
+        )
+        .unwrap();
+    let ids: Vec<&str> = set_aside.entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, [second.id.as_str(), reply.id.as_str()]);
+    assert_eq!(
+        set_aside.entries[1].desk, reply.desk,
+        "each comes with its mark"
+    );
+    assert!(!set_aside.compacted);
+    let now = strings(&["first", "hello", "second, edited"]);
+    assert_eq!(contents(store, &session.id), (now.clone(), now));
+    let live = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(
+        live.total_tokens,
+        6 + u64::from(edited.tokens),
+        "what was set aside no longer counts, its replacement does"
+    );
+    let gone = SetAside {
+        from: &second.id,
+        newest: &edited.id,
+        replacement: None,
+    };
+    assert!(store.set_aside_from(&session.id, &gone).is_err());
+
+    if !archived {
+        return;
+    }
+    // The question was compacted out of the live context, its answer was
+    // not, and a delivery reached the live context after the caller looked.
+    let mut session = live;
+    let third = say(MessageRole::User, "third");
+    let again = say(MessageRole::Assistant, "again");
+    for message in [&third, &again] {
+        store.append_to_archive(&session.id, message).unwrap();
+    }
+    session.messages = vec![
+        say(MessageRole::User, "[Compaction Summary] all of it"),
+        again.clone(),
+        say(MessageRole::Assistant, "a reminder"),
+    ];
+    store.save(&session).unwrap();
+    let set_aside = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &third.id,
+                newest: &again.id,
+                replacement: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(set_aside.entries.len(), 2);
+    assert!(set_aside.compacted, "the live context no longer held it");
+    assert_eq!(
+        contents(store, &session.id),
+        (
+            strings(&["first", "hello", "second, edited"]),
+            strings(&["[Compaction Summary] all of it", "a reminder"])
+        )
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id: &str) {
     let finished = |call: &str| JournalEntry {
@@ -5533,6 +5851,17 @@ mod tests {
     fn the_file_store_reassigns_owners_keeping_both_on_a_shared_channel() {
         let dir = tempfile::tempdir().unwrap();
         assert_reassign_owner_contract(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn the_in_memory_store_sets_aside_from_a_message() {
+        assert_set_aside_contract(&InMemorySessionStore::new(), false);
+    }
+
+    #[test]
+    fn the_file_store_sets_aside_from_a_message_in_its_archive_too() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_set_aside_contract(&JsonlSessionStore::new(dir.path()).unwrap(), true);
     }
 
     #[test]
