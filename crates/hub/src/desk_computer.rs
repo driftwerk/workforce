@@ -52,15 +52,14 @@ pub struct HubComputerGate {
 /// changes a page.
 pub const BROWSER_READS: &[&str] = workforce_skills::adapters::browser::READS;
 
-/// Whether `connector` is what a browser call is kept under: `browser…` in
-/// Desk's own, `chrome…` in the person's.
+/// Whether `connector` is what a browser call is kept under: a site in the
+/// person's Chrome (`chrome:<origin>`, `chrome-visit:<origin>`), or
+/// `chrome` itself.
 pub fn is_browser_key(connector: &str) -> bool {
-    ["browser", "chrome"].iter().any(|k| {
-        connector == *k
-            || connector
-                .strip_prefix(k)
-                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
-    })
+    connector == "chrome"
+        || connector
+            .strip_prefix("chrome")
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
 }
 
 /// Whether `tool` is a browser tool that changes a page.
@@ -1315,7 +1314,8 @@ mod tests {
             assert_eq!(decide_with(bound, "github.pr_get").0, "run");
             assert_eq!(decide_with(bound, "github.pr_merge").0, "refused");
             assert_eq!(decide_with(bound, "jira.search").0, "refused");
-            assert_eq!(decide_with(bound, "browser.navigate").0, "run");
+            // The browser is the person's own Chrome: asked once a session.
+            assert_eq!(decide_with(bound, "browser.navigate").0, "asks once");
             // Asking before nothing: a send runs too.
             let never = format!("[computer]\nasks = \"never\"\n\n{bound}");
             assert_eq!(decide_with(&never, "slack.send").0, "run");
@@ -1400,11 +1400,17 @@ mod tests {
             };
             let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
             let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
-            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+            // Reading in the person's Chrome asks once a session below
+            // unbound ("Use my Chrome"), and one that only suggests doesn't
+            // use it at all.
+            for body in ["", act.as_str()] {
                 for read in ["browser.snapshot", "browser.navigate"] {
-                    assert_eq!(decide_with(body, read).0, "run", "{read} in {body:?}");
+                    let (asked, ran_unattended, _) = decide_with(body, read);
+                    assert!(asked.starts_with("asks"), "{read} in {body:?}: {asked}");
+                    assert!(!ran_unattended, "a job never uses the person's Chrome");
                 }
             }
+            assert_eq!(decide_with(&suggest, "browser.snapshot").0, "refused");
             for body in ["", act.as_str()] {
                 let (asked, ran_unattended, unbound) = decide_with(body, "browser.click");
                 assert!(asked.starts_with("asks"), "{asked} in {body:?}");
@@ -1426,13 +1432,20 @@ mod tests {
             }));
             assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
-            // "Sign in for me": opening the page reads; the wait for the
-            // person is put to them at every level, acting fully too, and a
-            // job is refused it.
+            assert_eq!(decide_with(UNBOUND, "browser.snapshot").0, "run");
+            // "Sign in for me": opening the page is opening a site in the
+            // person's Chrome (asked below unbound, run unbound, refused
+            // at Suggest); the wait for the person is put to them at every
+            // level, acting fully too, and a job is refused both.
             for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
                 let (opened, opened_unattended, _) =
                     in_desk(|| decide_with(body, "browser.sign_in"));
-                assert_eq!(opened, "run", "{body:?}");
+                let expected = match body {
+                    b if b == UNBOUND => "run",
+                    b if b == suggest.as_str() => "refused",
+                    _ => "asks once",
+                };
+                assert_eq!(opened, expected, "{body:?}");
                 assert!(
                     !opened_unattended,
                     "nothing is opened to sign in to for a job"
@@ -1477,7 +1490,7 @@ mod tests {
                 &hub.subject,
             );
             let site = Effect::Connector {
-                connector: "browser:https://shop.example".into(),
+                connector: "chrome:https://shop.example".into(),
                 write: true,
             };
             let verdict = in_desk(|| gate.verdict("browser.signed_in", &site));
@@ -1486,7 +1499,7 @@ mod tests {
             assert_eq!(facts.effect, "sign_in");
             assert_eq!(
                 facts.connector.as_deref(),
-                Some("browser:https://shop.example")
+                Some("chrome:https://shop.example")
             );
             assert!(
                 facts.why.contains("never sees your password"),
@@ -1571,17 +1584,17 @@ mod tests {
     }
 
     #[test]
-    fn browser_keys_are_desks_and_the_persons_chrome() {
-        for k in [
-            "browser",
-            "browser:a.test",
-            "chrome",
-            "chrome:a.test",
-            "chrome-visit:a.test",
-        ] {
+    fn browser_keys_are_the_persons_chrome() {
+        for k in ["chrome", "chrome:a.test", "chrome-visit:a.test"] {
             assert!(is_browser_key(k), "{k}");
         }
-        for k in ["linear", "browserx", "chromecast", "chrome-x:a"] {
+        for k in [
+            "linear",
+            "browser",
+            "browser:a.test",
+            "chromecast",
+            "chrome-x:a",
+        ] {
             assert!(!is_browser_key(k), "{k}");
         }
     }

@@ -1070,10 +1070,7 @@ const BROWSER_READS: &[&str] = &[
     "browser.sign_in",
     "browser.snapshot",
     "browser.screenshot",
-    "browser.pdf",
     "browser.get_content",
-    "browser.console_messages",
-    "browser.network_requests",
     "browser.wait",
 ];
 const BROWSER_WRITES: &[&str] = &[
@@ -1082,9 +1079,17 @@ const BROWSER_WRITES: &[&str] = &[
     "browser.type",
     "browser.press_key",
     "browser.select_option",
-    "browser.evaluate",
     "browser.upload_file",
+    "browser.capture_key",
 ];
+
+/// The grants with "Use my Chrome for this session" already given: what
+/// the page-level rules below are about.
+fn in_use(grants: &[Grant]) -> Vec<Grant> {
+    let mut all = vec![kept("chrome", 99)];
+    all.extend_from_slice(grants);
+    all
+}
 
 fn on_page(tool: &str, write: bool) -> CallFacts {
     CallFacts {
@@ -1126,7 +1131,7 @@ fn browser_verdicts_by_standing_and_tool() {
                     let v = verdict(
                         &browsing_as(browsing, access, hostile),
                         false,
-                        &[],
+                        &in_use(&[]),
                         &on_page(tool, false),
                     );
                     if hostile && workforce_core::computer::navigates(tool) {
@@ -1137,6 +1142,11 @@ fn browser_verdicts_by_standing_and_tool() {
                                 why: Why::HostilePage
                             },
                             "after a hostile page, going on asks at {browsing:?}"
+                        );
+                    } else if browsing == Browsing::Suggests {
+                        assert!(
+                            matches!(&v, Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel),
+                            "one that only suggests doesn't use the person's Chrome: {v:?}"
                         );
                     } else {
                         assert_eq!(
@@ -1153,7 +1163,7 @@ fn browser_verdicts_by_standing_and_tool() {
                 verdict(
                     &browsing_as(Browsing::Unbound, access, false),
                     false,
-                    &[],
+                    &in_use(&[]),
                     &write
                 ),
                 run,
@@ -1162,31 +1172,18 @@ fn browser_verdicts_by_standing_and_tool() {
             let asked = verdict(
                 &browsing_as(Browsing::Asks, access, false),
                 false,
-                &[],
+                &in_use(&[]),
                 &write,
             );
-            if *tool == "browser.evaluate" {
-                assert!(
-                    matches!(
-                        asked,
-                        Verdict::Ask {
-                            why: Why::Unclear,
-                            ..
-                        }
-                    ),
-                    "{asked:?}"
-                );
-            } else {
-                assert_eq!(asked, page_ask(true), "asks {tool} at {access:?}");
-            }
+            assert_eq!(asked, page_ask(true), "asks {tool} at {access:?}");
             let suggests = verdict(
                 &browsing_as(Browsing::Suggests, access, false),
                 false,
-                &[],
+                &in_use(&[]),
                 &write,
             );
             assert!(
-                matches!(&suggests, Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel && refusal.sentence.contains("only suggests")),
+                matches!(&suggests, Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel),
                 "suggests {tool}: {suggests:?}"
             );
         }
@@ -1201,7 +1198,7 @@ fn after_a_hostile_page_opening_a_sign_in_page_asks() {
         let v = verdict(
             &browsing_as(browsing, Access::Full, true),
             false,
-            &[],
+            &in_use(&[]),
             &on_page("browser.sign_in", false),
         );
         assert_eq!(
@@ -1223,7 +1220,7 @@ fn after_a_hostile_page_opening_a_sign_in_page_asks() {
 fn the_computer_kill_switch_and_level_leave_the_browser_to_its_own_rules() {
     let p_ = browsing_as(Browsing::Unbound, Access::OwnFolder, false);
     assert_eq!(
-        verdict(&p_, true, &[], &on_page("browser.click", true)),
+        verdict(&p_, true, &in_use(&[]), &on_page("browser.click", true)),
         Verdict::Run { by: By::Rule }
     );
 }
@@ -1244,7 +1241,7 @@ fn a_hostile_page_asks_every_time_whatever_covers_the_call() {
             verdict(
                 &p_,
                 false,
-                std::slice::from_ref(&allowance),
+                &in_use(std::slice::from_ref(&allowance)),
                 &on_page("browser.click", true)
             ),
             hostile_ask,
@@ -1273,18 +1270,33 @@ fn a_session_allowance_covers_its_site_in_its_session() {
     let p_ = browsing_as(Browsing::Asks, Access::Full, false);
     let click = on_page("browser.click", true);
     assert_eq!(
-        verdict(&p_, false, &[site_allowance("shop.example", "s1")], &click),
+        verdict(
+            &p_,
+            false,
+            &in_use(&[site_allowance("shop.example", "s1")]),
+            &click
+        ),
         Verdict::Run {
             by: By::Session(Uuid::from_u128(7))
         }
     );
     assert_eq!(
-        verdict(&p_, false, &[site_allowance("other.example", "s1")], &click),
+        verdict(
+            &p_,
+            false,
+            &in_use(&[site_allowance("other.example", "s1")]),
+            &click
+        ),
         page_ask(true),
         "another site"
     );
     assert_eq!(
-        verdict(&p_, false, &[site_allowance("shop.example", "s2")], &click),
+        verdict(
+            &p_,
+            false,
+            &in_use(&[site_allowance("shop.example", "s2")]),
+            &click
+        ),
         page_ask(true),
         "another session"
     );
@@ -1297,12 +1309,13 @@ fn full_access_that_never_asks_acts_on_pages() {
     let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
     p_.access.asks = Asking::Never;
     assert_eq!(
-        verdict(&p_, false, &[], &on_page("browser.fill", true)),
+        verdict(&p_, false, &in_use(&[]), &on_page("browser.fill", true)),
         Verdict::Run { by: By::Rule }
     );
 }
 
-/// A call with no session offers no session allowance.
+/// A call with no session offers no session allowance: not even "Use my
+/// Chrome for this session" holds for it.
 #[test]
 fn a_browser_ask_outside_a_session_offers_allow_once_only() {
     let p_ = browsing_as(Browsing::Asks, Access::Full, false);
@@ -1310,17 +1323,23 @@ fn a_browser_ask_outside_a_session_offers_allow_once_only() {
         session_id: None,
         ..on_page("browser.click", true)
     };
-    assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
+    assert_eq!(
+        verdict(&p_, false, &in_use(&[]), &click),
+        Verdict::Ask {
+            choices: vec![Choice::AllowOnce, Choice::Deny],
+            why: Why::TheirChrome
+        }
+    );
 }
 
 #[test]
 fn a_browser_site_is_kept_by_its_host() {
     assert_eq!(
         browser_site(Some("https://shop.example")),
-        "browser:https://shop.example"
+        "chrome:https://shop.example"
     );
-    assert_eq!(browser_site(None), "browser");
-    assert_eq!(browser_site(Some("")), "browser");
+    assert_eq!(browser_site(None), "chrome");
+    assert_eq!(browser_site(Some("")), "chrome");
 }
 
 /// An agent at Own folder given `ACME` to work in.
@@ -1601,43 +1620,6 @@ fn the_persons_chrome_unbound_runs_and_at_suggest_is_refused() {
             "{tool}: {refused:?}"
         );
     }
-    // Desk's own browser still reads at Suggest.
-    assert_eq!(
-        verdict(
-            &browsing_as(Browsing::Suggests, Access::Full, false),
-            false,
-            &[],
-            &on_page("browser.snapshot", false)
-        ),
-        Verdict::Run { by: By::Rule }
-    );
-}
-
-/// A script on a page asks each time below unbound: no site allowance
-/// covers it, since it can press what the never-list reads.
-#[test]
-fn a_script_on_a_page_asks_each_time_below_unbound() {
-    let p_ = browsing_as(Browsing::Asks, Access::Full, false);
-    let script = on_page("browser.evaluate", true);
-    let once = Verdict::Ask {
-        choices: vec![Choice::AllowOnce, Choice::Deny],
-        why: Why::Unclear,
-    };
-    assert_eq!(verdict(&p_, false, &[], &script), once);
-    assert_eq!(
-        verdict(&p_, false, &[site_allowance("shop.example", "s1")], &script),
-        once,
-        "an allowance for the site doesn't cover a script"
-    );
-    assert_eq!(
-        verdict(
-            &browsing_as(Browsing::Unbound, Access::Full, false),
-            false,
-            &[],
-            &script
-        ),
-        Verdict::Run { by: By::Rule }
-    );
 }
 
 /// "Do anything" Full access still asks before using the person's Chrome:
@@ -1691,21 +1673,6 @@ fn a_browser_opening_a_file_is_held_as_a_read() {
     }
 }
 
-/// Below unbound a script asks each time, Full access that never asks
-/// included: it can press what the never-list reads.
-#[test]
-fn a_script_asks_even_where_everything_else_runs() {
-    let mut p_ = browsing_as(Browsing::Asks, Access::Full, false);
-    p_.access.asks = Asking::Never;
-    assert!(matches!(
-        verdict(&p_, false, &[], &on_page("browser.evaluate", true)),
-        Verdict::Ask {
-            why: Why::Unclear,
-            ..
-        }
-    ));
-}
-
 /// A page with no origin of its own (blank, inline, a file) is asked about
 /// once at a time: no allowance is shared for it.
 #[test]
@@ -1718,5 +1685,5 @@ fn a_page_with_no_origin_offers_no_session_allowance() {
             write: true,
         })
     };
-    assert_eq!(verdict(&p_, false, &[], &click), page_ask(false));
+    assert_eq!(verdict(&p_, false, &in_use(&[]), &click), page_ask(false));
 }

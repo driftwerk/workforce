@@ -11,13 +11,17 @@
 //!   a browser holds.
 //! - `GET /api/desk/browser/shots/{file}`: one screenshot an activity row
 //!   names.
-//! - `GET`/`PUT /api/desk/browser/settings`: which browsers Desk uses (Off,
-//!   Desk's own, My Chrome, Both), whether Desk's own shows on screen, the
-//!   sites My Chrome may and may not go to, and whether the person's Chrome
-//!   has remote debugging on and Desk is connected to it. Kept in
+//! - `GET`/`PUT /api/desk/browser/settings`: whether Desk uses the
+//!   person's Chrome, the sites it may and may not go to, and the Chrome
+//!   profiles Desk's extension connects from. Kept in
 //!   `…/Desk/browser/settings.json`, which no agent's tools reach.
+//! - `POST /api/desk/browser/chrome/{id}/confirm`, `…/choose`, and
+//!   `DELETE /api/desk/browser/chrome/{id}`: the person confirms a Chrome
+//!   profile asking to connect, chooses the one Desk uses, or forgets one.
+//! - `GET /ws/desk/chrome`: Desk's extension, through Desk Helper
+//!   (`desk_chrome`).
 //!
-//! When a turn ends, Desk lets go of the person's Chrome there.
+//! When a turn ends, Desk closes the tab it used in the person's Chrome.
 //!
 //! Below unbound, what Desk's never-list holds (paying, signing in or out,
 //! a credential's file) is refused on the page with a sentence for the
@@ -38,6 +42,8 @@ use uuid::Uuid;
 use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_desk::computer::{Activity, Computer};
 use workforce_skills::adapters::browser::{self, BrowserHooks, Done, OnPage, Settings, Which};
+
+use crate::desk_chrome::Chrome;
 
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 
@@ -69,7 +75,7 @@ impl SettingsFile {
         }
     }
 
-    /// What the person set; Desk's defaults (both browsers) where they set
+    /// What the person set; Desk's defaults (on, any site) where they set
     /// nothing. One that can't be read is the browser off, said in the log.
     pub(crate) fn get(&self) -> Settings {
         let at = std::fs::metadata(&self.path)
@@ -85,7 +91,7 @@ impl SettingsFile {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 warn!(error = %e, "Desk's browser settings can't be read; the browser is off");
                 Settings {
-                    uses: browser::Uses::Off,
+                    on: false,
                     ..Settings::default()
                 }
             }),
@@ -405,35 +411,6 @@ impl BrowserHooks for DeskHooks {
         }
     }
 
-    /// A page that moved to another file is read again as the gate reads a
-    /// file: it stays open only where the agent may read that file now,
-    /// without asking.
-    fn may_open_file(&self, agent: &str, path: &Path) -> Result<(), String> {
-        use workforce_core::computer::Verdict;
-        let Some(service) = self.state.registry.get(agent) else {
-            return Err("Desk couldn't check that file for this agent.".into());
-        };
-        let subject = crate::serve::ComputerSubject {
-            agent: agent.to_string(),
-            name: None,
-            workspace: service.workspace.clone(),
-        };
-        let gate = crate::desk_computer::HubComputerGate::for_agent(
-            self.computer.clone(),
-            &self.config,
-            &subject,
-        );
-        let effect = workforce_core::computer::Effect::Read {
-            paths: vec![workforce_agent::tools::paths::resolve_real(path)],
-        };
-        use workforce_agent::tools::computer::ComputerGate;
-        match gate.verdict("browser.navigate", &effect) {
-            Verdict::Run { .. } => Ok(()),
-            Verdict::Refuse { refusal } => Err(refusal.sentence),
-            _ => Err("Opening that file asks the person first; open it with browser.navigate so they're asked.".into()),
-        }
-    }
-
     fn record(&self, done: Done) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -496,12 +473,11 @@ fn doing(done: &Done) -> String {
         "browser.fill" | "browser.type" => "Typed into",
         "browser.press_key" => "Pressed",
         "browser.select_option" => "Chose in",
-        "browser.evaluate" => "Ran a script on",
         "browser.upload_file" => "Uploaded a file to",
         _ => "Used",
     };
     let line = match (done.tool.as_str(), done.target.as_deref()) {
-        ("browser.navigate", _) | ("browser.evaluate", _) | (_, None) => {
+        ("browser.navigate", _) | (_, None) => {
             format!("{verb} {}", host(&done.url))
         }
         (_, Some(target)) => format!("{verb} {target} on {}", host(&done.url)),
@@ -549,8 +525,7 @@ struct Routes {
     computer: Computer,
     shots: PathBuf,
     settings: Arc<SettingsFile>,
-    /// Where the person's Chrome writes `DevToolsActivePort`.
-    chrome_dir: Option<PathBuf>,
+    chrome: Arc<Chrome>,
 }
 
 type S = State<Arc<Routes>>;
@@ -611,8 +586,8 @@ async fn list(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Respons
     Json(json!({ "live": browser::live().await })).into_response()
 }
 
-/// Stop: the turns using the browser end, the browser closes now, and
-/// every "Allow for this session" a browser holds is dropped.
+/// Stop: the turns using the browser end, Desk's tabs close now, and every
+/// "Allow for this session" a browser holds is dropped.
 async fn stop(
     State(r): S,
     h: HeaderMap,
@@ -621,18 +596,32 @@ async fn stop(
 ) -> Response {
     holder!(r, h, q);
     let agent = body.and_then(|b| b.0.agent).filter(|a| !a.is_empty());
+    match stop_now(&r.state, &r.computer, agent.as_deref()).await {
+        Ok((closed, turns, forgotten)) => Json(json!({ "closed": closed, "turns_stopped": turns, "allowances_dropped": forgotten }))
+            .into_response(),
+        Err(()) => refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The browser closed, but Desk couldn't drop its allowances for this session. Try Stop again.",
+        ),
+    }
+}
+
+/// What Stop does, for one agent or all: cancels the turns using the
+/// browser, closes Desk's tabs, and drops the browser's session allowances.
+async fn stop_now(
+    state: &Arc<GatewayState>,
+    computer: &Computer,
+    agent: Option<&str>,
+) -> Result<(usize, usize, u64), ()> {
     let open = browser::live().await;
     let mut turns = 0;
-    for l in open
-        .iter()
-        .filter(|l| agent.as_deref().is_none_or(|a| a == l.agent))
-    {
-        let (Some(session), Some(service)) = (l.session.as_deref(), r.state.registry.get(&l.agent))
+    for l in open.iter().filter(|l| agent.is_none_or(|a| a == l.agent)) {
+        let (Some(session), Some(service)) = (l.session.as_deref(), state.registry.get(&l.agent))
         else {
             continue;
         };
         if crate::gateway::steer(
-            r.state.nats.as_ref(),
+            state.nats.as_ref(),
             &service,
             session,
             workforce_nats::chat::TurnControl::Cancel,
@@ -643,43 +632,89 @@ async fn stop(
             turns += 1;
         }
     }
-    let closed = browser::close(match agent.as_deref() {
+    let closed = browser::close(match agent {
         Some(a) => Which::Agent(a),
         None => Which::All,
     })
     .await;
-    let forgotten = match r
-        .computer
-        .store()
-        .forget_browser_grants(agent.as_deref())
-        .await
-    {
-        Ok(n) => n,
+    match computer.store().forget_browser_grants(agent).await {
+        Ok(n) => Ok((closed, turns, n)),
         Err(e) => {
             warn!(error = %format!("{e:#}"), "forgetting browser allowances failed");
-            return refusal(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The browser closed, but Desk couldn't drop its allowances for this session. Try Stop again.",
-            );
+            Err(())
         }
-    };
-    Json(json!({ "closed": closed, "turns_stopped": turns, "allowances_dropped": forgotten }))
-        .into_response()
+    }
 }
 
-/// The settings, and how the person's Chrome stands: remote debugging on
-/// (`available`) and Desk attached to it now (`connected`).
+/// What Stop reaches from the extension's own Stop button.
+static STOP_WITH: std::sync::OnceLock<(Arc<GatewayState>, Computer)> = std::sync::OnceLock::new();
+
+/// The person pressed Stop in Desk's extension: as Desk's own Stop does,
+/// for every agent.
+pub async fn stop_everything() {
+    if let Some((state, computer)) = STOP_WITH.get() {
+        let _ = stop_now(state, computer, None).await;
+    }
+}
+
+/// The settings, and how Desk's extension stands: whether the Chrome Desk
+/// uses is connected now, every profile it connects from, and where to get
+/// the extension.
 async fn settings_view(r: &Routes) -> serde_json::Value {
-    let connected = browser::live().await.iter().any(|l| l.backend == "chrome");
+    let store_url = (!crate::desk_chrome::STORE_ID.is_empty()).then(|| {
+        format!(
+            "https://chromewebstore.google.com/detail/{}",
+            crate::desk_chrome::STORE_ID
+        )
+    });
     json!({
         "settings": r.settings.get(),
         "chrome": {
-            "available": r.chrome_dir.as_deref().is_some_and(browser::chrome_available),
-            "connected": connected,
-            "min_version": browser::MIN_CHROME,
-            "turn_on": "chrome://inspect/#remote-debugging",
+            "connected": r.chrome.connected(),
+            "profiles": r.chrome.view(),
+            "store_url": store_url,
         },
     })
+}
+
+/// The person answers about a Chrome profile: confirms it, chooses it, or
+/// forgets it.
+async fn profile(
+    State(r): S,
+    h: HeaderMap,
+    UrlPath((id, what)): UrlPath<(String, String)>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    holder!(r, h, q);
+    let done = match what.as_str() {
+        "confirm" => r.chrome.confirm(&id),
+        "choose" => r.chrome.choose(&id),
+        _ => return refusal(StatusCode::NOT_FOUND, "no such answer"),
+    };
+    if !done {
+        return refusal(StatusCode::NOT_FOUND, "That Chrome isn't asking any more.");
+    }
+    Json(settings_view(&r).await).into_response()
+}
+
+async fn forget_profile(
+    State(r): S,
+    h: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    holder!(r, h, q);
+    r.chrome.forget(&id);
+    browser::close(Which::All).await;
+    Json(settings_view(&r).await).into_response()
+}
+
+async fn chrome_socket(
+    State(r): S,
+    ws: axum::extract::ws::WebSocketUpgrade,
+    h: HeaderMap,
+) -> Response {
+    crate::desk_chrome::handler(ws, h, Arc::clone(&r.state)).await
 }
 
 async fn get_settings(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
@@ -687,8 +722,7 @@ async fn get_settings(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) ->
     Json(settings_view(&r).await).into_response()
 }
 
-/// The person changes them: a browser turned off closes, and My Chrome
-/// turned off is let go, now.
+/// The person changes them: turned off, Desk's tabs close now.
 async fn put_settings(
     State(r): S,
     h: HeaderMap,
@@ -707,18 +741,8 @@ async fn put_settings(
             "Desk couldn't save the browser settings. Try again.",
         );
     }
-    use browser::{Backend, Uses};
-    match next.uses {
-        Uses::Off => {
-            browser::close(Which::All).await;
-        }
-        Uses::Desk => {
-            browser::close_backend(Backend::Chrome).await;
-        }
-        Uses::Chrome => {
-            browser::close_backend(Backend::Desk).await;
-        }
-        Uses::Both => {}
+    if !next.on {
+        browser::close(Which::All).await;
     }
     Json(settings_view(&r).await).into_response()
 }
@@ -798,15 +822,8 @@ pub fn install(
     let root = browser_root(config);
     let shots = shots_dir(config);
     let settings = Arc::new(SettingsFile::new(root.join("settings.json")));
-    let chrome_dir = config
-        .skills
-        .browser
-        .chrome_user_data_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .or_else(browser::chrome_user_data_dir);
+    let chrome = crate::desk_chrome::install(root.join("chrome-profiles.json"));
+    let _ = STOP_WITH.set((Arc::clone(state), computer.clone()));
     let hooks = Arc::new(DeskHooks {
         state: Arc::clone(state),
         config: config.clone(),
@@ -814,7 +831,7 @@ pub fn install(
         shots: shots.clone(),
         settings: Arc::clone(&settings),
     });
-    // A turn's end lets go of the person's Chrome it was using.
+    // A turn's end closes the tab it used in the person's Chrome.
     workforce_hub_core::hub_core::live_turns::on_turn_end(Box::new(|session: &str| {
         let session = session.to_string();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -852,12 +869,18 @@ pub fn install(
             "/api/desk/browser/settings",
             get(get_settings).put(put_settings),
         )
+        .route("/api/desk/browser/chrome/{id}/{what}", post(profile))
+        .route(
+            "/api/desk/browser/chrome/{id}",
+            axum::routing::delete(forget_profile),
+        )
+        .route("/ws/desk/chrome", get(chrome_socket))
         .with_state(Arc::new(Routes {
             state: Arc::clone(state),
             computer,
             shots,
             settings,
-            chrome_dir,
+            chrome,
         }))
 }
 
@@ -1039,13 +1062,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_both_and_keep_what_was_set() {
+    fn settings_default_to_on_and_keep_what_was_set() {
         let dir = tempfile::tempdir().unwrap();
         let file = SettingsFile::new(dir.path().join("browser/settings.json"));
-        assert_eq!(file.get().uses, browser::Uses::Both, "nothing set: both on");
+        assert!(file.get().on, "nothing set: on");
         let set = Settings {
-            uses: browser::Uses::Chrome,
-            show: Some(false),
+            on: false,
             sites: browser::Sites {
                 allow: vec![],
                 block: vec!["bank.test".into()],
@@ -1065,7 +1087,7 @@ mod tests {
         std::fs::write(dir.path().join("browser/settings.json"), "{ not json").unwrap();
         // A later mtime may share the second; drop what was read.
         *file.read.lock() = None;
-        assert_eq!(file.get().uses, browser::Uses::Off, "unreadable: off");
+        assert!(!file.get().on, "unreadable: off");
     }
 
     #[test]

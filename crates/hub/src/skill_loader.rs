@@ -1359,13 +1359,13 @@ After adding or changing credentials, call system.enable_skill('notion') to relo
         BuiltinSkillMeta {
             name: "browser",
             description:
-                "Headless browser automation — navigate, screenshot, PDF, interact with elements, inspect network/console (Chromium via CDP)",
+                "The person's own Chrome, through Desk's Chrome extension — open pages, read them, click, type, fill and screenshot, signed in as them. Only in a Desk turn the person is in; a server hub has no browser (use obscura for text-only scraping).",
             required_credentials: &[],
             tool_prefix: "browser",
             default_scope: CredScope::Either,
             managed_by: CredManaged::Manual,
             setup_hint:
-                "No credentials required — uses the bundled Chromium binary. Skill spawns one Chromium subprocess per agent, lazily on first call.",
+                "No credentials required — the person adds Desk's extension to Chrome (Desk → Settings → Browser) and confirms it once.",
             workspace_vault_prefix: "",
             workspace_credentials: &[],
             supports_config: false,
@@ -1374,7 +1374,7 @@ After adding or changing credentials, call system.enable_skill('notion') to relo
         BuiltinSkillMeta {
             name: "obscura",
             description:
-                "Headless browser automation via Obscura over stdio MCP — lower memory than the `browser` skill, but no screenshot or PDF. Choose for text-only scraping / form automation.",
+                "Headless browser automation via Obscura over stdio MCP — no screenshot or PDF. The browser for a server hub: text-only scraping / form automation.",
             required_credentials: &[],
             tool_prefix: "obscura",
             default_scope: CredScope::Either,
@@ -3915,31 +3915,13 @@ fn load_notion_from_vault(
     })
 }
 
-/// The browser skill as this hub runs it: `[skills.browser]` over its
-/// defaults. On Desk, profiles live in Desk's own folder (which every
-/// agent's tools are kept from), are never reaped, and the window shows, so
-/// the person can watch it and sign in once by hand.
+/// The browser skill as this hub runs it. Desk browses only in the
+/// person's own Chrome, through Desk's extension; there is nothing to set
+/// up here.
 pub(crate) fn browser_skill_config(
-    config: &WorkforceConfig,
+    _config: &WorkforceConfig,
 ) -> workforce_skills::adapters::browser::BrowserSkillConfig {
-    let set = &config.skills.browser;
-    let named = |v: &Option<String>| {
-        v.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let desk = crate::desk_folder::browser_profiles(config);
-    let profile_root =
-        named(&set.profile_root).or_else(|| desk.as_ref().map(|d| d.display().to_string()));
-    workforce_skills::adapters::browser::BrowserSkillConfig {
-        chrome_binary: named(&set.chrome_binary),
-        chrome_user_data_dir: named(&set.chrome_user_data_dir),
-        keep_profiles: profile_root.is_some(),
-        profile_root,
-        show: set.show.unwrap_or(desk.is_some()),
-        ..Default::default()
-    }
+    workforce_skills::adapters::browser::BrowserSkillConfig::default()
 }
 
 fn load_browser_from_vault(
@@ -5017,43 +4999,18 @@ mod tests {
         assert!(tpl.contains("paragraph_spacing = true"));
     }
 
-    /// On Desk the browser keeps its profiles in Desk's folder, never reaped,
-    /// on screen; elsewhere it runs as before: temp folder, reaped, headless.
+    /// The old Chromium skill's keys in `[skills.browser]` still read, and
+    /// change nothing: no browser is launched.
     #[test]
-    fn browser_skill_config_puts_desks_profiles_in_desks_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().canonicalize().unwrap().join("Desk/hub/data");
-        std::fs::create_dir_all(&data).unwrap();
-        let mut config = WorkforceConfig::default();
-        config.hub.data_dir = data.display().to_string();
-
-        let server = browser_skill_config(&config);
-        assert_eq!(server.profile_root, None, "no [desk]: the temp default");
-        assert!(!server.keep_profiles && !server.show);
-
-        config.desk.enabled = true;
-        let desk = browser_skill_config(&config);
-        let root = desk.profile_root.clone().expect("Desk's folder");
-        assert_eq!(
-            std::path::PathBuf::from(&root),
-            dir.path().canonicalize().unwrap().join("Desk/browser")
-        );
-        assert!(desk.keep_profiles, "Desk's profiles are never reaped");
-        assert!(desk.show, "Desk's browser shows by default");
-
-        config.skills.browser.show = Some(false);
-        config.skills.browser.chrome_binary = Some("/opt/chrome".into());
-        let hidden = browser_skill_config(&config);
-        assert!(!hidden.show);
-        assert_eq!(hidden.chrome_binary.as_deref(), Some("/opt/chrome"));
-    }
-
-    #[test]
-    fn browser_skills_config_reads_from_install_toml() {
+    fn the_old_browser_keys_still_read_and_launch_nothing() {
         let config: workforce_common::settings::SkillsConfig =
-            toml::from_str("[browser]\nprofile_root = \"/srv/browser\"\nshow = true\n").unwrap();
-        assert_eq!(config.browser.profile_root.as_deref(), Some("/srv/browser"));
-        assert_eq!(config.browser.show, Some(true));
+            toml::from_str("[browser]\nprofile_root = \"/srv/browser\"\nshow = true\nchrome_binary = \"/opt/chrome\"\n").unwrap();
+        assert_eq!(
+            config.browser,
+            workforce_common::settings::BrowserSkillsConfig::default()
+        );
+        let skill = browser_skill_config(&WorkforceConfig::default());
+        assert_eq!(skill.call_timeout_ms, 30_000);
     }
 
     #[test]

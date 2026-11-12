@@ -100,6 +100,8 @@ pub mod desk_browser;
 #[cfg(feature = "postgres")]
 pub mod desk_ceilings;
 #[cfg(feature = "postgres")]
+pub mod desk_chrome;
+#[cfg(feature = "postgres")]
 pub mod desk_computer;
 #[cfg(feature = "postgres")]
 pub mod desk_connections;

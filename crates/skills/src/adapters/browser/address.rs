@@ -7,16 +7,6 @@ use std::path::PathBuf;
 
 use url::Url;
 
-/// Which browser an address is opened in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum In {
-    /// Desk's own: the web, a blank page, an inline page, or a file.
-    Desk,
-    /// The person's Chrome: the web and a blank page only.
-    #[allow(dead_code)] // opened in by My Chrome
-    Chrome,
-}
-
 /// What an address is, for what may be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -60,12 +50,11 @@ pub fn kind(url: &str) -> Kind {
     }
 }
 
-/// Whether `kind` may be opened in `place`.
-pub fn openable(kind: &Kind, place: In) -> bool {
-    matches!(
-        (kind, place),
-        (Kind::Web | Kind::Blank, _) | (Kind::Inline | Kind::File(_), In::Desk)
-    )
+/// Whether Desk may open an address of `kind` in the person's Chrome: the
+/// web and a blank page, never a file, an inline page, a script or
+/// Chrome's own pages.
+pub fn opens_in_chrome(kind: &Kind) -> bool {
+    matches!(kind, Kind::Web | Kind::Blank)
 }
 
 /// The host of `url`, as Chrome reads it: lower case, IDNA, no trailing dot.
@@ -115,8 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn only_the_web_blank_inline_and_files_open_and_only_the_web_in_chrome() {
-        for (url, desk, chrome) in [
+    fn only_the_web_and_a_blank_page_open_in_chrome() {
+        for (url, _was_desks, chrome) in [
             ("https://a.test/", true, true),
             ("HTTP://a.test", true, true),
             ("about:blank", true, true),
@@ -132,9 +121,7 @@ mod tests {
             ("blob:https://a.test/x", false, false),
             ("not a url", false, false),
         ] {
-            let k = kind(url);
-            assert_eq!(openable(&k, In::Desk), desk, "{url} in Desk's");
-            assert_eq!(openable(&k, In::Chrome), chrome, "{url} in Chrome");
+            assert_eq!(opens_in_chrome(&kind(url)), chrome, "{url}");
         }
     }
 

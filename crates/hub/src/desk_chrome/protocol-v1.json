@@ -1,0 +1,41 @@
+{
+  "protocol": 1,
+  "about": "A sample of every message between Desk's Chrome extension and the hub (relayed by Desk Helper). The extension's tests and the hub's both read this file.",
+  "proof_prefix": "desk-chrome-v1:",
+  "host": "xyz.driftwerk.desk",
+  "hub_path": "/ws/desk/chrome",
+  "to_hub": {
+    "hello": { "type": "hello", "protocol": 1, "version": "0.1.0", "key": "BKs5rC3gCRu8KbUqlT1fWJb0lGv9xwYbJZlCqEZCxhZ4XQ8cBoAbfsYQ0GTHo/V3TQ7jqvYwCc6xcz8OYQn3rLw=", "label": "1A2B-3C4D-5E6F-7A8B" },
+    "proof": { "type": "proof", "signature": "c2lnbmF0dXJl" },
+    "result_ok": { "type": "result", "id": 7, "ok": true, "value": { "url": "https://shop.example/cart", "title": "Cart" } },
+    "result_error": { "type": "result", "id": 8, "ok": false, "error": "Nothing on the page matches `#save`." },
+    "tab_closed": { "type": "event", "event": "tab-closed", "session": "s-3f2a" },
+    "stopped": { "type": "event", "event": "stopped" }
+  },
+  "from_hub": {
+    "challenge": { "type": "challenge", "nonce": "bm9uY2Utbm9uY2Utbm9uY2Utbm9uY2U=", "state": "pending" },
+    "waiting": { "type": "waiting", "why": "Confirm this Chrome in Desk: Settings → Browser." },
+    "ready": { "type": "ready" },
+    "refused": { "type": "refused", "why": "Another connection from this Chrome is already Desk's." },
+    "status": { "type": "status", "activity": { "agent": "Allan", "url": "https://shop.example/cart", "host": "shop.example" } },
+    "calls": [
+      { "type": "call", "id": 1, "cmd": "open", "session": "s-3f2a" },
+      { "type": "call", "id": 2, "cmd": "navigate", "session": "s-3f2a", "url": "https://shop.example/cart" },
+      { "type": "call", "id": 3, "cmd": "where", "session": "s-3f2a" },
+      { "type": "call", "id": 4, "cmd": "read", "session": "s-3f2a", "what": "text" },
+      { "type": "call", "id": 5, "cmd": "shown", "session": "s-3f2a", "selector": "#save", "form": true },
+      { "type": "call", "id": 6, "cmd": "click", "session": "s-3f2a", "selector": "#save" },
+      { "type": "call", "id": 7, "cmd": "fill", "session": "s-3f2a", "selector": "#name", "value": "Allan" },
+      { "type": "call", "id": 8, "cmd": "type", "session": "s-3f2a", "selector": "#q", "text": "shoes" },
+      { "type": "call", "id": 9, "cmd": "press", "session": "s-3f2a", "selector": null, "key": "Enter" },
+      { "type": "call", "id": 10, "cmd": "select", "session": "s-3f2a", "selector": "#size", "value": "M" },
+      { "type": "call", "id": 11, "cmd": "wait", "session": "s-3f2a", "selector": "#done", "timeout_ms": 5000 },
+      { "type": "call", "id": 12, "cmd": "upload", "session": "s-3f2a", "selector": "#file", "files": [{ "name": "a.txt", "type": "text/plain", "base64": "aGk=" }] },
+      { "type": "call", "id": 13, "cmd": "capture", "session": "s-3f2a", "refuse": [{ "origin": "https://linear.app", "paths": ["/settings/account/security"] }] },
+      { "type": "call", "id": 17, "cmd": "capture_key", "session": "s-3f2a", "selector": "#new-key", "origin": "https://linear.app", "paths": ["/settings/account/security"] },
+      { "type": "call", "id": 14, "cmd": "front", "session": "s-3f2a" },
+      { "type": "call", "id": 15, "cmd": "close", "session": "s-3f2a" },
+      { "type": "call", "id": 16, "cmd": "stop" }
+    ]
+  }
+}

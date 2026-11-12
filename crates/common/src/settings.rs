@@ -10420,41 +10420,12 @@ pub struct SkillsConfig {
     pub browser: BrowserSkillsConfig,
 }
 
-/// `[skills.browser]`: where the browser skill keeps its profiles and
-/// whether its window shows.
-///
-/// ```toml
-/// [skills.browser]
-/// # profile_root = "/var/lib/workforce/browser"
-/// # show = true
-/// # chrome_binary = "/usr/bin/chromium"
-/// # chrome_user_data_dir = "/Users/me/Library/Application Support/Google/Chrome"
-/// ```
-///
-/// On a hub with `[desk]`, profiles live in Desk's own folder
-/// (`…/Desk/browser`), which every agent's tools are kept from, they are
-/// never reaped (the person signs in to them once, by hand), and the window
-/// shows. Elsewhere they live in the system's temp folder and are reaped
-/// after a week, headless, as before.
+/// `[skills.browser]`: nothing to set. Desk browses only in the person's
+/// own Chrome, through Desk's Chrome extension, and launches no browser of
+/// its own. Keys the old Chromium skill read (`profile_root`, `show`,
+/// `chrome_binary`, `chrome_user_data_dir`) are still read, and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserSkillsConfig {
-    /// Where profiles live, in place of the default above. Profiles under a
-    /// root named here are never reaped.
-    #[serde(default)]
-    pub profile_root: Option<String>,
-    /// Show the window (`true`) or run headless (`false`); unset, it shows
-    /// on Desk only.
-    #[serde(default)]
-    pub show: Option<bool>,
-    /// The Chrome or Chromium to run; found on `PATH` where unset.
-    #[serde(default)]
-    pub chrome_binary: Option<String>,
-    /// The person's own Chrome's user data folder, where it writes
-    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
-    /// own for this platform.
-    #[serde(default)]
-    pub chrome_user_data_dir: Option<String>,
-}
+pub struct BrowserSkillsConfig {}
 
 impl Default for SkillsConfig {
     fn default() -> Self {

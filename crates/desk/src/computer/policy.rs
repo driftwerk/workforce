@@ -140,13 +140,14 @@ pub struct Browser {
     pub hostile: bool,
 }
 
-/// The connector a browser call is kept under: `browser:<origin>`
-/// (`browser:https://shop.example`), so "Allow for this session" holds for
-/// one origin; `browser` alone for a page with none.
+/// What a browser call is kept under: the site it acts on in the person's
+/// Chrome (`chrome:https://shop.example`), so "Allow for this session"
+/// holds for that site alone; a page with no origin of its own (blank) is
+/// `chrome`, which no site's allowance covers.
 pub fn browser_site(origin: Option<&str>) -> String {
     match origin.filter(|o| !o.is_empty()) {
-        Some(o) => format!("browser:{o}"),
-        None => "browser".to_string(),
+        Some(o) => format!("chrome:{o}"),
+        None => "chrome".to_string(),
     }
 }
 
@@ -807,20 +808,16 @@ fn browsing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Verdict {
     if !write {
         return Verdict::Run { by: By::Rule };
     }
-    // A script can do anything on the page, past what a site's allowance
-    // and the never-list read: below unbound it is asked about each time,
-    // whatever else would let it run.
-    if call.tool == "browser.evaluate" {
-        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::Unclear);
-    }
     if p.access.access == Access::Full && p.access.asks == Asking::Never {
         return Verdict::Run { by: By::Rule };
     }
-    if let Some(by) = site_granted(p, grants, call, connector) {
-        return Verdict::Run { by };
-    }
     // An allowance for the session holds for one origin; a page with none
-    // of its own (blank, inline, a file) shares none.
+    // of its own (blank) shares none, not even "Use my Chrome".
+    if connector.contains("://") {
+        if let Some(by) = site_granted(p, grants, call, connector) {
+            return Verdict::Run { by };
+        }
+    }
     match connector.contains("://") {
         true => once_or_session(call, Why::OnAPage),
         false => ask(vec![Choice::AllowOnce, Choice::Deny], Why::OnAPage),
