@@ -537,6 +537,8 @@ pub(crate) mod tests {
             "messaging.send",
             "web.fetch",
             "crew.overview",
+            "subagent",
+            "coding.fanout",
         ] {
             service.tools.register(named(name));
         }
@@ -568,6 +570,12 @@ pub(crate) mod tests {
                 !turn.registry.has("crew.overview"),
                 "never this hub's own crew"
             );
+            for delegating in ["subagent", "coding.fanout", "workflow", "agent_message"] {
+                assert!(
+                    !turn.registry.has(delegating),
+                    "{delegating} starts a run of its own"
+                );
+            }
             assert!(!asks("memory"));
             assert!(names.iter().any(|n| n == "memory"), "{names:?}");
             assert!(std::ptr::addr_eq(

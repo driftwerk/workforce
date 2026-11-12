@@ -12,8 +12,10 @@
 //!   no session or folder grant ([`workforce_agent::tools::dispatch::options_for_tool`]),
 //!   and a saved rule never stands in for it (a tool's own requirement is
 //!   applied after policy). The design's hold list ([`HELD`]) is among them.
-//! - **This hub's own crew** (`crew.*` of the agent's own Desk) is not
-//!   offered at all: the crew a boss reaches is the link's.
+//! - **Not offered at all**: this hub's own crew (`crew.*` of the agent's
+//!   own Desk; the crew a boss reaches is the link's), and every tool that
+//!   hands work to another run ([`DELEGATING`]), whose run would hold
+//!   nothing and stand outside the fence.
 //!
 //! What is kept is a list of what is safe, not of what sends, because an
 //! agent's tools are open-ended (skills, MCP servers, WASM skills): a list of
@@ -56,10 +58,41 @@ pub const KEPT: &[&str] = &[
     workforce_agent::tools::data::DATA_QUERY_TOOL_NAME,
 ];
 
+/// The tools that hand work to another run: a sub-agent, another agent, a
+/// workflow, a coding session, a scheduled or watching job, a reviewer. A
+/// boss conversation never offers them, asked or not: one "Allow once"
+/// would start a run of its own, with every tool unheld and outside the
+/// group's fence.
+pub const DELEGATING: &[&str] = &[
+    "subagent",
+    "investigate",
+    "advisor",
+    "research_report",
+    "workflow",
+    "workflow.*",
+    "playbook",
+    "playbook.*",
+    "coding.*",
+    "agent.*",
+    "agent_message",
+    "scheduler",
+    "scheduler.*",
+    "reminder",
+    "heartbeat.*",
+    "watch",
+    "monitor",
+    "monitor.*",
+];
+
+/// Whether `tool` hands work to another run ([`DELEGATING`]).
+pub fn delegates(tool: &str) -> bool {
+    DELEGATING.iter().any(|p| names(p, tool))
+}
+
 /// Whether a boss conversation's turn is offered `tool` at all: anything
-/// but this hub's own crew.
+/// but this hub's own crew and the tools that [delegate](delegates).
 pub fn offered(tool: &str) -> bool {
-    !tool.starts_with("crew.")
+    !tool.starts_with("crew.") && !delegates(tool)
 }
 
 /// One of the agent's own tools in a boss conversation: every call asks the
@@ -77,6 +110,7 @@ impl Held {
              carry the group's work outside it, so it runs only if you allow it, this once.",
             inner.name()
         );
+        debug_assert!(why.contains("boss conversation"));
         Self { inner, why }
     }
 }
@@ -108,6 +142,11 @@ impl Tool for Held {
     }
 
     fn approval_requirement(&self) -> Option<String> {
+        Some(self.why.clone())
+    }
+
+    /// The same words, kept first on the card whatever else asks.
+    fn approval_notice(&self) -> Option<String> {
         Some(self.why.clone())
     }
 
@@ -211,6 +250,40 @@ mod tests {
             !kept(&registry, "web.fetch"),
             "built in, but not a kept name"
         );
+    }
+
+    #[test]
+    fn what_hands_work_to_another_run_is_never_offered() {
+        for t in [
+            "subagent",
+            "investigate",
+            "advisor",
+            "research_report",
+            "workflow",
+            "playbook",
+            "coding.claude",
+            "coding.fanout",
+            "coding.session",
+            "agent.chat",
+            "agent_message",
+            "scheduler",
+            "reminder",
+            "heartbeat.create",
+            "watch",
+            "monitor",
+            "crew.overview",
+        ] {
+            assert!(!offered(t), "{t}");
+        }
+        for t in [
+            "http.request",
+            "web.fetch",
+            "memory",
+            "messaging.send",
+            "codingx",
+        ] {
+            assert!(offered(t), "{t}");
+        }
     }
 
     #[test]

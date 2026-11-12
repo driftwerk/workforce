@@ -90,6 +90,101 @@ pub fn session_key_for(
     }
 }
 
+/// `name`, a group's as Desk named it, as plain Slack text: no control
+/// characters, its `&`, `<` and `>` escaped so no link, mention or channel
+/// markup in it works, and no formatting marks.
+pub fn slack_plain(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().filter(|c| !c.is_control()).take(80) {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '*' | '_' | '~' | '`' => {}
+            c => out.push(c),
+        }
+    }
+    match out.trim() {
+        "" => "Your group".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// The Slack threads of `service`'s agent that are boss conversations now,
+/// open and not left: their session keys, with their groups' names.
+pub fn boss_threads(service: &AgentService) -> Vec<(String, String)> {
+    service
+        .sessions
+        .list(None, 100_000)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| {
+            s.agent_id == service.agent_id.as_str()
+                && !s.is_sealed()
+                && !s.left_behind()
+                && dm_thread(&s.channel).is_some()
+                && s.claims_desk_boss()
+        })
+        .map(|s| {
+            let group = super::conversation::group_name(&s);
+            (s.channel, group)
+        })
+        .collect()
+}
+
+/// The line a thread is told once it is no longer its group's boss
+/// conversation.
+pub fn ended_line(group: &str) -> String {
+    format!(
+        "This thread is no longer {}'s boss conversation: what you write here now goes to our DM, and I can't see or run the group's sessions from it.",
+        slack_plain(group)
+    )
+}
+
+/// Tells each of `threads` (from [`boss_threads`]) that is no longer a boss
+/// conversation of `service`'s agent so, once, in a plain line in the
+/// thread. Best effort: a thread Slack won't take is logged.
+pub async fn tell_ended(service: &AgentService, threads: Vec<(String, String)>) {
+    for (key, group) in threads {
+        let still = service
+            .sessions
+            .list(Some(&key), 1)
+            .ok()
+            .and_then(|mut s| s.pop())
+            .is_some_and(|s| !s.is_sealed() && s.claims_desk_boss() && !s.left_behind());
+        let Some((workspace, channel, thread)) = dm_thread(&key) else {
+            continue;
+        };
+        if still {
+            continue;
+        }
+        let hint = workforce_common::channels::ChannelHint::from_parts(
+            Some(workspace.to_string()),
+            None,
+            None,
+        );
+        let surface = service
+            .surface_registry
+            .read()
+            .await
+            .resolve("slack", channel, hint)
+            .await;
+        let sent = match surface {
+            Ok(surface) => surface
+                .send_message(&OutboundMessage {
+                    thread_id: Some(thread.to_string()),
+                    ..OutboundMessage::text(channel, ended_line(&group))
+                })
+                .await
+                .map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            tracing::warn!(error = %format!("{e:#}"), "a Slack thread that stopped being a boss conversation couldn't be told so");
+        }
+    }
+}
+
 /// What opening a group's Slack thread came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Thread {
@@ -154,13 +249,7 @@ pub async fn open_thread(service: &AgentService, boss: &mut Session, meta: &Valu
         return Thread::Unavailable("The agent's Slack workspace can't be told.");
     };
     drop(registry);
-    let group: String = meta["groupName"]
-        .as_str()
-        .unwrap_or("Your group")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
+    let group = slack_plain(meta["groupName"].as_str().unwrap_or("Your group"));
     let first = format!(
         "*{group} · Desk*\nTalk to me about {group} in this thread: here I can see and run its sessions, as your Desk lets me. Anywhere else, I can't."
     );
@@ -198,6 +287,17 @@ pub async fn open_thread(service: &AgentService, boss: &mut Session, meta: &Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_name_is_plain_slack_text() {
+        assert_eq!(slack_plain("Acme"), "Acme");
+        assert_eq!(
+            slack_plain("<https://evil.example|Acme> <!channel> <@U1> *bold* & co"),
+            "&lt;https://evil.example|Acme&gt; &lt;!channel&gt; &lt;@U1&gt; bold &amp; co"
+        );
+        assert_eq!(slack_plain("  \u{7}  "), "Your group");
+        assert!(!ended_line("<!here>").contains("<!here>"));
+    }
 
     #[test]
     fn only_an_ims_thread_is_a_dm_thread() {

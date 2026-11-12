@@ -212,7 +212,7 @@ fn gate_with(
             .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
         {
             None => GateOutcome::RequireApproval {
-                reason,
+                reason: with_notice(tools, tool_name, reason),
                 allow_save_allow,
                 holds,
             },
@@ -460,6 +460,17 @@ pub fn combine_with_tool_requirement(
         decision,
         matched_rule,
         evaluation_time_us,
+    }
+}
+
+/// `reason`, a prompt's, after the notice `tool_name`'s tool always gives
+/// ([`Tool::approval_notice`](crate::tools::Tool::approval_notice)), once.
+pub fn with_notice(tools: &ToolRegistry, tool_name: &str, reason: String) -> String {
+    match tools.get(tool_name).and_then(|tool| tool.approval_notice()) {
+        Some(notice) if reason.starts_with(&notice) => reason,
+        Some(notice) if reason.trim().is_empty() || reason == notice => notice,
+        Some(notice) => format!("{notice}\n\n{reason}"),
+        None => reason,
     }
 }
 
@@ -1260,6 +1271,72 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A tool whose prompt always says who is asking, whatever else does.
+    struct NoticedTool;
+
+    #[async_trait::async_trait]
+    impl Tool for NoticedTool {
+        fn name(&self) -> &str {
+            "noticed"
+        }
+        fn description(&self) -> &str {
+            "noticed"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn approval_requirement(&self) -> Option<String> {
+            Some("From Acme's boss conversation.".into())
+        }
+        fn approval_notice(&self) -> Option<String> {
+            Some("From Acme's boss conversation.".into())
+        }
+        async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::success(input, 1))
+        }
+    }
+
+    /// A tool's notice heads its prompt whoever else asks, said once: alone
+    /// when only the tool asks, before policy's own words when policy asks
+    /// too.
+    #[test]
+    fn a_tools_notice_heads_its_prompt_whoever_asks() {
+        let tools = ToolRegistry::new();
+        tools.register(Arc::new(NoticedTool));
+        let calls = Arc::new(Calls::default());
+        let g = gates(&calls, None, CascadeState::Allow);
+        let reason_under = |policy: &PolicyEngine| match as_user(|| {
+            gate_tool_call(&g, policy, &tools, "noticed", &serde_json::json!({}))
+        }) {
+            GateOutcome::RequireApproval { reason, .. } => reason,
+            _ => panic!("it asks"),
+        };
+        assert_eq!(
+            reason_under(&permissive_policy()),
+            "From Acme's boss conversation."
+        );
+        let asking = PolicyEngine::from_yaml(
+            "rules:\n  - name: ask-all\n    scope: global\n    tool: \"*\"\n    action: ask\n",
+        )
+        .unwrap();
+        let both = reason_under(&asking);
+        assert!(both.starts_with("From Acme's boss conversation."), "{both}");
+        assert_eq!(both.matches("boss conversation").count(), 1, "{both}");
+        assert!(
+            both.len() > "From Acme's boss conversation.".len(),
+            "policy's words kept too"
+        );
+        assert_eq!(
+            with_notice(
+                &tools,
+                "noticed",
+                "From Acme's boss conversation.\n\nx".into()
+            ),
+            "From Acme's boss conversation.\n\nx",
+            "never twice"
+        );
     }
 
     struct EchoTool;

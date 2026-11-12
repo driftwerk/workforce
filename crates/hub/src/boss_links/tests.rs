@@ -1694,12 +1694,15 @@ mod uplink_tests {
             "http.request",
             "messaging.send",
             "web.fetch",
-            "subagent",
             // A shadow of a kept name is held, not kept.
             workforce_agent::spill::RETRIEVE_TOOL_NAME,
         ] {
             assert!(asks(r, held), "{held} asks first");
+            let card = r.get(held).unwrap().approval_notice().unwrap_or_default();
+            assert!(card.contains("boss conversation"), "{card}");
         }
+        // Nothing that would start a run of its own, asked or not.
+        assert!(!r.has("subagent"));
         n.retain(|t| !crate::boss_links::hold::kept_name(t) && !asks(r, t));
         n
     }
@@ -1959,7 +1962,11 @@ mod uplink_tests {
             message: &workforce_common::channels::OutboundMessage,
         ) -> eyre::Result<workforce_common::channels::SentMessage> {
             let mut sent = self.0.lock();
-            sent.push(message.text.clone());
+            sent.push(format!(
+                "{}|{}",
+                message.thread_id.as_deref().unwrap_or(""),
+                message.text
+            ));
             Ok(workforce_common::channels::SentMessage {
                 channel: message.channel.clone(),
                 message_id: format!("1700000000.00010{}", sent.len()),
@@ -2088,6 +2095,41 @@ mod uplink_tests {
         assert!(BossConversation::of(&copied, "allan", &person).is_none());
         let tools = turn_tools(&hub, "allan", &copied, &person);
         assert!(!tools.has("crew.overview") && asks(&tools, "http.request"));
+
+        // Allan leaving a local scope leaves the link's thread as it is, and
+        // the thread is told nothing.
+        let threads = crate::boss_links::slack::boss_threads(&allan);
+        assert_eq!(threads, [(key.clone(), "acme".to_string())]);
+        crate::memory_fence::leave_sessions(allan.sessions.as_ref(), "allan", "desk-group:g")
+            .unwrap();
+        crate::boss_links::slack::tell_ended(&allan, threads.clone()).await;
+        assert_eq!(slack.0.lock().len(), 1, "nothing to tell");
+        // Started afresh (`cmd: new`), it is still the group's.
+        allan.sessions.start_fresh(&key, &person, "allan").unwrap();
+        assert_eq!(
+            session_key_for(&allan, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            key
+        );
+        // A thread that does stop being one says so, once.
+        let mut ended = allan.sessions.find(&key, &person).unwrap().unwrap();
+        ended
+            .metadata_object_mut()
+            .remove(workforce_common::session::DESK_BOSS_KEY);
+        allan.sessions.save(&ended).unwrap();
+        assert_eq!(
+            session_key_for(&allan, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            dm,
+            "the thread is the DM's again"
+        );
+        crate::boss_links::slack::tell_ended(&allan, threads).await;
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 2, "{posted:?}");
+        assert!(
+            posted[1].starts_with(&format!("{ts}|")) && posted[1].contains("no longer acme"),
+            "{posted:?}"
+        );
+        // Told once: nothing is a boss thread any more.
+        assert!(crate::boss_links::slack::boss_threads(&allan).is_empty());
     }
 
     #[tokio::test]
