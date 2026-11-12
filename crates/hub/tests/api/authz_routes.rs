@@ -2355,4 +2355,41 @@ async fn an_identity_edit_never_writes_its_verified_email() {
     );
     assert!(!stored.linked_ids.contains_key("oidc_email"));
     assert!(!stored.linked_ids.contains_key("oidc_email_at"));
+
+    // One a sign-in wrote stays through an edit, and goes on suspension.
+    let mut signed_in = stored.clone();
+    signed_in
+        .linked_ids
+        .insert("oidc_email".into(), "member@example.com".into());
+    signed_in
+        .linked_ids
+        .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+    let store = state.identity_store.as_ref().unwrap();
+    store.update(&signed_in).unwrap();
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "linked_ids": { "slack": "U-2" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let kept = store.get_by_id(fx.member.id).unwrap().unwrap();
+    assert_eq!(
+        kept.linked_ids.get("oidc_email").map(String::as_str),
+        Some("member@example.com")
+    );
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "status": "suspended" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let gone = store.get_by_id(fx.member.id).unwrap().unwrap();
+    assert!(!gone.linked_ids.contains_key("oidc_email"));
+    assert!(!gone.linked_ids.contains_key("oidc_email_at"));
 }

@@ -38,8 +38,8 @@ pub fn identity_tool(system: System) -> &'static str {
 /// user, matched on the hub.
 pub fn by_email_tool(system: System) -> &'static str {
     match system {
-        System::Jira => "jira.user_by_my_email",
-        System::Linear => "linear.member_by_my_email",
+        System::Jira => "identity.jira_user_by_my_email",
+        System::Linear => "identity.linear_member_by_my_email",
     }
 }
 

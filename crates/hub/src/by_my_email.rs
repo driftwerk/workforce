@@ -1,7 +1,9 @@
-//! `linear.member_by_my_email` and `jira.user_by_my_email`: the one user on
-//! the hub's (shared) Linear or Jira key whose email is the one the caller's
-//! sign-in provider verified. What a Desk board's sync names the person by
-//! when the key isn't theirs.
+//! `identity.linear_member_by_my_email` and `identity.jira_user_by_my_email`:
+//! the one user on the hub's (shared) Linear or Jira key whose email is the
+//! one the caller's sign-in provider verified. What a Desk board's sync names
+//! the person by when the key isn't theirs. They're the identity's, not the
+//! adapter's: every agent has them, and one without Linear or Jira doesn't
+//! look as though it had.
 //!
 //! They take no arguments: the email is the caller's own, read from their
 //! identity here ([`crate::oidc::verified_email_state`]), so a caller can
@@ -35,8 +37,8 @@ pub enum On {
 impl On {
     fn name(self) -> &'static str {
         match self {
-            Self::Linear => "linear.member_by_my_email",
-            Self::Jira => "jira.user_by_my_email",
+            Self::Linear => "identity.linear_member_by_my_email",
+            Self::Jira => "identity.jira_user_by_my_email",
         }
     }
 

@@ -880,16 +880,16 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
 /// Who the person is on Jira (`jira.myself`) and on Linear
 /// (`linear.viewer`): what "assigned to me", Mine and Take it go by. Where
 /// the hub's key is shared, the one user there with the email the person's
-/// sign-in provider verified (`jira.user_by_my_email`,
-/// `linear.member_by_my_email`: no arguments, zero or one user, matched on
+/// sign-in provider verified (`identity.jira_user_by_my_email`,
+/// `identity.linear_member_by_my_email`: no arguments, zero or one user, matched on
 /// the hub, never the directory). A board's sync calls them when its hub
 /// offers them and never needs them: a hub without them still syncs, and its
 /// board asks for the id instead. All read-only.
 pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &[
     "jira.myself",
-    "jira.user_by_my_email",
+    "identity.jira_user_by_my_email",
     "linear.viewer",
-    "linear.member_by_my_email",
+    "identity.linear_member_by_my_email",
 ];
 
 #[cfg(test)]

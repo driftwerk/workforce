@@ -1059,11 +1059,11 @@ mod tests {
             "jira.assign_issue",
             "jira.myself",
             "jira.search_users",
-            "jira.user_by_my_email",
+            "identity.jira_user_by_my_email",
             "linear.issue_list",
             "linear.viewer",
             "linear.members_list",
-            "linear.member_by_my_email",
+            "identity.linear_member_by_my_email",
             "linear.issue_bulk_update",
             "linear.document_delete",
             "vault.get",
@@ -1081,11 +1081,11 @@ mod tests {
             names,
             [
                 "help",
+                "identity.jira_user_by_my_email",
+                "identity.linear_member_by_my_email",
                 "jira.myself",
                 "jira.search",
-                "jira.user_by_my_email",
                 "linear.issue_list",
-                "linear.member_by_my_email",
                 "linear.viewer"
             ]
         );

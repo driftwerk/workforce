@@ -717,7 +717,7 @@ impl Remote for FakeLinear {
                 .ok_or_else(|| RemoteError::Missing(tool.into())),
             // The hub's own match: its filters are the hub's to test; here,
             // what it answers for the person's verified email.
-            "linear.member_by_my_email" => {
+            "identity.linear_member_by_my_email" => {
                 let Some(want) = self.verified_email.lock().unwrap().clone() else {
                     return Ok(json!({ "user": null, "why": "no_verified_email" }));
                 };
@@ -1341,7 +1341,7 @@ async fn a_shared_key_names_the_one_member_with_the_verified_email() {
         );
         // Asked of the hub with nothing: it knows whose email to match.
         assert_eq!(
-            linear.calls_of("linear.member_by_my_email"),
+            linear.calls_of("identity.linear_member_by_my_email"),
             vec![json!({})]
         );
         let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
