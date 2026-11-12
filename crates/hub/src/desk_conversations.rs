@@ -14,7 +14,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
-use workforce_agent::rollover::CARRYOVER_PREFIX;
 use workforce_common::channels::{is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{MessageRole, SessionAttachment, SessionStore, TranscriptEntry};
 use workforce_desk::attachments::{Attachment, MAX_PER_MESSAGE};
@@ -34,16 +33,6 @@ const ENTRIES_PER_READ: usize = 400;
 /// before it settles for what it has. A page forward from a message reads
 /// back until it reaches that message, however far.
 const MAX_READS: usize = 25;
-
-/// User-role rows the hub writes for the model, never typed by anyone: a
-/// rolled-over thread's carry-over, compaction's orientation note, and the
-/// overflow notes the runner leaves when it drops context.
-const HUB_NOTES: &[&str] = &[
-    CARRYOVER_PREFIX,
-    "[System note:",
-    "[SYSTEM]",
-    crate::desk_crew::CHECK_IN,
-];
 
 /// The files a person's messages hold on their sessions, read once per
 /// session of the conversation's chain. A person's upload is on their message
@@ -111,7 +100,7 @@ fn said(
         MessageRole::System | MessageRole::Tool => return None,
     };
     let trimmed = entry.content.trim();
-    if entry.tool_metadata.is_some() || HUB_NOTES.iter().any(|note| trimmed.starts_with(note)) {
+    if entry.tool_metadata.is_some() || crate::desk_surface::hub_note(trimmed) {
         return None;
     }
     let mut mark = entry.desk.clone();
@@ -155,6 +144,16 @@ fn said(
         client_id: entry.external_id.clone(),
         seq: entry.seq,
     })
+}
+
+/// What `entry` of `store` shows in the conversation, if it is one of its
+/// messages ([`said`]), a person's files their message holds included.
+pub(crate) fn shown_as(
+    store: &dyn SessionStore,
+    entry: &TranscriptEntry,
+    agent: &Speaker,
+) -> Option<Said> {
+    said(entry, agent, Some(&mut HeldFiles::of(store)))
 }
 
 /// The time a page of a conversation covers, which the files that are
@@ -569,6 +568,60 @@ impl Conversations for HubConversations {
             .map(|p| ConversationRead::of(&p))
             .ok_or_else(|| ConversationError::Internal("the read point was not kept".into()))
     }
+
+    async fn message_memories(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+    ) -> Result<Vec<workforce_desk::SavedMemory>, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        let saved = crate::desk_delete::memories_of(&service, &owner, &found).await?;
+        Ok(crate::desk_delete::listed(&saved))
+    }
+
+    async fn delete_message(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        message: &str,
+        delete: workforce_desk::Delete,
+    ) -> Result<workforce_desk::Deleted, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = crate::desk_delete::speaker(agent, &service);
+        let crew = crate::desk_crew::for_state(&self.0);
+        let found = crate::desk_delete::persons_message(
+            &service,
+            &speaker,
+            &owner,
+            message,
+            crew.as_ref().map(|c| c.desk()),
+        )
+        .await?;
+        crate::desk_delete::delete(
+            &service,
+            service.memory_store.as_deref(),
+            &speaker,
+            &owner,
+            &found,
+            delete,
+        )
+        .await
+    }
 }
 
 /// The Desk conversations `owner` holds with `agent` in `store` whose head
@@ -673,7 +726,10 @@ mod tests {
             "[System note: context was compacted. 4 messages were summarised.]",
             None,
         );
-        session.add_user_message(&format!("{CARRYOVER_PREFIX}\nearlier"), None);
+        session.add_user_message(
+            &format!("{}\nearlier", workforce_agent::rollover::CARRYOVER_PREFIX),
+            None,
+        );
         session.add_assistant_message(
             "I'm on **gpt-6-luna**.\n\n```chart\n{\"type\":\"bar\"}\n```",
             9,

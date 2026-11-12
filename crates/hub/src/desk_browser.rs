@@ -468,7 +468,7 @@ fn host(url: &str) -> String {
 /// What a person reads of `done`: "Clicked #save on shop.example".
 fn doing(done: &Done) -> String {
     let verb = match done.tool.as_str() {
-        "browser.navigate" => "Opened",
+        "browser.navigate" | "browser.open_for_me" => "Opened",
         "browser.click" => "Clicked",
         "browser.fill" | "browser.type" => "Typed into",
         "browser.press_key" => "Pressed",
@@ -477,6 +477,7 @@ fn doing(done: &Done) -> String {
         _ => "Used",
     };
     let line = match (done.tool.as_str(), done.target.as_deref()) {
+        ("browser.open_for_me", _) => format!("{verb} {} for you", host(&done.url)),
         ("browser.navigate", _) | (_, None) => {
             format!("{verb} {}", host(&done.url))
         }
@@ -1026,6 +1027,14 @@ mod tests {
             )
             .doing,
             "Opened shop.example"
+        );
+        assert_eq!(
+            activity_of(
+                &done("browser.open_for_me", Some("https://staging.example.com/")),
+                None
+            )
+            .doing,
+            "Opened shop.example for you"
         );
     }
 

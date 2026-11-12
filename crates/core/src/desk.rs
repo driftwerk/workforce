@@ -305,7 +305,23 @@ pub struct DeskTurn {
     /// told to the agent in the hub's words, not as a line of the room's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<DeskMember>,
+    /// This message is the person's edit of their latest one in the DM
+    /// (`desk.edit`): the reply to the old version is set aside and the
+    /// agent answers this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<DeskEdit>,
 }
+
+/// What a Desk turn that edits the person's latest message replaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskEdit {
+    /// The message being replaced: its id in the conversation as the hub
+    /// read it, or the client's own id for it (the `message` its turn named).
+    pub replaces: String,
+}
+
+/// The longest id an edit may name.
+const EDIT_ID_CHARS: usize = 128;
 
 /// Why a turn Desk sent cannot run on the conversation it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +329,11 @@ pub enum DeskTurnError {
     NotDesk,
     WrongPlace,
     TooManyHops,
+    /// An edit not of the person's own message in the DM.
+    EditOutsideDm,
+    /// An edit sent under the id of the message it replaces: sent again, it
+    /// would name its own new version and set that answer aside too.
+    EditReusesId,
 }
 
 impl std::fmt::Display for DeskTurnError {
@@ -321,6 +342,8 @@ impl std::fmt::Display for DeskTurnError {
             Self::NotDesk => "a Desk turn must be sent on a Desk channel",
             Self::WrongPlace => "the turn's place is not this conversation's",
             Self::TooManyHops => "agents have handed this on too many times already",
+            Self::EditOutsideDm => "only your latest message in a direct message can be edited",
+            Self::EditReusesId => "an edit must be sent under a new message id",
         })
     }
 }
@@ -338,6 +361,19 @@ impl DeskTurn {
         }
         if self.hop > MAX_HOPS {
             return Err(DeskTurnError::TooManyHops);
+        }
+        if let Some(edit) = &self.edit {
+            let replaces = edit.replaces.trim();
+            if !matches!(self.place, DeskPlace::Dm)
+                || self.is_hand_off()
+                || replaces.is_empty()
+                || replaces.chars().count() > EDIT_ID_CHARS
+            {
+                return Err(DeskTurnError::EditOutsideDm);
+            }
+            if self.message.is_some_and(|id| id.to_string() == replaces) {
+                return Err(DeskTurnError::EditReusesId);
+            }
         }
         Ok(Self {
             place: self.place.clipped(),
@@ -364,6 +400,9 @@ impl DeskTurn {
                         .filter(|m| !m.is_empty()),
                 }),
                 ..voice
+            }),
+            edit: self.edit.map(|edit| DeskEdit {
+                replaces: edit.replaces.trim().to_string(),
             }),
             ..self
         })
@@ -411,6 +450,7 @@ impl DeskTurn {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         })
     }
 
@@ -419,6 +459,7 @@ impl DeskTurn {
     pub fn mark(&self) -> DeskMark {
         DeskMark {
             speaker: Some(self.speaker.clone()),
+            edited: self.edit.is_some(),
             ..self.place.mark()
         }
     }
@@ -550,6 +591,14 @@ pub struct DeskMark {
     /// failed, and folded away once a later answer replaces it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failed: bool,
+    /// The person's message is their edit of an earlier one, which reads
+    /// "(edited)".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+    /// The agent's reply answers a message the person has since deleted:
+    /// the reply stays, and Desk says what it answered is gone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answered_deleted: bool,
 }
 
 /// How far a person has read a place: through `at`, the item seen last
@@ -897,17 +946,24 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
 
 /// Who the person is on Jira (`jira.myself`) and on Linear
 /// (`linear.viewer`): what "assigned to me", Mine and Take it go by. Where
-/// the hub's key is shared, the one user there with the email the person's
-/// sign-in provider verified (`identity.jira_user_by_my_email`,
-/// `identity.linear_member_by_my_email`: no arguments, zero or one user, matched on
-/// the hub, never the directory). A board's sync calls them when its hub
-/// offers them and never needs them: a hub without them still syncs, and its
-/// board asks for the id instead. All read-only.
+/// the hub's key is shared, whom the person chose to be there, else the one
+/// user there with their verified email (`identity.jira_user_by_my_email`,
+/// `identity.linear_member_by_my_email`: no arguments, zero or one user,
+/// matched on the hub, never the directory). To choose: the members whose
+/// name contains what they typed (`identity.*_named`: id, name and avatar,
+/// never an email) and their own choice (`identity.*_choose_me`, which
+/// writes only the caller's). A board's sync calls them when its hub offers
+/// them and never needs them: a hub without them still syncs, and its board
+/// asks for the id instead.
 pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &[
     "jira.myself",
     "identity.jira_user_by_my_email",
+    "identity.jira_users_named",
+    "identity.jira_choose_me",
     "linear.viewer",
     "identity.linear_member_by_my_email",
+    "identity.linear_members_named",
+    "identity.linear_choose_me",
 ];
 
 #[cfg(test)]
@@ -950,6 +1006,7 @@ mod tests {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         }
     }
 
@@ -1067,6 +1124,72 @@ mod tests {
             hop(MAX_HOPS + 1).validated("desk"),
             Err(DeskTurnError::TooManyHops)
         );
+    }
+
+    #[test]
+    fn an_edit_reads_from_the_wire_and_holds_only_in_the_dm() {
+        let wire = serde_json::json!({
+            "place": {"kind": "dm"},
+            "speaker": {"kind": "person"},
+            "edit": {"replaces": " m-1 "},
+        });
+        let sent: DeskTurn = serde_json::from_value(wire).unwrap();
+        let edit = sent.clone().validated("desk").unwrap();
+        assert_eq!(
+            edit.edit,
+            Some(DeskEdit {
+                replaces: "m-1".into()
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&edit).unwrap()["edit"],
+            serde_json::json!({"replaces": "m-1"})
+        );
+        assert!(edit.mark().edited);
+        assert_eq!(
+            serde_json::to_value(edit.mark()).unwrap()["edited"],
+            serde_json::json!(true)
+        );
+        // An ordinary turn says nothing of an edit, on the turn or its mark.
+        let plain = turn(DeskPlace::Dm);
+        assert!(serde_json::to_value(&plain).unwrap().get("edit").is_none());
+        assert!(serde_json::to_value(plain.mark())
+            .unwrap()
+            .get("edited")
+            .is_none());
+
+        let elsewhere = DeskTurn {
+            edit: sent.edit.clone(),
+            ..turn(in_room(None))
+        };
+        assert_eq!(
+            elsewhere.validated("desk:planning"),
+            Err(DeskTurnError::EditOutsideDm)
+        );
+        let handed = DeskTurn {
+            speaker: DeskSpeaker::Agent {
+                name: "helper".into(),
+            },
+            hop: 1,
+            ..sent.clone()
+        };
+        assert_eq!(handed.validated("desk"), Err(DeskTurnError::EditOutsideDm));
+        let blank = DeskTurn {
+            edit: Some(DeskEdit {
+                replaces: "  ".into(),
+            }),
+            ..sent
+        };
+        assert_eq!(blank.validated("desk"), Err(DeskTurnError::EditOutsideDm));
+        let asked = Uuid::new_v4();
+        let reused = DeskTurn {
+            message: Some(asked),
+            edit: Some(DeskEdit {
+                replaces: asked.to_string(),
+            }),
+            ..turn(DeskPlace::Dm)
+        };
+        assert_eq!(reused.validated("desk"), Err(DeskTurnError::EditReusesId));
     }
 
     #[test]

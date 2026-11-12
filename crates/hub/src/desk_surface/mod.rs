@@ -6,6 +6,7 @@
 mod close;
 mod context;
 mod deliver;
+pub(crate) mod edit;
 #[cfg(feature = "postgres")]
 pub(crate) mod link;
 mod retarget;
@@ -21,6 +22,40 @@ pub(crate) use context::{desk_context, person_name};
 pub(crate) use deliver::{deliver, deliver_file, resumed, Delivery, Outbox};
 pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
+
+/// What a crew check-in's prompt starts with: the person never typed it, so
+/// the DM's history leaves it out.
+pub(crate) const CHECK_IN: &str = "[Desk check-in]";
+
+/// User-role rows the hub writes for the model, never typed by anyone: a
+/// rolled-over thread's carry-over, compaction's orientation note, the
+/// overflow notes the runner leaves when it drops context, and a crew
+/// check-in.
+const HUB_NOTES: &[&str] = &[
+    workforce_agent::rollover::CARRYOVER_PREFIX,
+    "[System note:",
+    "[SYSTEM]",
+    CHECK_IN,
+];
+
+/// Whether `text`, already trimmed, is a note the hub wrote ([`HUB_NOTES`]).
+pub(crate) fn hub_note(text: &str) -> bool {
+    HUB_NOTES.iter().any(|note| text.starts_with(note))
+}
+
+/// Whether `entry` is something the person said: a user row that is no
+/// tool's, no note the hub wrote, and not another agent's hand-off.
+pub(crate) fn persons(entry: &workforce_common::session::TranscriptEntry) -> bool {
+    entry.role == workforce_common::session::MessageRole::User
+        && entry.tool_metadata.is_none()
+        && !hub_note(entry.content.trim())
+        && !entry.desk.as_ref().is_some_and(|mark| {
+            matches!(
+                mark.speaker,
+                Some(workforce_common::channels::desk::DeskSpeaker::Agent { .. })
+            )
+        })
+}
 
 /// The hub's surface allow list, where it keeps one: what each person
 /// always allows an agent to write to from their Desk turns.
@@ -156,6 +191,7 @@ mod tests {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         }
     }
 

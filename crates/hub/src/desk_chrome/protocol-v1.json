@@ -11,6 +11,7 @@
     "result_error": { "type": "result", "id": 8, "ok": false, "error": "Nothing on the page matches `#save`." },
     "result_capture": { "type": "result", "id": 13, "ok": true, "value": { "png_base64": "iVBORw0KGgo=", "url": "https://shop.example/cart", "text": "Your cart" } },
     "result_capture_skipped": { "type": "result", "id": 13, "ok": true, "value": { "skipped": "not_front" } },
+    "result_hand_over": { "type": "result", "id": 18, "ok": true, "value": { "handed": true, "active": true, "focused": true, "url": "https://shop.example/cart", "title": "Cart" } },
     "tab_closed": { "type": "event", "event": "tab-closed", "session": "s-3f2a" },
     "stopped": { "type": "event", "event": "stopped" }
   },
@@ -36,6 +37,7 @@
       { "type": "call", "id": 13, "cmd": "capture", "session": "s-3f2a", "refuse": [{ "origin": "https://linear.app", "paths": ["/settings/account/security"] }] },
       { "type": "call", "id": 17, "cmd": "capture_key", "session": "s-3f2a", "selector": "#new-key", "origin": "https://linear.app", "paths": ["/settings/account/security"] },
       { "type": "call", "id": 14, "cmd": "front", "session": "s-3f2a" },
+      { "type": "call", "id": 18, "cmd": "hand_over", "session": "s-3f2a" },
       { "type": "call", "id": 15, "cmd": "close", "session": "s-3f2a" },
       { "type": "call", "id": 16, "cmd": "stop" }
     ]
