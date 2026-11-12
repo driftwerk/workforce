@@ -616,6 +616,18 @@ impl CrewHub {
                 })
                 .collect(),
         );
+        // The cheap model's day for every session's account: the main
+        // boss's, the accounts being shared (else the first boss's).
+        self.desk.set_account_limits(
+            list.iter()
+                .find(|(_, o)| o.scope == Scope::Ungrouped)
+                .or(list.first())
+                .map(|(_, o)| workforce_desk::account::Limits {
+                    cheap_calls_per_day: o.updates.cheap_calls_per_day,
+                    account_questions_per_day: o.updates.account_questions_per_day,
+                })
+                .unwrap_or_default(),
+        );
         // No boss allows a change to any agent's own settings, its own
         // limits among them.
         self.desk.withhold_agent_settings(

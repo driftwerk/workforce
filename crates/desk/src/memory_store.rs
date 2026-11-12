@@ -290,6 +290,18 @@ impl DeskStore {
                 .await
                 .context("keeping an exchange")?;
             }
+            // Which exchanges this session's record holds, whoever kept
+            // them: a resumed or forked conversation's account reads its
+            // copied history through these.
+            let at: Vec<DateTime<Utc>> = w.closed.iter().chain(w.open).map(|x| x.at).collect();
+            tx.execute(
+                "INSERT INTO memory_record_keys (session, engine, key, at) \
+                 SELECT $1, $2, k, a FROM unnest($3::text[], $4::timestamptz[]) AS t(k, a) \
+                 ON CONFLICT DO NOTHING",
+                &[&w.session, &w.engine.as_str(), &keys, &at],
+            )
+            .await
+            .context("noting which exchanges a session's record holds")?;
             // Exchanges that closed are to be read for notes: due as the
             // turn ends, at most every ten minutes.
             if !w.closed.is_empty() {
@@ -663,6 +675,11 @@ impl DeskStore {
         )
         .await?;
         tx.execute(
+            "DELETE FROM memory_record_keys WHERE at < now() - make_interval(days => $1)",
+            &[&days],
+        )
+        .await?;
+        tx.execute(
             "DELETE FROM memory_purges WHERE done_at < now() - interval '7 days'",
             &[],
         )
@@ -880,6 +897,18 @@ pub(crate) async fn forget_memory_in(
         let (session, group): (Uuid, Option<String>) = (row.try_get(0)?, row.try_get(1)?);
         queue_purge(tx, group.as_deref(), &Purge::Session { session }).await?;
     }
+    // What its record held, and its account, which was written from it.
+    tx.execute(
+        "DELETE FROM memory_record_keys WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM session_accounts WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await
+    .context("forgetting sessions' accounts")?;
     let readers: Vec<String> = ids.iter().map(|id| format!("session:{id}")).collect();
     tx.execute(
         "DELETE FROM memory_reads WHERE reader = ANY($1)",

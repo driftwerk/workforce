@@ -283,6 +283,57 @@ impl Deriver for HubDeriver {
     }
 }
 
+/// Who keeps sessions' running accounts: the floor's cheap model on the
+/// hub's own provider account, as a Desk session's gist and its notes are
+/// written, each call booked as what it is for; and the floor, handed each
+/// turn end's gist from the account's answer.
+pub(crate) struct HubAccountant {
+    pub model: crate::floor::gists::HubModel,
+}
+
+#[async_trait::async_trait]
+impl workforce_desk::account::Accountant for HubAccountant {
+    async fn answer(
+        &self,
+        session: uuid::Uuid,
+        engine: workforce_desk::engine::Engine,
+        system: &str,
+        user: &str,
+        call: workforce_desk::account::Call,
+    ) -> eyre::Result<String> {
+        use crate::floor::gists::Call;
+        use workforce_desk::account::Call as For;
+        let subject = workforce_desk::floor::Subject::Session {
+            id: session,
+            engine,
+        };
+        let call = match call {
+            For::Refresh => Call::ACCOUNT,
+            For::Now => Call::ACCOUNT_NOW,
+            For::Question => Call::ACCOUNT_QUESTION,
+        };
+        self.model
+            .answer_for(Some(&subject), None, system, user, call)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn gist(
+        &self,
+        session: uuid::Uuid,
+        purpose: Option<String>,
+        now: Option<String>,
+        by_model: bool,
+    ) {
+        if let Some(floor) = crate::floor::installed() {
+            floor
+                .gists
+                .account_gist(session, purpose, now, by_model)
+                .await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

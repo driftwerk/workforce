@@ -249,6 +249,11 @@ impl Desk {
             })
             .collect();
         puts.extend(folded);
+        for p in &puts {
+            if let ReadPlace::Session(id) = p.place {
+                self.account_looked(id);
+            }
+        }
         let changed = self.0.store.put_reads(owner, &puts).await?;
         self.announce_reads(&changed);
         Ok(changed)

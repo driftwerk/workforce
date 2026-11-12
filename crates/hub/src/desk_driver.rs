@@ -1061,6 +1061,12 @@ pub async fn mount(
                 fallback: config.floor.fallback_providers,
             },
         })),
+        accountant: Some(Arc::new(crate::desk_memory::HubAccountant {
+            model: crate::floor::gists::HubModel {
+                state: Arc::clone(state),
+                fallback: config.floor.fallback_providers,
+            },
+        })),
         ..crate::floor::desk_floor()
     };
     let desk = Desk::start(store, options(config), floor, cancel)
@@ -1070,6 +1076,13 @@ pub async fn mount(
     desk.count_budgets_in(config.user_timezone());
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
+    }
+    // A session a boss oversees has its turn-end gist written from its
+    // account, by the same rule the account writer keeps.
+    if let Some(floor) = crate::floor::installed() {
+        floor.gists.hand_turn_ends(Arc::new(|id| {
+            self::desk().is_some_and(|d| d.account_kept_for(id))
+        }));
     }
     // The hub's own Claude calls fail over across the person's accounts.
     if let Some(vault) = state.vault.as_ref() {

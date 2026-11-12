@@ -15,7 +15,14 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
+//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60 }
 //! ```
+//!
+//! `[oversight.updates]` holds the cheap model's day: every session's
+//! running account, the questions answered from a session's exchanges
+//! (their own share), and later the boss's updates, all within
+//! `cheap_calls_per_day`. Past it accounts are written plainly. The main
+//! overseer's applies to every account, as the accounts are shared.
 //!
 //! `full` is **Act fully**: everything `act` does, and, in the repositories
 //! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
@@ -308,6 +315,18 @@ pub struct Work {
     pub max_turns_per_hour: u32,
 }
 
+/// The cheap model's day for the boss's reading (`[oversight.updates]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Updates {
+    /// Account refreshes, questions about sessions and updates together.
+    pub cheap_calls_per_day: u32,
+    /// Questions' own share of them.
+    pub account_questions_per_day: u32,
+}
+
+/// The most cheap calls a day may allow.
+pub const MAX_CHEAP_CALLS: i64 = 10_000;
+
 /// The most sessions an overseer may run at once.
 pub const MAX_PARALLEL: i64 = 12;
 /// The most turns an hour it may spend on its sessions' turn ends.
@@ -332,6 +351,7 @@ pub struct Oversight {
     /// `[oversight.full]`, read whatever the level (kept for when it is
     /// `full`).
     pub full: Full,
+    pub updates: Updates,
 }
 
 /// What the group it oversees is said wrongly as.
@@ -398,6 +418,10 @@ impl Default for Oversight {
                 max_turns_per_hour: 60,
             },
             full: Full::default(),
+            updates: Updates {
+                cheap_calls_per_day: 500,
+                account_questions_per_day: 60,
+            },
         }
     }
 }
@@ -618,6 +642,10 @@ impl Oversight {
             root.and_then(|t| t.get("full")),
             "what it may ship on its own",
         )?)?;
+        let updates = table(
+            root.and_then(|t| t.get("updates")),
+            "how it keeps you posted",
+        )?;
         let take_on = match work.and_then(|t| t.get("take_on")) {
             None => d.work.take_on,
             Some(Value::String(s)) if s.trim() == "handed" => TakeOn::Handed,
@@ -826,6 +854,26 @@ impl Oversight {
                 )?,
             },
             full,
+            updates: Updates {
+                cheap_calls_per_day: whole(
+                    updates,
+                    "cheap_calls_per_day",
+                    d.updates.cheap_calls_per_day,
+                    0..=MAX_CHEAP_CALLS,
+                    &format!(
+                        "The most calls a day its cheap model may make must be a whole number from 0 to {MAX_CHEAP_CALLS}."
+                    ),
+                )?,
+                account_questions_per_day: whole(
+                    updates,
+                    "account_questions_per_day",
+                    d.updates.account_questions_per_day,
+                    0..=MAX_CHEAP_CALLS,
+                    &format!(
+                        "The most questions a day it may answer from a session's conversation must be a whole number from 0 to {MAX_CHEAP_CALLS}."
+                    ),
+                )?,
+            },
         })
     }
 
@@ -1094,6 +1142,36 @@ mod tests {
         assert!(parse("[oversight]\nact = { interrupt = \"yes\" }\n")
             .unwrap_err()
             .contains("interrupting a session without asking"));
+    }
+
+    #[test]
+    fn the_cheap_models_day_is_read_with_its_defaults() {
+        let d = parse("[oversight]\nenabled = true\n").unwrap();
+        assert_eq!(
+            (
+                d.updates.cheap_calls_per_day,
+                d.updates.account_questions_per_day
+            ),
+            (500, 60)
+        );
+        let set = parse(
+            "[oversight]\nenabled = true\n[oversight.updates]\ncheap_calls_per_day = 50\n\
+             account_questions_per_day = 5\nevery_minutes = 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                set.updates.cheap_calls_per_day,
+                set.updates.account_questions_per_day
+            ),
+            (50, 5),
+            "and a key this hub doesn't know yet is passed over"
+        );
+        assert!(
+            parse("[oversight]\nupdates = { cheap_calls_per_day = -1 }\n")
+                .unwrap_err()
+                .contains("cheap model")
+        );
     }
 
     /// Messaging agents and sessions started in another terminal are each
