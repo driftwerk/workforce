@@ -550,13 +550,16 @@ impl BoardSync {
         if !(due || now || queued) {
             return Ok(());
         }
-        // An agent that stopped offering the tools, or letting the person
-        // in: the agents there are asked again, and the board goes on
-        // through one that offers them.
-        let remote = if matches!(
-            s.paused,
-            Some(Paused::Missing { .. } | Paused::Refused { .. })
-        ) {
+        // An agent that stopped offering the tools, or no agent there
+        // letting the person in: the agents there are asked again, and the
+        // board goes on through one that offers them. Any other refusal (a
+        // policy's no) waits out its back-off as before.
+        let reprobe = match &s.paused {
+            Some(Paused::Missing { .. }) => true,
+            Some(Paused::Refused { reason }) => reason == NO_AGENT_LETS_YOU_IN,
+            _ => false,
+        };
+        let remote = if reprobe {
             match self
                 .offered(s.system, &s.via, &s.person, s.agent.as_deref())
                 .await
@@ -683,13 +686,16 @@ impl BoardSync {
                 Paused::NoToken | Paused::HubOffline { .. } | Paused::HubUnpaired
             )
         };
-        // The board's own agent first.
+        // The board's own agent first. What the agents lack outranks why
+        // one of them refused.
         let mut missing = None;
+        let mut other = None;
         if let Some(agent) = prefer {
             match probe(Some(agent.to_string())).await {
                 Ok(r) => return Ok(r),
                 Err(p) if fatal(&p) => return Err(p),
-                Err(p) => missing = Some(p),
+                Err(p @ Paused::Missing { .. }) => missing = Some(p),
+                Err(p) => other = Some(p),
             }
         }
         // Then every agent the person may reach there, asked at once and
@@ -731,7 +737,6 @@ impl BoardSync {
             }
         }
         found.extend(futures::future::join_all(rest.map(probe)).await);
-        let mut other = None;
         for found in found {
             match found {
                 Ok(r) => return Ok(r),

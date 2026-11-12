@@ -1883,3 +1883,49 @@ async fn a_board_whose_agent_shuts_you_out_finds_one_again() {
     })
     .await;
 }
+
+/// A board paused by a policy's refusal waits out its back-off: it is
+/// never asked again of every agent there on each pass.
+#[tokio::test]
+async fn a_policy_refusal_keeps_its_back_off() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents(&dir.path().join("remote"), Some("lattice")).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                link_body(Filter::All {
+                    include_done: false,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let refused = Paused::Refused {
+            reason: "policy denied".into(),
+        };
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        desk.change_sync(b.id, {
+            let refused = refused.clone();
+            move |s| {
+                // An agent without Jira: asking the agents again would move
+                // the board to `lattice`.
+                s.agent = Some("default".into());
+                s.paused = Some(refused);
+                s.backoff_until = Some(until);
+                s.failures = 3;
+            }
+        })
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, false).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.agent.as_deref(), Some("default"));
+        assert_ne!(s.failures, 0);
+    })
+    .await;
+}
