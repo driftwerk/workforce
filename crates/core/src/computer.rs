@@ -318,10 +318,14 @@ pub struct ComputerFacts {
 pub const SIGN_IN: &str = "browser.sign_in";
 pub const SIGNED_IN: &str = "browser.signed_in";
 
-/// Whether a browser call goes to an address: a navigation, or opening a
-/// site to sign in to. After a hostile page, going anywhere asks.
+/// Opening a page for the person: it goes to an address, then is theirs.
+pub const OPEN_FOR_ME: &str = "browser.open_for_me";
+
+/// Whether a browser call goes to an address: a navigation, opening a page
+/// for the person, or opening a site to sign in to. After a hostile page,
+/// going anywhere asks.
 pub fn navigates(tool: &str) -> bool {
-    matches!(tool, "browser.navigate" | SIGN_IN)
+    matches!(tool, "browser.navigate" | OPEN_FOR_ME | SIGN_IN)
 }
 
 static PERSONS_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

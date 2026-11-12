@@ -3,7 +3,9 @@
 //! extension's native messaging, relayed by Desk Helper); each
 //! `(agent, person)` gets a tab in Desk's own Chrome window
 //! ([`ExtensionCell`]), opened by its first call and closed on Stop, at a
-//! turn's end and after its idle time.
+//! turn's end and after its idle time. A page opened *for* the person
+//! (`browser.open_for_me`) is handed over instead: its tab moves to the
+//! front of their own window, and Desk lets go of it.
 //!
 //! Every tool reads and acts as before: page text fenced as untrusted, the
 //! person's own steps held back below unbound, the site list kept, what was
@@ -85,6 +87,21 @@ fn selector_ok(url: &str, selector: Option<&str>) -> Result<()> {
         _ => Ok(()),
     }
 }
+
+pub(super) use workforce_core::computer::OPEN_FOR_ME;
+
+/// What a hand-over that failed says: the agent tells the person.
+const NOT_SHOWN: &str = "The page wasn't put in front of the person, so tell them it wasn't shown.";
+
+/// What a hand-over says when the extension doesn't know how.
+pub const EXTENSION_TOO_OLD: &str = "Desk's Chrome extension is older than Desk and can't put a page in front of the person, so it wasn't shown. Tell them, and that updating Desk's extension in Chrome fixes it.";
+
+/// What a hand-over says when Chrome took the tab but didn't confirm it is
+/// in front.
+pub const NOT_IN_FRONT: &str = "The page is open as a tab in the person's Chrome, but Chrome didn't confirm it's in front of them. Tell them it's there and to switch to Chrome; don't say it's showing.";
+
+/// What a hand-over tells the model once the page is in front.
+pub const HANDED_OVER: &str = "The page is in front of the person, in their own Chrome window, and is theirs now: it stays open after this turn, and you can't read or act on it. To browse yourself, use browser.navigate, which opens your own tab.";
 
 /// Where the person's Chrome may not be, as a refusal.
 fn kept_away(host: &str) -> eyre::Report {
@@ -367,6 +384,69 @@ impl ExtensionCell {
     }
 
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
+        self.checked(url)?;
+        self.with(async |_| {
+            let (landed_url, title) = self.open(url, "browser.navigate").await?;
+            self.keep_to_sites().await?;
+            let mut seen = Seen::at(&landed_url);
+            let title = seen.text(&title);
+            let shown_url = seen.text(&landed_url);
+            Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
+        })
+        .await
+    }
+
+    /// Opens `url` for the person: through every check [`Self::navigate`]
+    /// makes, in this cell's own tab, then hands that tab over. The
+    /// extension moves it to the front of the person's current Chrome
+    /// window and lets go of it, so it is theirs: never closed at a turn's
+    /// end, and never driven by this agent again. Answers only once Chrome
+    /// says it is the active tab of the focused window.
+    pub(super) async fn open_for_person(&self, url: &str) -> Result<Value> {
+        self.checked(url)?;
+        self.with(async |_| {
+            let (landed_url, title) = self.open(url, OPEN_FOR_ME).await?;
+            self.keep_to_sites().await?;
+            // Nothing is asked of this tab after the hand-over: every call
+            // names the session, and the extension would open it a new tab.
+            let handed = self.ask("hand_over", json!({})).await;
+            let handed = match handed {
+                Ok(v) => v,
+                Err(e) => return Err(eyre!("{NOT_SHOWN} Chrome said: {e}")),
+            };
+            if handed["handed"].as_bool() != Some(true) {
+                // An extension older than this hub answers what it doesn't
+                // know with nothing; the tab is still Desk's.
+                return Err(eyre!(EXTENSION_TOO_OLD));
+            }
+            self.let_go();
+            if handed["active"].as_bool() != Some(true) || handed["focused"].as_bool() != Some(true)
+            {
+                return Err(eyre!(NOT_IN_FRONT));
+            }
+            let mut seen = Seen::at(&landed_url);
+            let title = seen.text(&title);
+            let shown_url = seen.text(&landed_url);
+            Ok(seen.into_output(
+                &self.key,
+                json!({ "url": shown_url, "title": title, "shown": true, "next": HANDED_OVER }),
+            ))
+        })
+        .await
+    }
+
+    /// The tab was handed to the person: it is no longer this cell's. What
+    /// it read is forgotten as a closed tab's is (a hostile page still
+    /// holds the agent back), and the site it was allowed goes.
+    fn let_go(&self) {
+        *self.open.lock().unwrap() = false;
+        *self.visited.lock().unwrap() = None;
+        untrusted::forget(&self.key);
+    }
+
+    /// What opening `url` is refused for before anything is asked of Chrome:
+    /// not a web page, or a site the person's list keeps Desk from.
+    fn checked(&self, url: &str) -> Result<()> {
         if !super::address::opens_in_chrome(&super::address::kind(url)) {
             return Err(eyre!(
                 "Desk opens web pages (https://…) and about:blank only, never files, scripts, inline pages or Chrome's own pages."
@@ -376,43 +456,46 @@ impl ExtensionCell {
         if !hooks::settings().sites.allows(host.as_deref()) {
             return Err(kept_away(host.as_deref().unwrap_or(url)));
         }
-        self.with(async |_| {
-            let at = self.ask("navigate", json!({ "url": url })).await?;
-            let landed_url = at["url"].as_str().unwrap_or_default().to_string();
-            untrusted::on(&self.key, &landed_url);
-            // Where it landed passes the gate before anything of it is said
-            // or pictured: a redirect to a site the session may not visit
-            // is left at once, and its address and title go unsaid.
-            let landed = super::address::origin_of(&landed_url);
-            let allowed_visit = landed.is_some() && landed == *self.pending_visit.lock().unwrap();
-            let refused = match (&landed, hooks::hooks()) {
-                _ if !may_show(&landed_url) => Some(
-                    "It led to a page Desk may not show in your Chrome, so it was left.".to_string(),
-                ),
-                (Some(origin), Some(h)) if !allowed_visit => h
-                    .may_visit(&self.agent, origin)
-                    .err()
-                    .map(|_| "It led to a site this conversation hasn't been allowed to open, so it was left.".to_string()),
-                _ => None,
-            };
-            if let Some(why) = refused {
-                let _ = self.ask("navigate", json!({ "url": "about:blank" })).await;
-                untrusted::on(&self.key, "about:blank");
-                return Err(eyre!("{why} Desk's tab is blank now."));
-            }
-            // Opened, by the call the person allowed, exactly the site it was
-            // allowed to: it may stay.
-            if allowed_visit {
-                *self.visited.lock().unwrap() = landed;
-            }
-            self.done("browser.navigate", Some(url)).await;
-            self.keep_to_sites().await?;
-            let mut seen = Seen::at(&landed_url);
-            let title = seen.text(at["title"].as_str().unwrap_or_default());
-            let shown_url = seen.text(&landed_url);
-            Ok(seen.into_output(&self.key, json!({ "url": shown_url, "title": title })))
-        })
-        .await
+        Ok(())
+    }
+
+    /// Takes this cell's tab to `url`, inside [`Self::with`]: where it lands
+    /// passes the gate and the site list, and what was done is recorded as
+    /// `tool`, with a picture. Its address and title, unfenced.
+    async fn open(&self, url: &str, tool: &str) -> Result<(String, String)> {
+        let at = self.ask("navigate", json!({ "url": url })).await?;
+        let landed_url = at["url"].as_str().unwrap_or_default().to_string();
+        untrusted::on(&self.key, &landed_url);
+        // Where it landed passes the gate before anything of it is said
+        // or pictured: a redirect to a site the session may not visit
+        // is left at once, and its address and title go unsaid.
+        let landed = super::address::origin_of(&landed_url);
+        let allowed_visit = landed.is_some() && landed == *self.pending_visit.lock().unwrap();
+        let refused = match (&landed, hooks::hooks()) {
+            _ if !may_show(&landed_url) => Some(
+                "It led to a page Desk may not show in your Chrome, so it was left.".to_string(),
+            ),
+            (Some(origin), Some(h)) if !allowed_visit => h
+                .may_visit(&self.agent, origin)
+                .err()
+                .map(|_| "It led to a site this conversation hasn't been allowed to open, so it was left.".to_string()),
+            _ => None,
+        };
+        if let Some(why) = refused {
+            let _ = self.ask("navigate", json!({ "url": "about:blank" })).await;
+            untrusted::on(&self.key, "about:blank");
+            return Err(eyre!("{why} Desk's tab is blank now."));
+        }
+        // Opened, by the call the person allowed, exactly the site it was
+        // allowed to: it may stay.
+        if allowed_visit {
+            *self.visited.lock().unwrap() = landed;
+        }
+        self.done(tool, Some(url)).await;
+        Ok((
+            landed_url,
+            at["title"].as_str().unwrap_or_default().to_string(),
+        ))
     }
 
     /// Opens `url` in Desk's tab and brings it to the front of the person's
