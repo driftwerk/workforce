@@ -348,6 +348,12 @@ impl ChromeCell {
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
         self.with(async |c| {
+            // The address read again now: never a picture of a key page.
+            if super::address::shows_keys(&c.url().await) {
+                return Err(eyre::eyre!(
+                    "This page shows keys, so Desk takes no picture of it."
+                ));
+            }
             let png = c.screenshot().await?;
             let size = png.len();
             stage_screenshot_artifact(png, size)

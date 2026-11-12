@@ -295,80 +295,6 @@ pub async fn stop_session(id: &str) -> Vec<(String, String)> {
     keys
 }
 
-/// A value Desk reads off the agent's open page for the hub, and never
-/// shows the agent: a key the service shows once, just made.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Capture {
-    /// The element holding it.
-    pub selector: String,
-    /// What to press first to show it (*Create*), if anything.
-    pub reveal: Option<String>,
-    /// What to press after, so it shows no more (*Done*), if anything.
-    pub dismiss: Option<String>,
-    /// The origins it may be read on (`https://id.atlassian.com`).
-    pub origins: Vec<String>,
-    /// How long to wait for it to show.
-    pub wait_ms: u64,
-}
-
-/// Reads [`Capture`]'s value off the page of the agent in scope, in Desk's
-/// own browser: in one call, holding the page (no other browser call runs
-/// on it meanwhile), it presses `reveal`, waits for `selector`, reads its
-/// value in Desk's own world on the page, and presses `dismiss`. What it
-/// read never goes into a tool's output, the page's record or a picture:
-/// the activity it leaves has its picture only once the value is
-/// dismissed. A field the person types a password into is never read.
-pub async fn capture(c: &Capture) -> Result<workforce_common::secret::Secret<String>> {
-    if current_backend() == Backend::Chrome {
-        return Err(eyre!(
-            "Desk reads a new key only in its own browser, not in your Chrome. Make it in Desk's own browser (`browser: \"desk\"`)."
-        ));
-    }
-    let (agent, user) = current_identity();
-    let id = SessionId::derive(&agent, &user);
-    for client in clients() {
-        let cell = client.sessions.lock().await.get(&id).cloned();
-        if let Some(cell) = cell {
-            return cell.capture(c).await;
-        }
-    }
-    Err(eyre!(
-        "Desk's browser has no page open for this agent. Open the page that shows the key first."
-    ))
-}
-
-/// Brings the page of `agent`'s browser for `user`, in Desk's own browser,
-/// to the front of the screen, so the person can sign in there. False when
-/// it has no page open.
-pub async fn show(agent: &str, user: &str) -> bool {
-    let id = SessionId::derive(agent, user);
-    for client in clients() {
-        let cell = client.sessions.lock().await.get(&id).cloned();
-        if let Some(cell) = cell {
-            let page = cell.inner.lock().await.as_ref().map(|a| a.page.clone());
-            if let Some(page) = page {
-                return page.bring_to_front().await.is_ok();
-            }
-        }
-    }
-    false
-}
-
-/// What [`capture`] reads of the element `selector` names, in Desk's own
-/// world: its value or its text, unless it is a field a password is typed
-/// into.
-fn capture_expression(selector: &str) -> Result<String> {
-    let sel = serde_json::to_string(selector)?;
-    Ok(format!(
-        "(() => {{ const el = document.querySelector({sel}); \
-           if (!el) return null; \
-           if (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'password' && !el.readOnly) \
-             return {{ refused: true }}; \
-           const v = ('value' in el && typeof el.value === 'string' && el.value) ? el.value : (el.textContent || ''); \
-           return {{ value: v.trim() }}; }})()"
-    ))
-}
-
 /// What a call was decided for, carried from the gate's decision to the
 /// call: the origin it acts on, or the file it opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,6 +1193,13 @@ impl SessionCell {
             guard.as_ref().map(|a| a.last_screenshot_size.clone())
         };
         self.with_page(move |page, _n, _c| async move {
+            // The address read again now: a page that moved to a key page
+            // since is never pictured.
+            if super::address::shows_keys(&self.current_url(&page).await) {
+                return Err(eyre!(
+                    "This page shows keys, so Desk takes no picture of it."
+                ));
+            }
             let bytes = page
                 .screenshot(ScreenshotParams::default())
                 .await
@@ -1430,101 +1363,6 @@ impl SessionCell {
             Ok(seen.into_output(&self.key, json!({ "result": value })))
         })
         .await
-    }
-
-    /// [`capture`] on this session's page.
-    async fn capture(&self, c: &Capture) -> Result<workforce_common::secret::Secret<String>> {
-        let c = c.clone();
-        self.with_page(|page, _n, _c| async move {
-            let on = super::address::origin_of(&self.current_url(&page).await);
-            if !on.as_ref().is_some_and(|o| c.origins.iter().any(|a| a == o)) {
-                return Err(eyre!(
-                    "The page isn't the service's own, so Desk read nothing from it. Open the service's page that shows the key."
-                ));
-            }
-            if let Some(reveal) = c.reveal.as_deref() {
-                self.press(&page, reveal).await?;
-            }
-            let expression = capture_expression(&c.selector)?;
-            let until = Instant::now() + Duration::from_millis(c.wait_ms.min(30_000));
-            let value = loop {
-                let read = isolated(&page, expression.clone()).await?;
-                if read.as_ref().and_then(|v| v.get("refused")).is_some() {
-                    return Err(eyre!(
-                        "That is a field a password is typed into, so Desk read nothing. Passwords stay with the person."
-                    ));
-                }
-                let got = read
-                    .as_ref()
-                    .and_then(|v| v.get("value"))
-                    .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string);
-                match got {
-                    Some(v) => break v,
-                    None if Instant::now() >= until => {
-                        return Err(eyre!(
-                            "Nothing showed in `{}`, so Desk read nothing. Check the key was made, then try again.",
-                            c.selector
-                        ))
-                    }
-                    None => tokio::time::sleep(Duration::from_millis(250)).await,
-                }
-            };
-            let value = workforce_common::secret::Secret::new(value);
-            let dismissed = match c.dismiss.as_deref() {
-                Some(dismiss) => self.press(&page, dismiss).await.is_ok(),
-                None => false,
-            };
-            // A picture of the page only once the key shows no more.
-            match dismissed {
-                true => self.done(&page, "connections.capture", None).await,
-                false => {
-                    if let Some(hooks) = hooks::hooks() {
-                        let url = self.current_url(&page).await;
-                        let session = self.last_session.lock().unwrap().clone();
-                        hooks.record(Done {
-                            agent: self.agent.clone(),
-                            user: self.user.clone(),
-                            session,
-                            tool: "connections.capture".to_string(),
-                            backend: "desk",
-                            url,
-                            target: None,
-                            screenshot: None,
-                        });
-                    }
-                }
-            }
-            Ok(value)
-        })
-        .await
-    }
-
-    /// Presses `selector` as `browser.click` would: never what the page
-    /// holds back for the person, nor through something laid over it.
-    async fn press(&self, page: &Page, selector: &str) -> Result<()> {
-        let probe = self
-            .hold(
-                page,
-                "browser.click",
-                Some(selector),
-                Some(selector),
-                true,
-                &[],
-            )
-            .await?;
-        match probe.at {
-            Some((x, y)) => press_at(page, x, y).await,
-            None => page
-                .find_element(selector)
-                .await
-                .wrap_err_with(|| format!("element not found for selector `{selector}`"))?
-                .click()
-                .await
-                .map(drop)
-                .wrap_err("click failed"),
-        }
     }
 
     async fn wait_for_selector(&self, selector: &str, timeout_ms: Option<u64>) -> Result<Value> {
@@ -1822,7 +1660,7 @@ impl BrowserClient {
     fn no_picture(&self) -> Result<()> {
         match self.on_key_page() {
             true => Err(eyre!(
-                "This page shows keys, so Desk takes no picture of it. Read it with browser.snapshot (keys in it are hidden); a key you made is read with connections.capture."
+                "This page shows keys, so Desk takes no picture of it. Read it with browser.snapshot (keys in it are hidden); a key you made is read with browser.capture_key."
             )),
             false => Ok(()),
         }
@@ -1960,10 +1798,11 @@ impl BrowserClient {
     }
 
     pub(super) async fn evaluate(&self, expression: &str) -> Result<Value> {
-        if self.on_chrome() {
-            return self.chrome().await?.evaluate(expression).await;
-        }
-        self.acquire().await?.evaluate(expression).await
+        let read = match self.on_chrome() {
+            true => self.chrome().await?.evaluate(expression).await?,
+            false => self.acquire().await?.evaluate(expression).await?,
+        };
+        Ok(self.keys_hidden(read))
     }
 
     pub(super) async fn wait_for_selector(
@@ -1971,17 +1810,21 @@ impl BrowserClient {
         selector: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
-        if self.on_chrome() {
-            return self
-                .chrome()
-                .await?
-                .wait_for_selector(selector, timeout_ms)
-                .await;
-        }
-        self.acquire()
-            .await?
-            .wait_for_selector(selector, timeout_ms)
-            .await
+        let read = match self.on_chrome() {
+            true => {
+                self.chrome()
+                    .await?
+                    .wait_for_selector(selector, timeout_ms)
+                    .await?
+            }
+            false => {
+                self.acquire()
+                    .await?
+                    .wait_for_selector(selector, timeout_ms)
+                    .await?
+            }
+        };
+        Ok(self.keys_hidden(read))
     }
 
     pub(super) async fn get_content(&self, format: &str) -> Result<Value> {
@@ -2000,17 +1843,19 @@ impl BrowserClient {
     }
 
     pub(super) async fn network_requests(&self) -> Result<Value> {
-        if self.on_chrome() {
-            return self.chrome().await?.network_requests().await;
-        }
-        self.acquire().await?.network_requests().await
+        let read = match self.on_chrome() {
+            true => self.chrome().await?.network_requests().await?,
+            false => self.acquire().await?.network_requests().await?,
+        };
+        Ok(self.keys_hidden(read))
     }
 
     pub(super) async fn console_messages(&self) -> Result<Value> {
-        if self.on_chrome() {
-            return self.chrome().await?.console_messages().await;
-        }
-        self.acquire().await?.console_messages().await
+        let read = match self.on_chrome() {
+            true => self.chrome().await?.console_messages().await?,
+            false => self.acquire().await?.console_messages().await?,
+        };
+        Ok(self.keys_hidden(read))
     }
 
     /// Upload a staged artifact to a file `<input>` on the current page. The

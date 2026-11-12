@@ -1757,25 +1757,8 @@ fn an_agents_tools_reach_exactly_its_connections() {
 
 mod setups {
     use super::*;
-    use setup::{Caller, Callers, Pages, Setups, StepState};
+    use setup::{Caller, Callers, Setups, StepState};
     use workforce_common::secret::Secret;
-
-    /// The page a capture reads: what it shows, and what it was asked.
-    struct Page {
-        shows: Mutex<String>,
-        asked: Mutex<Vec<workforce_skills::adapters::browser::Capture>>,
-    }
-
-    #[async_trait]
-    impl Pages for Page {
-        async fn capture(
-            &self,
-            c: &workforce_skills::adapters::browser::Capture,
-        ) -> eyre::Result<Secret<String>> {
-            self.asked.lock().unwrap().push(c.clone());
-            Ok(Secret::new(self.shows.lock().unwrap().clone()))
-        }
-    }
 
     struct People;
 
@@ -1804,63 +1787,62 @@ mod setups {
         }
     }
 
-    async fn setups(shows: &str) -> (Hub, Arc<Page>, Setups) {
+    async fn setups() -> (Hub, Setups) {
         let h = hub().await;
-        let page = Arc::new(Page {
-            shows: Mutex::new(shows.into()),
-            asked: Mutex::default(),
-        });
-        let s = Setups::new(Arc::clone(&h.c), page.clone(), Arc::new(People));
-        (h, page, s)
+        let s = Setups::new(Arc::clone(&h.c), Arc::new(People));
+        (h, s)
     }
+
+    const LINEAR_PAGE: (&str, &str) = ("https://linear.app", "/settings/account/security");
 
     #[tokio::test]
     async fn an_agent_sets_itself_up_and_the_key_never_comes_back() {
         let cache = Arc::new(crate::secret_cache::InMemorySecretCache::with_defaults());
         let _cache = crate::secret_cache::testing::GlobalCache::install(cache.clone());
-        let (h, page, s) = setups(GOOD).await;
+        let (h, s) = setups().await;
         let allan = caller("allan");
         let started = s.start(&allan, "linear", Some("Acme"), None).await.unwrap();
         assert_eq!(
             started.steps.iter().map(|x| x.id).collect::<Vec<_>>(),
             ["page", "sign_in", "key", "check"]
         );
-        assert_eq!(started.steps[0].state, StepState::Current);
-        assert!(s.next(&started).contains("linear.app"));
-        s.step(&allan, &started.id, "sign_in", StepState::Waiting, None)
-            .unwrap();
-        // A non-secret field is kept by `keep`; a secret only by `capture`.
+        assert!(s.next(&started).contains("browser.capture_key"));
+        // The browser asks where the key may be read: this setup's page.
+        let page = s.key_page(&allan, "linear").unwrap();
+        assert_eq!(page.origin, "https://linear.app");
+        assert_eq!(page.fields, ["api_key"]);
+        assert!(
+            s.key_page(&caller("ben"), "linear").is_none(),
+            "Ben runs none"
+        );
+        // A secret is never kept by `keep`.
         assert!(s
             .keep(&allan, &started.id, "api_key", GOOD)
             .unwrap_err()
-            .contains("connections.capture"));
+            .contains("browser.capture_key"));
 
-        let said = s
-            .capture(
+        let kept = s
+            .keep_key(
                 &allan,
-                &started.id,
-                "api_key",
-                "#new-key",
-                Some("button.create"),
-                Some("button.done"),
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(GOOD.into()),
             )
             .await
             .unwrap();
-        assert!(!said.contains(GOOD), "{said}");
-        let asked = page.asked.lock().unwrap()[0].clone();
-        assert_eq!(asked.origins, ["https://linear.app"]);
-        assert_eq!(asked.reveal.as_deref(), Some("button.create"));
+        assert_eq!((kept.test.as_str(), kept.length), ("passed", GOOD.len()));
+        let said = serde_json::to_string(&kept).unwrap();
+        assert!(
+            !said.contains(&GOOD[..8]) && !said.contains(&GOOD[GOOD.len() - 4..]),
+            "{said}"
+        );
         // Should it come back into view, it reaches the model as a marker.
         use workforce_common::secret_marker::SecretCache;
         let looked = cache.redact_known("desk:allan", &format!("your key is {GOOD}"));
         assert!(!looked.contains(GOOD), "{looked}");
-        // Nothing is kept until the check passes.
-        assert!(keys(&h.allan).is_empty() && keys(&h.global).is_empty());
-
-        let tested = s.test(&allan, &started.id).await.unwrap();
-        let done = tested.connected.clone().unwrap();
-        assert_eq!(done.account, "sarah@acme.example");
-        // Just for Allan: at his own tier, named as he was asked.
+        // Kept just for Allan, at his own tier, named as he was asked.
         assert_eq!(
             keys(&h.allan),
             [
@@ -1875,17 +1857,13 @@ mod setups {
             .await
             .unwrap();
         assert_eq!(on, "Linear is on for Allan, read and write.");
-        let config = h.crew.configs.lock().unwrap()["allan"].clone();
-        assert!(config.contains("linear = [\"default\"]"), "{config}");
         let card = &s.views(SARAH, Some("allan"))[0];
         assert!(
             card.steps.iter().all(|x| x.state == StepState::Done),
             "{card:?}"
         );
-
-        // No word of it, anywhere it went.
         let everything = format!(
-            "{said} {} {} {}",
+            "{} {} {}",
             serde_json::to_string(&s.views(SARAH, None)).unwrap(),
             serde_json::to_string(&h.c.list(SARAH).await).unwrap(),
             serde_json::to_string(&s.listing(&allan).await.unwrap()).unwrap(),
@@ -1894,34 +1872,73 @@ mod setups {
     }
 
     #[tokio::test]
-    async fn a_key_that_fails_its_check_or_isnt_one_keeps_nothing() {
-        let (h, page, s) = setups("not a key").await;
+    async fn a_key_off_another_page_not_shaped_as_a_key_or_refused_keeps_nothing() {
+        let (h, s) = setups().await;
         let allan = caller("allan");
         let started = s.start(&allan, "linear", None, None).await.unwrap();
-        let e = s
-            .capture(&allan, &started.id, "api_key", "#k", None, None)
-            .await
-            .unwrap_err();
-        assert!(e.contains("doesn't look like"), "{e}");
-        *page.shows.lock().unwrap() = BAD.into();
-        s.capture(&allan, &started.id, "api_key", "#k", None, None)
+        for (origin, path, value, want) in [
+            ("https://evil.example", LINEAR_PAGE.1, GOOD, "key page"),
+            (LINEAR_PAGE.0, "/settings/profile", GOOD, "key page"),
+            (
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                "not a key",
+                "doesn't look like",
+            ),
+        ] {
+            let e = s
+                .keep_key(
+                    &allan,
+                    "linear",
+                    None,
+                    origin,
+                    path,
+                    Secret::new(value.into()),
+                )
+                .await
+                .unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
+        // The service refuses it: nothing kept, the agent isn't told its
+        // words, the card is.
+        let kept = s
+            .keep_key(
+                &allan,
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(BAD.into()),
+            )
             .await
             .unwrap();
+        assert_eq!(kept.test, "failed");
         let e = s.test(&allan, &started.id).await.unwrap_err();
-        assert!(e.contains("Nothing was kept") && !e.contains(BAD), "{e}");
+        assert!(e.contains("Read the key"), "the key was dropped: {e}");
         assert!(keys(&h.allan).is_empty());
         let card = &s.views(SARAH, None)[0];
-        assert_eq!(
-            card.steps.iter().find(|x| x.id == "check").unwrap().state,
-            StepState::Failed
-        );
+        let check = card.steps.iter().find(|x| x.id == "check").unwrap();
+        assert_eq!(check.state, StepState::Failed);
+        assert!(!format!("{card:?}").contains(BAD));
+        // No setup: nothing read, nothing kept.
+        assert!(s
+            .keep_key(
+                &caller("ben"),
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(GOOD.into())
+            )
+            .await
+            .unwrap_err()
+            .contains("No linear setup"));
     }
 
     #[tokio::test]
     async fn a_setup_is_its_own_agents_and_conversations_and_the_rest_is_the_overseers() {
-        let (h, _page, s) = setups(GOOD).await;
+        let (h, s) = setups().await;
         let allan = caller("allan");
-        // Not for all the person's agents, nor another agent.
         for whom in ["all", "ben"] {
             let e = s
                 .start(&allan, "linear", None, Some(whom))
@@ -1930,7 +1947,6 @@ mod setups {
             assert!(e.contains("overseer"), "{whom}: {e}");
         }
         let started = s.start(&allan, "linear", None, None).await.unwrap();
-        // Ben can't use Allan's setup; nor can Allan in another conversation.
         let other = Caller {
             session: Some("elsewhere".into()),
             ..caller("allan")
@@ -1941,34 +1957,42 @@ mod setups {
                 .unwrap_err()
                 .contains("no such setup"));
         }
-        // The check is the hub's to mark.
         assert!(s
             .step(&allan, &started.id, "check", StepState::Done, None)
             .is_err());
-        // Someone other than the person isn't let in at all.
+        // No one but the person, and never outside a conversation.
         let stranger = Caller {
             person: "someone-else".into(),
             ..caller("allan")
         };
-        assert!(s.start(&stranger, "linear", None, None).await.is_err());
-        // Google, Email and Slack the person connects.
+        let sessionless = Caller {
+            session: None,
+            ..caller("allan")
+        };
+        for who in [stranger, sessionless] {
+            assert!(s.start(&who, "linear", None, None).await.is_err());
+            assert!(s.key_page(&who, "linear").is_none());
+        }
         for by_hand in ["google", "email", "slack"] {
             let e = s.start(&allan, by_hand, None, None).await.unwrap_err();
             assert!(e.contains("Settings → Connections"), "{by_hand}: {e}");
         }
-
         // The overseer may set one up for all, and turn one on for Allan.
         let ben = caller("ben");
-        let all = s
-            .start(&ben, "linear", Some("Acme"), Some("all"))
+        s.start(&ben, "linear", Some("Acme"), Some("all"))
             .await
             .unwrap();
-        s.capture(&ben, &all.id, "api_key", "#k", None, None)
-            .await
-            .unwrap();
-        s.test(&ben, &all.id).await.unwrap();
+        s.keep_key(
+            &ben,
+            "linear",
+            None,
+            LINEAR_PAGE.0,
+            LINEAR_PAGE.1,
+            Secret::new(GOOD.into()),
+        )
+        .await
+        .unwrap();
         assert!(keys(&h.global).contains(&mine(&ws("default", "api_key"))));
-        // Allan may not turn it on for Ben.
         assert!(s
             .use_it(
                 &allan,
@@ -1995,70 +2019,151 @@ mod setups {
             .await
             .unwrap();
         assert_eq!(on, "Linear is on for Allan, read only.");
-        let config = h.crew.configs.lock().unwrap()["allan"].clone();
-        assert!(config.contains("read_only = [\"linear\"]"), "{config}");
     }
 
+    /// A key held goes only where it was read for: a Jira Cloud site, kept
+    /// before the key, unchanged after it; Metabase tested only at the
+    /// origin its key was read on.
     #[tokio::test]
-    async fn a_key_is_read_only_on_the_services_own_page() {
-        let (_h, page, s) = setups("ATATT3xFfGF0example0123456789").await;
+    async fn a_key_goes_only_to_the_site_it_was_read_for() {
+        let (_h, s) = setups().await;
         let allan = caller("allan");
         let jira = s.start(&allan, "jira", Some("Acme"), None).await.unwrap();
-        assert_eq!(jira.steps[0].id, "where");
+        for bad in [
+            "http://acme.atlassian.net",
+            "acme.evil.example",
+            "https://acme.atlassian.net/jira/projects",
+            "https://acme.atlassian.net?x=1",
+            "https://user:pw@acme.atlassian.net",
+            "https://127.0.0.1",
+            "https://localhost",
+            "https://acme.atlassian.net:8443",
+        ] {
+            assert!(s.keep(&allan, &jira.id, "site", bad).is_err(), "{bad}");
+        }
         let kept = s
             .keep(&allan, &jira.id, "site", "acme.atlassian.net")
             .unwrap();
-        assert_eq!(kept.steps[0].label, "Found your site: acme.atlassian.net");
-        assert_eq!(kept.steps[0].state, StepState::Done);
+        assert_eq!(
+            kept.steps[0].label,
+            "Found your site: https://acme.atlassian.net"
+        );
         s.keep(&allan, &jira.id, "email", "sarah@acme.example")
             .unwrap();
-        s.capture(&allan, &jira.id, "api_token", "#token", None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            page.asked.lock().unwrap()[0].origins,
-            ["https://id.atlassian.com"]
-        );
-        // Metabase's is the person's own site, once kept.
+        let token = "ATATT3xFfGF0example0123456789abcdef";
+        s.keep_key(
+            &allan,
+            "jira",
+            None,
+            "https://id.atlassian.com",
+            "/manage-profile/security/api-tokens",
+            Secret::new(token.into()),
+        )
+        .await
+        .unwrap();
+        // A key the service refused is dropped: nothing is held for it.
+
         let mb = s.start(&allan, "metabase", None, None).await.unwrap();
         assert!(s
-            .capture(&allan, &mb.id, "api_key", "#k", None, None)
+            .keep(&allan, &mb.id, "site_url", "http://metabase.acme.example")
+            .is_err());
+        s.keep(&allan, &mb.id, "site_url", "https://metabase.acme.example")
+            .unwrap();
+        let page = s.key_page(&allan, "metabase").unwrap();
+        assert_eq!(page.origin, "https://metabase.acme.example");
+        assert!(s
+            .keep_key(
+                &allan,
+                "metabase",
+                None,
+                "https://metabase.evil.example",
+                "/admin/settings/authentication/api-keys",
+                Secret::new("mb_0123456789abcdefghij".into())
+            )
             .await
             .unwrap_err()
-            .contains("address"));
-        s.keep(
-            &allan,
-            &mb.id,
-            "site_url",
-            "https://metabase.acme.example/x",
-        )
-        .unwrap();
-        *page.shows.lock().unwrap() = "mb_0123456789abcdef".into();
-        s.capture(&allan, &mb.id, "api_key", "#k", None, None)
+            .contains("key page"));
+        // Datadog's site is a region.
+        let dd = s.start(&allan, "datadog", None, None).await.unwrap();
+        assert!(s.keep(&allan, &dd.id, "site", "evil.example").is_err());
+        s.keep(&allan, &dd.id, "site", "eu1").unwrap();
+        assert_eq!(
+            s.key_page(&allan, "datadog").unwrap().origin,
+            "https://app.datadoghq.eu"
+        );
+        let held = s
+            .keep_key(
+                &allan,
+                "datadog",
+                None,
+                "https://app.datadoghq.eu",
+                "/organization-settings/api-keys",
+                Secret::new("0123456789abcdef0123456789abcdef".into()),
+            )
             .await
             .unwrap();
-        assert_eq!(
-            page.asked.lock().unwrap()[1].origins,
-            ["https://metabase.acme.example"]
-        );
+        assert_eq!(held.test, "still needs app_key");
+        // Once a key is held, nothing about where it goes changes.
+        assert!(s
+            .keep(&allan, &dd.id, "site", "us1")
+            .unwrap_err()
+            .contains("held"));
+    }
+
+    #[tokio::test]
+    async fn too_many_setups_start_nothing() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        for _ in 0..16 {
+            s.start(&allan, "linear", None, None).await.unwrap();
+        }
+        assert!(s
+            .start(&allan, "github", None, None)
+            .await
+            .unwrap_err()
+            .contains("Too many"));
     }
 
     #[tokio::test]
     async fn the_tools_say_what_they_change_to_desks_gate() {
         use workforce_agent::tools::Tool;
+        use workforce_core::computer::Effect;
+        let write = |e: Effect| match e {
+            Effect::Connector {
+                connector,
+                write: true,
+            } => Some(connector),
+            _ => None,
+        };
         for tool in setup::SetupTool::all("allan") {
-            let effect = tool.effect(&json!({}));
-            let writes = matches!(
-                effect,
-                workforce_core::computer::Effect::Connector { write: true, .. }
-            );
-            assert_eq!(
-                writes,
-                ["connections.capture", "connections.test", "connections.use"]
-                    .contains(&tool.name()),
-                "{}",
-                tool.name()
-            );
+            let effect = write(tool.effect(&json!({ "service": "linear" })));
+            match tool.name() {
+                "connections.list" | "connections.step" | "connections.setup" => {
+                    assert_eq!(effect, None, "{}", tool.name())
+                }
+                // A connection write: asks below unbound.
+                "connections.keep" | "connections.test" => {
+                    assert_eq!(effect.as_deref(), Some("connections"), "{}", tool.name())
+                }
+                _ => assert!(effect.is_some(), "{}", tool.name()),
+            }
         }
+        let setup = setup::SetupTool::all("allan")
+            .into_iter()
+            .find(|t| t.name() == "connections.setup")
+            .unwrap();
+        assert_eq!(
+            write(setup.effect(&json!({ "service": "github" }))).as_deref(),
+            Some("connections"),
+            "GitHub's sign-in is gated"
+        );
+        let use_it = setup::SetupTool::all("allan")
+            .into_iter()
+            .find(|t| t.name() == "connections.use")
+            .unwrap();
+        assert_eq!(
+            write(use_it.effect(&json!({ "agent": "ben" }))).as_deref(),
+            Some("connections:other")
+        );
     }
 }
