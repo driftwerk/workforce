@@ -2211,11 +2211,10 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     // line and work turns run), is given the same block of what Desk keeps
     // of its crew and what it told the person lately.
     #[cfg(feature = "postgres")]
-    if let Some(channel) = session_id
-        .and_then(|sid| service.sessions.get(sid).ok().flatten())
-        .map(|s| s.channel)
-    {
-        if let Some(block) = crate::desk_crew::context::block(service, &channel).await {
+    if let Some(turn) = session_id.and_then(|sid| service.sessions.get(sid).ok().flatten()) {
+        if let Some(block) =
+            crate::desk_crew::context::block(service, &turn.channel, &turn.owner).await
+        {
             turn_context.push_str("\n\n");
             turn_context.push_str(&block);
         }

@@ -3582,10 +3582,10 @@ async fn every_turn_of_the_boss_is_given_the_same_block_and_its_posts_survive_a_
             overseer.sessions.append_to_archive(&dm.id, m).unwrap();
         }
         workforce_agent::rollover::seal_and_mint(overseer.sessions.as_ref(), &mut dm, 0).unwrap();
-        let in_dm = context::block(&overseer, DESK_CHANNEL)
+        let in_dm = context::block(&overseer, DESK_CHANNEL, PERSON)
             .await
             .expect("a block in the DM");
-        let on_line = context::block(&overseer, &super::line::line_channel(s.id))
+        let on_line = context::block(&overseer, &super::line::line_channel(s.id), PERSON)
             .await
             .expect("a block on the line");
         for (turn, block) in [("dm", &in_dm), ("line", &on_line)] {

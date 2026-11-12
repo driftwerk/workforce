@@ -20,6 +20,8 @@ pub(super) const CAP_CHARS: usize = 12_000;
 const ENTRY_CHARS: usize = 320;
 /// A quiet session's line once the block is over its cap.
 const SHORT_CHARS: usize = 100;
+/// The whole account of the session the turn is about, at most.
+const ABOUT_CHARS: usize = 4_000;
 /// The boss's own posts it is reminded of.
 pub(super) const POSTS: usize = 10;
 const POST_CHARS: usize = 240;
@@ -30,6 +32,8 @@ pub(super) struct Entry {
     pub id: Uuid,
     pub name: String,
     pub state: SessionState,
+    /// Its last turn failed.
+    pub failed: bool,
     pub account: Option<Account>,
 }
 
@@ -40,15 +44,15 @@ pub(super) struct Post {
     pub text: String,
 }
 
-/// Whether a session is between turns or gone: what drops first.
-fn quiet(s: SessionState) -> bool {
-    !matches!(
-        s,
-        SessionState::Starting
-            | SessionState::Working
-            | SessionState::Blocked
-            | SessionState::Asking
-    )
+/// Whether a session is quietly between turns or done: what drops first.
+/// One interrupted, or whose last turn failed, wants attention and keeps
+/// its line.
+fn quiet(e: &Entry) -> bool {
+    !e.failed
+        && matches!(
+            e.state,
+            SessionState::Idle | SessionState::Done | SessionState::Stopped | SessionState::Closed
+        )
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -59,8 +63,20 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-fn line(e: &Entry, short: bool) -> String {
-    let head = format!("- {} ({}, session_id {})", e.name, e.state.as_str(), e.id);
+fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
+    let state = match e.failed {
+        true => format!("{}, its last turn failed", e.state.as_str()),
+        false => e.state.as_str().to_string(),
+    };
+    let head = match &e.account {
+        Some(a) => format!(
+            "- {} ({state}, session_id {}, as of {})",
+            e.name,
+            e.id,
+            a.written_at.with_timezone(&tz).format("%H:%M")
+        ),
+        None => format!("- {} ({state}, session_id {})", e.name, e.id),
+    };
     match (&e.account, short) {
         (None, _) => format!("{head}: no account yet"),
         (Some(a), true) if !a.purpose.is_empty() => {
@@ -84,16 +100,23 @@ pub(super) fn body(
         return None;
     }
     let mut head = String::new();
+    let mut headed = None;
     if let Some(a) = about
         .and_then(|id| entries.iter().find(|e| e.id == id))
         .and_then(|e| e.account.as_ref().map(|a| (e, a)))
     {
+        let render = a.1.render();
+        let render: String = match render.chars().count() > ABOUT_CHARS {
+            true => format!("{}…", render.chars().take(ABOUT_CHARS).collect::<String>()),
+            false => render,
+        };
         head.push_str(&format!(
             "The session this turn is about, {} (as of {}):\n{}\n",
             a.0.name,
             a.1.written_at.with_timezone(&tz).format("%H:%M"),
-            a.1.render().trim_end()
+            render.trim_end()
         ));
+        headed = Some(a.0.id);
     }
     let mut tail = String::new();
     if !posts.is_empty() {
@@ -107,14 +130,15 @@ pub(super) fn body(
         }
     }
     // Working sessions first, then the quiet ones.
-    let mut shown: Vec<&Entry> = entries.iter().filter(|e| Some(e.id) != about).collect();
-    shown.sort_by_key(|e| quiet(e.state));
+    // The session the turn is about is listed too when it has no account
+    // to give whole.
+    let mut shown: Vec<&Entry> = entries.iter().filter(|e| Some(e.id) != headed).collect();
+    shown.sort_by_key(|e| quiet(e));
     let room = CAP_CHARS.saturating_sub(head.len() + tail.len());
-    let full: Vec<String> = shown.iter().map(|e| line(e, false)).collect();
-    let mut lines = full.clone();
-    if full.iter().map(|l| l.len() + 1).sum::<usize>() > room {
+    let mut lines: Vec<String> = shown.iter().map(|e| line(e, false, tz)).collect();
+    if lines.iter().map(|l| l.len() + 1).sum::<usize>() > room {
         // Over the cap: quiet sessions drop to one short line first.
-        lines = shown.iter().map(|e| line(e, quiet(e.state))).collect();
+        lines = shown.iter().map(|e| line(e, quiet(e), tz)).collect();
     }
     let mut sessions = String::new();
     let mut left = 0usize;
@@ -141,7 +165,7 @@ pub(super) fn body(
 /// The block for a turn of `service` on `channel` (its DM, or a session's
 /// line, where its line and work turns run), when it is a boss. None off
 /// those, for an agent that oversees nothing, or with nothing to say.
-pub(crate) async fn block(service: &AgentService, channel: &str) -> Option<String> {
+pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) -> Option<String> {
     let about = match channel {
         DESK_CHANNEL => None,
         c => Some(
@@ -154,14 +178,15 @@ pub(crate) async fn block(service: &AgentService, channel: &str) -> Option<Strin
     let crew = super::for_service(service)?;
     let (boss, o) = crew.overseer_named(service.agent_id.as_str())?;
     let seen = crew.desk.seen_by(&o.scope);
+    // The cheap tests first: the hub-internal one reads Desk's state.
     let views: Vec<_> = crew
         .desk
         .list()
         .into_iter()
         .filter(|v| v.state != SessionState::Closed)
-        .filter(|v| !crew.desk.hub_internal(v.id))
-        .filter(|v| !workforce_desk::ledger::agent_turn(&v.cwd, &v.name))
         .filter(|v| seen.sees(v.group.as_ref().map(|g| g.id.as_str())))
+        .filter(|v| !workforce_desk::ledger::agent_turn(&v.cwd, &v.name))
+        .filter(|v| !crew.desk.hub_internal(v.id))
         .collect();
     let ids: Vec<Uuid> = views.iter().map(|v| v.id).collect();
     let accounts = match crew.desk.session_accounts_of(&ids).await {
@@ -177,10 +202,11 @@ pub(crate) async fn block(service: &AgentService, channel: &str) -> Option<Strin
             id: v.id,
             name: v.label().to_string(),
             state: v.state,
+            failed: v.failure.is_some(),
             account: accounts.iter().find(|a| a.session == v.id).cloned(),
         })
         .collect();
-    let posts = recent_posts(&crew, &boss);
+    let posts = recent_posts(&boss, owner);
     let body = body(&entries, about, &posts, crew.desk.timezone())?;
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
@@ -189,17 +215,15 @@ pub(crate) async fn block(service: &AgentService, channel: &str) -> Option<Strin
     ))
 }
 
-/// The boss's own last [`POSTS`] DM posts, oldest first: from the DM's
-/// archive, so they survive its rollover.
-fn recent_posts(crew: &super::CrewHub, boss: &std::sync::Arc<AgentService>) -> Vec<Post> {
-    let Some(owner) = crew.person(Some(boss)) else {
-        return Vec::new();
-    };
+/// The boss's own last [`POSTS`] posts in its DM with `owner` (the person
+/// the turn is for), oldest first: from the DM's archive, so they survive
+/// its rollover.
+fn recent_posts(boss: &AgentService, owner: &str) -> Vec<Post> {
     let speaker = workforce_desk::Speaker::agent(boss.agent_id.as_str(), &super::name_of(boss));
     let page = match crate::desk_conversations::page(
         boss.sessions.as_ref(),
         &speaker,
-        &owner,
+        owner,
         DESK_CHANNEL,
         workforce_desk::Cursor::Newest,
         POSTS * 4,
@@ -238,6 +262,7 @@ mod tests {
             id,
             name: name.into(),
             state,
+            failed: false,
             account: Some(a),
         }
     }
@@ -299,5 +324,36 @@ mod tests {
             "{text}"
         );
         assert!(body(&[], None, &[], chrono_tz::UTC).is_none());
+    }
+
+    #[test]
+    fn the_session_a_turn_is_about_is_kept_without_an_account_and_clipped_with_a_long_one() {
+        let mut fresh = entry("new-one", SessionState::Working, "");
+        fresh.account = None;
+        let id = fresh.id;
+        let text = body(&[fresh], Some(id), &[], chrono_tz::UTC).unwrap();
+        assert!(text.contains("- new-one (working, session_id"), "{text}");
+        assert!(text.contains("no account yet"));
+        let mut long = entry("busy", SessionState::Working, "Fix the login page.");
+        if let Some(a) = long.account.as_mut() {
+            a.done = (0..20)
+                .map(|i| workforce_desk::account::Done {
+                    text: format!("step {i} {}", "with many words ".repeat(25)),
+                    refs: vec![],
+                    at: Utc::now(),
+                })
+                .collect();
+        }
+        let id = long.id;
+        let mut entries = vec![long];
+        entries.extend(
+            (0..20).map(|i| entry(&format!("other-{i}"), SessionState::Working, "Other work.")),
+        );
+        let text = body(&entries, Some(id), &[], chrono_tz::UTC).unwrap();
+        assert!(text.len() <= CAP_CHARS + 400, "{}", text.len());
+        assert!(
+            text.contains("- other-0 "),
+            "the others still have room: {text}"
+        );
     }
 }
