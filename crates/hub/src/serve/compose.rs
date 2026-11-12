@@ -2596,7 +2596,7 @@ fn register_memory_tools(
             }
         }
     }
-    tools.register(Arc::new(memory_tool));
+    tools.register_builtin(Arc::new(memory_tool));
     tools.register(Arc::new(crate::preferences::PreferenceTool::new(
         Arc::clone(memory_store),
         agent_id.clone(),
@@ -2650,8 +2650,8 @@ fn register_memory_tools(
     )));
     // Data plane: read-only SQL over staged tabular artifacts + shape
     // inspection.
-    tools.register(Arc::new(workforce_agent::tools::data::DataQueryTool));
-    tools.register(Arc::new(workforce_agent::tools::data::DataInspectTool));
+    tools.register_builtin(Arc::new(workforce_agent::tools::data::DataQueryTool));
+    tools.register_builtin(Arc::new(workforce_agent::tools::data::DataInspectTool));
     info!(
         "Memory tools registered (vector store: {})",
         config.weaviate.enabled
@@ -3429,7 +3429,7 @@ fn register_messaging_tools(
 
     // tool.retrieve — recover originals of tool outputs that compaction
     // truncated/evicted.
-    tools.register(Arc::new(crate::retrieve_tool::RetrieveTool::new(
+    tools.register_builtin(Arc::new(crate::retrieve_tool::RetrieveTool::new(
         Arc::clone(sessions),
     )));
 }

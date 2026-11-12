@@ -114,6 +114,11 @@ struct OnSocket {
     group_key: String,
     /// The tools its engine offers, `crew.*` alone.
     tools: Vec<String>,
+    /// The person and the agent it was minted for, and its engine's name
+    /// as registered at mint: what a boss tool binds a call to.
+    person: Uuid,
+    agent_id: String,
+    engine_name: String,
     /// Checks in a row that couldn't be made.
     unchecked: u32,
 }
@@ -267,6 +272,26 @@ impl Uplinks {
             })
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// The links on a socket now of the group `group_key` minted for
+    /// `person` and `agent`, with each one's engine name as registered at
+    /// mint: all a boss tool in that group's conversation may call. Never
+    /// another person's, another agent's or another group's.
+    pub fn links_for(&self, group_key: &str, person: Uuid, agent: &str) -> Vec<(Uuid, String)> {
+        let mut out: Vec<(Uuid, String)> = self
+            .links
+            .lock()
+            .iter()
+            .filter_map(|(id, s)| {
+                let links = s.links.lock();
+                let l = links.get(id)?;
+                (l.group_key == group_key && l.person == person && l.agent_id == agent)
+                    .then(|| (*id, l.engine_name.clone()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
     }
 
     /// The crew tools link `link_id`'s engine offers: names alone, as the
@@ -874,6 +899,9 @@ fn handshake(
                         token: Zeroizing::new(l.token.clone()),
                         group_key: live.link.group_key.clone(),
                         tools: tools.clone(),
+                        person: live.person.id,
+                        agent_id: live.link.agent_id.clone(),
+                        engine_name: live.link.engine_name.clone(),
                         unchecked: 0,
                     },
                 );
