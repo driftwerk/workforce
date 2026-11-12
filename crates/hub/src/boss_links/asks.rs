@@ -41,14 +41,29 @@ const MAX_MINUTES: i64 = 60;
 const SUMMARY_CHARS: usize = 300;
 const DETAIL_CHARS: usize = 1_000;
 
+/// The most asks one link may have open here at once; the rest wait on
+/// the engine, which sends them again on its next socket.
+pub const OPEN_PER_LINK: usize = 20;
+
+/// The most times an answer is sent again to an engine that had no room.
+const BUSY_TRIES: u8 = 5;
+
+/// An open ask, as this hub holds it in memory.
+struct Held {
+    link: Uuid,
+    /// The nonce it last came with.
+    nonce: String,
+    uplinks: Weak<Uplinks>,
+    expires_at: DateTime<Utc>,
+    /// The person's answer, once given: (choice, decider).
+    decided: Option<(String, Value)>,
+    busy: u8,
+}
+
 /// The asks this hub holds answers for, in memory.
 #[derive(Default)]
 pub struct Asks {
-    /// Each open ask's link, the nonce it last came with, and the uplinks
-    /// that carry the link.
-    nonces: parking_lot::Mutex<HashMap<Uuid, (Uuid, String, Weak<Uplinks>)>>,
-    /// Answers given and not yet closed by the engine: (choice, decider).
-    decided: parking_lot::Mutex<HashMap<Uuid, (String, Value)>>,
+    held: parking_lot::Mutex<HashMap<Uuid, Held>>,
 }
 
 /// This hub's asks: one table, whichever routed approval answers them.
@@ -181,25 +196,72 @@ pub fn refuses(row: &PendingApproval, choice: PermissionChoice) -> Option<&'stat
 }
 
 impl Asks {
-    fn link_of(&self, ask: Uuid) -> Option<Uuid> {
-        self.nonces.lock().get(&ask).map(|(l, _, _)| *l)
+    /// Holds `asked`, come on `link`, with the nonce it came with now:
+    /// false when another link holds it, or the link has as many open as
+    /// it may. What has run out is let go first.
+    fn hold(&self, asked: &Asked, link: Uuid, uplinks: &Arc<Uplinks>) -> bool {
+        let mut held = self.held.lock();
+        let now = Utc::now();
+        held.retain(|_, h| h.expires_at > now);
+        if let Some(h) = held.get_mut(&asked.ask) {
+            if h.link != link {
+                return false;
+            }
+            h.nonce = asked.nonce.clone();
+            h.uplinks = Arc::downgrade(uplinks);
+            return true;
+        }
+        if held.values().filter(|h| h.link == link).count() >= OPEN_PER_LINK {
+            return false;
+        }
+        held.insert(
+            asked.ask,
+            Held {
+                link,
+                nonce: asked.nonce.clone(),
+                uplinks: Arc::downgrade(uplinks),
+                expires_at: asked.expires_at,
+                decided: None,
+                busy: 0,
+            },
+        );
+        true
     }
 
     /// Keeps nothing more of `ask`.
     pub fn forget(&self, ask: Uuid) {
-        self.nonces.lock().remove(&ask);
-        self.decided.lock().remove(&ask);
+        self.held.lock().remove(&ask);
     }
+}
+
+/// `s`, an engine's words, as plain Slack text: its `&`, `<` and `>`
+/// escaped so no link, mention or channel markup in it works, and no
+/// formatting marks; its lines kept.
+fn slack_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '*' | '_' | '~' | '`' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The card an ask is shown with in Slack.
 fn blocks(asked: &Asked, live: &LiveLink, hub: &str, request: &str) -> Vec<Value> {
     let mut text = format!(
         ":raising_hand: *{}*\n{} on {}, through {}",
-        asked.summary, live.link.group_name, live.link.engine_id, live.agent_id
+        slack_text(&asked.summary),
+        super::slack::slack_plain(&live.link.group_name),
+        slack_text(&live.link.engine_id),
+        slack_text(&live.agent_id)
     );
     if let Some(d) = &asked.detail {
-        text.push_str(&format!("\n> {}", d.replace('\n', "\n> ")));
+        text.push_str(&format!("\n> {}", slack_text(d).replace('\n', "\n> ")));
     }
     let mut out = vec![json!({"type": "section", "text": {"type": "mrkdwn", "text": text}})];
     if asked.desk_only {
@@ -241,17 +303,6 @@ pub async fn asked(
 ) -> Result<(), ()> {
     let asked = Asked::of(frame, Utc::now()).ok_or(())?;
     let link = live.link.link_id;
-    // One ask is one link's: another link's id is never taken over.
-    {
-        let mut nonces = ASKS.nonces.lock();
-        if nonces.get(&asked.ask).is_some_and(|(l, _, _)| *l != link) {
-            return Err(());
-        }
-        nonces.insert(
-            asked.ask,
-            (link, asked.nonce.clone(), Arc::downgrade(&state.uplinks)),
-        );
-    }
     let Some(service) = state.registry.get(&live.agent_id) else {
         return Ok(());
     };
@@ -260,12 +311,34 @@ pub async fn asked(
     };
     let person = live.person.id.to_string();
     let request = request_id(asked.ask);
-    match store.get(&request) {
-        Ok(Some(row)) if row.tool_input["linkId"] != json!(link) => return Err(()),
-        Ok(Some(row)) if !row.is_pending() => {
+    // One ask is one link's: another link's id is never taken over, and
+    // its nonce is held only once the kept row says it is this link's.
+    let row = match store.get(&request) {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(error = %e, "an ask's approval couldn't be read");
+            return Ok(());
+        }
+    };
+    if row
+        .as_ref()
+        .is_some_and(|r| r.tool_input["linkId"] != json!(link))
+    {
+        return Err(());
+    }
+    if !ASKS.hold(&asked, link, &state.uplinks) {
+        return Ok(());
+    }
+    match row {
+        Some(row) if !row.is_pending() => {
             // Answered here before it came again: the answer goes down
             // with its new nonce.
-            let given = ASKS.decided.lock().get(&asked.ask).cloned().or_else(|| {
+            let kept = ASKS
+                .held
+                .lock()
+                .get(&asked.ask)
+                .and_then(|h| h.decided.clone());
+            let given = kept.or_else(|| {
                 let choice = match ApprovalOutcome::from_str_lossy(&row.status)? {
                     ApprovalOutcome::Approved => "allow",
                     ApprovalOutcome::Denied => "deny",
@@ -275,17 +348,17 @@ pub async fn asked(
                                      "via": "desk"});
                 Some((choice.to_string(), decider))
             });
-            if let Some((choice, decider)) = given {
-                send_decision(asked.ask, &choice, decider);
+            match given {
+                Some((choice, decider)) => {
+                    send_decision(asked.ask, &choice, decider);
+                }
+                // Run out here: never answered.
+                None => ASKS.forget(asked.ask),
             }
             return Ok(());
         }
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "an ask's approval couldn't be read");
-            return Ok(());
-        }
+        Some(_) => return Ok(()),
+        None => {}
     }
     let key = (
         live.person.id,
@@ -376,7 +449,7 @@ pub async fn asked(
             channel: channel.clone(),
             text: format!(
                 "{} — answer in this thread's card, or in Desk.",
-                asked.summary
+                slack_text(&asked.summary)
             ),
             thread_id: Some(ts),
             username: None,
@@ -396,75 +469,62 @@ pub async fn asked(
     Ok(())
 }
 
-/// Sends the answer to `ask` down its link, when a socket carries it; kept
-/// to send again until the engine closes the ask.
-fn send_decision(ask: Uuid, choice: &str, decider: Value) {
-    ASKS.decided
-        .lock()
-        .insert(ask, (choice.to_string(), decider.clone()));
-    let Some((link, nonce, uplinks)) = ASKS.nonces.lock().get(&ask).cloned() else {
-        return;
+/// Sends the answer to `ask` down its link, when a socket carries it;
+/// kept to send again until the engine closes the ask. Whether it went.
+fn send_decision(ask: Uuid, choice: &str, decider: Value) -> bool {
+    let (link, nonce, uplinks) = {
+        let mut held = ASKS.held.lock();
+        let Some(h) = held.get_mut(&ask) else {
+            return false;
+        };
+        h.decided = Some((choice.to_string(), decider.clone()));
+        (h.link, h.nonce.clone(), h.uplinks.clone())
     };
     let Some(uplinks) = uplinks.upgrade() else {
-        return;
+        return false;
     };
     uplinks.notify_link(
         link,
         json!({"type": "decision", "askId": ask, "linkId": link, "nonce": nonce,
                "choice": choice, "decider": decider, "decidedAt": Utc::now()}),
-    );
+    )
 }
 
 /// The person answered `row`, an ask's approval, with `choice`, as
-/// `decider` (their identity) by `via`: it goes down the link.
+/// `decider` (their identity) by `via`: it goes down the link. Whether it
+/// went now; else it goes when the engine sends the ask again.
 pub fn decided(
     row: &PendingApproval,
     choice: PermissionChoice,
     decider: &str,
     via: &str,
     slack: Option<&str>,
-) {
+) -> bool {
     let Some(ask) = row.tool_input["askId"]
         .as_str()
         .and_then(|a| a.parse().ok())
     else {
-        return;
+        return false;
     };
     let Some(choice) = choice_of(choice) else {
-        return;
+        return false;
     };
     let mut who = json!({"identityId": decider, "via": via});
     if let Some(s) = slack {
         who["slackUserId"] = json!(s);
     }
-    send_decision(ask, choice, who);
+    send_decision(ask, choice, who)
 }
 
-/// Takes an `ask_closed` or `decision_refused` frame come on `link`: the
-/// ask's answer is no longer sent, and its card says what came of it.
+/// Takes an `ask_closed` or `decision_refused` frame come on `live`'s
+/// link, for an ask that link's: its answer is no longer sent, and its card
+/// says what came of it. The engine's words are said as its: a card the
+/// person answered keeps their answer.
 pub async fn closed(state: &Arc<GatewayState>, live: &LiveLink, frame: &Value) {
     let Some(ask) = frame["askId"].as_str().and_then(|a| a.parse::<Uuid>().ok()) else {
         return;
     };
     let link = live.link.link_id;
-    if ASKS.link_of(ask).is_some_and(|l| l != link) {
-        return;
-    }
-    let refused = frame["type"] == "decision_refused";
-    // The engine had no room for it just then: the same answer, again.
-    if refused && frame["code"] == "busy" {
-        if let Some((choice, decider)) = ASKS.decided.lock().get(&ask).cloned() {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                send_decision(ask, &choice, decider);
-            });
-        }
-        return;
-    }
-    if !refused {
-        ASKS.nonces.lock().remove(&ask);
-    }
-    ASKS.decided.lock().remove(&ask);
     let Some(service) = state.registry.get(&live.agent_id) else {
         return;
     };
@@ -478,42 +538,84 @@ pub async fn closed(state: &Arc<GatewayState>, live: &LiveLink, frame: &Value) {
     if row.tool_input["linkId"] != json!(link) {
         return;
     }
-    let said = if refused {
-        format!(
-            "Not taken: {}",
-            plain(
-                frame["why"].as_str().unwrap_or("the engine refused it."),
-                200
-            )
-        )
-    } else {
-        match frame["how"].as_str().unwrap_or_default() {
-            "decided" => match frame["choice"].as_str() {
-                Some("allow") => "Allowed.".to_string(),
-                Some("stop") => "Denied, and the session stopped.".to_string(),
-                _ => "Denied.".to_string(),
-            },
-            "answered_in_desk" => "Already answered in Desk.".to_string(),
-            "answered_by_boss" => format!("{} answered it.", live.agent_id),
-            "expired" => "It waited too long: answer it in Desk.".to_string(),
-            _ => "No longer asked.".to_string(),
+    let refused = frame["type"] == "decision_refused";
+    // The engine had no room for it just then: the same answer, again, a
+    // few times.
+    if refused && frame["code"] == "busy" {
+        let again = {
+            let mut held = ASKS.held.lock();
+            held.get_mut(&ask).and_then(|h| {
+                h.busy += 1;
+                (h.busy <= BUSY_TRIES).then(|| h.decided.clone()).flatten()
+            })
+        };
+        if let Some((choice, decider)) = again {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let still = ASKS
+                    .held
+                    .lock()
+                    .get(&ask)
+                    .is_some_and(|h| h.decided.is_some());
+                if still {
+                    send_decision(ask, &choice, decider);
+                }
+            });
         }
-    };
-    if row.is_pending() {
-        let outcome = ApprovalOutcome::Expired;
-        if store.claim(&request, outcome, "").unwrap_or(false) {
-            crate::approvals::resolved(store.as_ref(), &request);
-        }
+        return;
     }
-    rewrite(&service, &store, &row, &said).await;
+    if refused {
+        // Not taken: the person's answer stays theirs, and the card says
+        // it wasn't taken.
+        if let Some(h) = ASKS.held.lock().get_mut(&ask) {
+            h.decided = None;
+        }
+        let why = plain(
+            frame["why"].as_str().unwrap_or("the engine refused it."),
+            200,
+        );
+        rewrite(
+            &service,
+            &store,
+            &row,
+            &format!(
+                "Your answer wasn't taken. The engine says: {}",
+                slack_text(&why)
+            ),
+        )
+        .await;
+        return;
+    }
+    ASKS.forget(ask);
+    if !row.is_pending() {
+        return;
+    }
+    let said = match frame["how"].as_str().unwrap_or_default() {
+        "answered_in_desk" => "Answered in Desk.",
+        "answered_by_boss" => "The boss answered it.",
+        "expired" => "It waited too long: answer it in Desk.",
+        _ => "No longer asked.",
+    };
+    if store
+        .claim(&request, ApprovalOutcome::Expired, "")
+        .unwrap_or(false)
+    {
+        crate::approvals::resolved(store.as_ref(), &request);
+    }
+    rewrite(&service, &store, &row, &format!("The engine says: {said}")).await;
 }
 
-/// What a card says once its person answered it here.
-pub fn said_of(choice: PermissionChoice) -> &'static str {
-    match choice_of(choice) {
-        Some("allow") => "Allowed: passed on.",
-        Some("stop") => "Denied, and the session asked to stop: passed on.",
-        _ => "Denied: passed on.",
+/// What a card says once its person answered it here with `choice`, and
+/// whether it went down the link now.
+pub fn said_of(choice: PermissionChoice, went: bool) -> String {
+    let what = match choice_of(choice) {
+        Some("allow") => "Allowed",
+        Some("stop") => "Denied, and the session asked to stop",
+        _ => "Denied",
+    };
+    match went {
+        true => format!("{what}: passed on."),
+        false => format!("{what}: passed on when the engine is back."),
     }
 }
 
@@ -544,8 +646,9 @@ pub async fn rewrite_decided(
     store: &Arc<dyn PendingApprovalStore>,
     row: &PendingApproval,
     choice: PermissionChoice,
+    went: bool,
 ) {
-    rewrite(service, store, row, said_of(choice)).await;
+    rewrite(service, store, row, &said_of(choice, went)).await;
 }
 
 /// Rewrites every card of `row` to say `said`, without its buttons.
@@ -570,7 +673,7 @@ async fn rewrite(
     let Some(surface) = surface else {
         return;
     };
-    let summary = row.tool_input["summary"].as_str().unwrap_or_default();
+    let summary = slack_text(row.tool_input["summary"].as_str().unwrap_or_default());
     let text = format!("*{summary}*\n{said}");
     for t in store.targets(&row.request_id).unwrap_or_default() {
         let (Some(dm), Some(ts)) = (&t.dm_channel, &t.message_ts) else {
@@ -632,6 +735,56 @@ mod tests {
             f[k] = v;
             assert!(Asked::of(&f, now).is_none(), "{k}");
         }
+    }
+
+    #[test]
+    fn an_engines_words_are_plain_in_a_card() {
+        let s =
+            slack_text("<https://evil.example|Approve in Desk> <!channel> <@U1> *ok* & `x`\nnext");
+        assert!(!s.contains('<') && !s.contains('>') && !s.contains('*') && !s.contains('`'));
+        assert!(s.contains("&lt;https://evil.example|Approve in Desk&gt;"));
+        assert!(s.contains("&amp;") && s.contains('\n'));
+        assert_eq!(
+            said_of(PermissionChoice::DenyAlways, false),
+            "Denied, and the session asked to stop: passed on when the engine is back."
+        );
+    }
+
+    #[test]
+    fn a_link_holds_its_own_asks_and_no_more_than_its_share() {
+        let asks = Asks::default();
+        let uplinks = Arc::new(Uplinks::default());
+        let (a, b) = (Uuid::from_u128(10), Uuid::from_u128(11));
+        let now = Utc::now();
+        let mut asked = Asked::of(&frame(), now).unwrap();
+        assert!(asks.hold(&asked, a, &uplinks));
+        // Another link never takes it over, nor its nonce.
+        let mut other = asked.clone();
+        other.nonce = "cd".repeat(32);
+        assert!(!asks.hold(&other, b, &uplinks));
+        assert_eq!(asks.held.lock()[&asked.ask].nonce, "ab".repeat(32));
+        // Its share open at once, then no more until one closes.
+        for i in 1..OPEN_PER_LINK as u128 {
+            asked.ask = Uuid::from_u128(100 + i);
+            assert!(asks.hold(&asked, a, &uplinks), "{i}");
+        }
+        asked.ask = Uuid::from_u128(999);
+        assert!(!asks.hold(&asked, a, &uplinks));
+        assert!(
+            asks.hold(&asked, b, &uplinks),
+            "another link's share is its own"
+        );
+        asks.forget(Uuid::from_u128(101));
+        asked.ask = Uuid::from_u128(998);
+        assert!(asks.hold(&asked, a, &uplinks));
+        // What has run out is let go.
+        asks.held
+            .lock()
+            .values_mut()
+            .for_each(|h| h.expires_at = now);
+        asked.ask = Uuid::from_u128(997);
+        assert!(asks.hold(&asked, a, &uplinks));
+        assert_eq!(asks.held.lock().len(), 1);
     }
 
     #[test]

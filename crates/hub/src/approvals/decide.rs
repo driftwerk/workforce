@@ -131,10 +131,11 @@ pub(crate) async fn decide(
             Decider::Slack(s) => ("slack", Some(s.to_string())),
             Decider::Person(_) => ("desk", None),
         };
-        crate::boss_links::asks::decided(&row, choice, &resolver_id, via, slack.as_deref());
+        let went =
+            crate::boss_links::asks::decided(&row, choice, &resolver_id, via, slack.as_deref());
         let resolved = row.clone();
         tokio::spawn(async move {
-            crate::boss_links::asks::rewrite_decided(&svc, &store, &resolved, choice).await;
+            crate::boss_links::asks::rewrite_decided(&svc, &store, &resolved, choice, went).await;
         });
         return Ok(Decided::Resolved(row));
     }
