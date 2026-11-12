@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use workforce_agent::rollover::CARRYOVER_PREFIX;
 use workforce_common::channels::{is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{
-    MessageRole, Session, SessionAttachment, SessionStore, TranscriptEntry,
+    MessageRole, Session, SessionAttachment, SessionStore, TranscriptEntry, UnknownCursor,
 };
 use workforce_desk::attachments::{Attachment, MAX_PER_MESSAGE};
 use workforce_desk::{
@@ -399,10 +399,6 @@ fn around(
     ))
 }
 
-/// How many times one search asks the store again when what it found was
-/// not all said in the conversation.
-const SEARCH_READS: usize = 10;
-
 /// How many characters of a match's text its excerpt holds, and how many of
 /// them come before the words it matched.
 const EXCERPT_CHARS: usize = 160;
@@ -430,7 +426,9 @@ fn chain_of(store: &dyn SessionStore, head: &Session) -> eyre::Result<Vec<String
 /// The messages of `owner`'s DM with `agent` in `store`, its whole chain, that
 /// match `query`, newest first: at most `limit`, older than the message
 /// `before` when it is named. Only what the conversation shows is a match,
-/// and its excerpt is cut from the text it shows.
+/// and its excerpt is cut from the text it shows. It reads on until the page
+/// is full or the chain is, so `more` always has the last match to go on
+/// from.
 pub(crate) fn search(
     store: &dyn SessionStore,
     agent: &Speaker,
@@ -443,49 +441,65 @@ pub(crate) fn search(
     let Some(head) = store.find(DESK_CHANNEL, owner).map_err(internal)? else {
         return Ok(Matches::default());
     };
-    if let Some(before) = before {
-        if crate::desk_surface::message_in_chain(store, &head.id, before)
-            .map_err(internal)?
-            .is_none()
-        {
-            return Err(ConversationError::Invalid(
-                "before names no message of this conversation".into(),
-            ));
+    // A cursor the store's search can't place, a message of another
+    // conversation or one it doesn't read, is the caller's mistake.
+    let refused = |e: eyre::Report| match e.downcast_ref::<UnknownCursor>() {
+        Some(_) => {
+            ConversationError::Invalid("before names no message of this conversation".into())
         }
-    }
+        None => internal(e),
+    };
     let chain = chain_of(store, &head).map_err(internal)?;
     let fetch = limit + 1;
     let mut cursor = before.map(str::to_string);
     let mut seen = HashSet::new();
     let mut matches = Vec::new();
-    let mut ended = false;
-    for _ in 0..SEARCH_READS {
+    // Each read starts strictly older than the last one ended, so the reads
+    // run out with the chain; one that doesn't move on ends them.
+    loop {
         let found = store
             .search_archive(&chain, query, fetch, cursor.as_deref())
-            .map_err(internal)?;
-        ended = found.len() < fetch;
+            .map_err(refused)?;
+        let ended = found.len() < fetch;
         for entry in &found {
             if seen.insert(entry.id.clone()) {
                 matches.extend(matched(entry, agent, &head, query));
             }
         }
         match found.last() {
-            Some(last) if !ended && matches.len() <= limit => cursor = Some(last.id.clone()),
+            Some(last)
+                if !ended
+                    && matches.len() <= limit
+                    && cursor.as_deref() != Some(last.id.as_str()) =>
+            {
+                cursor = Some(last.id.clone())
+            }
             _ => break,
         }
     }
-    let more = matches.len() > limit || !ended;
+    let more = matches.len() > limit;
     matches.truncate(limit);
     Ok(Matches { matches, more })
 }
 
-/// `entry` as a match of `query`, when the conversation shows it.
+/// `entry` as a match of `query`, when the conversation shows it. Where
+/// what it shows differs from what was kept (a secret redacted), the words
+/// must be in what it shows, so a search can't find what the page hides.
 fn matched(entry: &TranscriptEntry, agent: &Speaker, head: &Session, query: &str) -> Option<Match> {
     let said = said(entry, agent, None)?;
     let text = match said.from {
         Author::Agent => crate::spoken_text::kept_text(head, &said.text).into_owned(),
         Author::User => said.text,
     };
+    if text != entry.content {
+        let shown = text.to_lowercase();
+        if !query
+            .split_whitespace()
+            .all(|word| shown.contains(&word.to_lowercase()))
+        {
+            return None;
+        }
+    }
     Some(Match {
         id: said.id,
         from: said.from,
@@ -495,12 +509,14 @@ fn matched(entry: &TranscriptEntry, agent: &Speaker, head: &Session, query: &str
 }
 
 /// A few words of `text` on one line, around the first of `query`'s words it
-/// holds, or from its start; `…` marks what was cut.
+/// holds (their letters and digits, so `deploy,` finds `deploy`), or from
+/// its start; `…` marks what was cut.
 fn excerpt(text: &str, query: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = line.to_lowercase();
     let hit = query
-        .split_whitespace()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
         .filter_map(|word| lower.find(&word.to_lowercase()))
         .min()
         .map(|at| lower[..at].chars().count())
@@ -1900,6 +1916,11 @@ mod tests {
             "word ".repeat(40),
             "tail ".repeat(60)
         );
+        assert_eq!(
+            excerpt(&long, "café,"),
+            excerpt(&long, "café"),
+            "its letters"
+        );
         let cut = excerpt(&long, "CAFÉ");
         assert!(cut.starts_with('…') && cut.ends_with('…'), "{cut}");
         assert!(cut.contains("the café bill"), "{cut}");
@@ -1916,6 +1937,17 @@ mod tests {
         store.save(&session).unwrap();
         let found = search(&store, &scout(), ME, "bucket", None, 10).unwrap();
         assert_eq!(found.matches.len(), 1);
+        for probe in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "akiaiosfodnn7",
+            "key AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert_eq!(
+                search(&store, &scout(), ME, probe, None, 10).unwrap(),
+                Matches::default(),
+                "a redacted secret is not found: {probe}"
+            );
+        }
         assert!(
             !found.matches[0].excerpt.contains("AKIAIOSFODNN7EXAMPLE"),
             "{}",
@@ -1989,6 +2021,34 @@ mod tests {
         );
         assert_eq!((end.more, end.more_after), (true, Some(false)));
 
+        let odd = around(&store, &id("question 5"), 5);
+        assert_eq!(
+            texts_of(&odd),
+            [
+                "question 4",
+                "answer 4",
+                "question 5",
+                "answer 5",
+                "question 6"
+            ]
+        );
+        let odd = around(&store, &id("question 5"), 7);
+        assert_eq!(
+            texts_of(&odd),
+            [
+                "answer 3",
+                "question 4",
+                "answer 4",
+                "question 5",
+                "answer 5",
+                "question 6",
+                "answer 6"
+            ]
+        );
+        let one = around(&store, &id("question 5"), 1);
+        assert_eq!(texts_of(&one), ["question 5"]);
+        assert_eq!((one.more, one.more_after), (true, Some(true)));
+
         let whole = around(&store, &id("answer 4"), 200);
         assert_eq!(whole.messages.len(), 20);
         assert_eq!((whole.more, whole.more_after), (false, Some(false)));
@@ -2053,5 +2113,129 @@ mod tests {
             [("answer 0", Author::Agent), ("question 1", Author::User)]
         );
         assert_eq!((after_seam.more, after_seam.more_after), (true, Some(true)));
+    }
+
+    /// Every search of the DM a page at a time, oldest last.
+    fn searched_a_page_at_a_time(store: &dyn SessionStore, query: &str) -> Vec<Match> {
+        let mut all: Vec<Match> = Vec::new();
+        loop {
+            let before = all.last().map(|m| m.id.clone());
+            let page = search(store, &scout(), ME, query, before.as_deref(), 1).unwrap();
+            assert!(
+                page.matches.len() == 1 || !page.more,
+                "more always has a match to go on from"
+            );
+            all.extend(page.matches);
+            if !page.more {
+                return all;
+            }
+            assert!(all.len() < 50, "the pages end");
+        }
+    }
+
+    /// Turns a rollover carried into the successor verbatim, under their own
+    /// ids, are each found once, where they were first said, and a cursor
+    /// on one reads on from there.
+    fn carried_turns_are_found_once(store: &dyn SessionStore) {
+        for n in 0..3 {
+            exchange(store, n);
+        }
+        let head = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        let mut old = store.get(&head.id).unwrap().unwrap();
+        for message in &old.messages {
+            store.append_to_archive(&old.id, message).unwrap();
+        }
+        let successor = workforce_agent::rollover::seal_and_mint(store, &mut old, 6).unwrap();
+        let carried = successor
+            .messages
+            .iter()
+            .find(|m| m.content == "question 2")
+            .expect("the successor carries the last turns verbatim");
+        exchange(store, 3);
+        let all = searched_a_page_at_a_time(store, "question");
+        assert_eq!(
+            all.iter().map(|m| m.excerpt.as_str()).collect::<Vec<_>>(),
+            ["question 3", "question 2", "question 1", "question 0"]
+        );
+        let older = search(store, &scout(), ME, "question", Some(&carried.id), 10).unwrap();
+        assert_eq!(
+            older
+                .matches
+                .iter()
+                .map(|m| m.excerpt.as_str())
+                .collect::<Vec<_>>(),
+            ["question 1", "question 0"]
+        );
+    }
+
+    #[test]
+    fn carried_turns_are_found_once_in_files() {
+        let dir = tempfile::tempdir().unwrap();
+        carried_turns_are_found_once(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn carried_turns_are_found_once_on_postgres() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                carried_turns_are_found_once(store.as_ref());
+            },
+        )
+        .await;
+    }
+
+    /// A message kept since the session's archive began, but only live, is
+    /// no message the search reads: a cursor on it is the caller's mistake.
+    fn a_cursor_the_archive_lacks_is_refused(store: &dyn SessionStore) {
+        exchange(store, 0);
+        let head = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        let session = store.get(&head.id).unwrap().unwrap();
+        for message in &session.messages {
+            store.append_to_archive(&session.id, message).unwrap();
+        }
+        let mut session = store.get(&head.id).unwrap().unwrap();
+        let late = session.add_user_message("question late", None);
+        store.save(&session).unwrap();
+        let refused = search(store, &scout(), ME, "question", Some(&late), 10);
+        assert!(
+            matches!(refused, Err(ConversationError::Invalid(_))),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_the_archive_lacks_is_refused_in_files() {
+        let dir = tempfile::tempdir().unwrap();
+        a_cursor_the_archive_lacks_is_refused(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cursor_the_archive_lacks_is_refused_on_postgres() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                a_cursor_the_archive_lacks_is_refused(store.as_ref());
+            },
+        )
+        .await;
+    }
+
+    /// A page of one, through every match, ends with `more` false and never
+    /// says more with nothing to go on from, even past hub notes.
+    #[test]
+    fn a_search_a_match_at_a_time_reads_to_the_end() {
+        let store = InMemorySessionStore::new();
+        searched(&store, false);
+        let all = searched_a_page_at_a_time(&store, "question");
+        assert_eq!(all.len(), 5);
     }
 }

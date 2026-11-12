@@ -31,6 +31,10 @@ pub const MATCHES_MAX: usize = 100;
 /// How many matches a page of a search holds unasked.
 pub const MATCHES_DEFAULT: usize = 50;
 
+/// The longest search, in characters and in words.
+pub const QUERY_MAX_CHARS: usize = 256;
+pub const QUERY_MAX_WORDS: usize = 16;
+
 /// Who said a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -408,12 +412,20 @@ async fn search(
         return ConversationError::Invalid("a search needs words to look for".into())
             .into_response();
     };
+    let query = query.trim();
+    if query.chars().count() > QUERY_MAX_CHARS || query.split_whitespace().count() > QUERY_MAX_WORDS
+    {
+        return ConversationError::Invalid(format!(
+            "a search is at most {QUERY_MAX_CHARS} characters and {QUERY_MAX_WORDS} words"
+        ))
+        .into_response();
+    }
     let limit = q.limit.unwrap_or(MATCHES_DEFAULT).clamp(1, MATCHES_MAX);
     c.search(
         &headers,
         q.token.as_deref(),
         &agent,
-        query.trim(),
+        query,
         present(&q.before),
         limit,
     )
@@ -772,6 +784,20 @@ mod tests {
                 asked.last(),
                 Ask::Search("scout".into(), "x".into(), None, limit)
             );
+        }
+        let words = vec!["w"; QUERY_MAX_WORDS].join("%20");
+        let (status, _) = get(
+            Arc::clone(&asked),
+            &format!("/api/desk/conversations/scout/search?q={words}"),
+            Some("Bearer device-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "as many words as a search holds");
+        let too_long = [format!("{words}%20w"), "x".repeat(QUERY_MAX_CHARS + 1)];
+        for q in too_long {
+            let uri = format!("/api/desk/conversations/scout/search?q={q}");
+            let (status, _) = get(Arc::clone(&asked), &uri, Some("Bearer device-token")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{q}");
         }
         for blank in ["", "?q=", "?q=%20%20"] {
             let uri = format!("/api/desk/conversations/scout/search{blank}");

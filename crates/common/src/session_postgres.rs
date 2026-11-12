@@ -55,12 +55,12 @@ use crate::postgres::{
 };
 use crate::session::{
     compute_stats, context_usage_for, coordination_score, format_excerpt_rows, is_searched,
-    message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
-    redact_message_secrets, redact_messages_in_place, search_terms, tool_calls_for, ArchivePage,
-    InterruptedTurn, JournalEntry, MessageRole, Reassigned, RedactionStats, Session,
-    SessionAttachment, SessionContextType, SessionContextUsage, SessionExport, SessionKind,
-    SessionMessage, SessionSearchResult, SessionStats, SessionStore, ToolCallRecord,
-    TranscriptEntry, TurnPrincipal,
+    matches_every_term, message_to_transcript_entry, paginate_entries, rank_search_results,
+    reassigned_channel, redact_message_secrets, redact_messages_in_place, search_terms,
+    tool_calls_for, ArchivePage, InterruptedTurn, JournalEntry, MessageRole, Reassigned,
+    RedactionStats, Session, SessionAttachment, SessionContextType, SessionContextUsage,
+    SessionExport, SessionKind, SessionMessage, SessionSearchResult, SessionStats, SessionStore,
+    ToolCallRecord, TranscriptEntry, TurnPrincipal, UnknownCursor,
 };
 
 mod embedded {
@@ -1884,11 +1884,13 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
-    /// Full-text search on the archive's index, each word of `query` matching
-    /// any word it starts. A session of the chain whose archive is empty is
-    /// read from its live transcript, as `read_archive_page` reads it, and
-    /// matched as the default matches. Only this agent's sessions are read,
-    /// whatever ids are asked for.
+    /// Each word of `query` matches as the default matches it, a substring
+    /// whatever case, or through the archive's full-text index, which also
+    /// finds a word by its start or its stem: only among the chain's own rows
+    /// either way. A session of the chain whose archive is empty is read from
+    /// its live transcript, as `read_archive_page` reads it; a turn a
+    /// rollover carried there verbatim is matched where it was first said.
+    /// Only this agent's sessions are read, whatever ids are asked for.
     fn search_archive(
         &self,
         session_ids: &[String],
@@ -1902,6 +1904,10 @@ impl SessionStore for PostgresSessionStore {
             .collect();
         let tsquery = prefix_tsquery(query);
         let terms = search_terms(query);
+        let patterns: Vec<String> = terms
+            .iter()
+            .map(|t| format!("%{}%", escape_like(t)))
+            .collect();
         let before = before.map(str::to_string);
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -1952,47 +1958,59 @@ impl SessionStore for PostgresSessionStore {
                         })
                         .collect::<Result<_>>()?
                 };
-            // Where `before` is: its session's place in the chain, and its
-            // place in that session (its archive seq, or its index live).
+            // The live messages, and `before`, are each where they were first
+            // said: the oldest session of the chain holding them. A rollover
+            // carries turns into a successor under their own ids, and only
+            // the live transcript keeps those copies.
+            let mut wanted: Vec<String> = live.values().flatten().map(|e| e.id.clone()).collect();
+            wanted.extend(before.iter().cloned());
+            let in_archive = if wanted.is_empty() {
+                Vec::new()
+            } else {
+                scoped
+                    .query(
+                        "SELECT session_id, message_id, seq FROM session_archive
+                         WHERE session_id = ANY($1) AND message_id = ANY($2) AND tenant_id = $3",
+                        &[&chain, &wanted, &self.tenant_id()],
+                    )
+                    .await?
+            };
+            let place: std::collections::HashMap<Uuid, usize> = chain
+                .iter()
+                .enumerate()
+                .map(|(pos, id)| (*id, pos))
+                .collect();
+            // (chain place, place in that session) where each id was first said.
+            let mut first: std::collections::HashMap<String, (usize, i64)> = Default::default();
+            let mut note = |id: &str, at: (usize, i64)| {
+                let held = first.entry(id.to_string()).or_insert(at);
+                if at.0 > held.0 {
+                    *held = at;
+                }
+            };
+            for r in &in_archive {
+                if let Some(pos) = place.get(&r.get::<_, Uuid>(0)) {
+                    note(r.get(1), (*pos, r.get(2)));
+                }
+            }
+            for (id, entries) in &live {
+                for (i, entry) in entries.iter().enumerate() {
+                    note(&entry.id, (place[id], i as i64));
+                }
+            }
             let cursor: Option<(usize, i64)> = match before.as_deref() {
                 None => None,
-                Some(mid) => {
-                    let in_archive = scoped
-                        .query(
-                            "SELECT session_id, seq FROM session_archive
-                             WHERE session_id = ANY($1) AND message_id = $2 AND tenant_id = $3",
-                            &[&chain, &mid, &self.tenant_id()],
-                        )
-                        .await?;
-                    let mut at: Option<(usize, i64)> = None;
-                    for (pos, id) in chain.iter().enumerate() {
-                        let here = match archived[id] {
-                            true => in_archive
-                                .iter()
-                                .find(|r| r.get::<_, Uuid>(0) == *id)
-                                .map(|r| r.get::<_, i64>(1)),
-                            false => live
-                                .get(id)
-                                .and_then(|entries| entries.iter().position(|e| e.id == mid))
-                                .map(|i| i as i64),
-                        };
-                        if let Some(key) = here {
-                            at = Some((pos, key));
-                            break;
-                        }
-                    }
-                    match at {
-                        Some(at) => Some(at),
-                        None => eyre::bail!("no message of these sessions is {mid:?}"),
-                    }
-                }
+                Some(mid) => match first.get(mid) {
+                    Some(at) => Some(*at),
+                    None => return Err(UnknownCursor(mid.to_string()).into()),
+                },
             };
             let after_cursor = |pos: usize, key: i64| {
                 cursor.is_none_or(|(cp, ck)| pos > cp || (pos == cp && key < ck))
             };
             // (chain place, place in session, entry), each session newest first.
             let mut found: Vec<(usize, i64, TranscriptEntry)> = Vec::new();
-            if !tsquery.is_empty() && chain.iter().any(|id| archived[id]) {
+            if !terms.is_empty() && chain.iter().any(|id| archived[id]) {
                 let (cursor_pos, cursor_seq) = match cursor {
                     // array_position counts from 1.
                     Some((pos, key)) => (Some(pos as i32 + 1), Some(key)),
@@ -2006,7 +2024,8 @@ impl SessionStore for PostgresSessionStore {
                          FROM session_archive a
                          JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                          WHERE a.session_id = ANY($1) AND s.agent_id = $2 AND a.tenant_id = $3
-                           AND a.content_tsv @@ to_tsquery('english', $4)
+                           AND (a.content ILIKE ALL($8::text[])
+                                OR ($4 <> '' AND a.content_tsv @@ to_tsquery('english', $4)))
                            AND a.role IN ('user', 'assistant') AND a.tool_data IS NULL
                            AND NOT COALESCE((a.desk->>'failed')::boolean, false)
                            AND ($5::int4 IS NULL
@@ -2023,6 +2042,7 @@ impl SessionStore for PostgresSessionStore {
                             &cursor_pos,
                             &cursor_seq,
                             &(limit as i64),
+                            &patterns,
                         ],
                     )
                     .await?;
@@ -2034,19 +2054,18 @@ impl SessionStore for PostgresSessionStore {
                 }
             }
             scoped.finish().await?;
-            if !terms.is_empty() {
-                for (pos, id) in chain.iter().enumerate() {
-                    let Some(entries) = live.get(id) else {
-                        continue;
-                    };
-                    for (i, entry) in entries.iter().enumerate().rev() {
-                        if after_cursor(pos, i as i64)
-                            && is_searched(entry)
-                            && coordination_score(&entry.content.to_lowercase(), &terms)
-                                == terms.len()
-                        {
-                            found.push((pos, i as i64, entry.clone()));
-                        }
+            for (pos, id) in chain.iter().enumerate() {
+                let Some(entries) = live.get(id) else {
+                    continue;
+                };
+                for (i, entry) in entries.iter().enumerate().rev() {
+                    let key = (pos, i as i64);
+                    if first.get(entry.id.as_str()) == Some(&key)
+                        && after_cursor(pos, i as i64)
+                        && is_searched(entry)
+                        && matches_every_term(&entry.content, &terms)
+                    {
+                        found.push((pos, i as i64, entry.clone()));
                     }
                 }
             }
@@ -2577,6 +2596,14 @@ fn role_from_str(s: &str) -> MessageRole {
 /// `query` as a tsquery in which each of its words matches any word it
 /// starts: its letters and digits alone, so nothing a person types is read as
 /// tsquery syntax. Empty when it has none.
+/// `term` as a LIKE pattern's literal text: its wildcards and the escape
+/// itself escaped.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn prefix_tsquery(query: &str) -> String {
     query
         .split(|c: char| !c.is_alphanumeric())
