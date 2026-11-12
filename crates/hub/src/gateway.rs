@@ -6572,46 +6572,60 @@ async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool
     }
 }
 
-/// The longest display name an agent may be given.
-const AGENT_NAME_MAX_CHARS: usize = 100;
-
-/// A rename's name, trimmed: 1–100 characters.
-fn agent_name(name: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let name = name.trim();
-    match name.chars().count() {
-        1..=AGENT_NAME_MAX_CHARS => Ok(name.to_string()),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("an agent's name is 1 to {AGENT_NAME_MAX_CHARS} characters")
-            })),
-        )),
-    }
-}
-
-/// Writes a new display name and instructions to the agent's config overlay
-/// entry, where every later build of it reads them (a restart included), and
-/// shows the name at once. An empty `system_prompt` removes the instructions.
-async fn persist_name_and_prompt(
+/// Renames agent `id` the one way every rename goes (see
+/// [`crate::agent_rename`]): refused when another agent has the name, and
+/// written into its files and instructions as well as its config.
+async fn rename_agent(
     state: &GatewayState,
     caller: &CallerContext,
     id: &str,
-    name: Option<String>,
+    name: &str,
+    instructions: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::agent_rename::{RenameError, Renamer};
+    let (config_path, data_dir, lock_manager) = resolve_overlay_ctx(state)?;
+    let renamer = Renamer {
+        registry: &*state.registry,
+        config_path: &config_path,
+        data_dir: &data_dir,
+        lock_manager: &lock_manager,
+        def_store: state.def_store.as_deref(),
+        actor: caller.identity_id.as_deref(),
+        via: "web",
+    };
+    renamer.rename(id, name, instructions).await.map_err(|e| {
+        let status = match &e {
+            RenameError::Invalid(_) => StatusCode::BAD_REQUEST,
+            RenameError::Taken => StatusCode::CONFLICT,
+            RenameError::Missing(_) => StatusCode::NOT_FOUND,
+            RenameError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(serde_json::json!({"error": e.to_string()})))
+    })?;
+    if let Some(kick) = &state.overlay_kick {
+        kick.notify_one();
+    }
+    Ok(())
+}
+
+/// Writes new instructions to the agent's config overlay entry, where every
+/// later build of it reads them (a restart included). An empty
+/// `system_prompt` removes them.
+async fn persist_prompt(
+    state: &GatewayState,
+    caller: &CallerContext,
+    id: &str,
     system_prompt: Option<String>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if name.is_none() && system_prompt.is_none() {
+    if system_prompt.is_none() {
         return Ok(());
     }
     let (config_path, data_dir, lock_manager) = resolve_overlay_ctx(state)?;
-    let written = name.clone();
     crate::config_writer::overlay_update_agent_fields(
         &config_path,
         &data_dir,
         id,
         move |entry| {
-            if let Some(name) = written {
-                entry.insert("name".to_string(), toml::Value::String(name));
-            }
             match system_prompt {
                 Some(prompt) if prompt.trim().is_empty() => {
                     entry.remove("system_prompt");
@@ -6629,15 +6643,12 @@ async fn persist_name_and_prompt(
     )
     .await
     .map_err(|e| {
-        warn!(agent_id = %id, error = %e, "Failed to save an agent's name to the config overlay");
+        warn!(agent_id = %id, error = %e, "Failed to save an agent's instructions to the config overlay");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "saving the agent failed"})),
         )
     })?;
-    if let (Some(name), Some(service)) = (name, state.registry.get(id)) {
-        *service.name_override.write() = Some(name);
-    }
     if let Some(kick) = &state.overlay_kick {
         kick.notify_one();
     }
@@ -6715,8 +6726,10 @@ async fn apply_agent_update(
     // Verify agent exists
     let _service = resolve_agent(&state, &id)?;
 
-    let name = body.name.as_deref().map(agent_name).transpose()?;
-    persist_name_and_prompt(&state, &caller, &id, name, body.system_prompt.clone()).await?;
+    match body.name.as_deref() {
+        Some(name) => rename_agent(&state, &caller, &id, name, body.system_prompt.clone()).await?,
+        None => persist_prompt(&state, &caller, &id, body.system_prompt.clone()).await?,
+    }
 
     // Live model override (no restart required)
     if let Some(ref model) = body.model {
