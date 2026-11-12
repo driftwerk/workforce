@@ -203,6 +203,8 @@ pub mod oidc;
 pub mod pairing_tool;
 pub mod passive_memory;
 pub mod passive_memory_backfill;
+pub mod slack_email;
+pub mod verified_email;
 pub use hub_core::permissions_audit;
 pub mod permissions_writer;
 pub mod pictures;

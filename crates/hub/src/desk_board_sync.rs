@@ -1130,8 +1130,11 @@ async fn check_link(
         }),
         None => match sync::identify(&*remote, body.system).await {
             Ok(sync::Who::Person(me)) => Some(me),
-            Ok(sync::Who::ByEmail(me)) => {
-                out["meBy"] = json!("email");
+            Ok(sync::Who::ByEmail(me, source)) => {
+                out["meBy"] = json!(match source {
+                    workforce_desk::board::MeSource::VouchedBySlack => "slack",
+                    _ => "email",
+                });
                 Some(me)
             }
             Ok(other) => {
@@ -1160,7 +1163,7 @@ async fn check_link(
             me.as_ref().map(|m| m.id.as_str()),
             me.as_ref()
                 .map(|m| m.id.as_str())
-                .filter(|_| out["meBy"] == "email"),
+                .filter(|_| out["meBy"].is_string()),
         )
         .await;
         match matched {
@@ -1323,10 +1326,10 @@ async fn link_board(
                 link.me_name = Some(me.name);
                 link.me_source = Some(workforce_desk::board::MeSource::Vouched);
             }
-            Ok(sync::Who::ByEmail(me)) => {
+            Ok(sync::Who::ByEmail(me, source)) => {
                 link.me = Some(me.id);
                 link.me_name = Some(me.name);
-                link.me_source = Some(workforce_desk::board::MeSource::VouchedByEmail);
+                link.me_source = Some(source);
             }
             Ok(other) => link.me_note = other.why_not(&hub, link.system),
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),

@@ -98,6 +98,8 @@ The legacy per-field env overrides (`WORKFORCE_NATS_URL`, `WEAVIATE_API_KEY`, `A
 
 The hub trusts your OIDC identity provider's `email_verified` claim: a sign-in it marks verified records that email as the person's verified email, which Desk's board sync uses to find them on a shared Jira or Linear key. Use a provider that only marks emails verified once their owner has proven them.
 
+Without OIDC (or as well as it), the email Slack gives for a person's linked Slack account counts as verified too, while Slack says the account is a full member of the workspace the hub's bot is in: not a guest, a bot or an app, and not deactivated. The hub asks Slack again when that account messages and once a day, and drops the email when the account is deactivated or turned into a guest. The bot needs the `users:read.email` scope. A sign-in's email is used before Slack's.
+
 ---
 
 ## Health & Readiness Endpoints

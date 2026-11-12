@@ -1663,6 +1663,7 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
     {
         use workforce_identity::store::IdentityStore;
         let mut sam = remote.identities.get_by_id(remote.person).unwrap().unwrap();
+        sam.linked_ids.insert("oidc".into(), "sub-sam".into());
         sam.linked_ids
             .insert("oidc_email".into(), "sam@example.com".into());
         sam.linked_ids
