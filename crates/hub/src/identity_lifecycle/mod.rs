@@ -1140,7 +1140,7 @@ impl Lifecycle {
         let mut identity = self.identity(subject)?;
         // A suspended person's verified email no longer vouches for them.
         let forgot = status == IdentityStatus::Suspended
-            && crate::oidc::forget_verified_email(&mut identity);
+            && crate::verified_email::forget_verified_email(&mut identity);
         if identity.status != status || forgot {
             identity.status = status;
             identity.updated_at = Utc::now();

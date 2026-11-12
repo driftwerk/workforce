@@ -1933,6 +1933,11 @@ async fn resolve_slack_identity(
                     .get("slack")
                     .is_none_or(|id| id != slack_user_id)
                 {
+                    // The email Slack vouched for was the old account's.
+                    crate::verified_email::forget(
+                        &mut existing,
+                        crate::verified_email::Source::Slack,
+                    );
                     existing.link_id("slack", slack_user_id);
                     if let Err(e) = store.update(&existing) {
                         warn!(
@@ -2020,10 +2025,16 @@ async fn resolve_slack_identity_for_request(
         return SlackIdentityForRequest::Anonymous;
     };
     match resolve_slack_identity(store.as_ref(), slack_user_id, surface).await {
-        Ok(r) => SlackIdentityForRequest::Resolved {
-            identity_id: r.identity_id,
-            role: r.role,
-        },
+        Ok(r) => {
+            // The link is in use: Slack's word on its email, once a day.
+            if let (Some(surface), Ok(id)) = (surface, uuid::Uuid::parse_str(&r.identity_id)) {
+                crate::slack_email::refresh(store.as_ref(), surface, id).await;
+            }
+            SlackIdentityForRequest::Resolved {
+                identity_id: r.identity_id,
+                role: r.role,
+            }
+        }
         Err(SlackIdentityError::Suspended) => SlackIdentityForRequest::Suspended,
         Err(SlackIdentityError::Store(e)) => {
             warn!(error = %e, user = %slack_user_id, "Slack identity resolution failed");
@@ -2221,6 +2232,14 @@ pub fn spawn_slack_dispatch_loop(
     slack_claim_store: Option<Arc<dyn SlackMessageClaimer>>,
     channel_overrides: HashMap<String, SlackChannelOverride>,
 ) -> JoinHandle<()> {
+    // Every Slack-linked identity's Slack email, renewed or cleared daily.
+    if let Some(store) = &identity_store {
+        crate::slack_email::spawn_daily_sweep(
+            Arc::clone(store),
+            concrete_surfaces.clone(),
+            drain_token.clone(),
+        );
+    }
     tokio::spawn(async move {
         // Auto-discovery: create skeleton user profiles on first interaction
         let user_discovery = Arc::new(crate::user_discovery::UserDiscovery::new());
