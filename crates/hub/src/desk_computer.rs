@@ -140,6 +140,42 @@ fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
+/// Whether an identity is the person whose Desk this is: the only one whose
+/// turns may use their own Chrome, signed in as them.
+pub type HolderJudge = Box<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+
+static HOLDER: std::sync::OnceLock<HolderJudge> = std::sync::OnceLock::new();
+
+/// Installs the holder check, once (with Desk's browser).
+pub fn judge_holder_with(judge: HolderJudge) -> bool {
+    HOLDER.set(judge).is_ok()
+}
+
+/// Whether the turn in scope is the person whose Desk this is. With no
+/// check installed, it isn't: their Chrome is never assumed someone's.
+/// Sarah holds the test hub: her turns use her Chrome.
+#[cfg(test)]
+pub(crate) fn sarah_holds() {
+    let _ = judge_holder_with(Box::new(|user| user == Some("sarah")));
+}
+
+/// Whether this turn is the hub holder's own: the identity in scope is
+/// the person whose Desk this is.
+pub(crate) fn the_holders_turn() -> bool {
+    let user = CURRENT_USER_ID
+        .try_with(|u| u.clone())
+        .ok()
+        .filter(|u| !u.is_empty());
+    HOLDER.get().is_some_and(|judge| judge(user.as_deref()))
+}
+
+/// Whether `tool` with `effect` uses the person's Chrome: every browser
+/// call, and anything kept under a site there.
+fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
+    tool.starts_with("browser.")
+        || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
+}
+
 /// Where the person's home is.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -846,6 +882,20 @@ impl ComputerGate for HubComputerGate {
 
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict {
         use workforce_core::computer::{SIGNED_IN, SIGN_IN};
+        // The person's Chrome is signed in as them: only their own turns
+        // use it, never another identity's (a Slack thread, someone else's
+        // conversation, a client), whoever would answer the card.
+        if uses_their_chrome(tool, effect) && !the_holders_turn() {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: format!(
+                        "{} uses the browser only in a turn of the person whose Desk this is: it is their own Chrome, signed in as them.",
+                        self.policy.name
+                    ),
+                },
+            };
+        }
         // "Sign in for me" is for the person in Desk on this computer, who
         // can see Desk's browser: never a turn in Slack or another client.
         if (tool == SIGN_IN || tool == SIGNED_IN)
@@ -1074,7 +1124,10 @@ mod tests {
         workforce_agent::runner::CURRENT_DESK.sync_scope(Some(scope), f)
     }
 
+    use super::sarah_holds;
+
     fn as_sarah<T>(f: impl FnOnce() -> T) -> T {
+        sarah_holds();
         CURRENT_USER_ID.sync_scope("sarah".into(), || {
             CURRENT_SESSION_KEY.sync_scope("s1".into(), f)
         })
@@ -1493,7 +1546,7 @@ mod tests {
                 connector: "chrome:https://shop.example".into(),
                 write: true,
             };
-            let verdict = in_desk(|| gate.verdict("browser.signed_in", &site));
+            let verdict = as_sarah(|| in_desk(|| gate.verdict("browser.signed_in", &site)));
             let card = gate.card(&site, &verdict);
             let facts = card.facts.as_deref().unwrap();
             assert_eq!(facts.effect, "sign_in");
@@ -1510,6 +1563,49 @@ mod tests {
             assert!(!card.allow_session && card.allow_in_folder.is_none() && !card.allow_always);
             let refused = gate.refuses_unattended("browser.signed_in", &site).unwrap();
             assert!(refused.contains("needs you to sign in"), "{refused}");
+        })
+        .await;
+    }
+
+    /// The person's Chrome is signed in as them: another identity's turn (a
+    /// Slack thread, someone else's conversation) is refused every browser
+    /// call, whatever its level, and the cards for the person's own turns
+    /// are theirs alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_holders_turns_use_their_chrome() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            std::fs::write(hub.subject.workspace.join("config.toml"), UNBOUND).unwrap();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let site = Effect::Connector {
+                connector: "chrome:https://shop.example".into(),
+                write: false,
+            };
+            sarah_holds();
+            for tool in ["browser.snapshot", "browser.navigate", "browser.click", "browser.capture_key"] {
+                let theirs = CURRENT_USER_ID.sync_scope("tom".into(), || {
+                    CURRENT_SESSION_KEY.sync_scope("slack:T1:C1:1.0".into(), || gate.verdict(tool, &site))
+                });
+                assert!(
+                    matches!(&theirs, Verdict::Refuse { refusal } if refusal.sentence.contains("the person whose Desk this is")),
+                    "{tool} for another identity: {theirs:?}"
+                );
+                let nobody = gate.verdict(tool, &site);
+                assert!(matches!(nobody, Verdict::Refuse { .. }), "{tool} with nobody in scope");
+            }
+            let mine = as_sarah(|| gate.verdict("browser.snapshot", &site));
+            assert!(!matches!(mine, Verdict::Refuse { .. }), "{mine:?}");
+            // A card in the person's Chrome is theirs alone.
+            let card = gate.card(&site, &mine);
+            assert!(card.person_only());
+            // And on a Desk hub no browser card is routed to an approver.
+            workforce_core::computer::browser_is_the_persons_chrome();
+            assert!(workforce_core::computer::person_only("browser.click"));
         })
         .await;
     }

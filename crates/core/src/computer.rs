@@ -324,10 +324,22 @@ pub fn navigates(tool: &str) -> bool {
     matches!(tool, "browser.navigate" | SIGN_IN)
 }
 
+static PERSONS_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says this hub's browser is the person's own Chrome (a Desk hub), not a
+/// server's headless one.
+pub fn browser_is_the_persons_chrome() {
+    PERSONS_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether only the person in Desk may answer this call's card: never an
-/// approver it is routed to, nor a client answering for them.
+/// approver it is routed to, nor a client answering for them. "I'm signed
+/// in", and on a Desk hub every browser call's: it is their own Chrome,
+/// signed in as them. A server's headless browser routes as any tool.
 pub fn person_only(tool: &str) -> bool {
     tool == SIGNED_IN
+        || (tool.starts_with("browser.")
+            && PERSONS_CHROME.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Why a card asks, as its one "why" line says it.

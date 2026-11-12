@@ -16,6 +16,14 @@ use super::*;
 
 const FIXTURE: &str = include_str!("protocol-v1.json");
 
+/// `f` in a turn of the hub's holder.
+async fn held<T>(f: impl std::future::Future<Output = T>) -> T {
+    crate::desk_computer::sarah_holds();
+    workforce_agent::runner::CURRENT_USER_ID
+        .scope("sarah".into(), f)
+        .await
+}
+
 /// A stand-in extension: a key, and a socket to the hub's end.
 struct Ext {
     key: EcdsaKeyPair,
@@ -172,8 +180,7 @@ async fn a_chrome_reaches_nothing_until_the_person_confirms_it_and_then_takes_ca
         )
     );
     assert!(!chrome.connected(), "no calls before it is confirmed");
-    assert!(chrome
-        .call("where", json!({ "session": "s" }))
+    assert!(held(chrome.call("where", json!({ "session": "s" })))
         .await
         .is_err());
     // Confirmed: ready, and calls go to it.
@@ -181,7 +188,7 @@ async fn a_chrome_reaches_nothing_until_the_person_confirms_it_and_then_takes_ca
     assert_eq!(e.hear().await["type"], "ready");
     let asked = tokio::spawn({
         let chrome = Arc::clone(&chrome);
-        async move { chrome.call("where", json!({ "session": "s" })).await }
+        async move { held(chrome.call("where", json!({ "session": "s" }))).await }
     });
     let call = e.hear().await;
     assert_eq!(call["type"], "call");
@@ -192,11 +199,7 @@ async fn a_chrome_reaches_nothing_until_the_person_confirms_it_and_then_takes_ca
     // A failure comes back as the extension said it.
     let asked = tokio::spawn({
         let chrome = Arc::clone(&chrome);
-        async move {
-            chrome
-                .call("click", json!({ "session": "s", "selector": "#x" }))
-                .await
-        }
+        async move { held(chrome.call("click", json!({ "session": "s", "selector": "#x" }))).await }
     });
     let call = e.hear().await;
     e.say(json!({ "type": "result", "id": call["id"], "ok": false, "error": "Nothing on the page matches `#x`." }))
@@ -281,4 +284,30 @@ fn only_the_keys_own_signature_verifies() {
         "another key"
     );
     assert!(!verify(&public, "n1", "not base64!"));
+}
+
+#[tokio::test]
+async fn a_call_in_someone_elses_turn_never_reaches_the_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let chrome = Chrome::new(dir.path().join("p.json"));
+    crate::desk_computer::sarah_holds();
+    let theirs = workforce_agent::runner::CURRENT_USER_ID
+        .scope(
+            "tom".into(),
+            chrome.call("where", json!({ "session": "s" })),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(theirs.to_string(), OTHERS_TURN);
+    let nobody = chrome
+        .call("click", json!({ "session": "s" }))
+        .await
+        .unwrap_err();
+    assert_eq!(nobody.to_string(), OTHERS_TURN);
+    // Letting tabs go isn't someone's use of the browser.
+    let close = chrome
+        .call("close", json!({ "session": "s" }))
+        .await
+        .unwrap_err();
+    assert_ne!(close.to_string(), OTHERS_TURN);
 }

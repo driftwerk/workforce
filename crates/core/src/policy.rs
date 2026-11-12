@@ -70,10 +70,16 @@ pub struct PermissionPromptOptions {
 }
 
 impl PermissionPromptOptions {
-    /// Whether the card is one only the person in Desk answers ("Sign in
-    /// for me"): no client may answer it for them.
+    /// Whether the card is one only the person in Desk answers: "Sign in
+    /// for me", and anything in their Chrome. No client may answer it for
+    /// them.
     pub fn person_only(&self) -> bool {
-        self.facts.as_ref().is_some_and(|f| f.effect == "sign_in")
+        self.facts.as_ref().is_some_and(|f| {
+            f.effect == "sign_in"
+                || f.connector.as_deref().is_some_and(|c| {
+                    c == "chrome" || c.starts_with("chrome:") || c.starts_with("chrome-visit:")
+                })
+        })
     }
 
     /// Standard `ask` prompt. `allow_save_allow = false` collapses to

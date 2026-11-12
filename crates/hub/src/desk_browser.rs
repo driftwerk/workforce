@@ -844,6 +844,15 @@ pub fn install(
         let state = Arc::clone(state);
         crate::desk_computer::judge_unbound_with(Box::new(move |agent| unbound_now(&state, agent)));
     }
+    {
+        // Only the person whose Desk this is uses their Chrome, and its
+        // cards are theirs alone.
+        workforce_core::computer::browser_is_the_persons_chrome();
+        let state = Arc::clone(state);
+        crate::desk_computer::judge_holder_with(Box::new(move |user| {
+            crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user)
+        }));
+    }
     let _ = STOPPING.set(computer.clone());
     if !browser::install_hooks(hooks) {
         warn!("Desk's browser hooks were installed twice; the first stand");

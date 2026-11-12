@@ -495,6 +495,11 @@ fn patience(cmd: &str, args: &Value) -> Duration {
 #[async_trait::async_trait]
 impl ExtensionLink for Chrome {
     async fn call(&self, cmd: &str, args: Value) -> Result<Value> {
+        // Behind the gate's own refusal: nothing but letting tabs go runs
+        // in the person's Chrome outside a turn of theirs.
+        if !matches!(cmd, "close" | "stop") && !crate::desk_computer::the_holders_turn() {
+            return Err(eyre!(OTHERS_TURN));
+        }
         let conn = self
             .chosen_conn()
             .ok_or_else(|| eyre!(browser::NOT_CONNECTED))?;
@@ -529,6 +534,9 @@ impl ExtensionLink for Chrome {
         Chrome::connected(self)
     }
 }
+
+/// What a call in someone else's turn is told.
+pub const OTHERS_TURN: &str = "The browser is the person's own Chrome, signed in as them: it is used only in a turn of theirs.";
 
 /// Installs the hub's end of Desk's extension, its profiles kept in
 /// `file`.
