@@ -884,6 +884,7 @@ fn options(config: &WorkforceConfig) -> Options {
             derive_calls_per_day: desk.memory.derive_calls_per_day,
             machine: may_be_machine(desk),
             brief_max_tokens: desk.memory.brief_max_tokens,
+            max_disk_mb_ceiling: desk.memory.max_disk_mb_ceiling,
         },
         bosses: workforce_desk::grant::BossOptions {
             machine: is_machine(desk),

@@ -419,6 +419,45 @@ impl DeskStore {
             .transpose()?)
     }
 
+    /// Sets or clears (none) each of `settings` in one transaction.
+    pub async fn put_settings(&self, settings: &[(&str, Option<Value>)]) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        for (key, value) in settings {
+            match value {
+                Some(value) => {
+                    tx.execute(
+                        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) \
+                         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
+                        &[key, value],
+                    )
+                    .await?;
+                }
+                None => {
+                    tx.execute("DELETE FROM settings WHERE key = $1", &[key])
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// How many exchanges, from how many sessions, ended more than `days`
+    /// ago: what a sweep keeping `days` would remove.
+    pub async fn older_than(&self, days: u32) -> Result<(i64, i64)> {
+        let client = self.pool().get().await?;
+        let days = i32::try_from(days).unwrap_or(i32::MAX);
+        let row = client
+            .query_one(
+                "SELECT COUNT(*), COUNT(DISTINCT session) FROM memory_exchanges \
+                 WHERE COALESCE(ended, at) < now() - make_interval(days => $1)",
+                &[&days],
+            )
+            .await?;
+        Ok((row.try_get(0)?, row.try_get(1)?))
+    }
+
     pub async fn put_setting(&self, key: &str, value: &Value) -> Result<()> {
         let client = self.pool().get().await?;
         client

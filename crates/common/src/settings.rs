@@ -892,6 +892,10 @@ pub struct DeskMemoryConfig {
     /// The most disk session memory may use, in MB.
     #[serde(default = "default_desk_memory_max_disk_mb")]
     pub max_disk_mb: u64,
+    /// The most room the person may give session memory from Desk's
+    /// Settings, in MB; unset, any size Desk allows.
+    #[serde(default)]
+    pub max_disk_mb_ceiling: Option<u64>,
     /// The most passages written to the search index a minute.
     #[serde(default = "default_desk_memory_index_per_minute")]
     pub index_per_minute: u32,
@@ -917,6 +921,7 @@ impl Default for DeskMemoryConfig {
             backfill_days: default_desk_memory_backfill_days(),
             retain_days: default_desk_memory_retain_days(),
             max_disk_mb: default_desk_memory_max_disk_mb(),
+            max_disk_mb_ceiling: None,
             index_per_minute: default_desk_memory_index_per_minute(),
             derive_calls_per_day: default_desk_memory_derive_calls_per_day(),
             session_reach: default_desk_memory_session_reach(),

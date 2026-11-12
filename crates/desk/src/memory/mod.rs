@@ -55,6 +55,9 @@ pub struct MemoryOptions {
     /// The most tokens a handoff's brief may take, whatever the target's
     /// window.
     pub brief_max_tokens: u32,
+    /// The most room the person may give Desk Memory from Settings, when
+    /// the install sets a ceiling (`[desk.memory] max_disk_mb_ceiling`).
+    pub max_disk_mb_ceiling: Option<u64>,
 }
 
 /// What the person chose in Settings → Memory, over the install's
@@ -107,7 +110,10 @@ impl MemoryChoices {
             enabled: self.enabled.unwrap_or(base.enabled),
             derive: self.derive.unwrap_or(base.derive),
             retain_days: self.retain_days.unwrap_or(base.retain_days),
-            max_disk_mb: self.max_disk_mb.unwrap_or(base.max_disk_mb),
+            max_disk_mb: self
+                .max_disk_mb
+                .map(|mb| base.max_disk_mb_ceiling.map_or(mb, |c| mb.min(c)))
+                .unwrap_or(base.max_disk_mb),
             ..base.clone()
         }
     }
@@ -127,6 +133,7 @@ impl Default for MemoryOptions {
             derive_calls_per_day: 200,
             machine: false,
             brief_max_tokens: 20_000,
+            max_disk_mb_ceiling: None,
         }
     }
 }
