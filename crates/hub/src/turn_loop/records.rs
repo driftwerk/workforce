@@ -571,7 +571,7 @@ pub(crate) fn keep_failed_turn(
     let Some(desk) = turn.desk.filter(|desk| {
         matches!(
             desk.turn.place,
-            workforce_common::channels::desk::DeskPlace::Dm
+            workforce_common::channels::desk::DeskPlace::Dm { .. }
         )
     }) else {
         return;

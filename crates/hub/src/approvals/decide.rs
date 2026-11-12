@@ -79,6 +79,8 @@ pub(crate) enum DecideError {
     Unknown,
     /// The decider is not one of its approvers.
     NotAnApprover,
+    /// That answer isn't one the request offers here, and why.
+    NotOffered(&'static str),
     Failed(eyre::Report),
 }
 
@@ -103,6 +105,14 @@ pub(crate) async fn decide(
     if !decider.eligible(&targets) {
         return Err(DecideError::NotAnApprover);
     }
+    // A linked engine's ask: only the answers it offers, and the answer
+    // goes down its link; no run here resumes from it.
+    let ask = row.tool_name == crate::boss_links::asks::TOOL;
+    if ask {
+        if let Some(why) = crate::boss_links::asks::refuses(&row, choice) {
+            return Err(DecideError::NotOffered(why));
+        }
+    }
     let outcome = match choice.is_allow() {
         true => ApprovalOutcome::Approved,
         false => ApprovalOutcome::Denied,
@@ -116,6 +126,19 @@ pub(crate) async fn decide(
         return Ok(Decided::AlreadyResolved(row));
     }
     super::approvers_changed(targets.iter().map(|t| t.approver_id.as_str()));
+    if ask {
+        let (via, slack) = match decider {
+            Decider::Slack(s) => ("slack", Some(s.to_string())),
+            Decider::Person(_) => ("desk", None),
+        };
+        let went =
+            crate::boss_links::asks::decided(&row, choice, &resolver_id, via, slack.as_deref());
+        let resolved = row.clone();
+        tokio::spawn(async move {
+            crate::boss_links::asks::rewrite_decided(&svc, &store, &resolved, choice, went).await;
+        });
+        return Ok(Decided::Resolved(row));
+    }
     let (registry, resolved, display) = (Arc::clone(registry), row.clone(), decider.display(&svc));
     tokio::spawn(async move {
         super::slack::rewrite_all_targets(&svc, &store, &resolved, outcome, &resolver_id).await;
@@ -190,6 +213,7 @@ pub(crate) async fn decision(
             StatusCode::FORBIDDEN,
             "you are not an approver of this request",
         ),
+        Err(DecideError::NotOffered(why)) => refused(StatusCode::CONFLICT, why),
         Err(DecideError::Failed(e)) => {
             tracing::warn!(error = %e, request = %request_id, "deciding an approval failed");
             refused(

@@ -9105,7 +9105,7 @@ mod tests {
         use workforce_common::channels::desk::DeskPlace;
         let desk = || {
             Some(DeskScope {
-                target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+                target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
                 attended: false,
                 relayed: false,
                 owner: "person-1".into(),

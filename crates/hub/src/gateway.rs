@@ -1545,6 +1545,11 @@ const DESK_QUEUE: &str = "desk.queue";
 /// (`GET /api/desk/conversations/{agent}/search`), and a page read around a
 /// match (`around=`). Served with the conversation routes.
 const DESK_SEARCH: &str = "desk.search";
+/// A DM has threads: a conversation of its own on a message, on the channel
+/// `desk:thread:<id>`, listed by `GET /api/desk/conversations/{agent}/threads`,
+/// a reply in one also sent to the DM by
+/// `POST /api/desk/conversations/{agent}/messages`.
+const DESK_DM_THREADS: &str = "desk.dm_threads";
 /// A person may delete their own message in their DM, and forget what the
 /// agent remembered from it
 /// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
@@ -1621,6 +1626,7 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
         .chain(deliveries.then_some(DESK_DELETE))
         // Searching is too.
         .chain(deliveries.then_some(DESK_SEARCH))
+        .chain(deliveries.then_some(DESK_DM_THREADS))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)
@@ -1951,7 +1957,7 @@ mod desk_frame_tests {
     fn a_desk_connection_s_turn_is_checked_or_inferred() {
         let room = format!("desk:{}", uuid::Uuid::from_u128(5));
         let sent = DeskTurn {
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             ..DeskTurn::legacy("desk").unwrap()
         };
         assert_eq!(
@@ -2110,7 +2116,7 @@ mod voice_forward_tests {
                 session_id: "sess-1".into(),
                 message_id: "m1".into(),
                 kind: workforce_common::channels::desk::DeliveryKind::Job,
-                place: workforce_common::channels::desk::DeskPlace::Dm,
+                place: workforce_common::channels::desk::DeskPlace::Dm { thread: None },
                 spoken: false,
             },
         );
@@ -2800,7 +2806,7 @@ async fn handle_ws(
                             // So is an edit sent again: it is sent under an
                             // id of its own, which its first try saved.
                             if let Some(asked) = desk.as_ref().filter(|d| {
-                                matches!(d.turn.place, DeskPlace::Dm)
+                                matches!(d.turn.place, DeskPlace::Dm { .. })
                                     && d.turn.message.is_some_and(|id| {
                                         asked_already(
                                             &service,
@@ -17548,25 +17554,31 @@ mod turn_control_tests {
             followup_injection(
                 "approved, ship it",
                 "u1",
-                Some(DeskPlace::Dm),
+                Some(DeskPlace::Dm { thread: None }),
                 false,
                 Some("c-7")
             ),
             TurnControl::FollowUp {
                 text: "approved, ship it".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: false,
                 id: Some("c-7".into()),
             },
             "a follow-up carries the client's id for it"
         );
         assert_eq!(
-            followup_injection("approve req-1", "u1", Some(DeskPlace::Dm), true, None),
+            followup_injection(
+                "approve req-1",
+                "u1",
+                Some(DeskPlace::Dm { thread: None }),
+                true,
+                None
+            ),
             TurnControl::FollowUp {
                 text: "approve req-1".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: true,
                 id: None,
             },

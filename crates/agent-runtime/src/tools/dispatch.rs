@@ -1924,7 +1924,7 @@ mod tests {
     fn desk(attended: bool) -> workforce_common::channels::desk::DeskScope {
         use workforce_common::channels::desk::{DeskPlace, DeskTarget};
         workforce_common::channels::desk::DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             owner: "person-1".into(),
             attended,
             relayed: false,

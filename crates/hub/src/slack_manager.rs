@@ -5722,6 +5722,7 @@ async fn handle_routed_permission_button(
             )
             .await;
         }
+        Err(DecideError::NotOffered(why)) => post_ephemeral(response_url, why).await,
         Ok(Decided::Resolved(_)) => {}
         Ok(Decided::AlreadyResolved(row)) => {
             // Lost the race (already resolved/expired): rewrite just this

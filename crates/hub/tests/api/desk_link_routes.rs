@@ -43,7 +43,7 @@ fn delivered(session: &str) -> DeskDelivered {
         session_id: session.into(),
         message_id: "m1".into(),
         kind: DeliveryKind::Reminder,
-        place: DeskPlace::Dm,
+        place: DeskPlace::Dm { thread: None },
         spoken: false,
     }
 }
@@ -89,7 +89,7 @@ async fn a_link_hears_its_persons_deliveries_and_no_one_elses() {
     let mut theirs = link(token_for(&other)).await;
     assert_eq!(
         next(&mut mine).await,
-        json!({"type": "hello", "features": ["desk.place", "desk.stream", "desk.queue", "desk.roster", "desk.edit", "desk.delete", "desk.search", "desk.deliveries"]})
+        json!({"type": "hello", "features": ["desk.place", "desk.stream", "desk.queue", "desk.roster", "desk.edit", "desk.delete", "desk.search", "desk.dm_threads", "desk.deliveries"]})
     );
     next(&mut theirs).await;
     let (mut chat, _) = tokio_tungstenite::connect_async(format!(
