@@ -6,6 +6,7 @@
 mod close;
 mod context;
 mod deliver;
+pub(crate) mod edit;
 #[cfg(feature = "postgres")]
 pub(crate) mod link;
 mod retarget;
@@ -156,6 +157,7 @@ mod tests {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         }
     }
 

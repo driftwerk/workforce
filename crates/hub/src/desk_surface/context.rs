@@ -193,6 +193,7 @@ mod tests {
                 spoken: false,
                 voice: None,
                 members: Vec::new(),
+                edit: None,
             },
             target: DeskTarget {
                 place: DeskPlace::Dm,

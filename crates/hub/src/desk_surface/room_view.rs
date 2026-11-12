@@ -131,6 +131,7 @@ mod tests {
                         asked: false,
                     })
                     .collect(),
+                edit: None,
             },
             target: DeskTarget {
                 place,

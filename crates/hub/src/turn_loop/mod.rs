@@ -4698,6 +4698,24 @@ pub(crate) async fn stream_admitted(
         &service.sessions,
         &current_session_id,
     )?;
+    // A Desk edit of the person's latest message: under the claim, so no
+    // turn adds to the conversation meanwhile, the reply to the old version
+    // is set aside, and the agent is told what it did that stands.
+    let edit_note = match desk.and_then(|d| d.turn.edit.as_ref()) {
+        Some(edit) => {
+            let note = crate::desk_surface::edit::set_aside(
+                service.sessions.as_ref(),
+                &current_session_id,
+                edit,
+            )?;
+            session = service
+                .sessions
+                .get(&current_session_id)?
+                .ok_or_else(|| eyre::eyre!("Session not found: {current_session_id}"))?;
+            Some(note)
+        }
+        None => None,
+    };
     // A question the conversation holds already, unanswered, under the id
     // this turn names (one the hub runs as the next turn, after the turn it
     // was sent into never read it): the turn answers it where it is. A turn
@@ -4724,6 +4742,10 @@ pub(crate) async fn stream_admitted(
     // Build augmented message with channel context and welcome directive.
     let is_new_session = session.messages.is_empty();
     let mut effective_message = message.to_string();
+    // An edit is told just ahead of what the person said, after where.
+    if let Some(note) = edit_note {
+        effective_message = format!("{note}\n\n{effective_message}");
+    }
 
     // Inject messaging context so the agent knows where it is for tool calls:
     // the Slack channel and thread, or the Desk conversation and speaker.

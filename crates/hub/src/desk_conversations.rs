@@ -45,6 +45,22 @@ const HUB_NOTES: &[&str] = &[
     crate::desk_crew::CHECK_IN,
 ];
 
+/// Whether `entry` is something the person said: a user row that is no
+/// tool's, no note the hub wrote, and not another agent's hand-off.
+pub(crate) fn persons(entry: &TranscriptEntry) -> bool {
+    entry.role == MessageRole::User
+        && entry.tool_metadata.is_none()
+        && !HUB_NOTES
+            .iter()
+            .any(|note| entry.content.trim().starts_with(note))
+        && !entry.desk.as_ref().is_some_and(|mark| {
+            matches!(
+                mark.speaker,
+                Some(workforce_common::channels::desk::DeskSpeaker::Agent { .. })
+            )
+        })
+}
+
 /// The files a person's messages hold on their sessions, read once per
 /// session of the conversation's chain. A person's upload is on their message
 /// whether or not this hub keeps a desk, and a message saved before its mark

@@ -1828,6 +1828,103 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    fn set_aside_from(&self, session_id: &str, message_id: &str) -> Result<Vec<TranscriptEntry>> {
+        let id = parse_uuid(session_id)?;
+        let message_id = message_id.to_string();
+        let session_id_owned = session_id.to_string();
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let tx = conn.transaction().await?;
+            self.bind_tenant(&tx).await?;
+            let Some(cur) = tx
+                .query_opt(
+                    "SELECT messages, total_tokens FROM sessions
+                     WHERE id = $1 AND agent_id = $2 AND tenant_id = $3
+                     FOR UPDATE",
+                    &[&id, &self.agent_id, &self.tenant_id()],
+                )
+                .await?
+            else {
+                eyre::bail!("Session not found: {session_id_owned}");
+            };
+            let messages_json: serde_json::Value = cur.get(0);
+            let mut messages: Vec<SessionMessage> =
+                serde_json::from_value(messages_json).context("decode messages for set-aside")?;
+            let archived: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM session_archive
+                     WHERE session_id = $1 AND tenant_id = $2",
+                    &[&id, &self.tenant_id()],
+                )
+                .await?
+                .get(0);
+            // A session from before archive seeding reads its live messages
+            // (as `read_archive_page` does), so those are what is set aside.
+            let set_aside: Vec<TranscriptEntry> = if archived == 0 {
+                let from = messages
+                    .iter()
+                    .position(|m| m.id == message_id)
+                    .ok_or_else(|| eyre::eyre!("Message not found: {message_id}"))?;
+                messages[from..]
+                    .iter()
+                    .map(|m| message_to_transcript_entry(&session_id_owned, m))
+                    .collect()
+            } else {
+                // `seq` runs across the thread's sessions; this session's
+                // rows from the message on are the ones at or past its seq.
+                let rows = tx
+                    .query(
+                        "DELETE FROM session_archive
+                         WHERE session_id = $1 AND tenant_id = $2
+                           AND seq >= (SELECT MIN(seq) FROM session_archive
+                                       WHERE session_id = $1 AND tenant_id = $2
+                                         AND message_id = $3)
+                         RETURNING seq, message_id, role, content, tool_data, ts, tokens, desk,
+                                   external_id",
+                        &[&id, &self.tenant_id(), &message_id],
+                    )
+                    .await?;
+                if rows.is_empty() {
+                    eyre::bail!("Message not found: {message_id}");
+                }
+                let mut entries: Vec<TranscriptEntry> = rows
+                    .iter()
+                    .map(|r| archive_row_to_entry(&session_id_owned, r))
+                    .collect();
+                entries.sort_by_key(|e| e.seq);
+                entries
+            };
+            // The live context may have compacted the message away: it is cut
+            // from the first set-aside message it still holds, if any.
+            let ids: Vec<&str> = set_aside.iter().map(|e| e.id.as_str()).collect();
+            if let Some(from) = messages.iter().position(|m| ids.contains(&m.id.as_str())) {
+                let removed_tokens: u64 = messages[from..].iter().map(|m| m.tokens as u64).sum();
+                messages.truncate(from);
+                let total_tokens: i64 = cur.get(1);
+                let new_total = (total_tokens as u64).saturating_sub(removed_tokens) as i64;
+                let count = messages.len() as i32;
+                let json =
+                    serde_json::to_value(&messages).context("encode messages after set-aside")?;
+                tx.execute(
+                    "UPDATE sessions SET messages = $1, message_count = $2, total_tokens = $3,
+                         updated_at = $4, revision = revision + 1
+                     WHERE id = $5 AND tenant_id = $6",
+                    &[
+                        &json,
+                        &count,
+                        &new_total,
+                        &Utc::now(),
+                        &id,
+                        &self.tenant_id(),
+                    ],
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(set_aside)
+        })
+    }
+
     fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchResult>> {
         let terms = search_terms(query);
         if terms.is_empty() {
@@ -2497,6 +2594,14 @@ pub(crate) mod tests {
     async fn reassigning_owners_keeps_both_on_a_shared_channel_in_one_transaction() {
         with_store(|store| async move {
             crate::session::assert_reassign_owner_contract(store.as_ref());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setting_aside_from_a_message_takes_its_archive_rows_and_live_context() {
+        with_store(|store| async move {
+            crate::session::assert_set_aside_contract(store.as_ref(), true);
         })
         .await;
     }
