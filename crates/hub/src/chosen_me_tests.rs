@@ -118,6 +118,16 @@ fn a_name_search_shows_names_and_avatars_only() {
         ]
     );
     assert!(!serde_json::to_string(&found).unwrap().contains('@'));
+    // A Gravatar picture's address is a hash of the email: left out.
+    let answer = json!({ "users": [
+        { "account_id": "557058:kay", "display_name": "K. Hendrickse", "active": true,
+          "account_type": "atlassian",
+          "avatar": "https://secure.gravatar.com/avatar/0123456789abcdef?d=identicon" },
+    ] });
+    assert_eq!(
+        members_named(On::Jira, &answer, "hendr"),
+        vec![json!({ "id": "557058:kay", "name": "K. Hendrickse", "avatar": null })]
+    );
 }
 
 #[tokio::test]

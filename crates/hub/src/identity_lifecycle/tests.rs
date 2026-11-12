@@ -1764,11 +1764,30 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
             crate::verified_email::Source::Slack
         ))
     );
-    // Suspending forgets it.
+    // Whom someone chose to be on a shared key never moves: the target
+    // chooses for itself.
+    let chose = "chosen.jira:acme.atlassian.net";
+    let jo = Identity::new("Jo", IdentityRole::Member)
+        .with_linked_id(chose, r#"{"id":"557058:jo","name":"Jo"}"#);
+    hub.identities.create(&jo).unwrap();
+    let kit = Identity::new("Kit", IdentityRole::Member);
+    hub.identities.create(&kit).unwrap();
+    hub.lifecycle
+        .merge(jo.id, kit.id, &admin, false)
+        .await
+        .unwrap();
+    let kit = hub.identities.get_by_id(kit.id).unwrap().unwrap();
+    assert!(!kit.linked_ids.contains_key(chose), "Kit didn't choose");
+    // Suspending forgets it, and the choice too.
+    let mut cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();
+    cy.linked_ids
+        .insert(chose.into(), r#"{"id":"557058:cy","name":"Cy"}"#.into());
+    hub.identities.update(&cy).unwrap();
     hub.lifecycle.suspend(cy.id, &admin).await.unwrap();
     let cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();
     assert!(!cy
         .linked_ids
         .keys()
-        .any(|k| crate::verified_email::is_verified_key(k)));
+        .any(|k| crate::verified_email::is_verified_key(k)
+            || crate::chosen_me::is_chosen_key(k)));
 }

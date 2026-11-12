@@ -143,10 +143,19 @@ pub fn members_named(on: On, answer: &Value, needle: &str) -> Vec<Value> {
             shown
                 .iter()
                 .any(|n| n.to_lowercase().contains(&needle))
-                .then(|| json!({ "id": id, "name": name, "avatar": u[avatar].as_str() }))
+                .then(|| json!({ "id": id, "name": name, "avatar": u[avatar].as_str().filter(|a| !is_gravatar(a)) }))
         })
         .take(MAX_MEMBERS)
         .collect()
+}
+
+/// Whether `avatar` is a Gravatar picture, whose address is a hash of the
+/// person's email (Jira's default avatars are): not shown.
+fn is_gravatar(avatar: &str) -> bool {
+    url::Url::parse(avatar)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|h| h == "gravatar.com" || h.ends_with(".gravatar.com"))
 }
 
 /// `identity.jira_users_named` / `identity.linear_members_named`.

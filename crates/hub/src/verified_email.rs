@@ -203,11 +203,12 @@ pub fn keep_stored_verified(
     }
 }
 
-/// Forgets every verified email of `identity` (suspended); whether it had
-/// one.
+/// Forgets every verified email of `identity`, and whom it chose to be on
+/// a shared key (suspended); whether it had either. Both are earned again.
 pub fn forget_verified_email(identity: &mut Identity) -> bool {
-    let had = identity.linked_ids.keys().any(|k| is_verified_key(k));
-    identity.linked_ids.retain(|k, _| !is_verified_key(k));
+    let gone = |k: &str| is_verified_key(k) || crate::chosen_me::is_chosen_key(k);
+    let had = identity.linked_ids.keys().any(|k| gone(k));
+    identity.linked_ids.retain(|k, _| !gone(k));
     had
 }
 
