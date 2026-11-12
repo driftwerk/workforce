@@ -432,7 +432,7 @@ impl Tool for AgentCreateTool {
         }
 
         let user = current_turn_user();
-        if let Err(e) = crate::config_writer::overlay_upsert_agent(
+        if let Err(e) = crate::config_writer::overlay_create_agent(
             &config_path,
             std::path::Path::new(&self.ctx.data_dir),
             agent,
@@ -443,6 +443,12 @@ impl Tool for AgentCreateTool {
         )
         .await
         {
+            if crate::config_writer::AgentExists::is(&e) {
+                return Ok(ToolResult::failure(
+                    format!("Agent '{}' already exists", params.id),
+                    duration(),
+                ));
+            }
             return Ok(ToolResult::failure(
                 format!("Failed to save config: {}", e),
                 duration(),

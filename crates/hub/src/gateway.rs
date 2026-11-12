@@ -6435,7 +6435,9 @@ async fn create_agent(
         agent.insert("memory".to_string(), toml::Value::Table(memory));
     }
 
-    if let Err(e) = crate::config_writer::overlay_upsert_agent(
+    // Made only where no agent of that id is: checked again under the
+    // overlay's lock, so two creates of one id can't both be made.
+    if let Err(e) = crate::config_writer::overlay_create_agent(
         &config_path,
         &data_dir,
         agent,
@@ -6446,6 +6448,12 @@ async fn create_agent(
     )
     .await
     {
+        if crate::config_writer::AgentExists::is(&e) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("agent '{}' already exists", body.id)})),
+            ));
+        }
         // F8 (2026-05-15): log paths server-side but don't echo FS layout
         // back to the client.
         warn!(agent_id = %body.id, error = %e, "Failed to write agent to config overlay");
