@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 use workforce_agent::tools::RateLimitedError;
 
-use crate::adapters::auth::{field_paths, resolve_credential, resolve_host};
+use crate::adapters::auth::{field_paths, resolve_credential};
 use crate::adapters::utils::retry_after_secs;
 use workforce_common::settings::SecretStore;
 
@@ -158,8 +158,14 @@ impl DatadogClient {
                 };
                 let api_key = credential("api_key")?;
                 let app_key = credential("app_key")?;
-                let base_url =
-                    self.host_for(store.as_ref(), api_key.per_user && app_key.per_user)?;
+                // Both keys as one credential: the caller's only when both
+                // are, and of one tier only when both are.
+                let both = crate::adapters::auth::Resolved {
+                    value: String::new(),
+                    per_user: api_key.per_user && app_key.per_user,
+                    tier: api_key.tier.filter(|t| app_key.tier == Some(*t)),
+                };
+                let base_url = self.host_for(store.as_ref(), &both)?;
                 (
                     HeaderValue::from_str(&api_key.value)
                         .map_err(|e| eyre!("Invalid Datadog api_key: {}", e))?,
@@ -178,10 +184,14 @@ impl DatadogClient {
         Ok((headers, base_url))
     }
 
-    fn host_for(&self, store: &dyn SecretStore, per_user: bool) -> Result<String> {
+    fn host_for(
+        &self,
+        store: &dyn SecretStore,
+        cred: &crate::adapters::auth::Resolved,
+    ) -> Result<String> {
         let host = |field: &str| {
             let (ws, flat) = self.paths(field);
-            resolve_host(store, per_user, &ws, &flat)
+            crate::adapters::auth::host_for(store, cred, &ws, &flat)
         };
         match (host("base_url"), host("site")) {
             (Some(url), _) => Ok(url),

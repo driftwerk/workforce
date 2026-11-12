@@ -101,6 +101,12 @@ pub enum AgentReadDenial {
     /// sets it, in Desk or with the account tools; an agent never reads or
     /// writes it through the vault tools.
     LlmAccount,
+    /// On a hub running Desk, the path says where a connection sends its
+    /// key (a Jira site, a GitHub or Datadog address, a Metabase site, a
+    /// mailbox's server). The person sets it in Settings → Connections, or
+    /// the agent with `connections.*`, which asks first; an agent writing it
+    /// here could send the person's key to a host of its choosing.
+    ConnectionAddress,
     /// No `CURRENT_USER_ID` is in scope but the path is per-user. System
     /// jobs must opt into a synthetic identity via
     /// `workforce_agent::runner::with_system_identity` rather than read
@@ -156,6 +162,12 @@ impl std::fmt::Display for AgentReadDenial {
                 "vault path holds a model account, which says what pays for the \
                  agent's thinking, and is the person's to set, in Desk or with \
                  system.add_account; it is not read or written from the agent vault tool"
+            ),
+            AgentReadDenial::ConnectionAddress => write!(
+                f,
+                "vault path says where a connection sends its key, which the agent vault \
+                 tools don't change on Desk. Set the connection up with connections.setup, \
+                 or ask the person to change it in Settings → Connections"
             ),
             AgentReadDenial::NoUserIdentity => write!(
                 f,
@@ -235,6 +247,73 @@ pub fn agent_can_read(path: &str, current_uid: Option<&str>) -> Result<(), Agent
 }
 
 pub use workforce_common::vault_scope::{is_desk_link, DESK_LINK_PREFIXES};
+
+/// The fields that say where a connection sends its key: its address, and
+/// a mailbox's servers and how it reaches them.
+const ADDRESS_FIELDS: &[(&str, &[&str])] = &[
+    ("github", &["base_url"]),
+    ("jira", &["site"]),
+    ("datadog", &["site", "base_url"]),
+    ("metabase", &["site_url"]),
+    (
+        "email",
+        &["imap_host", "smtp_host", "imap_port", "smtp_port", "tls"],
+    ),
+];
+
+/// Whether `path` (shared or under `users/{uid}/`) says where one of Desk's
+/// connections sends its key: flat (`skills/jira/site`) or an instance's
+/// (`skills/jira/workspaces/acme/site`).
+pub fn is_connection_address(path: &str) -> bool {
+    let logical = path
+        .strip_prefix("users/")
+        .and_then(|rest| rest.split_once('/'))
+        .map_or(path, |(_, rest)| rest);
+    let Some(rest) = logical.strip_prefix("skills/") else {
+        return false;
+    };
+    let Some((connector, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((_, fields)) = ADDRESS_FIELDS.iter().find(|(c, _)| *c == connector) else {
+        return false;
+    };
+    let field = match tail.rsplit_once('/') {
+        // An instance's: `<collection>/<key>/<field>`, one level deep.
+        Some((within, field)) if within.split('/').count() == 2 => field,
+        Some(_) => return false,
+        None => tail,
+    };
+    fields.contains(&field)
+}
+
+/// [`agent_can_read`] for a tool that writes `path` (sets, deletes, or moves
+/// or copies to or from it). On a hub running Desk (`desk`), where a
+/// connection sends its key is never written from the agent vault tools.
+pub fn agent_can_write(
+    path: &str,
+    current_uid: Option<&str>,
+    desk: bool,
+) -> Result<(), AgentReadDenial> {
+    agent_can_read(path, current_uid)?;
+    if desk && is_connection_address(path) {
+        return Err(AgentReadDenial::ConnectionAddress);
+    }
+    Ok(())
+}
+
+/// Whether this hub runs Desk, whose connections the agent vault tools
+/// leave to Connections.
+pub fn desk_running() -> bool {
+    #[cfg(feature = "postgres")]
+    {
+        crate::desk_connections::installed().is_some()
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        false
+    }
+}
 
 /// Whether `path` is a model account, `llm/accounts/...` shared or under
 /// `users/{uid}/`, however its case or slashes are spelled.
@@ -566,5 +645,43 @@ mod tests {
     fn agent_can_read_rejects_dot_dot_in_non_users_path() {
         let err = agent_can_read("skills/jira/../google/api_key", Some("alice")).unwrap_err();
         assert_eq!(err, AgentReadDenial::CrossUser);
+    }
+
+    #[test]
+    fn on_desk_an_agent_never_writes_where_a_connection_sends_its_key() {
+        for path in [
+            "skills/jira/site",
+            "skills/jira/workspaces/acme/site",
+            "users/sam/skills/jira/workspaces/acme/site",
+            "skills/github/workspaces/acme/base_url",
+            "skills/datadog/accounts/prod/base_url",
+            "skills/datadog/site",
+            "skills/metabase/instances/acme/site_url",
+            "users/sam/skills/email/accounts/work/smtp_host",
+        ] {
+            assert!(is_connection_address(path), "{path}");
+            assert_eq!(
+                agent_can_write(path, Some("sam"), true),
+                Err(AgentReadDenial::ConnectionAddress),
+                "{path}"
+            );
+            // A hub without Desk: as before.
+            assert_eq!(agent_can_write(path, Some("sam"), false), Ok(()), "{path}");
+        }
+        for path in [
+            "skills/jira/workspaces/acme/api_token",
+            "skills/jira/workspaces/acme/label",
+            "skills/linear/workspaces/acme/api_key",
+            "skills/jira/workspaces/acme/nested/site",
+            "skills/postmark/workspaces/acme/base_url",
+        ] {
+            assert!(!is_connection_address(path), "{path}");
+            assert_eq!(agent_can_write(path, Some("sam"), true), Ok(()), "{path}");
+        }
+        // Another person's is still another person's.
+        assert_eq!(
+            agent_can_write("users/ben/skills/jira/site", Some("sam"), true),
+            Err(AgentReadDenial::CrossUser)
+        );
     }
 }

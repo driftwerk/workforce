@@ -29,7 +29,7 @@ use workforce_agent::llm::environment::SkillVariants;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::Tool;
 use workforce_common::settings::WorkforceConfig;
-use workforce_skills::adapters::auth::shared_get;
+use workforce_skills::adapters::auth::{address_for, shared_get};
 
 use crate::serve::AgentService;
 use crate::vault::Vault;
@@ -2448,7 +2448,7 @@ fn github_vault_config(
         .filter_map(|path| {
             let name = path.strip_prefix(prefix)?.strip_suffix(suffix)?.to_string();
             let token = store.get(&path)?;
-            let base_url = shared_get(store, &format!("{prefix}{name}/base_url"))
+            let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"))
                 .unwrap_or_else(|| config.github.base_url.clone());
             Some((
                 name.clone(),
@@ -2876,7 +2876,7 @@ fn jira_vault_config(
             warn!(workspace = name, "Skipping Jira workspace: missing email");
             continue;
         };
-        let site = shared_get(store, &format!("{prefix}{name}/site"));
+        let site = address_for(store, &path, &format!("{prefix}{name}/site"));
         let default_project = shared_get(store, &format!("{prefix}{name}/default_project"));
 
         let project_keys: Vec<String> = shared_get(store, &format!("{prefix}{name}/project_keys"))
@@ -2965,7 +2965,7 @@ fn jira_vault_config(
         let api_token = store
             .get("skills/jira/api_token")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/jira/api_token'"))?;
-        let site = shared_get(store, "skills/jira/site");
+        let site = address_for(store, "skills/jira/api_token", "skills/jira/site");
         let default_project = shared_get(store, "skills/jira/default_project");
 
         workforce_skills::adapters::jira::JiraSkillConfig {
@@ -3050,9 +3050,9 @@ fn datadog_vault_config(
             warn!(account = name, "Skipping Datadog account: missing app_key");
             continue;
         };
-        let site =
-            shared_get(store, &format!("{prefix}{name}/site")).unwrap_or_else(|| "us1".to_string());
-        let base_url = shared_get(store, &format!("{prefix}{name}/base_url"));
+        let site = address_for(store, &path, &format!("{prefix}{name}/site"))
+            .unwrap_or_else(|| "us1".to_string());
+        let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"));
 
         accounts.insert(
             name.to_string(),
@@ -3107,8 +3107,8 @@ fn datadog_vault_config(
         let app_key = store
             .get("skills/datadog/app_key")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/datadog/app_key'"))?;
-        let site = shared_get(store, "skills/datadog/site");
-        let base_url = shared_get(store, "skills/datadog/base_url");
+        let site = address_for(store, "skills/datadog/api_key", "skills/datadog/site");
+        let base_url = address_for(store, "skills/datadog/api_key", "skills/datadog/base_url");
 
         workforce_skills::adapters::datadog::DatadogSkillConfig {
             api_key: Some(api_key),
@@ -3181,7 +3181,7 @@ fn metabase_vault_config(
         let Some(api_key) = store.get(&path) else {
             continue;
         };
-        let site_url = shared_get(store, &format!("{prefix}{name}/site_url"));
+        let site_url = address_for(store, &path, &format!("{prefix}{name}/site_url"));
         let max_query_rows = shared_get(store, &format!("{prefix}{name}/max_query_rows"))
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -3236,7 +3236,7 @@ fn metabase_vault_config(
                  - vault.set('skills/metabase/instances/<name>/{{api_key,site_url}}', '...') for multi-instance"
             )
         })?;
-        let site_url = shared_get(store, "skills/metabase/site_url");
+        let site_url = address_for(store, "skills/metabase/api_key", "skills/metabase/site_url");
         let max_query_rows = shared_get(store, "skills/metabase/max_query_rows")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -4545,6 +4545,44 @@ pub(crate) fn ensure_adapters_loaded(service: &AgentService, wanted: impl Fn(&st
 
 #[cfg(test)]
 mod tests {
+    /// On a hub running Desk, a connection's address is the one kept with
+    /// its key: a site an agent wrote at its own tier is never where the
+    /// person's key goes, at load or per request.
+    #[tokio::test]
+    async fn on_desk_a_connections_address_is_the_one_kept_with_its_key() {
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin};
+        struct Every;
+        impl PinSource for Every {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
+        let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
+        let ws = |f: &str| format!("skills/jira/workspaces/acme/{f}");
+        for (f, v) in [
+            ("site", "https://acme.atlassian.net"),
+            ("email", "sam@acme.example"),
+            ("api_token", "person-token"),
+        ] {
+            global.set(&format!("users/sam/{}", ws(f)), v).unwrap();
+        }
+        agent.set(&ws("site"), "https://evil.example").unwrap();
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Every));
+        let store = crate::user_config::LayeredUserVault::new(agent, Some(global)).with_pins(pins);
+        workforce_agent::runner::CURRENT_USER_ID
+            .scope("sam".to_string(), async move {
+                let (config, _) = jira_vault_config(&store).unwrap();
+                assert_eq!(
+                    config.workspaces["acme"].site.as_deref(),
+                    Some("https://acme.atlassian.net")
+                );
+            })
+            .await;
+    }
+
     use super::*;
     use workforce_agent::runner::CURRENT_USER_ID;
     use workforce_agent::tools::registry::ToolRegistry;

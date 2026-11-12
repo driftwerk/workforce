@@ -17,7 +17,7 @@ use workforce_common::metabase_schema::{
 use workforce_common::settings::SecretStore;
 
 use super::schema_prompt;
-use crate::adapters::auth::{field_paths, resolve_companion, resolve_credential};
+use crate::adapters::auth::{companion_for, field_paths, resolve_credential};
 use crate::adapters::utils::retry_after_secs;
 
 const API_KEY_HEADER: &str = "x-api-key";
@@ -463,10 +463,9 @@ impl MetabaseClient {
                 let api_key = resolve_credential(store.as_ref(), &workspace, &flat)
                     .ok_or_else(|| eyre!("Metabase api_key not configured at {workspace}"))?;
                 let (site_ws, site_flat) = self.paths("site_url");
-                let base_url =
-                    resolve_companion(store.as_ref(), api_key.per_user, &site_ws, &site_flat)
-                        .map(|site| api_base(&site))
-                        .or_else(|| self.base_url.clone());
+                let base_url = companion_for(store.as_ref(), &api_key, &site_ws, &site_flat)
+                    .map(|site| api_base(&site))
+                    .or_else(|| self.base_url.clone());
                 let auth = HeaderValue::from_str(&api_key.value)
                     .map_err(|e| eyre!("Invalid Metabase API key: {e}"))?;
                 (auth, base_url)

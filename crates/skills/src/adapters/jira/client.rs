@@ -12,7 +12,7 @@ use serde_json::Value;
 use workforce_agent::tools::RateLimitedError;
 use workforce_common::settings::SecretStore;
 
-use crate::adapters::auth::{field_paths, resolve_companion, resolve_credential};
+use crate::adapters::auth::{companion_for, field_paths, resolve_credential};
 use crate::adapters::utils::retry_after_secs;
 
 /// Base path for Jira REST API v3.
@@ -120,7 +120,7 @@ impl JiraClient {
             .ok_or_else(|| eyre!("Jira API token not configured at {token_ws}"))?;
         let companion = |field: &str| {
             let (ws, flat) = self.paths(field);
-            resolve_companion(store.as_ref(), token.per_user, &ws, &flat)
+            companion_for(store.as_ref(), &token, &ws, &flat)
         };
         let email = companion("email")
             .ok_or_else(|| eyre!("Jira email not configured at {}", self.paths("email").0))?;

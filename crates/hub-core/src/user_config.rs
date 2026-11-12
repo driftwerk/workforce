@@ -451,6 +451,10 @@ impl LayeredUserVault {
 }
 
 impl workforce_common::settings::SecretStore for LayeredUserVault {
+    fn is_pinned(&self) -> bool {
+        self.pins.as_ref().is_some_and(|p| p.is_filled())
+    }
+
     fn get(&self, path: &str) -> Option<String> {
         self.tiers_in_order_for(path)
             .into_iter()

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 use workforce_common::settings::SecretStore;
 
-use crate::adapters::auth::{companion_at, resolve_at};
+use crate::adapters::auth::{companion_for, resolve_at};
 
 use super::client::ImapClient;
 use super::config::{EmailAccountConfig, EmailSkillConfig};
@@ -64,7 +64,10 @@ impl ImapConnector {
         };
         let path = |field: &str| format!("skills/email/accounts/{name}/{field}");
         let password = resolve_at(store.as_ref(), &path("password"))?;
-        let field = |field: &str| companion_at(store.as_ref(), password.per_user, &path(field));
+        let field = |field: &str| {
+            let at = path(field);
+            companion_for(store.as_ref(), &password, &at, &at)
+        };
         let parsed =
             |name: &str, default| field(name).and_then(|v| v.parse().ok()).unwrap_or(default);
         let username = field("username")?;
