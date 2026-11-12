@@ -340,6 +340,13 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.engines()).into_response()
 }
 
+/// Every engine read again now, as after Desk installed one or signed one
+/// in, rather than at the hourly read.
+async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.engines_read_now().await).into_response()
+}
+
 #[derive(Deserialize)]
 struct EngineBody {
     engine: crate::engine::Engine,
@@ -392,6 +399,27 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "ownPlanKey": s.desk.own_plan_key(),
     }))
     .into_response()
+}
+
+/// Signs an account in again: with a pasted token, kept for it once Claude
+/// Code signs in by it (201); without one, its sign-in begins (202).
+async fn sign_in_again(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(again): Json<crate::engine_accounts::SignInAgain>,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.sign_in_again(id, again).await {
+        Ok(added @ crate::service::Added::Account { .. }) => {
+            (StatusCode::CREATED, Json(added)).into_response()
+        }
+        Ok(added @ crate::service::Added::SignIn { .. }) => {
+            (StatusCode::ACCEPTED, Json(added)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Adds an account: with a pasted token, kept once Claude Code signs in by
@@ -1806,6 +1834,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
         .route("/api/desk/features", get(features))
+        .route("/api/desk/engines/read", post(engines_read))
         .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
         .route(
             "/api/desk/engines/sign-ins/{id}",
@@ -1817,6 +1846,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_account).delete(remove_account),
         )
         .route("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
+        .route("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
         .route(
             "/api/desk/accounts/sign-ins/{id}/direct",
@@ -2580,6 +2610,14 @@ mod tests {
             assert_eq!(engines[0]["caps"]["terminal"]["state"], "hooks");
             assert_eq!(engines[2]["views"], json!([]));
             assert_eq!(engines[7]["program"], Value::Null);
+            // Read again now, as after Desk installs or signs one in: the
+            // same list, as each engine reads now.
+            let (status, again) = call(&app, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                again.as_array().map(Vec::len),
+                engines.as_array().map(Vec::len)
+            );
             let cwd = dir.path().to_string_lossy().into_owned();
             let (status, refused) = call(
                 &app,

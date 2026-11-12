@@ -2100,6 +2100,18 @@ impl Desk {
         }
     }
 
+    /// Every engine read again now (one read under way is shared), as after
+    /// Desk installed one or signed one in: then as [`Desk::engines`].
+    pub async fn engines_read_now(&self) -> Vec<engine::EngineView> {
+        let asked = std::time::Instant::now();
+        let reads = Engine::ALL
+            .into_iter()
+            .map(|e| self.read_engine_since(e, asked, Since::Ended));
+        futures::future::join_all(reads).await;
+        self.spend_signed_in();
+        self.engines()
+    }
+
     /// Every engine as Settings → Engines and the new session dialog show
     /// it: its program, whether it is installed, its version and sign-in,
     /// and where Desk runs it.
