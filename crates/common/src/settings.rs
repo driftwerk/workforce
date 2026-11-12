@@ -9145,6 +9145,7 @@ impl RemoteMcpConfig {
         "jira.transition_issue",
         "jira.add_comment",
         "jira.get_project",
+        "jira.list_projects",
         "jira.myself",
         "identity.jira_user_by_my_email",
         "linear.issue_list",

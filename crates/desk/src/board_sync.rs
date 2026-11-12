@@ -48,6 +48,9 @@ pub fn by_email_tool(system: System) -> &'static str {
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
     all.extend([identity_tool(system), by_email_tool(system)]);
+    if system == System::Jira {
+        all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
+    }
     all
 }
 

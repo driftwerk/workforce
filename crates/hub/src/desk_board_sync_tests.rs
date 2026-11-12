@@ -113,6 +113,9 @@ impl Tool for FakeJiraTool {
         }
         let key = input["issue_key"].as_str().unwrap_or_default().to_string();
         let out = match self.name {
+            "jira.list_projects" => json!({ "count": 2, "projects": [
+                { "key": "ACME", "id": "1", "name": "Acme web" },
+                { "key": "OPS", "id": "2", "name": "Operations" } ] }),
             "jira.search" => {
                 let jql = input["jql"].as_str().unwrap_or_default();
                 let project = jql.split('"').nth(1).unwrap_or_default().to_string();
@@ -234,10 +237,15 @@ pub(crate) fn register_jira(
     jira: &Shared,
     except: &[&str],
 ) {
-    for name in workforce_desk::board_sync::JIRA_TOOLS
-        .iter()
-        .chain(["jira.api", "jira.delete_issue", "jira.myself"].iter())
-    {
+    for name in workforce_desk::board_sync::JIRA_TOOLS.iter().chain(
+        [
+            "jira.api",
+            "jira.delete_issue",
+            "jira.myself",
+            "jira.list_projects",
+        ]
+        .iter(),
+    ) {
         if !except.contains(name) {
             registry.register(Arc::new(FakeJiraTool {
                 name,
@@ -754,6 +762,11 @@ async fn the_link_dialog_is_told_the_states_and_the_matches() {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["matches"], 1);
+        // The projects to pick from, by key and name.
+        assert_eq!(
+            body["projects"],
+            json!([{ "key": "ACME", "name": "Acme web" }, { "key": "OPS", "name": "Operations" }])
+        );
         assert_eq!(body["prefill"]["doing"], "In Progress");
         assert_eq!(body["prefill"]["review"], "In Review");
         // Raw JQL that would reach another project is refused before any call.

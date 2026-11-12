@@ -316,6 +316,7 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
     let narrowed = ToolRegistry::empty_like(surface);
     workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
         .iter()
+        .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
         .chain(DEVICE_SURFACE_EXTRA)

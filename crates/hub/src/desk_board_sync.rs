@@ -1109,6 +1109,23 @@ async fn check_link(
             Err(e) => return said(e),
         }
     }
+    // Jira's projects, for a picker: only when the hub can list them (a
+    // token minted before the tool was offered can't, and the key is typed).
+    if body.system == System::Jira {
+        if let Ok(projects) = sync::call(
+            &*remote,
+            body.system,
+            "jira.list_projects",
+            json!({ "max_results": 100 }),
+        )
+        .await
+        {
+            let list = projects_of(&projects);
+            if !list.as_array().is_some_and(Vec::is_empty) {
+                out["projects"] = list;
+            }
+        }
+    }
     let Some(target) = body.target.as_deref() else {
         return Json(out).into_response();
     };
@@ -1173,6 +1190,27 @@ async fn check_link(
         }
     }
     Json(out).into_response()
+}
+
+/// A project list as the dialog shows it: key and name.
+fn projects_of(answer: &Value) -> Value {
+    let list = answer
+        .get("projects")
+        .or_else(|| answer.get("values"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(
+        list.into_iter()
+            .filter_map(|p| {
+                let key = p["key"].as_str()?;
+                Some(json!({
+                    "key": key,
+                    "name": sync::unfence(p["name"].as_str().unwrap_or(key)).0,
+                }))
+            })
+            .collect(),
+    )
 }
 
 /// A team list as the dialog shows it: id, key and name.
