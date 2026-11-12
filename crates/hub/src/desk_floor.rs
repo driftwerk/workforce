@@ -815,6 +815,7 @@ pub(crate) async fn answer(
                 Ok(Decided::Resolved(_)) => Ok(Ok(())),
                 Ok(Decided::AlreadyResolved(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
                 Err(DecideError::NotAnApprover) => Ok(Err(Unanswered::NotYours)),
+                Err(DecideError::NotOffered(_)) => Ok(Err(Unanswered::NotOffered)),
                 Err(DecideError::Unknown) => Ok(Err(Unanswered::Unknown)),
                 Err(DecideError::Failed(e)) => Err(e),
             }

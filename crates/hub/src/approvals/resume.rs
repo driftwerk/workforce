@@ -40,6 +40,10 @@ pub async fn launch_resume(
     outcome: ApprovalOutcome,
     resolver_display: &str,
 ) {
+    // A linked engine's ask: nothing here asked it, so nothing resumes.
+    if row.tool_name == crate::boss_links::asks::TOOL {
+        return;
+    }
     let Some(svc) = resume_service(registry, row) else {
         tracing::warn!(request = %row.request_id, agent = %row.agent_id, "no service to resume approval");
         return;
