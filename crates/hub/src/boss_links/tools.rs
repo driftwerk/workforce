@@ -153,6 +153,10 @@ pub fn describe(name: &str) -> &'static str {
     }
 }
 
+/// The boss tools a wake turn asks the person before using: those that
+/// start work rather than steer what runs.
+pub(crate) const WAKE_HELD: [&str; 3] = ["crew.start_session", "crew.resume", "crew.restart"];
+
 /// One boss tool, for one conversation.
 pub struct BossTool {
     name: &'static str,
@@ -160,10 +164,31 @@ pub struct BossTool {
     person: Uuid,
     /// The group's engines connected as the turn began, for the schema.
     engines: Vec<String>,
+    /// The group's name, for what it asks the person.
+    group: String,
     state: Weak<GatewayState>,
 }
 
 impl BossTool {
+    /// What a wake turn's call of this tool asks the person, when it is one
+    /// that starts work: none outside a wake turn. What a wake turn does to
+    /// a session already running (answering what it asks, nudging it,
+    /// denying, stopping or letting it go) is decided by its engine, as a
+    /// local boss's work turn is; starting a session, or starting one
+    /// again, from what a session said with nobody there waits for them.
+    fn held_in_wake(&self) -> Option<String> {
+        let waking = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+            .try_with(|o| o == super::wake::ORIGIN)
+            .unwrap_or(false);
+        (waking && WAKE_HELD.contains(&self.name)).then(|| {
+            format!(
+                "{} wants to use {} from {}'s boss conversation while you're away: it starts \
+                 work, so it runs only if you allow it, this once.",
+                self.conversation.agent, self.name, self.group
+            )
+        })
+    }
+
     /// The group's engines connected now: (link, engine name).
     fn links(&self, state: &GatewayState) -> Vec<(Uuid, String)> {
         state.uplinks.links_for(
@@ -264,6 +289,16 @@ impl Tool for BossTool {
         schema(self.name, &self.engines)
     }
 
+    /// In a wake turn, nobody is there: what starts work is asked of the
+    /// person first, once ([`WAKE_HELD`]).
+    fn approval_requirement(&self) -> Option<String> {
+        self.held_in_wake()
+    }
+
+    fn approval_notice(&self) -> Option<String> {
+        self.held_in_wake()
+    }
+
     async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
         let started = Instant::now();
         let ms = || started.elapsed().as_millis() as u64;
@@ -338,12 +373,31 @@ pub fn for_turn_on(
                     conversation: conversation.clone(),
                     person,
                     engines: engines.clone(),
+                    group: group.clone(),
                     state: Arc::downgrade(state),
                 }));
             }
         }
     }
     Arc::new(registry)
+}
+
+/// A boss tool `name` of a conversation of Allan's for `group`, reaching no
+/// hub: for tests of what it is, not what it does.
+#[cfg(test)]
+pub(crate) fn test_tool(name: &'static str, group: &str) -> BossTool {
+    BossTool {
+        name,
+        conversation: BossConversation {
+            group_key: "k".into(),
+            person: Uuid::nil().to_string(),
+            agent: "allan".into(),
+        },
+        person: Uuid::nil(),
+        engines: Vec::new(),
+        group: group.into(),
+        state: Weak::new(),
+    }
 }
 
 /// [`for_turn_on`] on this process's hub, for the turn's person.

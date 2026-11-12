@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use crate::boss_links::engine_key::{canonical_hub, Challenge, EngineKey, StoredEngineKey};
 use crate::boss_links::uplink::{PROTOCOL, PROTOCOL_HEADER};
+use crate::desk_crew::served::Offered;
 use crate::desk_crew::served::{ServedCall, SERVED_ACT, SERVED_READ};
 use crate::desk_crew::CrewHub;
 use crate::gateway::GatewayState;
@@ -666,6 +667,15 @@ impl Uplink {
             }
             let _ = sink.close().await;
         });
+        // What happens in each accepted link's group wakes its boss.
+        let events = tokio::spawn(send_events(
+            Arc::clone(&self.crew),
+            accepted
+                .values()
+                .map(|l| (l.link_id, l.group.clone(), l.boss()))
+                .collect(),
+            tx.clone(),
+        ));
         let mut last_seq = 0u64;
         let rates = Arc::clone(&self.rates);
         let ended = loop {
@@ -775,6 +785,7 @@ impl Uplink {
                 _ => {}
             }
         };
+        events.abort();
         drop(tx);
         let _ = writer.await;
         ended
@@ -810,6 +821,121 @@ impl Uplink {
     }
 }
 
+/// Whether `link`'s group has a grant now whose boss isn't the link's: the
+/// home moved the group to another boss, or to none.
+pub fn boss_moved(crew: &CrewHub, link: &HeldLink) -> bool {
+    crew.desk()
+        .grant_live(&link.group)
+        .is_ok_and(|g| g.boss.as_ref() != Some(&link.boss()))
+}
+
+/// The most requests one link sends its boss a minute: under the boss
+/// hub's share of a link's frames ([`crate::boss_links::uplink::EVENTS_PER_MINUTE`]),
+/// with room for what happens besides. The rest go with a later look.
+const OWED_PER_MINUTE: u32 = 20;
+
+/// How often what the boss owes an answer to is looked at.
+const OWED_EVERY: Duration = Duration::from_millis(500);
+
+/// The most `event` frames one link sends an hour: past it, what happens
+/// is counted and said with the next one sent.
+pub const EVENTS_PER_HOUR: usize = 120;
+
+/// Sends `event` frames up `tx` for what happens in each of `links`' groups
+/// ([`CrewHub::served_event`] decides what, and what of it the boss sees),
+/// at most [`EVENTS_PER_HOUR`] a link; until the socket ends.
+async fn send_events(
+    crew: Arc<CrewHub>,
+    links: Vec<(Uuid, String, BossRef)>,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    // Its bosses are connected while this runs: until the socket ends.
+    let _up = crew.remote_up(links.iter().map(|(_, _, b)| b.party_id()).collect());
+    let (_, mut rx) = crew.desk().subscribe();
+    let mut sent: HashMap<Uuid, VecDeque<Instant>> = HashMap::new();
+    let mut skipped: HashMap<Uuid, u64> = HashMap::new();
+    // Each link's requests given to its boss, while they are open.
+    let mut offered: HashMap<Uuid, HashMap<(Uuid, String), Offered>> = HashMap::new();
+    // Each link's requests sent this minute: kept under the boss hub's own
+    // share of a link's frames, so none is dropped there.
+    let mut owed_sent: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let mut look = tokio::time::interval(OWED_EVERY);
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // (link, the request it gives, if one, frame)
+        let frames: Vec<(Uuid, Option<Uuid>, Value)> = tokio::select! {
+            got = rx.recv() => {
+                let event = match got {
+                    Ok(workforce_desk::model::DeskEvent::Activity { event }) => event,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                };
+                // Each link wakes its own boss alone.
+                links
+                    .iter()
+                    .filter_map(|(link, group, boss)| {
+                        crew.served_event(group, boss, &event).map(|f| (*link, None, f))
+                    })
+                    .collect()
+            }
+            _ = look.tick() => links
+                .iter()
+                .flat_map(|(link, group, boss)| {
+                    crew.owed_remote(group, boss, offered.entry(*link).or_default())
+                        .into_iter()
+                        .map(|(asked, f)| (*link, Some(asked), f))
+                })
+                .collect(),
+        };
+        for (link, asked, mut frame) in frames {
+            let link = &link;
+            // A request not sent is looked at again next time.
+            let unsent = |offered: &mut HashMap<Uuid, HashMap<(Uuid, String), Offered>>| {
+                if let (Some(asked), Some(o)) = (asked, offered.get_mut(link)) {
+                    o.retain(|(id, _), _| *id != asked);
+                }
+            };
+            if asked.is_some() {
+                let now = Instant::now();
+                let (since, n) = owed_sent.entry(*link).or_insert((now, 0));
+                if now.duration_since(*since) >= Duration::from_secs(60) {
+                    (*since, *n) = (now, 0);
+                }
+                if *n >= OWED_PER_MINUTE {
+                    unsent(&mut offered);
+                    continue;
+                }
+                *n += 1;
+            }
+            let recent = sent.entry(*link).or_default();
+            while recent
+                .front()
+                .is_some_and(|at| at.elapsed() > Duration::from_secs(3_600))
+            {
+                recent.pop_front();
+            }
+            if recent.len() >= EVENTS_PER_HOUR {
+                // A request waits for room; anything else is counted.
+                match asked {
+                    Some(_) => unsent(&mut offered),
+                    None => *skipped.entry(*link).or_default() += 1,
+                }
+                continue;
+            }
+            frame["type"] = json!("event");
+            frame["linkId"] = json!(link);
+            frame["skipped"] = json!(skipped.get(link).copied().unwrap_or(0));
+            if tx.try_send(frame).is_ok() {
+                recent.push_back(Instant::now());
+                skipped.remove(link);
+            } else {
+                unsent(&mut offered);
+            }
+        }
+    }
+}
+
 /// The wait before the next try after `tries` failed ones: 1 s, doubling to
 /// 60 s, with up to a quarter more at random.
 pub fn backoff(tries: u32) -> Duration {
@@ -829,6 +955,14 @@ pub fn start(uplink: Uplink, cancel: CancellationToken) {
             let mut by_hub: BTreeMap<String, Vec<HeldLink>> = BTreeMap::new();
             if let Some(vault) = uplink.state.vault.as_ref() {
                 for l in held_links(vault).into_iter().filter(|l| l.live(now)) {
+                    // A link whose group has another boss now is the old
+                    // boss's: forgotten, never dialed again.
+                    if boss_moved(&uplink.crew, &l) {
+                        tracing::info!(target: "sentinel.audit", link = %l.link_id, group = %l.group, "a boss link was forgotten: its group has another boss now");
+                        let _ = vault
+                            .delete_with_actor(&desk_boss_link_path(&l.link_id.to_string()), ACTOR);
+                        continue;
+                    }
                     by_hub.entry(l.hub_url.clone()).or_default().push(l);
                 }
             }

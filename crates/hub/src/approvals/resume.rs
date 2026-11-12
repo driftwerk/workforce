@@ -49,48 +49,69 @@ pub async fn launch_resume(
     let channel_id = row.channel_id.clone().unwrap_or_default();
     // A request made in a Desk conversation, or by a run made in one, is
     // resumed answering to it, unattended.
-    let desk = svc
+    let session = svc
         .sessions
         .find(&row.session_key, &row.requester_id)
         .ok()
-        .flatten()
-        .and_then(|session| {
-            session
-                .desk_origin()
-                .map(|target| workforce_common::channels::desk::DeskScope {
-                    target,
-                    owner: session.owner,
-                    attended: false,
-                    relayed: false,
-                })
-        });
+        .flatten();
+    // A Desk group's boss conversation is resumed with nobody there, as the
+    // wake it came from was: what else it would ask goes to its person.
+    let boss = session.as_ref().is_some_and(|s| {
+        crate::boss_links::conversation::BossConversation::of(
+            s,
+            svc.agent_id.as_str(),
+            &row.requester_id,
+        )
+        .is_some()
+    });
+    let desk = session.and_then(|session| {
+        session
+            .desk_origin()
+            .map(|target| workforce_common::channels::desk::DeskScope {
+                target,
+                owner: session.owner,
+                attended: false,
+                relayed: false,
+            })
+    });
 
     // Mirror the scheduler: scope the delivery channel so the resumed
     // turn loads the right per-user visibility, then (for approve) scope
     // the exact tool the human authorised so the runner pre-executes it.
-    let result = match outcome {
-        ApprovalOutcome::Approved => {
-            let pre = PreExecutedTool {
-                tool_name: row.tool_name.clone(),
-                tool_input: row.tool_input.clone(),
-            };
-            with_desk(
-                desk,
-                CURRENT_CHANNEL_ID.scope(
-                    channel_id.clone(),
-                    CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
-                ),
-            )
-            .await
-        }
-        ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
-            with_desk(
-                desk,
-                CURRENT_CHANNEL_ID.scope(channel_id.clone(), run_turn(svc, row, &directive)),
-            )
-            .await
-        }
+    let origin = match boss {
+        true => crate::boss_links::wake::ORIGIN.to_string(),
+        false => workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+            .try_with(|o| o.clone())
+            .unwrap_or_default(),
     };
+    let result = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+        .scope(origin, async {
+            match outcome {
+                ApprovalOutcome::Approved => {
+                    let pre = PreExecutedTool {
+                        tool_name: row.tool_name.clone(),
+                        tool_input: row.tool_input.clone(),
+                    };
+                    with_desk(
+                        desk,
+                        CURRENT_CHANNEL_ID.scope(
+                            channel_id.clone(),
+                            CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
+                        ),
+                    )
+                    .await
+                }
+                ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
+                    with_desk(
+                        desk,
+                        CURRENT_CHANNEL_ID
+                            .scope(channel_id.clone(), run_turn(svc, row, &directive)),
+                    )
+                    .await
+                }
+            }
+        })
+        .await;
 
     match result {
         Ok(response) if !response.trim().is_empty() => {
@@ -163,10 +184,18 @@ async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str)
             .ok()
             .flatten();
         if let Some(session) = session {
-            if let Err(e) =
-                crate::desk_surface::resumed(svc, &session, &row.requester_id, response).await
-            {
-                tracing::warn!(error = %e, request = %row.request_id, "failed to deliver approval-resume response to Desk");
+            match crate::desk_surface::resumed(svc, &session, &row.requester_id, response).await {
+                // A Desk group's boss conversation has no Desk origin: its
+                // answer goes to whoever watches the conversation.
+                Ok(false) if session.claims_desk_boss() => {
+                    if let Some(push) = crate::session_push::installed() {
+                        push.deliver(&session.id, response).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, request = %row.request_id, "failed to deliver approval-resume response to Desk")
+                }
             }
         }
         return;

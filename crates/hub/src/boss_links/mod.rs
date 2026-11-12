@@ -35,6 +35,7 @@ pub mod merge;
 pub mod slack;
 pub mod tools;
 pub mod uplink;
+pub mod wake;
 
 #[cfg(test)]
 mod tests;

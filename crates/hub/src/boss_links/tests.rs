@@ -1643,11 +1643,11 @@ mod uplink_tests {
 
     /// Allan and Bea, each an agent of its own on `hub`, as on a real hub,
     /// both taking boss work.
-    async fn own_agents(hub: &Hub, dir: &std::path::Path) {
+    async fn own_agents(hub: &Hub, dir: &std::path::Path) -> Vec<wiremock::MockServer> {
+        let mut llms = Vec::new();
         for id in ["allan", "bea"] {
-            let mut config = workforce_common::settings::WorkforceConfig::default();
-            config.hub.data_dir = dir.join(id).to_string_lossy().into_owned();
-            config.llm.api_key = Some("test-key".into());
+            let (mut config, llm) =
+                crate::serve::testing::mock_llm_config(&dir.join(id), |_| {}).await;
             config.agents = vec![workforce_common::settings::AgentConfig {
                 id: id.into(),
                 ..Default::default()
@@ -1665,7 +1665,9 @@ mod uplink_tests {
             )
             .unwrap();
             hub.fx.state.registry.insert(id, service);
+            llms.push(llm);
         }
+        llms
     }
 
     /// Whether `name` asks the person first in `r`.
@@ -2173,5 +2175,375 @@ mod uplink_tests {
             Some("allan"),
             "desk:boss:not-a-group"
         ));
+    }
+
+    /// A socket of `engine`'s with the one link `plain`, proved and ready.
+    async fn open_link(
+        addr: std::net::SocketAddr,
+        plain: &str,
+        token_id: Uuid,
+        k: &EngineKey,
+        engine: &str,
+    ) -> Stream {
+        let mut s = connect(addr, "", plain, Some("1")).await.unwrap();
+        let ch = next(&mut s).await.unwrap();
+        let held = [Held {
+            token: plain,
+            token_id,
+            key: k,
+            engine_id: engine,
+        }];
+        send(&mut s, hello(&ch, engine, &held)).await;
+        assert_eq!(next(&mut s).await.unwrap()["type"], "ready");
+        s
+    }
+
+    /// The next wake handed on, if one comes soon.
+    async fn next_wake(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::boss_links::wake::Wake>,
+    ) -> Option<crate::boss_links::wake::Wake> {
+        tokio::time::timeout(std::time::Duration::from_millis(700), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn an_event_wakes_only_the_links_own_boss_whatever_it_says() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let mac = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let globex = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&mac, "globex", "mac"),
+        )
+        .unwrap();
+        let (tx, mut wakes) = tokio::sync::mpsc::channel(8);
+        hub.fx.state.uplinks.wake_into(tx);
+        let addr = serve(&hub).await;
+        let mut a = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        let _b = open_link(addr, &globex.plaintext, globex.record.id, &mac, "mac").await;
+
+        // Its person, agent and group are the link's, whatever the frame says.
+        send(
+            &mut a,
+            json!({"type": "event", "linkId": acme.link.link_id, "kind": "finished",
+                            "line": "acme-web finished", "skipped": 2,
+                            "person": Uuid::new_v4(), "agent": "bea", "groupKey": "evil"}),
+        )
+        .await;
+        let wake = next_wake(&mut wakes).await.expect("a wake");
+        assert_eq!(wake.person, sam.id);
+        assert_eq!(wake.agent, "allan");
+        assert_eq!(wake.group_key, acme.link.group_key);
+        assert_eq!(wake.engine, "devbox");
+        assert_eq!(wake.line, "acme-web finished");
+        assert_eq!(wake.skipped, 2);
+
+        // Another socket's link, or a frame that isn't a wake, wakes nobody.
+        for frame in [
+            json!({"type": "event", "linkId": globex.link.link_id, "kind": "finished", "line": "x"}),
+            json!({"type": "event", "linkId": Uuid::new_v4(), "kind": "finished", "line": "x"}),
+            json!({"type": "event", "linkId": acme.link.link_id, "kind": "stopped", "line": "x"}),
+            json!({"type": "event", "linkId": acme.link.link_id, "kind": "finished", "line": "  "}),
+            json!({"type": "event", "linkId": acme.link.link_id, "kind": "finished"}),
+        ] {
+            send(&mut a, frame.clone()).await;
+            assert!(next_wake(&mut wakes).await.is_none(), "{frame}");
+        }
+
+        // A revoked link's frames wake nobody.
+        assert!(links::revoke(hub.state(), sam.id, &device.id, acme.record.id).unwrap());
+        send(
+            &mut a,
+            json!({"type": "event", "linkId": acme.link.link_id, "kind": "failed", "line": "x"}),
+        )
+        .await;
+        assert!(next_wake(&mut wakes).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wake_turn_runs_in_the_groups_thread_or_its_desk_conversation_as_its_person() {
+        use crate::boss_links::conversation::{ensure, BossConversation};
+        use crate::boss_links::wake::{place, run, Place};
+        let hub = hub(on()).await;
+        let (mut sam, device, _) = hub.sam();
+        let dir = tempfile::tempdir().unwrap();
+        let _llms = own_agents(&hub, dir.path()).await;
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&key(), "acme", "devbox"),
+        )
+        .unwrap();
+        let globex = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&key(), "globex", "devbox"),
+        )
+        .unwrap();
+        let allan = hub.fx.state.registry.get("allan").unwrap();
+        allan.set_identity_store(hub.fx.identities.clone());
+        let person = sam.id.to_string();
+        let state = Arc::clone(&hub.fx.state);
+        let acme_key = (sam.id, "allan".to_string(), acme.link.group_key.clone());
+        let globex_key = (sam.id, "allan".to_string(), globex.link.group_key.clone());
+
+        // Not opened: nothing is woken.
+        assert_eq!(place(&state, &acme_key), None);
+        run(&state, &acme_key, &["devbox: acme-web finished".into()], 0)
+            .await
+            .unwrap();
+        assert!(allan
+            .sessions
+            .find(&format!("desk:boss:{}", acme.link.group_key), &person)
+            .unwrap()
+            .is_none());
+
+        // Acme has its Slack thread; Globex only its Desk conversation.
+        sam.linked_ids.insert("slack".into(), "U0SAM".into());
+        hub.fx.identities.update(&sam).unwrap();
+        let slack = Arc::new(FakeSlack::default());
+        allan.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as Arc<dyn workforce_common::channels::ChannelSurface>,
+        );
+        let opened = ensure(hub.state(), sam.id, &device.id, acme.record.id, true)
+            .await
+            .unwrap();
+        let Some(crate::boss_links::slack::Thread::Opened(thread)) = opened.slack else {
+            panic!("{:?}", opened.slack)
+        };
+        let desk = ensure(hub.state(), sam.id, &device.id, globex.record.id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            place(&state, &acme_key),
+            Some(Place::Thread(thread.clone()))
+        );
+        assert_eq!(
+            place(&state, &globex_key),
+            Some(Place::Desk(desk.channel.clone()))
+        );
+
+        // In the thread: run as Sam, answered there, and still the group's.
+        run(&state, &acme_key, &["devbox: acme-web finished".into()], 3)
+            .await
+            .unwrap();
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 2, "{posted:?}");
+        let ts = thread.rsplit(':').next().unwrap();
+        assert!(
+            posted[1].starts_with(&format!("{ts}|")) && posted[1].contains("done"),
+            "{posted:?}"
+        );
+        let session = allan.sessions.find(&thread, &person).unwrap().unwrap();
+        assert!(
+            BossConversation::of(&session, "allan", &person).is_some(),
+            "still the group's"
+        );
+        assert_eq!(
+            session.context_type,
+            Some(workforce_common::session::SessionContextType::Dm)
+        );
+        let asked = session
+            .messages
+            .iter()
+            .find(|m| m.content.contains("[Desk boss wake]"))
+            .expect("the wake is in the thread's conversation");
+        assert!(
+            asked.content.contains("acme-web finished")
+                && asked.content.contains("(and 3 more since)")
+        );
+
+        // In the Desk conversation: run there, answered there.
+        run(
+            &state,
+            &globex_key,
+            &["devbox: globex-api failed".into()],
+            0,
+        )
+        .await
+        .unwrap();
+        let session = allan
+            .sessions
+            .find(&desk.channel, &person)
+            .unwrap()
+            .unwrap();
+        assert!(BossConversation::of(&session, "allan", &person).is_some());
+        assert!(session
+            .messages
+            .iter()
+            .any(|m| m.content.contains("globex-api failed")));
+        assert!(session.messages.iter().any(|m| m.role
+            == workforce_common::session::MessageRole::Assistant
+            && m.content.contains("done")));
+        assert_eq!(slack.0.lock().len(), 2, "nothing more in Slack");
+
+        // Sam's Slack account changed: the old DM's thread is told nothing,
+        // and the wake runs in Acme's Desk conversation instead.
+        sam.linked_ids.insert("slack".into(), "U0NEW".into());
+        hub.fx.identities.update(&sam).unwrap();
+        run(&state, &acme_key, &["devbox: acme-api asked".into()], 0)
+            .await
+            .unwrap();
+        assert_eq!(slack.0.lock().len(), 2, "never the old account's DM");
+        let acme_desk = allan
+            .sessions
+            .find(&format!("desk:boss:{}", acme.link.group_key), &person)
+            .unwrap()
+            .unwrap();
+        assert!(acme_desk
+            .messages
+            .iter()
+            .any(|m| m.content.contains("acme-api asked")));
+
+        // Checked again each time: a revoked link, or a person no longer
+        // active, wakes nothing.
+        assert!(links::revoke(hub.state(), sam.id, &device.id, acme.record.id).unwrap());
+        assert!(run(&state, &acme_key, &["devbox: x".into()], 0)
+            .await
+            .is_err());
+        sam.status = workforce_identity::types::IdentityStatus::Suspended;
+        hub.fx.identities.update(&sam).unwrap();
+        assert!(run(&state, &globex_key, &["devbox: y".into()], 0)
+            .await
+            .is_err());
+        let globex_desk = allan
+            .sessions
+            .find(&desk.channel, &person)
+            .unwrap()
+            .unwrap();
+        assert!(!globex_desk
+            .messages
+            .iter()
+            .any(|m| m.content.contains("devbox: y")));
+    }
+
+    #[tokio::test]
+    async fn one_links_flood_is_dropped_before_any_check_and_takes_no_other_links_place() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let mac = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        let globex = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&mac, "globex", "mac"),
+        )
+        .unwrap();
+        let (tx, mut wakes) = tokio::sync::mpsc::channel(1024);
+        hub.fx.state.uplinks.wake_into(tx);
+        let addr = serve(&hub).await;
+        let mut a = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        let mut b = open_link(addr, &globex.plaintext, globex.record.id, &mac, "mac").await;
+        let event = |link: Uuid, i: u32| json!({"type": "event", "linkId": link, "kind": "finished", "line": format!("e{i}")});
+        // While the hub can't check links, nothing wakes and nothing counts
+        // against the engine.
+        // Short of the outage it waits out, the link stays: none wakes, and
+        // the socket answers.
+        hub.store_down.store(true, Ordering::SeqCst);
+        for i in 0..2 {
+            send(&mut b, event(globex.link.link_id, 100 + i)).await;
+        }
+        assert!(next_wake(&mut wakes).await.is_none());
+        send(&mut b, json!({"type": "ping"})).await;
+        assert_eq!(
+            next(&mut b).await.unwrap()["type"],
+            "pong",
+            "an outage isn't the engine's"
+        );
+        hub.store_down.store(false, Ordering::SeqCst);
+
+        // A flood: its link's places fill, and past its minute's share the
+        // rest is dropped before any check; the socket stays open.
+        for i in 0..40 {
+            send(&mut a, event(acme.link.link_id, i)).await;
+        }
+        let mut held = 0;
+        while let Some(w) = next_wake(&mut wakes).await {
+            assert_eq!(w.agent, "allan");
+            held += 1;
+        }
+        assert_eq!(
+            held,
+            crate::boss_links::uplink::WAKES_WAITING_PER_LINK,
+            "its places, no more"
+        );
+        // Another link's wake still has its place.
+        send(&mut b, event(globex.link.link_id, 0)).await;
+        let other = next_wake(&mut wakes).await.expect("the other link's wake");
+        assert_eq!(other.group_key, globex.link.group_key);
+        // Its places freed, it has spent its minute's share all the same.
+        for _ in 0..held {
+            hub.fx.state.uplinks.wake_taken(acme.link.link_id);
+        }
+        hub.fx.state.uplinks.wake_taken(globex.link.link_id);
+        for i in 40..80 {
+            send(&mut a, event(acme.link.link_id, i)).await;
+        }
+        assert!(
+            next_wake(&mut wakes).await.is_none(),
+            "past its minute's share of {}",
+            crate::boss_links::uplink::EVENTS_PER_MINUTE
+        );
+        send(&mut a, json!({"type": "ping"})).await;
+        assert_eq!(next(&mut a).await.unwrap()["type"], "pong", "still open");
+    }
+
+    #[test]
+    fn in_a_wake_turn_what_starts_work_asks_the_person_first() {
+        use workforce_agent::tools::Tool as _;
+        let tool = |name: &'static str| crate::boss_links::tools::test_tool(name, "Acme");
+        let wake = |name: &'static str| {
+            workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+                .sync_scope(crate::boss_links::wake::ORIGIN.to_string(), || {
+                    tool(name).approval_requirement()
+                })
+        };
+        for starts in ["crew.start_session", "crew.resume", "crew.restart"] {
+            let asked = wake(starts).unwrap_or_else(|| panic!("{starts} asks"));
+            assert!(asked.contains("Acme's boss conversation"), "{asked}");
+            assert!(
+                tool(starts).approval_requirement().is_none(),
+                "{starts}: only in a wake"
+            );
+        }
+        // What steers or narrows what runs is the engine's to decide, as a
+        // local boss's work turn is.
+        for steers in [
+            "crew.nudge",
+            "crew.approve",
+            "crew.deny",
+            "crew.stop",
+            "crew.interrupt",
+            "crew.release",
+            "crew.escalate",
+            "crew.overview",
+            "crew.activity",
+            "crew.history",
+        ] {
+            assert!(wake(steers).is_none(), "{steers}");
+        }
     }
 }
