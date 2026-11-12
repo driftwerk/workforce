@@ -2415,6 +2415,35 @@ pub fn spawn_slack_dispatch_loop(
                     // agent loop means a thread maps to a single session.
                     let effective_user = identity_id.clone().unwrap_or_else(|| user.clone());
 
+                    // A thread in a DM that its agent holds as one of this
+                    // person's Desk boss conversations is that conversation,
+                    // whatever `thread_isolation` says; any other thread is
+                    // the DM, as before.
+                    let session_key = match (is_dm, thread_ts.as_deref(), identity_id.as_deref()) {
+                        (true, Some(thread), Some(person)) => {
+                            let agent = resolve_agent_for_slack(
+                                is_dm,
+                                &user,
+                                &channel,
+                                &workspace_id,
+                                &bindings,
+                                &dm_routing,
+                            );
+                            match registry.resolve(agent.as_deref()) {
+                                Some(svc) => crate::boss_links::slack::session_key_for(
+                                    &svc,
+                                    &workspace_id,
+                                    &channel,
+                                    Some(thread),
+                                    person,
+                                    session_key,
+                                ),
+                                None => session_key,
+                            }
+                        }
+                        _ => session_key,
+                    };
+
                     // ── External-sender + agent access control gate (DW-149) ──
                     {
                         let target_agent = if is_dm {

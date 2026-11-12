@@ -49,7 +49,7 @@ mod work;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use tools::{describe as crew_describe, schema as crew_schema};
+pub(crate) use tools::schema as crew_schema;
 pub(crate) use watcher::reported;
 
 pub(crate) use extras::mentions_for;

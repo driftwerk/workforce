@@ -32,6 +32,7 @@ pub mod engine_key;
 pub mod hold;
 pub mod links;
 pub mod merge;
+pub mod slack;
 pub mod tools;
 pub mod uplink;
 

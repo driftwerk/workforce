@@ -1437,7 +1437,10 @@ async fn ws_handler(
     // no channel, otherwise the conversational channel it names.
     let anchor_channel = match query.channel.as_deref() {
         None => IOS_CHANNEL.to_string(),
-        Some(channel) if workforce_common::channels::is_conversational(channel) => {
+        Some(channel)
+            if workforce_common::channels::is_conversational(channel)
+                || workforce_common::channels::is_desk_boss_channel(channel) =>
+        {
             channel.to_string()
         }
         Some(channel) => return invalid_ws_channel(channel),
@@ -1452,6 +1455,29 @@ async fn ws_handler(
         Err(refused) => return refused,
     };
     let agent_id = query.agent_id;
+    // A Desk group's boss conversation anchors only its own person's
+    // connection, with its own agent, once its link has opened it.
+    if workforce_common::channels::is_desk_boss_channel(&anchor_channel) {
+        let owner = caller
+            .identity_id
+            .as_deref()
+            .or(caller.device_id.as_deref());
+        if !crate::boss_links::conversation::anchors(
+            &state,
+            owner,
+            agent_id.as_deref(),
+            &anchor_channel,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "boss_conversation",
+                    "message": crate::boss_links::conversation::REFUSED,
+                })),
+            )
+                .into_response();
+        }
+    }
     ws.on_upgrade(move |socket| {
         handle_ws(
             socket,

@@ -463,6 +463,27 @@ pub fn combine_with_tool_requirement(
     }
 }
 
+/// The answers a prompt for `tool_name` offers: `options`, but only Allow
+/// once and Deny (once or always) when the tool demands approval itself
+/// ([`Tool::approval_requirement`](crate::tools::Tool::approval_requirement)).
+/// Such a tool asks again on every call, so an "always", a session or a
+/// folder answer would promise what it can't keep.
+pub fn options_for_tool(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    mut options: workforce_core::policy::PermissionPromptOptions,
+) -> workforce_core::policy::PermissionPromptOptions {
+    if tools
+        .get(tool_name)
+        .is_some_and(|tool| tool.approval_requirement().is_some())
+    {
+        options.allow_always = false;
+        options.allow_session = false;
+        options.allow_in_folder = None;
+    }
+    options
+}
+
 /// Apply the requirement the live registered tool declares, re-read on every
 /// call so an uninstall or a rebuild that drops the gate takes effect at once.
 /// Runs last in [`gate_tool_call`], and unconditionally: a system job with no
@@ -1200,6 +1221,45 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::success(input, 1))
         }
+    }
+
+    /// A tool that asks for itself is offered Allow once and Deny alone:
+    /// it asks again on every call, so no "always", session or folder
+    /// answer is offered for it; any other tool's prompt is as it was.
+    #[test]
+    fn a_self_gated_tools_prompt_offers_once_or_deny_alone() {
+        let tools = ToolRegistry::new();
+        tools.register(Arc::new(GatedTool(Arc::new(AtomicUsize::new(0)))));
+        tools.register(Arc::new(EchoTool));
+        let wide = workforce_core::policy::PermissionPromptOptions {
+            allow_session: true,
+            allow_in_folder: Some("~/dev/acme-web".into()),
+            ..workforce_core::policy::PermissionPromptOptions::ask(true)
+        };
+        let gated = options_for_tool(&tools, "record-keeper.apply_change", wide.clone());
+        assert!(gated.allow_once && gated.deny_once);
+        assert!(!gated.allow_always && !gated.allow_session && gated.allow_in_folder.is_none());
+        let other = options_for_tool(&tools, "echo", wide.clone());
+        assert!(other.allow_always && other.allow_session && other.allow_in_folder.is_some());
+        // And whatever policy says, the call asks, with no "always".
+        let calls = Arc::new(Calls::default());
+        let g = gates(&calls, None, CascadeState::Allow);
+        let out = as_user(|| {
+            gate_tool_call(
+                &g,
+                &permissive_policy(),
+                &tools,
+                "record-keeper.apply_change",
+                &serde_json::json!({}),
+            )
+        });
+        assert!(matches!(
+            out,
+            GateOutcome::RequireApproval {
+                allow_save_allow: false,
+                ..
+            }
+        ));
     }
 
     struct EchoTool;

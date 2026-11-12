@@ -1,19 +1,24 @@
-//! What a boss conversation's turns may not do (remote bosses, RB6a): send
-//! the group's work anywhere but the conversation itself (design §10, 5),
-//! or bring in what the agent holds from elsewhere.
+//! What a boss conversation's turns may do freely, and what each time only
+//! with the person's say (remote bosses, RB6b; design §10, 5): nothing of the
+//! group's work leaves the conversation unless the person lets it, call by
+//! call.
 //!
-//! For now this is a hard deny, by the turn's tools: a boss conversation's
-//! turn is offered the boss tools and the few of the agent's own that
-//! neither send nor read outside the group ([`KEPT`]), never anything else,
-//! and nothing is adopted back mid-turn. The design's hold list ([`HELD`])
-//! is refused with the rest. Routing a held call to the person as an
-//! approval ("Allan wants to send Acme's work to …") comes with RB6b.
+//! - **Kept** ([`KEPT`]): the few of the agent's own tools that neither send
+//!   nor read outside the group, its fenced memory and reading back what this
+//!   turn's tools returned. They run as anywhere else.
+//! - **Held** ([`Held`]): every other tool the agent has. Each call asks the
+//!   person in the conversation first, "Allan wants to use … from Acme's
+//!   boss conversation", and runs only if they allow it, once: no "always",
+//!   no session or folder grant ([`workforce_agent::tools::dispatch::options_for_tool`]),
+//!   and a saved rule never stands in for it (a tool's own requirement is
+//!   applied after policy). The design's hold list ([`HELD`]) is among them.
+//! - **This hub's own crew** (`crew.*` of the agent's own Desk) is not
+//!   offered at all: the crew a boss reaches is the link's.
 //!
-//! It is a list of what is kept, not of what is held, because an agent's
-//! tools are open-ended (skills, MCP servers, WASM skills): `web.fetch`,
-//! `subagent`, `sessions` or an MCP server's `post` send or read as
-//! `http.request` does, and a list of what is held would miss whichever it
-//! didn't name.
+//! What is kept is a list of what is safe, not of what sends, because an
+//! agent's tools are open-ended (skills, MCP servers, WASM skills): a list of
+//! what sends would miss whichever it didn't name. Nothing more is adopted
+//! mid-turn, held or not.
 //!
 //! Memory is kept: in a boss conversation everything the agent remembers
 //! is tagged with the group's tag and nothing else is recalled
@@ -23,9 +28,13 @@
 //!
 //! A tool is kept by what it is, not only by its name: it must be the hub's
 //! own, as registered ([`ToolRegistry::is_builtin`]). A skill, an MCP server
-//! or anything else registered under a kept name is not kept.
+//! or anything else registered under a kept name is held instead.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use workforce_agent::tools::registry::ToolRegistry;
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 
 /// The design's hold list, as tool names: refused in a boss conversation
 /// whatever [`KEPT`] says.
@@ -46,6 +55,83 @@ pub const KEPT: &[&str] = &[
     workforce_agent::tools::data::DATA_INSPECT_TOOL_NAME,
     workforce_agent::tools::data::DATA_QUERY_TOOL_NAME,
 ];
+
+/// Whether a boss conversation's turn is offered `tool` at all: anything
+/// but this hub's own crew.
+pub fn offered(tool: &str) -> bool {
+    !tool.starts_with("crew.")
+}
+
+/// One of the agent's own tools in a boss conversation: every call asks the
+/// person first, once.
+pub struct Held {
+    inner: Arc<dyn Tool>,
+    why: String,
+}
+
+impl Held {
+    /// `inner` held in the boss conversation of `agent` for `group`.
+    pub fn new(inner: Arc<dyn Tool>, agent: &str, group: &str) -> Self {
+        let why = format!(
+            "{agent} wants to use {} from {group}'s boss conversation. Anything it sends could \
+             carry the group's work outside it, so it runs only if you allow it, this once.",
+            inner.name()
+        );
+        Self { inner, why }
+    }
+}
+
+#[async_trait]
+impl Tool for Held {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner.input_schema()
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
+        self.inner.execute(input).await
+    }
+
+    fn soft_deadline(&self) -> Option<std::time::Duration> {
+        self.inner.soft_deadline()
+    }
+
+    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(input)
+    }
+
+    fn approval_requirement(&self) -> Option<String> {
+        Some(self.why.clone())
+    }
+
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        self.inner.surface_effect(input)
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        self.inner.effect(input)
+    }
+
+    async fn collect(
+        &self,
+        input: serde_json::Value,
+        plan: serde_json::Value,
+        checkpoint: Option<String>,
+    ) -> eyre::Result<ToolResult> {
+        self.inner.collect(input, plan, checkpoint).await
+    }
+
+    async fn abandon(&self, plan: serde_json::Value, checkpoint: Option<String>) {
+        self.inner.abandon(plan, checkpoint).await
+    }
+}
 
 /// Whether `pattern` (a name, or `family.*`) names `tool`.
 fn names(pattern: &str, tool: &str) -> bool {

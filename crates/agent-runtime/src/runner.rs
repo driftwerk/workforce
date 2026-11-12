@@ -5967,6 +5967,11 @@ impl AgentRunner {
                                 self.config.permission_writer.clone(),
                             ),
                         };
+                        let prompt_options = crate::tools::dispatch::options_for_tool(
+                            &self.tools,
+                            &tool_name,
+                            prompt_options,
+                        );
                         let agent_id_str = self.config.agent_id.to_string();
                         let acting_user_id = CURRENT_USER_ID
                             .try_with(|u| u.clone())

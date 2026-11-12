@@ -936,7 +936,8 @@ impl Session {
         }
     }
 
-    fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+    /// The metadata as an object, made one when it isn't yet.
+    pub fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
         if !self.metadata.is_object() {
             self.metadata = serde_json::Value::Object(serde_json::Map::new());
         }

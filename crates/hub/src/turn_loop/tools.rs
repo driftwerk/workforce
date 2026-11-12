@@ -159,7 +159,7 @@ pub(crate) async fn turn_tools(
     let base = without_disabled_tools(service, base);
     // A Desk group's boss conversation: its boss tools and the agent's
     // fenced memory alone, whatever else a whitelist names.
-    if workforce_common::channels::is_desk_boss_channel(&session.channel) {
+    if session.claims_desk_boss() {
         return TurnTools {
             registry: crate::boss_links::tools::for_turn(service, session, base),
             exclusive: true,
@@ -523,12 +523,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A turn in a Desk group's boss conversation is offered the agent's
-    /// fenced memory alone of its own tools, whatever the agent has or gains
-    /// mid-turn, and whatever a whitelist names; any other conversation, all
-    /// of them.
+    /// A turn in a Desk group's boss conversation runs the agent's fenced
+    /// memory as it is and asks the person before every call of any other of
+    /// its tools, whatever a whitelist names; it never has this hub's own
+    /// crew, and adopts nothing mid-turn. Any other conversation's turn has
+    /// them all, unasked.
     #[tokio::test]
-    async fn a_boss_conversations_turn_keeps_only_what_neither_sends_nor_reads_elsewhere() {
+    async fn a_boss_conversations_turn_asks_before_anything_that_could_send() {
         let tmp = tempfile::tempdir().unwrap();
         let service = plain_service(tmp.path()).await;
         for name in [
@@ -549,12 +550,25 @@ pub(crate) mod tests {
             let turn = turn_tools(&service, &boss, whitelist).await;
             assert!(turn.exclusive);
             let names = names_of(&turn);
+            let asks = |n: &str| {
+                turn.registry
+                    .get(n)
+                    .is_some_and(|t| t.approval_requirement().is_some())
+            };
             assert!(
                 names
                     .iter()
-                    .all(|n| crate::boss_links::hold::kept(&turn.registry, n)),
-                "{names:?}"
+                    .all(|n| crate::boss_links::hold::kept(&turn.registry, n) != asks(n)),
+                "each kept, or held: {names:?}"
             );
+            for held in ["http.request", "messaging.send", "web.fetch"] {
+                assert!(asks(held), "{held}");
+            }
+            assert!(
+                !turn.registry.has("crew.overview"),
+                "never this hub's own crew"
+            );
+            assert!(!asks("memory"));
             assert!(names.iter().any(|n| n == "memory"), "{names:?}");
             assert!(std::ptr::addr_eq(
                 Arc::as_ptr(&turn.registry.get("memory").unwrap()),
@@ -563,15 +577,22 @@ pub(crate) mod tests {
             service.tools.register(named("http.get"));
             assert!(turn.registry.adopt(&["http.get".into()]).is_empty());
         }
-        // An MCP server or a skill shadowing it: no memory in a boss turn.
+        // An MCP server or a skill shadowing it: held, never kept.
         service.tools.register(named("memory"));
         let shadowed = turn_tools(&service, &boss, None).await;
-        assert!(
-            !shadowed.registry.has("memory"),
-            "{:?}",
-            names_of(&shadowed)
-        );
+        assert!(shadowed
+            .registry
+            .get("memory")
+            .is_some_and(|t| t.approval_requirement().is_some()));
         let plain = turn_tools(&service, &dm, None).await;
+        assert!(["http.request", "messaging.send", "web.fetch"]
+            .iter()
+            .all(|n| plain
+                .registry
+                .get(n)
+                .unwrap()
+                .approval_requirement()
+                .is_none()));
         assert!([
             "http.request",
             "messaging.send",
