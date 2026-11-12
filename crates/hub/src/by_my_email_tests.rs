@@ -126,14 +126,16 @@ async fn it_asks_only_by_the_caller_s_own_fresh_verified_email() {
     let mut sam = Identity::new("Sam", IdentityRole::Member);
     sam.email = Some("typed@example.com".into());
     let fresh = chrono::Utc::now().to_rfc3339();
-    sam.linked_ids
-        .insert(crate::oidc::OIDC_LINKED_ID_KEY.into(), "sub-sam".into());
     sam.linked_ids.insert(
-        crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+        crate::verified_email::OIDC_LINKED_ID_KEY.into(),
+        "sub-sam".into(),
+    );
+    sam.linked_ids.insert(
+        crate::verified_email::OIDC_VERIFIED_EMAIL_KEY.into(),
         "sam@example.com".into(),
     );
     sam.linked_ids
-        .insert(crate::oidc::OIDC_VERIFIED_AT_KEY.into(), fresh);
+        .insert(crate::verified_email::OIDC_VERIFIED_AT_KEY.into(), fresh);
     let tool = ByMyEmail::new(On::Linear, &tools, store_with(&sam));
     assert_eq!(ask(&tool, &sam).await["user"]["id"], "m-1");
     assert_eq!(
@@ -143,7 +145,7 @@ async fn it_asks_only_by_the_caller_s_own_fresh_verified_email() {
     // Verified long ago: renewed only by signing in.
     let mut old = sam.clone();
     old.linked_ids.insert(
-        crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+        crate::verified_email::OIDC_VERIFIED_AT_KEY.into(),
         (chrono::Utc::now() - chrono::Duration::days(91)).to_rfc3339(),
     );
     let tool = ByMyEmail::new(On::Linear, &tools, store_with(&old));
