@@ -225,6 +225,35 @@ mod tests {
         assert_eq!(decision_for(&out, "vault_shared_delete"), "deny");
     }
 
+    /// Only the email the sign-in provider verified, lately, is reported;
+    /// an identity's own (typed) email never is.
+    #[tokio::test]
+    async fn whoami_reports_only_the_verified_email() {
+        let store = Arc::new(InMemoryStore::default());
+        let mut identity = Identity::new("Sam", IdentityRole::Member);
+        identity.email = Some("typed@example.com".into());
+        identity.linked_ids.insert(
+            crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+            "sam@example.com".into(),
+        );
+        identity.linked_ids.insert(
+            crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        let mut typed = Identity::new("Typed", IdentityRole::Member);
+        typed.email = Some("typed@example.com".into());
+        store.create(&identity).unwrap();
+        store.create(&typed).unwrap();
+        let tool = make_tool(store as Arc<dyn IdentityStore>);
+        let ask = |id: Uuid| {
+            workforce_agent::runner::CURRENT_USER_ID.scope(id.to_string(), async {
+                tool.execute(json!({})).await.unwrap().output
+            })
+        };
+        assert_eq!(ask(identity.id).await["verified_email"], "sam@example.com");
+        assert_eq!(ask(typed.id).await["verified_email"], Value::Null);
+    }
+
     #[tokio::test]
     async fn whoami_reports_system_admin_capabilities() {
         let store = Arc::new(InMemoryStore::default());

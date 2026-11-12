@@ -315,11 +315,19 @@ pub(crate) async fn remote_hub_of_agents_with(
         let service = crate::serve::testing::plain_service(&dir.join(format!("agent-{n}"))).await;
         if jira_on == Some(id) {
             register_jira(&service.tools, &jira, &[]);
-            // A tool off the board sync's list, which a device never sees.
-            service.tools.register(Arc::new(FakeJiraTool {
-                name: "jira.assign_issue",
-                jira: Arc::clone(&jira),
-            }));
+            // Tools off the board sync's list, which a device never sees:
+            // an assign, and the directory lookups a device must never use
+            // to list who's there.
+            for name in [
+                "jira.assign_issue",
+                "jira.search_users",
+                "linear.members_list",
+            ] {
+                service.tools.register(Arc::new(FakeJiraTool {
+                    name,
+                    jira: Arc::clone(&jira),
+                }));
+            }
         }
         fx.state.registry.insert(id, service);
     }
@@ -1595,26 +1603,33 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         Some("lattice"),
     )
     .unwrap();
-    let names: Vec<String> = device
-        .tools()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|n| n.replace('_', "."))
-        .collect();
-    let allowed: Vec<String> = workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
-        .iter()
-        .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
-        .chain(["help", "identity.whoami"].iter())
-        .map(|t| t.replace('_', "."))
-        .collect();
-    assert!(names.contains(&"jira.search".to_string()), "{names:?}");
-    for n in &names {
-        assert!(allowed.contains(n), "a device sees {n}");
+    let mut names: Vec<String> = device.tools().await.unwrap();
+    names.sort();
+    // Written out, not taken from the lists the surface is built from.
+    let mut expected = vec![
+        "help",
+        "identity_whoami",
+        "jira_add_comment",
+        "jira_create_issue",
+        "jira_get_issue",
+        "jira_get_project",
+        "jira_list_transitions",
+        "jira_myself",
+        "jira_search",
+        "jira_transition_issue",
+        "jira_update_issue",
+        "jira_user_by_my_email",
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    // The directory lookups are refused to a device token outright.
+    for tool in ["jira.search_users", "linear.members_list"] {
+        let got = device.call(tool, json!({ "query": "a" })).await;
+        assert!(
+            matches!(got, Err(RemoteError::Missing(_))),
+            "{tool}: {got:?}"
+        );
     }
-    assert!(!names
-        .iter()
-        .any(|n| n == "jira.assign.issue" || n == "jira.api"));
 }
 
 /// A hub that refuses or slows the list of its agents says so, never as

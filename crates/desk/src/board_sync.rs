@@ -33,23 +33,21 @@ pub fn identity_tool(system: System) -> &'static str {
     }
 }
 
-/// The tool that finds `system`'s users by email, for a shared key.
-pub fn users_tool(system: System) -> &'static str {
+/// The hub's tool that names the one user on `system` with the email the
+/// person's sign-in verified, for a shared key: no arguments, zero or one
+/// user, matched on the hub.
+pub fn by_email_tool(system: System) -> &'static str {
     match system {
-        System::Jira => "jira.search_users",
-        System::Linear => "linear.members_list",
+        System::Jira => "jira.user_by_my_email",
+        System::Linear => "linear.member_by_my_email",
     }
 }
-
-/// The hub's own tool that says the email its sign-in provider verified for
-/// the person.
-pub const WHOAMI: &str = "identity.whoami";
 
 /// Every tool `system`'s sync may call: the ones it needs, and the ones
 /// that say who the person is there.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
-    all.extend([identity_tool(system), users_tool(system), WHOAMI]);
+    all.extend([identity_tool(system), by_email_tool(system)]);
     all
 }
 
@@ -336,7 +334,10 @@ fn linear_query(q: &str) -> Result<serde_json::Map<String, Value>, String> {
 /// The JQL a filter means for `project`, from `since` (a cursor, which is
 /// an `updated` time): the project clause outside the filter's own
 /// parentheses, oldest change first.
-pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
+/// `shared_me`: the person's Jira accountId when the hub's key is shared
+/// (matched by their verified email): "assigned to me" is then them, never
+/// `currentUser()`, which is whoever owns the key.
+pub fn jql(project: &str, f: &Filter, since: Option<&str>, shared_me: Option<&str>) -> String {
     let filter = match f {
         // A change since the cursor comes in whatever its state, so an
         // issue on the board that is done or cancelled there moves here;
@@ -349,7 +350,10 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>) -> String {
             "statusCategory != Done OR statusCategoryChangedDate >= -{}d",
             crate::board::DONE_WITHIN_DAYS
         ),
-        Filter::AssignedToMe => "assignee = currentUser()".to_string(),
+        Filter::AssignedToMe => match shared_me.filter(|m| check_me(System::Jira, m).is_ok()) {
+            Some(me) => format!("assignee = \"{me}\""),
+            None => "assignee = currentUser()".to_string(),
+        },
         Filter::CurrentCycle => "sprint in openSprints()".to_string(),
         Filter::Label(l) => format!("labels = \"{}\"", l.trim()),
         Filter::Query(q) => q.trim().to_string(),
@@ -454,8 +458,9 @@ pub enum Who {
     /// person's sign-in provider verified: this is them.
     ByEmail(Assignee),
     /// The key is shared (an agent's, the hub's): it says who owns the key,
-    /// never who the person is.
-    Shared,
+    /// never who the person is; and no one user there has their verified
+    /// email, for this reason.
+    Shared(NoMatch),
     /// The hub doesn't offer the tool, held it, or didn't say whose key it
     /// used (an older hub).
     Unsaid,
@@ -467,7 +472,13 @@ impl Who {
         let title = system.title();
         match self {
             Self::Person(_) | Self::ByEmail(_) => None,
-            Self::Shared => Some(format!(
+            Self::Shared(NoMatch::EmailHidden) => Some(format!(
+                "{hub} uses a shared {title} key, and {title} doesn't show your email to the shared key, so it can't say who you are."
+            )),
+            Self::Shared(NoMatch::Stale) => Some(format!(
+                "{hub} uses a shared {title} key, and it hasn't confirmed your email lately: sign in to {hub} again so it can say who you are."
+            )),
+            Self::Shared(_) => Some(format!(
                 "{hub} uses a shared {title} key, so it can't say who you are."
             )),
             Self::Unsaid => Some(format!(
@@ -483,7 +494,7 @@ impl Who {
     pub fn person(&self) -> Option<&Assignee> {
         match self {
             Self::Person(a) | Self::ByEmail(a) => Some(a),
-            Self::Shared | Self::Unsaid => None,
+            Self::Shared(_) | Self::Unsaid => None,
         }
     }
 }
@@ -507,79 +518,61 @@ pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, Remote
         Err(_) => Who::Unsaid,
     };
     match who {
-        Who::Shared => by_email(remote, system).await,
+        Who::Shared(_) => by_email(remote, system).await,
         who => Ok(who),
     }
 }
 
-/// The one user on `system` with the email the hub's sign-in provider
-/// verified for the person: `Shared` when there's no such email (never one
-/// they typed), no user with it, or more than one.
-async fn by_email(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
-    let email = match call(remote, system, WHOAMI, json!({})).await {
-        Ok(me) => me["verified_email"]
-            .as_str()
-            .map(|e| e.trim().to_ascii_lowercase())
-            .filter(|e| e.contains('@') && !e.chars().any(char::is_whitespace)),
-        Err(e) if stops(&e) => return Err(e),
-        Err(_) => None,
-    };
-    let Some(email) = email else {
-        return Ok(Who::Shared);
-    };
-    let args = match system {
-        System::Jira => json!({ "query": email, "max_results": 10 }),
-        System::Linear => json!({ "email": email, "limit": 10 }),
-    };
-    let answer = match call(remote, system, users_tool(system), args).await {
-        Ok(a) => a,
-        Err(e) if stops(&e) => return Err(e),
-        Err(_) => return Ok(Who::Shared),
-    };
-    Ok(match one_with_email(system, &answer, &email) {
-        Some(a) => Who::ByEmail(a),
-        None => Who::Shared,
-    })
+/// Why a shared key named no one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoMatch {
+    /// The hub can't match by email (an older one, or its tool failed).
+    Unasked,
+    /// The person has no verified email there.
+    NoVerifiedEmail,
+    /// Their verified email is too old: a sign-in renews it.
+    Stale,
+    /// No user there has it.
+    Nobody,
+    /// More than one user there has it.
+    Several,
+    /// The system hides users' emails from the shared key (Jira, often).
+    EmailHidden,
 }
 
-/// The one active user in a users answer whose email is exactly `email`;
-/// none for none, or for more than one.
-pub fn one_with_email(system: System, answer: &Value, email: &str) -> Option<Assignee> {
-    let (list, id, name) = match system {
-        System::Jira => ("users", "account_id", "display_name"),
-        System::Linear => ("members", "id", "name"),
+/// The one user on `system` with the email the hub's sign-in provider
+/// verified for the person, as the hub's own tool finds them (matched there:
+/// the directory never leaves the hub): `Shared` with why when there's
+/// none.
+async fn by_email(remote: &dyn Remote, system: System) -> Result<Who, RemoteError> {
+    let answer = match call(remote, system, by_email_tool(system), json!({})).await {
+        Ok(a) => a,
+        Err(e) if stops(&e) => return Err(e),
+        Err(_) => return Ok(Who::Shared(NoMatch::Unasked)),
     };
-    let found: Vec<Assignee> = answer[list]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|u| u["active"].as_bool() != Some(false))
-        .filter(|u| {
-            u["email"]
-                .as_str()
-                .is_some_and(|e| e.trim().eq_ignore_ascii_case(email))
-        })
-        .filter_map(|u| {
-            let id = u[id].as_str()?.trim().to_string();
-            check_me(system, &id).ok()?;
-            let shown = match system {
-                System::Linear => u["displayName"]
-                    .as_str()
-                    .filter(|n| !n.trim().is_empty())
-                    .map(|_| &u["displayName"])
-                    .unwrap_or(&u[name]),
-                System::Jira => &u[name],
-            };
-            Some(Assignee {
-                name: name_of(shown).unwrap_or_else(|| "You".into()),
+    Ok(by_email_of(system, &answer))
+}
+
+/// What the hub's by-email tool answered, as who the person is.
+pub fn by_email_of(system: System, answer: &Value) -> Who {
+    let user = &answer["user"];
+    if let Some(id) = user["id"].as_str() {
+        let id = id.trim().to_string();
+        if check_me(system, &id).is_ok() {
+            return Who::ByEmail(Assignee {
+                name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
                 id,
-            })
-        })
-        .collect();
-    match found.as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
+            });
+        }
     }
+    Who::Shared(match answer["why"].as_str() {
+        Some("no_verified_email") => NoMatch::NoVerifiedEmail,
+        Some("stale") => NoMatch::Stale,
+        Some("several") => NoMatch::Several,
+        Some("email_hidden") => NoMatch::EmailHidden,
+        Some("none") => NoMatch::Nobody,
+        _ => NoMatch::Unasked,
+    })
 }
 
 /// The person as `system`'s identity tool answered: them only when it says
@@ -588,7 +581,7 @@ pub fn one_with_email(system: System, answer: &Value, email: &str) -> Option<Ass
 pub fn identity_of(system: System, answer: &Value) -> Who {
     match answer.get("personal").and_then(Value::as_bool) {
         Some(true) => {}
-        Some(false) => return Who::Shared,
+        Some(false) => return Who::Shared(NoMatch::Unasked),
         None => return Who::Unsaid,
     }
     let (id, name) = match system {

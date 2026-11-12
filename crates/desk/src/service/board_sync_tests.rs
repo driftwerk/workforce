@@ -715,24 +715,25 @@ impl Remote for FakeLinear {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| RemoteError::Missing(tool.into())),
-            "identity.whoami" => Ok(json!({
-                "identity_id": "p1",
-                "verified_email": *self.verified_email.lock().unwrap(),
-            })),
-            "linear.members_list" => {
-                let want = args["email"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                let members: Vec<Value> = self
+            // The hub's own match: its filters are the hub's to test; here,
+            // what it answers for the person's verified email.
+            "linear.member_by_my_email" => {
+                let Some(want) = self.verified_email.lock().unwrap().clone() else {
+                    return Ok(json!({ "user": null, "why": "no_verified_email" }));
+                };
+                let found: Vec<(String, String)> = self
                     .members
                     .lock()
                     .unwrap()
                     .iter()
                     .filter(|(_, _, e)| e.eq_ignore_ascii_case(&want))
-                    .map(|(id, name, email)| json!({ "id": id, "name": name, "email": email, "active": true }))
+                    .map(|(id, name, _)| (id.clone(), name.clone()))
                     .collect();
-                Ok(json!({ "count": members.len(), "members": members }))
+                Ok(match found.as_slice() {
+                    [(id, name)] => json!({ "user": { "id": id, "name": name }, "why": null }),
+                    [] => json!({ "user": null, "why": "none" }),
+                    _ => json!({ "user": null, "why": "several" }),
+                })
             }
             "linear.issue_list" => {
                 let open = args["open_only"].as_bool() == Some(true);
@@ -1338,10 +1339,10 @@ async fn a_shared_key_names_the_one_member_with_the_verified_email() {
             (s.me.as_deref(), s.me_source, s.me_note),
             (Some(ME), Some(crate::board::MeSource::VouchedByEmail), None)
         );
-        // Asked by the exact email, never a page of everyone.
+        // Asked of the hub with nothing: it knows whose email to match.
         assert_eq!(
-            linear.calls_of("linear.members_list"),
-            vec![json!({ "email": "sam@example.com", "limit": 10 })]
+            linear.calls_of("linear.member_by_my_email"),
+            vec![json!({})]
         );
         let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
         d.take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
@@ -1365,11 +1366,10 @@ async fn no_member_several_or_an_unverified_email_names_no_one() {
         linear.set(1, "unstarted", 1, None);
         let b = taker(&d, &linear).await;
         let shared = "Atlas uses a shared Linear key, so it can't say who you are.";
-        // No verified email: nothing is looked up.
+        // No verified email.
         d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
         let s = d.board_sync(b.id).await.unwrap().unwrap().1;
         assert_eq!((s.me, s.me_note.as_deref()), (None, Some(shared)));
-        assert!(linear.calls_of("linear.members_list").is_empty());
         // A verified email no member has.
         *linear.verified_email.lock().unwrap() = Some("sam@example.com".into());
         d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
@@ -1480,6 +1480,46 @@ async fn a_board_with_tickets_links_and_keeps_them_beside_the_issues() {
         let after = d.ticket(own.ticket.id).await.unwrap();
         assert!(after.ticket.external.is_none());
         assert_eq!(after.key.as_deref(), Some("ACM-1"));
+    })
+    .await;
+}
+
+/// The member a shared key's verified email named when the board was linked
+/// isn't who it names now: Take it assigns no one, and says so.
+#[tokio::test]
+async fn take_it_refuses_when_the_matched_member_changes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        *linear.verified_email.lock().unwrap() = Some("sam@example.com".into());
+        linear
+            .members
+            .lock()
+            .unwrap()
+            .push((ME.into(), "Sam".into(), "sam@example.com".into()));
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        // The email now belongs to someone else there.
+        {
+            let mut m = linear.members.lock().unwrap();
+            m.clear();
+            m.push((ANA.into(), "Ana".into(), "sam@example.com".into()));
+        }
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        refused(
+            d.take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+                .await,
+            "now says you are Ana",
+        );
+        assert!(linear.calls_of("linear.issue_update").is_empty());
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            s.me.as_deref(),
+            Some(ME),
+            "Take it changes nothing about who the board knows"
+        );
     })
     .await;
 }

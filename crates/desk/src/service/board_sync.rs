@@ -646,6 +646,11 @@ impl Desk {
         };
         match s.system {
             System::Jira => {
+                // A shared key's "assigned to me" is whom the person's
+                // verified email names, never the key's owner.
+                let shared_me =
+                    s.me.as_deref()
+                        .filter(|_| s.me_source == Some(board::MeSource::VouchedByEmail));
                 let mut page: Option<String> = None;
                 for n in 0.. {
                     if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
@@ -653,7 +658,7 @@ impl Desk {
                         break;
                     }
                     let mut args = json!({
-                        "jql": crate::board_sync::jql(&s.target, &s.filter, since),
+                        "jql": crate::board_sync::jql(&s.target, &s.filter, since, shared_me),
                         "max_results": crate::board_sync::PAGE,
                         "fields": crate::board_sync::JIRA_FIELDS,
                     });

@@ -42,32 +42,120 @@ use workforce_identity::types::{Identity, IdentityRole, IdentityStatus, Provisio
 pub const OIDC_LINKED_ID_KEY: &str = "oidc";
 
 /// Where an identity keeps the email its OIDC provider last verified for it
-/// (`linked_ids`): set only here, on a sign-in whose email the provider
-/// says is verified, never from what anyone typed. What a board's sync may
-/// match a shared Jira or Linear key's users by ([`verified_email`]).
+/// (`linked_ids`), and when: written only by an OIDC sign-in whose email the
+/// provider says is verified. An admin's edit of an identity's links keeps
+/// the stored ones whatever it sends ([`keep_stored_verified`]), a merge
+/// moves them only with the `oidc` link itself, and suspending clears them.
+/// What a board's sync may match a shared Jira or Linear key's users by
+/// ([`verified_email`]). The hub trusts the identity provider's
+/// `email_verified`.
 pub const OIDC_VERIFIED_EMAIL_KEY: &str = "oidc_email";
+/// When [`OIDC_VERIFIED_EMAIL_KEY`] was last verified, RFC 3339.
+pub const OIDC_VERIFIED_AT_KEY: &str = "oidc_email_at";
 
-/// The email `identity`'s OIDC provider verified, lowercased; none for one
-/// that never signed in through OIDC, whatever its `email` says.
-pub fn verified_email(identity: &Identity) -> Option<String> {
-    identity
+/// How long a verified email stands without another sign-in.
+pub const VERIFIED_EMAIL_FRESH_DAYS: i64 = 90;
+
+/// Whether `key` is one of the verified-email links only a sign-in writes.
+pub fn is_verified_key(key: &str) -> bool {
+    key == OIDC_VERIFIED_EMAIL_KEY || key == OIDC_VERIFIED_AT_KEY
+}
+
+/// What an identity's verified email is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedEmail {
+    /// Verified at a sign-in in the last [`VERIFIED_EMAIL_FRESH_DAYS`].
+    Fresh(String),
+    /// Verified once, but not lately: a sign-in renews it.
+    Stale,
+    /// None: never signed in through OIDC, or not active.
+    None,
+}
+
+/// What `identity`'s verified email is at `now`: only an active identity's,
+/// only the provider's, and only lately.
+pub fn verified_email_state(
+    identity: &Identity,
+    now: chrono::DateTime<chrono::Utc>,
+) -> VerifiedEmail {
+    if !matches!(
+        identity.status,
+        IdentityStatus::Active | IdentityStatus::AutoProvisioned
+    ) {
+        return VerifiedEmail::None;
+    }
+    let Some(email) = identity
         .linked_ids
         .get(OIDC_VERIFIED_EMAIL_KEY)
         .map(|e| e.trim().to_ascii_lowercase())
         .filter(|e| e.contains('@'))
+    else {
+        return VerifiedEmail::None;
+    };
+    let at = identity
+        .linked_ids
+        .get(OIDC_VERIFIED_AT_KEY)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    match at {
+        Some(at) if now - at <= chrono::Duration::days(VERIFIED_EMAIL_FRESH_DAYS) => {
+            VerifiedEmail::Fresh(email)
+        }
+        _ => VerifiedEmail::Stale,
+    }
 }
 
-/// Keeps `email` (verified by the provider) as `identity`'s verified email;
-/// whether it changed.
-fn keep_verified_email(identity: &mut Identity, email: &str) -> bool {
-    let email = email.trim().to_ascii_lowercase();
-    let changed = identity.linked_ids.get(OIDC_VERIFIED_EMAIL_KEY) != Some(&email);
-    if changed {
-        identity
-            .linked_ids
-            .insert(OIDC_VERIFIED_EMAIL_KEY.to_string(), email);
+/// The email `identity`'s OIDC provider verified lately, lowercased; none
+/// otherwise, whatever its `email` says.
+pub fn verified_email(identity: &Identity) -> Option<String> {
+    match verified_email_state(identity, chrono::Utc::now()) {
+        VerifiedEmail::Fresh(e) => Some(e),
+        _ => None,
     }
-    changed
+}
+
+/// `incoming` links with the verified-email ones of `stored` in place of
+/// whatever it says of them: an edit never sets them.
+pub fn keep_stored_verified(
+    stored: &std::collections::HashMap<String, String>,
+    incoming: &mut std::collections::HashMap<String, String>,
+) {
+    incoming.retain(|k, _| !is_verified_key(k));
+    for (k, v) in stored.iter().filter(|(k, _)| is_verified_key(k)) {
+        incoming.insert(k.clone(), v.clone());
+    }
+}
+
+/// Forgets `identity`'s verified email (suspended, offboarded); whether it
+/// had one.
+pub fn forget_verified_email(identity: &mut Identity) -> bool {
+    let had = identity.linked_ids.contains_key(OIDC_VERIFIED_EMAIL_KEY);
+    identity.linked_ids.retain(|k, _| !is_verified_key(k));
+    had
+}
+
+/// Keeps `email` (verified by the provider just now) as `identity`'s
+/// verified email; whether anything changed. Its time is renewed once a day
+/// at most, so a sign-in doesn't always write.
+fn keep_verified_email(identity: &mut Identity, email: &str) -> bool {
+    let now = chrono::Utc::now();
+    let email = email.trim().to_ascii_lowercase();
+    let same = identity.linked_ids.get(OIDC_VERIFIED_EMAIL_KEY) == Some(&email);
+    let recent = identity
+        .linked_ids
+        .get(OIDC_VERIFIED_AT_KEY)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| now - t.with_timezone(&chrono::Utc) < chrono::Duration::days(1));
+    if same && recent {
+        return false;
+    }
+    identity
+        .linked_ids
+        .insert(OIDC_VERIFIED_EMAIL_KEY.to_string(), email);
+    identity
+        .linked_ids
+        .insert(OIDC_VERIFIED_AT_KEY.to_string(), now.to_rfc3339());
+    true
 }
 
 /// Maximum age of an unclaimed CSRF/PKCE state entry before it is pruned.
@@ -560,6 +648,62 @@ mod tests {
             IdentityResolution::Found(_) => panic!("expected Created"),
         };
         assert_eq!(verified_email(&made).as_deref(), Some("new@example.com"));
+    }
+
+    /// A sign-in found by its `sub` keeps the email the provider verifies
+    /// now, in place of an older one; an edit of the identity's links never
+    /// sets it; a suspended identity's isn't anyone's; and one not renewed
+    /// in 90 days is stale.
+    #[test]
+    fn a_sign_in_renews_the_verified_email_and_nothing_else_writes_it() {
+        let store = SqliteIdentityStore::in_memory().unwrap();
+        let cfg = test_config(vec![], true);
+        let mut who = Identity::new("Sam", IdentityRole::Member);
+        who.linked_ids
+            .insert(OIDC_LINKED_ID_KEY.into(), "sub-of-sam@new.example".into());
+        who.linked_ids
+            .insert(OIDC_VERIFIED_EMAIL_KEY.into(), "sam@old.example".into());
+        store.create(&who).unwrap();
+        // Found by `sub`, with the provider's new email.
+        let found = match resolve_identity(&cfg, &store, &claims("sam@new.example", true)).unwrap()
+        {
+            IdentityResolution::Found(i) => i,
+            IdentityResolution::Created(_) => panic!("expected Found"),
+        };
+        assert_eq!(verified_email(&found).as_deref(), Some("sam@new.example"));
+        assert_eq!(
+            verified_email(&store.get_by_id(who.id).unwrap().unwrap()).as_deref(),
+            Some("sam@new.example")
+        );
+        // An edit's links: the stored verified ones stand.
+        let mut sent = std::collections::HashMap::from([
+            (
+                OIDC_VERIFIED_EMAIL_KEY.to_string(),
+                "attacker@example.com".to_string(),
+            ),
+            ("slack".to_string(), "U1".to_string()),
+        ]);
+        keep_stored_verified(&found.linked_ids, &mut sent);
+        assert_eq!(sent[OIDC_VERIFIED_EMAIL_KEY], "sam@new.example");
+        assert_eq!(sent["slack"], "U1");
+        assert!(sent.contains_key(OIDC_VERIFIED_AT_KEY));
+        let mut none_sent = std::collections::HashMap::from([(
+            OIDC_VERIFIED_EMAIL_KEY.to_string(),
+            "attacker@example.com".to_string(),
+        )]);
+        keep_stored_verified(&std::collections::HashMap::new(), &mut none_sent);
+        assert!(none_sent.is_empty(), "an edit can't add one");
+        // Suspended: none.
+        let mut suspended = found.clone();
+        suspended.status = IdentityStatus::Suspended;
+        assert_eq!(verified_email(&suspended), None);
+        // Not renewed in 90 days: stale.
+        let later = chrono::Utc::now() + chrono::Duration::days(VERIFIED_EMAIL_FRESH_DAYS + 1);
+        assert_eq!(verified_email_state(&found, later), VerifiedEmail::Stale);
+        // Forgotten on suspension.
+        let mut gone = found.clone();
+        assert!(forget_verified_email(&mut gone));
+        assert!(!gone.linked_ids.keys().any(|k| is_verified_key(k)));
     }
 
     #[test]

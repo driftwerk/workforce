@@ -2321,3 +2321,38 @@ async fn keeping_manage_over_the_owner_route_leaves_every_other_grantee_alone() 
         "a plain transfer leaves the outgoing owner nothing"
     );
 }
+
+/// Editing an identity's links never sets (or clears) the email its sign-in
+/// provider verified: only a sign-in writes it.
+#[tokio::test]
+async fn an_identity_edit_never_writes_its_verified_email() {
+    let (state, fx) = state_with_fixtures();
+    let admin = fx.token(&fx.admin);
+    let path = format!("/api/identities/{}", fx.member.id);
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "linked_ids": {
+            "slack": "U-1",
+            "oidc_email": "someone-else@example.com",
+            "oidc_email_at": chrono::Utc::now().to_rfc3339(),
+        } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let stored = state
+        .identity_store
+        .as_ref()
+        .unwrap()
+        .get_by_id(fx.member.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.linked_ids.get("slack").map(String::as_str),
+        Some("U-1")
+    );
+    assert!(!stored.linked_ids.contains_key("oidc_email"));
+    assert!(!stored.linked_ids.contains_key("oidc_email_at"));
+}

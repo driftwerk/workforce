@@ -141,6 +141,7 @@ pub use hub_core::heartbeat_signature;
 pub mod heartbeat_tool;
 pub use workforce_hub_core::hosts;
 pub use workforce_hub_core::hub_core;
+pub mod by_my_email;
 pub mod identity_lifecycle;
 pub mod identity_lifecycle_tool;
 pub mod identity_tool;

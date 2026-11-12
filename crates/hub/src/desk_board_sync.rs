@@ -983,6 +983,7 @@ async fn count_matches(
     target_id: Option<&str>,
     filter: &Filter,
     me: Option<&str>,
+    shared_me: Option<&str>,
 ) -> Result<(usize, bool), RemoteError> {
     let mut n = 0usize;
     let pages = sync::MATCH_CEILING.div_ceil(sync::PAGE);
@@ -990,7 +991,7 @@ async fn count_matches(
     for _ in 0..pages {
         let (found, next) = match system {
             System::Jira => {
-                let mut args = json!({ "jql": sync::jql(target, filter, None), "max_results": sync::PAGE, "fields": ["summary"] });
+                let mut args = json!({ "jql": sync::jql(target, filter, None, shared_me), "max_results": sync::PAGE, "fields": ["summary"] });
                 if let Some(p) = &page {
                     args["next_page_token"] = json!(p);
                 }
@@ -1157,6 +1158,9 @@ async fn check_link(
             body.target_id.as_deref(),
             filter,
             me.as_ref().map(|m| m.id.as_str()),
+            me.as_ref()
+                .map(|m| m.id.as_str())
+                .filter(|_| out["meBy"] == "email"),
         )
         .await;
         match matched {
