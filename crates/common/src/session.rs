@@ -3348,7 +3348,11 @@ impl DeletedMessage {
 /// after it in its session, oldest first. A Desk reply's mark names the
 /// message it answers (`in_reply_to`, the client's id it was asked under, or
 /// its own id): those that do are its replies. Without any, its replies are
-/// the agent's messages straight after it, up to the person's next message.
+/// the agent's messages of the turn it asked: those straight after it, up to
+/// the next message of the person's or a note the hub left (a user row
+/// either way), or the first of the agent's that is no reply to it — one
+/// delivered outside a turn (a reminder, a job's, a monitor's), or one whose
+/// mark answers another message.
 pub fn replies_to(asked: &SessionMessage, later: &[SessionMessage]) -> Vec<String> {
     let names: Vec<Uuid> = [asked.external_id.as_deref(), Some(asked.id.as_str())]
         .into_iter()
@@ -3369,9 +3373,15 @@ pub fn replies_to(asked: &SessionMessage, later: &[SessionMessage]) -> Vec<Strin
     if !marked.is_empty() {
         return marked;
     }
+    let of_another_turn = |m: &SessionMessage| {
+        m.role == MessageRole::User
+            || m.desk
+                .as_ref()
+                .is_some_and(|mark| mark.delivery.is_some() || mark.in_reply_to.is_some())
+    };
     later
         .iter()
-        .take_while(|m| m.role != MessageRole::User)
+        .take_while(|m| !of_another_turn(m))
         .filter(|m| m.role == MessageRole::Assistant)
         .map(|m| m.id.clone())
         .collect()
@@ -5904,6 +5914,25 @@ mod tests {
         );
         let later = [tool, a.clone(), next, b.clone()];
         assert_eq!(replies_to(&asked, &later), vec![a.id.clone()]);
+        // A delivery outside the turn, or an answer to another message,
+        // ends the turn's replies.
+        for mark in [
+            crate::channels::desk::DeskMark {
+                delivery: Some(crate::channels::desk::DeliveryKind::Reminder),
+                ..Default::default()
+            },
+            crate::channels::desk::DeskMark {
+                in_reply_to: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        ] {
+            let other = SessionMessage {
+                desk: Some(mark),
+                ..say(MessageRole::Assistant, "elsewhere")
+            };
+            let later = [a.clone(), other, b.clone()];
+            assert_eq!(replies_to(&asked, &later), vec![a.id.clone()]);
+        }
         // A mark naming the message by its own id wins, wherever it is.
         let named = SessionMessage {
             desk: Some(crate::channels::desk::DeskMark {

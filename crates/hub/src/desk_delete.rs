@@ -22,6 +22,7 @@ use workforce_common::session::{MessageRole, SessionStore, TranscriptEntry};
 use workforce_desk::{
     Author, ConversationError, Delete, Deleted, SavedMemory, Speaker, SpeakerKind,
 };
+use workforce_memory::store::MemoryStore;
 use workforce_memory::types::{Memory, MemoryFilter, MemoryId};
 
 use crate::desk_conversations::shown_as;
@@ -37,13 +38,9 @@ const MAX_READS: usize = 50;
 /// How many sessions of a rolled-over DM are walked.
 const MAX_CHAIN: usize = 50;
 
-/// How many of the person's memories with the agent, saved since the
-/// message, are looked through for those it came from.
-const MEMORIES_SCANNED: usize = 5_000;
-
-/// How long before a message its memories may say they were made: another
-/// instance's clock may run behind the one that kept it.
-const CLOCK_SLACK: chrono::Duration = chrono::Duration::minutes(10);
+/// The most of a person's memories with an agent one listing reads, which
+/// a vector store holds a query's results to.
+const MEMORIES_SCANNED: usize = 10_000;
 
 /// The person's message, found in their DM.
 pub(crate) struct Found {
@@ -171,8 +168,13 @@ pub(crate) fn saved_from(memory: &Memory, chain: &[String], id: &str) -> bool {
         && memory.source_message_ids.iter().any(|m| m == id)
 }
 
-/// The person `owner`'s memories with `service`'s agent saved from `found`.
-/// None where the agent keeps no memories.
+/// The person `owner`'s memories with `service`'s agent that cite `found`
+/// in their provenance. None where the agent keeps no memories.
+///
+/// A memory may cite a message from before or after it was made (a lesson
+/// seen again adds the message to one it already had), so every one of the
+/// person's memories with the agent is looked through. Past what one read
+/// can hold, the listing is refused rather than cut short.
 pub(crate) async fn memories_of(
     service: &AgentService,
     owner: &str,
@@ -185,12 +187,17 @@ pub(crate) async fn memories_of(
         .list(MemoryFilter {
             owner: Some(service.agent_id.clone()),
             identity_id: Some(owner.to_string()),
-            created_after: Some(found.entry.timestamp - CLOCK_SLACK),
             limit: Some(MEMORIES_SCANNED),
             ..MemoryFilter::default()
         })
         .await
         .map_err(|e| ConversationError::Unavailable(format!("reading memories failed: {e:#}")))?;
+    if listed.len() >= MEMORIES_SCANNED {
+        return Err(ConversationError::Unavailable(format!(
+            "you have more than {MEMORIES_SCANNED} memories with this agent, too many to look \
+             through for one message"
+        )));
+    }
     Ok(listed
         .into_iter()
         .filter(|m| saved_from(m, &found.chain, &found.entry.id))
@@ -208,13 +215,58 @@ pub(crate) fn listed(memories: &[Memory]) -> Vec<SavedMemory> {
         .collect()
 }
 
+/// Forgets those of `asked` that are `owner`'s memories with `agent` citing
+/// `found`, each looked up by its id; any other id is left alone. The first
+/// that can't be forgotten fails the whole, so the message is kept and the
+/// person can try again.
+async fn forget_asked(
+    memories: Option<&dyn MemoryStore>,
+    agent: &workforce_core::types::AgentId,
+    owner: &str,
+    found: &Found,
+    asked: Vec<String>,
+) -> Result<Vec<String>, ConversationError> {
+    let Some(store) = memories else {
+        return Ok(Vec::new());
+    };
+    let unavailable = |e: eyre::Report| {
+        ConversationError::Unavailable(format!(
+            "a memory from the message could not be forgotten, so the message was kept: {e:#}"
+        ))
+    };
+    let mut forgot = Vec::new();
+    for id in asked {
+        if forgot.contains(&id) {
+            continue;
+        }
+        let memory_id = MemoryId(id.clone());
+        let cites = store
+            .get(&memory_id)
+            .await
+            .map_err(unavailable)?
+            .is_some_and(|m| {
+                m.owner == *agent
+                    && m.identity_id.as_deref() == Some(owner)
+                    && saved_from(&m, &found.chain, &found.entry.id)
+            });
+        if cites {
+            store.forget(&memory_id).await.map_err(unavailable)?;
+            forgot.push(id);
+        }
+    }
+    Ok(forgot)
+}
+
 /// Deletes `found` from every session of its DM, holding the DM's turn so
-/// none runs meanwhile, and forgets those of `delete.forget` in `saved`.
+/// none runs meanwhile, after forgetting those of `delete.forget` that cite
+/// it in `memories`: a memory the person asked to forget is never left with
+/// its message gone.
 pub(crate) async fn delete(
     service: &AgentService,
+    memories: Option<&dyn MemoryStore>,
     speaker: &Speaker,
+    owner: &str,
     found: &Found,
-    saved: &[Memory],
     delete: Delete,
 ) -> Result<Deleted, ConversationError> {
     let busy = || {
@@ -226,43 +278,50 @@ pub(crate) async fn delete(
     if service.live_turns.running(&found.head) {
         return Err(busy());
     }
-    // The fleet's claim keeps a turn on another instance out; on this one,
-    // the live turn above is the guard, as the claim is this process's
-    // already.
+    // The fleet's claim keeps a turn on another instance out. On this one
+    // the claim is the process's already, so the live turn is the guard,
+    // checked again with nothing awaited between it and the deletes. On
+    // Postgres a turn that loaded the session before them and saves after
+    // misses its revision, and its save keeps the stored messages, the note
+    // among them, adding only its own.
     let claim =
         crate::session_turn_claim::SessionTurnClaim::try_acquire(&service.sessions, &found.head)
             .map_err(|e| ConversationError::Unavailable(format!("{e:#}")))?
             .ok_or_else(busy)?;
-    let store = service.sessions.as_ref();
-    // A rolled-over DM keeps its latest turns word for word in the next
-    // session's live context, under the same ids: each session is cleared.
-    let cleared: eyre::Result<bool> = found.chain.iter().try_fold(false, |any, session| {
-        Ok(store
-            .delete_person_message(session, &found.entry.id)?
-            .found()
-            || any)
-    });
+    let forgot = match forget_asked(memories, &service.agent_id, owner, found, delete.forget).await
+    {
+        Ok(forgot) => forgot,
+        Err(e) => {
+            claim.release().await;
+            return Err(e);
+        }
+    };
+    let cleared = match service.live_turns.running(&found.head) {
+        true => Err(busy()),
+        false => {
+            let store = service.sessions.as_ref();
+            // A rolled-over DM keeps its latest turns word for word in the
+            // next session's live context, under the same ids: each session
+            // is cleared.
+            found
+                .chain
+                .iter()
+                .try_fold(false, |any, session| {
+                    Ok(store
+                        .delete_person_message(session, &found.entry.id)?
+                        .found()
+                        || any)
+                })
+                .map_err(internal)
+        }
+    };
     // Released before answering, so a message the person sends next isn't
     // refused on its account by another instance.
     claim.release().await;
-    if !cleared.map_err(internal)? {
+    if !cleared? {
         return Err(ConversationError::NotFound(
             "no such message in your conversation".into(),
         ));
-    }
-    let mut forgot = Vec::new();
-    if let Some(memories) = service.memory_store.as_ref() {
-        for id in delete.forget {
-            if forgot.contains(&id) || !saved.iter().any(|m| m.id.0 == id) {
-                continue;
-            }
-            match memories.forget(&MemoryId(id.clone())).await {
-                Ok(()) => forgot.push(id),
-                Err(e) => {
-                    tracing::warn!(error = %e, "forgetting a deleted message's memory failed")
-                }
-            }
-        }
     }
     Ok(Deleted {
         deleted: true,

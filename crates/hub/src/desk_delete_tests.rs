@@ -336,3 +336,176 @@ async fn a_message_kept_across_a_rollover_is_deleted_from_both_sessions() {
     let live = store.get(&active.id).unwrap().unwrap();
     assert_eq!(live.messages[0].content, DELETED_MESSAGE_NOTE);
 }
+
+/// The in-memory store, refusing to forget while told to.
+#[derive(Default)]
+struct Forgetful {
+    inner: workforce_memory::in_memory::InMemoryStore,
+    refuses: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl workforce_memory::store::MemoryStore for Forgetful {
+    async fn remember(&self, memory: Memory) -> eyre::Result<MemoryId> {
+        self.inner.remember(memory).await
+    }
+    async fn recall(
+        &self,
+        query: &str,
+        filter: workforce_memory::types::MemoryFilter,
+    ) -> eyre::Result<Vec<workforce_memory::types::MemorySearchResult>> {
+        self.inner.recall(query, filter).await
+    }
+    async fn get(&self, id: &MemoryId) -> eyre::Result<Option<Memory>> {
+        self.inner.get(id).await
+    }
+    async fn forget(&self, id: &MemoryId) -> eyre::Result<()> {
+        if self.refuses.load(std::sync::atomic::Ordering::SeqCst) {
+            eyre::bail!("the memory store answered 500");
+        }
+        self.inner.forget(id).await
+    }
+    async fn share(
+        &self,
+        id: &MemoryId,
+        visibility: workforce_memory::types::Visibility,
+    ) -> eyre::Result<()> {
+        self.inner.share(id, visibility).await
+    }
+    async fn count(&self, filter: workforce_memory::types::MemoryFilter) -> eyre::Result<usize> {
+        self.inner.count(filter).await
+    }
+    async fn list(
+        &self,
+        filter: workforce_memory::types::MemoryFilter,
+    ) -> eyre::Result<Vec<Memory>> {
+        self.inner.list(filter).await
+    }
+    async fn update_tags(&self, id: &MemoryId, tags: Vec<String>) -> eyre::Result<()> {
+        self.inner.update_tags(id, tags).await
+    }
+    async fn adjust_importance(&self, id: &MemoryId, delta: f32) -> eyre::Result<f32> {
+        self.inner.adjust_importance(id, delta).await
+    }
+    async fn identity_memories(
+        &self,
+        owner: &workforce_core::types::AgentId,
+        identity: &str,
+    ) -> eyre::Result<Vec<MemoryId>> {
+        self.inner.identity_memories(owner, identity).await
+    }
+    async fn identity_counts(
+        &self,
+        owner: &workforce_core::types::AgentId,
+    ) -> eyre::Result<std::collections::BTreeMap<String, usize>> {
+        self.inner.identity_counts(owner).await
+    }
+    async fn reassign_identity(
+        &self,
+        owner: &workforce_core::types::AgentId,
+        from: &str,
+        to: &str,
+    ) -> eyre::Result<usize> {
+        self.inner.reassign_identity(owner, from, to).await
+    }
+    async fn purge_identity(
+        &self,
+        owner: &workforce_core::types::AgentId,
+        identity: &str,
+    ) -> eyre::Result<usize> {
+        self.inner.purge_identity(owner, identity).await
+    }
+    async fn purge_memories(&self, ids: &[MemoryId]) -> eyre::Result<usize> {
+        self.inner.purge_memories(ids).await
+    }
+    async fn find_near_duplicate(
+        &self,
+        content: &str,
+        filter: workforce_memory::types::MemoryFilter,
+        min_similarity: f32,
+    ) -> eyre::Result<Option<workforce_memory::types::MemorySearchResult>> {
+        self.inner
+            .find_near_duplicate(content, filter, min_similarity)
+            .await
+    }
+    async fn record_recurrence(
+        &self,
+        id: &MemoryId,
+        additional_message_ids: Vec<String>,
+    ) -> eyre::Result<u32> {
+        self.inner
+            .record_recurrence(id, additional_message_ids)
+            .await
+    }
+}
+
+/// A memory the person asked to forget that can't be forgotten keeps its
+/// message, so they can try again; once it can, both go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_that_cant_be_forgotten_keeps_its_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+    let (state, [(alice_id, alice), _]) = gateway(&scout);
+    let (question, answer) = asked("pineapples");
+    let session = dm(&scout, &alice_id, &[&question, &answer]);
+    let memories = Forgetful::default();
+    let remembered = memories
+        .remember(
+            Memory::new(
+                "Alice likes pineapples",
+                MemoryLayer::Episodic,
+                scout.agent_id.clone(),
+            )
+            .with_identity_id(&alice_id)
+            .with_source_session(&session, vec![question.id.clone()]),
+        )
+        .await
+        .unwrap();
+    let speaker = Speaker::agent("scout", "Scout");
+    let found = persons_message(&scout, &speaker, &alice_id, &question.id, None)
+        .await
+        .unwrap();
+    let asked_to = || Delete {
+        forget: vec![remembered.0.clone()],
+    };
+    memories
+        .refuses
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let refused = delete(
+        &scout,
+        Some(&memories),
+        &speaker,
+        &alice_id,
+        &found,
+        asked_to(),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ConversationError::Unavailable(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        shown(&state, &alice).await[0],
+        ("pineapples".to_string(), false),
+        "the message is kept"
+    );
+    memories
+        .refuses
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let deleted = delete(
+        &scout,
+        Some(&memories),
+        &speaker,
+        &alice_id,
+        &found,
+        asked_to(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted.forgot, vec![remembered.0.clone()]);
+    assert!(memories.get(&remembered).await.unwrap().unwrap().deleted);
+    assert_eq!(
+        shown(&state, &alice).await,
+        [("About pineapples.".to_string(), true)]
+    );
+}

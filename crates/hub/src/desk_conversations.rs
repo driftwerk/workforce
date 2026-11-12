@@ -37,11 +37,10 @@ const MAX_READS: usize = 25;
 
 /// User-role rows the hub writes for the model, never typed by anyone: a
 /// rolled-over thread's carry-over, compaction's orientation note, and the
-/// overflow notes the runner leaves when it drops context, and what a
-/// message the person deleted leaves in its place.
+/// overflow notes the runner leaves when it drops context (and what a
+/// message the person deleted leaves in its place, one of those).
 const HUB_NOTES: &[&str] = &[
     CARRYOVER_PREFIX,
-    workforce_common::session::DELETED_MESSAGE_NOTE,
     "[System note:",
     "[SYSTEM]",
     crate::desk_crew::CHECK_IN,
@@ -625,12 +624,15 @@ impl Conversations for HubConversations {
             crew.as_ref().map(|c| c.desk()),
         )
         .await?;
-        // Read before the delete: a memory names the message it came from.
-        let saved = match delete.forget.is_empty() {
-            true => Vec::new(),
-            false => crate::desk_delete::memories_of(&service, &owner, &found).await?,
-        };
-        crate::desk_delete::delete(&service, &speaker, &found, &saved, delete).await
+        crate::desk_delete::delete(
+            &service,
+            service.memory_store.as_deref(),
+            &speaker,
+            &owner,
+            &found,
+            delete,
+        )
+        .await
     }
 }
 
