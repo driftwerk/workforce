@@ -172,8 +172,11 @@ pub async fn thread_is_theirs(service: &AgentService, person: &str, key: &str) -
     if slack_user.is_empty() {
         return false;
     }
-    let hint =
-        workforce_common::channels::ChannelHint::from_parts(Some(workspace.to_string()), None, None);
+    let hint = workforce_common::channels::ChannelHint::from_parts(
+        Some(workspace.to_string()),
+        None,
+        None,
+    );
     let registry = service.surface_registry.read().await;
     matches!(
         registry.resolve_user_dm("slack", &slack_user, hint).await,

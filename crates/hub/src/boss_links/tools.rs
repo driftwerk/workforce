@@ -153,6 +153,10 @@ pub fn describe(name: &str) -> &'static str {
     }
 }
 
+/// The boss tools a wake turn asks the person before using: those that
+/// start work rather than steer what runs.
+pub(crate) const WAKE_HELD: [&str; 3] = ["crew.start_session", "crew.resume", "crew.restart"];
+
 /// One boss tool, for one conversation.
 pub struct BossTool {
     name: &'static str,
@@ -167,16 +171,19 @@ pub struct BossTool {
 
 impl BossTool {
     /// What a wake turn's call of this tool asks the person, when it is one
-    /// that changes a session: none outside a wake turn.
+    /// that starts work: none outside a wake turn. What a wake turn does to
+    /// a session already running (answering what it asks, nudging it,
+    /// denying, stopping or letting it go) is decided by its engine, as a
+    /// local boss's work turn is; starting a session, or starting one
+    /// again, from what a session said with nobody there waits for them.
     fn held_in_wake(&self) -> Option<String> {
         let waking = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
             .try_with(|o| o == super::wake::ORIGIN)
             .unwrap_or(false);
-        let changes = SERVED_ACT.contains(&self.name) && self.name != "crew.escalate";
-        (waking && changes).then(|| {
+        (waking && WAKE_HELD.contains(&self.name)).then(|| {
             format!(
-                "{} wants to use {} from {}'s boss conversation while you're away: it changes a \
-                 session, so it runs only if you allow it, this once.",
+                "{} wants to use {} from {}'s boss conversation while you're away: it starts \
+                 work, so it runs only if you allow it, this once.",
                 self.conversation.agent, self.name, self.group
             )
         })
@@ -282,9 +289,8 @@ impl Tool for BossTool {
         schema(self.name, &self.engines)
     }
 
-    /// In a wake turn, nobody is there: what changes a session (nudging,
-    /// answering, stopping, starting…) is asked of the person first, once,
-    /// as everything else the boss would use is. Escalating to them is not.
+    /// In a wake turn, nobody is there: what starts work is asked of the
+    /// person first, once ([`WAKE_HELD`]).
     fn approval_requirement(&self) -> Option<String> {
         self.held_in_wake()
     }

@@ -115,6 +115,9 @@ pub struct CrewHub {
     /// let go only once that has lasted ([`work::LET_GO_AFTER_LOOKS`]), never
     /// on a config that failed to read once.
     unbossed: Mutex<HashMap<uuid::Uuid, (u32, std::time::Instant)>>,
+    /// How many uplinks carry each remote boss's links now, by its
+    /// `<hub>/<agent>`.
+    remote_up: Mutex<HashMap<String, usize>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -493,6 +496,7 @@ impl CrewHub {
             hops: Mutex::default(),
             wake_hop: Mutex::default(),
             unbossed: Mutex::default(),
+            remote_up: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
@@ -656,6 +660,14 @@ impl CrewHub {
                     };
                     Some((s.agent_id.as_str().to_string(), why))
                 })
+                .chain(
+                    self.remote_unanswering(
+                        &list
+                            .iter()
+                            .map(|(_, o)| o.scope.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                )
                 .collect(),
         );
         self.desk.set_holds(

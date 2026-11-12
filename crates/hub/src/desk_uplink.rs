@@ -36,7 +36,7 @@
 //! `Authorization` header alone, as grants are: Desk's native side holds it,
 //! and no page, agent or session can ask them.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -828,6 +828,9 @@ pub fn boss_moved(crew: &CrewHub, link: &HeldLink) -> bool {
         .is_ok_and(|g| g.boss.as_ref() != Some(&link.boss()))
 }
 
+/// How often what the boss owes an answer to is looked at.
+const OWED_EVERY: Duration = Duration::from_millis(500);
+
 /// The most `event` frames one link sends an hour: past it, what happens
 /// is counted and said with the next one sent.
 pub const EVENTS_PER_HOUR: usize = 120;
@@ -841,19 +844,48 @@ async fn send_events(
     tx: tokio::sync::mpsc::Sender<Value>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+    // Its bosses are connected while this runs: until the socket ends.
+    let _up = crew.remote_up(links.iter().map(|(_, _, b)| b.party_id()).collect());
     let (_, mut rx) = crew.desk().subscribe();
     let mut sent: HashMap<Uuid, VecDeque<Instant>> = HashMap::new();
     let mut skipped: HashMap<Uuid, u64> = HashMap::new();
+    // Each link's requests given to its boss, while they are open.
+    let mut offered: HashMap<Uuid, HashSet<(Uuid, String)>> = HashMap::new();
+    let mut look = tokio::time::interval(OWED_EVERY);
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let event = match rx.recv().await {
-            Ok(workforce_desk::model::DeskEvent::Activity { event }) => event,
-            Ok(_) | Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => return,
+        // (link, the request it gives, if one, frame)
+        let frames: Vec<(Uuid, Option<Uuid>, Value)> = tokio::select! {
+            got = rx.recv() => {
+                let event = match got {
+                    Ok(workforce_desk::model::DeskEvent::Activity { event }) => event,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                };
+                // Each link wakes its own boss alone.
+                links
+                    .iter()
+                    .filter_map(|(link, group, boss)| {
+                        crew.served_event(group, boss, &event).map(|f| (*link, None, f))
+                    })
+                    .collect()
+            }
+            _ = look.tick() => links
+                .iter()
+                .flat_map(|(link, group, boss)| {
+                    crew.owed_remote(group, boss, offered.entry(*link).or_default())
+                        .into_iter()
+                        .map(|(asked, f)| (*link, Some(asked), f))
+                })
+                .collect(),
         };
-        // Each link wakes its own boss alone.
-        for (link, group, boss) in &links {
-            let Some(mut frame) = crew.served_event(group, boss, &event) else {
-                continue;
+        for (link, asked, mut frame) in frames {
+            let link = &link;
+            // A request not sent is looked at again next time.
+            let unsent = |offered: &mut HashMap<Uuid, HashSet<(Uuid, String)>>| {
+                if let (Some(asked), Some(o)) = (asked, offered.get_mut(link)) {
+                    o.retain(|(id, _)| *id != asked);
+                }
             };
             let recent = sent.entry(*link).or_default();
             while recent
@@ -863,14 +895,21 @@ async fn send_events(
                 recent.pop_front();
             }
             if recent.len() >= EVENTS_PER_HOUR {
-                *skipped.entry(*link).or_default() += 1;
+                // A request waits for room; anything else is counted.
+                match asked {
+                    Some(_) => unsent(&mut offered),
+                    None => *skipped.entry(*link).or_default() += 1,
+                }
                 continue;
             }
             frame["type"] = json!("event");
             frame["linkId"] = json!(link);
-            frame["skipped"] = json!(skipped.remove(link).unwrap_or(0));
+            frame["skipped"] = json!(skipped.get(link).copied().unwrap_or(0));
             if tx.try_send(frame).is_ok() {
                 recent.push_back(Instant::now());
+                skipped.remove(link);
+            } else {
+                unsent(&mut offered);
             }
         }
     }
@@ -899,10 +938,8 @@ pub fn start(uplink: Uplink, cancel: CancellationToken) {
                     // boss's: forgotten, never dialed again.
                     if boss_moved(&uplink.crew, &l) {
                         tracing::info!(target: "sentinel.audit", link = %l.link_id, group = %l.group, "a boss link was forgotten: its group has another boss now");
-                        let _ = vault.delete_with_actor(
-                            &desk_boss_link_path(&l.link_id.to_string()),
-                            ACTOR,
-                        );
+                        let _ = vault
+                            .delete_with_actor(&desk_boss_link_path(&l.link_id.to_string()), ACTOR);
                         continue;
                     }
                     by_hub.entry(l.hub_url.clone()).or_default().push(l);

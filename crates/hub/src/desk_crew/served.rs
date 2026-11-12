@@ -24,12 +24,14 @@
 //! up by its scope or as one of this hub's agents, so a local overseer of
 //! the same group is never taken for it, nor it for one.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Act, Full, Level, Oversight, Scope, TakeOn};
+use workforce_desk::charge::Wheel;
 use workforce_desk::crew::{By, ItemKind, Party};
 use workforce_desk::grant::{self, BossRef, Grant};
 use workforce_desk::grant_store::{Begun, CallRow};
@@ -423,15 +425,17 @@ impl CrewHub {
     ) -> Option<Value> {
         use workforce_desk::crew::{Kind, PartyKind};
         let g = self.desk.grant_live(group).ok()?;
-        if !matches!(boss, BossRef::Remote { .. })
-            || !boss.servable()
-            || g.boss.as_ref() != Some(boss)
-        {
+        if !self.serves_remote(&g, boss) {
             return None;
         }
         if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You)
             || event.hop >= i16::from(workforce_core::desk::MAX_HOPS)
         {
+            return None;
+        }
+        // A request a session waits on reaches the boss by what is open
+        // ([`Self::owed_remote`]), not by the event that raised it.
+        if event.kind == Kind::NeedsYou && event.approval_id.is_some() {
             return None;
         }
         if !matches!(
@@ -468,6 +472,153 @@ impl CrewHub {
             "at": event.at,
             "hop": event.hop,
         }))
+    }
+
+    /// Marks `bosses` (each `<hub>/<agent>`) connected while the guard
+    /// lives: an uplink carries their links.
+    pub(crate) fn remote_up(self: &Arc<Self>, bosses: Vec<String>) -> RemoteUp {
+        {
+            let mut up = self.remote_up.lock();
+            for b in &bosses {
+                *up.entry(b.clone()).or_default() += 1;
+            }
+        }
+        RemoteUp {
+            crew: Arc::clone(self),
+            bosses,
+        }
+    }
+
+    /// Why each remote boss won't answer what the sessions it runs here
+    /// ask, by its `<hub>/<agent>`, as the badge says: its grant doesn't
+    /// serve it now, a local overseer of the group is its boss here, it
+    /// only watches or suggests, Desk's breaker holds it, or no uplink
+    /// carries its link. A boss left out answers. `local` are the scopes
+    /// of this hub's own overseers now.
+    pub(crate) fn remote_unanswering(&self, local: &[Scope]) -> Vec<(String, String)> {
+        let mut why: Vec<(String, String)> = Vec::new();
+        for (g, not_live) in self.desk.grants_bossed() {
+            let Some(boss @ BossRef::Remote { .. }) = g.boss.as_ref() else {
+                continue;
+            };
+            let party = boss.party_id();
+            if why.iter().any(|(b, _)| *b == party) {
+                continue;
+            }
+            let name = boss_name(&g);
+            let o = served_oversight(&g);
+            let reason = if let Some(not_live) = not_live {
+                not_live
+            } else if !boss.servable() || local.contains(&o.scope) {
+                format!("{name} isn't {}'s boss here.", g.name)
+            } else if o.level == Level::Watch {
+                format!("{name} only watches.")
+            } else if o.level == Level::Suggest {
+                format!("{name} only suggests: you decide.")
+            } else if let Some(held) = self.desk.agent_held_why(&party) {
+                format!("{name} is {held}.")
+            } else if self.remote_up.lock().get(&party).copied().unwrap_or(0) == 0 {
+                format!("{name} isn't connected, so this is yours.")
+            } else {
+                continue;
+            };
+            why.push((party, reason));
+        }
+        why
+    }
+
+    /// Whether `boss` is the remote boss served for `g` here now: the
+    /// grant's own boss, and no local overseer of the group (one boss per
+    /// group, as a call is decided, [`Self::serve_crew`]).
+    fn serves_remote(&self, g: &Grant, boss: &BossRef) -> bool {
+        matches!(boss, BossRef::Remote { .. })
+            && boss.servable()
+            && g.boss.as_ref() == Some(boss)
+            && self.overseer_for(&served_oversight(g).scope).is_none()
+    }
+
+    /// The requests `boss`, the remote boss of `group`, owes an answer to
+    /// and hasn't been given yet, as `event` frames: in each of the grant's
+    /// sessions it runs and has the wheel of, at a level that does more
+    /// than watch, the front request Desk can answer, while the boss isn't
+    /// held by Desk's breaker. As a local boss's ([`Self::owed_asks`]):
+    /// each is given once, `offered` keeping the ones given only while
+    /// they are still open, so one raised while the person drove the
+    /// session, one that became answerable later, and one open when the
+    /// link connected all reach it. A session's words only where Sees
+    /// shows its question. Each comes with the request it gives.
+    pub(crate) fn owed_remote(
+        &self,
+        group: &str,
+        boss: &BossRef,
+        offered: &mut HashSet<(Uuid, String)>,
+    ) -> Vec<(Uuid, Value)> {
+        let Ok(g) = self.desk.grant_live(group) else {
+            offered.clear();
+            return Vec::new();
+        };
+        if !self.serves_remote(&g, boss) || served_oversight(&g).level == Level::Watch {
+            offered.clear();
+            return Vec::new();
+        }
+        let party = boss.party_id();
+        if self.desk.agent_held(&party).is_some() {
+            return Vec::new();
+        }
+        let mut open = HashSet::new();
+        let mut owed = Vec::new();
+        for c in self.desk.charges() {
+            if c.boss != party || !self.in_grant(&g, c.session) {
+                continue;
+            }
+            let Ok(view) = self.desk.view(c.session) else {
+                continue;
+            };
+            let Some(p) = view.pending.as_ref() else {
+                continue;
+            };
+            open.insert(p.id);
+            let given = (p.id, party.clone());
+            if offered.contains(&given)
+                || !p.answerable
+                || p.request.is_none()
+                || c.wheel != Wheel::Boss
+            {
+                continue;
+            }
+            offered.insert(given);
+            let line = if sees::shows(g.sees, Part::Question) {
+                let what = match p.detail.trim() {
+                    "" => p.tool.clone(),
+                    detail => format!("{}: {}", p.tool, workforce_desk::crew::clip(detail, 300)),
+                };
+                format!(
+                    "{} ({}) waits on a request: {what} (approval_id {})",
+                    view.label(),
+                    c.session,
+                    p.id
+                )
+            } else {
+                format!(
+                    "{} ({}) waits on a request (approval_id {})",
+                    view.label(),
+                    c.session,
+                    p.id
+                )
+            };
+            owed.push((
+                p.id,
+                json!({
+                    "kind": "needs_you",
+                    "subject": c.session,
+                    "line": sees::capped(&line, 2_000),
+                    "at": chrono::Utc::now(),
+                    "hop": 0,
+                }),
+            ));
+        }
+        offered.retain(|(id, _)| open.contains(id));
+        owed
     }
 
     /// Whether `id` is one of this engine's sessions in `g`.
@@ -841,5 +992,26 @@ fn boss_name(g: &Grant) -> String {
         Some(BossRef::Remote { hub, agent }) => format!("{agent} ({hub})"),
         Some(BossRef::Local { agent }) => agent.clone(),
         None => "a boss".into(),
+    }
+}
+
+/// While it lives, its remote bosses are connected
+/// ([`CrewHub::remote_up`]).
+pub(crate) struct RemoteUp {
+    crew: Arc<CrewHub>,
+    bosses: Vec<String>,
+}
+
+impl Drop for RemoteUp {
+    fn drop(&mut self) {
+        let mut up = self.crew.remote_up.lock();
+        for b in &self.bosses {
+            if let Some(n) = up.get_mut(b) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    up.remove(b);
+                }
+            }
+        }
     }
 }

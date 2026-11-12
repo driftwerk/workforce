@@ -626,7 +626,10 @@ async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
         };
         let finished = event(Kind::Finished, session.clone(), &mine, "acme");
         assert!(crew.served_event("acme", &allan(), &finished).is_some());
-        assert!(crew.served_event("acme", &bob, &finished).is_none(), "not the grant's boss");
+        assert!(
+            crew.served_event("acme", &bob, &finished).is_none(),
+            "not the grant's boss"
+        );
         let link = |agent: &str| -> crate::desk_uplink::HeldLink {
             serde_json::from_value(json!({
                 "group": "acme", "hub": "driftwerk", "hubUrl": "https://boss.example.com",
@@ -653,6 +656,198 @@ async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
             line.contains("secret plan") && line.contains("hidden reason"),
             "{line}"
         );
+    })
+    .await;
+}
+
+/// A remote boss is given each request open in a session it runs, by what
+/// is open rather than the event that raised it, once, as a local boss is
+/// (#251); no local boss is given it; the badge says why it waits on the
+/// person when the remote boss won't answer; and once the person answers
+/// on Desk, the boss's late answer does nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
+    use std::collections::HashSet;
+    use workforce_desk::crew::{Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let put = |level: &'static str, revision: u64| {
+            let (d, acme_api) = (d.clone(), acme_api.clone());
+            async move {
+                let mut body = grant(&[mine.id], &acme_api, level, "status");
+                body["revision"] = json!(revision);
+                let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", body).await;
+                assert_eq!(code, StatusCode::OK, "{out}");
+            }
+        };
+        put("act", 1).await;
+        let r = serve(
+            &crew,
+            allan(),
+            "crew.start_session",
+            json!({"folder": acme_api.to_string_lossy(), "goal": "Fix the date picker",
+                   "engine": "claude", "reason": "Next up."}),
+        )
+        .await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        let started = eventually("Allan's session", async || {
+            d.charges()
+                .into_iter()
+                .find(|c| c.boss == "driftwerk/allan")
+                .map(|c| c.session)
+        })
+        .await;
+        let url = hook_url(dir.path(), started).await;
+        let ask = |command: &str| {
+            let url = url.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": command}});
+            tokio::spawn(async move { hook(&url, body).await })
+        };
+        let pending = |command: &'static str| {
+            let d = d.clone();
+            async move {
+                eventually(command, async || {
+                    d.view(started)
+                        .unwrap()
+                        .pending
+                        .filter(|p| p.detail == command)
+                })
+                .await
+                .id
+            }
+        };
+
+        let asked = ask("cargo build --release");
+        let a = pending("cargo build --release").await;
+        let mut offered = HashSet::new();
+        let owed = eventually("the request given to Allan", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(owed.len(), 1, "{owed:?}");
+        let (given, frame) = &owed[0];
+        assert_eq!(*given, a);
+        assert_eq!(frame["kind"], "needs_you");
+        assert_eq!(frame["subject"], json!(started));
+        let line = frame["line"].as_str().unwrap();
+        assert!(line.contains(&a.to_string()), "{line}");
+        assert!(
+            !line.contains("cargo build"),
+            "Sees status: no words: {line}"
+        );
+        // Once.
+        assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+        // Never to another boss, nor by the event that raised it.
+        assert!(crew
+            .owed_remote(
+                "acme",
+                &BossRef::Remote {
+                    hub: "driftwerk".into(),
+                    agent: "bob".into()
+                },
+                &mut HashSet::new()
+            )
+            .is_empty());
+        let mut raised = Event::new(
+            Kind::NeedsYou,
+            Party::session(&d.view(started).unwrap()),
+            Some(Party::session(&d.view(started).unwrap())),
+            "wants to run cargo build --release",
+        );
+        raised.group = Some("acme".into());
+        raised.approval_id = Some(a.to_string());
+        assert!(crew.served_event("acme", &allan(), &raised).is_none());
+        // No local boss is given it.
+        assert!(crew
+            .owed_asks(&mut HashSet::new())
+            .iter()
+            .all(|(s, _, _)| *s != started));
+
+        // Who it waits on: no uplink carries Allan's link, so the person.
+        crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("isn't connected")),
+            "{why:?}"
+        );
+        {
+            let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
+            crew.overseers();
+            assert_eq!(d.view(started).unwrap().waits_on_you, None, "Allan has it");
+        }
+        crew.overseers();
+        assert!(
+            d.view(started).unwrap().waits_on_you.is_some(),
+            "gone again"
+        );
+
+        // The person answers on Desk first: Allan's late answer does nothing.
+        d.decide(
+            started,
+            a,
+            workforce_desk::model::Decision::Allow,
+            Some(By::you()),
+        )
+        .unwrap();
+        let said = asked.await.unwrap();
+        assert_eq!(said["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        let late = serve(
+            &crew,
+            allan(),
+            "crew.deny",
+            json!({"session_id": started, "approval_id": a.to_string(), "reason": "Too slow."}),
+        )
+        .await;
+        assert_ne!(late.status, ServedStatus::Ok, "{:?}", late.body);
+
+        // A new request is given again; at Suggest too, and the badge says
+        // the person decides; at Watch, never.
+        let _asked = ask("cargo test --all");
+        let b = pending("cargo test --all").await;
+        let owed = eventually("the next request", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(owed[0].0, b);
+        put("suggest", 2).await;
+        let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
+        crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("only suggests")),
+            "{why:?}"
+        );
+        assert!(!crew
+            .owed_remote("acme", &allan(), &mut HashSet::new())
+            .is_empty());
+        put("watch", 3).await;
+        crew.overseers();
+        assert!(crew
+            .owed_remote("acme", &allan(), &mut HashSet::new())
+            .is_empty());
     })
     .await;
 }

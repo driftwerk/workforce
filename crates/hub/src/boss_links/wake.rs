@@ -284,8 +284,8 @@ pub(crate) fn still_bossed(state: &GatewayState, key: &Key) -> Result<(), String
         return Err("the person may no longer make agents bosses".into());
     }
     super::links::boss_agent(state, *person, agent).map_err(|e| e.to_string())?;
-    let live = super::links::group_links(state, *person, agent, group_key)
-        .map_err(|e| e.to_string())?;
+    let live =
+        super::links::group_links(state, *person, agent, group_key).map_err(|e| e.to_string())?;
     if live.is_empty() {
         return Err("no live link of the group's".into());
     }
