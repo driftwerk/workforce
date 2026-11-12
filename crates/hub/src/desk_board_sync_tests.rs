@@ -1706,6 +1706,7 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "jira_create_issue",
         "jira_get_issue",
         "jira_get_project",
+        "jira_list_comments",
         "jira_list_transitions",
         "jira_myself",
         "jira_search",
