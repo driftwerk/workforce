@@ -111,6 +111,8 @@ pub mod desk_conversations;
 #[cfg(feature = "postgres")]
 pub mod desk_crew;
 #[cfg(feature = "postgres")]
+pub(crate) mod desk_delete;
+#[cfg(feature = "postgres")]
 pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]
@@ -147,6 +149,7 @@ pub mod heartbeat_tool;
 pub use workforce_hub_core::hosts;
 pub use workforce_hub_core::hub_core;
 pub mod by_my_email;
+pub mod chosen_me;
 pub mod identity_lifecycle;
 pub mod identity_lifecycle_tool;
 pub mod identity_tool;

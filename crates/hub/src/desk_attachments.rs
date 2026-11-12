@@ -1756,4 +1756,4 @@ impl workforce_skills::adapters::image_view::ConversationFiles for SessionFiles 
 
 #[cfg(test)]
 #[path = "desk_attachments_tests.rs"]
-mod tests;
+pub(crate) mod tests;

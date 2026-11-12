@@ -146,8 +146,8 @@ impl Tool for ByMyEmail {
 
     fn description(&self) -> &str {
         match self.on {
-            On::Linear => "The one Linear member with the email your sign-in or Slack verified, as {user: {id, name}, source} (null when there's none, several, or no verified email, with why). Takes no arguments.",
-            On::Jira => "The one Jira user with the email your sign-in or Slack verified, as {user: {id, name}, source} (null when there's none, several, Jira hides emails, or no verified email, with why). Takes no arguments.",
+            On::Linear => "Who you are in Linear, as {user: {id, name}, source}: the member you chose to be (source \"chosen\", your own word, not verified), else the one member with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, or no verified email, with why. Takes no arguments.",
+            On::Jira => "Who you are in Jira, as {user: {id, name}, source}: the user you chose to be (source \"chosen\", your own word, not verified), else the one user with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, Jira hides emails, or no verified email, with why. Takes no arguments.",
         }
     }
 
@@ -171,6 +171,27 @@ impl Tool for ByMyEmail {
             Some(Ok(Some(identity))) => identity,
             _ => return Ok(ToolResult::success(none("no_verified_email"), ms())),
         };
+        // Whom the person chose to be there comes first.
+        if matches!(
+            identity.status,
+            workforce_identity::types::IdentityStatus::Active
+                | workforce_identity::types::IdentityStatus::AutoProvisioned
+        ) && identity
+            .linked_ids
+            .keys()
+            .any(|k| crate::chosen_me::is_chosen_key(k))
+        {
+            if let Some(tools) = self.tools.upgrade() {
+                if let Ok(place) = crate::chosen_me::place_of(self.on, &tools).await {
+                    if let Some(user) = crate::chosen_me::chosen_of(&identity, self.on, &place) {
+                        return Ok(ToolResult::success(
+                            json!({ "user": user, "why": null, "source": "chosen" }),
+                            ms(),
+                        ));
+                    }
+                }
+            }
+        }
         let (email, source) =
             match crate::verified_email::verified_email_state(&identity, chrono::Utc::now()) {
                 VerifiedEmail::Fresh(email, source) => (email, source),

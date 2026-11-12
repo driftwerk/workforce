@@ -5570,6 +5570,192 @@ fn load_policy_registers_builtin_rules_in_default_config() {
     }
 }
 
+/// Asks `text` in owner-1's Desk DM under the client id `asked`, as an edit
+/// of `replaces` when it names one, and runs the turn to its end.
+async fn desk_dm_ask(
+    service: &Arc<AgentService>,
+    text: &str,
+    asked: uuid::Uuid,
+    replaces: Option<String>,
+) -> Result<()> {
+    use workforce_common::channels::desk::{
+        DeskEdit, DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext, DESK_CHANNEL,
+    };
+    let turn = DeskTurn {
+        place: DeskPlace::Dm,
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(asked),
+        spoken: false,
+        voice: None,
+        members: Vec::new(),
+        edit: replaces.map(|replaces| DeskEdit { replaces }),
+    };
+    let desk = DeskTurnContext::new(
+        turn.validated(DESK_CHANNEL).unwrap(),
+        DESK_CHANNEL,
+        None,
+        false,
+        Some("ref-1".into()),
+        format!("reply-{asked}"),
+    );
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        ..
+    } = service
+        .process_message_with_progress(
+            DESK_CHANNEL,
+            "owner-1",
+            None,
+            text,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await?;
+    while progress_rx.recv().await.is_some() {}
+    handle.await.unwrap().map(|_| ())
+}
+
+/// A Desk DM edit of the person's latest message: the reply to the old
+/// version is set aside, and the agent answers the new one, told so, which
+/// reads "(edited)". Only the latest message may be edited, and an edit
+/// whose first try saved its new version but never answered it answers it
+/// where it is when sent again, setting nothing more aside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_desk_edit_sets_aside_the_old_reply_and_asks_again() {
+    use workforce_common::channels::desk::DESK_CHANNEL;
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, server) = service_on_mock_llm(tmp.path()).await;
+    let (first, second, edited) = (
+        uuid::Uuid::from_u128(21),
+        uuid::Uuid::from_u128(22),
+        uuid::Uuid::from_u128(23),
+    );
+    desk_dm_ask(&service, "first ask", first, None)
+        .await
+        .unwrap();
+    desk_dm_ask(&service, "second ask", second, None)
+        .await
+        .unwrap();
+    let sid = service
+        .sessions
+        .find(DESK_CHANNEL, "owner-1")
+        .unwrap()
+        .unwrap()
+        .id;
+    let said = |service: &AgentService| -> (Vec<String>, Vec<String>) {
+        let archive = service
+            .sessions
+            .read_archive_page(&sid, None, 50)
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|e| matches!(e.role, MessageRole::User | MessageRole::Assistant))
+            .map(|e| e.content)
+            .collect();
+        let live = service
+            .sessions
+            .get(&sid)
+            .unwrap()
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|m| matches!(m.role, MessageRole::User | MessageRole::Assistant))
+            .map(|m| m.content)
+            .collect();
+        (archive, live)
+    };
+    let before = said(&service);
+    assert_eq!(before.1, ["first ask", "done", "second ask", "done"]);
+
+    // Not the latest: refused, and nothing is set aside.
+    let refused = desk_dm_ask(&service, "first, edited", edited, Some(first.to_string()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        crate::desk_surface::edit::ONLY_THE_LATEST
+    );
+    assert_eq!(said(&service), before);
+
+    // A first try saved the new version in the old one's place, then died
+    // before answering it: sent again, the edit answers it where it is.
+    let mut saved = workforce_common::session::SessionMessage::user(
+        "second, edited",
+        Some(&edited.to_string()),
+        None,
+        None,
+    );
+    saved.desk = Some(workforce_common::channels::desk::DeskMark {
+        speaker: Some(workforce_common::channels::desk::DeskSpeaker::Person),
+        edited: true,
+        ..Default::default()
+    });
+    let replaces = workforce_common::channels::desk::DeskEdit {
+        replaces: second.to_string(),
+    };
+    let first_try =
+        crate::desk_surface::edit::set_aside(service.sessions.as_ref(), &sid, &replaces, &saved)
+            .unwrap();
+    assert!(matches!(
+        first_try,
+        crate::desk_surface::edit::Edited::Note(_)
+    ));
+    assert_eq!(said(&service).1, ["first ask", "done", "second, edited"]);
+
+    desk_dm_ask(&service, "second, edited", edited, Some(second.to_string()))
+        .await
+        .unwrap();
+    let after = said(&service);
+    assert_eq!(after.1, ["first ask", "done", "second, edited", "done"]);
+    assert!(
+        !after.0.iter().any(|text| text == "second ask"),
+        "{after:?}"
+    );
+    let session = service.sessions.get(&sid).unwrap().unwrap();
+    let asked = session
+        .messages
+        .iter()
+        .rfind(|m| m.role == MessageRole::User)
+        .unwrap();
+    assert!(asked.desk.as_ref().is_some_and(|mark| mark.edited));
+    assert_eq!(asked.external_id, Some(edited.to_string()));
+    let requests = server.received_requests().await.unwrap();
+    let body = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .rfind(|body| body.contains("second, edited"))
+        .expect("the edit was asked");
+    assert!(
+        body.contains("The person edited their last message."),
+        "{body}"
+    );
+    assert!(
+        !body.contains("second ask"),
+        "the old version is no longer in the context"
+    );
+}
+
 /// A Desk room turn: the agent is told the room, the thread and the lines
 /// before the ask, while the transcript keeps the person's words, marked with
 /// their place, and the answer under the id the client was promised.
@@ -5601,6 +5787,7 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
         spoken: false,
         voice: None,
         members: Vec::new(),
+        edit: None,
     };
     let desk = DeskTurnContext::new(
         turn.clone().validated(&channel).unwrap(),

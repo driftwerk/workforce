@@ -531,7 +531,7 @@ pub(crate) mod tests {
             ));
             let mut summary = d.unread(&NoCrew, YOU).await.unwrap();
             for _ in 0..100 {
-                if summary.activity.count > 0 {
+                if summary.activity.count >= 2 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;

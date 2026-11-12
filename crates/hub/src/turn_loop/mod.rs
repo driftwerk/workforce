@@ -4698,6 +4698,53 @@ pub(crate) async fn stream_admitted(
         &service.sessions,
         &current_session_id,
     )?;
+    // A Desk edit of the person's latest message: under the claim, so no
+    // turn adds to the conversation meanwhile, the reply to the old version
+    // is set aside and the new version saved in its place in one step, and
+    // the agent is told what that reply did that stands. Saved, the new
+    // version is the question the conversation holds below, answered where
+    // it is: so is the same edit sent again, which finds it saved already.
+    let edit_note = match desk.and_then(|d| d.turn.edit.as_ref().map(|edit| (d, edit))) {
+        Some((desk, edit)) => {
+            let files = crate::desk_attachments::carried(
+                Arc::clone(&service.sessions),
+                service.agent_id.as_str(),
+                &session.owner,
+                attachments.as_deref(),
+            )
+            .await;
+            let asked_id = desk.turn.message.map(|id| id.to_string());
+            let mut asked = workforce_common::session::SessionMessage::user(
+                display_content.unwrap_or(message),
+                external_id.or(asked_id.as_deref()),
+                attachments.clone(),
+                trust_level,
+            );
+            asked.desk = Some(workforce_common::channels::desk::DeskMark {
+                files,
+                ..desk.turn.mark()
+            });
+            let edited = crate::desk_surface::edit::set_aside(
+                service.sessions.as_ref(),
+                &current_session_id,
+                edit,
+                &asked,
+            )?;
+            session = service
+                .sessions
+                .get(&current_session_id)?
+                .ok_or_else(|| eyre::eyre!("Session not found: {current_session_id}"))?;
+            match edited {
+                crate::desk_surface::edit::Edited::Note(note) => Some(note),
+                // What the first try set aside is gone, and with it what
+                // that reply did: the agent is told only of the edit.
+                crate::desk_surface::edit::Edited::Already => {
+                    Some(crate::desk_surface::edit::edit_note(&[], false))
+                }
+            }
+        }
+        None => None,
+    };
     // A question the conversation holds already, unanswered, under the id
     // this turn names (one the hub runs as the next turn, after the turn it
     // was sent into never read it): the turn answers it where it is. A turn
@@ -4724,6 +4771,10 @@ pub(crate) async fn stream_admitted(
     // Build augmented message with channel context and welcome directive.
     let is_new_session = session.messages.is_empty();
     let mut effective_message = message.to_string();
+    // An edit is told just ahead of what the person said, after where.
+    if let Some(note) = edit_note {
+        effective_message = format!("{note}\n\n{effective_message}");
+    }
 
     // Inject messaging context so the agent knows where it is for tool calls:
     // the Slack channel and thread, or the Desk conversation and speaker.

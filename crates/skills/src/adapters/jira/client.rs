@@ -131,6 +131,12 @@ impl JiraClient {
         Ok((Self::encode_basic_auth(&email, &token.value)?, site))
     }
 
+    /// The Jira site the calls in use go to (`https://acme.atlassian.net`),
+    /// when it's configured.
+    pub fn site(&self) -> Option<String> {
+        self.resolve_auth().ok().map(|(_, site)| site)
+    }
+
     #[cfg(test)]
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()

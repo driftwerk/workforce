@@ -1226,6 +1226,7 @@ mod tests {
                 spoken: false,
                 voice: None,
                 members: Vec::new(),
+                edit: None,
             },
             channel,
             None,

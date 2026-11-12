@@ -23,7 +23,7 @@ use super::{Desk, DeskError};
 use crate::charge::{self, Charge, How, NotChargeable, Wheel};
 use crate::crew::{self, By, Kind, Party, PartyKind};
 use crate::line::{Delivery, LineKind, LineMessage};
-use crate::model::{DeskEvent, SessionState};
+use crate::model::{DeskEvent, SessionState, SessionView};
 use crate::scope::Scope;
 
 /// What the desk keeps of charges in memory: every row, and when the
@@ -50,6 +50,12 @@ pub(crate) struct Charges {
     /// as the hub says: withheld from what a boss answers for, as Desk's
     /// data is, so no boss allows a change to its own limits.
     agent_settings: Vec<std::path::PathBuf>,
+    /// Why each boss that won't answer what its sessions ask won't, by
+    /// agent id, as the hub says: it only watches or suggests, or Desk's
+    /// breaker holds it. A boss left out answers.
+    unanswering: HashMap<String, String>,
+    /// The requests a boss was given and left open: the person's now.
+    left: std::collections::HashSet<Uuid>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -144,6 +150,100 @@ impl Desk {
     /// for [`charge::HOLD`].
     pub fn set_holds(&self, holds: HashMap<String, chrono::Duration>) {
         self.0.state.lock().charges.holds = holds;
+    }
+
+    /// Why each boss that won't answer what the sessions it runs ask won't,
+    /// by its agent id, as the hub reads their settings: a boss left out
+    /// answers. The sessions whose badge this changes are shown again.
+    pub fn set_unanswering(&self, why: HashMap<String, String>) {
+        let changed = {
+            let mut st = self.0.state.lock();
+            let changed = st.charges.unanswering != why;
+            st.charges.unanswering = why;
+            changed
+        };
+        if changed {
+            self.charges_waiting_shown();
+        }
+    }
+
+    /// The request `approval` of `session` was given to its boss, whose
+    /// turn left it open: the person's to answer now, as its badge says.
+    pub fn leave_to_person(&self, session: Uuid, approval: Uuid) {
+        let open = {
+            let mut st = self.0.state.lock();
+            let open = st
+                .live
+                .get(&session)
+                .and_then(|l| l.pending.as_ref())
+                .is_some_and(|p| p.id == approval);
+            if open {
+                // Only what is still open anywhere is kept.
+                let pending: std::collections::HashSet<Uuid> = st
+                    .live
+                    .values()
+                    .filter_map(|l| l.pending.as_ref().map(|p| p.id))
+                    .collect();
+                st.charges.left.retain(|id| pending.contains(id));
+                st.charges.left.insert(approval);
+            }
+            open
+        };
+        if open {
+            if let Ok(view) = self.view(session) {
+                self.announce(DeskEvent::Session {
+                    session: Box::new(view),
+                });
+            }
+        }
+    }
+
+    /// Shows again each session a boss runs that waits on a request, as
+    /// who it waits on may have changed.
+    fn charges_waiting_shown(&self) {
+        let views: Vec<SessionView> = {
+            let st = self.0.state.lock();
+            st.charges
+                .rows
+                .values()
+                .filter(|c| c.live())
+                .filter(|c| st.live.get(&c.session).is_some_and(|l| l.pending.is_some()))
+                .filter_map(|c| st.records.get(&c.session).map(|r| Self::view_of(&st, r)))
+                .collect()
+        };
+        for view in views {
+            self.announce(DeskEvent::Session {
+                session: Box::new(view),
+            });
+        }
+    }
+
+    /// Why what `view` waits on is the person's to answer though a boss
+    /// runs it, if it is: they drive it, only its terminal can answer it,
+    /// its boss won't answer requests, or its boss left it to them. None
+    /// while its boss has it, and when no boss runs it.
+    pub(super) fn waits_on_you(st: &super::State, view: &SessionView) -> Option<String> {
+        let p = view.pending.as_ref()?;
+        let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
+        let name = st
+            .charges
+            .names
+            .get(&c.boss)
+            .cloned()
+            .unwrap_or_else(|| "Your boss".into());
+        if Self::wheel_now(st, c).person() {
+            return Some("You're driving it.".into());
+        }
+        if !p.answerable {
+            return Some("Only its terminal can answer this.".into());
+        }
+        if let Some(why) = st.charges.unanswering.get(&c.boss) {
+            return Some(why.clone());
+        }
+        if st.charges.left.contains(&p.id) {
+            return Some(format!("{name} left this to you."));
+        }
+        None
     }
 
     /// The repositories each boss acting fully may ship in, by its agent
@@ -714,6 +814,14 @@ impl Desk {
         let _ = self.0.events.send(DeskEvent::Charge {
             charge: Box::new(view.clone()),
         });
+        // Who what it waits on waits on changes with who runs and drives it.
+        if let Ok(now) = self.view(c.session) {
+            if now.pending.is_some() {
+                self.announce(DeskEvent::Session {
+                    session: Box::new(now),
+                });
+            }
+        }
         Ok(view)
     }
 
