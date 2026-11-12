@@ -414,12 +414,12 @@ pub async fn update_identity(
     }
     if let Some(mut linked_ids) = req.linked_ids {
         // The verified email is a sign-in's to write, never an edit's.
-        crate::oidc::keep_stored_verified(&identity.linked_ids, &mut linked_ids);
+        crate::oidc_email::keep_stored_verified(&identity.linked_ids, &mut linked_ids);
         identity.linked_ids = linked_ids;
     }
     // Suspended here as through the lifecycle: the verified email goes.
     if identity.status == IdentityStatus::Suspended {
-        crate::oidc::forget_verified_email(&mut identity);
+        crate::oidc_email::forget_verified_email(&mut identity);
     }
     identity.updated_at = chrono::Utc::now();
 

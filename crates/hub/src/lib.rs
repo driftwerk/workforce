@@ -198,6 +198,7 @@ pub mod node_presence;
 pub mod notes_tool;
 #[cfg(feature = "oidc")]
 pub mod oidc;
+pub mod oidc_email;
 pub mod pairing_tool;
 pub mod passive_memory;
 pub mod passive_memory_backfill;

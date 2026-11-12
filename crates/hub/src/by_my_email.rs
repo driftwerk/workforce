@@ -6,7 +6,7 @@
 //! look as though it had.
 //!
 //! They take no arguments: the email is the caller's own, read from their
-//! identity here ([`crate::oidc::verified_email_state`]), so a caller can
+//! identity here ([`crate::oidc_email::verified_email_state`]), so a caller can
 //! never ask about anyone else, and the directory itself never leaves the
 //! hub. Each asks the agent's own adapter tool (`linear.members_list` by
 //! email, `jira.search_users`) and keeps, here, only exact matches of an
@@ -25,7 +25,7 @@ use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_identity::store::IdentityStore;
 
-use crate::oidc::VerifiedEmail;
+use crate::oidc_email::VerifiedEmail;
 
 /// Which system a tool finds the caller on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +171,7 @@ impl Tool for ByMyEmail {
             Some(Ok(Some(identity))) => identity,
             _ => return Ok(ToolResult::success(none("no_verified_email"), ms())),
         };
-        let email = match crate::oidc::verified_email_state(&identity, chrono::Utc::now()) {
+        let email = match crate::oidc_email::verified_email_state(&identity, chrono::Utc::now()) {
             VerifiedEmail::Fresh(email) => email,
             VerifiedEmail::Stale => return Ok(ToolResult::success(none("stale"), ms())),
             VerifiedEmail::None => return Ok(ToolResult::success(none("no_verified_email"), ms())),

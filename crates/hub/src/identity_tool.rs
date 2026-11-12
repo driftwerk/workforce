@@ -118,7 +118,7 @@ impl Tool for WhoAmIIdentityTool {
                 "role": identity.effective_role_key(),
                 "capabilities": capabilities.capabilities,
                 // Only what an OIDC provider verified: never a typed email.
-                "verified_email": crate::oidc::verified_email(&identity),
+                "verified_email": crate::oidc_email::verified_email(&identity),
             }),
             elapsed(),
         ))
@@ -233,11 +233,11 @@ mod tests {
         let mut identity = Identity::new("Sam", IdentityRole::Member);
         identity.email = Some("typed@example.com".into());
         identity.linked_ids.insert(
-            crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+            crate::oidc_email::OIDC_VERIFIED_EMAIL_KEY.into(),
             "sam@example.com".into(),
         );
         identity.linked_ids.insert(
-            crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+            crate::oidc_email::OIDC_VERIFIED_AT_KEY.into(),
             chrono::Utc::now().to_rfc3339(),
         );
         let mut typed = Identity::new("Typed", IdentityRole::Member);

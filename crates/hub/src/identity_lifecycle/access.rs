@@ -56,12 +56,12 @@ impl Holding for IdentityRecord {
         // The verified email goes only with the sign-in it came from.
         let moves_oidc = source
             .linked_ids
-            .contains_key(crate::oidc::OIDC_LINKED_ID_KEY)
+            .contains_key(crate::oidc_email::OIDC_LINKED_ID_KEY)
             && !target
                 .linked_ids
-                .contains_key(crate::oidc::OIDC_LINKED_ID_KEY);
+                .contains_key(crate::oidc_email::OIDC_LINKED_ID_KEY);
         for (platform, id) in from.linked() {
-            if crate::oidc::is_verified_key(platform) {
+            if crate::oidc_email::is_verified_key(platform) {
                 if moves_oidc {
                     target
                         .linked_ids
