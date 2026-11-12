@@ -114,6 +114,10 @@ pub struct Connector {
     pub site: Option<&'static str>,
     /// What a new connection's name should be, as the form says.
     pub name_hint: &'static str,
+    /// Settings beside its keys that its adapter reads (not asked for by
+    /// the form): where a single connection kept each, and where an
+    /// instance does, under `<prefix><key>/`.
+    pub extras: &'static [(&'static str, &'static str)],
 }
 
 /// Where an instance keeps the name the person gave it.
@@ -265,6 +269,11 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "token",
         site: None,
         name_hint: "The organisation or account it works in, like acme",
+        extras: &[
+            ("skills/github/base_url", "base_url"),
+            ("skills/github/app_id", "app_id"),
+            ("skills/github/app_private_key", "app_private_key"),
+        ],
     },
     Connector {
         id: "google",
@@ -286,6 +295,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "refresh_token",
         site: None,
         name_hint: "Work, Personal",
+        extras: &[],
     },
     Connector {
         id: "email",
@@ -301,6 +311,20 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "password",
         site: None,
         name_hint: "Work, Personal",
+        extras: &[
+            ("skills/email/accounts/default/imap_port", "imap_port"),
+            ("skills/email/accounts/default/smtp_port", "smtp_port"),
+            ("skills/email/accounts/default/tls", "tls"),
+            ("skills/email/accounts/default/display_name", "display_name"),
+            (
+                "skills/email/accounts/default/connect_timeout_secs",
+                "connect_timeout_secs",
+            ),
+            (
+                "skills/email/accounts/default/command_timeout_secs",
+                "command_timeout_secs",
+            ),
+        ],
     },
     Connector {
         id: "jira",
@@ -316,6 +340,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_token",
         site: Some("site"),
         name_hint: "Acme",
+        extras: &[("skills/jira/default_project", "default_project")],
     },
     Connector {
         id: "linear",
@@ -331,6 +356,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_key",
         site: None,
         name_hint: "Acme",
+        extras: &[("skills/linear/default_team_id", "default_team_id")],
     },
     Connector {
         id: "slack",
@@ -346,6 +372,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "",
         site: None,
         name_hint: "",
+        extras: &[],
     },
     Connector {
         id: "datadog",
@@ -361,6 +388,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_key",
         site: Some("site"),
         name_hint: "Production",
+        extras: &[("skills/datadog/base_url", "base_url")],
     },
     Connector {
         id: "metabase",
@@ -376,6 +404,7 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_key",
         site: Some("site_url"),
         name_hint: "Acme",
+        extras: &[("skills/metabase/max_query_rows", "max_query_rows")],
     },
 ];
 
@@ -425,6 +454,7 @@ impl Connector {
             Some(_) => self
                 .subs
                 .iter()
+                .chain(self.extras.iter().map(|(_, sub)| sub))
                 .chain([&LABEL])
                 .map(|sub| self.at(key, sub))
                 .collect(),
@@ -509,6 +539,10 @@ mod tests {
             }
             if c.named() {
                 assert_eq!(c.key_of(&c.primary_at("acme")), Some("acme"));
+            }
+            // Each setting an instance holds is one the vault editor offers.
+            for (_, sub) in c.extras {
+                assert!(known(&c.at("acme", sub)), "{} holds {sub}", c.id);
             }
         }
     }

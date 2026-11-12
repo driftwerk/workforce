@@ -1676,6 +1676,22 @@ fn credential_families() -> Vec<CatalogEntry> {
     entries
 }
 
+/// Settings an instance of a Desk connector holds beside its keys, which
+/// its adapter reads: `(connector, key, what it is)`.
+pub const INSTANCE_SETTINGS: &[(&str, &str, &str)] = &[
+    ("github", "base_url", "API address (GitHub Enterprise)"),
+    ("github", "app_id", "GitHub App id"),
+    ("github", "app_private_key", "GitHub App private key"),
+    ("jira", "default_project", "Default project key"),
+    ("linear", "default_team_id", "Default team id"),
+    ("email", "imap_port", "IMAP port"),
+    ("email", "smtp_port", "SMTP port"),
+    ("email", "tls", "Use TLS"),
+    ("email", "display_name", "Display name"),
+    ("email", "connect_timeout_secs", "Connect timeout (seconds)"),
+    ("email", "command_timeout_secs", "Command timeout (seconds)"),
+];
+
 /// Per-skill "default <thing>" selector pointers (`skills/<skill>/default_<x>`)
 /// that pick the active workspace when a tool omits it. Recognised + addable so
 /// the pointer is never badged unrecognised. Suffixes are irregular (xero uses
@@ -1841,6 +1857,41 @@ pub fn credential_catalog() -> Vec<CatalogEntry> {
                     per_user_allowed: meta.default_scope.allows_per_user(),
                     required: wc.required,
                     description: wc.description.to_string(),
+                    multiline: false,
+                });
+            }
+            // What else an instance of a Desk connector holds that its
+            // adapter reads: moved with it from where a single connection
+            // kept it.
+            for (connector, key, description) in INSTANCE_SETTINGS {
+                let template = format!("{prefix}{{{var_name}}}/{key}");
+                if *connector != meta.tool_prefix
+                    || dotted
+                    || entries
+                        .iter()
+                        .any(|e: &CatalogEntry| e.template == template)
+                {
+                    continue;
+                }
+                entries.push(CatalogEntry {
+                    id: template.clone(),
+                    skill: Some(meta.name.to_string()),
+                    group: group.clone(),
+                    label: format!("{} — {description} (per {var_name})", meta.name),
+                    template,
+                    variables: vec![CatalogVariable {
+                        name: var_name.to_string(),
+                        label: var_label.to_string(),
+                        placeholder: "change-me".to_string(),
+                        example: None,
+                    }],
+                    source: "builtin",
+                    addable: true,
+                    scope,
+                    managed_by: managed,
+                    per_user_allowed: meta.default_scope.allows_per_user(),
+                    required: false,
+                    description: description.to_string(),
                     multiline: false,
                 });
             }

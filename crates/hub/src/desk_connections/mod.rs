@@ -772,14 +772,21 @@ impl Connections {
         }
     }
 
-    /// [`Self::migrate`] of `c` at one tier: the instance it moved to, if
-    /// it moved or was named.
+    /// [`Self::migrate`] of `c` at one tier: the instance it moved to or
+    /// named, if anything changed.
     ///
     /// It becomes the adapters' `default` (GitHub's: the owner it reached),
     /// unless another level holds that already (the person's connection for
     /// all their agents, migrated first): it then takes a key of its own,
     /// from its account, else the service, so the two stay two connections
     /// an agent can pick one by one.
+    ///
+    /// Every field and setting moves (its keys, its address, the settings
+    /// its adapter reads beside them), one by one, and none is written over:
+    /// one the instance holds already stays, the flat one with it beside it
+    /// if they differ (said in the log), gone if they are the same. So a
+    /// flat key written after the move (by an older tool, say) joins the
+    /// connection it belongs to, never replacing what it holds.
     fn migrate_at(
         &self,
         c: &Connector,
@@ -793,15 +800,34 @@ impl Connections {
         // Email and Google always kept theirs at `default`, the instance
         // path: unnamed, it is one kept before Connections named them.
         let native = c.primary == c.primary_at(DEFAULT_INSTANCE);
-        if vault.get(&key_at(tier, person, c.primary)).is_none() {
+        // Where each field and setting is kept now, and its name in an
+        // instance.
+        let pairs: Vec<(String, &str)> = c
+            .fields
+            .iter()
+            .map(|f| match native {
+                true => (c.at(DEFAULT_INSTANCE, f.sub), f.sub),
+                false => (f.path.to_string(), f.sub),
+            })
+            .chain(c.extras.iter().map(|(flat, sub)| (flat.to_string(), *sub)))
+            .collect();
+        let present: Vec<(String, &str, String)> = pairs
+            .into_iter()
+            .filter_map(|(from, sub)| {
+                let at = key_at(tier, person, &from);
+                vault.get(&at).map(|v| (at, sub, v))
+            })
+            .collect();
+        if present.is_empty() {
             return Ok(None);
         }
+        let has_key = vault.get(&key_at(tier, person, c.primary)).is_some();
         let default_label = key_at(
             tier,
             person,
             &c.label_at(DEFAULT_INSTANCE).expect("a named connector"),
         );
-        if native && vault.get(&default_label).is_some() {
+        if native && (!has_key || vault.get(&default_label).is_some()) {
             return Ok(None);
         }
         let account = checked.and_then(|k| k.account.clone()).or_else(|| {
@@ -840,62 +866,61 @@ impl Connections {
         if taken {
             key = self.new_key(c, person, &name);
         }
+        let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
+        // Email's or Google's own `default`: it only needs a name.
         if native && key == DEFAULT_INSTANCE {
             vault.apply(
                 &[VaultOp::Set {
-                    path: &default_label,
+                    path: &label,
                     value: &name,
                 }],
                 actor,
             )?;
-            return Ok(Some(DEFAULT_INSTANCE.to_string()));
+            return Ok(Some(key));
         }
-        if vault
+        let target_has_key = vault
             .get(&key_at(tier, person, &c.primary_at(&key)))
-            .is_some()
-        {
-            warn!(
+            .is_some();
+        // Settings with no key of their own, and no connection to join:
+        // left as they are.
+        if !has_key && !target_has_key {
+            tracing::debug!(
                 connector = c.id,
-                instance = %key,
-                "a flat connection wasn't moved: a connection of that name is kept already"
+                "flat settings with no connection to join stay"
             );
             return Ok(None);
         }
-        // What it holds, from where it is kept now to its instance's.
-        let from: Vec<(String, String)> = match native {
-            true => c
-                .subs
-                .iter()
-                .map(|sub| (c.at(DEFAULT_INSTANCE, sub), c.at(&key, sub)))
-                .collect(),
-            false => c
-                .fields
-                .iter()
-                .map(|f| (f.path.to_string(), c.field_at(f, &key)))
-                .collect(),
-        };
-        let moving: Vec<(String, String, String)> = from
-            .into_iter()
-            .filter_map(|(from, to)| {
-                let from = key_at(tier, person, &from);
-                let value = vault.get(&from)?;
-                Some((from, key_at(tier, person, &to), value))
-            })
+        let mut sets: Vec<(String, String)> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        for (from, sub, value) in &present {
+            let to = key_at(tier, person, &c.at(&key, sub));
+            match vault.get(&to) {
+                None => {
+                    sets.push((to, value.clone()));
+                    deletes.push(from.clone());
+                }
+                Some(kept) if kept == *value => deletes.push(from.clone()),
+                Some(_) => warn!(
+                    connector = c.id,
+                    instance = %key,
+                    field = sub,
+                    "a flat setting differs from the connection's own and stays beside it; the connection's is used"
+                ),
+            }
+        }
+        if vault.get(&label).is_none() {
+            sets.push((label.clone(), name.clone()));
+        }
+        if sets.is_empty() && deletes.is_empty() {
+            return Ok(None);
+        }
+        let mut ops: Vec<VaultOp<'_>> = sets
+            .iter()
+            .map(|(path, value)| VaultOp::Set { path, value })
             .collect();
-        let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
-        let mut ops: Vec<VaultOp<'_>> = Vec::new();
-        for (_, to, value) in &moving {
-            ops.push(VaultOp::Set { path: to, value });
-        }
-        ops.push(VaultOp::Set {
-            path: &label,
-            value: &name,
-        });
-        for (from, _, _) in &moving {
-            ops.push(VaultOp::Delete { path: from });
-        }
+        ops.extend(deletes.iter().map(|path| VaultOp::Delete { path }));
         vault.apply(&ops, actor)?;
-        info!(connector = c.id, instance = %key, tier = ?tier, "a flat connection moved to a named one");
+        info!(connector = c.id, instance = %key, tier = ?tier, moved = deletes.len(), "a flat connection moved to a named one");
         Ok(Some(key))
     }
 

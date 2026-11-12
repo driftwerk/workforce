@@ -900,13 +900,17 @@ async fn a_flat_connection_moves_to_a_named_one_at_its_own_tier_and_nothing_is_l
         assert!(h.global.get(&flat).is_none(), "{flat} moved");
     }
     assert!(h.allan.get(&mine("skills/linear/api_key")).is_none());
-    // A companion the catalog doesn't hold stays where it was.
+    // A setting the adapter reads beside the key moves with it.
     assert_eq!(
         h.global
-            .get(&mine("skills/linear/default_team_id"))
+            .get(&mine(&ws("default", "default_team_id")))
             .as_deref(),
         Some("team-1")
     );
+    assert!(h
+        .global
+        .get(&mine("skills/linear/default_team_id"))
+        .is_none());
     let linear = &connector(&list, "linear").connections[0];
     assert_eq!(linear.account.as_deref(), Some("sarah@acme.example"));
     // Every agent it reaches loads it again.
@@ -939,6 +943,116 @@ async fn a_flat_connection_never_moves_over_a_named_one() {
         Some(GOOD),
         "left as it was"
     );
+}
+
+#[tokio::test]
+async fn every_setting_an_adapter_reads_moves_with_its_connection() {
+    let h = hub().await;
+    for (path, value) in [
+        ("skills/datadog/api_key", "dd-api"),
+        ("skills/datadog/app_key", "dd-app"),
+        ("skills/datadog/site", "eu1"),
+        ("skills/datadog/base_url", "https://api.datadoghq.eu"),
+        ("skills/metabase/api_key", "mb-key"),
+        ("skills/metabase/site_url", "https://mb.acme.example"),
+        ("skills/metabase/max_query_rows", "500"),
+        ("skills/jira/api_token", "jira-token"),
+        ("skills/jira/email", "sarah@acme.example"),
+        ("skills/jira/site", "acme.atlassian.net"),
+        ("skills/jira/default_project", "ACM"),
+        ("skills/email/accounts/default/username", "bot@acme.example"),
+        ("skills/email/accounts/default/password", "app-pass"),
+        (
+            "skills/email/accounts/default/imap_host",
+            "imap.acme.example",
+        ),
+        ("skills/email/accounts/default/imap_port", "1993"),
+    ] {
+        h.allan.set(&mine(path), value).unwrap();
+    }
+    // The person's own Email for all agents takes `default`, so Allan's
+    // moves to a key of its own, settings and all.
+    h.global
+        .set(&mine("skills/email/accounts/default/password"), "p")
+        .unwrap();
+    h.c.migrate(SARAH).await;
+    let at = |path: &str| h.allan.get(&mine(path));
+    assert_eq!(
+        at("skills/datadog/accounts/default/base_url").as_deref(),
+        Some("https://api.datadoghq.eu")
+    );
+    assert_eq!(
+        at("skills/datadog/accounts/default/site").as_deref(),
+        Some("eu1")
+    );
+    assert_eq!(
+        at("skills/metabase/instances/default/max_query_rows").as_deref(),
+        Some("500")
+    );
+    assert_eq!(
+        at("skills/jira/workspaces/default/default_project").as_deref(),
+        Some("ACM")
+    );
+    assert_eq!(
+        at("skills/email/accounts/bot-acme-example/imap_port").as_deref(),
+        Some("1993")
+    );
+    let left: Vec<String> = keys(&h.allan)
+        .into_iter()
+        .filter(|k| {
+            !k.contains("/workspaces/") && !k.contains("/accounts/") && !k.contains("/instances/")
+        })
+        .collect();
+    assert!(left.is_empty(), "nothing flat is left: {left:?}");
+    assert!(at("skills/email/accounts/default/imap_port").is_none());
+}
+
+#[tokio::test]
+async fn no_field_of_a_named_connection_is_ever_written_over() {
+    let h = hub().await;
+    // A named connection, and a flat one beside it that disagrees on its
+    // site and has a setting the named one doesn't.
+    for (f, v) in [
+        ("api_token", "named-token"),
+        ("email", "sarah@acme.example"),
+        ("site", "acme.atlassian.net"),
+    ] {
+        h.global
+            .set(&mine(&format!("skills/jira/workspaces/default/{f}")), v)
+            .unwrap();
+    }
+    h.global
+        .set(&mine("skills/jira/api_token"), "named-token")
+        .unwrap();
+    h.global
+        .set(&mine("skills/jira/site"), "elsewhere.atlassian.net")
+        .unwrap();
+    h.global
+        .set(&mine("skills/jira/default_project"), "ACM")
+        .unwrap();
+    h.c.migrate(SARAH).await;
+    let at = |path: &str| h.global.get(&mine(path));
+    // The named one's site stays; the flat one that differs stays beside it.
+    assert_eq!(
+        at("skills/jira/workspaces/default/site").as_deref(),
+        Some("acme.atlassian.net")
+    );
+    assert_eq!(
+        at("skills/jira/site").as_deref(),
+        Some("elsewhere.atlassian.net")
+    );
+    // The same key is the same: the flat copy goes.
+    assert!(at("skills/jira/api_token").is_none());
+    // A setting written flat after the move joins the connection.
+    assert_eq!(
+        at("skills/jira/workspaces/default/default_project").as_deref(),
+        Some("ACM")
+    );
+    assert!(at("skills/jira/default_project").is_none());
+    // Again: nothing changes.
+    let before = keys(&h.global);
+    h.c.migrate(SARAH).await;
+    assert_eq!(before, keys(&h.global));
 }
 
 #[tokio::test]
