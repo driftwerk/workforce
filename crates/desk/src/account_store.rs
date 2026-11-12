@@ -150,7 +150,7 @@ impl DeskStore {
     }
 
     /// The exchanges of `session`'s conversation begun since `since` (all
-    /// with none), newest first, at most `limit`: those it harvested itself
+    /// with none), at most `limit`, newest first (or `oldest_first`): those it harvested itself
     /// and those its record holds that another session kept first (a
     /// resumed or forked conversation's history). Each with whether it was
     /// flagged as reading like instructions.
@@ -159,17 +159,24 @@ impl DeskStore {
         session: Uuid,
         since: Option<DateTime<Utc>>,
         limit: i64,
+        oldest_first: bool,
     ) -> Result<Vec<(Exchange, bool)>> {
         let client = self.pool().get().await?;
+        let order = match oldest_first {
+            true => "ASC",
+            false => "DESC",
+        };
         client
             .query(
-                "SELECT e.key, e.at, e.ended, e.asker, e.ask, e.answer, e.steps, e.errors, \
+                &format!(
+                    "SELECT e.key, e.at, e.ended, e.asker, e.ask, e.answer, e.steps, e.errors, \
                    cardinality(e.flagged) > 0 \
                  FROM memory_exchanges e \
                  WHERE (e.session = $1 OR EXISTS (SELECT 1 FROM memory_record_keys k \
                      WHERE k.session = $1 AND k.engine = e.engine AND k.key = e.key)) \
                    AND ($2::timestamptz IS NULL OR e.at >= $2) AND NOT e.compaction \
-                 ORDER BY e.at DESC, e.seq DESC LIMIT $3",
+                 ORDER BY e.at {order}, e.seq {order} LIMIT $3"
+                ),
                 &[&session, &since, &limit],
             )
             .await
@@ -323,13 +330,15 @@ mod tests {
     /// The keys a refresh would read now, oldest first, and the cursor
     /// after it.
     async fn unread(store: &DeskStore, s: Uuid, c: &Cursor) -> (Vec<String>, Cursor) {
-        let rows = store.account_exchanges(s, c.since(), 100).await.unwrap();
-        let mut keys: Vec<(String, DateTime<Utc>)> = rows
+        let rows = store
+            .account_exchanges(s, c.since(), 100, true)
+            .await
+            .unwrap();
+        let keys: Vec<(String, DateTime<Utc>)> = rows
             .into_iter()
             .filter(|(x, _)| c.unread(&x.key, x.at))
             .map(|(x, _)| (x.key, x.at))
             .collect();
-        keys.reverse();
         let next = c.with(keys.iter().map(|(k, at)| Read {
             key: k.clone(),
             at: *at,

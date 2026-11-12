@@ -25,6 +25,10 @@ const LOOK_EVERY: Duration = Duration::from_secs(60);
 const ATTENDED_FOR: Duration = Duration::from_secs(60 * 60);
 /// The most exchanges read back to find the unread ones.
 const READ_BACK: i64 = 100;
+/// The most refreshes one turn's end makes to catch up on a backlog.
+const CATCH_UP_ROUNDS: usize = 3;
+/// The longest one look at a running turn may take.
+const LOOK_WITHIN: Duration = Duration::from_secs(90);
 
 /// Why an account is refreshed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +83,8 @@ struct Said {
     written: Written,
     by_model: bool,
     reads: Vec<Read>,
+    /// Closed exchanges are left unread for another round.
+    more: bool,
 }
 
 fn fingerprint(tail: &Tail) -> u64 {
@@ -186,7 +192,17 @@ impl Desk {
                     // The refresh runs on its own, so a caller that stops
                     // waiting never leaves the others waiting.
                     let desk = self.clone();
-                    tokio::spawn(async move { desk.account_flight(id, moment).await });
+                    tokio::spawn(async move {
+                        let flight = desk.clone();
+                        let run =
+                            tokio::spawn(async move { flight.account_flight(id, moment).await });
+                        if run.await.is_err() {
+                            // It panicked: its callers are let go (the
+                            // sender drops) and the next refresh starts anew.
+                            tracing::warn!(session = %id, "a session's account refresh stopped short");
+                            desk.0.accounts.flights.lock().remove(&id);
+                        }
+                    });
                     rx
                 }
             }
@@ -268,42 +284,64 @@ impl Desk {
             notes,
         };
         let working = v.state == crate::model::SessionState::Working;
-        let said = match moment {
-            Moment::MidTurn => match self.account_now(id, &kept, &ctx).await? {
-                Some(s) => s,
-                None => return Ok(Some(kept)),
-            },
-            Moment::Read | Moment::TurnEnd => {
-                let ended = moment == Moment::TurnEnd || !working;
-                match self
-                    .account_delta(id, &v, &kept, &ctx, ended, working)
-                    .await?
-                {
+        let mut kept = kept;
+        let mut handed_by_model = kept.by_model;
+        // A backlog is caught up on in a few rounds, the oldest first.
+        for _ in 0..CATCH_UP_ROUNDS {
+            let said = match moment {
+                Moment::MidTurn => match self.account_now(id, &kept, &ctx).await? {
                     Some(s) => s,
-                    None => {
-                        // Nothing new said: the floor's gist still comes
-                        // from the account, as kept.
-                        if moment == Moment::TurnEnd && kept.version > 0 {
-                            self.account_hand_gist(id, &kept, kept.by_model).await;
-                        }
-                        return Ok((kept.version > 0).then_some(kept));
+                    None => return Ok(Some(kept)),
+                },
+                Moment::Read | Moment::TurnEnd => {
+                    let ended = moment == Moment::TurnEnd || !working;
+                    match self
+                        .account_delta(id, &v, &kept, &ctx, ended, working)
+                        .await?
+                    {
+                        Some(s) => s,
+                        None => break,
                     }
                 }
+            };
+            let more = said.more && moment != Moment::MidTurn;
+            handed_by_model = said.by_model;
+            kept = self.account_write(id, &kept, said, at).await?;
+            if !more {
+                break;
             }
-        };
+        }
+        // The floor's gist comes from the account, also when nothing new
+        // was said.
+        if moment == Moment::TurnEnd && kept.version > 0 {
+            self.account_hand_gist(id, &kept, handed_by_model).await;
+        }
+        Ok((kept.version > 0).then_some(kept))
+    }
+
+    /// Writes what `said` says onto `kept`, compare-and-set: the account
+    /// as kept after.
+    async fn account_write(
+        &self,
+        id: Uuid,
+        kept: &Account,
+        said: Said,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> eyre::Result<Account> {
         let asked_by = match kept.asked_by.is_empty() {
             true => Some(self.account_asked_by(id)),
             false => None,
         };
         let written = self.account_redacted(said.written);
-        let mut fresh = account::merge(&kept, &written, at);
+        let mut fresh = account::merge(kept, &written, at);
         if let Some(a) = &asked_by {
             fresh.asked_by = a.clone();
         }
         fresh.cursor = kept.cursor.with(said.reads.iter().cloned());
-        fresh.by_model = said.by_model;
+        // A plain write never says the model's words are gone.
+        fresh.by_model = said.by_model || kept.by_model;
         fresh.stale_after = None;
-        let kept_now = match self.0.store.session_account_put(&fresh).await? {
+        Ok(match self.0.store.session_account_put(&fresh).await? {
             Put::Kept(v) => Account {
                 version: v,
                 ..fresh
@@ -336,11 +374,7 @@ impl Desk {
                     }
                 }
             }
-        };
-        if moment == Moment::TurnEnd {
-            self.account_hand_gist(id, &kept_now, said.by_model).await;
-        }
-        Ok(Some(kept_now))
+        })
     }
 
     /// Hands the floor session `id`'s turn-end gist, said from `a`.
@@ -391,6 +425,9 @@ impl Desk {
             hide(text);
             for r in refs {
                 hide(&mut r.id);
+                if let Some(url) = &mut r.url {
+                    hide(url);
+                }
             }
         }
         for (what, why) in &mut w.decisions {
@@ -461,8 +498,15 @@ impl Desk {
         let Some(accountant) = self.0.accounts.accountant.clone() else {
             return Ok(None);
         };
-        if !self.account_take(kind).await? {
-            return Ok(None);
+        match self.account_take(kind).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(e) => {
+                // The day's count can't be read: no model is asked, and
+                // the account is said plainly.
+                tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't count the cheap model's calls; a session's account is said plainly");
+                return Ok(None);
+            }
         }
         self.0
             .accounts
@@ -500,20 +544,46 @@ impl Desk {
         ended: bool,
         working: bool,
     ) -> eyre::Result<Option<Said>> {
+        // A first account starts from the newest exchanges (its goal says
+        // what came before); after that every exchange is read in order,
+        // the oldest unread first, so none is passed over.
+        let first = kept.cursor.newest.is_none();
         let rows = self
             .0
             .store
-            .account_exchanges(id, kept.cursor.since(), READ_BACK)
+            .account_exchanges(id, kept.cursor.since(), READ_BACK, !first)
             .await?;
         let mut unread: Vec<(account::Exchange, bool)> = rows
             .into_iter()
             .filter(|(x, _)| x.ended.is_none() || kept.cursor.unread(&x.key, x.at))
             .collect();
-        unread.reverse();
-        // Every closed exchange found is read now; one still running is
-        // read again once it closes. What reads as instructions to a model
-        // is never given to one.
-        let reads: Vec<Read> = unread
+        if first {
+            unread.reverse();
+        }
+        // What reads as instructions to a model is never given to one.
+        let given: Vec<account::Exchange> = unread
+            .iter()
+            .filter(|(_, flagged)| !flagged)
+            .map(|(x, _)| x.clone())
+            .collect();
+        let delta = match first {
+            true => account::fit(&given),
+            false => account::fit_oldest(&given),
+        };
+        // Read now: every closed exchange up to the last one given (all of
+        // them for a first account); one still running is read again once
+        // it closes. Closed ones past it wait for the next round.
+        let upto = match first {
+            true => unread.len(),
+            false => match delta.last() {
+                Some(last) => unread
+                    .iter()
+                    .position(|(x, _)| x.key == last.key)
+                    .map_or(unread.len(), |i| i + 1),
+                None => unread.len(),
+            },
+        };
+        let reads: Vec<Read> = unread[..upto]
             .iter()
             .filter(|(x, _)| x.ended.is_some())
             .map(|(x, _)| Read {
@@ -521,12 +591,7 @@ impl Desk {
                 at: x.at,
             })
             .collect();
-        let given: Vec<account::Exchange> = unread
-            .into_iter()
-            .filter(|(_, flagged)| !flagged)
-            .map(|(x, _)| x)
-            .collect();
-        let delta = account::fit(&given);
+        let more = unread[upto..].iter().any(|(x, _)| x.ended.is_some());
         // The harvest is off or behind, or the turn still runs: what the
         // transcript and screen say fills in.
         let closed = delta.iter().any(|x| x.ended.is_some());
@@ -535,13 +600,20 @@ impl Desk {
             false => Tail::default(),
         };
         if delta.is_empty() && tail.is_empty() {
-            return Ok(None);
+            // Only flagged exchanges: read, so they aren't looked at again.
+            return Ok((!reads.is_empty()).then(|| Said {
+                written: Written::default(),
+                by_model: kept.by_model,
+                reads,
+                more,
+            }));
         }
         if account::short(delta) {
             return Ok(Some(Said {
                 written: account::plainly(kept, ctx, delta, &tail, ended),
                 by_model: false,
                 reads,
+                more,
             }));
         }
         let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
@@ -562,11 +634,13 @@ impl Desk {
                 written: w,
                 by_model: true,
                 reads,
+                more,
             },
             None => Said {
                 written: account::plainly(kept, ctx, delta, &tail, ended),
                 by_model: false,
                 reads,
+                more,
             },
         }))
     }
@@ -609,6 +683,7 @@ impl Desk {
             },
             by_model: false,
             reads: vec![],
+            more: false,
         };
         if short {
             return Ok(Some(plain()));
@@ -633,6 +708,7 @@ impl Desk {
                 },
                 by_model: true,
                 reads: vec![],
+                more: false,
             },
             None => plain(),
         }))
@@ -667,8 +743,16 @@ impl Desk {
                 .filter(|id| self.account_kept_for(*id) && self.account_attended(*id))
                 .collect();
             for id in due {
-                if let Err(e) = self.account_refresh(id, Moment::MidTurn).await {
-                    tracing::debug!(session = %id, error = %e, "couldn't write a running turn's now");
+                match tokio::time::timeout(LOOK_WITHIN, self.account_refresh(id, Moment::MidTurn))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(session = %id, error = %e, "couldn't write a running turn's now")
+                    }
+                    Err(_) => {
+                        tracing::info!(session = %id, "a running turn's now took too long; the others are looked at")
+                    }
                 }
             }
         }

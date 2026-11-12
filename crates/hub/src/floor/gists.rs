@@ -176,7 +176,8 @@ struct Inner {
     hands_off: OnceLock<HandsOff>,
     /// Turn-end gists handed to the account writer, waiting for it.
     handed: Mutex<HashMap<SubjectKey, Job>>,
-    /// When the account writer last wrote each session's gist.
+    /// Gists the account writer wrote before the floor saw their turn
+    /// end, each taken by that turn end.
     delivered: Mutex<HashMap<SubjectKey, Instant>>,
 }
 
@@ -266,11 +267,12 @@ impl Gists {
     /// [`HANDED_FOR`] (it couldn't), the floor writes it as ever.
     async fn handed(&self, job: Job) {
         let key = job.whose.1.clone();
+        // Used up here, so a later turn's end is never taken as written.
         let just = self
             .0
             .delivered
             .lock()
-            .get(&key)
+            .remove(&key)
             .is_some_and(|at| at.elapsed() < DELIVERED_FOR);
         if just {
             // Its account came first: the gist is written already.
@@ -304,7 +306,11 @@ impl Gists {
     ) {
         let key = SubjectKey::session(session);
         let handed = self.0.handed.lock().remove(&key);
-        self.0.delivered.lock().insert(key.clone(), Instant::now());
+        if handed.is_none() {
+            // The account came before the floor's turn end: that end is
+            // written already once it comes.
+            self.0.delivered.lock().insert(key.clone(), Instant::now());
+        }
         let owner = handed.as_ref().and_then(|j| j.whose.0.clone());
         let whose: Whose = (owner.clone(), key.clone());
         let lock = Arc::clone(self.0.writing.lock().entry(whose).or_default());

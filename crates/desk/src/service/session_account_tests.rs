@@ -226,6 +226,44 @@ async fn a_turn_end_is_read_from_its_exchanges_once_and_hands_the_floor_a_plain_
 }
 
 #[tokio::test]
+async fn a_backlog_is_read_oldest_first_and_none_is_passed_over() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER, ANSWER, ANSWER, ANSWER]);
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(&store, id, &[exchange("a00", 40, &"Began. ".repeat(60), 1)]).await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        // More than one refresh reads: a long gap, or refreshes that failed.
+        let backlog: Vec<Exchange> = (0..20)
+            .map(|i| exchange(&format!("b{i:02}"), 30 - i, &"Worked on. ".repeat(60), 1))
+            .collect();
+        harvested(&store, id, &backlog).await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        let asked: Vec<String> = fake.asked.lock().iter().map(|a| a.2.clone()).collect();
+        assert_eq!(asked.len(), 3, "the backlog is caught up on in rounds");
+        assert!(asked[1].contains("Please do b00"), "the oldest first");
+        assert!(!asked[1].contains("Please do b19"));
+        assert!(asked[2].contains("Please do b19"));
+        assert!(!asked[2].contains("Please do b00"), "each read once");
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 3, "nothing is left unread");
+        assert_eq!(fake.gists.lock().len(), 3, "one gist per turn end");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn two_refreshes_at_once_make_one_call() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

@@ -401,9 +401,20 @@ fn asker_of(a: Asker) -> &'static str {
 /// The exchanges one refresh reads: of `unread` (oldest first), the newest
 /// that fit [`DELTA_CHARS`] and [`DELTA_EXCHANGES`], oldest first again.
 pub fn fit(unread: &[Exchange]) -> &[Exchange] {
+    let n = fitting(unread.iter().rev());
+    &unread[unread.len() - n..]
+}
+
+/// The exchanges one catch-up refresh reads: of `unread` (oldest first),
+/// the oldest that fit, so what follows them is read by the next.
+pub fn fit_oldest(unread: &[Exchange]) -> &[Exchange] {
+    &unread[..fitting(unread.iter())]
+}
+
+fn fitting<'a>(xs: impl Iterator<Item = &'a Exchange>) -> usize {
     let mut used = 0usize;
     let mut n = 0usize;
-    for x in unread.iter().rev().take(DELTA_EXCHANGES) {
+    for x in xs.take(DELTA_EXCHANGES) {
         let size = x.ask.len().min(ASK_CHARS)
             + x.answer.len().min(REPLY_CHARS)
             + x.steps.len().min(STEPS_MAX) * STEP_CHARS / 2;
@@ -413,7 +424,7 @@ pub fn fit(unread: &[Exchange]) -> &[Exchange] {
         used += size;
         n += 1;
     }
-    &unread[unread.len() - n..]
+    n
 }
 
 fn record(out: &mut String, ctx: &Context, delta: &[Exchange], tail: &Tail) {
@@ -979,6 +990,9 @@ mod tests {
         let fitted = fit(&delta);
         assert!(!fitted.is_empty() && fitted.len() < delta.len());
         assert_eq!(fitted.last().unwrap().key, "k39", "the newest are read");
+        let caught = fit_oldest(&delta);
+        assert_eq!(caught.len(), fitted.len());
+        assert_eq!(caught[0].key, "k0", "a catch-up reads the oldest first");
         let mut hostile = x(
             "h",
             0,
