@@ -71,17 +71,6 @@ text_enum!(Billing {
     Unknown => "unknown",
 });
 
-impl Billing {
-    /// Whether its calls are real money someone is billed for by the call:
-    /// an API key's, Bedrock's and Vertex's (Claude Code reports those as
-    /// a key). A plan's calls (Claude, ChatGPT) are worth their
-    /// API-equivalent but bill nobody; a vendor's own account (Devin,
-    /// Copilot) is its plan; and a call Desk can't say the billing of is
-    /// not counted as billed.
-    pub fn billed(self) -> bool {
-        matches!(self, Self::Key)
-    }
-}
 
 /// One model call as an engine recorded it.
 #[derive(Debug, Clone, PartialEq)]

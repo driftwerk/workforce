@@ -14,7 +14,7 @@ use workforce_orchestrator::workflow_store::EditContext;
 
 use super::{name_of, CrewHub};
 
-pub const NAME: &str = "crew.ask_oversight_change";
+pub const NAME: &str = workforce_desk::crew::OWN_OVERSIGHT_TOOL;
 
 pub const DESCRIPTION: &str = "Ask the person to change your own oversight settings: your level \
 (watch, suggest, act, full), Act fully's daily budget (raise or remove it, or clear what today's \

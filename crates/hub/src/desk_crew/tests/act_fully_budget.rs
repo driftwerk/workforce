@@ -41,6 +41,19 @@ async fn spent(d: &Desk, session: uuid::Uuid, billing: Billing, usd: f64) {
         .unwrap();
 }
 
+/// Claude Code seen signed in as `via` now.
+async fn keep_sign_in(d: &Desk, via: workforce_desk::engine::Via) {
+    d.store()
+        .keep_sign_in(&workforce_desk::ledger_store::KeptSignIn {
+            engine: Engine::Claude,
+            via,
+            who: None,
+            since: chrono::Utc::now() - chrono::Duration::days(1),
+        })
+        .await
+        .unwrap();
+}
+
 /// A model call of the hub agent `agent`'s, of `usd`, paid as `billing`.
 fn hub_call(service: &AgentService, agent: &str, billing: HubBilling, usd: f64) {
     assert!(service
@@ -78,7 +91,10 @@ async fn plans_never_spend_act_fullys_budget_and_real_money_does() {
         // the overseer's own claude-code turns.
         spent(&d, s.id, Billing::Plan, 600.0).await;
         hub_call(&overseer, &id, HubBilling::Subscription, 400.0);
-        // A call Desk can't say the billing of isn't taken for billed.
+        // A call Desk can't say the billing of, on an engine only ever seen
+        // signed in to a plan (as after a restart, before it is read
+        // again), is a plan's.
+        keep_sign_in(&d, workforce_desk::engine::Via::Plan).await;
         spent(&d, s.id, Billing::Unknown, 50.0).await;
         assert_eq!(
             level().await,
@@ -96,12 +112,16 @@ async fn plans_never_spend_act_fullys_budget_and_real_money_does() {
         hub_call(&overseer, &id, HubBilling::Metered, 60.0);
         assert_eq!(level().await, (Level::Full, None));
         assert_eq!(d.full_budget_of(&id).unwrap().spent_usd, Some(180.0));
+        // Once it has been seen on a key, an unknown call could be one.
+        keep_sign_in(&d, workforce_desk::engine::Via::Key).await;
+        assert_eq!(level().await.0, Level::Act, "$50 unknown now counts");
+        assert_eq!(d.full_budget_of(&id).unwrap().spent_usd, Some(230.0));
         hub_call(&overseer, &id, HubBilling::Metered, 30.0);
         let (now, why) = level().await;
         assert_eq!(now, Level::Act);
         let why = why.unwrap();
         assert!(
-            why.contains("$210.00 of $200.00 in real money today"),
+            why.contains("$260.00 of $200.00 in real money today"),
             "{why}"
         );
         assert!(why.contains("plans aren't counted"), "{why}");
@@ -230,4 +250,23 @@ async fn an_overseer_asks_for_its_own_limits_on_a_card_the_person_approves() {
         assert!(said.contains("crew.ask_oversight_change"), "{said}");
     })
     .await;
+}
+
+/// A cleared time ahead of the clock counts from now, not from then: the
+/// budget never stops counting.
+#[test]
+fn a_cleared_time_is_never_after_now() {
+    let now = chrono::Utc::now();
+    let midnight = now - chrono::Duration::hours(3);
+    let mut full = workforce_common::oversight::Full::default();
+    assert_eq!(super::super::counted_from(midnight, now, &full), midnight);
+    full.budget_cleared_at = Some(now + chrono::Duration::days(30));
+    assert_eq!(super::super::counted_from(midnight, now, &full), now);
+    full.budget_cleared_at = Some(now - chrono::Duration::hours(1));
+    assert_eq!(
+        super::super::counted_from(midnight, now, &full),
+        now - chrono::Duration::hours(1)
+    );
+    full.budget_cleared_at = Some(midnight - chrono::Duration::hours(1));
+    assert_eq!(super::super::counted_from(midnight, now, &full), midnight, "yesterday's");
 }

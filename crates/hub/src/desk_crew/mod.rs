@@ -441,14 +441,26 @@ pub(crate) fn full_spent_why(spent: f64, budget: f64) -> String {
 }
 
 /// Where today's count of Act fully's budget starts: midnight in the
-/// person's time, or when they last cleared it, if that is later.
+/// person's time, or when they last cleared it, if that is later; never
+/// after `now` (a time ahead of the clock would count nothing until then).
 pub(crate) fn counted_from(
     midnight: DateTime<Utc>,
+    now: DateTime<Utc>,
     full: &workforce_common::oversight::Full,
 ) -> DateTime<Utc> {
+    cleared_today(midnight, now, full).unwrap_or(midnight)
+}
+
+/// When the person cleared today's count, as it counts: today's, and
+/// never after `now`.
+fn cleared_today(
+    midnight: DateTime<Utc>,
+    now: DateTime<Utc>,
+    full: &workforce_common::oversight::Full,
+) -> Option<DateTime<Utc>> {
     full.budget_cleared_at
+        .map(|c| c.min(now))
         .filter(|c| *c > midnight)
-        .unwrap_or(midnight)
 }
 
 fn mtime(workspace: &Path) -> Option<SystemTime> {
@@ -742,7 +754,7 @@ impl CrewHub {
             let Ok(full) = o.fully() else {
                 continue;
             };
-            let from = counted_from(midnight, full);
+            let from = counted_from(midnight, now, full);
             let seen = self.desk.seen_by(&o.scope);
             let filter = workforce_desk::ledger_store::Filter {
                 seen: Some(seen.clone()),
@@ -776,7 +788,7 @@ impl CrewHub {
                         spent_usd: usd,
                         budget_usd: budget,
                         spent: usd.is_some_and(|u| u >= budget),
-                        cleared_at: full.budget_cleared_at.filter(|c| *c > midnight),
+                        cleared_at: cleared_today(midnight, now, full),
                     },
                 );
             }
