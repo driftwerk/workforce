@@ -24,7 +24,7 @@
 //! up by its scope or as one of this hub's agents, so a local overseer of
 //! the same group is never taken for it, nor it for one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -551,7 +551,7 @@ impl CrewHub {
         &self,
         group: &str,
         boss: &BossRef,
-        offered: &mut HashSet<(Uuid, String)>,
+        offered: &mut HashMap<(Uuid, String), Offered>,
     ) -> Vec<(Uuid, Value)> {
         let Ok(g) = self.desk.grant_live(group) else {
             offered.clear();
@@ -579,14 +579,27 @@ impl CrewHub {
             };
             open.insert(p.id);
             let given = (p.id, party.clone());
-            if offered.contains(&given)
-                || !p.answerable
-                || p.request.is_none()
-                || c.wheel != Wheel::Boss
-            {
+            if let Some(o) = offered.get_mut(&given) {
+                // Given, and still open past [`LEFT_AFTER`] while the boss
+                // has it: whatever became of it on the boss's hub, it is
+                // the person's now, as a local boss's work turn leaves it.
+                if !o.left && o.at.elapsed() >= LEFT_AFTER && c.wheel == Wheel::Boss {
+                    o.left = true;
+                    tracing::info!(session = %c.session, approval = %p.id, "a remote boss left a request open: it is the person's");
+                    self.desk.leave_to_person(c.session, p.id);
+                }
                 continue;
             }
-            offered.insert(given);
+            if !p.answerable || p.request.is_none() || c.wheel != Wheel::Boss {
+                continue;
+            }
+            offered.insert(
+                given,
+                Offered {
+                    at: std::time::Instant::now(),
+                    left: false,
+                },
+            );
             let line = if sees::shows(g.sees, Part::Question) {
                 let what = match p.detail.trim() {
                     "" => p.tool.clone(),
@@ -617,7 +630,7 @@ impl CrewHub {
                 }),
             ));
         }
-        offered.retain(|(id, _)| open.contains(id));
+        offered.retain(|(id, _), _| open.contains(id));
         owed
     }
 
@@ -1014,4 +1027,17 @@ impl Drop for RemoteUp {
             }
         }
     }
+}
+
+/// How long a request given to a remote boss may stay open while the boss
+/// has it before it is the person's: its gathering, its turn and a margin.
+/// The boss's turn ends on its own hub, out of this engine's sight.
+pub(crate) const LEFT_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A request given to a remote boss: when, and whether it has since been
+/// left to the person.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Offered {
+    pub(crate) at: std::time::Instant,
+    pub(crate) left: bool,
 }

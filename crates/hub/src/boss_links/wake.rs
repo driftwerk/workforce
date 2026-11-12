@@ -356,6 +356,12 @@ pub(crate) async fn run(
     if reply.trim().is_empty() {
         return Ok(());
     }
+    // Checked again as it is posted: the turn may have taken minutes.
+    if let Place::Thread(k) = &place {
+        if !super::slack::thread_is_theirs(&service, &person, k).await {
+            place = Place::Desk(boss_channel(&key.2));
+        }
+    }
     match place {
         Place::Thread(k) => super::slack::post_in_thread(&service, &k, &reply).await,
         Place::Desk(c) => {

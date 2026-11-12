@@ -36,7 +36,7 @@
 //! `Authorization` header alone, as grants are: Desk's native side holds it,
 //! and no page, agent or session can ask them.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use crate::boss_links::engine_key::{canonical_hub, Challenge, EngineKey, StoredEngineKey};
 use crate::boss_links::uplink::{PROTOCOL, PROTOCOL_HEADER};
+use crate::desk_crew::served::Offered;
 use crate::desk_crew::served::{ServedCall, SERVED_ACT, SERVED_READ};
 use crate::desk_crew::CrewHub;
 use crate::gateway::GatewayState;
@@ -828,6 +829,11 @@ pub fn boss_moved(crew: &CrewHub, link: &HeldLink) -> bool {
         .is_ok_and(|g| g.boss.as_ref() != Some(&link.boss()))
 }
 
+/// The most requests one link sends its boss a minute: under the boss
+/// hub's share of a link's frames ([`crate::boss_links::uplink::EVENTS_PER_MINUTE`]),
+/// with room for what happens besides. The rest go with a later look.
+const OWED_PER_MINUTE: u32 = 20;
+
 /// How often what the boss owes an answer to is looked at.
 const OWED_EVERY: Duration = Duration::from_millis(500);
 
@@ -850,7 +856,10 @@ async fn send_events(
     let mut sent: HashMap<Uuid, VecDeque<Instant>> = HashMap::new();
     let mut skipped: HashMap<Uuid, u64> = HashMap::new();
     // Each link's requests given to its boss, while they are open.
-    let mut offered: HashMap<Uuid, HashSet<(Uuid, String)>> = HashMap::new();
+    let mut offered: HashMap<Uuid, HashMap<(Uuid, String), Offered>> = HashMap::new();
+    // Each link's requests sent this minute: kept under the boss hub's own
+    // share of a link's frames, so none is dropped there.
+    let mut owed_sent: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut look = tokio::time::interval(OWED_EVERY);
     look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -882,11 +891,23 @@ async fn send_events(
         for (link, asked, mut frame) in frames {
             let link = &link;
             // A request not sent is looked at again next time.
-            let unsent = |offered: &mut HashMap<Uuid, HashSet<(Uuid, String)>>| {
+            let unsent = |offered: &mut HashMap<Uuid, HashMap<(Uuid, String), Offered>>| {
                 if let (Some(asked), Some(o)) = (asked, offered.get_mut(link)) {
-                    o.retain(|(id, _)| *id != asked);
+                    o.retain(|(id, _), _| *id != asked);
                 }
             };
+            if asked.is_some() {
+                let now = Instant::now();
+                let (since, n) = owed_sent.entry(*link).or_insert((now, 0));
+                if now.duration_since(*since) >= Duration::from_secs(60) {
+                    (*since, *n) = (now, 0);
+                }
+                if *n >= OWED_PER_MINUTE {
+                    unsent(&mut offered);
+                    continue;
+                }
+                *n += 1;
+            }
             let recent = sent.entry(*link).or_default();
             while recent
                 .front()
