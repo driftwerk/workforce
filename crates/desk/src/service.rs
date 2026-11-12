@@ -841,6 +841,10 @@ enum Persist {
 
 struct Inner {
     opts: Options,
+    /// What the person chose in Settings → Memory, over `opts.memory`.
+    memory_choices: Mutex<crate::memory::MemoryChoices>,
+    /// One change of those choices at a time: written, then cached.
+    memory_choose: tokio::sync::Mutex<()>,
     /// The colours Desk draws its terminals in, which their colour queries
     /// are answered from ([`crate::vt::Palette`]).
     palette: crate::vt::Palette,
@@ -1515,6 +1519,8 @@ impl Desk {
         let (ledger, ledger_jobs) =
             ledger::LedgerRun::new(floor.pricer.clone(), floor.redactor.clone());
         let desk = Self(Arc::new(Inner {
+            memory_choices: Default::default(),
+            memory_choose: Default::default(),
             palette,
             palette_save: Default::default(),
             shell: terminals::login_shell(&env, terminals::account_shell, |p| p.is_file()),
@@ -1593,6 +1599,7 @@ impl Desk {
         desk.scopes_load().await;
         desk.grants_load().await;
         desk.lineage_load().await;
+        desk.memory_choices_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
@@ -1919,6 +1926,7 @@ impl Desk {
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
         view.mode = live.and(state.modes_started.get(&r.id).copied());
+        view.waits_on_you = Self::waits_on_you(state, &view);
         view
     }
 

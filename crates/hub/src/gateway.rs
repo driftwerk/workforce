@@ -1541,6 +1541,10 @@ const DESK_STREAM: &str = "desk.stream";
 /// A Desk message may be sent to queue for the running turn rather than
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
+/// A person may delete their own message in their DM, and forget what the
+/// agent remembered from it
+/// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
+const DESK_DELETE: &str = "desk.delete";
 const DESK_DELIVERIES: &str = "desk.deliveries";
 /// A Desk conversation's read names the client's own id for each message
 /// sent under one, and every kept row's place in the archive: Desk knows its
@@ -1549,6 +1553,10 @@ const DESK_CLIENT_IDS: &str = "desk.client_ids";
 /// A room turn may name the room's members, told to the agent in the hub's
 /// words and answering its room lookups (`desk_surface::room_view`).
 const DESK_ROSTER: &str = "desk.roster";
+/// A DM turn may edit the person's latest message
+/// ([`workforce_common::channels::desk::DeskEdit`]): the reply to the old
+/// version is set aside and the agent answers the new one.
+const DESK_EDIT: &str = "desk.edit";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
@@ -1577,6 +1585,20 @@ fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
             .any(|m| m.role == workforce_common::session::MessageRole::Assistant)
 }
 
+/// Whether a chat message is first offered to the session's live turn, to
+/// join it or wait for it. Attachments never join one (an injected message
+/// is text-only), unless sent to queue. An edit never joins or waits on a
+/// live turn: it starts its own, which a live one refuses busy, so it can't
+/// set aside a reply still being written.
+fn steers(
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+    has_attachments: bool,
+    queued: bool,
+) -> bool {
+    let edits = desk.is_some_and(|d| d.turn.edit.is_some());
+    !edits && (!has_attachments || queued)
+}
+
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
@@ -1589,8 +1611,10 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     // points beside it, and what numbers every row and keeps its client id.
     let in_postgres = deliveries && crate::session_store_factory::keeps_desk_reads();
     let reads = in_postgres.then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
-    [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER]
+    [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER, DESK_EDIT]
         .into_iter()
+        // Deleting is a conversation route, served where the link is.
+        .chain(deliveries.then_some(DESK_DELETE))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)
@@ -1873,6 +1897,47 @@ mod desk_frame_tests {
                 "type": "turn_end", "content": "", "session_id": "s1", "speakable": false,
                 "turn_ref": "ref-2", "command": true,
             })
+        );
+    }
+
+    #[test]
+    fn an_edit_is_never_steered_into_a_live_turn_nor_queued_for_one() {
+        use workforce_common::channels::desk::{DeskEdit, DeskTurnContext};
+        let context = |edit: Option<DeskEdit>| {
+            DeskTurnContext::new(
+                DeskTurn {
+                    edit,
+                    ..DeskTurn::legacy("desk").unwrap()
+                },
+                "desk",
+                None,
+                false,
+                None,
+                "reply-1".into(),
+            )
+        };
+        let plain = context(None);
+        let edit = context(Some(DeskEdit {
+            replaces: "m-1".into(),
+        }));
+        assert!(steers(Some(&plain), false, false));
+        assert!(steers(None, true, true));
+        assert!(!steers(None, true, false), "files never join a live turn");
+        for (files, queued) in [(false, false), (false, true), (true, true)] {
+            assert!(!steers(Some(&edit), files, queued));
+        }
+        // Outside the DM it never gets this far.
+        assert_eq!(
+            desk_turn_of(
+                true,
+                Some(DeskTurn {
+                    edit: edit.turn.edit.clone(),
+                    ..DeskTurn::legacy("desk:planning").unwrap()
+                }),
+                "desk:planning",
+                None,
+            ),
+            Err("only your latest message in a direct message can be edited".into())
         );
     }
 
@@ -2726,6 +2791,8 @@ async fn handle_ws(
                             // under its own id): once its turn has answered it,
                             // or while that turn runs, it is not asked twice. Its
                             // turn just ends, and the Desk reads what was kept.
+                            // So is an edit sent again: it is sent under an
+                            // id of its own, which its first try saved.
                             if let Some(asked) = desk.as_ref().filter(|d| {
                                 matches!(d.turn.place, DeskPlace::Dm)
                                     && d.turn.message.is_some_and(|id| {
@@ -2748,7 +2815,7 @@ async fn handle_ws(
                             }
                             let queued = client_msg.mode
                                 == Some(workforce_gateway_client::protocol::SendMode::Queue);
-                            if !has_attachments || queued {
+                            if steers(desk.as_ref(), has_attachments, queued) {
                                 let steered = steer(
                                     nats.as_ref(),
                                     &service,
@@ -6437,7 +6504,9 @@ async fn create_agent(
         agent.insert("memory".to_string(), toml::Value::Table(memory));
     }
 
-    if let Err(e) = crate::config_writer::overlay_upsert_agent(
+    // Made only where no agent of that id is: checked again under the
+    // overlay's lock, so two creates of one id can't both be made.
+    if let Err(e) = crate::config_writer::overlay_create_agent(
         &config_path,
         &data_dir,
         agent,
@@ -6448,6 +6517,12 @@ async fn create_agent(
     )
     .await
     {
+        if crate::config_writer::AgentExists::is(&e) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("agent '{}' already exists", body.id)})),
+            ));
+        }
         // F8 (2026-05-15): log paths server-side but don't echo FS layout
         // back to the client.
         warn!(agent_id = %body.id, error = %e, "Failed to write agent to config overlay");

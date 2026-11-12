@@ -757,6 +757,7 @@ impl CrewHub {
             engine,
             view,
             worktree,
+            ..
         } = action
         else {
             return Err("That isn't a session to start.".into());

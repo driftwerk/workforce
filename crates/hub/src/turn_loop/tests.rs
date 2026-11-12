@@ -1191,6 +1191,7 @@ async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none
         spoken: false,
         voice: None,
         members: Vec::new(),
+        edit: None,
     };
     let live = DeskTurnContext::new(turn, &channel, None, false, None, "reply-1".into());
     let (id, mark) = crate::turn_loop::records::reply_slot(Some(&live), &channel);
@@ -1227,6 +1228,7 @@ fn dm_turn(asked: uuid::Uuid) -> workforce_common::channels::desk::DeskTurnConte
         spoken: false,
         voice: None,
         members: Vec::new(),
+        edit: None,
     };
     DeskTurnContext::new(
         turn,
@@ -1591,6 +1593,7 @@ fn a_failed_room_turn_adds_no_room_message() {
         spoken: false,
         voice: None,
         members: Vec::new(),
+        edit: None,
     };
     let desk = DeskTurnContext::new(turn, &channel, None, false, None, "reply".into());
     let mut session = store
@@ -1979,6 +1982,7 @@ fn a_room_s_unread_follow_up_is_saved_as_before() {
         spoken: false,
         voice: None,
         members: Vec::new(),
+        edit: None,
     };
     let desk = DeskTurnContext::new(turn, &format!("desk:{room}"), None, false, None, "r".into());
     let unread = crate::turn_loop::next_turn::unread_plan(

@@ -41,22 +41,6 @@ pub struct Done {
     pub screenshot: Option<Vec<u8>>,
 }
 
-/// Which browsers Desk uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Uses {
-    /// None: every browser call is refused.
-    Off,
-    /// Desk's own browser only.
-    Desk,
-    /// The person's Chrome only.
-    Chrome,
-    /// Either: an unbound overseer reaches for the person's Chrome, every
-    /// other agent for Desk's own, and a call may name one.
-    #[default]
-    Both,
-}
-
 /// Which sites the person's Chrome may be taken to. A site is a host
 /// (`example.com`, which takes in its subdomains; `*.example.com` says so
 /// too). A blocked site is never visited; with any allowed, only those are.
@@ -92,16 +76,42 @@ impl Sites {
 }
 
 /// Desk's browser settings, as the person set them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "Kept")]
 pub struct Settings {
-    #[serde(default, rename = "use")]
-    pub uses: Uses,
-    /// Show Desk's own browser on screen; unset, as `[skills.browser]` says.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub show: Option<bool>,
+    /// Whether Desk uses the person's Chrome at all.
+    pub on: bool,
     /// Where the person's Chrome may go.
-    #[serde(default)]
     pub sites: Sites,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            on: true,
+            sites: Sites::default(),
+        }
+    }
+}
+
+/// The settings as kept, and as the old Chromium skill kept them (`use`:
+/// off, desk, chrome or both); only `off` meant off.
+#[derive(serde::Deserialize)]
+struct Kept {
+    on: Option<bool>,
+    #[serde(rename = "use")]
+    uses: Option<String>,
+    #[serde(default)]
+    sites: Sites,
+}
+
+impl From<Kept> for Settings {
+    fn from(k: Kept) -> Self {
+        Self {
+            on: k.on.unwrap_or_else(|| k.uses.as_deref() != Some("off")),
+            sites: k.sites,
+        }
+    }
 }
 
 /// The hub's side.
@@ -117,17 +127,25 @@ pub trait BrowserHooks: Send + Sync {
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String>;
     /// Keeps what was done. Must neither block nor fail the call.
     fn record(&self, done: Done);
-    /// Whether `agent` may have the file at `path` open, now: a page can
-    /// move to another file after the first was allowed. `Err` says why
-    /// not. A hub with no say lets it be.
-    fn may_open_file(&self, _agent: &str, _path: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
     /// Whether `agent` may be on `origin` in the person's Chrome, now: a
     /// page can take itself to a site the visit wasn't allowed for. `Err`
     /// says why not. A hub with no say lets it be.
     fn may_visit(&self, _agent: &str, _origin: &str) -> Result<(), String> {
         Ok(())
+    }
+    /// Keeps a new key `user`'s agent read off `connector`'s key page, for
+    /// the setup of `connector` running in `conversation` (its session
+    /// key), and tests it. Without such a setup running, nothing is kept.
+    /// What the test said (`passed`, or why not); `Err` says why it wasn't
+    /// kept. A hub with no connections keeps nothing.
+    fn keep_key(
+        &self,
+        _user: &str,
+        _conversation: &str,
+        _connector: &str,
+        _key: &str,
+    ) -> Result<String, String> {
+        Err("This hub doesn't set up connections from the browser.".into())
     }
     /// Whether the hub's gate decides every browser call before it is made
     /// (Desk's does): a write it decided nothing for is then refused.
@@ -147,16 +165,10 @@ pub(super) fn hooks() -> Option<&'static Arc<dyn BrowserHooks>> {
     HOOKS.get()
 }
 
-/// The settings in force: the hub's, or, with no hooks, Desk's own browser
-/// only, as before there was a choice.
+/// The settings in force: the hub's, or, with no hooks, the defaults (no
+/// browser is reached without hooks anyway).
 pub(super) fn settings() -> Settings {
-    match hooks() {
-        Some(h) => h.settings(),
-        None => Settings {
-            uses: Uses::Desk,
-            ..Settings::default()
-        },
-    }
+    hooks().map(|h| h.settings()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -199,14 +211,22 @@ mod tests {
     }
 
     #[test]
-    fn settings_read_as_the_person_wrote_them() {
+    fn settings_read_as_kept_and_as_the_old_skill_kept_them() {
         let s: Settings =
-            serde_json::from_str(r#"{"use":"chrome","sites":{"block":["bank.test"]}}"#).unwrap();
-        assert_eq!(s.uses, Uses::Chrome);
+            serde_json::from_str(r#"{"on":false,"sites":{"block":["bank.test"]}}"#).unwrap();
+        assert!(!s.on);
         assert_eq!(s.sites.block, vec!["bank.test"]);
-        assert_eq!(
-            serde_json::from_str::<Settings>("{}").unwrap().uses,
-            Uses::Both
-        );
+        assert!(serde_json::from_str::<Settings>("{}").unwrap().on);
+        for (old, on) in [
+            ("off", false),
+            ("desk", true),
+            ("chrome", true),
+            ("both", true),
+        ] {
+            let s: Settings = serde_json::from_str(&format!(r#"{{"use":"{old}"}}"#)).unwrap();
+            assert_eq!(s.on, on, "{old}");
+        }
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round, s);
     }
 }

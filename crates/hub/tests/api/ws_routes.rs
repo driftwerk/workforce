@@ -333,11 +333,17 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     // The hub link needs the conversation routes, which a hub built
     // without Postgres doesn't serve.
     let link: &[&str] = if cfg!(feature = "postgres") {
-        &["desk.deliveries"]
+        &["desk.delete", "desk.deliveries"]
     } else {
         &[]
     };
-    let mut offered = vec!["desk.place", "desk.stream", "desk.queue", "desk.roster"];
+    let mut offered = vec![
+        "desk.place",
+        "desk.stream",
+        "desk.queue",
+        "desk.roster",
+        "desk.edit",
+    ];
     offered.extend(link);
     assert_eq!(
         connected["features"],
@@ -474,6 +480,125 @@ async fn a_desk_reconnecting_mid_turn_is_told_where_the_turn_is() {
     let rest = frames_until(&mut again, "turn_end").await;
     assert!(rest.iter().any(|f| f["content"] == "done"), "{rest:?}");
     assert_eq!(rest.last().unwrap()["id"], reply_id);
+}
+
+/// A Desk DM edit runs as a turn of its own: while another turn is live it
+/// is refused busy and sets nothing aside; after it, the old reply is set
+/// aside and the new version answered, marked edited; sent again once
+/// answered, it just ends.
+#[tokio::test]
+async fn a_desk_edit_is_refused_while_a_turn_runs_and_runs_once() {
+    use workforce_common::session::MessageRole;
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        crate::support::agent_on_slow_mock_llm(data.path(), std::time::Duration::from_secs(1))
+            .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let sid = connected["session_id"].as_str().unwrap().to_string();
+    let (asked, edited) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let edit = |turn_ref: &str| {
+        json!({"type": "chat", "content": "first, edited", "turn_ref": turn_ref,
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"},
+                        "message": edited, "edit": {"replaces": asked}}})
+    };
+    // The frames up to `turn_ref`'s turn end.
+    async fn until_end(desk: &mut Socket, turn_ref: &str) -> Vec<Value> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = next_frame(desk).await;
+            let end = frame["type"] == "turn_end" && frame["turn_ref"] == turn_ref;
+            frames.push(frame);
+            if end {
+                return frames;
+            }
+        }
+    }
+    let said = |role: MessageRole| -> Vec<String> {
+        service
+            .sessions
+            .get(&sid)
+            .unwrap()
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|m| m.role == role)
+            .map(|m| m.content)
+            .collect()
+    };
+
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "first", "turn_ref": "ref-1",
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "message": asked}}),
+    )
+    .await;
+    frames_until(&mut desk, "turn_snapshot").await;
+    send(&mut desk, edit("ref-2")).await;
+    let mut frames = until_end(&mut desk, "ref-2").await;
+    let refused = frames
+        .iter()
+        .find(|f| f["turn_ref"] == "ref-2" && f["type"] == "error")
+        .unwrap_or_else(|| panic!("refused busy: {frames:?}"));
+    assert!(
+        refused["content"]
+            .as_str()
+            .unwrap()
+            .contains("still running"),
+        "{refused}"
+    );
+    if !frames
+        .iter()
+        .any(|f| f["type"] == "turn_end" && f["turn_ref"] == "ref-1")
+    {
+        frames = until_end(&mut desk, "ref-1").await;
+    }
+    assert!(frames
+        .iter()
+        .all(|f| f["turn_ref"] != "ref-2" || f["type"] != "stream_end"));
+    assert_eq!(said(MessageRole::User), ["first"], "nothing was set aside");
+    assert_eq!(said(MessageRole::Assistant), ["done"]);
+
+    send(&mut desk, edit("ref-3")).await;
+    let frames = until_end(&mut desk, "ref-3").await;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["turn_ref"] != "ref-3" || f["type"] != "error"),
+        "{frames:?}"
+    );
+    assert_eq!(said(MessageRole::User), ["first, edited"]);
+    assert_eq!(said(MessageRole::Assistant), ["done"]);
+    let session = service.sessions.get(&sid).unwrap().unwrap();
+    let question = session
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::User)
+        .unwrap();
+    assert!(question.desk.as_ref().is_some_and(|mark| mark.edited));
+    assert_eq!(question.external_id, Some(edited.to_string()));
+    let archived: Vec<String> = service
+        .sessions
+        .read_archive_page(&sid, None, 50)
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|e| e.content)
+        .collect();
+    assert!(!archived.contains(&"first".to_string()), "{archived:?}");
+
+    send(&mut desk, edit("ref-4")).await;
+    let frames = until_end(&mut desk, "ref-4").await;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["turn_ref"] != "ref-4" || f["type"] == "turn_end"),
+        "an edit answered already just ends: {frames:?}"
+    );
+    assert_eq!(said(MessageRole::User), ["first, edited"]);
+    assert_eq!(said(MessageRole::Assistant), ["done"]);
 }
 
 /// A connection that declares nothing is sent a turn's frames as before:

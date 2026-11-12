@@ -264,13 +264,20 @@ impl Desk {
         let Some(deriver) = self.0.derive.deriver.clone() else {
             return;
         };
-        if !self.0.opts.memory.derive || !self.0.opts.memory.enabled {
-            return;
-        }
         let mut failures = 0u32;
         loop {
             if self.0.cancel.is_cancelled() {
                 return;
+            }
+            // Off for the Desk: waits, since the person may turn it on.
+            let m = self.memory_now();
+            if !m.derive || !m.enabled {
+                tokio::select! {
+                    _ = self.0.cancel.cancelled() => return,
+                    _ = self.0.derive.poke.notified() => {}
+                    _ = tokio::time::sleep(PAUSED_EVERY) => {}
+                }
+                continue;
             }
             let wait = match self.derive_step(&*deriver).await {
                 Ok(Did::Work) => {
@@ -627,7 +634,7 @@ impl Desk {
         group: Option<&str>,
         failed: bool,
     ) -> Result<(Noting, Option<NotingWhy>), DeskError> {
-        let m = &self.0.opts.memory;
+        let m = &self.memory_now();
         if !m.enabled || !m.derive {
             return Ok((Noting::Off, Some(NotingWhy::DeskOff)));
         }

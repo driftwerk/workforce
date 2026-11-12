@@ -345,8 +345,18 @@ impl ChatTurn {
                 .pending
                 .iter()
                 .find(|p| p.request_id == request_id)
-                .map(|p| (p.expired(), offered(&p.options, choice)))
+                .map(|p| {
+                    (
+                        p.expired(),
+                        offered(&p.options, choice),
+                        p.options.person_only(),
+                    )
+                })
         };
+        if let Some((_, _, true)) = prompt {
+            return Err(ToolResult::failure(crate::mcp_gate::PERSON_ONLY, 0));
+        }
+        let prompt = prompt.map(|(expired, offered, _)| (expired, offered));
         match prompt {
             None => return Err(ToolResult::failure("unknown request", 0)),
             Some((true, _)) => {

@@ -3705,7 +3705,7 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             dir.path(),
             pool,
             "Answered.",
-            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
             &[],
         )
         .await;
@@ -3778,6 +3778,287 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             woke.content
         );
         assert!(woke.content.contains("crew.approve"), "{}", woke.content);
+    })
+    .await;
+}
+
+/// A session the overseer runs, ready to ask it things: the overseer
+/// acting, its tools in place, and the session handed to it.
+async fn handed_session(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+) -> (
+    Arc<AgentService>,
+    Arc<CrewHub>,
+    Desk,
+    wiremock::MockServer,
+    uuid::Uuid,
+    String,
+) {
+    // What waits on the person isn't a check-in (the test's minutes are
+    // short): only the session's line gives the overseer its requests.
+    let (overseer, crew, d, llm) = overseeing(
+        dir,
+        pool,
+        "Answered.",
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
+        &[],
+    )
+    .await;
+    eventually("the overseer's tools", async || {
+        overseer.tools.has("crew.approve").then_some(())
+    })
+    .await;
+    d.boss_bounds_with(workforce_desk::charge::Bounds {
+        home: dir.to_path_buf(),
+        ..Default::default()
+    });
+    let s = new_session(&d, dir, "acme-web").await;
+    let url = hook_url(dir, s.id).await;
+    hook(
+        &url,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    (overseer, crew, d, llm, s.id, url)
+}
+
+/// Asks Desk, as the session's `PermissionRequest` hook, to allow
+/// `command`; what the hook hears.
+fn ask_to_run(url: &str, command: &str) -> tokio::task::JoinHandle<Value> {
+    let url = url.to_string();
+    let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+        "tool_input": {"command": command}});
+    tokio::spawn(async move { hook(&url, body).await })
+}
+
+/// The `[Desk work]` turn on `session`'s line naming `approval`, once
+/// there is one.
+async fn work_turn_naming(
+    overseer: &AgentService,
+    session: uuid::Uuid,
+    approval: uuid::Uuid,
+) -> Option<String> {
+    let line = overseer
+        .sessions
+        .find(&super::line::line_channel(session), PERSON)
+        .unwrap()?;
+    line.messages
+        .iter()
+        .find(|m| {
+            m.content.starts_with(super::work::WORK)
+                && m.content.contains(&format!("approval_id {approval}"))
+        })
+        .map(|m| m.content.clone())
+}
+
+/// The bug of 12 Nov: a session the overseer runs asked while the person
+/// had its wheel, and nothing gave the request to the overseer once the
+/// wheel was its again, so it sat while the badge said the overseer had
+/// it. Now the request waits for the person while they drive, and is the
+/// overseer's, by its `approval_id`, the moment they stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_raised_while_the_person_drives_is_the_overseers_once_they_stop() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, llm, id, url) = handed_session(dir.path(), pool).await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.drive(id).await.unwrap();
+        let mut asked = ask_to_run(&url, "cat /tmp/out.txt; ls");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        calls_tool_once(
+            &llm,
+            &pending.id.to_string(),
+            "crew_approve",
+            json!({"session_id": id.to_string(), "approval_id": pending.id.to_string(),
+                "reason": "Reading its own output."}),
+        )
+        .await;
+        // The person drives: it waits for them, and the overseer is told
+        // nothing (well past the line's gathering).
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            work_turn_naming(&overseer, id, pending.id).await.is_none(),
+            "no work turn while the person drives"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut asked)
+                .await
+                .is_err(),
+            "unanswered while the person drives"
+        );
+        d.hand_back(id).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("the overseer answers it once it drives again")
+            .unwrap();
+        assert_eq!(
+            answered["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        let woke = eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
+        assert!(woke.contains("crew.approve"), "{woke}");
+    })
+    .await;
+}
+
+/// A request already open when the overseer takes a session on is its to
+/// answer: nothing new has to happen in the session first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_open_when_the_overseer_takes_a_session_on_is_its_to_answer() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, llm, id, url) = handed_session(dir.path(), pool).await;
+        let asked = ask_to_run(&url, "cargo test -p acme");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        calls_tool_once(
+            &llm,
+            &pending.id.to_string(),
+            "crew_approve",
+            json!({"session_id": id.to_string(), "approval_id": pending.id.to_string(),
+                "reason": "Running the tests is the plan."}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("the overseer answers it")
+            .unwrap();
+        assert_eq!(
+            answered["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
+    })
+    .await;
+}
+
+/// What a session the overseer runs waits on says whose it is: nobody
+/// else's while the overseer has it; the person's while they drive, and
+/// once the overseer's turn leaves it open, which it is never given again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_the_overseer_leaves_open_says_it_waits_on_you() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let (_, mut events) = d.subscribe();
+        d.drive(id).await.unwrap();
+        let _asked = ask_to_run(&url, "cat /tmp/out.txt");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        assert_eq!(
+            d.view(id).unwrap().waits_on_you.as_deref(),
+            Some("You're driving it.")
+        );
+        d.hand_back(id).await.unwrap();
+        // Desk is shown the session again as the wheel comes back: the
+        // request isn't the person's while the boss has it.
+        let shown = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(workforce_desk::model::DeskEvent::Session { session }) =
+                    events.recv().await
+                {
+                    if session.id == id
+                        && session.pending.is_some()
+                        && session.waits_on_you.is_none()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(shown.is_ok(), "the session is shown again on hand-back");
+        // Its turn only says "Answered.": the request is still open.
+        eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
+        let why = eventually("left to the person", async || {
+            d.view(id).unwrap().waits_on_you
+        })
+        .await;
+        assert_eq!(why, format!("{name} left this to you."));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let line = overseer
+            .sessions
+            .find(&super::line::line_channel(id), PERSON)
+            .unwrap()
+            .unwrap();
+        let turns = line
+            .messages
+            .iter()
+            .filter(|m| m.content.contains(&format!("approval_id {}", pending.id)))
+            .count();
+        assert_eq!(turns, 1, "given to the overseer once");
+    })
+    .await;
+}
+
+/// An overseer that only suggests leaves what its sessions ask to the
+/// person, and their badge says so from the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_whose_overseer_only_suggests_waits_on_you() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let _asked = ask_to_run(&url, "cargo test -p acme");
+        eventually("the request", async || d.view(id).unwrap().pending).await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n",
+        );
+        let why = eventually("only suggesting", async || {
+            crew.overseers();
+            d.view(id).unwrap().waits_on_you
+        })
+        .await;
+        assert_eq!(why, format!("{name} only suggests: you decide."));
     })
     .await;
 }
@@ -5145,4 +5426,213 @@ fn a_served_boss_is_told_whose_switch_it_is() {
         assert!(why.contains("never a remote boss's"), "{why}");
         assert!(!why.contains("Desk"), "{why}");
     }
+}
+
+/// An overseer at Act whose sessions start and reuse, and an idle Claude
+/// session `name` in `dir`, run by `boss` when one is given.
+async fn idle_in(
+    d: &Desk,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    boss: Option<&str>,
+) -> workforce_desk::model::SessionView {
+    let s = new_session(d, dir, name).await;
+    let url = hook_url(root, s.id).await;
+    hook(
+        &url,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    hook(
+        &url,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+    )
+    .await;
+    hook(
+        &url,
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+    )
+    .await;
+    if let Some(boss) = boss {
+        d.take_on(
+            s.id,
+            &workforce_desk::crew::Party::manager(boss, "Boss"),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+    }
+    eventually("it idles", async || {
+        matches!(
+            d.view(s.id).ok()?.state,
+            workforce_desk::model::SessionState::Idle | workforce_desk::model::SessionState::Done
+        )
+        .then_some(())
+    })
+    .await;
+    d.view(s.id).unwrap()
+}
+
+const REUSES: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 4\n";
+
+/// Always working in real sessions, a start goes to the idle session the
+/// overseer already runs in that folder: it is told the goal and Activity
+/// says which; asked for a new one, or elsewhere, one starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_goes_to_the_idle_session_it_runs_in_that_folder() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        idle_in(&d, dir.path(), dir.path(), "acme-web", Some("desk")).await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.start_session").then_some(())).await;
+        let start = overseer.tools.get("crew.start_session").unwrap();
+        let before = d.list().len();
+        let folder = format!("{}/", dir.path().to_string_lossy());
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Add the dark mode toggle", "reason": "Sam asked"}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["reused"], "acme-web", "{r:?}");
+        assert_eq!(d.list().len(), before, "no new session");
+        eventually("the reuse in Activity", async || {
+            let page = d.activity(Filter::All, None, 50).await.ok()?;
+            page.events
+                .into_iter()
+                .find(|e| e.text == "gave acme-web the work rather than starting a new session")
+                .filter(|e| e.reason.as_deref().is_some_and(|r| r.contains("Sam asked")))
+        })
+        .await;
+        // Asked for a new one: a new one, whatever is there.
+        let r = start
+            .execute(json!({"folder": folder, "goal": "Write the release notes", "new": true, "reason": "Sam asked for a new one"}))
+            .await
+            .unwrap();
+        assert!(r.output.get("reused").is_none(), "{r:?}");
+        assert_eq!(d.list().len(), before + 1);
+    })
+    .await;
+}
+
+/// Only a session this overseer runs is given a start's work: never the
+/// person's own, nor another boss's; and only on the engine asked for,
+/// the start's own gate first, and one start at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_reuses_only_the_overseers_own_session_on_its_engine_once_and_as_its_gate_says() {
+    use super::actions::Action;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        let mine = dir.path().join("mine");
+        let theirs = dir.path().join("theirs");
+        let others = dir.path().join("others");
+        for f in [&mine, &theirs, &others] {
+            std::fs::create_dir_all(f).unwrap();
+        }
+        let start = |folder: &Path, engine: Option<&str>| {
+            let mut i = json!({"folder": folder.to_string_lossy(), "goal": "Fix the flaky test"});
+            if let Some(e) = engine {
+                i["engine"] = json!(e);
+            }
+            Action::parse("crew.start_session", &i).unwrap()
+        };
+        let (_, o) = crew.overseer_service().unwrap();
+        // The person's own idle session: never.
+        idle_in(&d, dir.path(), &theirs, "theirs", None).await;
+        let mut a = start(&theirs, None);
+        assert!(crew.reuse_instead(&mut a, &o, "desk").await.is_none());
+        assert!(matches!(a, Action::StartSession { .. }));
+        // Another boss's: never.
+        idle_in(&d, dir.path(), &others, "others", Some("sarah")).await;
+        assert!(crew
+            .reuse_instead(&mut start(&others, None), &o, "desk")
+            .await
+            .is_none());
+        // Its own: yes, on its engine, and only once while claimed.
+        let own = idle_in(&d, dir.path(), &mine, "mine", Some("desk")).await;
+        assert!(
+            crew.reuse_instead(&mut start(&mine, Some("codex")), &o, "desk")
+                .await
+                .is_none(),
+            "another engine"
+        );
+        let mut a = start(&mine, None);
+        let (was, name) = crew.reuse_instead(&mut a, &o, "desk").await.unwrap();
+        assert_eq!(name, "mine");
+        assert!(matches!(was, Action::StartSession { .. }));
+        assert!(
+            matches!(a, Action::Nudge { to: super::actions::Target::Session(s), .. } if s == own.id)
+        );
+        assert!(
+            crew.reuse_instead(&mut start(&mine, None), &o, "desk")
+                .await
+                .is_none(),
+            "claimed"
+        );
+        crew.unclaim(own.id);
+        // The start's own gate holds: with handing out work off, no reuse.
+        let mut off = o.clone();
+        off.act.hand_out_work = false;
+        assert!(crew
+            .reuse_instead(&mut start(&mine, None), &off, "desk")
+            .await
+            .is_none());
+        // Nor the nudge's: with nudging off, none.
+        let mut quiet = o.clone();
+        quiet.act.nudge = false;
+        assert!(crew
+            .reuse_instead(&mut start(&mine, None), &quiet, "desk")
+            .await
+            .is_none());
+        let _ = overseer;
+    })
+    .await;
+}
+
+/// A session that can't take the work lets it go, and the start goes ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_a_session_cant_take_starts_a_session_instead() {
+    use super::actions::Action;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        let before = d.list().len();
+        let gone = uuid::Uuid::new_v4();
+        let nudge = Action::Nudge {
+            to: super::actions::Target::Session(gone),
+            message: "Fix the flaky test".into(),
+            reply_to: None,
+        };
+        let start = Action::parse(
+            "crew.start_session",
+            &json!({"folder": dir.path().to_string_lossy(), "goal": "Fix the flaky test"}),
+        )
+        .unwrap();
+        let by = crew.by_overseer("Sam asked").unwrap();
+        let (done, gave) = crew.give_or_start(&nudge, &start, gone, by).await.unwrap();
+        assert!(!gave);
+        assert!(done.starts_with("started "), "{done}");
+        assert_eq!(d.list().len(), before + 1);
+    })
+    .await;
+}
+
+/// The place a session's folder is: that folder, never a sibling worktree.
+#[test]
+fn only_the_same_folder_or_worktree_is_the_same_place() {
+    use super::actions::same_place_key;
+    assert_eq!(same_place_key("/r/acme-web/"), "/r/acme-web");
+    assert_eq!(
+        same_place_key("/r/acme-web/.worktrees/dark-mode/"),
+        "/r/acme-web/.worktrees/dark-mode"
+    );
+    assert_ne!(
+        same_place_key("/r/acme-web/.worktrees/dark-mode"),
+        same_place_key("/r/acme-web")
+    );
+    assert_ne!(same_place_key("/r/acme-api"), same_place_key("/r/acme-web"));
 }

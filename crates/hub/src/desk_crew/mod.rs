@@ -59,7 +59,7 @@ pub use plan::{plan_channel, PLAN};
 
 /// What a check-in's prompt starts with: the person never typed it, so the
 /// DM's history leaves it out.
-pub const CHECK_IN: &str = "[Desk check-in]";
+pub const CHECK_IN: &str = crate::desk_surface::CHECK_IN;
 
 /// Hand-offs between agents allowed from one thing that happened, as in
 /// rooms.
@@ -148,6 +148,9 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Sessions a start's work was given to, held from other starts until
+    /// [`actions::REUSE_CLAIM`] has passed.
+    reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     /// Calls for the person's machines, waiting for Desk's native side
     /// ([`relay`]), and who waits for each answer.
     relays: Mutex<relay::Relays>,
@@ -502,6 +505,7 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
@@ -633,6 +637,24 @@ impl CrewHub {
                             unbound: self.unbound_given(s, o),
                         },
                     ))
+                })
+                .collect(),
+        );
+        // Who won't answer what the sessions it runs ask, and why: the
+        // badge of such a session says it waits on the person.
+        self.desk.set_unanswering(
+            list.iter()
+                .filter_map(|(s, o)| {
+                    let name = name_of(s);
+                    let why = match o.level {
+                        Level::Watch => format!("{name} only watches."),
+                        Level::Suggest => format!("{name} only suggests: you decide."),
+                        Level::Act | Level::Full => {
+                            let held = self.desk.agent_held_why(s.agent_id.as_str())?;
+                            format!("{name} is {held}.")
+                        }
+                    };
+                    Some((s.agent_id.as_str().to_string(), why))
                 })
                 .collect(),
         );

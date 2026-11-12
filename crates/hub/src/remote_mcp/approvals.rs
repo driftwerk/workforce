@@ -92,6 +92,9 @@ impl DecideTool {
         choice: PermissionChoice,
         uid: &str,
     ) -> Result<ToolResult, ToolResult> {
+        if call.options.person_only() {
+            return Err(ToolResult::failure(crate::mcp_gate::PERSON_ONLY, 0));
+        }
         if !offered(&call.options, choice) {
             return Err(not_offered(choice));
         }
