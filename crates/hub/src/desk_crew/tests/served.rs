@@ -26,7 +26,7 @@ impl Authorize for HubToken {
     }
 }
 
-async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+pub(super) async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
     let app = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken));
     let res = app
         .oneshot(
@@ -50,14 +50,14 @@ async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, 
     )
 }
 
-fn allan() -> BossRef {
+pub(super) fn allan() -> BossRef {
     BossRef::Remote {
         hub: "driftwerk".into(),
         agent: "allan".into(),
     }
 }
 
-fn grant(members: &[uuid::Uuid], folder: &Path, level: &str, sees: &str) -> Value {
+pub(super) fn grant(members: &[uuid::Uuid], folder: &Path, level: &str, sees: &str) -> Value {
     json!({
         "grantVersion": 1, "revision": 1, "name": "Acme",
         "boss": "remote:driftwerk/allan", "level": level, "sees": sees,

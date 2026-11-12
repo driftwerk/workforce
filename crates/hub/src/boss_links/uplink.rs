@@ -1032,7 +1032,8 @@ fn handshake(
     let links: Vec<Value> = accepted
         .iter()
         .map(|(id, live)| {
-            json!({"linkId": id, "tokenId": live.token.id, "group": live.link.group_name})
+            json!({"linkId": id, "tokenId": live.token.id, "group": live.link.group_name,
+                   "identityId": live.person.id})
         })
         .collect();
     let ready = json!({"type": "ready", "links": links, "refused": refused,

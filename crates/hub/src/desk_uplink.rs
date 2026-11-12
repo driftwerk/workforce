@@ -641,8 +641,23 @@ impl Uplink {
             .filter_map(|l| l["linkId"].as_str()?.parse().ok())
             .filter_map(|id: Uuid| links.iter().find(|l| l.link_id == id).map(|l| (id, l)))
             .collect();
-        // What it asks open (none until asks, RB7), and what happened in
-        // each group while it was away.
+        // Each link's person, as the boss hub says: who may answer its
+        // asks. A hub that doesn't say is sent none.
+        let persons: HashMap<Uuid, String> = ready["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| {
+                let id: Uuid = l["linkId"].as_str()?.parse().ok()?;
+                let person = l["identityId"].as_str().filter(|p| !p.is_empty())?;
+                accepted.contains_key(&id).then(|| (id, person.to_string()))
+            })
+            .collect();
+        let asks_taken = ready["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|x| x == "asks"));
+        // What it asks open goes up again with the first look, and what
+        // happened in each group while it was away now.
         let _ = sink
             .send(Ws::Text(
                 json!({"type": "asks_open", "asks": []}).to_string().into(),
@@ -671,6 +686,17 @@ impl Uplink {
             Arc::clone(&self.crew),
             accepted
                 .values()
+                .map(|l| (l.link_id, l.group.clone(), l.boss()))
+                .collect(),
+            tx.clone(),
+        ));
+        // What its sessions ask the person goes up each link whose person
+        // the hub named, when the hub takes asks.
+        let asks = tokio::spawn(send_asks(
+            Arc::clone(&self.crew),
+            accepted
+                .values()
+                .filter(|l| asks_taken && persons.contains_key(&l.link_id))
                 .map(|l| (l.link_id, l.group.clone(), l.boss()))
                 .collect(),
             tx.clone(),
@@ -778,6 +804,37 @@ impl Uplink {
                         let _ = tx.send(result).await;
                     });
                 }
+                // An answer to one of this engine's asks: taken only on the
+                // link it came on, from its person, once.
+                Some("decision") => {
+                    let link = frame["linkId"]
+                        .as_str()
+                        .and_then(|l| l.parse::<Uuid>().ok())
+                        .and_then(|l| accepted.get(&l).copied());
+                    let Some(link) = link else {
+                        let _ = tx
+                            .send(json!({"type": "decision_refused", "askId": frame["askId"],
+                                         "code": "other_link",
+                                         "why": "That answer isn't for this request."}))
+                            .await;
+                        continue;
+                    };
+                    let person = persons.get(&link.link_id).cloned();
+                    let (crew, tx, link) = (Arc::clone(&self.crew), tx.clone(), link.clone());
+                    let frame = frame.clone();
+                    tokio::spawn(async move {
+                        let back = crew
+                            .remote_decision(
+                                link.link_id,
+                                &link.group,
+                                &link.boss(),
+                                person.as_deref(),
+                                &frame,
+                            )
+                            .await;
+                        let _ = tx.send(back).await;
+                    });
+                }
                 Some("state") => {
                     tracing::info!(state = ?frame["state"], "a boss hub said a link's state");
                 }
@@ -785,6 +842,7 @@ impl Uplink {
             }
         };
         events.abort();
+        asks.abort();
         drop(tx);
         let _ = writer.await;
         ended
@@ -910,6 +968,37 @@ async fn send_events(
                 skipped.remove(link);
             } else {
                 unsent(&mut offered);
+            }
+        }
+    }
+}
+
+/// How often what each link's sessions ask the person is looked at.
+const ASKS_EVERY: Duration = Duration::from_secs(2);
+
+/// Sends `ask` and `ask_closed` frames up `tx` for each of `links`
+/// ([`CrewHub::asks_up`]): the first look sends every ask still open again
+/// with a new nonce, as does the look after one couldn't be sent; until the
+/// socket ends.
+async fn send_asks(
+    crew: Arc<CrewHub>,
+    links: Vec<(Uuid, String, BossRef)>,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let mut look = tokio::time::interval(ASKS_EVERY);
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut again: HashSet<Uuid> = links.iter().map(|(l, _, _)| *l).collect();
+    loop {
+        look.tick().await;
+        for (link, group, boss) in &links {
+            let frames = crew.asks_up(*link, group, boss, again.remove(link)).await;
+            for f in frames {
+                if tx.try_send(f).is_err() {
+                    again.insert(*link);
+                }
             }
         }
     }

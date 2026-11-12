@@ -406,6 +406,19 @@ impl CrewHub {
         } else {
             self.served_act(tool, &call.input, &grant, &o, &boss).await
         };
+        // The boss answered a request itself: its ask to the person is
+        // closed.
+        if matches!(result, Ok((ServedStatus::Ok, _)))
+            && matches!(tool, "crew.approve" | "crew.deny")
+        {
+            if let Some(approval) = call.input["approval_id"]
+                .as_str()
+                .and_then(|a| a.parse::<Uuid>().ok())
+            {
+                self.answered_by_boss(call.link_id.as_deref(), approval)
+                    .await;
+            }
+        }
         result.unwrap_or_else(refused)
     }
 
@@ -530,7 +543,7 @@ impl CrewHub {
     /// Whether `boss` is the remote boss served for `g` here now: the
     /// grant's own boss, and no local overseer of the group (one boss per
     /// group, as a call is decided, [`Self::serve_crew`]).
-    fn serves_remote(&self, g: &Grant, boss: &BossRef) -> bool {
+    pub(super) fn serves_remote(&self, g: &Grant, boss: &BossRef) -> bool {
         matches!(boss, BossRef::Remote { .. })
             && boss.servable()
             && g.boss.as_ref() == Some(boss)
