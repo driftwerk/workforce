@@ -2011,8 +2011,15 @@ type P = State<Arc<ProvidersApi>>;
 
 impl IntoResponse for AccountError {
     fn into_response(self) -> Response {
+        if let AccountError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            AccountError::Invalid(_) => StatusCode::BAD_REQUEST,
+            AccountError::Invalid(_) | AccountError::Refused(_) => StatusCode::BAD_REQUEST,
             AccountError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AccountError::Internal(e) => {
                 tracing::error!(error = %e, "desk provider credentials failed");
@@ -2150,8 +2157,15 @@ async fn voice_relay(
 
 impl IntoResponse for SpeakError {
     fn into_response(self) -> Response {
+        if let SpeakError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            SpeakError::Invalid(_) => StatusCode::BAD_REQUEST,
+            SpeakError::Invalid(_) | SpeakError::Refused(_) => StatusCode::BAD_REQUEST,
             SpeakError::NoKey(_) => StatusCode::SERVICE_UNAVAILABLE,
             SpeakError::Upstream(e) => {
                 tracing::warn!(error = %e, "desk speech synthesis failed");

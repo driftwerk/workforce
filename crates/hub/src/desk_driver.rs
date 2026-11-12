@@ -252,7 +252,7 @@ impl Speech for VaultKeys {
                     provider = key.name(),
                     "desk voice key refused by its test call"
                 );
-                return Err(SpeakError::Invalid(said));
+                return Err(SpeakError::Refused(said));
             }
         }
         vault
@@ -545,7 +545,7 @@ impl HubAccounts {
                     .await
                 {
                     true => Ok(()),
-                    false => Err(AccountError::Invalid(format!(
+                    false => Err(AccountError::Refused(format!(
                         "Desk couldn't get the models from the vLLM server at {api_key}. Check                          it's running, the address, and the API key if it asks for one."
                     ))),
                 };
@@ -577,7 +577,7 @@ impl HubAccounts {
                     provider = spec.id,
                     "desk provider key refused by its test call"
                 );
-                Err(AccountError::Invalid(said))
+                Err(AccountError::Refused(said))
             }
         }
     }
@@ -1374,7 +1374,7 @@ mod tests {
             .save_key(VoiceKey::Speech(SpeechProvider::ElevenLabs), typed)
             .await
             .unwrap_err();
-        let SpeakError::Invalid(said) = &e else {
+        let SpeakError::Refused(said) = &e else {
             panic!("{e:?}")
         };
         assert!(
@@ -1784,7 +1784,7 @@ mod tests {
                 .connect(anthropic, &fields(&[("api_key", typed)]))
                 .await
                 .unwrap_err();
-            let AccountError::Invalid(said) = &e else {
+            let AccountError::Refused(said) = &e else {
                 panic!("a refused key is the person's to fix: {e:?}");
             };
             assert!(
@@ -1827,7 +1827,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&e, AccountError::Invalid(m) if m.contains("http://127.0.0.1:9")),
+                matches!(&e, AccountError::Refused(m) if m.contains("http://127.0.0.1:9")),
                 "{e:?}"
             );
             assert!(global.find_account("vllm").is_none());

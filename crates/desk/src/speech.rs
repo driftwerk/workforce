@@ -134,6 +134,10 @@ pub enum SpeakError {
     NoKey(SpeechProvider),
     #[error("{0}")]
     Upstream(String),
+    /// The provider refused a voice key when it was tried: why, in the
+    /// person's words, with the fix.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Speaks for the app. Implemented by the hub over its speech providers and
@@ -144,7 +148,7 @@ pub trait Speech: Send + Sync {
 
     /// Tries `key` with the smallest call its provider takes, then keeps
     /// it where Desk reads it. A key the provider refuses is not kept, and
-    /// [`SpeakError::Invalid`] says why in the person's words; neither ever
+    /// [`SpeakError::Refused`] says why in the person's words; neither ever
     /// carries the key.
     async fn save_key(&self, key: VoiceKey, _value: &str) -> Result<(), SpeakError> {
         Err(SpeakError::Invalid(format!(
@@ -196,7 +200,7 @@ mod tests {
 
         async fn save_key(&self, key: VoiceKey, value: &str) -> Result<(), SpeakError> {
             if value == REFUSED {
-                return Err(SpeakError::Invalid(format!(
+                return Err(SpeakError::Refused(format!(
                     "{} didn't accept that key",
                     key.label()
                 )));
@@ -367,6 +371,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let said = body["error"].as_str().unwrap();
         assert_eq!(said, "OpenAI didn't accept that key");
+        assert_eq!(body["code"], crate::providers::KEY_REFUSED);
         assert!(!body.to_string().contains(REFUSED));
 
         let (status, _) = save_key(
