@@ -30,11 +30,12 @@ use workforce_desk::providers::Group;
 use workforce_desk::{
     AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, HubInternal,
     KeySource, Options, Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech,
-    Standing,
+    SpeechProvider, Standing, VoiceKey,
 };
 
 use crate::agent_llm::vault_provider_name;
 use crate::credentials::{how_to_add, Caller, Legacy};
+use crate::desk_key_check::{refusal, Live, TestCall, Tried};
 use crate::desk_tools::DeskTool;
 use crate::gateway::{resolve_caller_context, GatewayState};
 use crate::hub_core::logins::store as login_store;
@@ -136,19 +137,32 @@ fn bearer_is(headers: &HeaderMap, token: &str) -> bool {
 /// Voice keys from the vault alone: the provider's speech key at
 /// `speech/<provider>/api_key` (the person's own, then shared tiers), then
 /// the provider's LLM account. Never the environment.
-struct VaultKeys(Option<Arc<Vault>>);
+struct VaultKeys {
+    vault: Option<Arc<Vault>>,
+    /// How a voice key is tried before it is kept.
+    calls: Arc<dyn TestCall>,
+}
 
 fn speech_key_path(provider: &str) -> String {
     format!("speech/{provider}/api_key")
 }
 
 impl VaultKeys {
+    fn new(vault: Option<Arc<Vault>>) -> Self {
+        Self {
+            vault,
+            calls: Arc::new(Live),
+        }
+    }
+
+    /// The key for `provider`: Desk's voice key, else the provider's
+    /// `llm/accounts/*` key (the Gemini key agents think with also talks).
     fn speech_key(&self, provider: &str) -> Option<String> {
-        Caller::new(None, None, self.0.clone())
+        Caller::new(None, None, self.vault.clone())
             .resolve(&speech_key_path(provider), CredScope::Either)
             .or_else(|| {
                 Legacy::default()
-                    .account(None, self.0.clone(), provider)
+                    .account(None, self.vault.clone(), provider)
                     .key()
             })
     }
@@ -203,6 +217,66 @@ impl Speech for VaultKeys {
             media_type: spoken.media_type.into(),
         })
     }
+
+    async fn save_key(&self, key: VoiceKey, value: &str) -> Result<(), SpeakError> {
+        let vault = self
+            .vault
+            .as_ref()
+            .ok_or_else(|| SpeakError::Invalid("Desk can't keep keys here yet".into()))?;
+        let answered = match key {
+            VoiceKey::Gemini => {
+                let gemini = workforce_desk::providers::spec("gemini")
+                    .and_then(Spec::default_model)
+                    .unwrap_or("gemini-3.8-flash");
+                self.calls
+                    .think(
+                        ProviderKind::Gemini,
+                        value,
+                        &AccountExtras::default(),
+                        gemini,
+                    )
+                    .await
+            }
+            VoiceKey::Speech(provider) => self.calls.speak(provider.name(), value).await,
+        };
+        if let Err(error) = answered {
+            let tried = Tried {
+                name: key.label(),
+                kind: (key == VoiceKey::Gemini).then_some(ProviderKind::Gemini),
+                hint: voice_key_hint(key),
+                ..Tried::default()
+            };
+            if let Some(said) = refusal(&tried, &error) {
+                // Never what the provider said: it can quote the key.
+                tracing::info!(
+                    provider = key.name(),
+                    "desk voice key refused by its test call"
+                );
+                return Err(SpeakError::Refused(said));
+            }
+        }
+        vault
+            .set_with_actor(&speech_key_path(key.name()), value, VaultActor::RestOwner)
+            .map_err(|e| {
+                tracing::warn!(provider = key.name(), error = %e, "desk voice key not stored");
+                SpeakError::Invalid(format!("Desk couldn't keep the {} key", key.label()))
+            })
+    }
+}
+
+/// Where a voice key is made.
+fn voice_key_hint(key: VoiceKey) -> &'static str {
+    match key {
+        VoiceKey::Speech(SpeechProvider::FishAudio) => "Create a key at fish.audio under API keys",
+        VoiceKey::Speech(SpeechProvider::ElevenLabs) => {
+            "Create a key at elevenlabs.io under Developers → API keys"
+        }
+        VoiceKey::Speech(SpeechProvider::OpenAi) => {
+            "Create a key at platform.openai.com under API keys"
+        }
+        VoiceKey::Speech(SpeechProvider::Soniox) => "Create a key at console.soniox.com",
+        VoiceKey::Gemini => "Create a key at aistudio.google.com",
+    }
 }
 
 /// The credentials of the providers a Desk agent thinks with, in the global
@@ -218,6 +292,11 @@ struct HubAccounts {
     google_login: GoogleLogin,
     /// Where a plan is asked which models it lists now.
     plans: Option<PlanSource>,
+    /// How a key is tried before it is stored.
+    calls: Arc<dyn TestCall>,
+    /// The ports this hub listens on: a server address on this computer at
+    /// one of them is the hub itself, never a model server.
+    own_ports: Vec<u16>,
 }
 
 type GoogleLogin = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
@@ -286,6 +365,60 @@ fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
 }
 
 /// A server address as the client is handed it.
+/// `value` as a region, location or project name: lowercase letters,
+/// digits and dashes only, since it becomes part of the provider's address.
+fn place_name(label: &str, value: Option<String>) -> Result<Option<String>, AccountError> {
+    match value {
+        Some(v)
+            if v.is_empty()
+                || !v
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+        {
+            Err(AccountError::Invalid(format!(
+                "the {label} is lowercase letters, digits and dashes, like us-east-1"
+            )))
+        }
+        v => Ok(v),
+    }
+}
+
+/// `url` as it may be said back: never a user or password typed into it.
+fn shown_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => "that address".into(),
+    }
+}
+
+/// Whether `url` reaches this computer at one of `ports`.
+fn is_own(url: &str, ports: &[u16]) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let local = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        None => false,
+    };
+    local
+        && u.port_or_known_default()
+            .is_some_and(|p| ports.contains(&p))
+}
+
+/// The ports in listen addresses like `0.0.0.0:8080`.
+fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
+    listens
+        .into_iter()
+        .filter_map(|l| l.rsplit(':').next()?.parse().ok())
+        .collect()
+}
+
 fn server_url(fields: &Fields) -> Result<String, AccountError> {
     let url = field(fields, "url").unwrap_or_default();
     match url::Url::parse(url) {
@@ -324,14 +457,14 @@ fn account(
                         .into(),
                 ));
             }
-            extras.region = field(fields, "region").map(str::to_string);
+            extras.region = place_name("region", field(fields, "region").map(str::to_string))?;
             extras.profile = Some(profile);
             // The profile, not the hub's environment or default chain, is
             // where its credentials come from.
             workforce_agent::llm::bedrock_credentials::CHAIN_SENTINEL.to_string()
         }
         ProviderKind::Bedrock => {
-            extras.region = field(fields, "region").map(str::to_string);
+            extras.region = place_name("region", field(fields, "region").map(str::to_string))?;
             format!(
                 "{}:{}",
                 required("access_key_id")?,
@@ -339,14 +472,13 @@ fn account(
             )
         }
         ProviderKind::VertexAnthropic if field(fields, "service_account_json").is_none() => {
-            extras.project = Some(field(fields, "project").map(str::to_string).ok_or_else(
-                || {
-                    AccountError::Invalid(
-                        "using your Google login needs the Project ID: a login names no project"
-                            .into(),
-                    )
-                },
-            )?);
+            extras.project =
+                place_name("Project ID", field(fields, "project").map(str::to_string))?;
+            extras.project = Some(extras.project.take().ok_or_else(|| {
+                AccountError::Invalid(
+                    "using your Google login needs the Project ID: a login names no project".into(),
+                )
+            })?);
             if google_login().is_none() {
                 return Err(AccountError::Invalid(
                     "no Google login was found on this Mac: run gcloud auth \
@@ -354,7 +486,10 @@ fn account(
                         .into(),
                 ));
             }
-            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            extras.location = place_name(
+                "location",
+                Some(field(fields, "location").unwrap_or("global").to_string()),
+            )?;
             CHAIN_SENTINEL.to_string()
         }
         ProviderKind::VertexAnthropic => {
@@ -365,15 +500,21 @@ fn account(
                     "the service account key is the whole JSON key file, starting with {".into(),
                 ));
             };
-            extras.project = field(fields, "project")
-                .map(str::to_string)
-                .or_else(|| source.project_id());
+            extras.project = place_name(
+                "Project ID",
+                field(fields, "project")
+                    .map(str::to_string)
+                    .or_else(|| source.project_id()),
+            )?;
             if extras.project.is_none() {
                 return Err(AccountError::Invalid(
                     "the key names no project: give the Project ID".into(),
                 ));
             }
-            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            extras.location = place_name(
+                "location",
+                Some(field(fields, "location").unwrap_or("global").to_string()),
+            )?;
             key
         }
         ProviderKind::Ollama => server_url(fields)?,
@@ -405,7 +546,7 @@ impl HubAccounts {
     fn vault(&self) -> Result<&Arc<Vault>, AccountError> {
         self.vault
             .as_ref()
-            .ok_or_else(|| AccountError::Unavailable("the hub has no vault".into()))
+            .ok_or_else(|| AccountError::Unavailable("Desk can't keep keys here yet".into()))
     }
 
     /// Where a local server is, and its bearer key: the vault account's URL
@@ -449,6 +590,70 @@ impl HubAccounts {
         default.map(|url| (url.to_string(), env_key()))
     }
 
+    /// One call on `record` as an agent would make it, before it is stored:
+    /// why not, in the person's words, when the provider refused it. Ollama
+    /// is left to its standing, which asks it each time.
+    async fn tried(
+        &self,
+        spec: &Spec,
+        kind: ProviderKind,
+        record: &serde_json::Value,
+    ) -> Result<(), AccountError> {
+        let api_key = record["api_key"].as_str().unwrap_or_default();
+        let extras: AccountExtras = serde_json::from_value(record.clone()).unwrap_or_default();
+        match kind {
+            ProviderKind::Ollama => return Ok(()),
+            ProviderKind::Vllm if is_own(api_key, &self.own_ports) => {
+                return Err(AccountError::Invalid(
+                    "that address is Desk itself, not a vLLM server: give the address vLLM listens on"
+                        .into(),
+                ));
+            }
+            ProviderKind::Vllm => {
+                return match self
+                    .calls
+                    .reach(Server::Vllm, api_key, extras.token.as_deref())
+                    .await
+                {
+                    true => Ok(()),
+                    false => Err(AccountError::Refused(format!(
+                        "Desk couldn't get the models from the vLLM server at {}. Check it's running, the address, and the API key if it asks for one.",
+                        shown_url(api_key)
+                    ))),
+                };
+            }
+            _ => {}
+        }
+        let Some(model) = spec.default_model() else {
+            return Ok(());
+        };
+        let Err(error) = self.calls.think(kind, api_key, &extras, model).await else {
+            return Ok(());
+        };
+        let login = extras.profile.is_some()
+            || (kind == ProviderKind::VertexAnthropic && api_key == CHAIN_SENTINEL);
+        let tried = Tried {
+            name: spec.name,
+            kind: Some(kind),
+            hint: spec.connect.hint,
+            model: Some(model),
+            region: extras.region.as_deref().or(extras.location.as_deref()),
+            project: extras.project.as_deref(),
+            login,
+        };
+        match refusal(&tried, &error) {
+            None => Ok(()),
+            Some(said) => {
+                // Never what the provider said: it can quote the key.
+                tracing::info!(
+                    provider = spec.id,
+                    "desk provider key refused by its test call"
+                );
+                Err(AccountError::Refused(said))
+            }
+        }
+    }
+
     async fn write(&self, path: &str, value: &str) -> Result<(), AccountError> {
         let vault = self.vault()?;
         let known = Arc::clone(&self.known);
@@ -456,7 +661,7 @@ impl HubAccounts {
             .await
             .map_err(|e| {
                 tracing::warn!(path, error = %e, "desk provider credential not stored");
-                AccountError::Internal(format!("saving {path} failed"))
+                AccountError::Internal("Desk couldn't keep the key. Try again in a moment.".into())
             })
     }
 
@@ -466,7 +671,9 @@ impl HubAccounts {
             .map(drop)
             .map_err(|e| {
                 tracing::warn!(path, error = %e, "desk provider credential not removed");
-                AccountError::Internal(format!("removing {path} failed"))
+                AccountError::Internal(
+                    "Desk couldn't remove the key. Try again in a moment.".into(),
+                )
             })
     }
 }
@@ -566,6 +773,9 @@ impl Accounts for HubAccounts {
     async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
         let (kind, name) = metered(spec)?;
         let record = account(kind, fields, &self.google_login)?;
+        // Nowhere to keep it: say so before any call is made with it.
+        self.vault()?;
+        self.tried(spec, kind, &record).await?;
         let path = self
             .vault()?
             .find_account(name)
@@ -926,7 +1136,7 @@ pub async fn mount(
         Arc::clone(state),
         Arc::clone(&crew),
     )));
-    let voice = Realtime::new(Arc::new(VaultKeys(state.vault.clone())));
+    let voice = Realtime::new(Arc::new(VaultKeys::new(state.vault.clone())));
     let app = app.merge(crate::gateway::hardened(crate::desk_connections::install(
         state,
         config,
@@ -940,7 +1150,7 @@ pub async fn mount(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),
         Arc::new(voice),
-        Arc::new(VaultKeys(state.vault.clone())),
+        Arc::new(VaultKeys::new(state.vault.clone())),
         Arc::new(HubAccounts {
             vault: state.vault.clone(),
             known: {
@@ -948,6 +1158,8 @@ pub async fn mount(
                 Arc::new(move || crate::gateway::login_vaults(&state))
             },
             google_login: Arc::new(adc_file),
+            calls: Arc::new(Live),
+            own_ports: ports_of([config.hub.listen.as_str(), config.gateway.listen.as_str()]),
             plans: state
                 .registry
                 .host()
@@ -1197,7 +1409,7 @@ mod tests {
     fn voice_keys_come_from_the_speech_path_in_the_vault() {
         let dir = tempfile::tempdir().unwrap();
         let global = vault(dir.path());
-        let keys = VaultKeys(Some(Arc::clone(&global)));
+        let keys = VaultKeys::new(Some(Arc::clone(&global)));
         assert_eq!(keys.api_key(Provider::Gemini), None);
         global.set("speech/gemini/api_key", "gm-test").unwrap();
         assert_eq!(keys.api_key(Provider::Gemini).as_deref(), Some("gm-test"));
@@ -1222,9 +1434,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_voice_key_is_kept_only_once_its_provider_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = vault(dir.path());
+        let typed = "el-typed-wrong-0123456789";
+        let refused = VaultKeys {
+            vault: Some(Arc::clone(&global)),
+            calls: Arc::new(crate::desk_key_check::Answers::failing(&format!(
+                "elevenlabs speech returned 401 Unauthorized: invalid_api_key {typed}"
+            ))),
+        };
+        let e = refused
+            .save_key(VoiceKey::Speech(SpeechProvider::ElevenLabs), typed)
+            .await
+            .unwrap_err();
+        let SpeakError::Refused(said) = &e else {
+            panic!("{e:?}")
+        };
+        assert!(
+            said.starts_with("ElevenLabs didn't accept that key"),
+            "{said}"
+        );
+        assert!(said.contains("elevenlabs.io"), "{said}");
+        assert!(!said.contains(typed));
+        assert!(global.get("speech/elevenlabs/api_key").is_none());
+
+        let calls = Arc::new(crate::desk_key_check::Answers::passing());
+        let passing = VaultKeys {
+            vault: Some(Arc::clone(&global)),
+            calls: calls.clone(),
+        };
+        passing
+            .save_key(VoiceKey::Speech(SpeechProvider::ElevenLabs), "el-right")
+            .await
+            .unwrap();
+        passing
+            .save_key(VoiceKey::Gemini, "gm-right")
+            .await
+            .unwrap();
+        assert_eq!(
+            passing.speech_key("elevenlabs").as_deref(),
+            Some("el-right")
+        );
+        assert_eq!(
+            passing.api_key(Provider::Gemini).as_deref(),
+            Some("gm-right")
+        );
+        let asked = calls.asked.lock().clone();
+        assert_eq!(asked[0], "speak elevenlabs");
+        assert!(
+            asked[1].starts_with("gemini "),
+            "Gemini Live's key thinks: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn gemini_live_talks_with_the_gemini_key_agents_think_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = vault(dir.path());
+        global
+            .set(
+                "llm/accounts/gemini",
+                &serde_json::json!({ "provider": "gemini", "api_key": "gm-provider" }).to_string(),
+            )
+            .unwrap();
+        let keys = VaultKeys::new(Some(global));
+        assert_eq!(
+            keys.api_key(Provider::Gemini).as_deref(),
+            Some("gm-provider")
+        );
+    }
+
     #[test]
     fn no_vault_means_no_voice_keys() {
-        assert_eq!(VaultKeys(None).api_key(Provider::OpenAi), None);
+        assert_eq!(VaultKeys::new(None).api_key(Provider::OpenAi), None);
     }
 
     fn speak(provider: SpeechProvider) -> Speak {
@@ -1242,7 +1526,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let global = vault(dir.path());
         global.set("speech/elevenlabs/api_key", "el-test").unwrap();
-        let keys = VaultKeys(Some(global));
+        let keys = VaultKeys::new(Some(global));
         for provider in SpeechProvider::ALL
             .into_iter()
             .filter(|p| *p != SpeechProvider::ElevenLabs)
@@ -1294,6 +1578,8 @@ mod tests {
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
                 plans: None,
+                calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             }
         }
 
@@ -1558,6 +1844,195 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_key_is_tried_on_its_default_model_and_one_refused_is_never_stored() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let anthropic = spec("anthropic").unwrap();
+            let typed = "sk-ant-api03-typed-wrong";
+            let refused = Arc::new(crate::desk_key_check::Answers::failing(&format!(
+                "Anthropic API error (401 Unauthorized): invalid x-api-key {typed}"
+            )));
+            let accounts = HubAccounts {
+                calls: refused.clone(),
+                ..accounts(&global)
+            };
+            let e = accounts
+                .connect(anthropic, &fields(&[("api_key", typed)]))
+                .await
+                .unwrap_err();
+            let AccountError::Refused(said) = &e else {
+                panic!("a refused key is the person's to fix: {e:?}");
+            };
+            assert!(
+                said.starts_with("Anthropic didn't accept that key"),
+                "{said}"
+            );
+            assert!(!said.contains(typed), "the key is never repeated: {said}");
+            assert!(global.find_account_api_key("anthropic").is_none());
+            assert!(!accounts.standing(anthropic).await.connected);
+            assert_eq!(
+                *refused.asked.lock(),
+                vec![format!("anthropic {}", anthropic.default_model().unwrap())]
+            );
+
+            // One the provider answers is stored, and stands connected.
+            let passing = HubAccounts {
+                calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
+                ..accounts
+            };
+            passing
+                .connect(anthropic, &fields(&[("api_key", "sk-ant-api03-right")]))
+                .await
+                .unwrap();
+            assert!(passing.standing(anthropic).await.connected);
+        }
+
+        #[test]
+        fn a_region_location_or_project_is_only_a_name_never_part_of_an_address() {
+            for ok in ["us-east-1", "global", "europe-west4", "acme-ai-123"] {
+                assert_eq!(
+                    place_name("region", Some(ok.into())).unwrap().as_deref(),
+                    Some(ok)
+                );
+            }
+            assert_eq!(place_name("region", None).unwrap(), None);
+            for bad in [
+                "evil.example.com/x",
+                "us-east-1.attacker.net",
+                "us-east-1#",
+                "a/b",
+                "US-EAST-1",
+                "",
+                "x@y",
+            ] {
+                assert!(
+                    matches!(
+                        place_name("region", Some(bad.into())),
+                        Err(AccountError::Invalid(_))
+                    ),
+                    "{bad}"
+                );
+            }
+            let bedrock = |region: &str| {
+                account(
+                    kind("bedrock"),
+                    &fields(&[
+                        ("access_key_id", "AKIA"),
+                        ("secret_access_key", "s"),
+                        ("region", region),
+                    ]),
+                    &(Arc::new(|| None) as GoogleLogin),
+                )
+            };
+            assert!(bedrock("eu-west-2").is_ok());
+            assert!(bedrock("169.254.169.254/latest").is_err());
+        }
+
+        #[test]
+        fn an_address_is_said_back_without_its_user_or_password() {
+            assert_eq!(
+                shown_url("http://sam:hunter2@gpu.lan:8000/v1"),
+                "http://gpu.lan:8000/v1"
+            );
+            assert_eq!(shown_url("not a url"), "that address");
+        }
+
+        #[test]
+        fn the_hubs_own_ports_on_this_computer_are_never_a_model_server() {
+            let own = ports_of(["127.0.0.1:8080", "0.0.0.0:3000"]);
+            assert_eq!(own, vec![8080, 3000]);
+            for url in [
+                "http://127.0.0.1:8080",
+                "http://localhost:3000/v1",
+                "http://[::1]:8080",
+                "http://0.0.0.0:3000",
+                "http://127.0.0.2:8080",
+            ] {
+                assert!(is_own(url, &own), "{url}");
+            }
+            for url in ["http://127.0.0.1:8000", "http://gpu.lan:8080", "nope"] {
+                assert!(!is_own(url, &own), "{url}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_hub_itself_is_refused_as_a_vllm_server_before_any_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let calls = Arc::new(crate::desk_key_check::Answers::passing());
+            let accounts = HubAccounts {
+                calls: calls.clone(),
+                own_ports: vec![8080],
+                ..accounts(&global)
+            };
+            let e = accounts
+                .connect(
+                    spec("vllm").unwrap(),
+                    &fields(&[("url", "http://localhost:8080")]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Invalid(m) if m.contains("Desk itself")),
+                "{e:?}"
+            );
+            assert!(calls.asked.lock().is_empty());
+            assert!(global.find_account("vllm").is_none());
+        }
+
+        #[tokio::test]
+        async fn without_a_vault_no_test_call_is_made() {
+            let calls = Arc::new(crate::desk_key_check::Answers::passing());
+            let e = HubAccounts {
+                vault: None,
+                known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
+                plans: None,
+                calls: calls.clone(),
+                own_ports: Vec::new(),
+            }
+            .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
+            .await
+            .unwrap_err();
+            assert!(matches!(e, AccountError::Unavailable(_)), "{e:?}");
+            assert!(calls.asked.lock().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_vllm_server_that_doesnt_answer_is_not_stored() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = HubAccounts {
+                calls: Arc::new(crate::desk_key_check::Answers::failing("down")),
+                ..accounts(&global)
+            };
+            let e = accounts
+                .connect(
+                    spec("vllm").unwrap(),
+                    &fields(&[("url", "http://127.0.0.1:9")]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Refused(m) if m.contains("http://127.0.0.1:9")),
+                "{e:?}"
+            );
+            let e = accounts
+                .connect(
+                    spec("vllm").unwrap(),
+                    &fields(&[("url", "http://sam:hunter2@127.0.0.1:9")]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Refused(m) if !m.contains("hunter2") && !m.contains("sam")),
+                "{e:?}"
+            );
+            assert!(global.find_account("vllm").is_none());
+        }
+
+        #[tokio::test]
         async fn a_plan_is_connected_by_its_login_and_disconnecting_signs_it_out() {
             let dir = tempfile::tempdir().unwrap();
             let global = vault(dir.path());
@@ -1708,6 +2183,8 @@ mod tests {
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
                 plans: None,
+                calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             }
             .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
             .await
@@ -1740,6 +2217,8 @@ mod tests {
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
                 plans: None,
+                calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             };
             for spec in PROVIDERS {
                 let models: Vec<&str> = match spec.lists_installed() {
@@ -1828,6 +2307,8 @@ mod tests {
                 known: Arc::new(Vec::new),
                 google_login: Arc::new(|| None),
                 plans: None,
+                calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             };
             let bedrock = spec("bedrock").unwrap();
             let unhonoured: Vec<&str> = bedrock

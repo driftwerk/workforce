@@ -965,6 +965,20 @@ impl Desk {
                 Ok(json!({ "id": m.id, "delivery": m.delivery, "note": note }))
             }
             Call::Reply { to, text } => {
+                // A mark is the question's to this session that it opens.
+                let to = match to {
+                    line::ReplyTo::Id(id) => id,
+                    line::ReplyTo::Mark(mark) => self
+                        .0
+                        .store
+                        .line_marked(&caller.to_string(), &mark)
+                        .await
+                        .map_err(|e| say(e.into()))?
+                        .map(|m| m.id)
+                        .ok_or_else(|| {
+                            format!("No question to you on Desk's line has the mark {mark}.")
+                        })?,
+                };
                 let a = self
                     .line_answer(to, Sender::Session(caller), text)
                     .await

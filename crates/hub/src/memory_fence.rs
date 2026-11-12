@@ -161,9 +161,29 @@ pub(crate) fn turns_in_flight(workspace: &Path) -> usize {
     IN_FLIGHT.lock().get(workspace).copied().unwrap_or(0)
 }
 
-/// The fence a turn of `agent` starting now carries: the one it is inside
-/// already (a turn that runs another for the same agent), else its config's.
-pub(crate) fn fence_for_turn(agent: &AgentId, workspace: &Path) -> String {
+/// The fence a turn of `agent` on `channel` starting now carries.
+///
+/// In a Desk group's boss conversation, the group's own tag, whatever turn
+/// it runs inside: everything remembered there is the group's, and only
+/// that is recalled, never what the agent holds from elsewhere. A channel
+/// that claims to be one but isn't (`session` says) remembers and recalls
+/// nothing scoped. Anywhere else, the one it is inside already (a turn that
+/// runs another for the same agent), else its config's; none of those
+/// recalls a boss conversation's memories, which no other fence admits.
+pub(crate) fn fence_for_turn(
+    agent: &AgentId,
+    workspace: &Path,
+    channel: &str,
+    session: impl FnOnce() -> Option<workforce_common::session::Session>,
+) -> String {
+    if workforce_common::channels::is_desk_boss_channel(channel) {
+        let fence = session()
+            .and_then(|s| {
+                crate::boss_links::conversation::BossConversation::of(&s, agent.as_str(), &s.owner)
+            })
+            .map_or(Fence::Unknown, |c| Fence::Boss(c.memory_tag()));
+        return encode(agent, &fence);
+    }
     workforce_agent::runner::CURRENT_MEMORY_FENCE
         .try_with(|s| s.clone())
         .ok()
@@ -171,14 +191,28 @@ pub(crate) fn fence_for_turn(agent: &AgentId, workspace: &Path) -> String {
         .unwrap_or_else(|| turn_fence(agent, workspace))
 }
 
+/// Whether the turn running now is in a Desk group's boss conversation,
+/// by the fence it carries: what it reads outside the memory store (a
+/// legacy notes file) is left out.
+pub(crate) fn in_boss_conversation() -> bool {
+    workforce_agent::runner::CURRENT_MEMORY_FENCE
+        .try_with(|s| {
+            s.split_once('\t').is_some_and(|(_, f)| {
+                f.starts_with(workforce_memory::group_tagged::LINK_BOSS_TAG_PREFIX)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The session metadata key a boss's conversations carry once it left the
 /// scope they were had in: the scope's tag.
 pub(crate) const LEFT_SCOPE: &str = workforce_common::session::LEFT_SCOPE_KEY;
 
 /// Whether `s` was had while its agent was the boss of a scope it has left
-/// since: never read again, nor recalled in a digest.
+/// since, or is a Desk group's boss conversation: never read again in
+/// another conversation, nor recalled in a digest.
 pub(crate) fn left_behind(s: &workforce_common::session::Session) -> bool {
-    s.left_behind()
+    s.kept_apart()
 }
 
 /// Every conversation of `sessions`' agent is left with the scope `tag` it
@@ -292,6 +326,146 @@ mod tests {
         assert_eq!(out.output["count"].as_u64(), Some(0), "{}", out.output);
     }
 
+    /// A Desk group's boss conversation of Allan's with Sam, as its link
+    /// makes it.
+    fn boss_conversation(key: &str) -> Session {
+        let mut s = Session::new(&format!("desk:boss:{key}"), "sam", "allan");
+        s.metadata = serde_json::json!({ "desk_boss": {
+            "v": 1, "groupKey": key, "groupName": "Acme", "person": "sam", "agent": "allan",
+        }});
+        s
+    }
+
+    #[tokio::test]
+    async fn a_boss_conversation_keeps_its_memory_and_none_other_both_ways() {
+        use workforce_memory::types::{Memory, MemoryFilter, MemoryLayer};
+        let dir = tempfile::tempdir().unwrap();
+        let allan = AgentId::new("allan");
+        let inner: Arc<dyn MemoryStore> =
+            Arc::new(workforce_memory::in_memory::InMemoryStore::new());
+        let store = fenced(Arc::clone(&inner), &allan, dir.path());
+        let mem = |content: &str| {
+            let mut m = Memory::new(content, MemoryLayer::Episodic, allan.clone());
+            m.identity_id = Some("sam".into());
+            m
+        };
+        let filter = || MemoryFilter {
+            identity_id: Some("sam".into()),
+            limit: Some(10),
+            ..MemoryFilter::default()
+        };
+        let all = |store: Arc<dyn MemoryStore>| async move {
+            let mut c: Vec<String> = store
+                .list(filter())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.content)
+                .collect();
+            c.sort();
+            c
+        };
+        let acme = boss_conversation("k-acme");
+        let in_acme = fence_for_turn(&allan, dir.path(), &acme.channel, || Some(acme.clone()));
+        let in_dm = fence_for_turn(&allan, dir.path(), "desk", || None);
+        assert_eq!(in_dm, encode(&allan, &Fence::Open));
+        let fence = &workforce_agent::runner::CURRENT_MEMORY_FENCE;
+
+        // Remembered in a plain DM: untagged. In Acme's conversation: Acme's.
+        fence
+            .scope(in_dm.clone(), store.remember(mem("dm canary")))
+            .await
+            .unwrap();
+        let acmes = fence
+            .scope(in_acme.clone(), store.remember(mem("acme canary")))
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.get(&acmes).await.unwrap().unwrap().tags,
+            ["desk-group:boss/k-acme"]
+        );
+        // Each recalls its own alone.
+        assert_eq!(
+            fence.scope(in_acme.clone(), all(store.clone())).await,
+            ["acme canary"]
+        );
+        assert_eq!(
+            fence.scope(in_dm.clone(), all(store.clone())).await,
+            ["dm canary"]
+        );
+        // A turn inside Acme's keeps Acme's fence; Acme's never inherits a
+        // DM's.
+        let nested = fence
+            .scope(in_acme.clone(), async {
+                fence_for_turn(&allan, dir.path(), "subagent:x", || None)
+            })
+            .await;
+        assert_eq!(nested, in_acme);
+        let entered = fence
+            .scope(in_dm.clone(), async {
+                fence_for_turn(&allan, dir.path(), &acme.channel, || Some(acme.clone()))
+            })
+            .await;
+        assert_eq!(entered, in_acme);
+        // Another group's conversation reads none of Acme's.
+        let globex = boss_conversation("k-globex");
+        let in_globex =
+            fence_for_turn(&allan, dir.path(), &globex.channel, || Some(globex.clone()));
+        assert!(fence.scope(in_globex, all(store.clone())).await.is_empty());
+
+        // A channel that only claims to be one remembers nothing and recalls
+        // none of the group's (a turn can't be had there: nothing opens it).
+        let mut forged = Session::new("desk:boss:k-acme", "sam", "allan");
+        for s in [forged.clone(), {
+            forged.metadata = serde_json::json!({ "desk_boss": { "groupKey": "k-acme", "person": "mia", "agent": "allan" }});
+            forged.clone()
+        }] {
+            let f = fence_for_turn(&allan, dir.path(), &s.channel, || Some(s.clone()));
+            assert_eq!(f, encode(&allan, &Fence::Unknown));
+            assert_eq!(
+                fence.scope(f.clone(), all(store.clone())).await,
+                ["dm canary"],
+                "never the group's"
+            );
+            assert!(fence
+                .scope(f, store.remember(mem("planted")))
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            fence_for_turn(&allan, dir.path(), "DESK:BOSS:k-acme", || None),
+            encode(&allan, &Fence::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_boss_conversation_is_never_read_in_another() {
+        let acme = boss_conversation("k-acme");
+        assert!(left_behind(&acme));
+        let mut dm = Session::new("desk", "sam", "allan");
+        dm.context_type = Some(SessionContextType::Dm);
+        let mut talked = acme.clone();
+        talked.context_type = Some(SessionContextType::Dm);
+        talked.add_user_message("acme canary", None);
+        assert!(!crate::session_digest::digest_source_eligible(
+            &talked,
+            &dm,
+            "allan",
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            &Default::default(),
+            &Default::default(),
+        ));
+        // Its successor stays one.
+        let next = {
+            let mut n = acme.successor();
+            n.adopt_conversation_mode(&acme);
+            n
+        };
+        assert!(
+            crate::boss_links::conversation::BossConversation::of(&next, "allan", "sam").is_some()
+        );
+    }
+
     #[test]
     fn a_boss_is_fenced_to_its_scope_and_anyone_else_is_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -352,11 +526,13 @@ mod tests {
         // A turn begun inside another of the same agent's keeps the outer
         // one's fence; one begun fresh reads the config.
         let inner = workforce_agent::runner::CURRENT_MEMORY_FENCE
-            .scope(began.clone(), async { fence_for_turn(&sarah, dir.path()) })
+            .scope(began.clone(), async {
+                fence_for_turn(&sarah, dir.path(), "desk", || None)
+            })
             .await;
         assert_eq!(inner, began);
         assert_eq!(
-            fence_for_turn(&sarah, dir.path()),
+            fence_for_turn(&sarah, dir.path(), "desk", || None),
             encode(&sarah, &Fence::Boss("desk-group:g-atlas".into()))
         );
         // A turn counts while it lives.

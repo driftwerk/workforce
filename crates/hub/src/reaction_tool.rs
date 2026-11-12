@@ -58,11 +58,15 @@ fn shared_input_schema(action: &str) -> serde_json::Value {
 }
 
 fn build_reaction(input: &serde_json::Value) -> Result<Reaction> {
+    let channel = input["channel"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
+    // A Desk group's boss conversation is reached through its link alone.
+    if let Some(why) = crate::boss_links::conversation::refused_channel(channel) {
+        eyre::bail!("{why}");
+    }
     Ok(Reaction {
-        channel: input["channel"]
-            .as_str()
-            .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?
-            .to_string(),
+        channel: channel.to_string(),
         message_id: input["message_id"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing 'message_id' parameter"))?

@@ -143,7 +143,7 @@ impl std::fmt::Display for Refusal {
             Refusal::NotStartable(e) => write!(f, "Desk can't start {} sessions here yet.", e.title()),
             Refusal::NotSignedIn(e) => write!(f, "That {} account isn't signed in; sign it in again, or choose another.", e.title()),
             Refusal::CrossGroup => f.write_str("Work can't be handed to a session in another group."),
-            Refusal::HubInternal => f.write_str("This is one of the hub's own runs, so it can't be handed on."),
+            Refusal::HubInternal => f.write_str("This is one of Desk's own runs, so it can't be handed on."),
             Refusal::MemoryOff(e) => write!(f, "Desk isn't remembering this session, so it has nothing to hand over. Turn Remember on, or start {} here with only the goal.", e.title()),
             Refusal::NoRecord { source, target } => write!(f, "Desk can't read {} conversations, so it can't hand this one over. Start {} here with only the goal instead.", source.title(), target.title()),
             Refusal::NoRedactor => f.write_str(crate::memory::NO_REDACTOR),

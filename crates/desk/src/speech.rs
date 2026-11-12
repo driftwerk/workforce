@@ -49,6 +49,39 @@ impl SpeechProvider {
     }
 }
 
+/// A voice key Desk keeps: a speech provider's, or the Gemini key Gemini
+/// Live talks with (the Gemini provider's, when one is connected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceKey {
+    Speech(SpeechProvider),
+    Gemini,
+}
+
+impl VoiceKey {
+    /// The key named as its vault path spells it (`speech/<name>/api_key`).
+    pub fn parse(name: &str) -> Option<Self> {
+        SpeechProvider::ALL
+            .into_iter()
+            .find(|p| p.name() == name)
+            .map(Self::Speech)
+            .or((name == "gemini").then_some(Self::Gemini))
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Speech(p) => p.name(),
+            Self::Gemini => "gemini",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Speech(p) => p.label(),
+            Self::Gemini => "Gemini",
+        }
+    }
+}
+
 /// What to say, and how. `model` and `voice` fall back to the provider's
 /// defaults; `speed` is a rate multiplier each provider clamps to its range.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -94,13 +127,17 @@ pub enum SpeakError {
     #[error("{0}")]
     Invalid(String),
     #[error(
-        "this hub has no {} key: add a {} key under Voices in Desk Settings",
+        "Desk has no {} key yet: add a {} key under Voices in Desk Settings",
         .0.label(),
         .0.label()
     )]
     NoKey(SpeechProvider),
     #[error("{0}")]
     Upstream(String),
+    /// The provider refused a voice key when it was tried: why, in the
+    /// person's words, with the fix.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Speaks for the app. Implemented by the hub over its speech providers and
@@ -108,6 +145,17 @@ pub enum SpeakError {
 #[async_trait]
 pub trait Speech: Send + Sync {
     async fn speak(&self, request: &Speak) -> Result<Audio, SpeakError>;
+
+    /// Tries `key` with the smallest call its provider takes, then keeps
+    /// it where Desk reads it. A key the provider refuses is not kept, and
+    /// [`SpeakError::Refused`] says why in the person's words; neither ever
+    /// carries the key.
+    async fn save_key(&self, key: VoiceKey, _value: &str) -> Result<(), SpeakError> {
+        Err(SpeakError::Invalid(format!(
+            "this Desk can't check a {} key yet",
+            key.label()
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -126,12 +174,16 @@ mod tests {
     use crate::realtime::Realtime;
     use crate::testing::{Bearer, NoKeys};
 
-    /// Speaks every request as its text's bytes, or answers `fails`.
+    /// Speaks every request as its text's bytes, or answers `fails`; keeps
+    /// every key but `refused`.
     #[derive(Default)]
     struct Fake {
         heard: Mutex<Vec<Speak>>,
         fails: Option<SpeakError>,
+        kept: Mutex<Vec<(VoiceKey, String)>>,
     }
+
+    const REFUSED: &str = "refused-key-0123456789";
 
     #[async_trait]
     impl Speech for Fake {
@@ -144,6 +196,17 @@ mod tests {
                     media_type: "audio/mpeg".into(),
                 }),
             }
+        }
+
+        async fn save_key(&self, key: VoiceKey, value: &str) -> Result<(), SpeakError> {
+            if value == REFUSED {
+                return Err(SpeakError::Refused(format!(
+                    "{} didn't accept that key",
+                    key.label()
+                )));
+            }
+            self.kept.lock().push((key, value.into()));
+            Ok(())
         }
     }
 
@@ -256,6 +319,100 @@ mod tests {
         );
     }
 
+    async fn save_key(app: Router, token: &str, name: &str, body: Value) -> (StatusCode, Value) {
+        let request = Request::post(format!("/api/desk/voice/keys/{name}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn a_voice_key_is_kept_once_its_provider_takes_it_and_never_echoed() {
+        let fake = Arc::new(Fake::default());
+        let (status, body) = save_key(
+            app(Arc::clone(&fake)),
+            "hub-token",
+            "elevenlabs",
+            json!({ "key": "  el-right  " }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = save_key(
+            app(Arc::clone(&fake)),
+            "hub-token",
+            "gemini",
+            json!({ "key": "gm-right" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            *fake.kept.lock(),
+            vec![
+                (
+                    VoiceKey::Speech(SpeechProvider::ElevenLabs),
+                    "el-right".into()
+                ),
+                (VoiceKey::Gemini, "gm-right".into()),
+            ]
+        );
+
+        let (status, body) = save_key(
+            app(Arc::clone(&fake)),
+            "hub-token",
+            "openai",
+            json!({ "key": REFUSED }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let said = body["error"].as_str().unwrap();
+        assert_eq!(said, "OpenAI didn't accept that key");
+        assert_eq!(body["code"], crate::providers::KEY_REFUSED);
+        assert!(!body.to_string().contains(REFUSED));
+
+        let (status, _) = save_key(
+            app(Arc::clone(&fake)),
+            "hub-token",
+            "openai",
+            json!({ "key": " " }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = save_key(
+            app(Arc::clone(&fake)),
+            "hub-token",
+            "kokoro",
+            json!({ "key": "k" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = save_key(
+            app(Arc::clone(&fake)),
+            "wrong",
+            "openai",
+            json!({ "key": "k" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fake.kept.lock().len(), 2);
+    }
+
+    #[test]
+    fn voice_keys_are_named_as_their_vault_paths_spell_them() {
+        for provider in SpeechProvider::ALL {
+            assert_eq!(
+                VoiceKey::parse(provider.name()),
+                Some(VoiceKey::Speech(provider))
+            );
+        }
+        assert_eq!(VoiceKey::parse("gemini"), Some(VoiceKey::Gemini));
+        assert_eq!(VoiceKey::parse("kokoro"), None);
+    }
+
     #[tokio::test]
     async fn needs_the_hub_token() {
         let fake = Arc::new(Fake::default());
@@ -284,7 +441,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error(&body),
-            "this hub has no Fish Audio key: add a Fish Audio key under Voices in Desk Settings"
+            "Desk has no Fish Audio key yet: add a Fish Audio key under Voices in Desk Settings"
         );
     }
 

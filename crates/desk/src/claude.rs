@@ -129,6 +129,11 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         Launch::Resume { session_id } => vec!["--resume".to_string(), session_id.to_string()],
     };
     let mut settings = hook_settings_for(s.hook_url, s.approval_timeout_secs, s.fail_closed);
+    // Desk's own line tools are allowed up front: in auto mode Claude Code's
+    // classifier would otherwise judge `reply` and the rest like any outside
+    // call, and a refusal there becomes a card that waits on the person.
+    // Only these: every other tool goes through Desk's hooks as before.
+    settings["permissions"] = json!({ "allow": line_tools_allowed() });
     if let Some(theme) = s.theme {
         settings["theme"] = Value::String(theme.into());
     }
@@ -159,6 +164,15 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         cwd: s.cwd.to_path_buf(),
         env,
     }
+}
+
+/// What Claude Code names Desk's plugin's line tools (`mcp__desk__reply`),
+/// as `permissions.allow` lists them.
+pub fn line_tools_allowed() -> Vec<String> {
+    crate::line::TOOLS
+        .iter()
+        .map(|t| format!("mcp__desk__{}", t.name))
+        .collect()
 }
 
 /// Where Desk's plugin posts the plan's rate limits from.
@@ -762,6 +776,38 @@ pub(crate) mod tests {
             hook_settings("http://h", 60),
             hook_settings_for("http://h", 60, false)
         );
+    }
+
+    #[test]
+    fn desks_own_line_tools_and_only_those_are_allowed_up_front() {
+        let env = BTreeMap::new();
+        for fail_closed in [false, true] {
+            let s = spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: None,
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme: None,
+                mode: None,
+                fail_closed,
+            });
+            let at = s.args.iter().position(|a| a == "--settings").unwrap();
+            let v: Value = serde_json::from_str(&s.args[at + 1]).unwrap();
+            let allow: Vec<String> =
+                serde_json::from_value(v["permissions"]["allow"].clone()).unwrap();
+            assert!(allow.contains(&"mcp__desk__reply".to_string()), "{allow:?}");
+            assert!(allow.contains(&"mcp__desk__ask".to_string()), "{allow:?}");
+            assert_eq!(allow.len(), crate::line::TOOLS.len());
+            assert!(allow
+                .iter()
+                .all(|t| t.starts_with("mcp__desk__") && !t.contains('*')));
+            // The hooks are still there with them.
+            assert!(v["hooks"]["PreToolUse"].is_array());
+        }
     }
 
     #[test]

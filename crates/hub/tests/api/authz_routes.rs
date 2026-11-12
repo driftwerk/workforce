@@ -2321,3 +2321,75 @@ async fn keeping_manage_over_the_owner_route_leaves_every_other_grantee_alone() 
         "a plain transfer leaves the outgoing owner nothing"
     );
 }
+
+/// Editing an identity's links never sets (or clears) the email its sign-in
+/// provider verified: only a sign-in writes it.
+#[tokio::test]
+async fn an_identity_edit_never_writes_its_verified_email() {
+    let (state, fx) = state_with_fixtures();
+    let admin = fx.token(&fx.admin);
+    let path = format!("/api/identities/{}", fx.member.id);
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "linked_ids": {
+            "slack": "U-1",
+            "oidc_email": "someone-else@example.com",
+            "oidc_email_at": chrono::Utc::now().to_rfc3339(),
+        } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let stored = state
+        .identity_store
+        .as_ref()
+        .unwrap()
+        .get_by_id(fx.member.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.linked_ids.get("slack").map(String::as_str),
+        Some("U-1")
+    );
+    assert!(!stored.linked_ids.contains_key("oidc_email"));
+    assert!(!stored.linked_ids.contains_key("oidc_email_at"));
+
+    // One a sign-in wrote stays through an edit, and goes on suspension.
+    let mut signed_in = stored.clone();
+    signed_in
+        .linked_ids
+        .insert("oidc_email".into(), "member@example.com".into());
+    signed_in
+        .linked_ids
+        .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+    let store = state.identity_store.as_ref().unwrap();
+    store.update(&signed_in).unwrap();
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "linked_ids": { "slack": "U-2" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let kept = store.get_by_id(fx.member.id).unwrap().unwrap();
+    assert_eq!(
+        kept.linked_ids.get("oidc_email").map(String::as_str),
+        Some("member@example.com")
+    );
+    let (s, _) = req_json(
+        state.clone(),
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(serde_json::json!({ "status": "suspended" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let gone = store.get_by_id(fx.member.id).unwrap().unwrap();
+    assert!(!gone.linked_ids.contains_key("oidc_email"));
+    assert!(!gone.linked_ids.contains_key("oidc_email_at"));
+}

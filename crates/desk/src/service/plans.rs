@@ -1784,6 +1784,7 @@ impl Desk {
             .clone()
             .filter(|g| self.layout().groups.iter().any(|x| &x.id == g));
         let new = NewSession {
+            fresh_worktree: false,
             engine,
             view: runs.view,
             name: key.clone(),

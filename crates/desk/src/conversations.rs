@@ -287,7 +287,7 @@ pub trait Conversations: Send + Sync {
         _put: PutRead,
     ) -> Result<ConversationRead, ConversationError> {
         Err(ConversationError::Unavailable(
-            "this hub keeps no read points".into(),
+            "Desk keeps no read points here yet".into(),
         ))
     }
 }

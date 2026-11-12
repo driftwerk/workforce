@@ -149,7 +149,18 @@ pub struct Assignee {
 #[serde(rename_all = "camelCase")]
 pub enum MeSource {
     Vouched,
+    /// The hub's key is shared: the one user there with the email the
+    /// person's sign-in provider verified.
+    VouchedByEmail,
     Typed,
+}
+
+impl MeSource {
+    /// Whether the hub stood behind it (by the person's own key, or by
+    /// their verified email): only then is anything assigned to them.
+    pub fn vouched(self) -> bool {
+        matches!(self, Self::Vouched | Self::VouchedByEmail)
+    }
 }
 
 /// A field that can be absent (not known), null (known to be none) or a
@@ -331,6 +342,11 @@ pub struct Sync {
     /// before assignees were kept catches up on its first pass.
     #[serde(default)]
     pub assignees_swept: bool,
+    /// The board was linked with tickets of its own, which stay on Desk only
+    /// (keeping their own keys) while the issues come in beside them: none
+    /// made before this time is ever made an issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_before: Option<DateTime<Utc>>,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.

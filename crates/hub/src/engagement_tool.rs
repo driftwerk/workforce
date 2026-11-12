@@ -133,6 +133,10 @@ impl Tool for MessagingSetModeTool {
         let start = Instant::now();
         let params: SetModeInput =
             serde_json::from_value(input).map_err(|e| eyre::eyre!("Invalid input: {}", e))?;
+        // A Desk group's boss conversation is reached through its link alone.
+        if let Some(why) = crate::boss_links::conversation::refused_channel(&params.channel) {
+            return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64));
+        }
 
         let scope = EngagementScope::new(&self.agent_id, &params.channel, params.thread_id.clone());
 
@@ -238,6 +242,10 @@ impl Tool for MessagingGetModeTool {
         let start = Instant::now();
         let params: GetModeInput =
             serde_json::from_value(input).map_err(|e| eyre::eyre!("Invalid input: {}", e))?;
+        // A Desk group's boss conversation is reached through its link alone.
+        if let Some(why) = crate::boss_links::conversation::refused_channel(&params.channel) {
+            return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64));
+        }
 
         let resolved = self
             .overrides
