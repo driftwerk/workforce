@@ -2192,7 +2192,17 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
         "sendgrid" => adapters::sendgrid::SendGridSkill::tool_names(),
         "hubspot" => adapters::hubspot::HubspotSkill::tool_names(),
         "notion" => adapters::notion::NotionSkill::tool_names(),
-        "browser" => adapters::browser::BrowserSkill::tool_names(),
+        // Every name either browser owns: the person's Chrome on a Desk hub,
+        // the headless one on a server.
+        "browser" => {
+            let mut names = adapters::browser::BrowserSkill::tool_names();
+            for n in adapters::browser_headless::BrowserSkill::tool_names() {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            names
+        }
         "obscura" => adapters::obscura::ObscuraSkill::tool_names(),
         "email" => adapters::email::EmailSkill::tool_names(),
         _ => Vec::new(),
@@ -3915,13 +3925,33 @@ fn load_notion_from_vault(
     })
 }
 
-/// The browser skill as this hub runs it. Desk browses only in the
-/// person's own Chrome, through Desk's extension; there is nothing to set
-/// up here.
-pub(crate) fn browser_skill_config(
-    _config: &WorkforceConfig,
-) -> workforce_skills::adapters::browser::BrowserSkillConfig {
-    workforce_skills::adapters::browser::BrowserSkillConfig::default()
+/// The headless browser a server hub runs: `[skills.browser]` over its
+/// defaults.
+pub(crate) fn headless_browser_config(
+    config: &WorkforceConfig,
+) -> workforce_skills::adapters::browser_headless::BrowserSkillConfig {
+    let set = &config.skills.browser;
+    let named = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let profile_root = named(&set.profile_root);
+    workforce_skills::adapters::browser_headless::BrowserSkillConfig {
+        chrome_binary: named(&set.chrome_binary),
+        keep_profiles: profile_root.is_some(),
+        profile_root,
+        show: set.show.unwrap_or(false),
+        ..Default::default()
+    }
+}
+
+/// Whether `browser.*` on this hub is the person's own Chrome, through
+/// Desk's extension (a Desk hub), rather than the headless browser a server
+/// hub runs.
+pub(crate) fn browser_is_the_persons_chrome(config: &WorkforceConfig) -> bool {
+    config.desk.enabled
 }
 
 fn load_browser_from_vault(
@@ -3930,10 +3960,20 @@ fn load_browser_from_vault(
     config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
-    let config = browser_skill_config(config);
     let store = layered_user_store(vault, global_vault);
-    let skill = workforce_skills::adapters::browser::BrowserSkill::with_store(config, store)?;
-    let tools = skill.tools();
+    let tools = if browser_is_the_persons_chrome(config) {
+        workforce_skills::adapters::browser::BrowserSkill::with_store(
+            workforce_skills::adapters::browser::BrowserSkillConfig::default(),
+            store,
+        )?
+        .tools()
+    } else {
+        workforce_skills::adapters::browser_headless::BrowserSkill::with_store(
+            headless_browser_config(config),
+            store,
+        )?
+        .tools()
+    };
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
         names.push(tool.name().to_string());
@@ -4296,9 +4336,9 @@ fn load_linear_tools(tools: &mut Vec<Arc<dyn Tool>>) {
 
 #[allow(dead_code)]
 fn load_browser_tools(tools: &mut Vec<Arc<dyn Tool>>) {
-    let skill_config = workforce_skills::adapters::browser::BrowserSkillConfig::default();
+    let skill_config = workforce_skills::adapters::browser_headless::BrowserSkillConfig::default();
 
-    match workforce_skills::adapters::browser::BrowserSkill::new(skill_config) {
+    match workforce_skills::adapters::browser_headless::BrowserSkill::new(skill_config) {
         Ok(skill) => {
             let skill_tools = skill.tools();
             let count = skill_tools.len();
@@ -4999,18 +5039,61 @@ mod tests {
         assert!(tpl.contains("paragraph_spacing = true"));
     }
 
-    /// The old Chromium skill's keys in `[skills.browser]` still read, and
-    /// change nothing: no browser is launched.
+    /// A server hub (no `[desk]`) keeps its headless browser, with the whole
+    /// tool surface it had (scripts, PDFs, console and network included) and
+    /// `[skills.browser]` read; a Desk hub gets the person's own Chrome
+    /// instead, without them.
     #[test]
-    fn the_old_browser_keys_still_read_and_launch_nothing() {
-        let config: workforce_common::settings::SkillsConfig =
-            toml::from_str("[browser]\nprofile_root = \"/srv/browser\"\nshow = true\nchrome_binary = \"/opt/chrome\"\n").unwrap();
-        assert_eq!(
-            config.browser,
-            workforce_common::settings::BrowserSkillsConfig::default()
+    fn a_server_hub_keeps_its_headless_browser_and_a_desk_hub_gets_the_persons_chrome() {
+        let vault = new_test_vault;
+        let names = |config: &WorkforceConfig| {
+            let registry = ToolRegistry::new();
+            let loaded = load_browser_from_vault(vault(), None, config, &registry).unwrap();
+            loaded.tool_names
+        };
+        let mut server = WorkforceConfig::default();
+        server.skills.browser = toml::from_str(
+            "profile_root = \"/srv/browser\"\nshow = false\nchrome_binary = \"/usr/bin/chromium\"\n",
+        )
+        .unwrap();
+        assert!(!browser_is_the_persons_chrome(&server));
+        let headless = names(&server);
+        for tool in [
+            "browser.navigate",
+            "browser.snapshot",
+            "browser.screenshot",
+            "browser.click",
+            "browser.fill",
+            "browser.evaluate",
+            "browser.pdf",
+            "browser.console_messages",
+            "browser.network_requests",
+        ] {
+            assert!(
+                headless.iter().any(|n| n == tool),
+                "{tool} on a server: {headless:?}"
+            );
+        }
+        let config = headless_browser_config(&server);
+        assert_eq!(config.profile_root.as_deref(), Some("/srv/browser"));
+        assert_eq!(config.chrome_binary.as_deref(), Some("/usr/bin/chromium"));
+        assert!(config.keep_profiles && !config.show);
+
+        let mut desk = WorkforceConfig::default();
+        desk.desk.enabled = true;
+        assert!(browser_is_the_persons_chrome(&desk));
+        let chrome = names(&desk);
+        assert!(chrome.iter().any(|n| n == "browser.navigate"));
+        assert!(chrome.iter().any(|n| n == "browser.capture_key"));
+        assert!(
+            !chrome.iter().any(|n| n == "browser.evaluate"),
+            "{chrome:?}"
         );
-        let skill = browser_skill_config(&WorkforceConfig::default());
-        assert_eq!(skill.call_timeout_ms, 30_000);
+        // Every name either owns is the skill's.
+        let all = static_skill_tool_names("browser");
+        for n in headless.iter().chain(chrome.iter()) {
+            assert!(all.contains(&n.as_str()), "{n}");
+        }
     }
 
     #[test]

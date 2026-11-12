@@ -10429,12 +10429,35 @@ pub struct SkillsConfig {
     pub browser: BrowserSkillsConfig,
 }
 
-/// `[skills.browser]`: nothing to set. Desk browses only in the person's
-/// own Chrome, through Desk's Chrome extension, and launches no browser of
-/// its own. Keys the old Chromium skill read (`profile_root`, `show`,
-/// `chrome_binary`, `chrome_user_data_dir`) are still read, and ignored.
+/// `[skills.browser]`: the headless browser a server hub runs (a hub
+/// without Desk): where it keeps its profiles, whether its window shows,
+/// and which Chromium runs.
+///
+/// ```toml
+/// [skills.browser]
+/// # profile_root = "/var/lib/workforce/browser"
+/// # show = true
+/// # chrome_binary = "/usr/bin/chromium"
+/// ```
+///
+/// Profiles live in the system's temp folder and are reaped after a week,
+/// headless, unless set otherwise here. A hub with `[desk]` launches no
+/// browser: Desk browses in the person's own Chrome, through Desk's
+/// extension, and these keys change nothing there. `chrome_user_data_dir`
+/// (the old remote-debugging My Chrome) is still read, and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserSkillsConfig {}
+pub struct BrowserSkillsConfig {
+    /// Where profiles live, in place of the default above. Profiles under a
+    /// root named here are never reaped.
+    #[serde(default)]
+    pub profile_root: Option<String>,
+    /// Show the window (`true`) or run headless (`false`, the default).
+    #[serde(default)]
+    pub show: Option<bool>,
+    /// The Chrome or Chromium to run; found on `PATH` where unset.
+    #[serde(default)]
+    pub chrome_binary: Option<String>,
+}
 
 impl Default for SkillsConfig {
     fn default() -> Self {
