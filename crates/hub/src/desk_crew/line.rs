@@ -598,8 +598,10 @@ struct Gathered {
     messages: Vec<LineMessage>,
     /// What its turn's end said, when the overseer runs it.
     ended: Vec<String>,
-    /// The requests named in `ended` (given to the boss once each).
-    asks: Vec<Uuid>,
+    /// The requests it waits on that its boss is given, each with its line
+    /// for the work turn: read again as the turn starts, and only those
+    /// still open go in.
+    asks: Vec<(Uuid, String)>,
 }
 
 impl Gathered {
@@ -634,8 +636,8 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
     let mut looked: Option<Instant> = None;
-    // The requests already given to a boss, by id, while they are open.
-    let mut offered: HashSet<Uuid> = HashSet::new();
+    // The requests already given to a boss, by id and boss, while open.
+    let mut offered: HashSet<(Uuid, String)> = HashSet::new();
     let mut asked_at: Option<Instant> = None;
     loop {
         let mut look = false;
@@ -690,9 +692,11 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             asked_at = Some(Instant::now());
             for (session, approval, line) in crew.owed_asks(&mut offered) {
                 tracing::info!(%session, %approval, "a request goes to the boss that runs its session");
-                let g = gathering.entry(session).or_insert_with(Gathered::new);
-                g.ended.push(line);
-                g.asks.push(approval);
+                gathering
+                    .entry(session)
+                    .or_insert_with(Gathered::new)
+                    .asks
+                    .push((approval, line));
             }
         }
         // New sessions as they appear, and all of them now and then.
@@ -718,12 +722,23 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             else {
                 continue;
             };
+            // Answered while it was gathered (by the person, say): no turn
+            // for it.
+            let open = crew
+                .desk
+                .view(session)
+                .ok()
+                .and_then(|v| v.pending)
+                .map(|p| p.id);
+            asks.retain(|(approval, _)| Some(*approval) == open);
+            let work = !ended.is_empty() || !asks.is_empty();
             // Let go, or taken over, while it waited: no work turn, and its
             // requests are the boss's to be given again once it drives.
-            if !ended.is_empty() && !crew.still_works(session) {
+            if work && !crew.still_works(session) {
                 ended.clear();
-                for approval in asks.drain(..) {
-                    offered.remove(&approval);
+                let boss = crew.boss_of(session);
+                for (approval, _) in asks.drain(..) {
+                    offered.retain(|(a, b)| *a != approval || Some(b) != boss.as_ref());
                 }
                 if messages.is_empty() {
                     continue;
@@ -731,7 +746,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             }
             // Out of work turns for the hour: its turn's end waits for the
             // next, and what it asked goes on.
-            if !ended.is_empty() && !crew.spend_work_turn(session) {
+            if work && !crew.spend_work_turn(session) {
                 gathering.insert(
                     session,
                     Gathered {
@@ -744,6 +759,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     continue;
                 }
             }
+            ended.extend(asks.iter().map(|(_, line)| line.clone()));
             let crew = Arc::clone(&crew);
             running.insert(
                 session,

@@ -111,7 +111,10 @@ impl CrewHub {
     /// raised while the person held the wheel, one that became answerable
     /// after it was raised, one whose event was lost, and one open when the
     /// boss took the session on or the hub started all reach the boss.
-    pub(crate) fn owed_asks(&self, offered: &mut HashSet<Uuid>) -> Vec<(Uuid, Uuid, String)> {
+    pub(crate) fn owed_asks(
+        &self,
+        offered: &mut HashSet<(Uuid, String)>,
+    ) -> Vec<(Uuid, Uuid, String)> {
         let mut open = HashSet::new();
         let mut owed = Vec::new();
         for c in self.desk.charges() {
@@ -122,14 +125,15 @@ impl CrewHub {
                 continue;
             };
             open.insert(p.id);
-            if offered.contains(&p.id)
+            let given = (p.id, c.boss.clone());
+            if offered.contains(&given)
                 || !p.answerable
                 || p.request.is_none()
                 || !self.still_works(c.session)
             {
                 continue;
             }
-            offered.insert(p.id);
+            offered.insert(given);
             let what = match p.detail.trim() {
                 "" => p.tool.clone(),
                 detail => format!("{}: {}", p.tool, crew::clip(detail, 300)),
@@ -144,8 +148,16 @@ impl CrewHub {
                 ),
             ));
         }
-        offered.retain(|id| open.contains(id));
+        offered.retain(|(id, _)| open.contains(id));
         owed
+    }
+
+    /// The boss that runs `session` now, if one does.
+    pub(crate) fn boss_of(&self, session: Uuid) -> Option<String> {
+        self.desk
+            .charge_of(session)
+            .filter(|c| c.live())
+            .map(|c| c.boss)
     }
 
     /// Whether a work turn for `session` is still wanted: the overseer runs
