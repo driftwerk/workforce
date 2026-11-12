@@ -1564,78 +1564,137 @@ impl CrewHub {
         ))
     }
 
-    /// With "always work in real sessions", the session already there to
-    /// give a start's work to instead of starting another: `action` becomes
-    /// a nudge to it with the goal, said so in `by`'s reason, and the
-    /// session's name is what it answers. None when the person asked for a
-    /// new one, a worktree of its own was asked for, or none fits.
-    pub(crate) fn reuse_instead(
+    /// With "always work in real sessions", the session this overseer
+    /// already runs to give a start's work to instead of starting another:
+    /// `action` becomes a nudge to it with the goal, and the session is
+    /// claimed so another start doesn't pile onto it. Only when the start
+    /// itself would run (`hand_out_work`, the level) and so would the nudge;
+    /// never when the person asked for a new one or a worktree of its own.
+    /// The start as it was, and the session's name, when it does.
+    pub(crate) async fn reuse_instead(
         &self,
         action: &mut Action,
         o: &Oversight,
         boss: &str,
-    ) -> Option<String> {
+    ) -> Option<(Action, String)> {
         let Action::StartSession {
             folder,
             goal,
+            engine,
             worktree: None,
             fresh: false,
             ..
-        } = action
+        } = &*action
         else {
             return None;
         };
-        if !o.work.prefer_sessions {
+        if !o.work.prefer_sessions || self.gate(action, o) != Gate::Run {
             return None;
         }
-        let v = self.reusable(folder, goal, o, boss)?;
-        let name = v.label().to_string();
-        *action = Action::Nudge {
+        let engine = self.engine_or_default(*engine, o).ok()?;
+        let v = self.reusable(folder, goal, engine, o, boss).await?;
+        let nudge = Action::Nudge {
             to: Target::Session(v.id),
             message: goal.clone(),
             reply_to: None,
         };
-        Some(name)
+        if self.gate(&nudge, o) != Gate::Run || !self.claim(v.id) {
+            return None;
+        }
+        let start = std::mem::replace(action, nudge);
+        Some((start, v.label().to_string()))
     }
 
-    /// A session in `o`'s scope that `goal` in `folder` can go to: in that
-    /// folder or another worktree of its repository, running and between
-    /// turns (idle or done), not the person's to drive now, not another
-    /// boss's, and one Desk started (or, with that switch on, one in
-    /// another terminal). One already on that goal first, then one `boss`
-    /// runs, then the one used last.
-    pub(crate) fn reusable(
+    /// Claims `session` for a start's work for a while, so concurrent starts
+    /// don't all go to it; false when another has it claimed.
+    fn claim(&self, session: Uuid) -> bool {
+        let mut claims = self.reuse_claims.lock();
+        let now = std::time::Instant::now();
+        claims.retain(|_, at| now.duration_since(*at) < REUSE_CLAIM);
+        if claims.contains_key(&session) {
+            return false;
+        }
+        claims.insert(session, now);
+        true
+    }
+
+    /// Lets go of a claim whose nudge didn't go.
+    pub(crate) fn unclaim(&self, session: Uuid) {
+        self.reuse_claims.lock().remove(&session);
+    }
+
+    /// Gives `session` the work `nudge` carries; if it can't take it, lets
+    /// go of it and does `start` as asked instead. What was done, and
+    /// whether the session got the work.
+    pub(crate) async fn give_or_start(
+        &self,
+        nudge: &Action,
+        start: &Action,
+        session: Uuid,
+        by: By,
+    ) -> Result<(String, bool), String> {
+        match self.perform(nudge, by.clone()).await {
+            Ok(done) => Ok((done, true)),
+            Err(why) => {
+                self.unclaim(session);
+                tracing::info!(%session, %why, "a session given a start's work couldn't take it; starting one");
+                Ok((self.perform(start, by).await?, false))
+            }
+        }
+    }
+
+    /// A session `goal` in `folder` on `engine` can go to: one `boss` runs
+    /// (never the person's own, nor another boss's), in that same folder or
+    /// worktree, on that engine, running and between turns (idle or done),
+    /// not being driven by the person, not claimed by another start, and
+    /// not on a ticket of its own unless it is on this very goal. One on
+    /// this goal first, then the one used last.
+    pub(crate) async fn reusable(
         &self,
         folder: &str,
         goal: &str,
+        engine: Engine,
         o: &Oversight,
         boss: &str,
     ) -> Option<SessionView> {
         let place = same_place_key(folder);
         let seen = self.desk.seen_by(&o.scope);
         let goal = goal.trim().to_lowercase();
-        self.desk
+        let claimed: std::collections::HashSet<Uuid> = {
+            let now = std::time::Instant::now();
+            self.reuse_claims
+                .lock()
+                .iter()
+                .filter(|(_, at)| now.duration_since(**at) < REUSE_CLAIM)
+                .map(|(s, _)| *s)
+                .collect()
+        };
+        let mut fits: Vec<SessionView> = self
+            .desk
             .list()
             .into_iter()
             .filter(|v| {
                 v.live
+                    && v.engine == engine
                     && matches!(v.state, SessionState::Idle | SessionState::Done)
                     && seen.sees(v.group.as_ref().map(|g| g.id.as_str()))
                     && same_place_key(&v.cwd) == place
-                    && (v.origin == Origin::Desk || o.act.message_terminal_sessions)
+                    && self.runs(v.id, boss)
                     && !self.desk.wheel_of(v.id).is_some_and(|w| w.person())
-                    && self
-                        .desk
-                        .charge_of(v.id)
-                        .is_none_or(|c| !c.live() || c.boss == boss)
+                    && !claimed.contains(&v.id)
             })
-            .max_by_key(|v| {
-                (
-                    v.goal.trim().to_lowercase() == goal,
-                    self.runs(v.id, boss),
-                    v.updated_at,
-                )
-            })
+            .collect();
+        fits.sort_by_key(|v| {
+            std::cmp::Reverse((v.goal.trim().to_lowercase() == goal, v.updated_at))
+        });
+        for v in fits {
+            let same_goal = v.goal.trim().to_lowercase() == goal;
+            // On a ticket of its own, it's that ticket's.
+            if same_goal || self.desk.doing_key(v.id).await.is_none() {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// `engine`, or the overseer's default one.
@@ -2158,18 +2217,18 @@ impl CrewHub {
     }
 }
 
-/// Where a folder's work is, to tell two sessions in one place: its
-/// repository's main folder for a worktree of it, without a trailing
-/// slash, `~` read as the home folder.
+/// How long a session given a start's work is held from another start.
+pub(crate) const REUSE_CLAIM: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A folder as two sessions are compared by: the same folder (or the same
+/// worktree, never a sibling worktree of its repository), without a
+/// trailing slash, `~` read as the home folder.
 pub(crate) fn same_place_key(folder: &str) -> String {
     let f = folder.trim().trim_end_matches('/');
-    let f = match (f.strip_prefix("~/"), std::env::var("HOME")) {
+    match (f.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
         _ => f.to_string(),
-    };
-    workforce_desk::project_of(&f)
-        .trim_end_matches('/')
-        .to_string()
+    }
 }
 
 #[cfg(test)]

@@ -408,29 +408,18 @@ impl CrewTool {
             o.insert("ticket".into(), json!(key));
         }
         let oversight = &b.oversight;
-        // Always working in real sessions, a start goes to the session
-        // already there for it when one fits: told the goal, not a new one.
-        let reused = crew.reuse_instead(&mut action, oversight, b.service.agent_id.as_str());
+        // Always working in real sessions, a start goes to the session it
+        // already runs for it when one fits, as the start would have run:
+        // told the goal, not a new one.
+        let reused = crew
+            .reuse_instead(&mut action, oversight, b.service.agent_id.as_str())
+            .await;
         let reason = match &reused {
-            Some(name) => format!(
+            Some((_, name)) => format!(
                 "{reason} (gave it to {name}, already there, rather than starting a new session)"
             ),
             None => reason.to_string(),
         };
-        if let (
-            Action::Nudge {
-                to: Target::Session(s),
-                message,
-                ..
-            },
-            true,
-            Some(o),
-        ) = (&action, reused.is_some(), kept.as_object_mut())
-        {
-            // A suggestion of it is the nudge's, as the person would see it.
-            o.insert("session_id".into(), json!(s.to_string()));
-            o.insert("message".into(), json!(message));
-        }
         let input = &kept;
         let by = crew.by_boss(&b.service, &reason);
         crew.know_question(&action).await;
@@ -447,29 +436,35 @@ impl CrewTool {
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
                 let actor = by.party.clone();
-                let done = crew.perform(&action, by).await?;
+                let Some((start, name)) = reused else {
+                    let done = crew.perform(&action, by).await?;
+                    return Ok(json!({ "done": done }));
+                };
+                let Action::Nudge { to: Target::Session(s), .. } = &action else {
+                    return Err("That isn't a session to give work to.".into());
+                };
+                let s = *s;
+                let (done, gave) = crew.give_or_start(&action, &start, s, by).await?;
+                if !gave {
+                    return Ok(json!({ "done": done }));
+                }
                 // Activity, and the Floor's rail, say which session got the
                 // work instead of a new one, and why.
-                if let (Some(name), Action::Nudge { to: Target::Session(s), .. }) = (&reused, &action) {
-                    if let Ok(v) = crew.desk.view(*s) {
-                        let mut e = crew::Event::new(
-                            crew::Kind::Nudged,
-                            actor,
-                            Some(crew::Party::session(&v)),
-                            format!("gave {name} the work rather than starting a new session"),
-                        );
-                        e.reason = Some(reason.clone());
-                        crew.desk.note(e);
-                    }
+                if let Ok(v) = crew.desk.view(s) {
+                    let mut e = crew::Event::new(
+                        crew::Kind::Nudged,
+                        actor,
+                        Some(crew::Party::session(&v)),
+                        format!("gave {name} the work rather than starting a new session"),
+                    );
+                    e.reason = Some(reason.clone());
+                    crew.desk.note(e);
                 }
-                Ok(match reused {
-                    Some(name) => json!({
-                        "done": done,
-                        "reused": name,
-                        "note": format!("{name} was already there for this, idle in the same folder, so it got the work instead of a new session. Pass new: true only when the person asks for a new one."),
-                    }),
-                    None => json!({ "done": done }),
-                })
+                Ok(json!({
+                    "done": done,
+                    "reused": name,
+                    "note": format!("{name} was already there for this, idle in the same folder, so it got the work instead of a new session. Pass new: true only when the person asks for a new one."),
+                }))
             }
             Gate::Suggest(why) => {
                 if action.starts_session() {
