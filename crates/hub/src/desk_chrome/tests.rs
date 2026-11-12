@@ -311,3 +311,68 @@ async fn a_call_in_someone_elses_turn_never_reaches_the_extension() {
         .unwrap_err();
     assert_ne!(close.to_string(), OTHERS_TURN);
 }
+
+/// A second Chrome the person confirms doesn't take over from the one they
+/// use: Settings shows both, and the first stays chosen until they choose.
+#[tokio::test]
+async fn confirming_another_chrome_keeps_the_one_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let chrome = Chrome::new(dir.path().join("p.json"));
+    let port = hub(Arc::clone(&chrome)).await;
+    let mut first = ext(port, new_key()).await;
+    first.handshake(true).await;
+    let one = chrome.view()[0].id.clone();
+    assert!(chrome.confirm(&one));
+    assert_eq!(first.hear().await["type"], "ready");
+    let mut second = ext(port, new_key()).await;
+    second.handshake(true).await;
+    let two = chrome
+        .view()
+        .into_iter()
+        .find(|p| p.state == "pending")
+        .unwrap()
+        .id;
+    assert!(chrome.confirm(&two));
+    let chosen: Vec<String> = chrome
+        .view()
+        .into_iter()
+        .filter(|p| p.chosen)
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(chosen, std::slice::from_ref(&one));
+    assert!(chrome.choose(&two));
+    assert!(chrome.view().iter().any(|p| p.id == two && p.chosen));
+}
+
+/// No more than a few Chromes ask the person at once.
+#[tokio::test]
+async fn only_a_few_chromes_ask_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let chrome = Chrome::new(dir.path().join("p.json"));
+    let port = hub(Arc::clone(&chrome)).await;
+    let mut asking = Vec::new();
+    for _ in 0..MAX_ASKING {
+        let mut e = ext(port, new_key()).await;
+        let (_, next) = e.handshake(true).await;
+        assert_eq!(next["type"], "waiting");
+        asking.push(e);
+    }
+    let mut more = ext(port, new_key()).await;
+    let (_, next) = more.handshake(true).await;
+    assert_eq!(next["type"], "refused");
+    assert_eq!(chrome.view().len(), MAX_ASKING);
+}
+
+#[test]
+fn a_version_is_shown_only_as_digits_and_dots() {
+    assert_eq!(version_of(Some("1.2.3")), "1.2.3");
+    for said in [
+        None,
+        Some(""),
+        Some("1.0 — Official Desk, safe to confirm"),
+        Some("12345678901234567"),
+        Some("1.0\u{202e}"),
+    ] {
+        assert_eq!(version_of(said), "?", "{said:?}");
+    }
+}

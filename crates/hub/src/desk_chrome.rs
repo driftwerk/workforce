@@ -47,6 +47,25 @@ pub const STORE_ID: &str = "";
 /// How long the extension has to say hello and prove itself.
 const HANDSHAKE: Duration = Duration::from_secs(15);
 
+/// How many profiles may be asking the person at once: more is someone
+/// flooding Settings → Browser.
+pub const MAX_ASKING: usize = 3;
+
+/// The version a profile says it is, as Settings shows it: digits and dots
+/// only, else nothing it said is shown.
+fn version_of(said: Option<&str>) -> String {
+    match said {
+        Some(v)
+            if !v.is_empty()
+                && v.len() <= 16
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            v.to_string()
+        }
+        _ => "?".into(),
+    }
+}
+
 /// One Chrome profile the extension connected from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
@@ -91,6 +110,9 @@ pub struct Chrome {
     live: parking_lot::Mutex<HashMap<String, Arc<Conn>>>,
     /// Profiles asking now, waiting for the person.
     asking: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Profiles with a connection past its proof, asking or ready: one
+    /// each, taken in one step.
+    taken: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Changes when a profile is confirmed or forgotten.
     changed: watch::Sender<u64>,
     next: AtomicU64,
@@ -140,6 +162,7 @@ impl Chrome {
             profiles: parking_lot::Mutex::new(profiles),
             live: Default::default(),
             asking: Default::default(),
+            taken: Default::default(),
             changed: watch::channel(0).0,
             next: AtomicU64::new(1),
         })
@@ -210,16 +233,22 @@ impl Chrome {
     }
 
     /// The person confirms profile `id` is theirs. False when no such
-    /// profile is asking.
+    /// profile is asking. Desk uses it only if it used no other: where the
+    /// person chose one already, that one stays chosen, and Settings says
+    /// so, until they choose this one.
     pub fn confirm(&self, id: &str) -> bool {
         let mut profiles = self.profiles.lock();
+        let others_chosen = profiles
+            .iter()
+            .any(|p| p.id != id && p.confirmed && p.chosen);
         let Some(p) = profiles.iter_mut().find(|p| p.id == id) else {
             return false;
         };
         p.confirmed = true;
-        // The one just confirmed is the one Desk uses.
-        for q in profiles.iter_mut() {
-            q.chosen = q.id == id;
+        if !others_chosen {
+            for q in profiles.iter_mut() {
+                q.chosen = q.id == id;
+            }
         }
         drop(profiles);
         self.save();
@@ -284,12 +313,7 @@ impl Chrome {
             return;
         };
         let id = id_of(&key);
-        let version: String = hello["version"]
-            .as_str()
-            .unwrap_or("?")
-            .chars()
-            .take(32)
-            .collect();
+        let version = version_of(hello["version"].as_str());
         // The challenge, and the proof it holds that key.
         let nonce = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>());
         let confirmed = self
@@ -324,11 +348,20 @@ impl Chrome {
                 .await;
             return;
         }
-        // A second live connection for this profile is refused.
-        if self.live.lock().contains_key(&id) || self.asking.lock().contains(&id) {
+        // A second live connection for this profile is refused: checked
+        // and taken in one step, so two at once can't both pass.
+        let Some(_taken) = Taken::take(&self, &id) else {
             warn!(profile = %id, "a second connection from a Chrome profile was refused");
             let _ = sink
                 .send(say(json!({ "type": "refused", "why": "Another connection from this Chrome is already Desk's." })))
+                .await;
+            return;
+        };
+        // Not too many asking the person at once.
+        if !confirmed && self.asking.lock().len() >= MAX_ASKING {
+            warn!(profile = %id, "a Chrome profile was refused: too many asking already");
+            let _ = sink
+                .send(say(json!({ "type": "refused", "why": "Too many Chromes are asking Desk at once. Answer them in Settings → Browser first." })))
                 .await;
             return;
         }
@@ -459,6 +492,27 @@ impl Chrome {
             },
             _ => {}
         }
+    }
+}
+
+/// A profile's one connection past its proof, given back when it ends.
+struct Taken {
+    chrome: Arc<Chrome>,
+    id: String,
+}
+
+impl Taken {
+    fn take(chrome: &Arc<Chrome>, id: &str) -> Option<Self> {
+        chrome.taken.lock().insert(id.to_string()).then(|| Self {
+            chrome: Arc::clone(chrome),
+            id: id.to_string(),
+        })
+    }
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        self.chrome.taken.lock().remove(&self.id);
     }
 }
 
