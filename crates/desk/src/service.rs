@@ -865,8 +865,9 @@ struct Inner {
     /// Each engine's reads, one at a time: when the last began and ended.
     engine_reads: BTreeMap<Engine, Arc<tokio::sync::Mutex<Option<EngineRead>>>>,
     /// When every engine was last asked to be read again, in the last
-    /// minute ([`Desk::engines_read_now`]).
-    engines_read_asked: Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// minute, by who asked ([`Desk::engines_read_now`]).
+    engines_read_asked:
+        Mutex<HashMap<Option<String>, std::collections::VecDeque<std::time::Instant>>>,
     /// While the sessions running at the last stop are restored: since
     /// when a read of an engine serves them all.
     restoring_since: Mutex<Option<std::time::Instant>>,
@@ -2111,16 +2112,21 @@ impl Desk {
     /// Every engine read again now (one read under way is shared), as after
     /// Desk installed one or signed one in: then as [`Desk::engines`].
     ///
-    /// Asked more than [`ENGINES_READS_A_MINUTE`] times in a minute, it
-    /// answers what was last read without reading: each read runs every
-    /// engine's program, which asking without end mustn't do.
-    pub async fn engines_read_now(&self) -> Vec<engine::EngineView> {
+    /// Asked more than [`ENGINES_READS_A_MINUTE`] times in a minute by one
+    /// `caller` (the signed-in person; none for the hub's own token), it
+    /// answers them what was last read without reading: each read runs
+    /// every engine's program, which asking without end mustn't do, and one
+    /// asker going on doesn't hold back another.
+    pub async fn engines_read_now(&self, caller: Option<&str>) -> Vec<engine::EngineView> {
         let asked = std::time::Instant::now();
         {
-            let mut recent = self.0.engines_read_asked.lock();
+            let mut all = self.0.engines_read_asked.lock();
+            let minute = Duration::from_secs(60);
+            all.retain(|_, r| r.back().is_some_and(|t| asked.duration_since(*t) < minute));
+            let recent = all.entry(caller.map(str::to_string)).or_default();
             while recent
                 .front()
-                .is_some_and(|t| asked.duration_since(*t) >= Duration::from_secs(60))
+                .is_some_and(|t| asked.duration_since(*t) >= minute)
             {
                 recent.pop_front();
             }
@@ -2138,10 +2144,14 @@ impl Desk {
         self.engines()
     }
 
-    /// How many reads of every engine were asked for in the last minute.
+    /// How many reads of every engine `caller` asked for in the last minute.
     #[cfg(test)]
-    pub(crate) fn engines_reads_this_minute(&self) -> usize {
-        self.0.engines_read_asked.lock().len()
+    pub(crate) fn engines_reads_this_minute(&self, caller: Option<&str>) -> usize {
+        self.0
+            .engines_read_asked
+            .lock()
+            .get(&caller.map(str::to_string))
+            .map_or(0, |r| r.len())
     }
 
     /// Every engine as Settings → Engines and the new session dialog show

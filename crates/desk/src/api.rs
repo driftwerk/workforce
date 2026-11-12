@@ -342,9 +342,13 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 
 /// Every engine read again now, as after Desk installed one or signed one
 /// in, rather than at the hourly read.
+/// Reads every engine again; how often is counted for each caller.
 async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
-    guarded!(s, h, q);
-    Json(s.desk.engines_read_now().await).into_response()
+    let caller = match s.auth.authorize(&h, q.token.as_deref()).await {
+        Ok(caller) => caller,
+        Err(status) => return (status, Json(json!({ "error": "not allowed" }))).into_response(),
+    };
+    Json(s.desk.engines_read_now(caller.as_deref()).await).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2595,6 +2599,22 @@ mod tests {
             assert!(!body.to_string().contains("sk-ant"), "{body}");
             assert!(desk.accounts().is_empty(), "nothing added");
 
+            // Signed in, but not an administrator: refused as well.
+            let member = super::sessions_router(desk.clone(), crate::testing::not_an_admin());
+            let (status, _) = call(&member, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 403);
+            let (status, body) = call(
+                &member,
+                "POST",
+                &path,
+                Some(json!({ "token": "sk-ant-oat01-anything-0123456789012345678901234567" })),
+            )
+            .await;
+            assert_eq!(status, 403);
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            assert!(desk.accounts().is_empty(), "nothing added");
+            assert_eq!(desk.engines_reads_this_minute(None), 0, "nothing read");
+
             // An id that isn't one is refused before anything else.
             let app = super::sessions_router(desk.clone(), allow_all());
             let (status, _) = call(
@@ -2621,10 +2641,15 @@ mod tests {
                 assert!(engines.as_array().is_some_and(|e| !e.is_empty()));
             }
             assert_eq!(
-                desk.engines_reads_this_minute(),
+                desk.engines_reads_this_minute(None),
                 crate::service::ENGINES_READS_A_MINUTE,
                 "only so many read"
             );
+            // Counted for each caller: another person asking still reads.
+            let ada = super::sessions_router(desk.clone(), crate::testing::identified("ada"));
+            let (status, _) = call(&ada, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(desk.engines_reads_this_minute(Some("ada")), 1);
         })
         .await;
     }
