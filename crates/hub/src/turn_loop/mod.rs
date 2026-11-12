@@ -2207,6 +2207,20 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     turn_context.push_str("\n\n");
     turn_context.push_str(&meta_lines.join("\n"));
 
+    // Every turn of a boss, in its DM and on a session's line (where its
+    // line and work turns run), is given the same block of what Desk keeps
+    // of its crew and what it told the person lately.
+    #[cfg(feature = "postgres")]
+    if let Some(channel) = session_id
+        .and_then(|sid| service.sessions.get(sid).ok().flatten())
+        .map(|s| s.channel)
+    {
+        if let Some(block) = crate::desk_crew::context::block(service, &channel).await {
+            turn_context.push_str("\n\n");
+            turn_context.push_str(&block);
+        }
+    }
+
     // ── Voice Mode Directive ──────────────────────────────────────────
     // When this turn arrived over voice, inject formatting rules so the
     // agent responds conversationally for TTS playback.
