@@ -39,8 +39,9 @@ impl Tool for WhoAmIIdentityTool {
         "Report who you are talking to and what they are allowed to do: returns \
          identity_id, display_name, role (member / system_admin), and a \
          per-capability decision view (allow / ask / deny) from the live \
-         authorization matrix, and the email their sign-in provider verified \
-         (verified_email; null when none). Use it to answer 'what can I do' or to check \
+         authorization matrix, and the email their sign-in provider or their \
+         workspace's Slack verified (verified_email, with verified_email_source \
+         sign_in or slack; null when none). Use it to answer 'what can I do' or to check \
          whether the current user may perform an admin action before you try."
     }
 
@@ -111,14 +112,16 @@ impl Tool for WhoAmIIdentityTool {
             identity.status,
             &crate::authz::capability_matrix(),
         );
+        let verified = crate::verified_email::verified(&identity);
         Ok(ToolResult::success(
             json!({
                 "identity_id": identity.id.to_string(),
                 "display_name": identity.display_name,
                 "role": identity.effective_role_key(),
                 "capabilities": capabilities.capabilities,
-                // Only what an OIDC provider verified: never a typed email.
-                "verified_email": crate::oidc::verified_email(&identity),
+                // Only what a sign-in or Slack vouched for: never a typed email.
+                "verified_email": verified.as_ref().map(|(e, _)| e),
+                "verified_email_source": verified.as_ref().map(|(_, s)| s.name()),
             }),
             elapsed(),
         ))
@@ -232,6 +235,9 @@ mod tests {
         let store = Arc::new(InMemoryStore::default());
         let mut identity = Identity::new("Sam", IdentityRole::Member);
         identity.email = Some("typed@example.com".into());
+        identity
+            .linked_ids
+            .insert(crate::oidc::OIDC_LINKED_ID_KEY.into(), "sub-sam".into());
         identity.linked_ids.insert(
             crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
             "sam@example.com".into(),

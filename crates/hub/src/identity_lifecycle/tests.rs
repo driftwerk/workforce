@@ -1727,6 +1727,41 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
         None,
         "no sign-in moved, so no email"
     );
+    // Slack's goes with the Slack link, and only with it.
+    let slack_vouched = |name: &str, slack: &str, email: &str| {
+        let who = Identity::new(name, IdentityRole::Member)
+            .with_linked_id("slack", slack)
+            .with_linked_id("slack_email", email)
+            .with_linked_id("slack_email_at", &at);
+        hub.identities.create(&who).unwrap();
+        who
+    };
+    let fay = slack_vouched("Fay", "U-FAY", "fay@example.com");
+    let gus = hub.person("Gus", "U-GUS");
+    hub.lifecycle
+        .merge(fay.id, gus.id, &admin, false)
+        .await
+        .unwrap();
+    let gus = hub.identities.get_by_id(gus.id).unwrap().unwrap();
+    assert!(
+        !gus.linked_ids.contains_key("slack_email"),
+        "Gus keeps his own Slack"
+    );
+    let hal = slack_vouched("Hal", "U-HAL", "hal@example.com");
+    let ivy = Identity::new("Ivy", IdentityRole::Member);
+    hub.identities.create(&ivy).unwrap();
+    hub.lifecycle
+        .merge(hal.id, ivy.id, &admin, false)
+        .await
+        .unwrap();
+    let ivy = hub.identities.get_by_id(ivy.id).unwrap().unwrap();
+    assert_eq!(
+        crate::verified_email::verified(&ivy),
+        Some((
+            "hal@example.com".to_string(),
+            crate::verified_email::Source::Slack
+        ))
+    );
     // Suspending forgets it.
     hub.lifecycle.suspend(cy.id, &admin).await.unwrap();
     let cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();

@@ -1,12 +1,12 @@
 //! `identity.linear_member_by_my_email` and `identity.jira_user_by_my_email`:
 //! the one user on the hub's (shared) Linear or Jira key whose email is the
-//! one the caller's sign-in provider verified. What a Desk board's sync names
+//! one the caller's sign-in provider, or else Slack, verified ([`crate::verified_email`]). What a Desk board's sync names
 //! the person by when the key isn't theirs. They're the identity's, not the
 //! adapter's: every agent has them, and one without Linear or Jira doesn't
 //! look as though it had.
 //!
 //! They take no arguments: the email is the caller's own, read from their
-//! identity here ([`crate::oidc::verified_email_state`]), so a caller can
+//! identity here ([`crate::verified_email::verified_email_state`]), so a caller can
 //! never ask about anyone else, and the directory itself never leaves the
 //! hub. Each asks the agent's own adapter tool (`linear.members_list` by
 //! email, `jira.search_users`) and keeps, here, only exact matches of an
@@ -146,8 +146,8 @@ impl Tool for ByMyEmail {
 
     fn description(&self) -> &str {
         match self.on {
-            On::Linear => "The one Linear member with the email your sign-in verified, as {user: {id, name}} (null when there's none, several, or no verified email, with why). Takes no arguments.",
-            On::Jira => "The one Jira user with the email your sign-in verified, as {user: {id, name}} (null when there's none, several, Jira hides emails, or no verified email, with why). Takes no arguments.",
+            On::Linear => "The one Linear member with the email your sign-in or Slack verified, as {user: {id, name}, source} (null when there's none, several, or no verified email, with why). Takes no arguments.",
+            On::Jira => "The one Jira user with the email your sign-in or Slack verified, as {user: {id, name}, source} (null when there's none, several, Jira hides emails, or no verified email, with why). Takes no arguments.",
         }
     }
 
@@ -171,8 +171,9 @@ impl Tool for ByMyEmail {
             Some(Ok(Some(identity))) => identity,
             _ => return Ok(ToolResult::success(none("no_verified_email"), ms())),
         };
-        let email = match crate::oidc::verified_email_state(&identity, chrono::Utc::now()) {
-            VerifiedEmail::Fresh(email) => email,
+        let (email, source) = match crate::oidc::verified_email_state(&identity, chrono::Utc::now())
+        {
+            VerifiedEmail::Fresh(email, source) => (email, source),
             VerifiedEmail::Stale => return Ok(ToolResult::success(none("stale"), ms())),
             VerifiedEmail::None => return Ok(ToolResult::success(none("no_verified_email"), ms())),
         };
@@ -190,10 +191,10 @@ impl Tool for ByMyEmail {
                 ms(),
             ));
         }
-        Ok(ToolResult::success(
-            pick(self.on, &answer.output, &email),
-            ms(),
-        ))
+        let mut found = pick(self.on, &answer.output, &email);
+        // Whose word the email is: a sign-in's, or Slack's.
+        found["source"] = json!(source.name());
+        Ok(ToolResult::success(found, ms()))
     }
 }
 

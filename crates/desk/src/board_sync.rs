@@ -456,7 +456,7 @@ pub enum Who {
     Person(Assignee),
     /// The key is shared, and exactly one user there has the email the
     /// person's sign-in provider verified: this is them.
-    ByEmail(Assignee),
+    ByEmail(Assignee, crate::board::MeSource),
     /// The key is shared (an agent's, the hub's): it says who owns the key,
     /// never who the person is; and no one user there has their verified
     /// email, for this reason.
@@ -471,7 +471,7 @@ impl Who {
     pub fn why_not(&self, hub: &str, system: System) -> Option<String> {
         let title = system.title();
         match self {
-            Self::Person(_) | Self::ByEmail(_) => None,
+            Self::Person(_) | Self::ByEmail(..) => None,
             Self::Shared(NoMatch::EmailHidden) => Some(format!(
                 "{hub} uses a shared {title} key, and {title} doesn't show your email to the shared key, so it can't say who you are."
             )),
@@ -493,7 +493,7 @@ impl Who {
     /// The person, when it says who they are.
     pub fn person(&self) -> Option<&Assignee> {
         match self {
-            Self::Person(a) | Self::ByEmail(a) => Some(a),
+            Self::Person(a) | Self::ByEmail(a, _) => Some(a),
             Self::Shared(_) | Self::Unsaid => None,
         }
     }
@@ -559,10 +559,13 @@ pub fn by_email_of(system: System, answer: &Value) -> Who {
     if let Some(id) = user["id"].as_str() {
         let id = id.trim().to_string();
         if check_me(system, &id).is_ok() {
-            return Who::ByEmail(Assignee {
-                name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
-                id,
-            });
+            return Who::ByEmail(
+                Assignee {
+                    name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
+                    id,
+                },
+                crate::board::MeSource::of_source(answer["source"].as_str()),
+            );
         }
     }
     Who::Shared(match answer["why"].as_str() {

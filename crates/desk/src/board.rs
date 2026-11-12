@@ -152,6 +152,9 @@ pub enum MeSource {
     /// The hub's key is shared: the one user there with the email the
     /// person's sign-in provider verified.
     VouchedByEmail,
+    /// The hub's key is shared: the one user there with the email Slack
+    /// gives for the person's linked Slack account.
+    VouchedBySlack,
     Typed,
 }
 
@@ -159,7 +162,24 @@ impl MeSource {
     /// Whether the hub stood behind it (by the person's own key, or by
     /// their verified email): only then is anything assigned to them.
     pub fn vouched(self) -> bool {
-        matches!(self, Self::Vouched | Self::VouchedByEmail)
+        matches!(
+            self,
+            Self::Vouched | Self::VouchedByEmail | Self::VouchedBySlack
+        )
+    }
+
+    /// Whether it names the person on a shared key, where the key's own
+    /// "me" (Jira's `currentUser()`) is its owner, not them.
+    pub fn on_a_shared_key(self) -> bool {
+        matches!(self, Self::VouchedByEmail | Self::VouchedBySlack)
+    }
+
+    /// The source the hub's by-email tools said (`source`).
+    pub fn of_source(source: Option<&str>) -> Self {
+        match source {
+            Some("slack") => Self::VouchedBySlack,
+            _ => Self::VouchedByEmail,
+        }
     }
 }
 

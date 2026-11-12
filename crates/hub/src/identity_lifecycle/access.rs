@@ -53,16 +53,18 @@ impl Holding for IdentityRecord {
             eyre::bail!("an identity of the merge is gone");
         };
         let mut tally = Tally::default();
-        // The verified email goes only with the sign-in it came from.
-        let moves_oidc = source
-            .linked_ids
-            .contains_key(crate::oidc::OIDC_LINKED_ID_KEY)
-            && !target
-                .linked_ids
-                .contains_key(crate::oidc::OIDC_LINKED_ID_KEY);
+        // A verified email goes only with the link it came with.
+        // Decided before any link moves.
+        let moving: Vec<crate::verified_email::Source> = crate::verified_email::Source::ALL
+            .into_iter()
+            .filter(|s| {
+                source.linked_ids.contains_key(s.link())
+                    && !target.linked_ids.contains_key(s.link())
+            })
+            .collect();
         for (platform, id) in from.linked() {
-            if crate::oidc::is_verified_key(platform) {
-                if moves_oidc {
+            if let Some(vouched) = crate::verified_email::Source::of_key(platform) {
+                if moving.contains(&vouched) {
                     target
                         .linked_ids
                         .insert(platform.to_string(), id.to_string());
