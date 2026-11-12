@@ -452,7 +452,7 @@ impl Desk {
 
     /// Writes the prints, so later evidence can still undo a link made by
     /// usage after a restart.
-    fn keep_prints(&self) {
+    pub(super) fn keep_prints(&self) {
         let prints: Vec<(Raw, Prints)> = self
             .0
             .state

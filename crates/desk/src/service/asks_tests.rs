@@ -24,6 +24,7 @@ use crate::store::{build_pool, tests::record_fixture, DeskStore};
 async fn asking_session(d: &Desk, dir: &Path) -> SessionView {
     d.create(
         NewSession {
+            fresh_worktree: false,
             engine: Engine::Claude,
             view: None,
             name: "orphans".into(),

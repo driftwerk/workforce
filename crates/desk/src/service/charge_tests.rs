@@ -370,6 +370,7 @@ async fn an_ended_session_cant_be_taken_on_and_says_why() {
 
 fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSession {
     crate::model::NewSession {
+        fresh_worktree: false,
         engine: crate::engine::Engine::Claude,
         view: None,
         name: "acme-web".into(),

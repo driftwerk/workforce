@@ -483,6 +483,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
             .create_for_as(
                 session,
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Claude,
                     view: None,
                     name: "again".into(),
@@ -526,6 +527,7 @@ async fn a_start_cut_off_after_its_session_started_only_links_it() {
             .unwrap();
         // Its session started; the runner stopped before linking it.
         let new = NewSession {
+            fresh_worktree: false,
             engine: Engine::Claude,
             view: None,
             name: "DES-1".into(),
@@ -1232,6 +1234,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
         let spender = d
             .create(
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Claude,
                     view: None,
                     name: "acme-web".into(),

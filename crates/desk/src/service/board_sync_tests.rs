@@ -102,6 +102,7 @@ fn link(hub: Option<&str>) -> LinkBoard {
         me_source: None,
         me_note: None,
         not_me: false,
+        keep_tickets: false,
         states: BTreeMap::from([(TicketState::Todo, "To Do".to_string())]),
     }
 }
@@ -818,6 +819,7 @@ async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
             me_source: None,
             me_note: None,
             not_me: false,
+            keep_tickets: false,
             states: BTreeMap::from([
                 (TicketState::Todo, "unstarted".to_string()),
                 (TicketState::Done, "completed".to_string()),
@@ -1396,6 +1398,88 @@ async fn no_member_several_or_an_unverified_email_names_no_one() {
             "Use Check who you are on the board",
         );
         assert!(linear.calls_of("linear.issue_update").is_empty());
+    })
+    .await;
+}
+
+/// A board with tickets of its own links when asked to keep them: they stay
+/// on Desk only, with their own keys, never made issues even once edited,
+/// and the issues come in beside them.
+#[tokio::test]
+async fn a_board_with_tickets_links_and_keeps_them_beside_the_issues() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: Some("ACM".into()),
+            })
+            .await
+            .unwrap();
+        let you = crate::crew::By::you();
+        let own = d
+            .create_ticket(
+                crate::service::NewTicket {
+                    board: b.id,
+                    title: "Our own".into(),
+                    body: String::new(),
+                    state: None,
+                    needs: vec![],
+                },
+                &you,
+            )
+            .await
+            .unwrap();
+        // Refused unless asked to keep them.
+        assert!(matches!(
+            d.link_board(b.id, link(None), "sam").await,
+            Err(DeskError::Conflict(_))
+        ));
+        let linked = d
+            .link_board(
+                b.id,
+                LinkBoard {
+                    keep_tickets: true,
+                    ..link(None)
+                },
+                "sam",
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked.prefix.as_deref(), Some("ACM"));
+        assert!(linked.sync.unwrap().local_before.is_some());
+        let remote = jira(2, &[]);
+        d.pull_board(b.id, &remote).await.unwrap();
+        let keys: HashSet<String> = d
+            .tickets(b.id, &Default::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| t.key)
+            .collect();
+        assert_eq!(
+            keys,
+            HashSet::from(["ACM-1".into(), "ACME-1".into(), "ACME-2".into()])
+        );
+        // Edited after: still Desk's only.
+        d.edit_ticket(
+            own.ticket.id,
+            crate::service::TicketPatch {
+                title: Some("Our own, edited".into()),
+                ..Default::default()
+            },
+            &you,
+        )
+        .await
+        .unwrap();
+        // Never even queued to go out.
+        assert!(d.nothing_to_push(b.id).await.unwrap());
+        d.push_board(b.id, &remote).await.unwrap();
+        let after = d.ticket(own.ticket.id).await.unwrap();
+        assert!(after.ticket.external.is_none());
+        assert_eq!(after.key.as_deref(), Some("ACM-1"));
     })
     .await;
 }

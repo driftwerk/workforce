@@ -99,6 +99,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, o: Options) -> Desk {
 
 fn session(dir: &Path, account: Option<Option<Uuid>>) -> NewSession {
     NewSession {
+        fresh_worktree: false,
         engine: Engine::Claude,
         view: None,
         name: "auth-fix".into(),
@@ -3661,6 +3662,26 @@ async fn an_account_whose_sign_in_is_gone_is_signed_in_again_and_keeps_everythin
             Some("sk-ant-oat01-good-c0de-0123456789012345678901234567890123".to_string())
         );
 
+        // What Desk knew of which Anthropic account it was is forgotten
+        // when it signs in again: the new sign-in may be another one.
+        let link = crate::identity::Link {
+            identity: crate::identity::Identity {
+                key: "k-before".into(),
+                email: Some("before@example.com".into()),
+            },
+            by: crate::identity::LinkedBy::Manual,
+            at: chrono::Utc::now(),
+        };
+        d.0.store.put_account_link(work, Some(&link)).await.unwrap();
+        {
+            let mut st = d.0.state.lock();
+            st.links.insert(work, link);
+            st.standing.insert(Some(work), Default::default());
+            st.prints
+                .entry(super::identities::Raw::Account(work))
+                .or_default();
+        }
+
         // By a pasted token: checked, then kept for it.
         let refused = d
             .sign_in_again(
@@ -3689,6 +3710,18 @@ async fn an_account_whose_sign_in_is_gone_is_signed_in_again_and_keeps_everythin
         assert_eq!(
             keys.get(work).unwrap().map(|t| t.expose().to_string()),
             Some(OTHER.to_string())
+        );
+        {
+            let st = d.0.state.lock();
+            assert!(!st.links.contains_key(&work), "its link is forgotten");
+            assert!(!st.standing.contains_key(&Some(work)));
+            assert!(!st
+                .prints
+                .contains_key(&super::identities::Raw::Account(work)));
+        }
+        assert!(
+            !d.0.store.account_links().await.unwrap().contains_key(&work),
+            "and forgotten in the store, so a restart doesn't bring it back"
         );
         assert!(matches!(
             d.sign_in_again(Uuid::new_v4(), SignInAgain::default())
@@ -3770,6 +3803,96 @@ async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_sta
             Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
         }
         assert_eq!(work_standing(&d, work).full(now), Some(Some(week)));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn only_an_engine_whose_accounts_sign_in_by_token_is_signed_in_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        // An account of an engine Desk can't sign accounts in for (none
+        // can be added, but one may be in the list from elsewhere).
+        let other = Uuid::new_v4();
+        {
+            let mut st = d.0.state.lock();
+            let mut a = st.accounts.iter().find(|a| a.id == work).unwrap().clone();
+            a.id = other;
+            a.engine = Engine::Codex;
+            st.accounts.push(a);
+        }
+        let refused = d
+            .sign_in_again(
+                other,
+                SignInAgain {
+                    token: Some(OTHER.into()),
+                    remote: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(DeskError::Invalid(m)) if m.contains("can't sign")),
+            "{refused:?}"
+        );
+        assert!(keys.get(other).unwrap().is_none(), "nothing kept for it");
+    })
+    .await;
+}
+
+/// Keys whose writing of a token is when the account is removed: what
+/// Desk sees of a removal that lands while a sign-in again keeps its token.
+struct RemovedWhileKept {
+    keys: Arc<MemoryKeys>,
+    desk: parking_lot::Mutex<Option<Desk>>,
+}
+
+impl crate::engine_accounts::Keys for RemovedWhileKept {
+    fn get(&self, account: Uuid) -> eyre::Result<Option<crate::engine_accounts::AccountToken>> {
+        self.keys.get(account)
+    }
+    fn set(&self, account: Uuid, token: &crate::engine_accounts::AccountToken) -> eyre::Result<()> {
+        self.keys.set(account, token)?;
+        if let Some(d) = self.desk.lock().take() {
+            d.0.state.lock().accounts.retain(|a| a.id != account);
+        }
+        Ok(())
+    }
+    fn delete(&self, account: Uuid) -> eyre::Result<()> {
+        self.keys.delete(account)
+    }
+    fn name(&self) -> &'static str {
+        "the test store"
+    }
+}
+
+#[tokio::test]
+async fn an_account_removed_while_it_signs_in_again_leaves_no_sign_in_behind() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        keys.delete(work).unwrap();
+        let token = crate::engine_accounts::AccountToken::new(OTHER).unwrap();
+        // Its removal takes it out of the list (as it does before it
+        // deletes its sign-in) just as its sign-in again keeps the token.
+        let racing = Arc::new(RemovedWhileKept {
+            keys: keys.clone(),
+            desk: parking_lot::Mutex::new(Some(d.clone())),
+        });
+        let renewed = d.renew_account(racing, work, &token).await;
+        assert!(
+            matches!(&renewed, Err(DeskError::Invalid(m)) if m.contains("removed")),
+            "it isn't signed in again: it's gone ({renewed:?})"
+        );
+        assert!(
+            keys.get(work).unwrap().is_none(),
+            "the token it kept went with it"
+        );
+        assert!(d.accounts().is_empty(), "nor is it back in the list");
     })
     .await;
 }

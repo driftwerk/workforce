@@ -23,6 +23,7 @@ use crate::store::build_pool;
 async fn session(d: &Desk, dir: &Path, name: &str, goal: &str) -> SessionView {
     d.create(
         NewSession {
+            fresh_worktree: false,
             engine: Engine::Claude,
             view: None,
             name: name.into(),

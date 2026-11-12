@@ -1026,6 +1026,18 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
     }
 }
 
+/// What this hub can do that an older one can't, by name, so a newer Desk
+/// asks for it only here: `fresh-worktree` (a separate copy that is always
+/// a new branch), `folder-remotes` (a listing says its repository and where
+/// it comes from), `keep-tickets` (a board with tickets of its own links
+/// keeping them).
+pub const FEATURES: &[&str] = &["fresh-worktree", "folder-remotes", "keep-tickets"];
+
+async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(json!({ "features": FEATURES })).into_response()
+}
+
 #[derive(Deserialize)]
 struct FolderParams {
     token: Option<String>,
@@ -1821,6 +1833,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/features", get(features))
         .route("/api/desk/engines/read", post(engines_read))
         .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
         .route(
@@ -2571,6 +2584,60 @@ mod tests {
             .await;
             assert!((400..500).contains(&status), "{status}");
             assert!(!home.join("other").exists());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reading_engines_and_signing_accounts_in_again_are_the_admins_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let (status, _) = call(&denied, "POST", "/api/desk/engines/read", None).await;
+            assert!(status == 401 || status == 403, "{status}");
+            let path = format!("/api/desk/accounts/{}/sign-in", uuid::Uuid::new_v4());
+            let (status, body) = call(
+                &denied,
+                "POST",
+                &path,
+                Some(json!({ "token": "sk-ant-oat01-anything-0123456789012345678901234567" })),
+            )
+            .await;
+            assert!(status == 401 || status == 403, "{status}");
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            assert!(desk.accounts().is_empty(), "nothing added");
+
+            // An id that isn't one is refused before anything else.
+            let app = super::sessions_router(desk.clone(), allow_all());
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/accounts/not-an-id/sign-in",
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, 400);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engines_asked_to_be_read_without_end_are_read_a_few_times_a_minute() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let app = super::sessions_router(desk.clone(), allow_all());
+            for _ in 0..crate::service::ENGINES_READS_A_MINUTE + 8 {
+                let (status, engines) = call(&app, "POST", "/api/desk/engines/read", None).await;
+                assert_eq!(status, 200, "still answered: {engines}");
+                assert!(engines.as_array().is_some_and(|e| !e.is_empty()));
+            }
+            assert_eq!(
+                desk.engines_reads_this_minute(),
+                crate::service::ENGINES_READS_A_MINUTE,
+                "only so many read"
+            );
         })
         .await;
     }

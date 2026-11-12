@@ -792,6 +792,10 @@ pub(super) struct EngineRead {
     ended: std::time::Instant,
 }
 
+/// How many times a minute asking for every engine to be read again
+/// ([`Desk::engines_read_now`]) reads them.
+pub(crate) const ENGINES_READS_A_MINUTE: usize = 12;
+
 /// Which read since a moment serves a caller: one that began after it
 /// (what changed just before is in it), or one that ended after it (a read
 /// under way when it asked is shared).
@@ -860,6 +864,9 @@ struct Inner {
     engines: Mutex<BTreeMap<Engine, Installed>>,
     /// Each engine's reads, one at a time: when the last began and ended.
     engine_reads: BTreeMap<Engine, Arc<tokio::sync::Mutex<Option<EngineRead>>>>,
+    /// When every engine was last asked to be read again, in the last
+    /// minute ([`Desk::engines_read_now`]).
+    engines_read_asked: Mutex<std::collections::VecDeque<std::time::Instant>>,
     /// While the sessions running at the last stop are restored: since
     /// when a read of an engine serves them all.
     restoring_since: Mutex<Option<std::time::Instant>>,
@@ -1549,6 +1556,7 @@ impl Desk {
                 .into_iter()
                 .map(|e| (e, Arc::default()))
                 .collect(),
+            engines_read_asked: Mutex::default(),
             restoring_since: Mutex::new(restoring_since),
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
@@ -2102,14 +2110,38 @@ impl Desk {
 
     /// Every engine read again now (one read under way is shared), as after
     /// Desk installed one or signed one in: then as [`Desk::engines`].
+    ///
+    /// Asked more than [`ENGINES_READS_A_MINUTE`] times in a minute, it
+    /// answers what was last read without reading: each read runs every
+    /// engine's program, which asking without end mustn't do.
     pub async fn engines_read_now(&self) -> Vec<engine::EngineView> {
         let asked = std::time::Instant::now();
+        {
+            let mut recent = self.0.engines_read_asked.lock();
+            while recent
+                .front()
+                .is_some_and(|t| asked.duration_since(*t) >= Duration::from_secs(60))
+            {
+                recent.pop_front();
+            }
+            if recent.len() >= ENGINES_READS_A_MINUTE {
+                tracing::debug!("engines asked to be read too often: answering the last read");
+                return self.engines();
+            }
+            recent.push_back(asked);
+        }
         let reads = Engine::ALL
             .into_iter()
             .map(|e| self.read_engine_since(e, asked, Since::Ended));
         futures::future::join_all(reads).await;
         self.spend_signed_in();
         self.engines()
+    }
+
+    /// How many reads of every engine were asked for in the last minute.
+    #[cfg(test)]
+    pub(crate) fn engines_reads_this_minute(&self) -> usize {
+        self.0.engines_read_asked.lock().len()
     }
 
     /// Every engine as Settings → Engines and the new session dialog show
@@ -2903,6 +2935,12 @@ impl Desk {
             .map(str::trim)
             .filter(|b| !b.is_empty())
         {
+            Some(base) if new.fresh_worktree => {
+                let (path, branch) = worktree::create_fresh(&cwd, base)
+                    .await
+                    .map_err(|e| DeskError::Invalid(e.to_string()))?;
+                (path, Some(branch))
+            }
             Some(branch) => (
                 worktree::create(&cwd, branch)
                     .await
@@ -6599,6 +6637,7 @@ mod tests {
     pub(super) async fn new_session(d: &Desk, dir: &Path) -> SessionView {
         d.create(
             NewSession {
+                fresh_worktree: false,
                 engine: Engine::Claude,
                 view: None,
                 name: "auth-fix".into(),
@@ -7145,6 +7184,7 @@ mod tests {
             let elsewhere = dir.path().join("acme-web");
             std::fs::create_dir(&elsewhere).unwrap();
             let new = |cwd: &Path, worktree: Option<&str>| NewSession {
+                fresh_worktree: false,
                 engine: Engine::Claude,
                 view: None,
                 name: "login-race".into(),
@@ -7309,6 +7349,7 @@ mod tests {
             let s = d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "auth-fix".into(),
@@ -7367,6 +7408,7 @@ mod tests {
             assert!(d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "bad".into(),
@@ -7418,6 +7460,7 @@ mod tests {
             let added = BTreeMap::from([(PLUGIN_DIRS.to_string(), "/plugins/desk".to_string())]);
             d.create(
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Claude,
                     view: None,
                     name: "auth-fix".into(),
@@ -7851,6 +7894,7 @@ mod tests {
             let s = d
                 .create(
                     NewSession {
+                        fresh_worktree: false,
                         engine: Engine::Claude,
                         view: None,
                         name: "acme-web".into(),
