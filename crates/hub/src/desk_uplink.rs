@@ -671,7 +671,7 @@ impl Uplink {
             Arc::clone(&self.crew),
             accepted
                 .values()
-                .map(|l| (l.link_id, l.group.clone()))
+                .map(|l| (l.link_id, l.group.clone(), l.boss()))
                 .collect(),
             tx.clone(),
         ));
@@ -820,6 +820,14 @@ impl Uplink {
     }
 }
 
+/// Whether `link`'s group has a grant now whose boss isn't the link's: the
+/// home moved the group to another boss, or to none.
+pub fn boss_moved(crew: &CrewHub, link: &HeldLink) -> bool {
+    crew.desk()
+        .grant_live(&link.group)
+        .is_ok_and(|g| g.boss.as_ref() != Some(&link.boss()))
+}
+
 /// The most `event` frames one link sends an hour: past it, what happens
 /// is counted and said with the next one sent.
 pub const EVENTS_PER_HOUR: usize = 120;
@@ -829,7 +837,7 @@ pub const EVENTS_PER_HOUR: usize = 120;
 /// at most [`EVENTS_PER_HOUR`] a link; until the socket ends.
 async fn send_events(
     crew: Arc<CrewHub>,
-    links: Vec<(Uuid, String)>,
+    links: Vec<(Uuid, String, BossRef)>,
     tx: tokio::sync::mpsc::Sender<Value>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
@@ -842,8 +850,9 @@ async fn send_events(
             Ok(_) | Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => return,
         };
-        for (link, group) in &links {
-            let Some(mut frame) = crew.served_event(group, &event) else {
+        // Each link wakes its own boss alone.
+        for (link, group, boss) in &links {
+            let Some(mut frame) = crew.served_event(group, boss, &event) else {
                 continue;
             };
             let recent = sent.entry(*link).or_default();
@@ -886,6 +895,16 @@ pub fn start(uplink: Uplink, cancel: CancellationToken) {
             let mut by_hub: BTreeMap<String, Vec<HeldLink>> = BTreeMap::new();
             if let Some(vault) = uplink.state.vault.as_ref() {
                 for l in held_links(vault).into_iter().filter(|l| l.live(now)) {
+                    // A link whose group has another boss now is the old
+                    // boss's: forgotten, never dialed again.
+                    if boss_moved(&uplink.crew, &l) {
+                        tracing::info!(target: "sentinel.audit", link = %l.link_id, group = %l.group, "a boss link was forgotten: its group has another boss now");
+                        let _ = vault.delete_with_actor(
+                            &desk_boss_link_path(&l.link_id.to_string()),
+                            ACTOR,
+                        );
+                        continue;
+                    }
                     by_hub.entry(l.hub_url.clone()).or_default().push(l);
                 }
             }

@@ -407,9 +407,10 @@ impl CrewHub {
         result.unwrap_or_else(refused)
     }
 
-    /// What `event` tells the remote boss of `group` as a wake-up (an
-    /// uplink's `event` frame), or nothing: only while `group`'s grant is
-    /// live and its boss is remote; only a turn's end, a question, a failure
+    /// What `event` tells `boss`, the remote boss of `group` a link is for,
+    /// as a wake-up (an uplink's `event` frame), or nothing: only while
+    /// `group`'s grant is live and its boss is that very boss (as a call is
+    /// served, [`Self::serve_crew`]); only a turn's end, a question, a failure
     /// or a limit of one of the grant's own sessions, had while it was in the
     /// grant's group; never what the boss itself or the person did, nor past
     /// the hand-off limit. Its words only when the grant's Sees shows them
@@ -417,11 +418,15 @@ impl CrewHub {
     pub(crate) fn served_event(
         &self,
         group: &str,
+        boss: &BossRef,
         event: &workforce_desk::crew::Event,
     ) -> Option<Value> {
         use workforce_desk::crew::{Kind, PartyKind};
         let g = self.desk.grant_live(group).ok()?;
-        if !matches!(g.boss, Some(BossRef::Remote { .. })) {
+        if !matches!(boss, BossRef::Remote { .. })
+            || !boss.servable()
+            || g.boss.as_ref() != Some(boss)
+        {
             return None;
         }
         if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You)

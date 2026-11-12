@@ -161,6 +161,26 @@ pub async fn tell_ended(service: &AgentService, threads: Vec<(String, String)>) 
     }
 }
 
+/// Whether the Slack DM thread `key` is in `person`'s own DM with the agent
+/// now: their Slack account as linked today opens that very DM. A thread
+/// whose DM was another account's is never told anything.
+pub async fn thread_is_theirs(service: &AgentService, person: &str, key: &str) -> bool {
+    let Some((workspace, channel, _)) = dm_thread(key) else {
+        return false;
+    };
+    let slack_user = service.resolve_platform_user_id(person);
+    if slack_user.is_empty() {
+        return false;
+    }
+    let hint =
+        workforce_common::channels::ChannelHint::from_parts(Some(workspace.to_string()), None, None);
+    let registry = service.surface_registry.read().await;
+    matches!(
+        registry.resolve_user_dm("slack", &slack_user, hint).await,
+        Ok((_, dm)) if dm == channel
+    )
+}
+
 /// Posts `text`, an agent's answer, into the Slack DM thread `key`: made
 /// safe to send first (no secret, no tool output).
 pub async fn post_in_thread(service: &AgentService, key: &str, text: &str) -> Result<(), String> {

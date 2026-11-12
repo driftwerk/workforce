@@ -2391,5 +2391,103 @@ mod uplink_tests {
             == workforce_common::session::MessageRole::Assistant
             && m.content.contains("done")));
         assert_eq!(slack.0.lock().len(), 2, "nothing more in Slack");
+
+        // Sam's Slack account changed: the old DM's thread is told nothing,
+        // and the wake runs in Acme's Desk conversation instead.
+        sam.linked_ids.insert("slack".into(), "U0NEW".into());
+        hub.fx.identities.update(&sam).unwrap();
+        run(&state, &acme_key, &["devbox: acme-api asked".into()], 0).await.unwrap();
+        assert_eq!(slack.0.lock().len(), 2, "never the old account's DM");
+        let acme_desk = allan
+            .sessions
+            .find(&format!("desk:boss:{}", acme.link.group_key), &person)
+            .unwrap()
+            .unwrap();
+        assert!(acme_desk.messages.iter().any(|m| m.content.contains("acme-api asked")));
+
+        // Checked again each time: a revoked link, or a person no longer
+        // active, wakes nothing.
+        assert!(links::revoke(hub.state(), sam.id, &device.id, acme.record.id).unwrap());
+        assert!(run(&state, &acme_key, &["devbox: x".into()], 0).await.is_err());
+        sam.status = workforce_identity::types::IdentityStatus::Suspended;
+        hub.fx.identities.update(&sam).unwrap();
+        assert!(run(&state, &globex_key, &["devbox: y".into()], 0).await.is_err());
+        let globex_desk = allan.sessions.find(&desk.channel, &person).unwrap().unwrap();
+        assert!(!globex_desk.messages.iter().any(|m| m.content.contains("devbox: y")));
+    }
+
+    #[tokio::test]
+    async fn one_links_flood_is_dropped_before_any_check_and_takes_no_other_links_place() {
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let devbox = key();
+        let mac = key();
+        let acme = links::mint(hub.state(), sam.id, &device.id, &request(&devbox, "acme", "devbox")).unwrap();
+        let globex = links::mint(hub.state(), sam.id, &device.id, &request(&mac, "globex", "mac")).unwrap();
+        let (tx, mut wakes) = tokio::sync::mpsc::channel(1024);
+        hub.fx.state.uplinks.wake_into(tx);
+        let addr = serve(&hub).await;
+        let mut a = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        let mut b = open_link(addr, &globex.plaintext, globex.record.id, &mac, "mac").await;
+        let event = |link: Uuid, i: u32| {
+            json!({"type": "event", "linkId": link, "kind": "finished", "line": format!("e{i}")})
+        };
+        // While the hub can't check links, nothing wakes and nothing counts
+        // against the engine.
+        hub.store_down.store(true, Ordering::SeqCst);
+        send(&mut a, event(acme.link.link_id, 0)).await;
+        assert!(next_wake(&mut wakes).await.is_none());
+        hub.store_down.store(false, Ordering::SeqCst);
+
+        // A flood: its link's places fill, and past its minute's share the
+        // rest is dropped before any check; the socket stays open.
+        for i in 0..40 {
+            send(&mut a, event(acme.link.link_id, i)).await;
+        }
+        let mut held = 0;
+        while let Some(w) = next_wake(&mut wakes).await {
+            assert_eq!(w.agent, "allan");
+            held += 1;
+        }
+        assert_eq!(held, crate::boss_links::uplink::WAKES_WAITING_PER_LINK, "its places, no more");
+        // Another link's wake still has its place.
+        send(&mut b, event(globex.link.link_id, 0)).await;
+        let other = next_wake(&mut wakes).await.expect("the other link's wake");
+        assert_eq!(other.group_key, globex.link.group_key);
+        // Its places freed, it has spent its minute's share all the same.
+        for _ in 0..held {
+            hub.fx.state.uplinks.wake_taken(acme.link.link_id);
+        }
+        hub.fx.state.uplinks.wake_taken(globex.link.link_id);
+        for i in 40..80 {
+            send(&mut a, event(acme.link.link_id, i)).await;
+        }
+        assert!(
+            next_wake(&mut wakes).await.is_none(),
+            "past its minute's share of {}",
+            crate::boss_links::uplink::EVENTS_PER_MINUTE
+        );
+        send(&mut a, json!({"type": "ping"})).await;
+        assert_eq!(next(&mut a).await.unwrap()["type"], "pong", "still open");
+    }
+
+    #[test]
+    fn in_a_wake_turn_what_changes_a_session_asks_the_person_first() {
+        use workforce_agent::tools::Tool as _;
+        let tool = |name: &'static str| crate::boss_links::tools::test_tool(name, "Acme");
+        let wake = |name: &'static str| {
+            workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+                .sync_scope(crate::boss_links::wake::ORIGIN.to_string(), || {
+                    tool(name).approval_requirement()
+                })
+        };
+        for changes in ["crew.nudge", "crew.approve", "crew.deny", "crew.stop", "crew.start_session", "crew.release"] {
+            let asked = wake(changes).unwrap_or_else(|| panic!("{changes} asks"));
+            assert!(asked.contains("Acme's boss conversation"), "{asked}");
+            assert!(tool(changes).approval_requirement().is_none(), "{changes}: only in a wake");
+        }
+        for reads in ["crew.overview", "crew.activity", "crew.history", "crew.escalate"] {
+            assert!(wake(reads).is_none(), "{reads}");
+        }
     }
 }

@@ -46,6 +46,8 @@ const KINDS: [&str; 5] = ["finished", "question", "needs_you", "failed", "limit"
 /// One engine's wake-up for a link's boss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wake {
+    /// The link it came on.
+    pub link_id: Uuid,
     pub person: Uuid,
     pub agent: String,
     pub group_key: String,
@@ -70,6 +72,7 @@ impl Wake {
             return None;
         }
         Some(Self {
+            link_id: live.link.link_id,
             person: live.person.id,
             agent: live.link.agent_id.clone(),
             group_key: live.link.group_key.clone(),
@@ -195,6 +198,9 @@ async fn run_loop(
         tokio::select! {
             wake = rx.recv() => {
                 let Some(wake) = wake else { return };
+                if let Some(state) = state.upgrade() {
+                    state.uplinks.wake_taken(wake.link_id);
+                }
                 waiting.entry(wake.key()).or_default().add(&wake, Instant::now());
             }
             Some((key, _ran)) = done.recv() => {
@@ -259,6 +265,33 @@ pub fn place(state: &GatewayState, key: &Key) -> Option<Place> {
     Some(thread.map_or(Place::Desk(channel), Place::Thread))
 }
 
+/// Why `key`'s boss may not be woken now, checked again in full each time:
+/// boss work on here, the person active and still allowed it, the agent
+/// still theirs to use and taking boss work, and a live link of theirs for
+/// the group.
+pub(crate) fn still_bossed(state: &GatewayState, key: &Key) -> Result<(), String> {
+    let (person, agent, group_key) = key;
+    super::links::require_enabled(state).map_err(|e| e.to_string())?;
+    let active = state
+        .identity_store
+        .as_ref()
+        .and_then(|s| s.get_by_id(*person).ok().flatten())
+        .is_some_and(|p| p.status == workforce_identity::types::IdentityStatus::Active);
+    if !active {
+        return Err("the person isn't active here".into());
+    }
+    if !super::links::holds_desk_boss(state, *person) {
+        return Err("the person may no longer make agents bosses".into());
+    }
+    super::links::boss_agent(state, *person, agent).map_err(|e| e.to_string())?;
+    let live = super::links::group_links(state, *person, agent, group_key)
+        .map_err(|e| e.to_string())?;
+    if live.is_empty() {
+        return Err("no live link of the group's".into());
+    }
+    Ok(())
+}
+
 /// Runs one wake turn of `key`'s boss with `lines`, and delivers its answer
 /// where it ran.
 pub(crate) async fn run(
@@ -268,14 +301,21 @@ pub(crate) async fn run(
     more: u64,
 ) -> Result<(), String> {
     let (person, agent, _) = key;
+    still_bossed(state, key)?;
     let person = person.to_string();
     let service = state
         .registry
         .get(agent)
         .ok_or("the boss agent isn't serving")?;
-    let Some(place) = place(state, key) else {
+    let Some(mut place) = place(state, key) else {
         return Ok(());
     };
+    // The thread is told only while its DM is still the person's own.
+    if let Place::Thread(k) = &place {
+        if !super::slack::thread_is_theirs(&service, &person, k).await {
+            place = Place::Desk(boss_channel(&key.2));
+        }
+    }
     let desk = service
         .sessions
         .find(&boss_channel(&key.2), &person)
@@ -334,6 +374,7 @@ mod tests {
 
     fn wake(line: &str) -> Wake {
         Wake {
+            link_id: Uuid::nil(),
             person: Uuid::nil(),
             agent: "allan".into(),
             group_key: "k".into(),

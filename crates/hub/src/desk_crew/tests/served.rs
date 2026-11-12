@@ -572,6 +572,7 @@ async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
         let woke = crew
             .served_event(
                 "acme",
+                &allan(),
                 &event(Kind::Finished, session.clone(), &mine, "acme"),
             )
             .expect("a turn's end wakes it");
@@ -606,21 +607,44 @@ async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
             event(Kind::Nudged, session.clone(), &mine, "acme"),
         ];
         for e in &quiet {
-            assert!(crew.served_event("acme", e).is_none(), "{e:?}");
+            assert!(crew.served_event("acme", &allan(), e).is_none(), "{e:?}");
         }
         // Nor for a group with no grant.
         assert!(crew
             .served_event(
                 "globex",
+                &allan(),
                 &event(Kind::Finished, session.clone(), &mine, "globex")
             )
             .is_none());
+
+        // Two links of one group, for two bosses: only the grant's own
+        // boss's link is told, and the other's is forgotten.
+        let bob = BossRef::Remote {
+            hub: "driftwerk".into(),
+            agent: "bob".into(),
+        };
+        let finished = event(Kind::Finished, session.clone(), &mine, "acme");
+        assert!(crew.served_event("acme", &allan(), &finished).is_some());
+        assert!(crew.served_event("acme", &bob, &finished).is_none(), "not the grant's boss");
+        let link = |agent: &str| -> crate::desk_uplink::HeldLink {
+            serde_json::from_value(json!({
+                "group": "acme", "hub": "driftwerk", "hubUrl": "https://boss.example.com",
+                "linkId": uuid::Uuid::new_v4(), "tokenId": uuid::Uuid::new_v4(),
+                "token": "wfb_x", "expiresAt": chrono::Utc::now() + chrono::Duration::days(1),
+                "engineId": "devbox", "agentId": agent,
+            }))
+            .unwrap()
+        };
+        assert!(!crate::desk_uplink::boss_moved(&crew, &link("allan")));
+        assert!(crate::desk_uplink::boss_moved(&crew, &link("bob")));
 
         // At Replies, its words too.
         put("replies", 2).await;
         let woke = crew
             .served_event(
                 "acme",
+                &allan(),
                 &event(Kind::Question, session.clone(), &mine, "acme"),
             )
             .unwrap();

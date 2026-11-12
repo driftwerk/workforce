@@ -172,6 +172,8 @@ pub struct Uplinks {
     /// Where the links' wake-ups go ([`super::wake`]), once this hub wakes
     /// bosses.
     wakes: std::sync::OnceLock<tokio::sync::mpsc::Sender<super::wake::Wake>>,
+    /// How many of each link's wakes wait on the queue now.
+    wakes_waiting: parking_lot::Mutex<HashMap<Uuid, usize>>,
     #[cfg(test)]
     pub(crate) hub: parking_lot::Mutex<Option<String>>,
 }
@@ -186,6 +188,37 @@ impl std::fmt::Debug for Uplinks {
 
 /// What a link's call came to.
 pub type CallResult = Result<Value, String>;
+
+/// Why a link checked again didn't hold, and whether that was only this hub
+/// not being able to check it now (not the engine's doing).
+#[derive(Debug)]
+pub struct Rechecked {
+    pub why: String,
+    pub unavailable: bool,
+}
+
+impl Rechecked {
+    fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            unavailable: false,
+        }
+    }
+}
+
+impl From<Rechecked> for String {
+    fn from(r: Rechecked) -> Self {
+        r.why
+    }
+}
+
+/// The most `event` frames a socket takes for one link a minute: the rest
+/// are dropped before any check, and nothing is counted against it.
+pub const EVENTS_PER_MINUTE: u32 = 30;
+
+/// The most wakes of one link waiting to be gathered at once: one link's
+/// flood never takes another's place.
+pub const WAKES_WAITING_PER_LINK: usize = 8;
 
 /// A place among the unproved sockets, given back when dropped.
 struct Unproved {
@@ -282,11 +315,36 @@ impl Uplinks {
         let _ = self.wakes.set(tx);
     }
 
-    /// Hands `wake` on, when this hub wakes bosses; never waits.
+    /// Hands `wake` on, when this hub wakes bosses; never waits. Each link
+    /// has [`WAKES_WAITING_PER_LINK`] places: past them its wakes are
+    /// dropped, and no other link's are.
     fn wake(&self, wake: super::wake::Wake) {
-        if let Some(tx) = self.wakes.get() {
-            if tx.try_send(wake).is_err() {
-                tracing::warn!("a boss's wake-up was dropped: its queue is full");
+        let Some(tx) = self.wakes.get() else {
+            return;
+        };
+        let link = wake.link_id;
+        {
+            let mut waiting = self.wakes_waiting.lock();
+            let n = waiting.entry(link).or_default();
+            if *n >= WAKES_WAITING_PER_LINK {
+                tracing::warn!(%link, "a boss's wake-up was dropped: its link's places are full");
+                return;
+            }
+            *n += 1;
+        }
+        if tx.try_send(wake).is_err() {
+            self.wake_taken(link);
+            tracing::warn!(%link, "a boss's wake-up was dropped: the queue is full");
+        }
+    }
+
+    /// One of `link`'s wakes was taken off the queue.
+    pub(crate) fn wake_taken(&self, link: Uuid) {
+        let mut waiting = self.wakes_waiting.lock();
+        if let Some(n) = waiting.get_mut(&link) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                waiting.remove(&link);
             }
         }
     }
@@ -348,13 +406,13 @@ impl Uplinks {
         state: &GatewayState,
         socket: &Arc<Socket>,
         link_id: Uuid,
-    ) -> Result<LiveLink, String> {
+    ) -> Result<LiveLink, Rechecked> {
         let token = socket
             .links
             .lock()
             .get(&link_id)
             .map(|l| l.token.clone())
-            .ok_or_else(|| "That boss link isn't connected.".to_string())?;
+            .ok_or_else(|| Rechecked::refused("That boss link isn't connected."))?;
         match authenticate_link(state, &token) {
             Ok(live) if live.link.link_id == link_id => {
                 if let Some(l) = socket.links.lock().get_mut(&link_id) {
@@ -365,7 +423,7 @@ impl Uplinks {
             Ok(_) | Err(LinkRefusal::Unauthenticated) => {
                 let why = LinkRefusal::Unauthenticated.to_string();
                 self.drop_link(socket, link_id, &why).await;
-                Err(why)
+                Err(Rechecked::refused(why))
             }
             // Couldn't check now: not sent; dropped once it has gone on.
             Err(LinkRefusal::Unavailable) => {
@@ -377,12 +435,15 @@ impl Uplinks {
                     self.drop_link(socket, link_id, &LinkRefusal::Unavailable.to_string())
                         .await;
                 }
-                Err(LinkRefusal::Unavailable.to_string())
+                Err(Rechecked {
+                    why: LinkRefusal::Unavailable.to_string(),
+                    unavailable: true,
+                })
             }
             Err(why) => {
                 let why = why.to_string();
                 self.drop_link(socket, link_id, &why).await;
-                Err(why)
+                Err(Rechecked::refused(why))
             }
         }
     }
@@ -776,6 +837,8 @@ async fn run(
     let mut ticker = tokio::time::interval(timing.ping_every);
     ticker.tick().await;
     let mut unanswered = 0u32;
+    // Each link's events this minute: (since, how many).
+    let mut events: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut bad = 0u32;
     loop {
         if bad > MAX_BAD_FRAMES {
@@ -824,9 +887,28 @@ async fn run(
                             bad += 1;
                             continue;
                         };
-                        let Ok(live) = uplinks.recheck(&state, &socket, link).await else {
+                        if !socket.links.lock().contains_key(&link) {
                             bad += 1;
                             continue;
+                        }
+                        // Past its minute's share: dropped before any check.
+                        let now = Instant::now();
+                        let (since, n) = events.entry(link).or_insert((now, 0));
+                        if now.duration_since(*since) >= Duration::from_secs(60) {
+                            (*since, *n) = (now, 0);
+                        }
+                        *n += 1;
+                        if *n > EVENTS_PER_MINUTE {
+                            continue;
+                        }
+                        let live = match uplinks.recheck(&state, &socket, link).await {
+                            Ok(live) => live,
+                            // This hub couldn't check: not the engine's doing.
+                            Err(r) if r.unavailable => continue,
+                            Err(_) => {
+                                bad += 1;
+                                continue;
+                            }
                         };
                         match super::wake::Wake::of(&live, &frame) {
                             Some(wake) => uplinks.wake(wake),
