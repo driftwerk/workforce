@@ -374,6 +374,8 @@ const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 pub fn router(state: Arc<GatewayState>) -> Router {
     // The boss tools of this hub's turns call its uplinks.
     crate::boss_links::tools::serve_for(&state);
+    // And what happens in their groups wakes them.
+    crate::boss_links::wake::start(&state);
     let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
@@ -1539,6 +1541,10 @@ const DESK_STREAM: &str = "desk.stream";
 /// A Desk message may be sent to queue for the running turn rather than
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
+/// A DM can be searched over its whole history on the hub
+/// (`GET /api/desk/conversations/{agent}/search`), and a page read around a
+/// match (`around=`). Served with the conversation routes.
+const DESK_SEARCH: &str = "desk.search";
 /// A person may delete their own message in their DM, and forget what the
 /// agent remembered from it
 /// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
@@ -1613,6 +1619,8 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
         .into_iter()
         // Deleting is a conversation route, served where the link is.
         .chain(deliveries.then_some(DESK_DELETE))
+        // Searching is too.
+        .chain(deliveries.then_some(DESK_SEARCH))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)

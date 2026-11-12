@@ -88,7 +88,8 @@ pub use adopt::HubInternal;
 pub use api::{router, sessions_router, Authorize};
 pub use conversations::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,
-    Conversations, Cursor, Delete, Deleted, Page, PutRead, Said, SavedMemory, Speaker, SpeakerKind,
+    Conversations, Cursor, Delete, Deleted, Match, Matches, Page, PutRead, Said, SavedMemory,
+    Speaker, SpeakerKind,
 };
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};

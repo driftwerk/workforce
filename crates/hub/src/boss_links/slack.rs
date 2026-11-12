@@ -152,37 +152,72 @@ pub async fn tell_ended(service: &AgentService, threads: Vec<(String, String)>) 
             .ok()
             .and_then(|mut s| s.pop())
             .is_some_and(|s| !s.is_sealed() && s.claims_desk_boss() && !s.left_behind());
-        let Some((workspace, channel, thread)) = dm_thread(&key) else {
-            continue;
-        };
         if still {
             continue;
         }
-        let hint = workforce_common::channels::ChannelHint::from_parts(
-            Some(workspace.to_string()),
-            None,
-            None,
-        );
-        let surface = service
-            .surface_registry
-            .read()
-            .await
-            .resolve("slack", channel, hint)
-            .await;
-        let sent = match surface {
-            Ok(surface) => surface
-                .send_message(&OutboundMessage {
-                    thread_id: Some(thread.to_string()),
-                    ..OutboundMessage::text(channel, ended_line(&group))
-                })
-                .await
-                .map(|_| ()),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = sent {
-            tracing::warn!(error = %format!("{e:#}"), "a Slack thread that stopped being a boss conversation couldn't be told so");
+        if let Err(why) = post(service, &key, &ended_line(&group)).await {
+            tracing::warn!(why = %why, "a Slack thread that stopped being a boss conversation couldn't be told so");
         }
     }
+}
+
+/// Whether the Slack DM thread `key` is in `person`'s own DM with the agent
+/// now: their Slack account as linked today opens that very DM. A thread
+/// whose DM was another account's is never told anything.
+pub async fn thread_is_theirs(service: &AgentService, person: &str, key: &str) -> bool {
+    let Some((workspace, channel, _)) = dm_thread(key) else {
+        return false;
+    };
+    let slack_user = service.resolve_platform_user_id(person);
+    if slack_user.is_empty() {
+        return false;
+    }
+    let hint = workforce_common::channels::ChannelHint::from_parts(
+        Some(workspace.to_string()),
+        None,
+        None,
+    );
+    let registry = service.surface_registry.read().await;
+    matches!(
+        registry.resolve_user_dm("slack", &slack_user, hint).await,
+        Ok((_, dm)) if dm == channel
+    )
+}
+
+/// Posts `text`, an agent's answer, into the Slack DM thread `key`: made
+/// safe to send first (no secret, no tool output).
+pub async fn post_in_thread(service: &AgentService, key: &str, text: &str) -> Result<(), String> {
+    post(
+        service,
+        key,
+        &crate::slack_manager::sanitize_outbound_logged(text),
+    )
+    .await
+}
+
+/// Posts `text` as it is into the Slack DM thread `key`.
+async fn post(service: &AgentService, key: &str, text: &str) -> Result<(), String> {
+    let (workspace, channel, thread) = dm_thread(key).ok_or("not a Slack DM thread")?;
+    let hint = workforce_common::channels::ChannelHint::from_parts(
+        Some(workspace.to_string()),
+        None,
+        None,
+    );
+    let surface = service
+        .surface_registry
+        .read()
+        .await
+        .resolve("slack", channel, hint)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    surface
+        .send_message(&OutboundMessage {
+            thread_id: Some(thread.to_string()),
+            ..OutboundMessage::text(channel, text)
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// What opening a group's Slack thread came to.
