@@ -1788,6 +1788,5 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
     assert!(!cy
         .linked_ids
         .keys()
-        .any(|k| crate::verified_email::is_verified_key(k)
-            || crate::chosen_me::is_chosen_key(k)));
+        .any(|k| crate::verified_email::is_verified_key(k) || crate::chosen_me::is_chosen_key(k)));
 }
