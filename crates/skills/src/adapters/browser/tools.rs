@@ -273,6 +273,27 @@ fn specs() -> Vec<ToolSpec> {
             handler: handler(|c, _input| async move { c.signed_in().await }.boxed()),
         },
         ToolSpec {
+            name: "browser.keep_google_client",
+            description:
+                "On Google Cloud Console in Desk's own browser, right after creating a Desktop app OAuth client: keeps its client ID and secret as the person's Google client, so Desk can sign them in to Google. Read the dialog with browser.snapshot: the secret shows as a [[secret:…]] marker; pass that marker as client_secret, never the secret itself, and never screenshot the dialog.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "client_id": { "type": "string", "description": "The client ID: …apps.googleusercontent.com" },
+                    "client_secret": { "type": "string", "description": "The [[secret:…]] marker browser.snapshot showed for the client secret" }
+                },
+                "required": ["client_id", "client_secret"]
+            }),
+            handler: handler(|c, input| {
+                async move {
+                    let id = require_str(&input, "client_id")?;
+                    let secret = require_str(&input, "client_secret")?;
+                    c.keep_google_client(id, secret).await
+                }
+                .boxed()
+            }),
+        },
+        ToolSpec {
             name: "browser.snapshot",
             description: "Return the current page URL, title, and visible body text.",
             schema: json!({ "type": "object", "properties": {} }),
@@ -745,8 +766,9 @@ mod tests {
         for r in READS {
             assert!(names.contains(r), "{r}");
         }
-        // The seven that change a page, and the sign-in card's wait.
-        assert_eq!(READS.len() + 8, names.len());
+        // The seven that change a page, the sign-in card's wait, and
+        // keeping a Google client.
+        assert_eq!(READS.len() + 9, names.len());
     }
 
     #[test]

@@ -348,6 +348,13 @@ impl ChromeCell {
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
         self.with(async |c| {
+            let text = c.evaluate(super::client::PAGE_TEXT).await;
+            let shows = text.as_ref().map_or(true, |t| {
+                workforce_common::redact::contains_secret(t.as_str().unwrap_or_default())
+            });
+            if shows {
+                return Err(eyre!(super::client::SHOWS_A_SECRET));
+            }
             let png = c.screenshot().await?;
             let size = png.len();
             stage_screenshot_artifact(png, size)

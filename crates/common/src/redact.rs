@@ -93,6 +93,8 @@ static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
         ("VOYAGE_KEY", r"pa-[a-zA-Z0-9_-]{32,}"),
         ("GROQ_KEY", r"gsk_[a-zA-Z0-9]{20,}"),
         ("GOOGLE_API_KEY", r"AIza[a-zA-Z0-9_-]{35}"),
+        // A Google OAuth client's secret, as Cloud Console shows it once.
+        ("GOOGLE_OAUTH_CLIENT_SECRET", r"GOCSPX-[A-Za-z0-9_-]{20,}"),
         // ── Source-control providers ──
         ("GITHUB_PAT", r"ghp_[a-zA-Z0-9]{36,}"),
         ("GITHUB_OAUTH_TOKEN", r"gho_[a-zA-Z0-9]{36,}"),
@@ -489,6 +491,17 @@ pub fn redact_url_str(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Google OAuth client's secret, as Cloud Console shows it, is a
+    /// secret: masked, and caught wherever it's read.
+    #[test]
+    fn a_google_client_secret_is_caught() {
+        let shown = concat!("Client secret GOC", "SPX-abcdefghijklmnopqrstuvwxyz12 (copy it now)");
+        assert!(contains_secret(shown));
+        let masked = redact_secrets(shown);
+        assert!(!masked.contains("abcdefghijklmnopqrstuvwxyz12"), "{masked}");
+        assert!(!contains_secret("Client ID 123-abc.apps.googleusercontent.com"));
+    }
 
     const URL_SECRETS: [&str; 5] = ["opsuser7", "hunter2", "k-acme42", "s3cr3t", "fr4gment"];
 

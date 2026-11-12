@@ -738,8 +738,53 @@ pub const SIGN_IN_NEXT: &str = "The page is open on the person's screen in Desk'
 pub(super) fn no_screenshot(tool: &str) -> bool {
     matches!(
         tool,
-        "browser.fill" | "browser.type" | "browser.sign_in" | "browser.signed_in"
+        "browser.fill"
+            | "browser.type"
+            | "browser.sign_in"
+            | "browser.signed_in"
+            | KEEP_GOOGLE_CLIENT
     )
+}
+
+/// The tool that keeps a Google OAuth client the agent made in Cloud Console.
+pub const KEEP_GOOGLE_CLIENT: &str = "browser.keep_google_client";
+
+/// Where a Google OAuth client is made: the only page a client is kept from.
+pub const CLOUD_CONSOLE: &str = "https://console.cloud.google.com";
+
+/// The page's text and the values of its fields, to check for a secret
+/// before a picture is taken of it.
+pub(super) const PAGE_TEXT: &str = "(() => { const t = document.body ? document.body.innerText : ''; const v = Array.from(document.querySelectorAll('input, textarea')).map(e => e.value || '').join(' '); return t + ' ' + v; })()";
+
+/// What a screenshot of a page showing a secret is refused with.
+pub const SHOWS_A_SECRET: &str = "The page shows a secret (a key or a client secret), so Desk didn't take a picture of it. Read it with browser.snapshot, which hides the secret behind a marker you can pass on.";
+
+/// Whether a Google OAuth client ID reads as one:
+/// `123-abc.apps.googleusercontent.com`.
+pub(super) fn is_google_client_id(id: &str) -> bool {
+    let Some(head) = id.strip_suffix(".apps.googleusercontent.com") else {
+        return false;
+    };
+    let Some((number, rest)) = head.split_once('-') else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether a Google OAuth client secret reads as one (`GOCSPX-…`), and not
+/// a marker left unresolved.
+pub(super) fn is_google_client_secret(secret: &str) -> bool {
+    secret.strip_prefix("GOCSPX-").is_some_and(|rest| {
+        rest.len() >= 20
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
 }
 
 /// Lazy, drop-safe handle to one user's headless-Chromium session: a single
@@ -1019,7 +1064,7 @@ impl SessionCell {
             true => (path_only(&url), target.map(path_only)),
             false => (url, target.map(str::to_string)),
         };
-        let typed = no_screenshot(tool);
+        let typed = no_screenshot(tool) || self.shows_secret(page).await;
         let screenshot = match typed {
             true => None,
             false => timeout(
@@ -1312,6 +1357,58 @@ impl SessionCell {
         read
     }
 
+    /// Whether the page shows a secret now (a key, a client secret): no
+    /// picture is taken of it. A page that can't be read counts as one.
+    async fn shows_secret(&self, page: &Page) -> bool {
+        match page.evaluate(PAGE_TEXT).await {
+            Ok(r) => r
+                .into_value::<String>()
+                .map_or(true, |text| workforce_common::redact::contains_secret(&text)),
+            Err(_) => true,
+        }
+    }
+
+    /// Keeps the Google OAuth client Cloud Console just made, as the
+    /// person's: only from Cloud Console, and only one that reads as a
+    /// client. Its secret came here as a marker and goes nowhere else.
+    async fn keep_google_client(&self, client_id: &str, client_secret: &str) -> Result<Value> {
+        let client_id = client_id.trim().to_string();
+        let secret = client_secret.trim().to_string();
+        if !is_google_client_id(&client_id) {
+            return Err(eyre!(
+                "That isn't a Google OAuth client ID (it ends .apps.googleusercontent.com)."
+            ));
+        }
+        if !is_google_client_secret(&secret) {
+            return Err(eyre!(
+                "That isn't the client's secret: pass the [[secret:…]] marker browser.snapshot showed for it."
+            ));
+        }
+        let Some(hooks) = hooks::hooks() else {
+            return Err(eyre!(
+                "This hub doesn't keep a Google OAuth client for Desk."
+            ));
+        };
+        self.with_page(|page, _n, _c| async move {
+            let url = self.current_url(&page).await;
+            if super::address::origin_of(&url).as_deref() != Some(CLOUD_CONSOLE) {
+                return Err(eyre!(
+                    "A Google OAuth client is kept only from Google Cloud Console ({CLOUD_CONSOLE}), where it was just made; this page is elsewhere."
+                ));
+            }
+            hooks
+                .keep_google_client(&self.user, &client_id, &secret)
+                .map_err(|e| eyre!(e))?;
+            self.done(&page, KEEP_GOOGLE_CLIENT, None).await;
+            Ok(json!({
+                "kept": true,
+                "client_id": client_id,
+                "next": "The person's Google OAuth client is kept. Close Cloud Console's dialog, and tell them it's ready: Desk starts their Google sign-in.",
+            }))
+        })
+        .await
+    }
+
     /// The page's address and title now.
     async fn where_now(&self, page: &Page) -> (String, String) {
         let title = page
@@ -1362,6 +1459,9 @@ impl SessionCell {
             guard.as_ref().map(|a| a.last_screenshot_size.clone())
         };
         self.with_page(move |page, _n, _c| async move {
+            if self.shows_secret(&page).await {
+                return Err(eyre!(SHOWS_A_SECRET));
+            }
             let bytes = page
                 .screenshot(ScreenshotParams::default())
                 .await
@@ -1820,6 +1920,24 @@ impl BrowserClient {
             ));
         }
         self.acquire().await?.sign_in(url).await
+    }
+
+    /// Keeps the Google OAuth client the agent made in Cloud Console, in
+    /// Desk's own browser.
+    pub(super) async fn keep_google_client(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<Value> {
+        if self.on_chrome() {
+            return Err(eyre!(
+                "Desk makes a Google OAuth client in its own browser only: open Cloud Console there (`browser: \"desk\"`)."
+            ));
+        }
+        self.acquire()
+            .await?
+            .keep_google_client(client_id, client_secret)
+            .await
     }
 
     /// Where Desk's own browser is once the person signed in.
@@ -3059,6 +3177,35 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Only what reads as a Google OAuth client is kept: an ID that ends
+    /// `.apps.googleusercontent.com`, and a `GOCSPX-` secret, never a marker
+    /// left unresolved.
+    #[test]
+    fn a_google_client_is_kept_only_as_one_reads() {
+        assert!(is_google_client_id(
+            "123456789012-abcdef0123456789.apps.googleusercontent.com"
+        ));
+        for bad in [
+            "abcdef.apps.googleusercontent.com",
+            "123-ABC.apps.googleusercontent.com",
+            "123-abc.apps.googleusercontent.com.evil.example",
+            "-abc.apps.googleusercontent.com",
+            "",
+        ] {
+            assert!(!is_google_client_id(bad), "{bad}");
+        }
+        assert!(is_google_client_secret(concat!("GOC", "SPX-abcdefghijklmnopqrstuvwxyz12")));
+        for bad in [
+            "[[secret:abc type=GOOGLE_OAUTH_CLIENT_SECRET preview=GOCSPX…]]",
+            "GOCSPX-short",
+            "GOCSPX-has spaces in it and more",
+            "secret",
+        ] {
+            assert!(!is_google_client_secret(bad), "{bad}");
+        }
+        assert!(no_screenshot(KEEP_GOOGLE_CLIENT));
     }
 
     /// A sign-in records and returns a page's origin and path only: a

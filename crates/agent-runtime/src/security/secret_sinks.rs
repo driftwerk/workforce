@@ -49,6 +49,9 @@ const SUBSTITUTION_REGISTRY: &[(&str, &[&str])] = &[
         &["bot_token", "app_token", "signing_secret"],
     ),
     ("browser.fill", &["value"]),
+    // The Google OAuth client the agent made in Cloud Console, kept as the
+    // person's (its ID isn't a secret).
+    ("browser.keep_google_client", &["client_secret"]),
     ("browser.type", &["text"]),
     ("obscura.fill", &["value"]),
     ("obscura.type", &["text"]),

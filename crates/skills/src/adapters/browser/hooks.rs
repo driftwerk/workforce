@@ -129,6 +129,17 @@ pub trait BrowserHooks: Send + Sync {
     fn may_visit(&self, _agent: &str, _origin: &str) -> Result<(), String> {
         Ok(())
     }
+    /// Keeps `user`'s own Google OAuth client, made in Cloud Console, where
+    /// Desk's Google sign-in reads it. `Err` says why not. A hub with no
+    /// say keeps nothing.
+    fn keep_google_client(
+        &self,
+        _user: &str,
+        _client_id: &str,
+        _client_secret: &str,
+    ) -> Result<(), String> {
+        Err("This hub doesn't keep a Google OAuth client for Desk.".into())
+    }
     /// Whether the hub's gate decides every browser call before it is made
     /// (Desk's does): a write it decided nothing for is then refused.
     fn gate_decides(&self) -> bool {

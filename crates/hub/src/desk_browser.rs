@@ -378,6 +378,28 @@ impl BrowserHooks for DeskHooks {
     /// A page in the person's Chrome that took itself to another site is
     /// held to that site's visit as the gate decides one: it stays only
     /// where this session may be, without asking.
+    fn keep_google_client(
+        &self,
+        user: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<(), String> {
+        use crate::desk_connections::Refusal;
+        let Some(connections) = crate::desk_connections::installed() else {
+            return Err("Desk's connections aren't running, so the client wasn't kept.".into());
+        };
+        connections
+            .keep_google_client(user, client_id, client_secret)
+            .map_err(|refused| match refused {
+                Refusal::Invalid(e) | Refusal::NotFound(e) | Refusal::Unavailable(e) => e,
+                Refusal::TestFailed { error, .. } => error,
+                Refusal::Internal(e) => {
+                    warn!(error = %format!("{e:#}"), "keeping the Google OAuth client failed");
+                    "Desk couldn't keep the client just now.".into()
+                }
+            })
+    }
+
     fn may_visit(&self, agent: &str, origin: &str) -> Result<(), String> {
         use workforce_core::computer::Verdict;
         let Some(service) = self.state.registry.get(agent) else {
