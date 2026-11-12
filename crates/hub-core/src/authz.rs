@@ -661,7 +661,12 @@ impl Capability {
                 "slack.app_configure",
                 "slack.disconnect",
             ],
-            Capability::AgentsManage => &["agent.create", "agent.update", "agent.delete"],
+            Capability::AgentsManage => &[
+                "agent.create",
+                "agent.update",
+                "agent.rename",
+                "agent.delete",
+            ],
             Capability::PersonasManage => &["role.create", "role.update", "role.delete"],
             Capability::SkillsManage => &[
                 "system.install_catalog_skill",
@@ -926,7 +931,9 @@ pub fn decision_for(cap: Capability, is_admin: bool) -> Decision {
 pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capability> {
     match tool {
         // Agent lifecycle (mutating only — reads stay ungated).
-        "agent.create" | "agent.update" | "agent.delete" => Some(Capability::AgentsManage),
+        "agent.create" | "agent.update" | "agent.rename" | "agent.delete" => {
+            Some(Capability::AgentsManage)
+        }
         // Persona templates (mutating only).
         "role.create" | "role.update" | "role.delete" => Some(Capability::PersonasManage),
         // Merging, transferring from and deleting identities; the tool also
@@ -1739,6 +1746,7 @@ mod tests {
         let cases: &[(&str, Capability)] = &[
             ("agent.create", Capability::AgentsManage),
             ("agent.update", Capability::AgentsManage),
+            ("agent.rename", Capability::AgentsManage),
             ("agent.delete", Capability::AgentsManage),
             ("role.create", Capability::PersonasManage),
             ("role.update", Capability::PersonasManage),

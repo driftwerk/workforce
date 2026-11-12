@@ -55,12 +55,13 @@ use crate::postgres::{
 };
 use crate::session::{
     compute_stats, context_usage_for, coordination_score, delete_live_message, format_excerpt_rows,
-    message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
-    redact_message_secrets, redact_messages_in_place, replies_to, search_terms, tool_calls_for,
-    ArchivePage, DeletedMessage, InterruptedTurn, JournalEntry, MessageRole, Reassigned,
-    RedactionStats, Session, SessionAttachment, SessionContextType, SessionContextUsage,
-    SessionExport, SessionKind, SessionMessage, SessionSearchResult, SessionStats, SessionStore,
-    SetAside, SetAsideRows, SetAsideStale, ToolCallRecord, TranscriptEntry, TurnPrincipal,
+    is_searched, matches_every_term, message_to_transcript_entry, paginate_entries,
+    rank_search_results, reassigned_channel, redact_message_secrets, redact_messages_in_place,
+    replies_to, search_terms, tool_calls_for, ArchivePage, DeletedMessage, InterruptedTurn,
+    JournalEntry, MessageRole, Reassigned, RedactionStats, Session, SessionAttachment,
+    SessionContextType, SessionContextUsage, SessionExport, SessionKind, SessionMessage,
+    SessionSearchResult, SessionStats, SessionStore, SetAside, SetAsideRows, SetAsideStale,
+    ToolCallRecord, TranscriptEntry, TurnPrincipal, UnknownCursor,
 };
 
 mod embedded {
@@ -2126,6 +2127,200 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    /// Each word of `query` matches as the default matches it, a substring
+    /// whatever case, or through the archive's full-text index, which also
+    /// finds a word by its start or its stem: only among the chain's own rows
+    /// either way. A session of the chain whose archive is empty is read from
+    /// its live transcript, as `read_archive_page` reads it; a turn a
+    /// rollover carried there verbatim is matched where it was first said.
+    /// Only this agent's sessions are read, whatever ids are asked for.
+    fn search_archive(
+        &self,
+        session_ids: &[String],
+        query: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<Vec<TranscriptEntry>> {
+        let asked: Vec<Uuid> = session_ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        let tsquery = prefix_tsquery(query);
+        let terms = search_terms(query);
+        let patterns: Vec<String> = terms
+            .iter()
+            .map(|t| format!("%{}%", escape_like(t)))
+            .collect();
+        let before = before.map(str::to_string);
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            // The asked sessions this agent holds, and whether each has an
+            // archive; one with none reads from its live transcript.
+            let held = scoped
+                .query(
+                    "SELECT s.id, EXISTS (
+                         SELECT 1 FROM session_archive a
+                         WHERE a.session_id = s.id AND a.tenant_id = s.tenant_id)
+                     FROM sessions s
+                     WHERE s.id = ANY($1) AND s.agent_id = $2 AND s.tenant_id = $3",
+                    &[&asked, &self.agent_id, &self.tenant_id()],
+                )
+                .await?;
+            let archived: std::collections::HashMap<Uuid, bool> =
+                held.iter().map(|r| (r.get(0), r.get(1))).collect();
+            let chain: Vec<Uuid> = asked
+                .iter()
+                .filter(|id| archived.contains_key(*id))
+                .copied()
+                .collect();
+            let unarchived: Vec<Uuid> = chain.iter().filter(|id| !archived[*id]).copied().collect();
+            let live: std::collections::HashMap<Uuid, Vec<TranscriptEntry>> =
+                if unarchived.is_empty() {
+                    Default::default()
+                } else {
+                    let rows = scoped
+                        .query(
+                            &format!(
+                                "SELECT {SESSION_COLUMNS} FROM sessions
+                             WHERE id = ANY($1) AND agent_id = $2 AND tenant_id = $3"
+                            ),
+                            &[&unarchived, &self.agent_id, &self.tenant_id()],
+                        )
+                        .await?;
+                    rows.iter()
+                        .map(|r| {
+                            let session = row_to_session(r)?;
+                            let id = parse_uuid(&session.id)?;
+                            let entries = session
+                                .messages
+                                .iter()
+                                .map(|m| message_to_transcript_entry(&session.id, m))
+                                .collect();
+                            Ok((id, entries))
+                        })
+                        .collect::<Result<_>>()?
+                };
+            // The live messages, and `before`, are each where they were first
+            // said: the oldest session of the chain holding them. A rollover
+            // carries turns into a successor under their own ids, and only
+            // the live transcript keeps those copies.
+            let mut wanted: Vec<String> = live.values().flatten().map(|e| e.id.clone()).collect();
+            wanted.extend(before.iter().cloned());
+            let in_archive = if wanted.is_empty() {
+                Vec::new()
+            } else {
+                scoped
+                    .query(
+                        "SELECT session_id, message_id, seq FROM session_archive
+                         WHERE session_id = ANY($1) AND message_id = ANY($2) AND tenant_id = $3",
+                        &[&chain, &wanted, &self.tenant_id()],
+                    )
+                    .await?
+            };
+            let place: std::collections::HashMap<Uuid, usize> = chain
+                .iter()
+                .enumerate()
+                .map(|(pos, id)| (*id, pos))
+                .collect();
+            // (chain place, place in that session) where each id was first said.
+            let mut first: std::collections::HashMap<String, (usize, i64)> = Default::default();
+            let mut note = |id: &str, at: (usize, i64)| {
+                let held = first.entry(id.to_string()).or_insert(at);
+                if at.0 > held.0 {
+                    *held = at;
+                }
+            };
+            for r in &in_archive {
+                if let Some(pos) = place.get(&r.get::<_, Uuid>(0)) {
+                    note(r.get(1), (*pos, r.get(2)));
+                }
+            }
+            for (id, entries) in &live {
+                for (i, entry) in entries.iter().enumerate() {
+                    note(&entry.id, (place[id], i as i64));
+                }
+            }
+            let cursor: Option<(usize, i64)> = match before.as_deref() {
+                None => None,
+                Some(mid) => match first.get(mid) {
+                    Some(at) => Some(*at),
+                    None => return Err(UnknownCursor(mid.to_string()).into()),
+                },
+            };
+            let after_cursor = |pos: usize, key: i64| {
+                cursor.is_none_or(|(cp, ck)| pos > cp || (pos == cp && key < ck))
+            };
+            // (chain place, place in session, entry), each session newest first.
+            let mut found: Vec<(usize, i64, TranscriptEntry)> = Vec::new();
+            if !terms.is_empty() && chain.iter().any(|id| archived[id]) {
+                let (cursor_pos, cursor_seq) = match cursor {
+                    // array_position counts from 1.
+                    Some((pos, key)) => (Some(pos as i32 + 1), Some(key)),
+                    None => (None, None),
+                };
+                let rows = scoped
+                    .query(
+                        "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens,
+                                a.desk, a.external_id, a.session_id,
+                                array_position($1::uuid[], a.session_id) AS pos
+                         FROM session_archive a
+                         JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
+                         WHERE a.session_id = ANY($1) AND s.agent_id = $2 AND a.tenant_id = $3
+                           AND (a.content ILIKE ALL($8::text[])
+                                OR ($4 <> '' AND a.content_tsv @@ to_tsquery('english', $4)))
+                           AND a.role IN ('user', 'assistant') AND a.tool_data IS NULL
+                           AND NOT COALESCE((a.desk->>'failed')::boolean, false)
+                           AND ($5::int4 IS NULL
+                                OR array_position($1::uuid[], a.session_id) > $5
+                                OR (array_position($1::uuid[], a.session_id) = $5
+                                    AND a.seq < $6::int8))
+                         ORDER BY pos ASC, a.seq DESC
+                         LIMIT $7",
+                        &[
+                            &chain,
+                            &self.agent_id,
+                            &self.tenant_id(),
+                            &tsquery,
+                            &cursor_pos,
+                            &cursor_seq,
+                            &(limit as i64),
+                            &patterns,
+                        ],
+                    )
+                    .await?;
+                for r in &rows {
+                    let session: Uuid = r.get(9);
+                    let pos: i32 = r.get(10);
+                    let entry = archive_row_to_entry(&session.to_string(), r);
+                    found.push(((pos - 1) as usize, entry.seq.unwrap_or_default(), entry));
+                }
+            }
+            scoped.finish().await?;
+            for (pos, id) in chain.iter().enumerate() {
+                let Some(entries) = live.get(id) else {
+                    continue;
+                };
+                for (i, entry) in entries.iter().enumerate().rev() {
+                    let key = (pos, i as i64);
+                    if first.get(entry.id.as_str()) == Some(&key)
+                        && after_cursor(pos, i as i64)
+                        && is_searched(entry)
+                        && matches_every_term(&entry.content, &terms)
+                    {
+                        found.push((pos, i as i64, entry.clone()));
+                    }
+                }
+            }
+            found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            Ok(found
+                .into_iter()
+                .take(limit)
+                .map(|(_, _, entry)| entry)
+                .collect())
+        })
+    }
+
     fn append_to_archive(&self, session_id: &str, message: &SessionMessage) -> Result<()> {
         let id = parse_uuid(session_id)?;
         let message = message.clone();
@@ -2621,6 +2816,26 @@ fn role_from_str(s: &str) -> MessageRole {
         "tool" => MessageRole::Tool,
         _ => MessageRole::User,
     }
+}
+
+/// `term` as a LIKE pattern's literal text: its wildcards and the escape
+/// itself escaped.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// `query` as a tsquery in which each of its words matches any word it
+/// starts: its letters and digits alone, so nothing a person types is read as
+/// tsquery syntax. Empty when it has none.
+fn prefix_tsquery(query: &str) -> String {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("{}:*", word.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(" & ")
 }
 
 /// One message into the archive. Its parameters: session, message id,
@@ -3968,6 +4183,34 @@ pub(crate) mod tests {
             );
         })
         .await;
+    }
+
+    /// The archive's index answers the same as the default scan, and a
+    /// session with no archive yet is read from its live transcript; another
+    /// agent's store finds nothing in this one's sessions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_archive_searches_a_chain_newest_first() {
+        for archive in [true, false] {
+            with_embedded_pg_pool(|pool| async move {
+                let store = PostgresSessionStore::with_pool(pool.clone(), "scout")
+                    .await
+                    .unwrap();
+                let chain = crate::session::assert_search_archive_contract(store.as_ref(), archive);
+                let other = PostgresSessionStore::with_shared_pool(pool, "other");
+                assert!(other
+                    .search_archive(&chain, "deploy", 10, None)
+                    .unwrap()
+                    .is_empty());
+            })
+            .await;
+        }
+    }
+
+    #[test]
+    fn a_prefix_tsquery_is_words_alone() {
+        assert_eq!(prefix_tsquery("Deploy DW-546"), "deploy:* & dw:* & 546:*");
+        assert_eq!(prefix_tsquery("a:b & !c' | (d)"), "a:* & b:* & c:* & d:*");
+        assert_eq!(prefix_tsquery(" &|!():* "), "");
     }
 
     #[tokio::test(flavor = "multi_thread")]

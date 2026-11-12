@@ -667,7 +667,7 @@ async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
 /// on Desk, the boss's late answer does nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use workforce_desk::crew::{Event, Party};
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -739,7 +739,7 @@ async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
 
         let asked = ask("cargo build --release");
         let a = pending("cargo build --release").await;
-        let mut offered = HashSet::new();
+        let mut offered = HashMap::new();
         let owed = eventually("the request given to Allan", async || {
             let o = crew.owed_remote("acme", &allan(), &mut offered);
             (!o.is_empty()).then_some(o)
@@ -766,7 +766,7 @@ async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
                     hub: "driftwerk".into(),
                     agent: "bob".into()
                 },
-                &mut HashSet::new()
+                &mut HashMap::new()
             )
             .is_empty());
         let mut raised = Event::new(
@@ -796,6 +796,18 @@ async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
             let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
             crew.overseers();
             assert_eq!(d.view(started).unwrap().waits_on_you, None, "Allan has it");
+            // Left open past its time with Allan, it is the person's, once.
+            for o in offered.values_mut() {
+                o.at -= crate::desk_crew::served::LEFT_AFTER;
+            }
+            assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+            let why = d.view(started).unwrap().waits_on_you;
+            assert!(
+                why.as_deref()
+                    .is_some_and(|w| w.contains("left this to you")),
+                "{why:?}"
+            );
+            assert!(offered.values().all(|o| o.left));
         }
         crew.overseers();
         assert!(
@@ -841,12 +853,17 @@ async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
             "{why:?}"
         );
         assert!(!crew
-            .owed_remote("acme", &allan(), &mut HashSet::new())
+            .owed_remote("acme", &allan(), &mut HashMap::new())
             .is_empty());
         put("watch", 3).await;
         crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("only watches")),
+            "{why:?}"
+        );
         assert!(crew
-            .owed_remote("acme", &allan(), &mut HashSet::new())
+            .owed_remote("acme", &allan(), &mut HashMap::new())
             .is_empty());
     })
     .await;

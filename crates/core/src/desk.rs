@@ -926,6 +926,11 @@ pub const BOARD_SYNC_JIRA_TOOLS: &[&str] = &[
     "jira.get_project",
 ];
 
+/// The one read-only Jira tool the link dialog may also call, to list the
+/// projects the person can reach so it can offer a picker. Not one the sync
+/// needs: a hub without it only has the key typed.
+pub const BOARD_SYNC_JIRA_PICK_TOOLS: &[&str] = &["jira.list_projects"];
+
 /// The Linear tools a Desk board's sync may call on a hub.
 pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
     "linear.issue_list",

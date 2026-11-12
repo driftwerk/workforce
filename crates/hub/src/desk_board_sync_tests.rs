@@ -113,6 +113,9 @@ impl Tool for FakeJiraTool {
         }
         let key = input["issue_key"].as_str().unwrap_or_default().to_string();
         let out = match self.name {
+            "jira.list_projects" => json!({ "count": 2, "projects": [
+                { "key": "ACME", "id": "1", "name": "Acme web" },
+                { "key": "OPS", "id": "2", "name": "Operations" } ] }),
             "jira.search" => {
                 let jql = input["jql"].as_str().unwrap_or_default();
                 let project = jql.split('"').nth(1).unwrap_or_default().to_string();
@@ -234,10 +237,15 @@ pub(crate) fn register_jira(
     jira: &Shared,
     except: &[&str],
 ) {
-    for name in workforce_desk::board_sync::JIRA_TOOLS
-        .iter()
-        .chain(["jira.api", "jira.delete_issue", "jira.myself"].iter())
-    {
+    for name in workforce_desk::board_sync::JIRA_TOOLS.iter().chain(
+        [
+            "jira.api",
+            "jira.delete_issue",
+            "jira.myself",
+            "jira.list_projects",
+        ]
+        .iter(),
+    ) {
         if !except.contains(name) {
             registry.register(Arc::new(FakeJiraTool {
                 name,
@@ -769,6 +777,21 @@ async fn the_link_dialog_is_told_the_states_and_the_matches() {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["matches"], 1);
+        // The projects are asked once, with the first check, not again with a target.
+        assert!(body.get("projects").is_none());
+        let (status, first) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        // To pick from, by key and name.
+        assert_eq!(
+            first["projects"],
+            json!([{ "key": "ACME", "name": "Acme web" }, { "key": "OPS", "name": "Operations" }])
+        );
         assert_eq!(body["prefill"]["doing"], "In Progress");
         assert_eq!(body["prefill"]["review"], "In Review");
         // Raw JQL that would reach another project is refused before any call.
@@ -1650,6 +1673,7 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "jira_create_issue",
         "jira_get_issue",
         "jira_get_project",
+        "jira_list_projects",
         "jira_list_transitions",
         "jira_myself",
         "jira_search",

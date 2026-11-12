@@ -12,6 +12,7 @@ pub mod agent_inbox;
 pub mod agent_llm;
 pub mod agent_message_tool;
 pub mod agent_registry;
+pub mod agent_rename;
 pub mod agent_tool;
 pub(crate) mod agent_turn;
 pub use agent_turn::connect::wire as wire_device_logins;

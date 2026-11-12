@@ -3298,6 +3298,73 @@ pub trait SessionStore: Send + Sync {
         Ok(ArchivePage { messages, has_more })
     }
 
+    /// The messages of `session_ids` that match `query`, newest first, at
+    /// most `limit`: what a person or the agent said, never a tool row or a
+    /// turn's failure. `session_ids` is one thread's chain, newest session
+    /// first, and the order runs back through it: a session's messages,
+    /// newest first, then its predecessor's. A turn a rollover carried into a
+    /// successor under its own id is matched once, where it was first said:
+    /// in the oldest session that holds it. With `before`, a message of one
+    /// of them, only those older than it; a `before` none of them holds is
+    /// an [`UnknownCursor`]. Reads what
+    /// [`read_archive_page`](Self::read_archive_page) reads, so every match
+    /// is a message a page of the thread holds.
+    ///
+    /// This one matches every whitespace-separated word of `query` as a
+    /// case-insensitive substring, so part of a word finds the whole one; a
+    /// store with an index overrides it.
+    fn search_archive(
+        &self,
+        session_ids: &[String],
+        query: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> eyre::Result<Vec<TranscriptEntry>> {
+        let terms = search_terms(query);
+        let mut sessions: Vec<Vec<TranscriptEntry>> = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            sessions.push(match self.get(session_id)? {
+                Some(_) => {
+                    self.read_archive_page(session_id, None, usize::MAX)?
+                        .messages
+                }
+                None => Vec::new(),
+            });
+        }
+        // Where each message was first said: the oldest session holding it.
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (pos, entries) in sessions.iter().enumerate() {
+            for entry in entries {
+                first.insert(entry.id.as_str(), pos);
+            }
+        }
+        let originals = sessions.iter().enumerate().flat_map(|(pos, entries)| {
+            let first = &first;
+            entries
+                .iter()
+                .rev()
+                .filter(move |e| first.get(e.id.as_str()) == Some(&pos))
+        });
+        let mut passed = before.is_none();
+        let mut found = Vec::new();
+        for entry in originals {
+            if !passed {
+                passed = Some(entry.id.as_str()) == before;
+                continue;
+            }
+            if found.len() >= limit {
+                break;
+            }
+            if is_searched(entry) && matches_every_term(&entry.content, &terms) {
+                found.push(entry.clone());
+            }
+        }
+        match (passed, before) {
+            (false, Some(before)) => Err(UnknownCursor(before.to_string()).into()),
+            _ => Ok(found),
+        }
+    }
+
     /// The files the messages of `session_id` hold by reference, by message
     /// id ([`files_by_message`]). What a store's archive doesn't keep is read
     /// from its live messages, so a message compacted out of them may be
@@ -5626,6 +5693,32 @@ pub(crate) fn search_terms(query: &str) -> Vec<String> {
         })
 }
 
+/// A search's `before` names no message of the sessions it searched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCursor(pub String);
+
+impl std::fmt::Display for UnknownCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no message of these sessions is {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownCursor {}
+
+/// Whether `content` holds every one of `terms` (lowercased), case aside.
+/// No terms is no match.
+pub(crate) fn matches_every_term(content: &str, terms: &[String]) -> bool {
+    !terms.is_empty() && coordination_score(&content.to_lowercase(), terms) == terms.len()
+}
+
+/// Whether [`SessionStore::search_archive`] looks at `entry`: something a
+/// person or the agent said, not a tool row or a turn's failure.
+pub(crate) fn is_searched(entry: &TranscriptEntry) -> bool {
+    matches!(entry.role, MessageRole::User | MessageRole::Assistant)
+        && entry.tool_metadata.is_none()
+        && !entry.is_failure()
+}
+
 /// Count of distinct `terms` occurring as substrings of `content_lower` (already
 /// lowercased). A message covering more query terms ranks above one covering
 /// fewer, so a multi-word query surfaces its best matches first instead of
@@ -6182,9 +6275,139 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
     store.journal_clear(session_id).unwrap();
 }
 
+/// [`SessionStore::search_archive`] on a chain of two sessions: what was
+/// said, newest first back across the seam, a word's start finding it, every
+/// word needed, paged by `before`; never a tool row, a turn's failure or a
+/// session outside the chain. With `archive`, every message is archived too.
+/// Returns the chain, newest first.
+#[cfg(test)]
+pub(crate) fn assert_search_archive_contract(
+    store: &dyn SessionStore,
+    archive: bool,
+) -> Vec<String> {
+    let mut old = Session::new("desk", "u", "scout");
+    old.add_user_message("deploy the release", None);
+    let mut tool_call = SessionMessage::tool(
+        "x",
+        &serde_json::json!({}),
+        &serde_json::json!(""),
+        true,
+        1,
+        None,
+    );
+    tool_call.role = MessageRole::Assistant;
+    tool_call.content = "deploy it with a tool".into();
+    old.messages.push(tool_call);
+    old.add_assistant_message("Deployed the release", 1);
+    old.seal();
+    store.save(&old).unwrap();
+    let mut new = Session::new("desk", "u", "scout");
+    new.set_prev_session_id(&old.id);
+    new.add_user_message(
+        "ping foo.example.com, mail ops@example.org, read /var/log/app.log",
+        None,
+    );
+    new.add_user_message("what about the deployment?", None);
+    new.add_assistant_message("Agent error: deploy failed", 0);
+    new.messages.last_mut().unwrap().desk = Some(crate::channels::desk::DeskMark {
+        failed: true,
+        ..Default::default()
+    });
+    new.add_assistant_message("Nothing else to deploy", 1);
+    store.save(&new).unwrap();
+    let mut elsewhere = Session::new("desk", "v", "scout");
+    elsewhere.add_user_message("deploy elsewhere", None);
+    store.save(&elsewhere).unwrap();
+    if archive {
+        for session in [&old, &new, &elsewhere] {
+            for message in &session.messages {
+                store.append_to_archive(&session.id, message).unwrap();
+            }
+        }
+    }
+    let chain = vec![new.id.clone(), old.id.clone()];
+    let search = |query: &str, limit: usize, before: Option<&str>| -> Vec<(String, String)> {
+        store
+            .search_archive(&chain, query, limit, before)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.content, e.id))
+            .collect()
+    };
+    let texts = |found: &[(String, String)]| -> Vec<String> {
+        found.iter().map(|(text, _)| text.clone()).collect()
+    };
+    let all = [
+        "Nothing else to deploy",
+        "what about the deployment?",
+        "Deployed the release",
+        "deploy the release",
+    ];
+    assert_eq!(texts(&search("deploy", 10, None)), all);
+    assert_eq!(
+        texts(&search("DEPLO", 10, None)),
+        all,
+        "part of a word, any case"
+    );
+    assert_eq!(
+        texts(&search("release deploy", 10, None)),
+        ["Deployed the release", "deploy the release"],
+        "every word"
+    );
+    assert!(search("nowhere", 10, None).is_empty());
+    // Hosts, addresses, paths, stop words and parts of words, as typed.
+    let ping = "ping foo.example.com, mail ops@example.org, read /var/log/app.log";
+    for query in ["example", "OPS@example", "log/app.lo", "foo.example.com,"] {
+        assert_eq!(texts(&search(query, 10, None)), [ping], "{query}");
+    }
+    assert_eq!(
+        texts(&search("deploym", 10, None)),
+        ["what about the deployment?"]
+    );
+    assert_eq!(
+        texts(&search("the", 10, None)),
+        [
+            "what about the deployment?",
+            "Deployed the release",
+            "deploy the release"
+        ],
+        "a stop word"
+    );
+    assert!(
+        search("100%", 10, None).is_empty(),
+        "a wildcard is a character"
+    );
+    let first = search("deploy", 2, None);
+    assert_eq!(texts(&first), all[..2]);
+    let second = search("deploy", 2, Some(&first[1].1));
+    assert_eq!(texts(&second), all[2..], "the cursor crosses the seam");
+    assert!(search("deploy", 2, Some(&second[1].1)).is_empty());
+    let refused = store
+        .search_archive(&chain, "deploy", 2, Some("no-such-message"))
+        .unwrap_err();
+    assert!(
+        refused.downcast_ref::<UnknownCursor>().is_some(),
+        "a cursor outside the chain: {refused}"
+    );
+    chain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_in_memory_store_searches_a_chain_newest_first() {
+        assert_search_archive_contract(&InMemorySessionStore::new(), false);
+    }
+
+    #[test]
+    fn the_file_store_searches_a_chain_newest_first_live_or_archived() {
+        for archive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            assert_search_archive_contract(&JsonlSessionStore::new(dir.path()).unwrap(), archive);
+        }
+    }
 
     #[test]
     fn the_in_memory_store_reassigns_owners_keeping_both_on_a_shared_channel() {

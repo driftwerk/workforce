@@ -2460,9 +2460,19 @@ mod uplink_tests {
         let event = |link: Uuid, i: u32| json!({"type": "event", "linkId": link, "kind": "finished", "line": format!("e{i}")});
         // While the hub can't check links, nothing wakes and nothing counts
         // against the engine.
+        // Short of the outage it waits out, the link stays: none wakes, and
+        // the socket answers.
         hub.store_down.store(true, Ordering::SeqCst);
-        send(&mut a, event(acme.link.link_id, 0)).await;
+        for i in 0..2 {
+            send(&mut b, event(globex.link.link_id, 100 + i)).await;
+        }
         assert!(next_wake(&mut wakes).await.is_none());
+        send(&mut b, json!({"type": "ping"})).await;
+        assert_eq!(
+            next(&mut b).await.unwrap()["type"],
+            "pong",
+            "an outage isn't the engine's"
+        );
         hub.store_down.store(false, Ordering::SeqCst);
 
         // A flood: its link's places fill, and past its minute's share the
