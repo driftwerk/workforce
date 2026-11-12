@@ -178,6 +178,13 @@ impl Desk {
                 .and_then(|l| l.pending.as_ref())
                 .is_some_and(|p| p.id == approval);
             if open {
+                // Only what is still open anywhere is kept.
+                let pending: std::collections::HashSet<Uuid> = st
+                    .live
+                    .values()
+                    .filter_map(|l| l.pending.as_ref().map(|p| p.id))
+                    .collect();
+                st.charges.left.retain(|id| pending.contains(id));
                 st.charges.left.insert(approval);
             }
             open
@@ -807,6 +814,14 @@ impl Desk {
         let _ = self.0.events.send(DeskEvent::Charge {
             charge: Box::new(view.clone()),
         });
+        // Who what it waits on waits on changes with who runs and drives it.
+        if let Ok(now) = self.view(c.session) {
+            if now.pending.is_some() {
+                self.announce(DeskEvent::Session {
+                    session: Box::new(now),
+                });
+            }
+        }
         Ok(view)
     }
 
@@ -1179,14 +1194,6 @@ impl Desk {
             };
             if let Err(e) = result {
                 tracing::warn!(session = %view.id, error = %e, "couldn't write down who drives a session");
-            }
-            // Who what it waits on waits on changed with the wheel.
-            if view.pending.is_some() {
-                if let Ok(now) = self.view(view.id) {
-                    self.announce(DeskEvent::Session {
-                        session: Box::new(now),
-                    });
-                }
             }
         }
     }

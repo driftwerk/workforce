@@ -3976,6 +3976,7 @@ async fn a_request_the_overseer_leaves_open_says_it_waits_on_you() {
         )
         .await
         .unwrap();
+        let (_, mut events) = d.subscribe();
         d.drive(id).await.unwrap();
         let _asked = ask_to_run(&url, "cat /tmp/out.txt");
         let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
@@ -3984,6 +3985,24 @@ async fn a_request_the_overseer_leaves_open_says_it_waits_on_you() {
             Some("You're driving it.")
         );
         d.hand_back(id).await.unwrap();
+        // Desk is shown the session again as the wheel comes back: the
+        // request isn't the person's while the boss has it.
+        let shown = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(workforce_desk::model::DeskEvent::Session { session }) =
+                    events.recv().await
+                {
+                    if session.id == id
+                        && session.pending.is_some()
+                        && session.waits_on_you.is_none()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(shown.is_ok(), "the session is shown again on hand-back");
         // Its turn only says "Answered.": the request is still open.
         eventually("the work turn", async || {
             work_turn_naming(&overseer, id, pending.id).await
