@@ -762,9 +762,19 @@ async fn the_link_dialog_is_told_the_states_and_the_matches() {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["matches"], 1);
-        // The projects to pick from, by key and name.
+        // The projects are asked once, with the first check, not again with a target.
+        assert!(body.get("projects").is_none());
+        let (status, first) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        // To pick from, by key and name.
         assert_eq!(
-            body["projects"],
+            first["projects"],
             json!([{ "key": "ACME", "name": "Acme web" }, { "key": "OPS", "name": "Operations" }])
         );
         assert_eq!(body["prefill"]["doing"], "In Progress");

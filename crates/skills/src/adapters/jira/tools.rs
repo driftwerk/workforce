@@ -1272,7 +1272,8 @@ impl Tool for JiraListProjectsTool {
             "properties": {
                 "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
                 "query": { "type": "string", "description": "Optional substring filter on project key/name" },
-                "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" }
+                "max_results": { "type": "integer", "description": "Page size (default 50, max 100; Jira Cloud pages at 50)" },
+                "start_at": { "type": "integer", "description": "Index of the first project (default 0), to read the next page" }
             }
         })
     }
@@ -1283,7 +1284,9 @@ impl Tool for JiraListProjectsTool {
             .unwrap_or(50)
             .min(100)
             .to_string();
-        let mut q: Vec<(&str, &str)> = vec![("maxResults", max.as_str())];
+        let first = coerce_to_u64(&input["start_at"]).unwrap_or(0).to_string();
+        let mut q: Vec<(&str, &str)> =
+            vec![("maxResults", max.as_str()), ("startAt", first.as_str())];
         let query_str = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
         if !query_str.is_empty() {
             q.push(("query", query_str));

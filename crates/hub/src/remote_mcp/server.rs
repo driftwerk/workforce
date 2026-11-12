@@ -406,6 +406,7 @@ mod tests {
         let allow = RemoteMcpConfig::DEFAULT_TOOLS_ALLOW;
         for tool in workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
             .iter()
+            .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
         {
             assert!(allow.contains(tool), "{tool} is not offered by default");

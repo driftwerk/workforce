@@ -345,6 +345,18 @@ impl Remote for LocalRemote {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.run(tool, args, false).await
+    }
+
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.run(tool, args, true).await
+    }
+}
+
+impl LocalRemote {
+    /// Runs `tool`; `quiet`: with no approver to route to and nowhere to
+    /// hand a routed approval, so a call that needs one asks no one.
+    async fn run(&self, tool: &str, args: Value, quiet: bool) -> Result<Value, RemoteError> {
         use crate::mcp::ToolCallExecutor as _;
         use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor};
         let service = self.service()?;
@@ -369,10 +381,18 @@ impl Remote for LocalRemote {
                 },
             },
             ctx,
-            router: service.approval_router.read().clone(),
+            router: if quiet {
+                None
+            } else {
+                service.approval_router.read().clone()
+            },
             mode: ApprovalMode::Park {
                 pending: Arc::new(crate::mcp_gate::PendingCalls::default()),
-                routed: self.state.registry.routed_delivery(),
+                routed: if quiet {
+                    tokio::sync::mpsc::channel(1).0
+                } else {
+                    self.state.registry.routed_delivery()
+                },
                 bridge: Arc::from(Vec::new()),
             },
         };
@@ -1109,21 +1129,32 @@ async fn check_link(
             Err(e) => return said(e),
         }
     }
-    // Jira's projects, for a picker: only when the hub can list them (a
-    // token minted before the tool was offered can't, and the key is typed).
-    if body.system == System::Jira {
-        if let Ok(projects) = sync::call(
-            &*remote,
-            body.system,
-            "jira.list_projects",
-            json!({ "max_results": 100 }),
-        )
-        .await
-        {
-            let list = projects_of(&projects);
-            if !list.as_array().is_some_and(Vec::is_empty) {
-                out["projects"] = list;
+    // Jira's projects, for a picker: asked once, with the first check (no
+    // target yet), not again as the dialog is edited; only when the hub can
+    // list them (a token minted before the tool was offered can't, and the
+    // key is typed). Never asks anyone to approve it. Jira Cloud pages at
+    // 50, so up to two pages are read for the 100 shown.
+    if body.system == System::Jira && body.target.is_none() {
+        let mut all: Vec<Value> = Vec::new();
+        while all.len() < MAX_PROJECTS {
+            let got = sync::call_quiet(
+                &*remote,
+                body.system,
+                "jira.list_projects",
+                json!({ "max_results": 50, "start_at": all.len() }),
+            )
+            .await;
+            let Ok(page) = got else { break };
+            let list = projects_of(&page);
+            let n = list.as_array().map_or(0, Vec::len);
+            all.extend(list.as_array().cloned().unwrap_or_default());
+            if n < 50 {
+                break;
             }
+        }
+        all.truncate(MAX_PROJECTS);
+        if !all.is_empty() {
+            out["projects"] = Value::Array(all);
         }
     }
     let Some(target) = body.target.as_deref() else {
@@ -1191,6 +1222,9 @@ async fn check_link(
     }
     Json(out).into_response()
 }
+
+/// The most projects the link dialog lists.
+const MAX_PROJECTS: usize = 100;
 
 /// A project list as the dialog shows it: key and name.
 fn projects_of(answer: &Value) -> Value {
