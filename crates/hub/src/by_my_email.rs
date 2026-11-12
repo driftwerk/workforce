@@ -171,6 +171,27 @@ impl Tool for ByMyEmail {
             Some(Ok(Some(identity))) => identity,
             _ => return Ok(ToolResult::success(none("no_verified_email"), ms())),
         };
+        // Whom the person chose to be there comes first.
+        if matches!(
+            identity.status,
+            workforce_identity::types::IdentityStatus::Active
+                | workforce_identity::types::IdentityStatus::AutoProvisioned
+        ) && identity
+            .linked_ids
+            .keys()
+            .any(|k| crate::chosen_me::is_chosen_key(k))
+        {
+            if let Some(tools) = self.tools.upgrade() {
+                if let Ok(place) = crate::chosen_me::place_of(self.on, &tools).await {
+                    if let Some(user) = crate::chosen_me::chosen_of(&identity, self.on, &place) {
+                        return Ok(ToolResult::success(
+                            json!({ "user": user, "why": null, "source": "chosen" }),
+                            ms(),
+                        ));
+                    }
+                }
+            }
+        }
         let (email, source) = match crate::oidc::verified_email_state(&identity, chrono::Utc::now())
         {
             VerifiedEmail::Fresh(email, source) => (email, source),

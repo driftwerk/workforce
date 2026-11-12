@@ -778,6 +778,8 @@ pub fn router(sync: Arc<BoardSync>) -> Router {
         .route("/api/desk/sync-hubs", get(list_hubs))
         .route("/api/desk/sync-hubs/{hub}", put(put_hub).delete(delete_hub))
         .route("/api/desk/boards/link/check", post(check_link))
+        .route("/api/desk/boards/link/members", post(members_named))
+        .route("/api/desk/boards/link/me", post(choose_me))
         .route(
             "/api/desk/boards/{id}/link",
             put(link_board).delete(unlink_board),
@@ -974,6 +976,111 @@ struct CheckBody {
     me: Option<String>,
 }
 
+/// Who the person is on a shared key, chosen: the members there whose name
+/// contains `name`, or their choice kept (`id`, `name`) or cleared.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeBody {
+    system: System,
+    via: Via,
+    /// The board's agent there, tried first.
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// The hub's agent for `body`, and the hub's name; or the refusal.
+async fn reach_for_me(
+    r: &Routes,
+    body: &MeBody,
+    person: &str,
+) -> Result<(Arc<dyn Remote>, String), Response> {
+    let hub = r.sync.hub_name(&body.via).await;
+    match r
+        .sync
+        .offered(body.system, &body.via, person, body.agent.as_deref())
+        .await
+    {
+        Ok(reached) => Ok((reached.remote, hub)),
+        Err(p) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": paused_words(&hub, body.system, &p), "paused": p })),
+        )
+            .into_response()),
+    }
+}
+
+/// The members on the board's service whose name contains what the person
+/// typed: id, name and avatar, as the hub's agent lists them (never emails).
+async fn members_named(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<MeBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    let (remote, hub) = match reach_for_me(&r, &body, &person).await {
+        Ok(reached) => reached,
+        Err(refused) => return refused,
+    };
+    let name = body.name.as_deref().unwrap_or_default();
+    match sync::call(
+        &*remote,
+        body.system,
+        sync::members_tool(body.system),
+        json!({ "name": name }),
+    )
+    .await
+    {
+        // Only what a member is shown by: whatever else came, it stays here.
+        Ok(answer) => Json(
+            json!({ "members": answer["members"].as_array().into_iter().flatten().map(|m| json!({
+            "id": m["id"], "name": m["name"], "avatar": m["avatar"],
+        })).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(e) => refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+    }
+}
+
+/// Keeps or clears whom the person chose to be on the board's service:
+/// always their own, on the hub that holds the key.
+async fn choose_me(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<MeBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    let args = if body.clear {
+        json!({ "clear": true })
+    } else {
+        let Some(id) = body.id.as_deref().map(str::trim).filter(|i| !i.is_empty()) else {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                "Choose someone, or clear your choice.",
+            );
+        };
+        if let Err(e) = sync::check_me(body.system, id) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+        json!({ "id": id, "name": body.name })
+    };
+    let (remote, hub) = match reach_for_me(&r, &body, &person).await {
+        Ok(reached) => reached,
+        Err(refused) => return refused,
+    };
+    match sync::call(&*remote, body.system, sync::choose_tool(body.system), args).await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(e) => refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+    }
+}
+
 /// How many of `target`'s issues `filter` matches, read page by page up to
 /// [`sync::MATCH_CEILING`]; and whether there may be more than that.
 async fn count_matches(
@@ -1133,6 +1240,7 @@ async fn check_link(
             Ok(sync::Who::ByEmail(me, source)) => {
                 out["meBy"] = json!(match source {
                     workforce_desk::board::MeSource::VouchedBySlack => "slack",
+                    workforce_desk::board::MeSource::Chosen => "chosen",
                     _ => "email",
                 });
                 Some(me)

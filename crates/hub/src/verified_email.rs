@@ -170,7 +170,14 @@ pub fn keep_stored_verified(
     stored: &HashMap<String, String>,
     incoming: &mut HashMap<String, String>,
 ) {
-    incoming.retain(|k, _| !is_verified_key(k));
+    // Whom a person chose to be on a shared key is theirs alone to say.
+    incoming.retain(|k, _| !is_verified_key(k) && !crate::chosen_me::is_chosen_key(k));
+    for (k, v) in stored
+        .iter()
+        .filter(|(k, _)| crate::chosen_me::is_chosen_key(k))
+    {
+        incoming.insert(k.clone(), v.clone());
+    }
     for source in Source::ALL {
         let link = source.link();
         if stored.get(link).is_none() || stored.get(link) != incoming.get(link) {

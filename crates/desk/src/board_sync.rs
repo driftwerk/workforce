@@ -43,11 +43,34 @@ pub fn by_email_tool(system: System) -> &'static str {
     }
 }
 
+/// The hub's tool that lists the members there whose name contains what
+/// the person typed (`{name}`): id, name and avatar, never an email.
+pub fn members_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "identity.jira_users_named",
+        System::Linear => "identity.linear_members_named",
+    }
+}
+
+/// The hub's tool that keeps (`{id, name}`) or clears (`{clear: true}`)
+/// whom the person chose to be there: only ever their own.
+pub fn choose_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "identity.jira_choose_me",
+        System::Linear => "identity.linear_choose_me",
+    }
+}
+
 /// Every tool `system`'s sync may call: the ones it needs, and the ones
-/// that say who the person is there.
+/// that say (or let the person say) who they are there.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
-    all.extend([identity_tool(system), by_email_tool(system)]);
+    all.extend([
+        identity_tool(system),
+        by_email_tool(system),
+        members_tool(system),
+        choose_tool(system),
+    ]);
     all
 }
 
