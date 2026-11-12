@@ -1539,6 +1539,10 @@ const DESK_STREAM: &str = "desk.stream";
 /// A Desk message may be sent to queue for the running turn rather than
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
+/// A DM can be searched over its whole history on the hub
+/// (`GET /api/desk/conversations/{agent}/search`), and a page read around a
+/// match (`around=`). Served with the conversation routes.
+const DESK_SEARCH: &str = "desk.search";
 /// A person may delete their own message in their DM, and forget what the
 /// agent remembered from it
 /// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
@@ -1613,6 +1617,8 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
         .into_iter()
         // Deleting is a conversation route, served where the link is.
         .chain(deliveries.then_some(DESK_DELETE))
+        // Searching is too.
+        .chain(deliveries.then_some(DESK_SEARCH))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)

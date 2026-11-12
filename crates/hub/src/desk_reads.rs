@@ -120,6 +120,7 @@ mod tests {
                 said("u2", Author::User, 6, None),
             ],
             more: false,
+            ..Page::default()
         };
         let point = ReadPoint {
             at: at(1),
@@ -162,6 +163,7 @@ mod tests {
                 .map(|i| said(&format!("a{i}"), Author::Agent, i + 1, None))
                 .collect(),
             more: true,
+            ..Page::default()
         };
         let unread = unread_of(&many, None, at(0));
         assert_eq!((unread.count, unread.capped), (UNREAD_CAP, true));
@@ -169,6 +171,7 @@ mod tests {
         let short = Page {
             messages: vec![said("a1", Author::Agent, 5, None)],
             more: true,
+            ..Page::default()
         };
         assert!(
             unread_of(&short, None, at(0)).capped,
