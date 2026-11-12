@@ -771,7 +771,9 @@ async fn a_page_opened_for_the_person_outlives_the_turn_and_is_not_the_agents() 
     let closes = calls_of("close");
     assert_eq!(turn_ended("turn-hand").await, 0);
     assert_eq!(calls_of("close"), closes, "the person's tab isn't closed");
-    // The agent's next call isn't on the person's page.
+    // The agent's next call on "the page" is told it's theirs, and opens
+    // no tab; a page of its own it may still open.
+    let asked = WORLD.lock().unwrap().calls.len();
     let read = run_in(
         "turn-next",
         "shower",
@@ -780,14 +782,22 @@ async fn a_page_opened_for_the_person_outlives_the_turn_and_is_not_the_agents() 
         json!({}),
     )
     .await;
-    assert!(
-        read.output["url"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("about:blank"),
-        "{}",
-        read.output
+    assert_eq!(read.error.as_deref(), Some(extension::HANDED_ALREADY));
+    assert_eq!(
+        WORLD.lock().unwrap().calls.len(),
+        asked,
+        "Chrome isn't asked"
     );
+    let own = run_in(
+        "turn-next",
+        "shower",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://staging.example.com/" }),
+    )
+    .await;
+    assert!(own.success, "{:?}", own.error);
+    assert_eq!(turn_ended("turn-next").await, 1, "its own tab closes");
     let rows = HOOKS.done.lock().unwrap();
     assert!(rows
         .iter()
@@ -855,6 +865,14 @@ async fn a_hand_over_chrome_does_not_confirm_is_a_plain_failure() {
     let old = open("turn-old").await;
     assert_eq!(old.error.as_deref(), Some(extension::EXTENSION_TOO_OLD));
     assert_eq!(turn_ended("turn-old").await, 1);
+
+    // Nothing shown, so nothing is recorded as opened for them.
+    assert!(!HOOKS
+        .done
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|d| d.agent == "unshown" && d.tool == "browser.open_for_me"));
 
     WORLD.lock().unwrap().hand_over = HandOver::Behind;
     let behind = open("turn-behind").await;

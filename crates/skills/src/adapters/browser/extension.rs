@@ -100,6 +100,9 @@ pub const EXTENSION_TOO_OLD: &str = "Desk's Chrome extension is older than Desk 
 /// in front.
 pub const NOT_IN_FRONT: &str = "The page is open as a tab in the person's Chrome, but Chrome didn't confirm it's in front of them. Tell them it's there and to switch to Chrome; don't say it's showing.";
 
+/// What a call on "the page" says once that page was handed to the person.
+pub const HANDED_ALREADY: &str = "The page you opened for the person is theirs now, so you can't read or act on it. To browse yourself, open a page with browser.navigate.";
+
 /// What a hand-over tells the model once the page is in front.
 pub const HANDED_OVER: &str = "The page is in front of the person, in their own Chrome window, and is theirs now: it stays open after this turn, and you can't read or act on it. To browse yourself, use browser.navigate, which opens your own tab.";
 
@@ -141,6 +144,9 @@ pub(super) struct ExtensionCell {
     pending_visit: StdMutex<Option<String>>,
     /// One call at a time in its tab.
     serial: Mutex<()>,
+    /// Its last page was handed to the person, and no page of its own has
+    /// been opened since: a call on "the page" would find a blank tab.
+    handed: StdMutex<bool>,
 }
 
 impl Drop for ExtensionCell {
@@ -168,6 +174,7 @@ impl ExtensionCell {
             visited: StdMutex::new(None),
             pending_visit: StdMutex::new(None),
             serial: Mutex::new(()),
+            handed: StdMutex::new(false),
         }
     }
 
@@ -245,6 +252,9 @@ impl ExtensionCell {
     /// the call's decision are checked.
     async fn with<T>(&self, op: impl AsyncFnOnce(&str) -> Result<T>) -> Result<T> {
         link()?;
+        if *self.handed.lock().unwrap() {
+            return Err(eyre!(HANDED_ALREADY));
+        }
         self.touch();
         let _serial = self.serial.lock().await;
         let decided = take_decided();
@@ -346,9 +356,9 @@ impl ExtensionCell {
 
     /// Records what was done, with a picture of the page after.
     async fn done(&self, tool: &str, target: Option<&str>) {
-        let Some(hooks) = hooks::hooks() else {
+        if hooks::hooks().is_none() {
             return;
-        };
+        }
         let url = self.where_now().await.map(|(u, _)| u).unwrap_or_default();
         let signing_in = matches!(tool, SIGN_IN | SIGNED_IN);
         let (url, target) = match signing_in {
@@ -358,6 +368,15 @@ impl ExtensionCell {
         let screenshot = match no_screenshot(tool) {
             true => None,
             false => self.picture().await,
+        };
+        self.record(tool, target, url, screenshot);
+    }
+
+    /// Keeps a row of what was done, as [`Self::done`] does, from what was
+    /// read of the page already.
+    fn record(&self, tool: &str, target: Option<String>, url: String, screenshot: Option<Vec<u8>>) {
+        let Some(hooks) = hooks::hooks() else {
+            return;
         };
         hooks.record(Done {
             agent: self.agent.clone(),
@@ -385,8 +404,9 @@ impl ExtensionCell {
 
     pub(super) async fn navigate(&self, url: &str) -> Result<Value> {
         self.checked(url)?;
+        *self.handed.lock().unwrap() = false;
         self.with(async |_| {
-            let (landed_url, title) = self.open(url, "browser.navigate").await?;
+            let (landed_url, title) = self.open(url, "browser.navigate", true).await?;
             self.keep_to_sites().await?;
             let mut seen = Seen::at(&landed_url);
             let title = seen.text(&title);
@@ -404,9 +424,16 @@ impl ExtensionCell {
     /// says it is the active tab of the focused window.
     pub(super) async fn open_for_person(&self, url: &str) -> Result<Value> {
         self.checked(url)?;
+        *self.handed.lock().unwrap() = false;
         self.with(async |_| {
-            let (landed_url, title) = self.open(url, OPEN_FOR_ME).await?;
+            let (landed_url, title) = self.open(url, OPEN_FOR_ME, false).await?;
             self.keep_to_sites().await?;
+            // The row is kept once the page is the person's, with the
+            // picture taken while it is still Desk's tab.
+            let shot = match hooks::hooks() {
+                Some(_) => self.picture().await,
+                None => None,
+            };
             // Nothing is asked of this tab after the hand-over: every call
             // names the session, and the extension would open it a new tab.
             let handed = self.ask("hand_over", json!({})).await;
@@ -419,18 +446,21 @@ impl ExtensionCell {
                 // know with nothing; the tab is still Desk's.
                 return Err(eyre!(EXTENSION_TOO_OLD));
             }
-            self.let_go();
-            if handed["active"].as_bool() != Some(true) || handed["focused"].as_bool() != Some(true)
-            {
-                return Err(eyre!(NOT_IN_FRONT));
-            }
+            self.record(OPEN_FOR_ME, Some(url.to_string()), landed_url.clone(), shot);
+            let in_front = handed["active"].as_bool() == Some(true)
+                && handed["focused"].as_bool() == Some(true);
             let mut seen = Seen::at(&landed_url);
             let title = seen.text(&title);
             let shown_url = seen.text(&landed_url);
-            Ok(seen.into_output(
+            let out = seen.into_output(
                 &self.key,
                 json!({ "url": shown_url, "title": title, "shown": true, "next": HANDED_OVER }),
-            ))
+            );
+            self.let_go();
+            match in_front {
+                true => Ok(out),
+                false => Err(eyre!(NOT_IN_FRONT)),
+            }
         })
         .await
     }
@@ -440,6 +470,7 @@ impl ExtensionCell {
     /// holds the agent back), and the site it was allowed goes.
     fn let_go(&self) {
         *self.open.lock().unwrap() = false;
+        *self.handed.lock().unwrap() = true;
         *self.visited.lock().unwrap() = None;
         untrusted::forget(&self.key);
     }
@@ -461,8 +492,9 @@ impl ExtensionCell {
 
     /// Takes this cell's tab to `url`, inside [`Self::with`]: where it lands
     /// passes the gate and the site list, and what was done is recorded as
-    /// `tool`, with a picture. Its address and title, unfenced.
-    async fn open(&self, url: &str, tool: &str) -> Result<(String, String)> {
+    /// `tool`, with a picture, when `record`. Its address and title,
+    /// unfenced.
+    async fn open(&self, url: &str, tool: &str, record: bool) -> Result<(String, String)> {
         let at = self.ask("navigate", json!({ "url": url })).await?;
         let landed_url = at["url"].as_str().unwrap_or_default().to_string();
         untrusted::on(&self.key, &landed_url);
@@ -491,7 +523,9 @@ impl ExtensionCell {
         if allowed_visit {
             *self.visited.lock().unwrap() = landed;
         }
-        self.done(tool, Some(url)).await;
+        if record {
+            self.done(tool, Some(url)).await;
+        }
         Ok((
             landed_url,
             at["title"].as_str().unwrap_or_default().to_string(),
@@ -505,6 +539,7 @@ impl ExtensionCell {
         if !matches!(super::address::kind(url), super::address::Kind::Web) {
             return Err(eyre!("A sign-in page is a web page (https://…)."));
         }
+        *self.handed.lock().unwrap() = false;
         let id = SessionId(self.key.clone());
         self.with(async |_| {
             super::client::start_signing(&id);
