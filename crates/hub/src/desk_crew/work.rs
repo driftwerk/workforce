@@ -152,6 +152,18 @@ impl CrewHub {
         owed
     }
 
+    /// Leaves to the person each of `asks` (requests of `session` its
+    /// boss's work turn was given) that the turn left open.
+    pub(crate) fn left_open(&self, session: Uuid, asks: &[(Uuid, String)]) {
+        let Some(pending) = self.desk.view(session).ok().and_then(|v| v.pending) else {
+            return;
+        };
+        if asks.iter().any(|(a, _)| *a == pending.id) {
+            tracing::info!(%session, approval = %pending.id, "the boss left a request open: it is the person's");
+            self.desk.leave_to_person(session, pending.id);
+        }
+    }
+
     /// The boss that runs `session` now, if one does.
     pub(crate) fn boss_of(&self, session: Uuid) -> Option<String> {
         self.desk

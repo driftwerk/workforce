@@ -3957,6 +3957,112 @@ async fn a_request_open_when_the_overseer_takes_a_session_on_is_its_to_answer() 
     .await;
 }
 
+/// What a session the overseer runs waits on says whose it is: nobody
+/// else's while the overseer has it; the person's while they drive, and
+/// once the overseer's turn leaves it open, which it is never given again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_the_overseer_leaves_open_says_it_waits_on_you() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let (_, mut events) = d.subscribe();
+        d.drive(id).await.unwrap();
+        let _asked = ask_to_run(&url, "cat /tmp/out.txt");
+        let pending = eventually("the request", async || d.view(id).unwrap().pending).await;
+        assert_eq!(
+            d.view(id).unwrap().waits_on_you.as_deref(),
+            Some("You're driving it.")
+        );
+        d.hand_back(id).await.unwrap();
+        // Desk is shown the session again as the wheel comes back: the
+        // request isn't the person's while the boss has it.
+        let shown = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(workforce_desk::model::DeskEvent::Session { session }) =
+                    events.recv().await
+                {
+                    if session.id == id
+                        && session.pending.is_some()
+                        && session.waits_on_you.is_none()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(shown.is_ok(), "the session is shown again on hand-back");
+        // Its turn only says "Answered.": the request is still open.
+        eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
+        let why = eventually("left to the person", async || {
+            d.view(id).unwrap().waits_on_you
+        })
+        .await;
+        assert_eq!(why, format!("{name} left this to you."));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let line = overseer
+            .sessions
+            .find(&super::line::line_channel(id), PERSON)
+            .unwrap()
+            .unwrap();
+        let turns = line
+            .messages
+            .iter()
+            .filter(|m| m.content.contains(&format!("approval_id {}", pending.id)))
+            .count();
+        assert_eq!(turns, 1, "given to the overseer once");
+    })
+    .await;
+}
+
+/// An overseer that only suggests leaves what its sessions ask to the
+/// person, and their badge says so from the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_whose_overseer_only_suggests_waits_on_you() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let _asked = ask_to_run(&url, "cargo test -p acme");
+        eventually("the request", async || d.view(id).unwrap().pending).await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n",
+        );
+        let why = eventually("only suggesting", async || {
+            crew.overseers();
+            d.view(id).unwrap().waits_on_you
+        })
+        .await;
+        assert_eq!(why, format!("{name} only suggests: you decide."));
+    })
+    .await;
+}
+
 /// [`fake_cli`] that says its version, as an installed Claude Code does.
 fn installed_cli(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;

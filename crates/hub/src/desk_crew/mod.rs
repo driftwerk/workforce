@@ -640,6 +640,24 @@ impl CrewHub {
                 })
                 .collect(),
         );
+        // Who won't answer what the sessions it runs ask, and why: the
+        // badge of such a session says it waits on the person.
+        self.desk.set_unanswering(
+            list.iter()
+                .filter_map(|(s, o)| {
+                    let name = name_of(s);
+                    let why = match o.level {
+                        Level::Watch => format!("{name} only watches."),
+                        Level::Suggest => format!("{name} only suggests: you decide."),
+                        Level::Act | Level::Full => {
+                            let held = self.desk.agent_held_why(s.agent_id.as_str())?;
+                            format!("{name} is {held}.")
+                        }
+                    };
+                    Some((s.agent_id.as_str().to_string(), why))
+                })
+                .collect(),
+        );
         self.desk.set_holds(
             list.iter()
                 .map(|(s, o)| {

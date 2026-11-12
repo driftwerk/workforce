@@ -248,6 +248,11 @@ pub struct SessionView {
     /// in, while it runs in it: shown on its card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<crate::mode::Mode>,
+    /// Why what it waits on (`pending`) is the person's to answer though a
+    /// boss runs it, in a few words; absent while the boss has it, or no
+    /// boss runs it. Its badge says "Waiting on you" while it is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waits_on_you: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -333,6 +338,7 @@ impl SessionView {
             interrupted: false,
             reading: false,
             mode: None,
+            waits_on_you: None,
             failure: None,
             created_at: r.created_at,
             updated_at: r.updated_at,

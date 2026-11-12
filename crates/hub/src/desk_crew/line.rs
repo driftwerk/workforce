@@ -763,7 +763,12 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             let crew = Arc::clone(&crew);
             running.insert(
                 session,
-                tokio::spawn(async move { crew.answer_line(session, messages, ended).await }),
+                tokio::spawn(async move {
+                    crew.answer_line(session, messages, ended).await;
+                    // What its turn was given and left open is the
+                    // person's: never given to it again by itself.
+                    crew.left_open(session, &asks);
+                }),
             );
         }
     }
