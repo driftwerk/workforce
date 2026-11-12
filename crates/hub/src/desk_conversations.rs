@@ -16,11 +16,13 @@ use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use workforce_agent::rollover::CARRYOVER_PREFIX;
 use workforce_common::channels::{is_desk_conversation, DESK_CHANNEL};
-use workforce_common::session::{MessageRole, SessionAttachment, SessionStore, TranscriptEntry};
+use workforce_common::session::{
+    MessageRole, Session, SessionAttachment, SessionStore, TranscriptEntry,
+};
 use workforce_desk::attachments::{Attachment, MAX_PER_MESSAGE};
 use workforce_desk::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, Conversations, Cursor,
-    Page, PutRead, Said, Speaker,
+    Match, Matches, Page, PutRead, Said, Speaker,
 };
 
 use crate::desk_surface::shown;
@@ -233,6 +235,9 @@ fn read_with(
             }
         }
         Cursor::After(id) => (None, Some(id), None),
+        Cursor::Around(id) => {
+            return around(store, agent, owner, channel, &head, id, limit, held);
+        }
     };
     // Newest first while gathering: past the limit, or reaching the message
     // a forward page starts after, ends it. A forward page keeps only the
@@ -317,7 +322,208 @@ fn read_with(
             before: cursor_at,
         },
     };
-    Ok((Page { messages, more }, span))
+    Ok((
+        Page {
+            messages,
+            more,
+            more_after: None,
+        },
+        span,
+    ))
+}
+
+/// A page with the message `id` in the middle: half of `limit` before it, it,
+/// and the rest after; where one side runs out, the other fills the page.
+/// Read as a page before it and a page after it are, so it walks the chain's
+/// seams as they do. `more` says older messages remain, `more_after` newer.
+#[allow(clippy::too_many_arguments)]
+fn around(
+    store: &dyn SessionStore,
+    agent: &Speaker,
+    owner: &str,
+    channel: &str,
+    head: &Session,
+    id: &str,
+    limit: usize,
+    mut held: Option<&mut HeldFiles<'_>>,
+) -> Result<(Page, Span), ConversationError> {
+    let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
+    let unknown =
+        || ConversationError::Invalid("around names no message of this conversation".into());
+    let entry = crate::desk_surface::message_in_chain(store, &head.id, id)
+        .map_err(internal)?
+        .ok_or_else(unknown)?
+        .1;
+    let mut middle = said(&entry, agent, held.as_deref_mut()).ok_or_else(unknown)?;
+    if middle.from == Author::Agent {
+        middle.text = crate::spoken_text::kept_text(head, &middle.text).into_owned();
+    }
+    let mut side = |cursor, limit| {
+        read_with(
+            store,
+            agent,
+            owner,
+            channel,
+            cursor,
+            limit,
+            held.as_deref_mut(),
+        )
+    };
+    let (mut older, mut older_span) = side(Cursor::Before(id), limit / 2)?;
+    let (newer, newer_span) = side(
+        Cursor::After(id),
+        limit.saturating_sub(older.messages.len() + 1),
+    )?;
+    let room = limit.saturating_sub(newer.messages.len() + 1);
+    if !newer.more && older.more && older.messages.len() < room {
+        (older, older_span) = side(Cursor::Before(id), room)?;
+    }
+    let span = Span {
+        after: older_span.after.or_else(|| older.more.then_some(middle.at)),
+        before: newer_span
+            .before
+            .or_else(|| newer.more.then_some(middle.at)),
+    };
+    let mut messages = older.messages;
+    messages.push(middle);
+    messages.extend(newer.messages);
+    let mut seen = HashSet::new();
+    messages.retain(|said| seen.insert(said.id.clone()));
+    Ok((
+        Page {
+            messages,
+            more: older.more,
+            more_after: Some(newer.more),
+        },
+        span,
+    ))
+}
+
+/// How many times one search asks the store again when what it found was
+/// not all said in the conversation.
+const SEARCH_READS: usize = 10;
+
+/// How many characters of a match's text its excerpt holds, and how many of
+/// them come before the words it matched.
+const EXCERPT_CHARS: usize = 160;
+const EXCERPT_LEAD: usize = 40;
+
+/// The sessions of the conversation whose newest is `head`, newest first,
+/// as [`SessionStore::read_thread_page`] walks them: back through each
+/// predecessor until one is gone.
+fn chain_of(store: &dyn SessionStore, head: &Session) -> eyre::Result<Vec<String>> {
+    let mut chain = vec![head.id.clone()];
+    let mut prev = head.prev_session_id().map(str::to_string);
+    while let Some(id) = prev.take() {
+        if chain.len() >= 50 || chain.contains(&id) {
+            break;
+        }
+        let Some(session) = store.get(&id)? else {
+            break;
+        };
+        prev = session.prev_session_id().map(str::to_string);
+        chain.push(id);
+    }
+    Ok(chain)
+}
+
+/// The messages of `owner`'s DM with `agent` in `store`, its whole chain, that
+/// match `query`, newest first: at most `limit`, older than the message
+/// `before` when it is named. Only what the conversation shows is a match,
+/// and its excerpt is cut from the text it shows.
+pub(crate) fn search(
+    store: &dyn SessionStore,
+    agent: &Speaker,
+    owner: &str,
+    query: &str,
+    before: Option<&str>,
+    limit: usize,
+) -> Result<Matches, ConversationError> {
+    let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
+    let Some(head) = store.find(DESK_CHANNEL, owner).map_err(internal)? else {
+        return Ok(Matches::default());
+    };
+    if let Some(before) = before {
+        if crate::desk_surface::message_in_chain(store, &head.id, before)
+            .map_err(internal)?
+            .is_none()
+        {
+            return Err(ConversationError::Invalid(
+                "before names no message of this conversation".into(),
+            ));
+        }
+    }
+    let chain = chain_of(store, &head).map_err(internal)?;
+    let fetch = limit + 1;
+    let mut cursor = before.map(str::to_string);
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    let mut ended = false;
+    for _ in 0..SEARCH_READS {
+        let found = store
+            .search_archive(&chain, query, fetch, cursor.as_deref())
+            .map_err(internal)?;
+        ended = found.len() < fetch;
+        for entry in &found {
+            if seen.insert(entry.id.clone()) {
+                matches.extend(matched(entry, agent, &head, query));
+            }
+        }
+        match found.last() {
+            Some(last) if !ended && matches.len() <= limit => cursor = Some(last.id.clone()),
+            _ => break,
+        }
+    }
+    let more = matches.len() > limit || !ended;
+    matches.truncate(limit);
+    Ok(Matches { matches, more })
+}
+
+/// `entry` as a match of `query`, when the conversation shows it.
+fn matched(entry: &TranscriptEntry, agent: &Speaker, head: &Session, query: &str) -> Option<Match> {
+    let said = said(entry, agent, None)?;
+    let text = match said.from {
+        Author::Agent => crate::spoken_text::kept_text(head, &said.text).into_owned(),
+        Author::User => said.text,
+    };
+    Some(Match {
+        id: said.id,
+        from: said.from,
+        at: said.at,
+        excerpt: excerpt(&text, query),
+    })
+}
+
+/// A few words of `text` on one line, around the first of `query`'s words it
+/// holds, or from its start; `…` marks what was cut.
+fn excerpt(text: &str, query: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = line.to_lowercase();
+    let hit = query
+        .split_whitespace()
+        .filter_map(|word| lower.find(&word.to_lowercase()))
+        .min()
+        .map(|at| lower[..at].chars().count())
+        .unwrap_or(0);
+    let chars: Vec<char> = line.chars().collect();
+    let hit = hit.min(chars.len());
+    let mut start = hit.saturating_sub(EXCERPT_LEAD);
+    // Not mid-word, where a space is near.
+    if start > 0 {
+        if let Some(space) = chars[start..hit].iter().position(|c| *c == ' ') {
+            start += space + 1;
+        }
+    }
+    let end = (start + EXCERPT_CHARS).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// [`read`]'s page alone.
@@ -528,6 +734,33 @@ impl Conversations for HubConversations {
             .await
             .map(|copied| Closed { copied })
             .map_err(|e| ConversationError::Internal(format!("{e:#}")))
+    }
+
+    /// Only the caller's own DM with `agent` is searched: the person comes
+    /// from the request, never from what it asks for.
+    async fn search(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        query: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Matches, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = Speaker::agent(
+            agent,
+            &service.display_name().unwrap_or_else(|| agent.to_string()),
+        );
+        search(
+            service.sessions.as_ref(),
+            &speaker,
+            &owner,
+            query,
+            before,
+            limit,
+        )
     }
 
     /// The point is the caller's own, so no one moves another's; every
@@ -1483,5 +1716,342 @@ mod tests {
         )
         .unwrap();
         assert_eq!(older.messages.len(), 2, "the cursor crosses the seam");
+    }
+
+    fn found(matches: &Matches) -> Vec<(&str, Author)> {
+        matches
+            .matches
+            .iter()
+            .map(|m| (m.excerpt.as_str(), m.from))
+            .collect()
+    }
+
+    /// The caller's DM with this agent, five exchanges, and what a search
+    /// must never find: another person's DM, the caller's room, a note the
+    /// hub left the model, a tool row and a turn's failure, all naming the
+    /// same words. With `archive`, every message is archived as a turn
+    /// archives it.
+    fn searched(store: &dyn SessionStore, archive: bool) {
+        use workforce_common::channels::desk::DeskMark;
+        for n in 0..5 {
+            exchange(store, n);
+        }
+        let mut dm = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        dm.add_user_message("[System note: question 9 was compacted]", None);
+        dm.messages.push(SessionMessage::tool(
+            "notes",
+            &serde_json::json!({"q": "question 9"}),
+            &serde_json::json!("question 9"),
+            true,
+            1,
+            None,
+        ));
+        dm.messages.last_mut().unwrap().content = "question 9 in a tool".into();
+        dm.add_assistant_message("Agent error: question 9 failed", 0);
+        dm.messages.last_mut().unwrap().desk = Some(DeskMark {
+            failed: true,
+            ..DeskMark::default()
+        });
+        store.save(&dm).unwrap();
+        let mut theirs = store
+            .get_or_create(DESK_CHANNEL, "identity-2", "scout")
+            .unwrap();
+        theirs.add_user_message("question 9 of theirs", None);
+        store.save(&theirs).unwrap();
+        let mut room = store.get_or_create("desk:release", ME, "scout").unwrap();
+        room.add_user_message("question 9 in the room", None);
+        store.save(&room).unwrap();
+        if archive {
+            for id in [&dm.id, &theirs.id, &room.id] {
+                let session = store.get(id).unwrap().unwrap();
+                for message in &session.messages {
+                    store.append_to_archive(id, message).unwrap();
+                }
+            }
+        }
+    }
+
+    fn a_search_finds_the_dm_alone_newest_first_a_page_at_a_time(store: &dyn SessionStore) {
+        let look = |query: &str, before: Option<&str>, limit| {
+            search(store, &scout(), ME, query, before, limit).unwrap()
+        };
+        assert_eq!(
+            look("question 9", None, 50),
+            Matches::default(),
+            "nobody else's, no room, no note, tool row or failure"
+        );
+        let first = look("question", None, 2);
+        assert_eq!(
+            found(&first),
+            [("question 4", Author::User), ("question 3", Author::User)]
+        );
+        assert!(first.more);
+        let second = look("question", Some(&first.matches[1].id), 2);
+        assert_eq!(
+            found(&second),
+            [("question 2", Author::User), ("question 1", Author::User)]
+        );
+        assert!(second.more);
+        let last = look("question", Some(&second.matches[1].id), 2);
+        assert_eq!(found(&last), [("question 0", Author::User)]);
+        assert!(!last.more);
+        let answers = look("ANSW", None, 50);
+        assert_eq!(answers.matches.len(), 5, "part of a word, any case");
+        assert!(answers.matches.iter().all(|m| m.from == Author::Agent));
+        assert!(answers.matches.windows(2).all(|w| w[0].at >= w[1].at));
+        // Each match's id is a cursor of the conversation's pages.
+        let around = page(
+            store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Around(&first.matches[0].id),
+            3,
+        )
+        .unwrap();
+        assert_eq!(around.messages[1].text, "question 4");
+        let refused = search(store, &scout(), ME, "question", Some("not-a-message"), 2);
+        assert!(matches!(refused, Err(ConversationError::Invalid(_))));
+        assert_eq!(
+            search(store, &scout(), "identity-3", "question", None, 2).unwrap(),
+            Matches::default(),
+            "no DM, nothing found"
+        );
+    }
+
+    #[test]
+    fn a_search_finds_the_dm_alone_in_memory() {
+        let store = InMemorySessionStore::new();
+        searched(&store, false);
+        a_search_finds_the_dm_alone_newest_first_a_page_at_a_time(&store);
+    }
+
+    #[test]
+    fn a_search_finds_the_dm_alone_in_files() {
+        for archive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = JsonlSessionStore::new(dir.path()).unwrap();
+            searched(&store, archive);
+            a_search_finds_the_dm_alone_newest_first_a_page_at_a_time(&store);
+        }
+    }
+
+    /// On postgres, from the archive's index or from a live transcript not
+    /// yet archived; another agent's DM with the same person is never read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_search_finds_the_dm_alone_on_postgres() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        for archive in [true, false] {
+            workforce_postgres::test_support::with_test_pool(
+                PostgresSessionStore::build_pool,
+                |pool| async move {
+                    let store = PostgresSessionStore::with_pool(pool.clone(), "scout")
+                        .await
+                        .expect("store");
+                    let other = PostgresSessionStore::with_shared_pool(pool, "other");
+                    let mut theirs = other.get_or_create(DESK_CHANNEL, ME, "other").unwrap();
+                    theirs.add_user_message("question 9 for another agent", None);
+                    other.save(&theirs).unwrap();
+                    for message in &theirs.messages {
+                        other.append_to_archive(&theirs.id, message).unwrap();
+                    }
+                    searched(store.as_ref(), archive);
+                    a_search_finds_the_dm_alone_newest_first_a_page_at_a_time(store.as_ref());
+                },
+            )
+            .await;
+        }
+    }
+
+    /// A search crosses a rolled-over DM's seam, and an id it found pages
+    /// around it there.
+    #[test]
+    fn a_search_crosses_a_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        exchange(&store, 0);
+        let old = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        workforce_agent::rollover::roll_if_stale(
+            &store,
+            old,
+            &workforce_common::session::CompactionConfig::default(),
+            chrono::Utc::now() + chrono::Duration::days(3),
+        )
+        .unwrap();
+        exchange(&store, 1);
+        let found = search(&store, &scout(), ME, "question", None, 50).unwrap();
+        assert_eq!(
+            found
+                .matches
+                .iter()
+                .map(|m| m.excerpt.as_str())
+                .collect::<Vec<_>>(),
+            ["question 1", "question 0"],
+            "the carry-over is no match"
+        );
+        assert!(!found.more);
+    }
+
+    #[test]
+    fn an_excerpt_is_a_line_around_the_words_cut_where_it_was_cut() {
+        assert_eq!(excerpt("short\n\n  text", "text"), "short text");
+        let long = format!(
+            "{} the café bill {}",
+            "word ".repeat(40),
+            "tail ".repeat(60)
+        );
+        let cut = excerpt(&long, "CAFÉ");
+        assert!(cut.starts_with('…') && cut.ends_with('…'), "{cut}");
+        assert!(cut.contains("the café bill"), "{cut}");
+        assert!(cut.chars().count() <= EXCERPT_CHARS + 2, "{cut}");
+        assert!(!cut.starts_with("…ord"), "not mid-word: {cut}");
+        assert!(excerpt(&long, "absent").starts_with("word word"));
+    }
+
+    #[test]
+    fn a_match_s_excerpt_reads_as_its_message_does() {
+        let store = InMemorySessionStore::new();
+        let mut session = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+        session.add_assistant_message("the key is AKIAIOSFODNN7EXAMPLE for the bucket", 5);
+        store.save(&session).unwrap();
+        let found = search(&store, &scout(), ME, "bucket", None, 10).unwrap();
+        assert_eq!(found.matches.len(), 1);
+        assert!(
+            !found.matches[0].excerpt.contains("AKIAIOSFODNN7EXAMPLE"),
+            "{}",
+            found.matches[0].excerpt
+        );
+    }
+
+    fn around(store: &dyn SessionStore, id: &str, limit: usize) -> Page {
+        page(store, &scout(), ME, DESK_CHANNEL, Cursor::Around(id), limit).unwrap()
+    }
+
+    /// The message in the middle, half the page before it and the rest
+    /// after; at either end of the conversation the other side fills it.
+    #[test]
+    fn a_page_around_a_message_holds_it_in_the_middle() {
+        let store = InMemorySessionStore::new();
+        for n in 0..10 {
+            exchange(&store, n);
+        }
+        let all = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
+        let id = |text: &str| {
+            all.messages
+                .iter()
+                .find(|m| m.text == text)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let texts_of =
+            |page: &Page| -> Vec<String> { page.messages.iter().map(|m| m.text.clone()).collect() };
+
+        let middle = around(&store, &id("question 5"), 6);
+        assert_eq!(
+            texts_of(&middle),
+            [
+                "answer 3",
+                "question 4",
+                "answer 4",
+                "question 5",
+                "answer 5",
+                "question 6"
+            ]
+        );
+        assert_eq!((middle.more, middle.more_after), (true, Some(true)));
+
+        let start = around(&store, &id("question 0"), 6);
+        assert_eq!(
+            texts_of(&start),
+            [
+                "question 0",
+                "answer 0",
+                "question 1",
+                "answer 1",
+                "question 2",
+                "answer 2"
+            ]
+        );
+        assert_eq!((start.more, start.more_after), (false, Some(true)));
+
+        let end = around(&store, &id("answer 9"), 6);
+        assert_eq!(
+            texts_of(&end),
+            [
+                "question 7",
+                "answer 7",
+                "question 8",
+                "answer 8",
+                "question 9",
+                "answer 9"
+            ]
+        );
+        assert_eq!((end.more, end.more_after), (true, Some(false)));
+
+        let whole = around(&store, &id("answer 4"), 200);
+        assert_eq!(whole.messages.len(), 20);
+        assert_eq!((whole.more, whole.more_after), (false, Some(false)));
+
+        let wire = serde_json::to_value(&middle).unwrap();
+        assert_eq!(wire["more_after"], serde_json::json!(true));
+        assert!(serde_json::to_value(&all)
+            .unwrap()
+            .get("more_after")
+            .is_none());
+
+        let refused = page(
+            &store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Around("not-a-message"),
+            6,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, ConversationError::Invalid(_)),
+            "{refused}"
+        );
+    }
+
+    /// Around a message either side of a rolled-over DM's seam, the page
+    /// reads across it.
+    #[test]
+    fn a_page_around_a_message_crosses_a_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        exchange(&store, 0);
+        let old = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        workforce_agent::rollover::roll_if_stale(
+            &store,
+            old,
+            &workforce_common::session::CompactionConfig::default(),
+            chrono::Utc::now() + chrono::Duration::days(3),
+        )
+        .unwrap();
+        exchange(&store, 1);
+        let all = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
+        assert_eq!(all.messages.len(), 4);
+        let before_seam = around(&store, &all.messages[1].id, 4);
+        assert_eq!(
+            texts(&before_seam),
+            [
+                ("question 0", Author::User),
+                ("answer 0", Author::Agent),
+                ("question 1", Author::User),
+                ("answer 1", Author::Agent),
+            ]
+        );
+        assert_eq!(
+            (before_seam.more, before_seam.more_after),
+            (false, Some(false))
+        );
+        let after_seam = around(&store, &all.messages[2].id, 2);
+        assert_eq!(
+            texts(&after_seam),
+            [("answer 0", Author::Agent), ("question 1", Author::User)]
+        );
+        assert_eq!((after_seam.more, after_seam.more_after), (true, Some(true)));
     }
 }

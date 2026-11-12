@@ -1,7 +1,8 @@
 //! A person's Desk conversations with the hub's agents, as Desk reads them
 //! back: which changed since it last looked (`GET /api/desk/conversations`),
-//! one conversation's messages either side of a cursor
-//! (`GET /api/desk/conversations/{agent}`), and closing a room's
+//! one conversation's messages either side of a cursor or around a message
+//! (`GET /api/desk/conversations/{agent}`), the DM's messages that match words
+//! (`GET /api/desk/conversations/{agent}/search`), and closing a room's
 //! conversation once the room is gone
 //! (`POST /api/desk/conversations/{agent}/close`). The hub reads them from
 //! the sessions each Desk channel keeps for that person and agent, and only
@@ -23,6 +24,12 @@ use workforce_core::desk::{DeskMark, Mark, ReadPoint, DESK_CHANNEL};
 
 /// The most messages one page holds, and how many a page holds unasked.
 pub const PAGE_MAX: usize = 200;
+
+/// The most matches one page of a search holds.
+pub const MATCHES_MAX: usize = 100;
+
+/// How many matches a page of a search holds unasked.
+pub const MATCHES_DEFAULT: usize = 50;
 
 /// Who said a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -123,6 +130,9 @@ pub enum Cursor<'a> {
     Before(&'a str),
     /// The messages just after this one; `more` says newer ones remain.
     After(&'a str),
+    /// This message in the middle: half the page before it, it, and the
+    /// rest after; `more` says older ones remain, `more_after` newer ones.
+    Around(&'a str),
 }
 
 /// A conversation of the caller's that changed since they last looked, or
@@ -199,10 +209,30 @@ pub struct Closed {
 }
 
 /// A page of the conversation, oldest first; `more` when messages remain
-/// beyond it in the direction it was read.
+/// beyond it in the direction it was read. A page around a message reads
+/// both ways: `more` when older ones remain, `more_after` when newer ones do.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Page {
     pub messages: Vec<Said>,
+    pub more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more_after: Option<bool>,
+}
+
+/// A message of the DM that matches a search: its id, which a page's cursor
+/// takes, who said it, when, and a few words of it around the match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Match {
+    pub id: String,
+    pub from: Author,
+    pub at: DateTime<Utc>,
+    pub excerpt: String,
+}
+
+/// A page of a search, newest first; `more` when older matches remain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Matches {
+    pub matches: Vec<Match>,
     pub more: bool,
 }
 
@@ -290,6 +320,23 @@ pub trait Conversations: Send + Sync {
             "Desk keeps no read points here yet".into(),
         ))
     }
+
+    /// At most `limit` of the messages of the caller's DM with `agent`, its
+    /// whole history, that match `query`, newest first: those older than the
+    /// match `before`, when it is named.
+    async fn search(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+        _query: &str,
+        _before: Option<&str>,
+        _limit: usize,
+    ) -> Result<Matches, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "this hub does not search conversations".into(),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -298,6 +345,15 @@ struct PageQuery {
     channel: Option<String>,
     before: Option<String>,
     after: Option<String>,
+    around: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    token: Option<String>,
+    q: Option<String>,
+    before: Option<String>,
     limit: Option<usize>,
 }
 
@@ -323,13 +379,16 @@ async fn conversation(
     Query(q): Query<PageQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(PAGE_MAX).clamp(1, PAGE_MAX);
-    let cursor = match (present(&q.before), present(&q.after)) {
-        (None, None) => Cursor::Newest,
-        (Some(before), None) => Cursor::Before(before),
-        (None, Some(after)) => Cursor::After(after),
-        (Some(_), Some(_)) => {
-            return ConversationError::Invalid("a page is before a message or after one".into())
-                .into_response()
+    let cursor = match (present(&q.before), present(&q.after), present(&q.around)) {
+        (None, None, None) => Cursor::Newest,
+        (Some(before), None, None) => Cursor::Before(before),
+        (None, Some(after), None) => Cursor::After(after),
+        (None, None, Some(around)) => Cursor::Around(around),
+        _ => {
+            return ConversationError::Invalid(
+                "a page is before a message, after one or around one".into(),
+            )
+            .into_response()
         }
     };
     let channel = present(&q.channel).unwrap_or(DESK_CHANNEL);
@@ -337,6 +396,30 @@ async fn conversation(
         .await
         .map(Json)
         .into_response()
+}
+
+async fn search(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path(agent): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> Response {
+    let Some(query) = present(&q.q) else {
+        return ConversationError::Invalid("a search needs words to look for".into())
+            .into_response();
+    };
+    let limit = q.limit.unwrap_or(MATCHES_DEFAULT).clamp(1, MATCHES_MAX);
+    c.search(
+        &headers,
+        q.token.as_deref(),
+        &agent,
+        query.trim(),
+        present(&q.before),
+        limit,
+    )
+    .await
+    .map(Json)
+    .into_response()
 }
 
 async fn active(
@@ -381,6 +464,7 @@ pub fn router(conversations: Arc<dyn Conversations>) -> Router {
     Router::new()
         .route("/api/desk/conversations", get(active))
         .route("/api/desk/conversations/{agent}", get(conversation))
+        .route("/api/desk/conversations/{agent}/search", get(search))
         .route("/api/desk/conversations/{agent}/close", post(close))
         .route(
             "/api/desk/conversations/{agent}/read",
@@ -406,6 +490,7 @@ mod tests {
         Page(String, String, String, usize),
         Active(Option<DateTime<Utc>>),
         Close(String, Close),
+        Search(String, String, Option<String>, usize),
     }
 
     /// Answers fixed values, and remembers what it was asked.
@@ -464,6 +549,7 @@ mod tests {
                     seq: None,
                 }],
                 more: true,
+                more_after: None,
             })
         }
 
@@ -495,6 +581,33 @@ mod tests {
             let copied = close.undelivered.len();
             self.0.lock().unwrap().push(Ask::Close(agent.into(), close));
             Ok(Closed { copied })
+        }
+
+        async fn search(
+            &self,
+            headers: &HeaderMap,
+            token: Option<&str>,
+            agent: &str,
+            query: &str,
+            before: Option<&str>,
+            limit: usize,
+        ) -> Result<Matches, ConversationError> {
+            self.check(headers, token)?;
+            self.0.lock().unwrap().push(Ask::Search(
+                agent.into(),
+                query.into(),
+                before.map(str::to_string),
+                limit,
+            ));
+            Ok(Matches {
+                matches: vec![Match {
+                    id: "m1".into(),
+                    from: Author::User,
+                    at: "2026-10-28T09:00:00Z".parse().unwrap(),
+                    excerpt: "…the release notes…".into(),
+                }],
+                more: true,
+            })
         }
     }
 
@@ -599,6 +712,74 @@ mod tests {
             asked.last(),
             Ask::Page("scout".into(), "desk".into(), "Newest".into(), PAGE_MAX)
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_around_a_message_names_it_alone() {
+        let asked = Arc::new(Asked::default());
+        let (status, _) = get(
+            Arc::clone(&asked),
+            "/api/desk/conversations/scout?around=m5&limit=20",
+            Some("Bearer device-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            asked.last(),
+            Ask::Page("scout".into(), "desk".into(), "Around(\"m5\")".into(), 20)
+        );
+        for both in ["around=m5&before=m1", "around=m5&after=m1"] {
+            let uri = format!("/api/desk/conversations/scout?{both}");
+            let (status, body) = get(Arc::clone(&asked), &uri, Some("Bearer device-token")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{both}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_answers_its_matches_newest_first_and_whether_more_remain() {
+        let asked = Arc::new(Asked::default());
+        let (status, body) = get(
+            Arc::clone(&asked),
+            "/api/desk/conversations/scout/search?q=release%20notes&before=m9",
+            Some("Bearer device-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "matches": [{
+                    "id": "m1", "from": "user", "at": "2026-10-28T09:00:00Z",
+                    "excerpt": "…the release notes…",
+                }],
+                "more": true,
+            })
+        );
+        assert_eq!(
+            asked.last(),
+            Ask::Search(
+                "scout".into(),
+                "release notes".into(),
+                Some("m9".into()),
+                MATCHES_DEFAULT
+            )
+        );
+        for (query, limit) in [("&limit=0", 1), ("&limit=9000", MATCHES_MAX)] {
+            let uri = format!("/api/desk/conversations/scout/search?q=x{query}");
+            let (status, _) = get(Arc::clone(&asked), &uri, Some("Bearer device-token")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                asked.last(),
+                Ask::Search("scout".into(), "x".into(), None, limit)
+            );
+        }
+        for blank in ["", "?q=", "?q=%20%20"] {
+            let uri = format!("/api/desk/conversations/scout/search{blank}");
+            let (status, _) = get(Arc::clone(&asked), &uri, Some("Bearer device-token")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{blank:?}");
+        }
+        let (status, _) = get(asked, "/api/desk/conversations/scout/search?q=x", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

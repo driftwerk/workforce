@@ -1539,6 +1539,10 @@ const DESK_STREAM: &str = "desk.stream";
 /// A Desk message may be sent to queue for the running turn rather than
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
+/// A DM can be searched over its whole history on the hub
+/// (`GET /api/desk/conversations/{agent}/search`), and a page read around a
+/// match (`around=`). Served with the conversation routes.
+const DESK_SEARCH: &str = "desk.search";
 const DESK_DELIVERIES: &str = "desk.deliveries";
 /// A Desk conversation's read names the client's own id for each message
 /// sent under one, and every kept row's place in the archive: Desk knows its
@@ -1590,6 +1594,7 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER]
         .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
+        .chain(deliveries.then_some(DESK_SEARCH))
         .chain(signals)
         .chain(reads)
         .chain(in_postgres.then_some(DESK_CLIENT_IDS))
