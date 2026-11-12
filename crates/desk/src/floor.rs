@@ -771,6 +771,27 @@ pub struct BossView {
     /// for a group with no budget of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<workforce_core::budget::Standing>,
+    /// Act fully's daily budget and the real money spent against it today,
+    /// while it chose Act fully with a budget; left out otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act_fully: Option<FullBudget>,
+}
+
+/// Act fully's daily budget as the hub counts it: real money only (calls
+/// paid by an API key, Bedrock or Vertex), never the person's Claude or
+/// ChatGPT plans, which bill nobody by the call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullBudget {
+    /// The real money spent today, in its scope; `None` until read.
+    pub spent_usd: Option<f64>,
+    pub budget_usd: f64,
+    /// It is spent: Act fully is held, and the boss acts as Act, until
+    /// tomorrow, a higher budget, or the person clears it.
+    pub spent: bool,
+    /// When the person last cleared it today: what it counts is from then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<DateTime<Utc>>,
 }
 
 /// Each subject's gist, as kept.
@@ -1989,6 +2010,7 @@ mod tests {
             state: BossState::Idle,
             paused: None,
             spend: None,
+            act_fully: None,
         }];
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["needs"][0]["group"], "acme");

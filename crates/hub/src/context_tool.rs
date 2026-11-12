@@ -15,31 +15,10 @@ use serde::Deserialize;
 use workforce_agent::llm::model_limits;
 use workforce_agent::tools::{Tool, ToolResult};
 
-use workforce_common::session::{MessageRole, Session, SessionStore};
+use workforce_common::session::{MessageRole, Session};
 
 use crate::memory::MemoryManager;
 use crate::serve::AgentService;
-
-/// Resolve the most recently updated session, preferring the given
-/// channel and falling back to any. Always returns a fully hydrated
-/// session (not a meta-only shell) — `list()` may hand back shells, so
-/// we re-fetch via `get()` to trigger lazy hydration before any callers
-/// iterate `session.messages`.
-fn most_recent_session(
-    sessions: &Arc<dyn SessionStore>,
-    channel: Option<&str>,
-) -> Result<Option<Session>> {
-    let id = sessions
-        .list(channel, 1)?
-        .into_iter()
-        .next()
-        .or_else(|| sessions.list(None, 1).ok().and_then(|mut v| v.pop()))
-        .map(|s| s.id);
-    match id {
-        Some(id) => sessions.get(&id),
-        None => Ok(None),
-    }
-}
 
 /// How many of the session's newest messages follow its last `memory.recall`
 /// call, judged by the tool rows' recorded calls.
@@ -97,7 +76,7 @@ impl Tool for ContextStatusTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Session ID to check (default: most recent session)"
+                    "description": "Session ID to check (default: this conversation)"
                 },
                 "channel": {
                     "type": "string",
@@ -116,27 +95,13 @@ impl Tool for ContextStatusTool {
                 channel: None,
             });
 
-        let session = if let Some(session_id) = &input.session_id {
-            match self.service.sessions.get(session_id)? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        format!("Session not found: {}", session_id),
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
-        } else {
-            let channel = input.channel.as_deref().unwrap_or("unknown");
-            match most_recent_session(&self.service.sessions, Some(channel))? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        "No active session found",
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
+        let session = match crate::tool_session::resolve(
+            self.service.sessions.as_ref(),
+            input.session_id.as_deref(),
+            input.channel.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(why) => return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64)),
         };
 
         let resolved_model = self.service.resolve_model(&session, None, None);
@@ -241,7 +206,7 @@ impl Tool for ContextSuggestTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Session ID to analyze (default: most recent session)"
+                    "description": "Session ID to analyze (default: this conversation)"
                 },
                 "channel": {
                     "type": "string",
@@ -260,27 +225,13 @@ impl Tool for ContextSuggestTool {
                 channel: None,
             });
 
-        let session = if let Some(session_id) = &input.session_id {
-            match self.service.sessions.get(session_id)? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        format!("Session not found: {}", session_id),
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
-        } else {
-            let channel = input.channel.as_deref().unwrap_or("unknown");
-            match most_recent_session(&self.service.sessions, Some(channel))? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        "No active session found",
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
+        let session = match crate::tool_session::resolve(
+            self.service.sessions.as_ref(),
+            input.session_id.as_deref(),
+            input.channel.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(why) => return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64)),
         };
 
         let mut suggestions: Vec<serde_json::Value> = Vec::new();
@@ -504,31 +455,16 @@ impl Tool for ContextDropTool {
         };
 
         // Session lookup — same pattern as CompactionTool / ContextStatusTool
-        let mut session = if let Some(session_id) = &input.session_id {
-            match self.service.sessions.get(session_id)? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        format!("Session not found: {}", session_id),
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
-        } else {
-            let channel = input
+        let mut session = match crate::tool_session::resolve(
+            self.service.sessions.as_ref(),
+            input.session_id.as_deref(),
+            input
                 .session_channel
                 .as_deref()
-                .or(input.channel.as_deref())
-                .unwrap_or("unknown");
-            match most_recent_session(&self.service.sessions, Some(channel))? {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult::failure(
-                        "No active session found",
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
+                .or(input.channel.as_deref()),
+        ) {
+            Ok(s) => s,
+            Err(why) => return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64)),
         };
 
         let result = match input.action.as_str() {

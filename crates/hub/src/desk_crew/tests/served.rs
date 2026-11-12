@@ -118,7 +118,11 @@ fn a_grant_gives_its_boss_its_own_group_and_switches_and_nothing_more() {
     );
     // Act fully has no budget until leases give one: it acts within Desk.
     assert_eq!(o.level, workforce_common::oversight::Level::Full);
-    assert!(super::super::fully_given(&o, Some(0.0)).is_err());
+    assert!(super::super::fully_for("devbox/sarah", &o, Some(0.0)).is_err());
+    assert!(
+        super::super::fully_given(&o, Some(0.0)).is_ok(),
+        "one of this hub's own may leave it blank"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -494,7 +498,7 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
         assert!(r.body["error"]
             .as_str()
             .unwrap()
-            .contains("boss on this hub"));
+            .contains("already has a boss here"));
         // A call id sent again by another boss says nothing of the first.
         let call = |boss| ServedCall {
             tool: "crew.overview".into(),

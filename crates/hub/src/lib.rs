@@ -60,6 +60,7 @@ pub mod context_fuse_tool;
 pub mod context_tool;
 pub(crate) mod conversation_seed;
 pub mod cost_analytics_tools;
+pub mod tool_session;
 pub use hub_core::cost_forecast;
 pub use hub_core::cost_governor;
 pub mod credentials;
@@ -111,6 +112,8 @@ pub mod desk_crew;
 pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]
+pub(crate) mod desk_key_check;
+#[cfg(feature = "postgres")]
 pub mod desk_key_models;
 #[cfg(feature = "postgres")]
 pub mod desk_ledger;
@@ -141,6 +144,7 @@ pub use hub_core::heartbeat_signature;
 pub mod heartbeat_tool;
 pub use workforce_hub_core::hosts;
 pub use workforce_hub_core::hub_core;
+pub mod by_my_email;
 pub mod identity_lifecycle;
 pub mod identity_lifecycle_tool;
 pub mod identity_tool;

@@ -888,7 +888,7 @@ pub fn preseed_consolidation_cursor(workspace: &Path, since: DateTime<Utc>) -> R
 fn consolidatable(s: &workforce_common::session::Session) -> bool {
     !crate::turn_extraction::leaves_no_memory(&s.channel)
         && !s.is_shared_conversation()
-        && !s.left_behind()
+        && !s.kept_apart()
 }
 
 #[cfg(test)]

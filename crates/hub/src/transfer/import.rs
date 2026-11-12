@@ -438,6 +438,8 @@ fn rewrite_session_meta(bytes: &[u8], target_agent: &str, remap: &RemapPlan) -> 
         obj.insert("owner".into(), json!(remap.identity(owner)));
     }
     if let Some(metadata) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        // A boss conversation is made by its link alone, never by a bundle.
+        metadata.remove(workforce_common::session::DESK_BOSS_KEY);
         if let Some(agent) = metadata.get("chat_agent_id").and_then(|v| v.as_str()) {
             let mapped = remap.agent(agent);
             metadata.insert("chat_agent_id".into(), json!(mapped));

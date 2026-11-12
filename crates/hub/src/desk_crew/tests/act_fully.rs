@@ -6,7 +6,7 @@
 
 use super::super::actions::{Action, Gate, Target};
 use super::*;
-use workforce_common::oversight::{Level, Oversight, FULL_NO_BUDGET, FULL_NO_REPOS};
+use workforce_common::oversight::{Level, Oversight, FULL_NO_REPOS};
 
 const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\nworkflows = [\"deploy.yml\", \"promote.yml\"]\nbudget_usd_per_day = 25\n";
@@ -392,11 +392,11 @@ async fn act_fully_ships_in_the_named_repositories_and_never_past_the_hard_limit
     .await;
 }
 
-/// Act fully short of named repositories or a daily budget, or with its
-/// budget spent or its spend unread, acts as Act and says why; Desk is told
-/// it ships nowhere.
+/// Act fully short of named repositories, or with its budget spent or its
+/// spend unread, acts as Act and says why; Desk is told it ships nowhere.
+/// With no budget set, nothing it spends holds it.
 #[tokio::test(flavor = "multi_thread")]
-async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_why() {
+async fn act_fully_without_repositories_or_over_its_budget_falls_back_to_act_and_says_why() {
     let parse = |body: &str| {
         let doc: toml::Table = toml::from_str(body).unwrap();
         Oversight::of(doc.get("oversight")).unwrap()
@@ -408,15 +408,14 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
     );
     let no_budget =
         parse("[oversight]\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n");
-    assert_eq!(
-        super::super::fully_given(&no_budget, Some(0.0)).unwrap_err(),
-        FULL_NO_BUDGET
-    );
+    // A budget is optional: with none, only the check-in ceilings and
+    // Stop bound it (a served boss still needs one, see `served`).
+    assert!(super::super::fully_given(&no_budget, Some(0.0)).is_ok());
     let full = parse(FULL);
     assert!(super::super::fully_given(&full, Some(24.99)).is_ok());
     assert!(super::super::fully_given(&full, Some(25.0))
         .unwrap_err()
-        .contains("daily budget of $25.00, for the Desk sessions' spend in this scope and the overseer's own model use, is spent"));
+        .contains("Act fully's daily budget is spent: $25.00 of $25.00 in real money today"));
     assert!(super::super::fully_given(&full, None)
         .unwrap_err()
         .contains("today's spend is read"));
@@ -430,7 +429,7 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
             &base,
             pool,
             "ok",
-            "[oversight]\nenabled = true\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n",
+            "[oversight]\nenabled = true\nlevel = \"full\"\nfull = { budget_usd_per_day = 25 }\n",
             &[],
         )
         .await;
@@ -443,7 +442,7 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
         let (_, o) = crew.overseer_service().unwrap();
         assert_eq!(
             crew.level_now(&id, &o),
-            (Level::Act, Some(FULL_NO_BUDGET.to_string()))
+            (Level::Act, Some(FULL_NO_REPOS.to_string()))
         );
         assert!(
             d.bosses().iter().all(|b| b.level == "act"),
@@ -455,15 +454,28 @@ async fn act_fully_without_repositories_or_a_budget_falls_back_to_act_and_says_w
         let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
             "tool_input": {"command": "gh pr merge 42 --squash"}});
         let asked = tokio::spawn(async move { hook(&url, body).await });
-        let a = eventually("the merge", async || d.view(s.id).unwrap().pending).await.id;
+        let a = eventually("the merge", async || d.view(s.id).unwrap().pending)
+            .await
+            .id;
         let mut answering = o.clone();
         answering.act.answer_sessions = true;
         assert!(matches!(
-            crew.gate(&Action::Approve { session: s.id, approval: a }, &answering),
+            crew.gate(
+                &Action::Approve {
+                    session: s.id,
+                    approval: a
+                },
+                &answering
+            ),
             Gate::Suggest(_)
         ));
-        d.decide(s.id, a, workforce_desk::model::Decision::Deny, Some(By::you()))
-            .unwrap();
+        d.decide(
+            s.id,
+            a,
+            workforce_desk::model::Decision::Deny,
+            Some(By::you()),
+        )
+        .unwrap();
         asked.await.unwrap();
     })
     .await;

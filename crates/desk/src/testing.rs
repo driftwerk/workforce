@@ -79,6 +79,12 @@ pub(crate) fn identified(name: &str) -> std::sync::Arc<dyn Authorize> {
     std::sync::Arc::new(Fixed(Ok(Some(name.to_string()))))
 }
 
+/// A signed-in person who isn't an administrator: refused, as the hub
+/// refuses them (403).
+pub(crate) fn not_an_admin() -> std::sync::Arc<dyn Authorize> {
+    std::sync::Arc::new(Fixed(Err(StatusCode::FORBIDDEN)))
+}
+
 /// Lets no one in.
 pub(crate) fn deny_all() -> std::sync::Arc<dyn Authorize> {
     std::sync::Arc::new(Fixed(Err(StatusCode::UNAUTHORIZED)))

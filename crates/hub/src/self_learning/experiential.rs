@@ -112,8 +112,12 @@ pub fn scan_experiential_sessions(
     let recent: Vec<_> = sessions
         .list_since(agent_id, cutoff, SESSION_SCAN_CAP)?
         .into_iter()
+        // Nor a conversation kept apart: a Desk group's boss conversation,
+        // or one a boss left behind, is its group's alone.
         .filter(|s| {
-            !s.is_shared_conversation() && !crate::turn_extraction::is_eval_channel(&s.channel)
+            !s.is_shared_conversation()
+                && !crate::turn_extraction::is_eval_channel(&s.channel)
+                && !s.kept_apart()
         })
         .collect();
     if recent.is_empty() {
@@ -363,6 +367,22 @@ mod tests {
         assert_eq!(turns[0].assistant, "run the deploy script");
         assert_eq!(turns[1].turn_index, 1);
         assert_eq!(turns[1].session_id, id);
+    }
+
+    #[test]
+    fn a_scan_never_reads_a_conversation_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store();
+        seed_session(&store, "a", "c1", 60, &[("q1", "a1")]);
+        seed_session(&store, "a", "desk:boss:k", 60, &[("acme q", "acme a")]);
+        let mut left = Session::new("c2", "owner", "a");
+        left.add_user_message("left q", None);
+        left.add_assistant_message("left a", 100);
+        left.metadata = serde_json::json!({ "desk_scope_left": "desk-group:acme" });
+        store.save(&left).unwrap();
+        let turns = scan_experiential_sessions(&store, dir.path(), "a", 3600, Utc::now()).unwrap();
+        let users: Vec<&str> = turns.iter().map(|t| t.user.as_str()).collect();
+        assert_eq!(users, ["q1"]);
     }
 
     #[test]

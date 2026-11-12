@@ -27,6 +27,10 @@ pub struct ToolRegistry {
     /// What every tool registered here is wrapped in ([`Self::guard_with`]);
     /// kept by every copy, so a tool a copy registers is held alike.
     guard: RwLock<Option<Guard>>,
+    /// The names whose tool now is the hub's own, as registered by
+    /// [`Self::register_builtin`]: a skill, an MCP server or anything else
+    /// registered under the same name since takes the name out.
+    builtins: RwLock<std::collections::BTreeSet<String>>,
 }
 
 /// A connector's write tool, run in its connector's write scope
@@ -146,6 +150,7 @@ impl ToolRegistry {
             credential_pins: Arc::default(),
             upstream: None,
             guard: RwLock::new(None),
+            builtins: RwLock::default(),
         }
     }
 
@@ -193,8 +198,24 @@ impl ToolRegistry {
         if let Some(upstream) = &self.upstream {
             upstream.own.write().insert(name.clone());
         }
+        self.builtins.write().remove(&name);
         self.tools.write().insert(name, tool);
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register one of the hub's own tools: [`Self::is_builtin`] holds for
+    /// its name until something else is registered under it.
+    pub fn register_builtin(&self, tool: Arc<dyn Tool>) {
+        let name = tool.name().to_string();
+        self.register(tool);
+        self.builtins.write().insert(name);
+    }
+
+    /// Whether the tool registered as `name` now is the hub's own
+    /// ([`Self::register_builtin`]), not a skill's, an MCP server's or any
+    /// other that took the name.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.has(name) && self.builtins.read().contains(name)
     }
 
     /// Advances on every registration and effective removal, so a caller can
@@ -256,6 +277,7 @@ impl ToolRegistry {
     /// complete safely — this only removes the registry entry.
     pub fn unregister(&self, name: &str) -> bool {
         let removed = self.tools.write().remove(name).is_some();
+        self.builtins.write().remove(name);
         if removed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -290,6 +312,7 @@ impl ToolRegistry {
             credential_pins: Arc::clone(&self.credential_pins),
             upstream: None,
             guard: RwLock::new(self.guard.read().clone()),
+            builtins: RwLock::new(self.builtins.read().clone()),
         }
     }
 
@@ -347,6 +370,11 @@ impl ToolRegistry {
                         return None;
                     }
                     tools.insert(name.clone(), fresh);
+                    let mut builtins = self.builtins.write();
+                    match upstream.source.is_builtin(&name) {
+                        true => builtins.insert(name.clone()),
+                        false => builtins.remove(&name),
+                    };
                     Some(name)
                 })
                 .collect()
@@ -423,6 +451,34 @@ mod tests {
                 .unwrap_or("no message");
             Ok(ToolResult::success(serde_json::json!({"echo": msg}), 1))
         }
+    }
+
+    #[test]
+    fn a_builtin_stays_one_only_until_something_takes_its_name() {
+        let source = Arc::new(ToolRegistry::new());
+        source.register_builtin(Arc::new(DummyTool));
+        assert!(source.is_builtin("test.dummy"));
+        let copy = ToolRegistry::follow(&source, |_| true);
+        assert!(copy.is_builtin("test.dummy"), "a copy keeps it");
+        // A skill or an MCP server registering the same name takes it.
+        source.register(Arc::new(DummyTool));
+        assert!(!source.is_builtin("test.dummy"));
+        assert!(
+            copy.is_builtin("test.dummy"),
+            "the copy still holds the built-in"
+        );
+        copy.adopt(&["test.dummy".into()]);
+        assert!(
+            !copy.is_builtin("test.dummy"),
+            "adopting the shadow takes it in the copy too"
+        );
+        source.register_builtin(Arc::new(DummyTool));
+        source.unregister("test.dummy");
+        assert!(!source.is_builtin("test.dummy"));
+        assert!(
+            !ToolRegistry::from_tools([Arc::new(DummyTool) as Arc<dyn Tool>])
+                .is_builtin("test.dummy")
+        );
     }
 
     #[test]
