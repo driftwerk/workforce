@@ -71,7 +71,6 @@ text_enum!(Billing {
     Unknown => "unknown",
 });
 
-
 /// One model call as an engine recorded it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spend {

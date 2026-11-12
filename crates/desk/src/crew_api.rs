@@ -522,7 +522,10 @@ mod tests {
             h: &HeaderMap,
             q: Option<&str>,
         ) -> Result<Option<String>, StatusCode> {
-            Bearer.authorize(h, q).await.map(|_| Some("someone-else".into()))
+            Bearer
+                .authorize(h, q)
+                .await
+                .map(|_| Some("someone-else".into()))
         }
         async fn authorize_holder(
             &self,

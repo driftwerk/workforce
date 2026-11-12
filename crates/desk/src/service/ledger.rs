@@ -442,7 +442,10 @@ impl Desk {
         tokio::spawn(async move {
             for k in keep {
                 if let Err(e) = store.keep_sign_in(&k).await {
-                    tracing::warn!(error = format!("{e:#}"), "couldn't keep an engine's sign-in");
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "couldn't keep an engine's sign-in"
+                    );
                 }
             }
         });
@@ -1027,16 +1030,25 @@ impl Desk {
 /// say which.
 fn same_payer(a: &SignIn, b: &SignIn) -> bool {
     match (a, b) {
-        (SignIn::In { via: va, who: wa, .. }, SignIn::In { via: vb, who: wb, .. }) => {
-            va == vb && (wa.is_none() || wb.is_none() || wa == wb)
-        }
+        (
+            SignIn::In {
+                via: va, who: wa, ..
+            },
+            SignIn::In {
+                via: vb, who: wb, ..
+            },
+        ) => va == vb && (wa.is_none() || wb.is_none() || wa == wb),
         _ => false,
     }
 }
 
 /// `sign_in` of `engine` since `since`, as kept across a restart; none for
 /// one signed out or not read.
-fn kept(engine: Engine, sign_in: &SignIn, since: DateTime<Utc>) -> Option<crate::ledger_store::KeptSignIn> {
+fn kept(
+    engine: Engine,
+    sign_in: &SignIn,
+    since: DateTime<Utc>,
+) -> Option<crate::ledger_store::KeptSignIn> {
     match sign_in {
         SignIn::In { via, who, .. } => Some(crate::ledger_store::KeptSignIn {
             engine,
@@ -1445,7 +1457,10 @@ mod tests {
         let key = crate::engine::claude_sign_in(r#"{"loggedIn":true,"authMethod":"api_key"}"#);
         let now = since + chrono::Duration::days(2);
         let switched = after.signed_in(now, [(Engine::Claude, key)].into_iter());
-        assert_eq!((switched[0].via, switched[0].since), (crate::engine::Via::Key, now));
+        assert_eq!(
+            (switched[0].via, switched[0].since),
+            (crate::engine::Via::Key, now)
+        );
     }
 
     /// Bedrock and Vertex sign Claude Code in as a third party: real money,
@@ -1461,11 +1476,26 @@ mod tests {
             r#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"vertex","analyticsDisabled":true,"loginExpiresAt":null}"#,
         );
         for s in [bedrock, vertex] {
-            assert!(matches!(s, SignIn::In { via: crate::engine::Via::Key, .. }), "{s:?}");
+            assert!(
+                matches!(
+                    s,
+                    SignIn::In {
+                        via: crate::engine::Via::Key,
+                        ..
+                    }
+                ),
+                "{s:?}"
+            );
             let (run, _rx) = LedgerRun::new(Some(Arc::new(Table)), None);
-            let at = DateTime::parse_from_rfc3339("2026-11-11T09:00:00Z").unwrap().to_utc();
+            let at = DateTime::parse_from_rfc3339("2026-11-11T09:00:00Z")
+                .unwrap()
+                .to_utc();
             run.signed_in(at, [(Engine::Claude, s)].into_iter());
-            let call = run.stamp(Engine::Claude, spend("2026-11-11T09:30:00Z", "claude-opus-5-5"), None);
+            let call = run.stamp(
+                Engine::Claude,
+                spend("2026-11-11T09:30:00Z", "claude-opus-5-5"),
+                None,
+            );
             assert_eq!(call.billing, Billing::Key);
             assert!(billed(call.billing, None));
         }
@@ -1481,8 +1511,14 @@ mod tests {
         assert!(billed(Billing::Key, Some(&plans)));
         assert!(!billed(Billing::Plan, Some(&both)));
         assert!(!billed(Billing::Vendor, None));
-        assert!(!billed(Billing::Unknown, Some(&plans)), "only ever on plans: a plan's");
-        assert!(billed(Billing::Unknown, Some(&both)), "seen on a key: could be one");
+        assert!(
+            !billed(Billing::Unknown, Some(&plans)),
+            "only ever on plans: a plan's"
+        );
+        assert!(
+            billed(Billing::Unknown, Some(&both)),
+            "seen on a key: could be one"
+        );
         assert!(billed(Billing::Unknown, None), "never seen: could be a key");
         assert!(billed(Billing::Unknown, Some(&Default::default())));
     }

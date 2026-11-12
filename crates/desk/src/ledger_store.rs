@@ -192,13 +192,15 @@ impl DeskStore {
     /// Every way each engine has been seen signed in.
     pub async fn billings_seen(
         &self,
-    ) -> Result<std::collections::BTreeMap<Engine, std::collections::BTreeSet<crate::engine::Via>>> {
+    ) -> Result<std::collections::BTreeMap<Engine, std::collections::BTreeSet<crate::engine::Via>>>
+    {
         let client = self.pool().get().await?;
         let rows = client
             .query("SELECT engine, via FROM ledger_billings_seen", &[])
             .await
             .context("reading how the engines were signed in")?;
-        let mut seen: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> = Default::default();
+        let mut seen: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> =
+            Default::default();
         for r in &rows {
             let (engine, via): (String, String) = (r.get(0), r.get(1));
             if let (Ok(e), Ok(v)) = (Engine::parse(&engine), crate::engine::Via::parse(&via)) {

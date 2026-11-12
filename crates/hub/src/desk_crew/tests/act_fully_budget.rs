@@ -268,5 +268,9 @@ fn a_cleared_time_is_never_after_now() {
         now - chrono::Duration::hours(1)
     );
     full.budget_cleared_at = Some(midnight - chrono::Duration::hours(1));
-    assert_eq!(super::super::counted_from(midnight, now, &full), midnight, "yesterday's");
+    assert_eq!(
+        super::super::counted_from(midnight, now, &full),
+        midnight,
+        "yesterday's"
+    );
 }
