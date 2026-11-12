@@ -79,7 +79,7 @@ pub(crate) async fn persons_message(
     let entry = find(store, &head.id, id)
         .map_err(internal)?
         .ok_or_else(not_found)?;
-    let shown = shown_as(&entry, speaker).ok_or_else(not_found)?;
+    let shown = shown_as(store, &entry, speaker).ok_or_else(not_found)?;
     let theirs = shown.from == Author::User
         && entry.role == MessageRole::User
         && !entry
@@ -150,7 +150,9 @@ fn chain(store: &dyn SessionStore, head: &str) -> eyre::Result<Vec<String>> {
             .get(current)?
             .and_then(|s| s.prev_session_id().map(str::to_string))
         {
-            Some(prev) if !chain.contains(&prev) => chain.push(prev),
+            // A predecessor pruned or expired ends the chain, as it ends a
+            // read of the thread.
+            Some(prev) if !chain.contains(&prev) && store.get(&prev)?.is_some() => chain.push(prev),
             _ => break,
         }
     }
@@ -227,21 +229,23 @@ pub(crate) async fn delete(
     // The fleet's claim keeps a turn on another instance out; on this one,
     // the live turn above is the guard, as the claim is this process's
     // already.
-    let _claim =
+    let claim =
         crate::session_turn_claim::SessionTurnClaim::try_acquire(&service.sessions, &found.head)
             .map_err(|e| ConversationError::Unavailable(format!("{e:#}")))?
             .ok_or_else(busy)?;
     let store = service.sessions.as_ref();
     // A rolled-over DM keeps its latest turns word for word in the next
     // session's live context, under the same ids: each session is cleared.
-    let mut found_any = false;
-    for session in &found.chain {
-        let deleted = store
-            .delete_person_message(session, &found.entry.id)
-            .map_err(internal)?;
-        found_any |= deleted.found();
-    }
-    if !found_any {
+    let cleared: eyre::Result<bool> = found.chain.iter().try_fold(false, |any, session| {
+        Ok(store
+            .delete_person_message(session, &found.entry.id)?
+            .found()
+            || any)
+    });
+    // Released before answering, so a message the person sends next isn't
+    // refused on its account by another instance.
+    claim.release().await;
+    if !cleared.map_err(internal)? {
         return Err(ConversationError::NotFound(
             "no such message in your conversation".into(),
         ));

@@ -296,3 +296,43 @@ fn a_memory_comes_from_a_message_its_provenance_names() {
     };
     assert!(!saved_from(&forgotten, &chain, "m2"));
 }
+
+/// In a DM that rolled over, the message is in the sealed predecessor's
+/// archive and word for word in the active session's live context: it goes
+/// from both. A predecessor pruned from further back ends the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_kept_across_a_rollover_is_deleted_from_both_sessions() {
+    use workforce_common::session::Session;
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+    let (state, [(alice_id, alice), _]) = gateway(&scout);
+    let store = scout.sessions.as_ref();
+    let pruned = Session::new(DESK_CHANNEL, &alice_id, scout.agent_id.as_str());
+    let mut older = pruned.successor();
+    older.set_prev_session_id(&pruned.id);
+    let (question, answer) = asked("pineapples");
+    for message in [&question, &answer] {
+        store.append_to_archive(&older.id, message).unwrap();
+        older.messages.push(message.clone());
+    }
+    store.save(&older).unwrap();
+    let mut active = older.successor();
+    active.set_prev_session_id(&older.id);
+    active.messages = vec![question.clone(), answer.clone()];
+    older.seal();
+    store.seal_and_insert_successor(&older, &active).unwrap();
+    assert_eq!(
+        store.find(DESK_CHANNEL, &alice_id).unwrap().unwrap().id,
+        active.id
+    );
+
+    let uri = format!("/api/desk/conversations/scout/messages/{}", question.id);
+    let (status, body) = send(&state, "DELETE", &uri, &alice, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        shown(&state, &alice).await,
+        [("About pineapples.".to_string(), true)]
+    );
+    let live = store.get(&active.id).unwrap().unwrap();
+    assert_eq!(live.messages[0].content, DELETED_MESSAGE_NOTE);
+}

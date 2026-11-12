@@ -159,10 +159,14 @@ fn said(
     })
 }
 
-/// What `entry` shows in the conversation, if it is one of its messages
-/// ([`said`]), without the files it holds.
-pub(crate) fn shown_as(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
-    said(entry, agent, None)
+/// What `entry` of `store` shows in the conversation, if it is one of its
+/// messages ([`said`]), a person's files their message holds included.
+pub(crate) fn shown_as(
+    store: &dyn SessionStore,
+    entry: &TranscriptEntry,
+    agent: &Speaker,
+) -> Option<Said> {
+    said(entry, agent, Some(&mut HeldFiles::of(store)))
 }
 
 /// The time a page of a conversation covers, which the files that are
