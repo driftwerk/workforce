@@ -85,7 +85,10 @@ impl CrewHub {
                 .ok()
                 .and_then(|v| v.pending)
                 .map(|p| p.id);
-            let how = if grant.is_none() {
+            let member = grant
+                .as_ref()
+                .is_some_and(|g| g.members.contains(&ask.session) || g.born.contains(&ask.session));
+            let how = if !member {
                 Some("withdrawn")
             } else if now >= ask.expires_at {
                 Some("expired")
@@ -107,10 +110,19 @@ impl CrewHub {
                         .await
                         .unwrap_or(false)
                     {
+                        // As it was asked: its class and options are the
+                        // kept ones.
                         if let Some(g) = &grant {
-                            if let Some(f) =
-                                self.ask_frame(g, link, ask.id, ask.session, &n, ask.expires_at)
-                            {
+                            if let Some(f) = self.ask_frame(
+                                g,
+                                link,
+                                ask.id,
+                                ask.session,
+                                &n,
+                                ask.expires_at,
+                                ask.class,
+                                &ask.options,
+                            ) {
                                 out.push(f);
                             }
                         }
@@ -143,7 +155,7 @@ impl CrewHub {
             if bosses && view.waits_on_you.is_none() {
                 continue;
             }
-            let class = self.class_of(&g, &view);
+            let (class, _) = self.class_of(&g, &view);
             let options = boss_ask::options(class);
             let n = nonce();
             let hash = boss_ask::nonce_hash(&n);
@@ -162,7 +174,9 @@ impl CrewHub {
                 .await;
             match made {
                 Ok(Some(id)) => {
-                    if let Some(f) = self.ask_frame(&g, link, id, *session, &n, expires_at) {
+                    if let Some(f) =
+                        self.ask_frame(&g, link, id, *session, &n, expires_at, class, &options)
+                    {
                         out.push(f);
                     }
                 }
@@ -176,11 +190,22 @@ impl CrewHub {
         out
     }
 
-    /// Whether the request `view` waits on is answered in Desk only.
-    fn class_of(&self, g: &Grant, view: &workforce_desk::model::SessionView) -> Class {
+    /// Whether the request `view` waits on is answered in Desk only, and
+    /// the hard limit it runs into. Fails closed: a request this engine
+    /// can't read the whole of (Codex's, a tool it doesn't know) is
+    /// answered in Desk.
+    fn class_of(
+        &self,
+        g: &Grant,
+        view: &workforce_desk::model::SessionView,
+    ) -> (Class, Option<workforce_desk::never::Never>) {
         let Some(p) = view.pending.as_ref() else {
-            return Class::DeskOnly;
+            return (Class::DeskOnly, None);
         };
+        // What Codex says it will do isn't what runs.
+        if !p.choices.is_empty() {
+            return (Class::DeskOnly, None);
+        }
         let shipping_needs_desk = g
             .act
             .get("shipping_needs_desk")
@@ -195,22 +220,60 @@ impl CrewHub {
             home: &home,
             scratch: &scratch,
         };
-        let (never, ships) = match p.tool.as_str() {
-            "Bash" | "shell" | "exec_command" => (
-                workforce_desk::never::command(&p.detail, &at),
-                boss_ask::ships(&p.detail),
-            ),
-            _ => (
-                workforce_desk::never::path(std::path::Path::new(p.detail.trim()))
-                    .or_else(|| workforce_desk::never::said(&p.detail)),
-                false,
-            ),
+        // The tool and what it was given, as the engine's hook said them;
+        // the request's label is for people.
+        let Some(r) = p.request.as_ref() else {
+            return (Class::DeskOnly, None);
         };
-        boss_ask::class_of(never, ships, shipping_needs_desk)
+        let input = |k: &str| r.input[k].as_str().unwrap_or_default().to_string();
+        let (never, ships) = match r.tool.as_str() {
+            "Bash" | "shell" | "exec_command" => {
+                let command = match input("command") {
+                    c if c.is_empty() => p.detail.clone(),
+                    c => c,
+                };
+                (
+                    workforce_desk::never::command(&command, &at),
+                    boss_ask::ships(&command),
+                )
+            }
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "Read" => {
+                let path = match input("file_path") {
+                    f if f.is_empty() => input("notebook_path"),
+                    f => f,
+                };
+                if path.is_empty() {
+                    return (Class::DeskOnly, None);
+                }
+                // What runs on its own later: CI, hooks, an agent's settings.
+                if [
+                    ".github/",
+                    ".git/",
+                    ".claude/",
+                    ".codex/",
+                    ".husky/",
+                    ".gitlab-ci",
+                ]
+                .iter()
+                .any(|w| path.contains(w))
+                {
+                    return (Class::DeskOnly, None);
+                }
+                (
+                    workforce_desk::never::path(std::path::Path::new(&path))
+                        .or_else(|| workforce_desk::never::said(&p.detail)),
+                    false,
+                )
+            }
+            _ => return (Class::DeskOnly, None),
+        };
+        (boss_ask::class_of(never, ships, shipping_needs_desk), never)
     }
 
-    /// The `ask` frame for the request `session` waits on, its words as
-    /// the grant's Sees shows its question; none when it no longer waits.
+    /// The `ask` frame for the request `session` waits on, of `class` with
+    /// `options`, its words as the grant's Sees shows its question (never
+    /// the words of a request for secrets); none when it no longer waits.
+    #[allow(clippy::too_many_arguments)]
     fn ask_frame(
         &self,
         g: &Grant,
@@ -219,25 +282,39 @@ impl CrewHub {
         session: Uuid,
         nonce: &str,
         expires_at: chrono::DateTime<Utc>,
+        class: Class,
+        options: &[Choice],
     ) -> Option<Value> {
         let view = self.desk.view(session).ok()?;
         let p = view.pending.as_ref()?;
-        let class = self.class_of(g, &view);
-        let detail = sees::shows(g.sees, Part::Question).then(|| {
+        let shows = sees::shows(g.sees, Part::Question);
+        let secret = self.class_of(g, &view).1 == Some(workforce_desk::never::Never::Secrets);
+        let detail = (shows && !secret).then(|| {
             sees::capped(
                 &workforce_common::redact::redact_secrets(&p.detail),
                 DETAIL_CHARS,
             )
         });
+        let summary = if shows {
+            format!(
+                "{} asks to use {}",
+                view.label(),
+                p.request
+                    .as_ref()
+                    .map_or(p.tool.as_str(), |r| r.tool.as_str())
+            )
+        } else {
+            format!("A session in {} asks for your answer", g.group)
+        };
         Some(json!({
             "type": "ask",
             "askId": ask,
             "nonce": nonce,
             "linkId": link,
             "class": class.as_str(),
-            "summary": format!("{} asks to use {}", view.label(), p.tool),
+            "summary": summary,
             "detail": detail,
-            "options": boss_ask::options(class).iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "options": options.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "expiresAt": expires_at,
             "subject": session,
         }))
@@ -267,7 +344,11 @@ impl CrewHub {
         };
         let choice = match boss_ask::accept_remote(&ask, &d, link, person, Utc::now()) {
             Ok(c) => c,
-            Err(boss_ask::Refusal::NotOpen) => return closed(ask.id, &ask.state),
+            Err(boss_ask::Refusal::NotOpen) => {
+                self.audit_decision(boss, group, &d, "refused", "not_open")
+                    .await;
+                return closed(ask.id, &ask.state);
+            }
             Err(why) => {
                 self.audit_decision(boss, group, &d, "refused", why.as_str())
                     .await;
@@ -275,11 +356,11 @@ impl CrewHub {
             }
         };
         // Still the boss's group, and the request still the one asked.
-        let live = self
-            .desk
-            .grant_live(group)
-            .ok()
-            .filter(|g| g.group == ask.group && self.serves_remote(g, boss));
+        let live = self.desk.grant_live(group).ok().filter(|g| {
+            g.group == ask.group
+                && self.serves_remote(g, boss)
+                && (g.members.contains(&ask.session) || g.born.contains(&ask.session))
+        });
         if live.is_none() {
             if store
                 .boss_ask_close(ask.id, "withdrawn")
@@ -336,7 +417,10 @@ impl CrewHub {
         self.audit_decision(boss, group, &d, outcome, choice.as_str())
             .await;
         if let Err(why) = done {
+            // Taken, so never again from elsewhere: the request stays open
+            // in Desk, and the card says to answer it there.
             tracing::info!(ask = %ask.id, %why, "a remote answer was taken but couldn't be applied");
+            return refused(json!(ask.id), boss_ask::Refusal::NotApplied);
         }
         json!({"type": "ask_closed", "askId": ask.id, "how": "decided", "choice": choice.as_str()})
     }

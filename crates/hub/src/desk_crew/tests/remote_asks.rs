@@ -88,7 +88,8 @@ async fn a_sessions_ask_goes_up_once_and_its_answer_is_taken_once_from_its_perso
         assert_eq!(frames.len(), 1, "{frames:?}");
         let first = frames[0].clone();
         assert_eq!(first["type"], "ask");
-        assert_eq!(first["class"], "anywhere");
+        assert_eq!(first["class"], "anywhere", "{first}");
+        assert_eq!(first["summary"], "acme-web asks to use Bash");
         assert_eq!(first["options"], json!(["allow", "deny", "stop"]));
         assert_eq!(first["subject"], json!(mine.id));
         assert!(first["detail"].as_str().unwrap().contains("cargo build"));

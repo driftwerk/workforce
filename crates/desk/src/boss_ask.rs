@@ -94,46 +94,90 @@ pub fn options(class: Class) -> Vec<Choice> {
     }
 }
 
-/// The hard limits whose requests are the person's in Desk only: what
-/// widens what anyone may do (reading secrets, a boss's or the engine's
-/// own limits, money, accounts, what Desk keeps). The rest of the list is
-/// a session's ordinary ask the person may answer from anywhere.
-const DESK_ONLY: [Never; 5] = [
-    Never::Secrets,
-    Never::OwnLimits,
-    Never::Money,
-    Never::Accounts,
-    Never::Records,
-];
-
 /// The class of a request, from the hard limit it runs into, if any, and
 /// whether it ships (a push, a merge, a release, a publish, a deploy) in a
-/// group whose person keeps shipping to Desk.
+/// group whose person keeps shipping to Desk. Every hard limit is the
+/// person's in Desk: what widens what anyone may do, or can't be taken
+/// back, is never allowed on another hub's word.
 pub fn class_of(never: Option<Never>, ships: bool, shipping_needs_desk: bool) -> Class {
-    if never.is_some_and(|n| DESK_ONLY.contains(&n)) || (ships && shipping_needs_desk) {
+    if never.is_some() || (ships && shipping_needs_desk) {
         Class::DeskOnly
     } else {
         Class::Anywhere
     }
 }
 
+/// The programs whose verbs below ship.
+const SHIPPERS: [&str; 20] = [
+    "git",
+    "gh",
+    "glab",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "cargo",
+    "docker",
+    "podman",
+    "terraform",
+    "tofu",
+    "helm",
+    "kubectl",
+    "twine",
+    "poetry",
+    "flyctl",
+    "fly",
+    "vercel",
+    "netlify",
+];
+
+/// What a shipper does when it ships.
+const SHIP_VERBS: [&str; 8] = [
+    "push", "merge", "publish", "deploy", "release", "apply", "upload", "workflow",
+];
+
 /// Whether `command` reads as shipping: a push, a merge, a release, a
-/// publish or a deploy. Loose on purpose: a false catch costs one answer
-/// in Desk.
+/// publish, an apply or a deploy, by any of the shippers, wherever its
+/// options put the verb, and inside a `sh -c` too. Loose on purpose: a
+/// false catch costs one answer in Desk.
 pub fn ships(command: &str) -> bool {
-    let c = command.to_ascii_lowercase();
-    [
-        "git push",
-        "pr merge",
-        "git merge",
-        "release create",
-        "publish",
-        "deploy",
-        "workflow run",
-    ]
-    .iter()
-    .any(|w| c.contains(w))
+    ships_within(command, 0)
 }
+
+fn ships_within(command: &str, depth: u8) -> bool {
+    let c = command.to_ascii_lowercase();
+    if c.contains("publish") || c.contains("deploy") {
+        return true;
+    }
+    if depth > 3 {
+        return true;
+    }
+    let words: Vec<String> =
+        shlex::split(&c).unwrap_or_else(|| c.split_whitespace().map(String::from).collect());
+    let mut shipper = false;
+    for w in &words {
+        // A command inside a command (`sh -c "…"`, `env … git push`).
+        if w.contains(char::is_whitespace) && ships_within(w, depth + 1) {
+            return true;
+        }
+        for part in w.split([';', '&', '|', '\n']) {
+            if part.is_empty() {
+                shipper = false;
+                continue;
+            }
+            let program = part.rsplit('/').next().unwrap_or(part);
+            if SHIPPERS.contains(&program) {
+                shipper = true;
+            } else if shipper && SHIP_VERBS.contains(&part) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The longest a decision's fields may be.
+const FIELD_CHARS: usize = 128;
 
 /// The hash a nonce is kept as.
 pub fn nonce_hash(nonce: &str) -> String {
@@ -202,6 +246,9 @@ pub enum Refusal {
     DeskOnly,
     /// Not one of its answers.
     NotAnOption,
+    /// Taken, but the session couldn't be answered so: the person answers
+    /// it in Desk.
+    NotApplied,
 }
 
 impl Refusal {
@@ -214,6 +261,7 @@ impl Refusal {
             Self::NotThePerson => "Only the person this boss works for answers it.",
             Self::DeskOnly => "Decide this in Desk.",
             Self::NotAnOption => "That isn't one of its answers.",
+            Self::NotApplied => "It couldn't be done: answer it in Desk.",
         }
     }
 
@@ -226,6 +274,7 @@ impl Refusal {
             Self::NotThePerson => "not_the_person",
             Self::DeskOnly => "desk_only",
             Self::NotAnOption => "not_an_option",
+            Self::NotApplied => "not_applied",
         }
     }
 }
@@ -240,11 +289,23 @@ pub fn accept_remote(
     person: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Choice, Refusal> {
-    if ask.state != "open" {
-        return Err(Refusal::NotOpen);
-    }
+    // Another link learns nothing of this one's asks, not even whether
+    // they are open.
     if ask.link_id != link || decision.ask_id != ask.id {
         return Err(Refusal::OtherLink);
+    }
+    let d = &decision.decider;
+    let long = |s: &str| s.len() > FIELD_CHARS;
+    if long(&decision.nonce)
+        || long(&decision.choice)
+        || long(&d.identity_id)
+        || long(&d.via)
+        || d.slack_user_id.as_deref().is_some_and(long)
+    {
+        return Err(Refusal::NotAnOption);
+    }
+    if ask.state != "open" {
+        return Err(Refusal::NotOpen);
     }
     if now >= ask.expires_at {
         return Err(Refusal::Expired);
@@ -402,16 +463,32 @@ mod tests {
             Class::DeskOnly
         );
         assert_eq!(class_of(Some(Never::Money), false, false), Class::DeskOnly);
-        assert_eq!(
-            class_of(Some(Never::RewriteHistory), false, false),
-            Class::Anywhere
-        );
+        // Every hard limit, those that can't be taken back too.
+        for n in crate::never::ALL {
+            assert_eq!(class_of(Some(n), false, false), Class::DeskOnly, "{n:?}");
+        }
         assert_eq!(class_of(None, true, false), Class::Anywhere);
         assert_eq!(class_of(None, true, true), Class::DeskOnly);
         assert!(ships("git push origin main"));
         assert!(ships("gh pr merge 42 --squash"));
         assert!(ships("npm publish"));
         assert!(!ships("cargo test"));
+        // Wherever the options put the verb, and inside a shell.
+        for c in [
+            "git -C repo push",
+            "git  push",
+            "git -c core.x=y push origin",
+            "/usr/bin/git push",
+            "docker push ghcr.io/acme/api",
+            "terraform apply -auto-approve",
+            "cd api && git push",
+            "bash -c 'git push --tags'",
+            "gh workflow run release.yml",
+        ] {
+            assert!(ships(c), "{c}");
+        }
+        assert!(!ships("git status && cargo build"));
+        assert!(!ships("echo push"));
         assert_eq!(options(Class::DeskOnly), vec![Choice::Deny, Choice::Stop]);
     }
 }

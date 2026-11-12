@@ -701,6 +701,9 @@ impl Uplink {
                 .collect(),
             tx.clone(),
         ));
+        // At most a few answers are worked on at once; the rest are refused
+        // to be sent again.
+        let deciding = Arc::new(tokio::sync::Semaphore::new(DECIDING_AT_ONCE));
         let mut last_seq = 0u64;
         let rates = Arc::clone(&self.rates);
         let ended = loop {
@@ -819,10 +822,18 @@ impl Uplink {
                             .await;
                         continue;
                     };
+                    let Ok(permit) = Arc::clone(&deciding).try_acquire_owned() else {
+                        let _ = tx
+                            .send(json!({"type": "decision_refused", "askId": frame["askId"],
+                                         "code": "busy", "why": "Busy: answer again."}))
+                            .await;
+                        continue;
+                    };
                     let person = persons.get(&link.link_id).cloned();
                     let (crew, tx, link) = (Arc::clone(&self.crew), tx.clone(), link.clone());
                     let frame = frame.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let back = crew
                             .remote_decision(
                                 link.link_id,
@@ -976,10 +987,17 @@ async fn send_events(
 /// How often what each link's sessions ask the person is looked at.
 const ASKS_EVERY: Duration = Duration::from_secs(2);
 
+/// How many answers from a boss hub are worked on at once.
+const DECIDING_AT_ONCE: usize = 4;
+
+/// The most frames kept to send again once the socket has room.
+const UNSENT_KEPT: usize = 256;
+
 /// Sends `ask` and `ask_closed` frames up `tx` for each of `links`
 /// ([`CrewHub::asks_up`]): the first look sends every ask still open again
-/// with a new nonce, as does the look after one couldn't be sent; until the
-/// socket ends.
+/// with a new nonce; a frame the socket had no room for is sent again as it
+/// was, and only when more wait than are kept do a link's asks go up again
+/// with new nonces; until the socket ends.
 async fn send_asks(
     crew: Arc<CrewHub>,
     links: Vec<(Uuid, String, BossRef)>,
@@ -991,14 +1009,37 @@ async fn send_asks(
     let mut look = tokio::time::interval(ASKS_EVERY);
     look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut again: HashSet<Uuid> = links.iter().map(|(l, _, _)| *l).collect();
+    let mut unsent: std::collections::VecDeque<(Uuid, Value)> = Default::default();
     loop {
         look.tick().await;
+        while let Some((link, f)) = unsent.pop_front() {
+            if let Err(e) = tx.try_send(f) {
+                let tokio::sync::mpsc::error::TrySendError::Full(f) = e else {
+                    return;
+                };
+                unsent.push_front((link, f));
+                break;
+            }
+        }
         for (link, group, boss) in &links {
             let frames = crew.asks_up(*link, group, boss, again.remove(link)).await;
             for f in frames {
-                if tx.try_send(f).is_err() {
-                    again.insert(*link);
+                if !unsent.is_empty() {
+                    unsent.push_back((*link, f));
+                    continue;
                 }
+                match tx.try_send(f) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(f)) => {
+                        unsent.push_back((*link, f));
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+        if unsent.len() > UNSENT_KEPT {
+            for (link, _) in unsent.drain(..) {
+                again.insert(link);
             }
         }
     }
