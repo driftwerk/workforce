@@ -14,6 +14,8 @@ mod board_api;
 pub mod board_store;
 pub mod board_sync;
 pub mod board_sync_store;
+pub mod boss_ask;
+pub mod boss_ask_store;
 pub mod breaker;
 pub mod budget_store;
 pub mod charge;
