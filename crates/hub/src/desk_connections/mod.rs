@@ -423,6 +423,17 @@ pub fn slug(name: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
+/// Whether `key` is an instance key as [`slug`] makes one: lower case
+/// letters, digits and dashes, at most 64 long. Any other (a key written by
+/// hand in the vault editor) isn't one Connections names or lists.
+pub fn is_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// A site as a name: `acme.atlassian.net` and `https://acme.atlassian.net`
 /// are "Acme".
 fn site_name(site: &str) -> Option<String> {
@@ -497,7 +508,7 @@ impl Connections {
         else {
             return Err(gone());
         };
-        if key.is_empty() || key.len() > 64 || key.contains('/') {
+        if !is_key(key) {
             return Err(gone());
         }
         let agent = (!agent.is_empty()).then_some(agent);
@@ -577,6 +588,7 @@ impl Connections {
                     let (key, _) = rest.split_once('/')?;
                     Some(key.to_string())
                 })
+                .filter(|key| is_key(key))
                 .collect();
             for key in keys {
                 let held = vault
@@ -863,7 +875,16 @@ impl Connections {
                 .iter()
                 .filter(|l| *l != level)
                 .any(|l| self.instances(c, l, person).iter().any(|(k, _)| *k == key));
-        if taken {
+        // Kept at both of this level's tiers (the person's own, and a bare
+        // one beside it): the person's own keeps its key, and the bare one
+        // takes `shared`, so both show.
+        let beside = self
+            .instances(c, level, person)
+            .iter()
+            .any(|(k, t)| *k == key && *t != tier);
+        if beside {
+            key = self.new_key(c, person, "shared");
+        } else if taken {
             key = self.new_key(c, person, &name);
         }
         let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
@@ -889,6 +910,21 @@ impl Connections {
                 "flat settings with no connection to join stay"
             );
             return Ok(None);
+        }
+        // Beside a connection that has its key, a flat field joins it only
+        // when it came with that same key: a site of one account never pairs
+        // with another's key.
+        if target_has_key {
+            let flat_key = vault.get(&key_at(tier, person, c.primary));
+            let held = vault.get(&key_at(tier, person, &c.primary_at(&key)));
+            if flat_key.is_none() || flat_key != held {
+                warn!(
+                    connector = c.id,
+                    instance = %key,
+                    "flat settings stay beside a connection: they didn't come with its key"
+                );
+                return Ok(None);
+            }
         }
         let mut sets: Vec<(String, String)> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
