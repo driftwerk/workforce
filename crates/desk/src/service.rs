@@ -99,7 +99,7 @@ mod moves;
 mod session_account;
 #[cfg(test)]
 mod session_account_tests;
-pub use session_account::Moment as AccountMoment;
+pub use session_account::{AccountRead, Moment as AccountMoment};
 #[cfg(test)]
 mod moves_tests;
 #[cfg(test)]

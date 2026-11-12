@@ -1613,6 +1613,10 @@ async fn what_the_crew_tools_read_is_fenced_as_data() {
                 "session history",
                 read("crew.history", json!({"session_id": s.id.to_string()})).await,
             ),
+            (
+                "session account, kept by none: its history",
+                read("crew.account", json!({"session_id": s.id.to_string()})).await,
+            ),
         ] {
             let opens = out.find("<<<EXTERNAL_UNTRUSTED_CONTENT_");
             let said = out.find(SAID);
@@ -3464,6 +3468,79 @@ async fn a_session_the_overseer_runs_wakes_it_on_its_line_when_its_turn_ends() {
         .await;
         assert!(woke.content.contains("acme-web finished"), "{}", woke.content);
         assert!(woke.content.contains(&format!("session_id {}", s.id)));
+    })
+    .await;
+}
+
+/// Desk's status question to a working session waits on its line for its
+/// turn to end, marked as Desk's, and waits on the person while they drive
+/// it; crew.account with no account kept says what crew.history does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_question_waits_for_the_turn_and_for_the_person_at_the_wheel() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nmessage_terminal_sessions = true\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.ask_session").then_some(())
+        })
+        .await;
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        let account = tool("crew.account")
+            .execute(json!({"session_id": s.id.to_string()}))
+            .await
+            .unwrap()
+            .output;
+        assert!(account["note"].as_str().unwrap().contains("no account"), "{account}");
+        assert!(account["session"].as_str().unwrap().contains("Upgrade the date picker"), "{account}");
+        let asked = tool("crew.ask_session")
+            .execute(json!({"session_id": s.id.to_string(), "question": "Which version are you moving to?", "reason": "The person asked."}))
+            .await
+            .unwrap()
+            .output;
+        let done = asked["done"].as_str().unwrap_or_default();
+        assert!(done.contains("once its turn ends"), "{asked}");
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let sent = thread.last().unwrap();
+        assert!(sent.text.starts_with(super::actions::STATUS_QUESTION), "{}", sent.text);
+        assert!(sent.text.ends_with("Which version are you moving to?"));
+        assert_ne!(sent.delivery, workforce_desk::line::Delivery::Delivered, "never typed in over its turn");
+        // The person drives a session the boss runs: the question waits.
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.drive(s.id).await.unwrap();
+        let waits = tool("crew.ask_session")
+            .execute(json!({"session_id": s.id.to_string(), "question": "Still on it?", "reason": "The person asked."}))
+            .await
+            .unwrap()
+            .output;
+        assert!(waits["done"].as_str().unwrap_or_default().contains("the person is driving it"), "{waits}");
     })
     .await;
 }

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -25,6 +25,8 @@ const LOOK_EVERY: Duration = Duration::from_secs(60);
 const ATTENDED_FOR: Duration = Duration::from_secs(60 * 60);
 /// The most exchanges read back to find the unread ones.
 const READ_BACK: i64 = 100;
+/// The most recent exchanges a question reads from.
+const QUESTION_READ_BACK: i64 = 40;
 /// The most refreshes one turn's end makes to catch up on a backlog.
 const CATCH_UP_ROUNDS: usize = 3;
 /// The longest one look at a running turn may take.
@@ -61,6 +63,10 @@ pub(super) struct AccountRun {
     mid_turn: Mutex<HashMap<Uuid, (Instant, u64)>>,
     /// When the person last looked at each session.
     looked: Mutex<HashMap<Uuid, Instant>>,
+    /// When each session's turn last ended.
+    pub(super) ended: Mutex<HashMap<Uuid, DateTime<Utc>>>,
+    /// When a reader last refreshed each session's account.
+    read_refreshed: Mutex<HashMap<Uuid, Instant>>,
     /// Model calls made, for tests.
     pub(super) calls: std::sync::atomic::AtomicUsize,
 }
@@ -73,9 +79,22 @@ impl AccountRun {
             limits: Mutex::default(),
             mid_turn: Mutex::default(),
             looked: Mutex::default(),
+            ended: Mutex::default(),
+            read_refreshed: Mutex::default(),
             calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
+}
+
+/// A session's account as a reader is given it.
+#[derive(Debug, Clone)]
+pub struct AccountRead {
+    /// None: none is kept yet.
+    pub account: Option<Account>,
+    /// Refreshed for this reader.
+    pub refreshed: bool,
+    /// Older than it should be: say how fresh it is.
+    pub stale: bool,
 }
 
 /// What a refresh found to say.
@@ -153,6 +172,121 @@ impl Desk {
         Ok(self.0.store.session_account(id).await?)
     }
 
+    /// Session `id`'s account for a reader (the boss, before it says
+    /// anything of it): refreshed first when it is stale (older than
+    /// [`account::FRESH_FOR`] while it works, or a turn ended since it was
+    /// written), at most once per session in that time, within
+    /// [`account::WRITE_WITHIN`]; else the one kept, said to be stale.
+    pub async fn account_read(&self, id: Uuid) -> Result<AccountRead, DeskError> {
+        let kept = self.0.store.session_account(id).await?;
+        let now = crate::crew::now();
+        let working = self
+            .view(id)
+            .is_ok_and(|v| v.state == crate::model::SessionState::Working);
+        let ended = self.0.accounts.ended.lock().get(&id).copied();
+        let stale = |a: &Option<Account>| match a {
+            None => true,
+            Some(a) => a.stale(now, working) || ended.is_some_and(|e| e > a.written_at),
+        };
+        if !stale(&kept) || !self.account_kept_for(id) {
+            let stale = kept.is_some() && stale(&kept);
+            return Ok(AccountRead {
+                account: kept,
+                refreshed: false,
+                stale,
+            });
+        }
+        // One reader's refresh per session in the floor's time: a later
+        // reader gets what it wrote.
+        let due = {
+            let mut read = self.0.accounts.read_refreshed.lock();
+            match read.get(&id) {
+                Some(at) if at.elapsed() < account::FRESH_FOR => false,
+                _ => {
+                    read.insert(id, Instant::now());
+                    true
+                }
+            }
+        };
+        if !due {
+            let stale = kept.is_some() && stale(&kept);
+            return Ok(AccountRead {
+                account: kept,
+                refreshed: false,
+                stale,
+            });
+        }
+        let within = account::WRITE_WITHIN + Duration::from_secs(5);
+        match tokio::time::timeout(within, self.account_refresh(id, Moment::Read)).await {
+            Ok(Ok(Some(a))) => Ok(AccountRead {
+                account: Some(a),
+                refreshed: true,
+                stale: false,
+            }),
+            Ok(Ok(None)) => Ok(AccountRead {
+                account: kept,
+                refreshed: false,
+                stale: false,
+            }),
+            Ok(Err(e)) => {
+                tracing::info!(session = %id, error = %e, "a session's account couldn't be refreshed for a reader; the kept one is given");
+                Ok(AccountRead {
+                    stale: kept.is_some(),
+                    account: kept,
+                    refreshed: false,
+                })
+            }
+            Err(_) => Ok(AccountRead {
+                stale: kept.is_some(),
+                account: kept,
+                refreshed: false,
+            }),
+        }
+    }
+
+    /// The answer to `question` about session `id`, from its account and
+    /// up to about 12k tokens of its recent conversation, by the cheap
+    /// model within the day's share of questions. None when no model may
+    /// be asked or the record doesn't say.
+    pub async fn account_question(
+        &self,
+        id: Uuid,
+        question: &str,
+    ) -> Result<Option<String>, DeskError> {
+        let v = self.view(id)?;
+        let kept = self.0.store.session_account(id).await?;
+        let recent: Vec<account::Exchange> = self
+            .0
+            .store
+            .account_exchanges(id, None, QUESTION_READ_BACK, false)
+            .await
+            ?
+            .into_iter()
+            // What reads as instructions to a model is never given to one.
+            .filter(|(_, flagged)| !flagged)
+            .map(|(x, _)| x)
+            .collect();
+        if recent.is_empty() && kept.is_none() {
+            return Ok(None);
+        }
+        let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
+        let prompt = account::question_prompt(kept.as_ref(), v.label(), &recent, question, &nonce);
+        let answer = self
+            .account_ask(
+                id,
+                v.engine,
+                CheapKind::Question,
+                Call::Question,
+                account::QUESTION_SYSTEM,
+                &prompt,
+            )
+            .await?;
+        let answer = answer
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty() && !a.contains(account::NOT_IN_RECORD));
+        Ok(answer.map(|a| self.account_redacted_text(a)))
+    }
+
     /// A turn of session `id` ended and the harvest read it: its account
     /// is refreshed off the caller.
     pub(super) fn account_turn_ended(&self, id: Uuid) {
@@ -160,6 +294,7 @@ impl Desk {
             return;
         }
         self.0.accounts.mid_turn.lock().remove(&id);
+        self.0.accounts.ended.lock().insert(id, crate::crew::now());
         let desk = self.clone();
         tokio::spawn(async move {
             if let Err(e) = desk.account_refresh(id, Moment::TurnEnd).await {
@@ -404,6 +539,13 @@ impl Desk {
     }
 
     /// What the model wrote, as safely kept as what it read.
+    fn account_redacted_text(&self, text: String) -> String {
+        match &self.0.ledger.redactor {
+            Some(r) => r.stored(&text).text.into_owned(),
+            None => text,
+        }
+    }
+
     fn account_redacted(&self, mut w: Written) -> Written {
         let Some(r) = self.0.ledger.redactor.clone() else {
             return w;

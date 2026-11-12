@@ -514,3 +514,96 @@ async fn an_open_exchange_is_kept_mid_turn_and_the_turns_end_refreshes_the_accou
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_reader_gets_a_fresh_account_as_kept_and_a_stale_one_refreshed_once_in_two_minutes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER, ANSWER, ANSWER]);
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let store = DeskStore::from_pool(pool.clone());
+        // Its turn end writes it first.
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"Long work. ".repeat(60), 2)],
+        )
+        .await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        // Fresh: given as kept, with no call.
+        let fresh = d.account_read(id).await.unwrap();
+        assert!(fresh.account.is_some() && !fresh.refreshed && !fresh.stale);
+        assert_eq!(fake.calls(), 1);
+        // A turn ended since it was written: refreshed before it is read.
+        harvested(
+            &store,
+            id,
+            &[exchange("x2", 1, &"More work. ".repeat(60), 2)],
+        )
+        .await;
+        d.0.accounts.ended.lock().insert(id, Utc::now());
+        let read = d.account_read(id).await.unwrap();
+        assert!(read.refreshed && !read.stale);
+        assert_eq!(fake.calls(), 2);
+        // Stale again within two minutes: the kept one, said to be stale.
+        harvested(
+            &store,
+            id,
+            &[exchange("x3", 0, &"Even more. ".repeat(60), 2)],
+        )
+        .await;
+        d.0.accounts.ended.lock().insert(id, Utc::now());
+        let floor = d.account_read(id).await.unwrap();
+        assert!(!floor.refreshed && floor.stale, "{floor:?}");
+        assert_eq!(fake.calls(), 2, "one reader's refresh per two minutes");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_is_answered_from_the_conversation_or_not_at_all() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[
+            "It signed in with the key named DEPLOY_TOKEN: \"using DEPLOY_TOKEN from the vault\".",
+            "NOT IN THE RECORD",
+        ]);
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let store = DeskStore::from_pool(pool.clone());
+        let mut x = exchange("x1", 10, "Deployed, using DEPLOY_TOKEN from the vault.", 1);
+        x.ask = "Deploy the login fix".into();
+        harvested(&store, id, &[x]).await;
+        let answer = d
+            .account_question(id, "Which API key did it use?")
+            .await
+            .unwrap()
+            .expect("answered");
+        assert!(answer.contains("DEPLOY_TOKEN"));
+        let (_, call, asked) = fake.asked.lock()[0].clone();
+        assert_eq!(call, Call::Question);
+        assert!(
+            asked.contains("using DEPLOY_TOKEN from the vault"),
+            "from the exchanges"
+        );
+        assert!(asked.contains("Which API key did it use?"));
+        assert!(
+            d.account_question(id, "What did it eat?")
+                .await
+                .unwrap()
+                .is_none(),
+            "what the record doesn't say isn't answered"
+        );
+        // Past the questions' share no model is asked.
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 500,
+            account_questions_per_day: 0,
+        });
+        assert!(d.account_question(id, "Again?").await.unwrap().is_none());
+        assert_eq!(fake.calls(), 2);
+    })
+    .await;
+}
