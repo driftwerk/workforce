@@ -3705,7 +3705,7 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             dir.path(),
             pool,
             "Answered.",
-            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
             &[],
         )
         .await;
@@ -3949,7 +3949,10 @@ async fn a_request_open_when_the_overseer_takes_a_session_on_is_its_to_answer() 
             answered["hookSpecificOutput"]["decision"]["behavior"],
             "allow"
         );
-        assert!(work_turn_naming(&overseer, id, pending.id).await.is_some());
+        eventually("the work turn", async || {
+            work_turn_naming(&overseer, id, pending.id).await
+        })
+        .await;
     })
     .await;
 }
