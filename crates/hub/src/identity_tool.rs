@@ -235,15 +235,16 @@ mod tests {
         let store = Arc::new(InMemoryStore::default());
         let mut identity = Identity::new("Sam", IdentityRole::Member);
         identity.email = Some("typed@example.com".into());
-        identity
-            .linked_ids
-            .insert(crate::oidc::OIDC_LINKED_ID_KEY.into(), "sub-sam".into());
         identity.linked_ids.insert(
-            crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+            crate::verified_email::OIDC_LINKED_ID_KEY.into(),
+            "sub-sam".into(),
+        );
+        identity.linked_ids.insert(
+            crate::verified_email::OIDC_VERIFIED_EMAIL_KEY.into(),
             "sam@example.com".into(),
         );
         identity.linked_ids.insert(
-            crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+            crate::verified_email::OIDC_VERIFIED_AT_KEY.into(),
             chrono::Utc::now().to_rfc3339(),
         );
         let mut typed = Identity::new("Typed", IdentityRole::Member);

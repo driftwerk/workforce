@@ -38,21 +38,10 @@ use workforce_common::settings::{OidcConfig, OidcDefaultRole};
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole, IdentityStatus, ProvisioningSource};
 
-/// Key under which the OIDC `sub` is stored in `Identity::linked_ids`.
-pub const OIDC_LINKED_ID_KEY: &str = "oidc";
-
-/// Where an identity keeps the email its OIDC provider last verified for it
-/// (`linked_ids`), and when: written only by an OIDC sign-in whose email the
-/// provider says is verified. The hub trusts the identity provider's
-/// `email_verified`. How it's kept, and what else may vouch for an email:
-/// [`crate::verified_email`].
-pub const OIDC_VERIFIED_EMAIL_KEY: &str = "oidc_email";
-/// When [`OIDC_VERIFIED_EMAIL_KEY`] was last verified, RFC 3339.
-pub const OIDC_VERIFIED_AT_KEY: &str = "oidc_email_at";
-
 pub use crate::verified_email::{
     forget_verified_email, is_verified_key, keep_stored_verified, verified_email,
-    verified_email_state, VerifiedEmail, VERIFIED_EMAIL_FRESH_DAYS,
+    verified_email_state, VerifiedEmail, OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY,
+    OIDC_VERIFIED_EMAIL_KEY, VERIFIED_EMAIL_FRESH_DAYS,
 };
 
 /// Keeps `email` (verified by the provider just now) as `identity`'s

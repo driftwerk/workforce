@@ -25,6 +25,18 @@ use workforce_identity::types::{Identity, IdentityStatus};
 /// How long a verified email stands without being renewed.
 pub const VERIFIED_EMAIL_FRESH_DAYS: i64 = 90;
 
+/// Key under which the OIDC `sub` is stored in `Identity::linked_ids`.
+pub const OIDC_LINKED_ID_KEY: &str = "oidc";
+
+/// Where an identity keeps the email its OIDC provider last verified for it
+/// (`linked_ids`), and when: written only by an OIDC sign-in whose email the
+/// provider says is verified. The hub trusts the identity provider's
+/// `email_verified`. How it's kept, and what else may vouch for an email:
+/// this module.
+pub const OIDC_VERIFIED_EMAIL_KEY: &str = "oidc_email";
+/// When [`OIDC_VERIFIED_EMAIL_KEY`] was last verified, RFC 3339.
+pub const OIDC_VERIFIED_AT_KEY: &str = "oidc_email_at";
+
 /// Who vouched for an email.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -39,7 +51,7 @@ impl Source {
     /// The link the email comes with, and goes with.
     pub fn link(self) -> &'static str {
         match self {
-            Self::Oidc => "oidc",
+            Self::Oidc => OIDC_LINKED_ID_KEY,
             Self::Slack => "slack",
         }
     }
@@ -47,7 +59,7 @@ impl Source {
     /// Where the email is kept.
     pub fn email_key(self) -> &'static str {
         match self {
-            Self::Oidc => "oidc_email",
+            Self::Oidc => OIDC_VERIFIED_EMAIL_KEY,
             Self::Slack => "slack_email",
         }
     }
@@ -55,7 +67,7 @@ impl Source {
     /// When it was last vouched for, RFC 3339.
     pub fn at_key(self) -> &'static str {
         match self {
-            Self::Oidc => "oidc_email_at",
+            Self::Oidc => OIDC_VERIFIED_AT_KEY,
             Self::Slack => "slack_email_at",
         }
     }

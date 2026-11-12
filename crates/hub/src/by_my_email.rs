@@ -25,7 +25,7 @@ use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_identity::store::IdentityStore;
 
-use crate::oidc::VerifiedEmail;
+use crate::verified_email::VerifiedEmail;
 
 /// Which system a tool finds the caller on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,12 +192,14 @@ impl Tool for ByMyEmail {
                 }
             }
         }
-        let (email, source) = match crate::oidc::verified_email_state(&identity, chrono::Utc::now())
-        {
-            VerifiedEmail::Fresh(email, source) => (email, source),
-            VerifiedEmail::Stale => return Ok(ToolResult::success(none("stale"), ms())),
-            VerifiedEmail::None => return Ok(ToolResult::success(none("no_verified_email"), ms())),
-        };
+        let (email, source) =
+            match crate::verified_email::verified_email_state(&identity, chrono::Utc::now()) {
+                VerifiedEmail::Fresh(email, source) => (email, source),
+                VerifiedEmail::Stale => return Ok(ToolResult::success(none("stale"), ms())),
+                VerifiedEmail::None => {
+                    return Ok(ToolResult::success(none("no_verified_email"), ms()))
+                }
+            };
         let (lookup, args) = self.on.lookup(&email);
         let Some(tool) = self.tools.upgrade().and_then(|t| t.get(lookup)) else {
             return Ok(ToolResult::failure(

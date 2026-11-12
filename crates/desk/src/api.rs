@@ -1646,8 +1646,41 @@ async fn change_memory_settings(
         Ok(b) => b,
         Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
     };
+    // What the install set is the hub holder's alone to change.
+    if change.chooses() {
+        if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+            return (status, Json(json!({ "error": "Only the person whose Desk this is can change what it remembers." }))).into_response();
+        }
+    }
     s.desk
         .change_memory_settings(&change)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct RetainQuery {
+    days: u32,
+    token: Option<String>,
+}
+
+/// What keeping conversations `days` would remove at the next sweep, for
+/// Desk to confirm a shrink against.
+async fn retain_preview(State(s): S, h: HeaderMap, Query(q): Query<RetainQuery>) -> Response {
+    if let Err(r) = guard(
+        &*s.auth,
+        &h,
+        &TokenQuery {
+            token: q.token.clone(),
+        },
+    )
+    .await
+    {
+        return r;
+    }
+    s.desk
+        .retain_preview(q.days)
         .await
         .map(Json)
         .into_response()
@@ -1901,6 +1934,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/memory/settings",
             get(memory_settings).patch(change_memory_settings),
         )
+        .route("/api/desk/memory/retain-preview", get(retain_preview))
         .route("/api/desk/memory/groups/{id}", patch(change_group_memory))
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(

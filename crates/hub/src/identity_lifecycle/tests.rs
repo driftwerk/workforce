@@ -1682,7 +1682,9 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
 /// from; suspending someone forgets theirs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension() {
-    use crate::oidc::{OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY, OIDC_VERIFIED_EMAIL_KEY};
+    use crate::verified_email::{
+        OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY, OIDC_VERIFIED_EMAIL_KEY,
+    };
     let hub = hub().await;
     let admin = hub.admin();
     let at = chrono::Utc::now().to_rfc3339();
@@ -1709,7 +1711,7 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
         Some("sub-ada")
     );
     assert_eq!(
-        crate::oidc::verified_email(&bo).as_deref(),
+        crate::verified_email::verified_email(&bo).as_deref(),
         Some("ada@example.com")
     );
     // Into someone with their own sign-in: theirs stands, and the source's
@@ -1723,7 +1725,7 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
         .unwrap();
     let ed = hub.identities.get_by_id(ed.id).unwrap().unwrap();
     assert_eq!(
-        crate::oidc::verified_email(&ed),
+        crate::verified_email::verified_email(&ed),
         None,
         "no sign-in moved, so no email"
     );
@@ -1768,5 +1770,5 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
     assert!(!cy
         .linked_ids
         .keys()
-        .any(|k| crate::oidc::is_verified_key(k)));
+        .any(|k| crate::verified_email::is_verified_key(k)));
 }
