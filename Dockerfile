@@ -103,6 +103,11 @@ RUN chmod 0755 /usr/local/bin/workforce-init
 # ─── Bundled skills (SKILL.md workflow definitions) ─────────────────────────
 COPY skills/ /app/bundled-skills/skills/
 
+# ─── Chromium (headless browser for the `browser` skill via CDP) ─────────────
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 # ─── Claude Code CLI (used by coding.claude tool + claude-code workflow engine) ─
 # Pinned: an unpinned install silently crossing CC's 2.1.69 schema-deferral
 # boundary inside a frozen cache epoch is what hid the ToolSearch breakage.
