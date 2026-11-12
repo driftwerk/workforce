@@ -768,14 +768,11 @@ async fn a_page_opened_for_the_person_outlives_the_turn_and_is_not_the_agents() 
         .handed
         .contains(&"https://staging.example.com/".to_string()));
     assert!(!live().await.iter().any(|l| l.agent == "shower"));
-    let closes = calls_of("close");
-    assert_eq!(turn_ended("turn-hand").await, 0);
-    assert_eq!(calls_of("close"), closes, "the person's tab isn't closed");
-    // The agent's next call on "the page" is told it's theirs, and opens
-    // no tab; a page of its own it may still open.
+    // In the same turn, a call on "the page" is told it's theirs, and
+    // Chrome isn't asked (which would open the agent a blank tab).
     let asked = WORLD.lock().unwrap().calls.len();
     let read = run_in(
-        "turn-next",
+        "turn-hand",
         "shower",
         "sarah",
         "browser.snapshot",
@@ -788,16 +785,26 @@ async fn a_page_opened_for_the_person_outlives_the_turn_and_is_not_the_agents() 
         asked,
         "Chrome isn't asked"
     );
+    let closes = calls_of("close");
+    assert_eq!(turn_ended("turn-hand").await, 0);
+    assert_eq!(calls_of("close"), closes, "the person's tab isn't closed");
+    // A page of its own it may still open, which closes with its turn; the
+    // person's page is never touched.
     let own = run_in(
         "turn-next",
         "shower",
         "sarah",
         "browser.navigate",
-        json!({ "url": "https://staging.example.com/" }),
+        json!({ "url": "https://own.example/" }),
     )
     .await;
     assert!(own.success, "{:?}", own.error);
     assert_eq!(turn_ended("turn-next").await, 1, "its own tab closes");
+    assert!(!WORLD
+        .lock()
+        .unwrap()
+        .handed
+        .contains(&"https://own.example/".to_string()));
     let rows = HOOKS.done.lock().unwrap();
     assert!(rows
         .iter()
