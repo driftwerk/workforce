@@ -531,7 +531,7 @@ impl Desk {
     }
 
     /// The registry's record of `id`, closed sessions too.
-    async fn session_record(&self, id: Uuid) -> Option<SessionRecord> {
+    pub(super) async fn session_record(&self, id: Uuid) -> Option<SessionRecord> {
         if let Ok(r) = self.record(id) {
             return Some(r);
         }
@@ -626,6 +626,11 @@ impl Desk {
                 tracing::warn!(session = %id, error = %e, "couldn't read a session's record");
                 failed.get_or_insert(e);
             }
+        }
+        // The turn's exchanges are kept now: its account is written from
+        // them, off the harvest.
+        if ending {
+            self.account_turn_ended(id);
         }
         failed.map_or(Ok(()), Err)
     }

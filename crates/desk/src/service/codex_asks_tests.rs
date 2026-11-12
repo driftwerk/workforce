@@ -116,6 +116,7 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             },
             CancellationToken::new(),
         )
@@ -334,6 +335,7 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             },
             CancellationToken::new(),
         )
@@ -437,6 +439,7 @@ async fn a_codex_turn_that_failed_leaves_its_session_done() {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             },
             CancellationToken::new(),
         )

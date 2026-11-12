@@ -1935,6 +1935,7 @@ mod floor {
                         redactor: None,
                         index: None,
                         deriver: None,
+                        accountant: None,
                     },
                 )
                 .await;
@@ -2048,6 +2049,7 @@ mod floor {
                         redactor: None,
                         index: None,
                         deriver: None,
+                        accountant: None,
                     },
                 )
                 .await;
@@ -2150,6 +2152,7 @@ mod floor {
                         redactor: None,
                         index: None,
                         deriver: None,
+                        accountant: None,
                     },
                 )
                 .await;
@@ -2478,6 +2481,7 @@ mod floor {
                         redactor: None,
                         index: None,
                         deriver: None,
+                        accountant: None,
                     },
                 )
                 .await;

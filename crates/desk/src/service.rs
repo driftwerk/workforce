@@ -96,6 +96,10 @@ mod memory_line_tests;
 mod memory_recall;
 mod modes;
 mod moves;
+mod session_account;
+#[cfg(test)]
+mod session_account_tests;
+pub use session_account::Moment as AccountMoment;
 #[cfg(test)]
 mod moves_tests;
 #[cfg(test)]
@@ -774,6 +778,10 @@ pub struct Floor {
     /// Notes decisions, facts and to-dos from sessions: the hub's cheap
     /// model. Without one, nothing is noted.
     pub deriver: Option<Arc<dyn crate::memory::derive::Deriver>>,
+    /// Keeps each overseen session's running account: the hub's cheap
+    /// model, which is handed each turn end's gist too. Without one, no
+    /// account is kept.
+    pub accountant: Option<Arc<dyn crate::account::Accountant>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -880,6 +888,7 @@ struct Inner {
     index: memory_index::IndexRun,
     /// Session memory's notes and their worker.
     derive: memory_derive::DeriveRun,
+    accounts: session_account::AccountRun,
     /// Handoff's lineage, and its preview's wait.
     handoff: handoff::HandoffRun,
     /// Reads a turn's last reply where the rules can't tell whether it
@@ -1568,6 +1577,7 @@ impl Desk {
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
             derive: memory_derive::DeriveRun::new(floor.deriver.clone()),
+            accounts: session_account::AccountRun::new(floor.accountant.clone()),
             handoff: Default::default(),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
@@ -1606,6 +1616,7 @@ impl Desk {
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().index_loop());
         tokio::spawn(desk.clone().derive_loop());
+        tokio::spawn(desk.clone().account_loop());
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
@@ -7170,6 +7181,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7333,6 +7345,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7466,6 +7479,7 @@ mod tests {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -7583,6 +7597,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7708,6 +7723,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8026,6 +8042,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8870,6 +8887,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8934,6 +8952,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -9002,6 +9021,7 @@ mod tests {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             },
             CancellationToken::new(),
         )

@@ -2,6 +2,8 @@
 //! the person at the machine, tracked through hooks and app-server events,
 //! kept in a Postgres registry, and restored after a restart.
 
+pub mod account;
+pub mod account_store;
 mod adopt;
 pub mod api;
 pub mod asking;
@@ -94,6 +96,7 @@ pub use conversations::{
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
+pub use service::AccountMoment;
 pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
     BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
