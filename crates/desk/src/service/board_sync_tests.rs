@@ -650,6 +650,8 @@ struct FakeLinear {
     verified_email: Mutex<Option<String>>,
     /// The workspace's members: (id, name, email).
     members: Mutex<Vec<(String, String, String)>>,
+    /// Whom the person chose to be there: (id, name).
+    chosen: Mutex<Option<(String, String)>>,
 }
 
 impl FakeLinear {
@@ -718,6 +720,11 @@ impl Remote for FakeLinear {
             // The hub's own match: its filters are the hub's to test; here,
             // what it answers for the person's verified email.
             "identity.linear_member_by_my_email" => {
+                if let Some((id, name)) = self.chosen.lock().unwrap().clone() {
+                    return Ok(
+                        json!({ "user": { "id": id, "name": name }, "why": null, "source": "chosen" }),
+                    );
+                }
                 let Some(want) = self.verified_email.lock().unwrap().clone() else {
                     return Ok(json!({ "user": null, "why": "no_verified_email" }));
                 };
@@ -1352,6 +1359,71 @@ async fn a_shared_key_names_the_one_member_with_the_verified_email() {
             linear.calls_of("linear.issue_update"),
             vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
         );
+    })
+    .await;
+}
+
+/// Whom the person chose to be on a shared key is who the board goes by:
+/// Take it assigns them, "assigned to me" asks for them; a choice cleared
+/// falls back to the verified email.
+#[tokio::test]
+async fn a_chosen_member_is_who_the_board_goes_by() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let linear = FakeLinear::default();
+        *linear.viewer.lock().unwrap() = Some(viewer(false));
+        // Their Slack email isn't their Linear one: no match, so they choose.
+        *linear.verified_email.lock().unwrap() = Some("sam@slack.example".into());
+        linear.members.lock().unwrap().extend([
+            (
+                ME.to_string(),
+                "Sam".to_string(),
+                "sam@linear.example".to_string(),
+            ),
+            (
+                ANA.to_string(),
+                "Ana".to_string(),
+                "ana@example.com".to_string(),
+            ),
+        ]);
+        *linear.chosen.lock().unwrap() = Some((ME.to_string(), "Sam".to_string()));
+        linear.set(1, "unstarted", 1, None);
+        let b = taker(&d, &linear).await;
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            (s.me.as_deref(), s.me_source),
+            (Some(ME), Some(crate::board::MeSource::Chosen))
+        );
+        assert_eq!(
+            crate::board_sync::linear_args(
+                "team",
+                &crate::board::Filter::AssignedToMe,
+                s.me.as_deref(),
+                None,
+                None
+            )["assignee_id"],
+            ME
+        );
+        let t = ticket_of(&d, &b, "ENG-1").await.ticket.id;
+        d.take_ticket(t, &linear, "Atlas", &crate::crew::By::you())
+            .await
+            .unwrap();
+        assert_eq!(
+            linear.calls_of("linear.issue_update"),
+            vec![json!({ "identifier": "ENG-1", "assignee_id": ME })]
+        );
+        // Changed to Ana, then cleared: back to the email, which names no one.
+        *linear.chosen.lock().unwrap() = Some((ANA.to_string(), "Ana".to_string()));
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        assert_eq!(
+            d.board_sync(b.id).await.unwrap().unwrap().1.me.as_deref(),
+            Some(ANA)
+        );
+        *linear.chosen.lock().unwrap() = None;
+        d.recheck_me(b.id, &linear, "Atlas").await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.me, s.me_source), (None, None));
     })
     .await;
 }

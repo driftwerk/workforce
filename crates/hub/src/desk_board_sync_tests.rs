@@ -364,6 +364,8 @@ pub(crate) async fn remote_hub_of_agents_with(
             "help",
             "identity.whoami",
             "identity.jira_user_by_my_email",
+            "identity.jira_users_named",
+            "identity.jira_choose_me",
         ],
         jira,
         Some(devices),
@@ -1641,6 +1643,8 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "jira_transition_issue",
         "jira_update_issue",
         "identity_jira_user_by_my_email",
+        "identity_jira_users_named",
+        "identity_jira_choose_me",
     ];
     expected.sort();
     assert_eq!(names, expected);
@@ -1679,6 +1683,44 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         json!({ "id": SAM_ACCOUNT, "name": "Sam" }),
         "{asked}"
     );
+    // Or whom they choose to be: the names there (never an email), then
+    // their own choice, which comes before the email.
+    let named = device
+        .call("identity.jira_users_named", json!({ "name": "sa" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        named["members"],
+        json!([{ "id": SAM_ACCOUNT, "name": "Sam", "avatar": null }]),
+        "{named}"
+    );
+    assert!(!named.to_string().contains('@'));
+    device
+        .call(
+            "identity.jira_choose_me",
+            json!({ "id": "557058:other", "name": "Sam R." }),
+        )
+        .await
+        .unwrap();
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        asked["user"],
+        json!({ "id": "557058:other", "name": "Sam R." })
+    );
+    assert_eq!(asked["source"], "chosen");
+    device
+        .call("identity.jira_choose_me", json!({ "clear": true }))
+        .await
+        .unwrap();
+    let asked = device
+        .call("identity.jira_user_by_my_email", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(asked["user"]["id"], SAM_ACCOUNT);
+    assert_eq!(asked["source"], "sign_in");
 }
 
 /// A hub that refuses or slows the list of its agents says so, never as

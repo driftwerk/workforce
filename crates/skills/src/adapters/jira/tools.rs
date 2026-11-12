@@ -797,6 +797,9 @@ impl Tool for JiraMyselfTool {
                     "display_name": me["displayName"],
                     "email": me["emailAddress"],
                     "personal": personal,
+                    // Which Jira site this is: what a person's choice of
+                    // who they are there is kept against.
+                    "site": client.site(),
                 }),
                 start.elapsed().as_millis() as u64,
             )),
@@ -1442,6 +1445,7 @@ impl Tool for JiraSearchUsersTool {
                             "email": u["emailAddress"],
                             "active": u["active"],
                             "account_type": u["accountType"],
+                            "avatar": u["avatarUrls"]["48x48"],
                         })
                     })
                     .collect();

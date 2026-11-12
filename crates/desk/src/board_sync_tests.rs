@@ -729,6 +729,24 @@ fn who_the_person_is_comes_from_the_hub_s_identity_tool() {
         )
     );
     assert!(crate::board::MeSource::VouchedBySlack.vouched());
+    // And whom they chose to be.
+    assert_eq!(
+        by_email_of(
+            System::Jira,
+            &json!({ "user": { "id": "557058:kay", "name": "Kay" }, "why": null, "source": "chosen" })
+        ),
+        Who::ByEmail(
+            Assignee {
+                id: "557058:kay".into(),
+                name: "Kay".into()
+            },
+            crate::board::MeSource::Chosen
+        )
+    );
+    assert!(
+        crate::board::MeSource::Chosen.vouched()
+            && crate::board::MeSource::Chosen.on_a_shared_key()
+    );
     assert!(crate::board::MeSource::VouchedBySlack.on_a_shared_key());
     assert_eq!(
         by_email_of(
