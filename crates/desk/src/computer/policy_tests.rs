@@ -1067,6 +1067,7 @@ fn writing_over_a_file_outside_the_folder_asks_at_full_access() {
 /// Tools that only read a page, and tools that change one.
 const BROWSER_READS: &[&str] = &[
     "browser.navigate",
+    "browser.open_for_me",
     "browser.sign_in",
     "browser.snapshot",
     "browser.screenshot",

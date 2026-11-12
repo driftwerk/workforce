@@ -512,6 +512,10 @@ impl BrowserClient {
         self.cell().await.navigate(url).await
     }
 
+    pub(super) async fn open_for_person(&self, url: &str) -> Result<Value> {
+        self.cell().await.open_for_person(url).await
+    }
+
     pub(super) async fn sign_in(&self, url: &str) -> Result<Value> {
         self.cell().await.sign_in(url).await
     }
