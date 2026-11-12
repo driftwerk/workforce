@@ -294,6 +294,9 @@ struct HubAccounts {
     plans: Option<PlanSource>,
     /// How a key is tried before it is stored.
     calls: Arc<dyn TestCall>,
+    /// The ports this hub listens on: a server address on this computer at
+    /// one of them is the hub itself, never a model server.
+    own_ports: Vec<u16>,
 }
 
 type GoogleLogin = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
@@ -362,6 +365,60 @@ fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
 }
 
 /// A server address as the client is handed it.
+/// `value` as a region, location or project name: lowercase letters,
+/// digits and dashes only, since it becomes part of the provider's address.
+fn place_name(label: &str, value: Option<String>) -> Result<Option<String>, AccountError> {
+    match value {
+        Some(v)
+            if v.is_empty()
+                || !v
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+        {
+            Err(AccountError::Invalid(format!(
+                "the {label} is lowercase letters, digits and dashes, like us-east-1"
+            )))
+        }
+        v => Ok(v),
+    }
+}
+
+/// `url` as it may be said back: never a user or password typed into it.
+fn shown_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => "that address".into(),
+    }
+}
+
+/// Whether `url` reaches this computer at one of `ports`.
+fn is_own(url: &str, ports: &[u16]) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let local = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        None => false,
+    };
+    local
+        && u.port_or_known_default()
+            .is_some_and(|p| ports.contains(&p))
+}
+
+/// The ports in listen addresses like `0.0.0.0:8080`.
+fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
+    listens
+        .into_iter()
+        .filter_map(|l| l.rsplit(':').next()?.parse().ok())
+        .collect()
+}
+
 fn server_url(fields: &Fields) -> Result<String, AccountError> {
     let url = field(fields, "url").unwrap_or_default();
     match url::Url::parse(url) {
@@ -400,14 +457,14 @@ fn account(
                         .into(),
                 ));
             }
-            extras.region = field(fields, "region").map(str::to_string);
+            extras.region = place_name("region", field(fields, "region").map(str::to_string))?;
             extras.profile = Some(profile);
             // The profile, not the hub's environment or default chain, is
             // where its credentials come from.
             workforce_agent::llm::bedrock_credentials::CHAIN_SENTINEL.to_string()
         }
         ProviderKind::Bedrock => {
-            extras.region = field(fields, "region").map(str::to_string);
+            extras.region = place_name("region", field(fields, "region").map(str::to_string))?;
             format!(
                 "{}:{}",
                 required("access_key_id")?,
@@ -415,14 +472,13 @@ fn account(
             )
         }
         ProviderKind::VertexAnthropic if field(fields, "service_account_json").is_none() => {
-            extras.project = Some(field(fields, "project").map(str::to_string).ok_or_else(
-                || {
-                    AccountError::Invalid(
-                        "using your Google login needs the Project ID: a login names no project"
-                            .into(),
-                    )
-                },
-            )?);
+            extras.project =
+                place_name("Project ID", field(fields, "project").map(str::to_string))?;
+            extras.project = Some(extras.project.take().ok_or_else(|| {
+                AccountError::Invalid(
+                    "using your Google login needs the Project ID: a login names no project".into(),
+                )
+            })?);
             if google_login().is_none() {
                 return Err(AccountError::Invalid(
                     "no Google login was found on this Mac: run gcloud auth \
@@ -430,7 +486,10 @@ fn account(
                         .into(),
                 ));
             }
-            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            extras.location = place_name(
+                "location",
+                Some(field(fields, "location").unwrap_or("global").to_string()),
+            )?;
             CHAIN_SENTINEL.to_string()
         }
         ProviderKind::VertexAnthropic => {
@@ -441,15 +500,21 @@ fn account(
                     "the service account key is the whole JSON key file, starting with {".into(),
                 ));
             };
-            extras.project = field(fields, "project")
-                .map(str::to_string)
-                .or_else(|| source.project_id());
+            extras.project = place_name(
+                "Project ID",
+                field(fields, "project")
+                    .map(str::to_string)
+                    .or_else(|| source.project_id()),
+            )?;
             if extras.project.is_none() {
                 return Err(AccountError::Invalid(
                     "the key names no project: give the Project ID".into(),
                 ));
             }
-            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            extras.location = place_name(
+                "location",
+                Some(field(fields, "location").unwrap_or("global").to_string()),
+            )?;
             key
         }
         ProviderKind::Ollama => server_url(fields)?,
@@ -538,6 +603,12 @@ impl HubAccounts {
         let extras: AccountExtras = serde_json::from_value(record.clone()).unwrap_or_default();
         match kind {
             ProviderKind::Ollama => return Ok(()),
+            ProviderKind::Vllm if is_own(api_key, &self.own_ports) => {
+                return Err(AccountError::Invalid(
+                    "that address is Desk itself, not a vLLM server: give the address vLLM listens on"
+                        .into(),
+                ));
+            }
             ProviderKind::Vllm => {
                 return match self
                     .calls
@@ -546,7 +617,8 @@ impl HubAccounts {
                 {
                     true => Ok(()),
                     false => Err(AccountError::Refused(format!(
-                        "Desk couldn't get the models from the vLLM server at {api_key}. Check                          it's running, the address, and the API key if it asks for one."
+                        "Desk couldn't get the models from the vLLM server at {}. Check it's running, the address, and the API key if it asks for one.",
+                        shown_url(api_key)
                     ))),
                 };
             }
@@ -701,6 +773,8 @@ impl Accounts for HubAccounts {
     async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
         let (kind, name) = metered(spec)?;
         let record = account(kind, fields, &self.google_login)?;
+        // Nowhere to keep it: say so before any call is made with it.
+        self.vault()?;
         self.tried(spec, kind, &record).await?;
         let path = self
             .vault()?
@@ -1085,6 +1159,7 @@ pub async fn mount(
             },
             google_login: Arc::new(adc_file),
             calls: Arc::new(Live),
+            own_ports: ports_of([config.hub.listen.as_str(), config.gateway.listen.as_str()]),
             plans: state
                 .registry
                 .host()
@@ -1504,6 +1579,7 @@ mod tests {
                 google_login: Arc::new(|| None),
                 plans: None,
                 calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             }
         }
 
@@ -1802,6 +1878,7 @@ mod tests {
             // One the provider answers is stored, and stands connected.
             let passing = HubAccounts {
                 calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
                 ..accounts
             };
             passing
@@ -1809,6 +1886,117 @@ mod tests {
                 .await
                 .unwrap();
             assert!(passing.standing(anthropic).await.connected);
+        }
+
+        #[test]
+        fn a_region_location_or_project_is_only_a_name_never_part_of_an_address() {
+            for ok in ["us-east-1", "global", "europe-west4", "acme-ai-123"] {
+                assert_eq!(
+                    place_name("region", Some(ok.into())).unwrap().as_deref(),
+                    Some(ok)
+                );
+            }
+            assert_eq!(place_name("region", None).unwrap(), None);
+            for bad in [
+                "evil.example.com/x",
+                "us-east-1.attacker.net",
+                "us-east-1#",
+                "a/b",
+                "US-EAST-1",
+                "",
+                "x@y",
+            ] {
+                assert!(
+                    matches!(
+                        place_name("region", Some(bad.into())),
+                        Err(AccountError::Invalid(_))
+                    ),
+                    "{bad}"
+                );
+            }
+            let bedrock = |region: &str| {
+                account(
+                    kind("bedrock"),
+                    &fields(&[
+                        ("access_key_id", "AKIA"),
+                        ("secret_access_key", "s"),
+                        ("region", region),
+                    ]),
+                    &(Arc::new(|| None) as GoogleLogin),
+                )
+            };
+            assert!(bedrock("eu-west-2").is_ok());
+            assert!(bedrock("169.254.169.254/latest").is_err());
+        }
+
+        #[test]
+        fn an_address_is_said_back_without_its_user_or_password() {
+            assert_eq!(
+                shown_url("http://sam:hunter2@gpu.lan:8000/v1"),
+                "http://gpu.lan:8000/v1"
+            );
+            assert_eq!(shown_url("not a url"), "that address");
+        }
+
+        #[test]
+        fn the_hubs_own_ports_on_this_computer_are_never_a_model_server() {
+            let own = ports_of(["127.0.0.1:8080", "0.0.0.0:3000"]);
+            assert_eq!(own, vec![8080, 3000]);
+            for url in [
+                "http://127.0.0.1:8080",
+                "http://localhost:3000/v1",
+                "http://[::1]:8080",
+                "http://0.0.0.0:3000",
+                "http://127.0.0.2:8080",
+            ] {
+                assert!(is_own(url, &own), "{url}");
+            }
+            for url in ["http://127.0.0.1:8000", "http://gpu.lan:8080", "nope"] {
+                assert!(!is_own(url, &own), "{url}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_hub_itself_is_refused_as_a_vllm_server_before_any_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let calls = Arc::new(crate::desk_key_check::Answers::passing());
+            let accounts = HubAccounts {
+                calls: calls.clone(),
+                own_ports: vec![8080],
+                ..accounts(&global)
+            };
+            let e = accounts
+                .connect(
+                    spec("vllm").unwrap(),
+                    &fields(&[("url", "http://localhost:8080")]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Invalid(m) if m.contains("Desk itself")),
+                "{e:?}"
+            );
+            assert!(calls.asked.lock().is_empty());
+            assert!(global.find_account("vllm").is_none());
+        }
+
+        #[tokio::test]
+        async fn without_a_vault_no_test_call_is_made() {
+            let calls = Arc::new(crate::desk_key_check::Answers::passing());
+            let e = HubAccounts {
+                vault: None,
+                known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
+                plans: None,
+                calls: calls.clone(),
+                own_ports: Vec::new(),
+            }
+            .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
+            .await
+            .unwrap_err();
+            assert!(matches!(e, AccountError::Unavailable(_)), "{e:?}");
+            assert!(calls.asked.lock().is_empty());
         }
 
         #[tokio::test]
@@ -1828,6 +2016,17 @@ mod tests {
                 .unwrap_err();
             assert!(
                 matches!(&e, AccountError::Refused(m) if m.contains("http://127.0.0.1:9")),
+                "{e:?}"
+            );
+            let e = accounts
+                .connect(
+                    spec("vllm").unwrap(),
+                    &fields(&[("url", "http://sam:hunter2@127.0.0.1:9")]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Refused(m) if !m.contains("hunter2") && !m.contains("sam")),
                 "{e:?}"
             );
             assert!(global.find_account("vllm").is_none());
@@ -1985,6 +2184,7 @@ mod tests {
                 google_login: Arc::new(|| None),
                 plans: None,
                 calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             }
             .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
             .await
@@ -2018,6 +2218,7 @@ mod tests {
                 google_login: Arc::new(|| None),
                 plans: None,
                 calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             };
             for spec in PROVIDERS {
                 let models: Vec<&str> = match spec.lists_installed() {
@@ -2107,6 +2308,7 @@ mod tests {
                 google_login: Arc::new(|| None),
                 plans: None,
                 calls: Arc::new(crate::desk_key_check::Answers::passing()),
+                own_ports: Vec::new(),
             };
             let bedrock = spec("bedrock").unwrap();
             let unhonoured: Vec<&str> = bedrock
