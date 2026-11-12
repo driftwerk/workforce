@@ -412,8 +412,14 @@ pub async fn update_identity(
     if let Some(status) = req.status {
         identity.status = IdentityStatus::from_str_lossy(&status);
     }
-    if let Some(linked_ids) = req.linked_ids {
+    if let Some(mut linked_ids) = req.linked_ids {
+        // The verified email is a sign-in's to write, never an edit's.
+        crate::oidc::keep_stored_verified(&identity.linked_ids, &mut linked_ids);
         identity.linked_ids = linked_ids;
+    }
+    // Suspended here as through the lifecycle: the verified email goes.
+    if identity.status == IdentityStatus::Suspended {
+        crate::oidc::forget_verified_email(&mut identity);
     }
     identity.updated_at = chrono::Utc::now();
 

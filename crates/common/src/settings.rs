@@ -2011,6 +2011,12 @@ pub struct HubConfig {
     /// the operator to configure it and HubSpot webhooks cannot verify.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// What this workspace is called where people connect to it (Desk
+    /// names it so in Settings → Workspaces): `name = "Driftwerk"`.
+    /// Optional; when unset it is the first part of the hub's address that
+    /// says whose it is (`workforce.driftwerk.xyz` → "Driftwerk").
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Default for HubConfig {
@@ -2025,6 +2031,7 @@ impl Default for HubConfig {
             resume_delay_secs: None,
             workflow_maintenance_interval_secs: None,
             public_url: None,
+            name: None,
         }
     }
 }
@@ -9139,6 +9146,7 @@ impl RemoteMcpConfig {
         "jira.add_comment",
         "jira.get_project",
         "jira.myself",
+        "identity.jira_user_by_my_email",
         "linear.issue_list",
         "linear.issue_get",
         "linear.issue_search",
@@ -9149,6 +9157,7 @@ impl RemoteMcpConfig {
         "linear.states_list",
         "linear.teams_list",
         "linear.viewer",
+        "identity.linear_member_by_my_email",
         "help",
     ];
 

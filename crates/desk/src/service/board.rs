@@ -529,12 +529,19 @@ impl Desk {
         );
         // A change here on a synced board goes out to its issue; the pull's
         // own changes don't go back.
-        let pushes = b.as_ref().is_some_and(|b| b.sync.is_some())
+        let sync = b.as_ref().and_then(|b| b.sync.as_ref());
+        let pushes = sync.is_some()
             && !crate::board_sync::is_remote_party(&by.party)
             && match &t.external {
                 Some(e) => e.synced && !e.kept,
-                // Only what the person made here becomes an issue there.
-                None => t.created_by.kind == PartyKind::You,
+                // Only what the person made here becomes an issue there, and
+                // never one the board had before it was linked keeping them.
+                None => {
+                    t.created_by.kind == PartyKind::You
+                        && sync
+                            .and_then(|s| s.local_before)
+                            .is_none_or(|at| t.created_at > at)
+                }
             };
         if pushes {
             if let Err(e) = self.0.store.queue_push(t.id, t.board, now()).await {
@@ -886,6 +893,7 @@ impl Desk {
                         .filter(|g| self.layout().groups.iter().any(|x| &x.id == g))
                 });
                 let session = NewSession {
+                    fresh_worktree: false,
                     engine: new.engine,
                     view: None,
                     name: key.clone(),

@@ -107,18 +107,49 @@ impl LedgerRun {
     }
 
     /// Notes what each engine is signed in as now, keeping when it was
-    /// first seen so.
+    /// first seen so (the same way of paying, by the same account, is the
+    /// same sign-in however else it reads). The sign-ins to keep across a
+    /// restart, as they now stand.
     pub(super) fn signed_in(
         &self,
         now: DateTime<Utc>,
         sign_ins: impl Iterator<Item = (Engine, SignIn)>,
-    ) {
+    ) -> Vec<crate::ledger_store::KeptSignIn> {
         let mut signed = self.signed.lock();
+        let mut keep = Vec::new();
         for (engine, sign_in) in sign_ins {
-            match signed.get(&engine) {
-                Some((known, _)) if *known == sign_in => {}
-                _ => {
-                    signed.insert(engine, (sign_in, now));
+            let since = match signed.get(&engine) {
+                Some((known, _)) if *known == sign_in => continue,
+                Some((known, since)) if same_payer(known, &sign_in) => *since,
+                _ => now,
+            };
+            if let Some(k) = kept(engine, &sign_in, since) {
+                keep.push(k);
+            }
+            signed.insert(engine, (sign_in, since));
+        }
+        keep
+    }
+
+    /// Puts back the sign-ins kept before a restart: a call made while
+    /// Desk was down is stamped with how it was paid. One read since that
+    /// is the same keeps the earlier time.
+    pub(super) fn restore_sign_ins(&self, kept: Vec<crate::ledger_store::KeptSignIn>) {
+        let mut signed = self.signed.lock();
+        for k in kept {
+            let restored = SignIn::In {
+                via: k.via,
+                who: k.who.clone(),
+                plan: None,
+                ids: Vec::new(),
+            };
+            match signed.get_mut(&k.engine) {
+                Some((now, since)) if same_payer(now, &restored) => {
+                    *since = (*since).min(k.since);
+                }
+                Some(_) => {}
+                None => {
+                    signed.insert(k.engine, (restored, k.since));
                 }
             }
         }
@@ -396,12 +427,28 @@ impl Desk {
         let _ = self.0.ledger.jobs.send(Job::Live { session: id, spend });
     }
 
-    /// Notes what the engines are signed in as, for the calls read from now.
+    /// Notes what the engines are signed in as, for the calls read from
+    /// now, and keeps it across a restart.
     pub(super) fn spend_signed_in(&self) {
         let now = Utc::now();
-        self.0
+        let keep = self
+            .0
             .ledger
             .signed_in(now, self.sign_ins().by_engine.into_iter());
+        if keep.is_empty() {
+            return;
+        }
+        let store = Arc::clone(&self.0.store);
+        tokio::spawn(async move {
+            for k in keep {
+                if let Err(e) = store.keep_sign_in(&k).await {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "couldn't keep an engine's sign-in"
+                    );
+                }
+            }
+        });
     }
 
     /// The ledger's worker: every known session's history first (closed
@@ -410,6 +457,15 @@ impl Desk {
     /// stops.
     pub(super) async fn ledger_loop(self, jobs: Jobs) {
         let Jobs { mut jobs, mut soon } = jobs;
+        // How each engine was signed in before a restart, before any of
+        // what it spent meanwhile is read.
+        match self.0.store.kept_sign_ins().await {
+            Ok(kept) => self.0.ledger.restore_sign_ins(kept),
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't read the engines' sign-ins kept before"
+            ),
+        }
         match self.0.store.every_session().await {
             Ok(all) => all.iter().for_each(|r| self.spend_read(r.id)),
             Err(e) => tracing::warn!(
@@ -906,6 +962,29 @@ impl Desk {
         view
     }
 
+    /// The real money the ledger's calls cost from `from` to `to`, in the
+    /// rows `filter` keeps: only the calls a key paid for
+    /// ([`Billing::billed`]), never a plan's at their API-equivalent.
+    pub async fn billed_usd(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        filter: &Filter,
+    ) -> Result<f64, DeskError> {
+        let tz = self.timezone();
+        let cells = self
+            .0
+            .store
+            .ledger_cells(from, to, tz.name(), filter)
+            .await?;
+        let seen = self.0.store.billings_seen().await?;
+        Ok(cells
+            .iter()
+            .filter(|c| billed(c.billing, seen.get(&c.engine)))
+            .map(|c| c.usd)
+            .sum())
+    }
+
     /// Where `period` began, in the person's timezone.
     pub fn period_start(&self, period: Period, now: DateTime<Utc>) -> DateTime<Utc> {
         ledger::window_start(period, now, self.timezone())
@@ -944,6 +1023,53 @@ impl Desk {
                 .encode()
             });
         Ok(LedgerPage { rows, next })
+    }
+}
+
+/// Whether two sign-ins pay the same way, by the same account where both
+/// say which.
+fn same_payer(a: &SignIn, b: &SignIn) -> bool {
+    match (a, b) {
+        (
+            SignIn::In {
+                via: va, who: wa, ..
+            },
+            SignIn::In {
+                via: vb, who: wb, ..
+            },
+        ) => va == vb && (wa.is_none() || wb.is_none() || wa == wb),
+        _ => false,
+    }
+}
+
+/// `sign_in` of `engine` since `since`, as kept across a restart; none for
+/// one signed out or not read.
+fn kept(
+    engine: Engine,
+    sign_in: &SignIn,
+    since: DateTime<Utc>,
+) -> Option<crate::ledger_store::KeptSignIn> {
+    match sign_in {
+        SignIn::In { via, who, .. } => Some(crate::ledger_store::KeptSignIn {
+            engine,
+            via: *via,
+            who: who.clone(),
+            since,
+        }),
+        SignIn::Out | SignIn::Unknown => None,
+    }
+}
+
+/// Whether a call paid as `billing`, on an engine seen signed in as
+/// `seen`, is real money: a key's always; one Desk can't say the payment
+/// of only when it could have been a key's (the engine was seen on a key,
+/// or never seen at all). On an engine only ever seen on plans it is a
+/// plan's, as after a restart before the sign-in is read again.
+pub(crate) fn billed(billing: Billing, seen: Option<&std::collections::BTreeSet<Via>>) -> bool {
+    match billing {
+        Billing::Key => true,
+        Billing::Plan | Billing::Vendor => false,
+        Billing::Unknown => seen.is_none_or(|s| s.is_empty() || s.contains(&Via::Key)),
     }
 }
 
@@ -1293,6 +1419,108 @@ mod tests {
             priced: Priced::None,
             billing: None,
         }
+    }
+
+    /// A restart keeps how each engine was signed in: a call made while
+    /// Desk was down, read before the sign-in is read again, is still the
+    /// plan's, and the same sign-in read again keeps the earlier time.
+    #[test]
+    fn a_restart_keeps_how_each_engine_was_signed_in() {
+        let since = DateTime::parse_from_rfc3339("2026-11-10T09:00:00Z")
+            .unwrap()
+            .to_utc();
+        let plan = crate::engine::claude_sign_in(
+            r#"{"loggedIn":true,"authMethod":"claude.ai","email":"allan@example.com","orgId":"org-1","subscriptionType":"max"}"#,
+        );
+        let (before, _rx) = LedgerRun::new(Some(Arc::new(Table)), None);
+        let keep = before.signed_in(since, [(Engine::Claude, plan.clone())].into_iter());
+        assert_eq!(keep.len(), 1);
+        assert_eq!(keep[0].via, crate::engine::Via::Plan);
+        assert_eq!(keep[0].since, since);
+
+        // Desk restarts: a call from while it was down, read first.
+        let (after, _rx) = LedgerRun::new(Some(Arc::new(Table)), None);
+        after.restore_sign_ins(keep);
+        let down = after.stamp(
+            Engine::Claude,
+            spend("2026-11-11T07:00:00Z", "claude-opus-5-5"),
+            None,
+        );
+        assert_eq!(down.billing, Billing::Plan, "not unknown after a restart");
+        // The sign-in read again: the same, so its time stands.
+        let again = after.signed_in(
+            since + chrono::Duration::days(1),
+            [(Engine::Claude, plan)].into_iter(),
+        );
+        assert_eq!(again[0].since, since);
+        // Signed in with a key instead: from now on, a key's.
+        let key = crate::engine::claude_sign_in(r#"{"loggedIn":true,"authMethod":"api_key"}"#);
+        let now = since + chrono::Duration::days(2);
+        let switched = after.signed_in(now, [(Engine::Claude, key)].into_iter());
+        assert_eq!(
+            (switched[0].via, switched[0].since),
+            (crate::engine::Via::Key, now)
+        );
+    }
+
+    /// Bedrock and Vertex sign Claude Code in as a third party: real money,
+    /// a key's, never a plan's.
+    #[test]
+    fn bedrock_and_vertex_are_billed_by_the_call() {
+        // As `claude auth status --json` (2.1.322) says it with
+        // CLAUDE_CODE_USE_BEDROCK=1 and AWS_REGION set.
+        let bedrock = crate::engine::claude_sign_in(
+            r#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock","analyticsDisabled":true,"loginExpiresAt":null}"#,
+        );
+        let vertex = crate::engine::claude_sign_in(
+            r#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"vertex","analyticsDisabled":true,"loginExpiresAt":null}"#,
+        );
+        for s in [bedrock, vertex] {
+            assert!(
+                matches!(
+                    s,
+                    SignIn::In {
+                        via: crate::engine::Via::Key,
+                        ..
+                    }
+                ),
+                "{s:?}"
+            );
+            let (run, _rx) = LedgerRun::new(Some(Arc::new(Table)), None);
+            let at = DateTime::parse_from_rfc3339("2026-11-11T09:00:00Z")
+                .unwrap()
+                .to_utc();
+            run.signed_in(at, [(Engine::Claude, s)].into_iter());
+            let call = run.stamp(
+                Engine::Claude,
+                spend("2026-11-11T09:30:00Z", "claude-opus-5-5"),
+                None,
+            );
+            assert_eq!(call.billing, Billing::Key);
+            assert!(billed(call.billing, None));
+        }
+    }
+
+    /// What counts as real money: a key's; an unknown one only where it
+    /// could be a key's.
+    #[test]
+    fn an_unknown_call_counts_only_where_it_could_be_a_keys() {
+        use crate::engine::Via;
+        let plans: std::collections::BTreeSet<Via> = [Via::Plan].into();
+        let both: std::collections::BTreeSet<Via> = [Via::Plan, Via::Key].into();
+        assert!(billed(Billing::Key, Some(&plans)));
+        assert!(!billed(Billing::Plan, Some(&both)));
+        assert!(!billed(Billing::Vendor, None));
+        assert!(
+            !billed(Billing::Unknown, Some(&plans)),
+            "only ever on plans: a plan's"
+        );
+        assert!(
+            billed(Billing::Unknown, Some(&both)),
+            "seen on a key: could be one"
+        );
+        assert!(billed(Billing::Unknown, None), "never seen: could be a key");
+        assert!(billed(Billing::Unknown, Some(&Default::default())));
     }
 
     #[test]

@@ -150,6 +150,13 @@ pub(crate) enum Action {
         session: Uuid,
         mode: Mode,
     },
+    /// Change the overseer `agent`'s own `[oversight]`: only ever a
+    /// suggestion, which only the person can accept, as its own limits are
+    /// never the overseer's to change.
+    ChangeOversight {
+        agent: String,
+        change: super::own_settings::Change,
+    },
 }
 
 #[derive(Deserialize)]
@@ -381,6 +388,10 @@ impl Action {
                     "Say which mode: default, acceptEdits, auto, plan or bypassPermissions.",
                 )?,
             },
+            super::own_settings::NAME => Self::ChangeOversight {
+                agent: text(i.agent_id, "whose settings")?,
+                change: super::own_settings::Change::parse(input)?,
+            },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -448,7 +459,8 @@ impl Action {
             | Self::TakeOn { .. }
             | Self::Release { .. }
             | Self::Handoff { .. }
-            | Self::SetMode { .. } => "",
+            | Self::SetMode { .. }
+            | Self::ChangeOversight { .. } => "",
         })
     }
 }
@@ -496,6 +508,13 @@ impl CrewHub {
         // Unbound, every crew action runs: Desk answers what it asks for
         // itself (`boss_decides`), and only the hold while the person types
         // into a session it runs waits, as a courtesy.
+        // Its own limits are the person's at every level, unbound too: only
+        // ever a card they approve.
+        if let Action::ChangeOversight { .. } = action {
+            return Gate::Suggest(
+                "your own limits are the person's to change, never yours: they approve it with one click".into(),
+            );
+        }
         let boss = self.boss_id(o);
         if o.level != Level::Watch && self.unbound(o) {
             if let Some(held) = self.mode_hold(action, o, boss.as_deref()) {
@@ -538,6 +557,11 @@ impl CrewHub {
         boss: Option<&str>,
         served: bool,
     ) -> Gate {
+        if let Action::ChangeOversight { .. } = action {
+            return Gate::Suggest(
+                "your own limits are the person's to change, never yours: they approve it with one click".into(),
+            );
+        }
         if let Some(held) = self.mode_hold(action, o, boss) {
             return held;
         }
@@ -699,7 +723,7 @@ impl CrewHub {
             Action::Deny { .. } | Action::Stop { .. } => (false, None),
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => (true, None),
-            Action::Handoff { .. } => (false, None),
+            Action::Handoff { .. } | Action::ChangeOversight { .. } => (false, None),
             // At Act, only to a mode that still asks before it runs a
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
@@ -922,7 +946,9 @@ impl CrewHub {
             // starts; and it is only ever suggested.
             | Action::Handoff { .. }
             // Below unbound, only to a mode that still asks.
-            | Action::SetMode { .. } => true,
+            | Action::SetMode { .. }
+            // Only ever a card the person approves.
+            | Action::ChangeOversight { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -1023,6 +1049,7 @@ impl CrewHub {
             }
             | Action::MoveTicket { .. }
             | Action::Escalate { .. } => None,
+            Action::ChangeOversight { agent, .. } => self.party_of_agent(agent),
             Action::Nudge {
                 to: Target::Session(s),
                 ..
@@ -1152,6 +1179,16 @@ impl CrewHub {
                 self.session_name(*session),
                 mode.title()
             ),
+            Action::ChangeOversight { agent, change } => {
+                let mut said = change.describe();
+                if let Some(first) = said.get(..1) {
+                    said = first.to_uppercase() + &said[1..];
+                }
+                format!(
+                    "{said}, in {}'s own oversight settings. Only you can change them.",
+                    self.agent_name(agent)
+                )
+            }
         }
     }
 
@@ -1174,6 +1211,22 @@ impl CrewHub {
         };
         let d = &self.desk;
         match action {
+            Action::ChangeOversight { agent, change } => {
+                // The person, saying yes to the card: never the overseer,
+                // whatever path an action takes.
+                if by.party.kind != crew::PartyKind::You {
+                    return Err("Only the person changes an overseer's own settings.".into());
+                }
+                let done = self.change_own_oversight(agent, change).await?;
+                let mut b = by;
+                b.reason = b.reason.or(Some("Approved in Desk.".into()));
+                self.desk.note(b.event(
+                    Kind::Approved,
+                    self.party_of_agent(agent),
+                    format!("changed {done}"),
+                ));
+                Ok(format!("changed {done}"))
+            }
             Action::Nudge {
                 to: Target::Session(s),
                 message,
@@ -1462,6 +1515,7 @@ impl CrewHub {
             .desk
             .create_for(
                 NewSession {
+                    fresh_worktree: false,
                     engine,
                     view: Some(view),
                     name: label,

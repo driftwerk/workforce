@@ -605,6 +605,7 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
         let s = d
             .create(
                 NewSession {
+                    fresh_worktree: false,
                     engine: Engine::Codex,
                     view: None,
                     name: "acme-api".into(),
@@ -723,6 +724,7 @@ async fn codex_working(
     let s = d
         .create(
             NewSession {
+                fresh_worktree: false,
                 engine: Engine::Codex,
                 view: None,
                 name: "acme-api".into(),
@@ -1602,4 +1604,66 @@ fn a_line_kind_reads_back() {
         assert_eq!(Asked::parse(a.as_str()).unwrap(), a);
     }
     assert_eq!(serde_json::to_value(Asked::Lapsed).unwrap(), "lapsed");
+}
+
+#[tokio::test]
+async fn a_reply_names_its_question_as_the_session_read_it_mark_or_id() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let a = new_session(&d, dir.path()).await;
+        let b = new_session(&d, dir.path()).await;
+        idle(&d, a.id).await;
+        idle(&d, b.id).await;
+        // A asks B, not waiting: B answers later on its own line.
+        let ask = |text: &'static str| {
+            let d = d.clone();
+            async move {
+                let r = d
+                    .line_call(
+                        a.id,
+                        "ask",
+                        &json!({"to": b.id, "text": text, "wait_seconds": 0}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                serde_json::from_value::<Uuid>(r["id"].clone()).unwrap()
+            }
+        };
+        let mark_of = |id: Uuid| id.simple().to_string()[..8].to_string();
+        for given in [
+            |m: &str, _: Uuid| m.to_string(),
+            |m: &str, _: Uuid| format!("m:{m}"),
+            |m: &str, _: Uuid| format!("[Desk m:{m}]"),
+            |_: &str, id: Uuid| id.to_string(),
+        ] {
+            let q = ask("Which port?").await;
+            let r = d
+                .line_call(
+                    b.id,
+                    "reply",
+                    &json!({"message_id": given(&mark_of(q), q), "text": "5433"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let answer: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+            assert_eq!(row(&d, answer).await.in_reply_to, Some(q));
+            assert_eq!(row(&d, q).await.asked, Some(Asked::Answered));
+        }
+        // A mark of no question to this session is said so, plainly.
+        let q = ask("Tests too?").await;
+        let refused = d
+            .line_call(
+                a.id,
+                "reply",
+                &json!({"message_id": mark_of(q), "text": "yes"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("No question to you"), "{refused}");
+    })
+    .await;
 }

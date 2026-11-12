@@ -157,6 +157,14 @@ pub(crate) async fn turn_tools(
         base
     };
     let base = without_disabled_tools(service, base);
+    // A Desk group's boss conversation: its boss tools and the agent's
+    // fenced memory alone, whatever else a whitelist names.
+    if workforce_common::channels::is_desk_boss_channel(&session.channel) {
+        return TurnTools {
+            registry: crate::boss_links::tools::for_turn(service, session, base),
+            exclusive: true,
+        };
+    }
     let Some(whitelist) = whitelist else {
         return TurnTools {
             registry: base,
@@ -513,6 +521,65 @@ pub(crate) mod tests {
             only_whitelisted_or_retrieval(&names, &["memory", "heartbeat"]),
             "{names:?}"
         );
+    }
+
+    /// A turn in a Desk group's boss conversation is offered the agent's
+    /// fenced memory alone of its own tools, whatever the agent has or gains
+    /// mid-turn, and whatever a whitelist names; any other conversation, all
+    /// of them.
+    #[tokio::test]
+    async fn a_boss_conversations_turn_keeps_only_what_neither_sends_nor_reads_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = plain_service(tmp.path()).await;
+        for name in [
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            "crew.overview",
+        ] {
+            service.tools.register(named(name));
+        }
+        // The real memory tool, as the hub registers it.
+        let memory = service.tools.get("memory").expect("the hub's memory tool");
+        assert!(service.tools.is_builtin("memory"));
+        assert_ne!(memory.description(), "stub");
+        let boss = Session::new("desk:boss:k-acme", "sam", service.agent_id.as_str());
+        let dm = Session::new("desk", "sam", service.agent_id.as_str());
+        for whitelist in [None, Some(&["http".to_string(), "web".to_string()][..])] {
+            let turn = turn_tools(&service, &boss, whitelist).await;
+            assert!(turn.exclusive);
+            let names = names_of(&turn);
+            assert!(
+                names
+                    .iter()
+                    .all(|n| crate::boss_links::hold::kept(&turn.registry, n)),
+                "{names:?}"
+            );
+            assert!(names.iter().any(|n| n == "memory"), "{names:?}");
+            assert!(std::ptr::addr_eq(
+                Arc::as_ptr(&turn.registry.get("memory").unwrap()),
+                Arc::as_ptr(&memory)
+            ));
+            service.tools.register(named("http.get"));
+            assert!(turn.registry.adopt(&["http.get".into()]).is_empty());
+        }
+        // An MCP server or a skill shadowing it: no memory in a boss turn.
+        service.tools.register(named("memory"));
+        let shadowed = turn_tools(&service, &boss, None).await;
+        assert!(
+            !shadowed.registry.has("memory"),
+            "{:?}",
+            names_of(&shadowed)
+        );
+        let plain = turn_tools(&service, &dm, None).await;
+        assert!([
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            "crew.overview"
+        ]
+        .iter()
+        .all(|n| plain.registry.has(n)));
     }
 
     /// The prod case: an agent not opted in to `code.refactor` runs every

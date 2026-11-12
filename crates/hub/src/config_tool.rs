@@ -210,7 +210,11 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
         Some(&"oversight") => Err(
-            "oversight is human-only: the person sets what an agent oversees in Desk".to_string(),
+            "oversight is human-only: you can't change your own limits (level, Act fully's daily \
+             budget, switches) and nothing else stands in for them. Tell the person so plainly; \
+             as their overseer, post crew.ask_oversight_change for them to approve with one \
+             click, else they change it in the agent's Desk settings"
+                .to_string(),
         ),
         Some(&"environments") => Err(
             "environments are human-only: a person changes them with `cmd: env …` or in the \
