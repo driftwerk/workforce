@@ -34,6 +34,13 @@ pub struct RemoteCaller {
     pub as_member: bool,
 }
 
+/// What a 403 says when the token's person is no longer active here. A
+/// client of this hub (a Desk's board sync) tells refusals apart by these
+/// words, so they are kept as they are.
+pub const NOT_ACTIVE: &str = "identity is not active";
+/// What a 403 says when the token is not one for remote MCP here.
+pub const OUT_OF_SCOPE: &str = "this token's scopes do not cover remote MCP on this hub";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthError {
     Unauthenticated,
@@ -53,12 +60,8 @@ impl IntoResponse for AuthError {
                 "a live remote MCP token is required",
             )
                 .into_response(),
-            Self::NotActive => (StatusCode::FORBIDDEN, "identity is not active").into_response(),
-            Self::OutOfScope => (
-                StatusCode::FORBIDDEN,
-                "this token's scopes do not cover remote MCP on this hub",
-            )
-                .into_response(),
+            Self::NotActive => (StatusCode::FORBIDDEN, NOT_ACTIVE).into_response(),
+            Self::OutOfScope => (StatusCode::FORBIDDEN, OUT_OF_SCOPE).into_response(),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "remote MCP token store unavailable",

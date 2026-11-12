@@ -288,6 +288,8 @@ pub(crate) struct RemoteHub {
     /// The hub's people, and the one the tokens are for.
     pub identities: Arc<workforce_identity::sqlite::SqliteIdentityStore>,
     pub person: uuid::Uuid,
+    /// The hub itself, to change who its agents admit.
+    pub state: Arc<GatewayState>,
 }
 
 pub(crate) async fn remote_hub(
@@ -312,15 +314,33 @@ pub(crate) async fn remote_hub_of_agents(
     dir: &std::path::Path,
     jira_on: Option<&str>,
 ) -> RemoteHub {
-    remote_hub_of_agents_with(dir, jira_on, false).await
+    remote_hub_of_agents_with(dir, jira_on, &[]).await
 }
 
-/// As [`remote_hub_of_agents`]; `lattice_closed`: its access policy admits
-/// someone else only.
+/// Closes agent `id` on `state` to everyone but a stranger, or opens it
+/// again to everyone.
+pub(crate) fn close_agent(state: &GatewayState, id: &str, closed: bool) {
+    use workforce_common::settings::{AccessMode, AgentAccessConfig};
+    state.access_gate.upsert(
+        id.into(),
+        AgentAccessConfig {
+            mode: if closed {
+                AccessMode::Allowlist
+            } else {
+                AccessMode::Open
+            },
+            allow: vec![uuid::Uuid::new_v4().to_string()],
+            ..Default::default()
+        },
+    );
+}
+
+/// As [`remote_hub_of_agents`]; the agents `closed` admit someone else
+/// only.
 pub(crate) async fn remote_hub_of_agents_with(
     dir: &std::path::Path,
     jira_on: Option<&str>,
-    lattice_closed: bool,
+    closed: &[&str],
 ) -> RemoteHub {
     let (fx, devices) = crate::remote_mcp::testing::fixture_with_devices(true);
     let jira: Shared = Arc::default();
@@ -346,16 +366,8 @@ pub(crate) async fn remote_hub_of_agents_with(
         }
         fx.state.registry.insert(id, service);
     }
-    if lattice_closed {
-        use workforce_common::settings::{AccessMode, AgentAccessConfig};
-        fx.state.access_gate.upsert(
-            "lattice".into(),
-            AgentAccessConfig {
-                mode: AccessMode::Allowlist,
-                allow: vec![uuid::Uuid::new_v4().to_string()],
-                ..Default::default()
-            },
-        );
+    for id in closed {
+        close_agent(&fx.state, id, true);
     }
     serve_remote(
         fx,
@@ -432,6 +444,7 @@ async fn serve_remote(
         jira,
         identities: Arc::clone(&fx.identities),
         person: member.id,
+        state: Arc::clone(&fx.state),
     }
 }
 
@@ -1575,7 +1588,7 @@ async fn no_agent_with_jira_is_said_plainly() {
 async fn a_hub_lists_only_the_agents_its_person_may_reach() {
     let dir = tempfile::tempdir().unwrap();
     let http = reqwest::Client::new();
-    let open = remote_hub_of_agents_with(dir.path(), Some("lattice"), false).await;
+    let open = remote_hub_of_agents_with(dir.path(), Some("lattice"), &[]).await;
     let list = |url: String, token: Option<String>| {
         let http = http.clone();
         async move {
@@ -1600,10 +1613,10 @@ async fn a_hub_lists_only_the_agents_its_person_may_reach() {
     let token = Secret::new(&open.token).unwrap();
     assert_eq!(
         hub_agents(&open.url, &token, &http).await.unwrap(),
-        ["default", "lattice"]
+        Some(vec!["default".to_string(), "lattice".to_string()])
     );
     let closed_dir = tempfile::tempdir().unwrap();
-    let closed = remote_hub_of_agents_with(closed_dir.path(), Some("lattice"), true).await;
+    let closed = remote_hub_of_agents_with(closed_dir.path(), Some("lattice"), &["lattice"]).await;
     let (status, body) = list(closed.url.clone(), Some(closed.token.clone())).await;
     assert_eq!(status, 200);
     assert_eq!(
@@ -1711,4 +1724,162 @@ async fn a_refused_or_busy_agent_list_is_said_as_such() {
             (_, other) => panic!("{status}: {other:?}"),
         }
     }
+}
+
+// ── A person the default agent turns away ────────────────────────────────
+
+/// The default agent doesn't let the person in, but another has Jira: the
+/// token is kept (it was never the token), the dialog says "Jira through
+/// Lattice", and the board syncs through it.
+#[tokio::test]
+async fn a_person_the_default_agent_turns_away_links_through_another() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote =
+            remote_hub_of_agents_with(&dir.path().join("remote"), Some("lattice"), &["default"])
+                .await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &[]);
+        let local = local_hub(desk.clone(), dir.path());
+        let (status, body) = local.link_atlas(&remote).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["offers"]["jira"], true, "{body}");
+        let (status, body) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" },
+                        "target": "ACME", "filter": { "kind": "all", "value": { "includeDone": false } } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"], json!({ "id": "lattice", "name": "Lattice" }));
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                link_body(Filter::All { include_done: false }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["agent"], "lattice");
+        local.sync.pass_board(b.id, true).await.unwrap();
+        assert_eq!(desk.tickets(b.id, &Default::default()).await.unwrap().len(), 1);
+    })
+    .await;
+}
+
+/// No agent there lets the person in: said so, not as a token to make
+/// again; nothing is kept.
+#[tokio::test]
+async fn no_agent_letting_you_in_is_said_plainly() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents_with(
+            &dir.path().join("remote"),
+            Some("lattice"),
+            &["default", "lattice"],
+        )
+        .await;
+        let local = local_hub(desk.clone(), dir.path());
+        let (status, body) = local.link_atlas(&remote).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "Atlas has no agent that lets you in; ask whoever runs it to let you use one."
+        );
+        assert!(local.sync.desk.sync_hub("atlas").await.unwrap().is_none());
+    })
+    .await;
+}
+
+/// A token the hub doesn't know is one to make again; a person it no longer
+/// lets in is told that instead.
+#[tokio::test]
+async fn a_dead_token_and_a_suspended_person_are_told_apart() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents(&dir.path().join("remote"), Some("lattice")).await;
+        let local = local_hub(desk.clone(), dir.path());
+        let bad = format!("wfr_{}", "x".repeat(43));
+        let (status, body) = local
+            .send(
+                "PUT",
+                "/api/desk/sync-hubs/atlas",
+                json!({ "name": "Atlas", "url": remote.url, "token": bad }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "Atlas refused that token; make a new one there.");
+        {
+            use workforce_identity::types::IdentityStatus;
+            let mut sam = remote.identities.get_by_id(remote.person).unwrap().unwrap();
+            sam.status = IdentityStatus::Suspended;
+            remote.identities.update(&sam).unwrap();
+        }
+        let (status, body) = local.link_atlas(&remote).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "Atlas turned that token away: your account there isn't active; ask whoever runs it to turn it back on."
+        );
+        // On an agent's own route too, never as a token to make again.
+        let direct = HubRemote::new(
+            &remote.url,
+            &Secret::new(&remote.token).unwrap(),
+            Arc::new(reqwest::Client::new()),
+            Some("lattice"),
+        )
+        .unwrap();
+        assert!(
+            matches!(direct.tools().await, Err(RemoteError::Refused(ref r)) if r.contains("isn't active")),
+        );
+    })
+    .await;
+}
+
+/// The agent a board syncs through stops letting the person in: the board
+/// pauses as missing its tools (never as a hub without remote MCP), and once
+/// an agent with them lets the person in again, its next pass goes on.
+#[tokio::test]
+async fn a_board_whose_agent_shuts_you_out_finds_one_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let remote = remote_hub_of_agents(&dir.path().join("remote"), Some("lattice")).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &[]);
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let b = board(&desk, "Acme").await;
+        let (status, body) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                link_body(Filter::All {
+                    include_done: false,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        close_agent(&remote.state, "lattice", true);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert!(
+            matches!(s.paused, Some(Paused::Missing { .. })),
+            "{:?}",
+            s.paused
+        );
+        close_agent(&remote.state, "lattice", false);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.agent.as_deref(), s.paused), (Some("lattice"), None));
+        assert_eq!(
+            desk.tickets(b.id, &Default::default()).await.unwrap().len(),
+            1
+        );
+    })
+    .await;
 }
