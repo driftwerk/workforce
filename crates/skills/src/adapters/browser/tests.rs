@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use eyre::{eyre, Result};
 use serde_json::{json, Value};
 
-use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID};
+use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
 
 use super::*;
 
@@ -25,6 +25,8 @@ struct Page {
     keys: HashMap<&'static str, std::result::Result<&'static str, &'static str>>,
     /// Where a click takes the tab, by selector.
     goes: HashMap<&'static str, &'static str>,
+    /// Where opening it lands instead: a redirect.
+    redirect: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -62,7 +64,10 @@ impl ExtensionLink for Stand {
         let page = w.pages.get(&url).cloned().unwrap_or_default();
         Ok(match cmd {
             "navigate" => {
-                let to = args["url"].as_str().unwrap_or_default().to_string();
+                let mut to = args["url"].as_str().unwrap_or_default().to_string();
+                if let Some(r) = w.pages.get(&to).and_then(|p| p.redirect) {
+                    to = r.to_string();
+                }
                 let title = w.pages.get(&to).map(|p| p.title).unwrap_or("");
                 w.tabs.insert(session, to.clone());
                 json!({ "url": to, "title": title })
@@ -84,6 +89,10 @@ impl ExtensionLink for Stand {
                 json!(true)
             }
             "fill" | "type" => {
+                // As the extension does: on the origin it was resolved for only.
+                if args["origin"].as_str() != origin_of(&url).as_deref() {
+                    return Err(eyre!("The page moved, so nothing was typed."));
+                }
                 let v = args["value"]
                     .as_str()
                     .or(args["text"].as_str())
@@ -93,7 +102,8 @@ impl ExtensionLink for Stand {
             }
             "press" | "select" | "wait" | "upload" => json!(true),
             "capture" => {
-                json!({ "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" })
+                // What it pictured, read in the same moment.
+                json!({ "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "url": url, "text": page.text })
             }
             "capture_key" => match page.keys.get(args["selector"].as_str().unwrap_or_default()) {
                 Some(Ok(v)) => {
@@ -119,7 +129,7 @@ impl ExtensionLink for Stand {
 /// keys.
 struct TestHooks {
     done: Mutex<Vec<Done>>,
-    kept: Mutex<Vec<(String, String, String)>>,
+    kept: Mutex<Vec<(String, String, String, String)>>,
 }
 
 impl BrowserHooks for TestHooks {
@@ -134,11 +144,25 @@ impl BrowserHooks for TestHooks {
     fn record(&self, done: Done) {
         self.done.lock().unwrap().push(done);
     }
-    fn keep_key(&self, user: &str, connector: &str, key: &str) -> Result<String, String> {
-        self.kept
-            .lock()
-            .unwrap()
-            .push((user.into(), connector.into(), key.into()));
+    fn may_visit(&self, _agent: &str, origin: &str) -> Result<(), String> {
+        match origin {
+            "https://elsewhere.example" => Err("not allowed this session".into()),
+            _ => Ok(()),
+        }
+    }
+    fn keep_key(
+        &self,
+        user: &str,
+        conversation: &str,
+        connector: &str,
+        key: &str,
+    ) -> Result<String, String> {
+        self.kept.lock().unwrap().push((
+            user.into(),
+            conversation.into(),
+            connector.into(),
+            key.into(),
+        ));
         Ok("passed".into())
     }
 }
@@ -183,11 +207,14 @@ async fn run(
     CURRENT_AGENT_ID
         .scope(
             agent.to_string(),
-            CURRENT_USER_ID.scope(user.to_string(), async move {
-                // As the gate does before a call: what it acts on.
-                let _ = t.effect(&input);
-                t.execute(input).await.unwrap()
-            }),
+            CURRENT_USER_ID.scope(
+                user.to_string(),
+                CURRENT_SESSION_KEY.scope("conv-1".into(), async move {
+                    // As the gate does before a call: what it acts on.
+                    let _ = t.effect(&input);
+                    t.execute(input).await.unwrap()
+                }),
+            ),
         )
         .await
 }
@@ -398,13 +425,38 @@ async fn a_new_key_goes_to_the_secret_path_and_never_to_the_model() {
         "{}",
         kept.output
     );
-    assert_eq!(kept.output["ends"], "…uvwx");
+    assert_eq!(kept.output["length"], key.chars().count());
+    assert!(kept.output.get("ends").is_none());
     assert_eq!(kept.output["test"], "passed");
-    assert!(HOOKS
-        .kept
-        .lock()
-        .unwrap()
-        .contains(&("sarah".into(), "fixture".into(), key.into())));
+    assert!(HOOKS.kept.lock().unwrap().contains(&(
+        "sarah".into(),
+        "conv-1".into(),
+        "fixture".into(),
+        key.into()
+    )));
+    // A selector that tests what a field holds would read the key a
+    // character at a time: refused on a key page, by every call.
+    for (tool, input) in [
+        (
+            "browser.click",
+            json!({ "selector": "input[value^=\"fx_a\"]" }),
+        ),
+        ("browser.wait", json!({ "selector": "#key[value^=fx_b]" })),
+        (
+            keys::CAPTURE_KEY,
+            json!({ "selector": "input[v\\61lue^=fx]", "connector": "fixture" }),
+        ),
+    ] {
+        let probe = run("setup", "sarah", tool, input).await;
+        assert!(
+            probe
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("tests a field's value")),
+            "{tool}: {:?}",
+            probe.error
+        );
+    }
     // An editable field, an unknown connector, or another page: nothing.
     let field = run(
         "setup",
@@ -547,4 +599,76 @@ async fn stop_closes_the_tab_and_live_lists_only_open_ones() {
         .any(|l| l.agent == "stopper" && l.host.as_deref() == Some("live.example")));
     assert!(close(Which::Agent("stopper")).await >= 1);
     assert!(!live().await.iter().any(|l| l.agent == "stopper"));
+}
+
+/// Where a navigation lands passes the gate before anything of it is said:
+/// a redirect to a site the session may not visit, or to the hub's own
+/// port on this computer, is left at once and its address goes unsaid.
+#[tokio::test]
+async fn a_navigation_that_lands_somewhere_it_may_not_be_says_nothing_of_it() {
+    let _serial = setup().await;
+    page(
+        "https://bounce.example/",
+        Page {
+            redirect: Some("https://elsewhere.example/secret-path"),
+            ..Page::default()
+        },
+    );
+    page(
+        "https://elsewhere.example/secret-path",
+        Page {
+            title: "Private title",
+            ..Page::default()
+        },
+    );
+    let went = run(
+        "lander",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://bounce.example/" }),
+    )
+    .await;
+    let error = went.error.unwrap();
+    assert!(error.contains("hasn't been allowed"), "{error}");
+    assert!(!error.contains("secret-path") && !error.contains("Private title"));
+    assert!(went.output.is_null() || !went.output.to_string().contains("elsewhere"));
+    let at = run("lander", "sarah", "browser.snapshot", json!({})).await;
+    let shown = at.output["url"].as_str().unwrap_or_default();
+    assert!(shown.contains("about:blank"), "{}", at.output);
+    // The hub's own port here is never a page Desk opens.
+    keep_off_ports(vec![50148]);
+    let own = run(
+        "lander",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "http://127.0.0.1:50148/api/desk/browser" }),
+    )
+    .await;
+    assert!(!own.success);
+    assert!(!own.error.unwrap().contains("50148"));
+    keep_off_ports(Vec::new());
+}
+
+/// A fill is typed only on the origin it was resolved for: the extension is
+/// told it, and refuses a page that moved.
+#[tokio::test]
+async fn a_fill_names_the_origin_it_was_resolved_for() {
+    let _serial = setup().await;
+    page("https://form.example/", Page::default());
+    run(
+        "filler",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://form.example/" }),
+    )
+    .await;
+    let filled = run(
+        "filler",
+        "sarah",
+        "browser.fill",
+        json!({ "selector": "#q", "value": "hello" }),
+    )
+    .await;
+    assert!(filled.success, "{:?}", filled.error);
+    assert!(WORLD.lock().unwrap().typed.contains(&"hello".to_string()));
 }

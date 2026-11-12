@@ -83,9 +83,70 @@ pub fn origin_of(url: &str) -> Option<String> {
     })
 }
 
+static OWN_PORTS: std::sync::RwLock<Vec<u16>> = std::sync::RwLock::new(Vec::new());
+
+/// Keeps the person's Chrome off the hub's own ports on this computer: the
+/// local hub is never a page Desk opens.
+pub fn keep_off_ports(ports: Vec<u16>) {
+    *OWN_PORTS.write().unwrap() = ports;
+}
+
+/// Whether `url` is this computer (a loopback or unspecified address, or
+/// `localhost`) on one of the hub's own ports.
+pub fn on_own_port(url: &str) -> bool {
+    on_ports(url, &OWN_PORTS.read().unwrap())
+}
+
+fn on_ports(url: &str, ports: &[u16]) -> bool {
+    let Some(u) = parse(url) else {
+        return false;
+    };
+    let local = match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        None => false,
+    };
+    local
+        && u.port_or_known_default()
+            .is_some_and(|p| ports.contains(&p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hubs_own_ports_here_are_known() {
+        let ports = [50148, 8080];
+        for own in [
+            "http://127.0.0.1:50148/api",
+            "http://localhost:8080/",
+            "http://LOCALHOST.:50148",
+            "http://app.localhost:50148",
+            "http://0.0.0.0:8080",
+            "http://[::1]:50148/",
+            "http://[::ffff:127.0.0.1]:8080/",
+            "http://127.1.2.3:8080/",
+        ] {
+            assert!(on_ports(own, &ports), "{own}");
+        }
+        for not in [
+            "http://127.0.0.1:3000/",
+            "https://example.com:8080/",
+            "http://localhost/",
+            "about:blank",
+        ] {
+            assert!(!on_ports(not, &ports), "{not}");
+        }
+    }
 
     #[test]
     fn files_are_read_as_chrome_reads_them() {

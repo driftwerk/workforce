@@ -52,8 +52,31 @@ pub fn matches(page: &KeyPage, url: &str) -> bool {
         return false;
     };
     super::address::origin_of(url).as_deref() == Some(page.origin.as_str())
-        && page.paths.iter().any(|p| u.path().starts_with(p.as_str()))
+        && page.paths.iter().any(|p| under(u.path(), p))
 }
+
+/// Whether `path` is `prefix` or under it, a whole segment at a time:
+/// `/settings/api` holds `/settings/api/new`, never `/settings/apikeys`.
+pub fn under(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/")) || prefix.is_empty()
+}
+
+/// Whether `selector` could tell, by matching or not, what a field holds:
+/// an attribute test on `value`, or any CSS escape that could spell one.
+/// On a key page such a selector is refused: whether it matched would read
+/// the key a character at a time.
+pub fn probes_value(selector: &str) -> bool {
+    let flat: String = selector
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    flat.contains("[value") || flat.contains("|value") || flat.contains('\\')
+}
+
+/// What a selector that tests a field's value is told on a key page.
+pub const PROBES_VALUE: &str = "On a key page Desk doesn't take a selector that tests a field's value (`[value…]`, or an escape): use an id, a name or a label instead.";
 
 /// Whether `url` is any connector's key page.
 pub fn is_key_page(url: &str) -> bool {
@@ -129,9 +152,32 @@ mod tests {
         ] {
             assert!(!matches(&page, not), "{not}");
         }
+        assert!(!matches(&page, "https://keys.example/settings/apikeys"));
+        assert!(matches(&page, "https://keys.example/settings/api"));
         assert!(shaped(&page, "fx_abcdefghijklmnopqrstuvwx"));
         assert!(!shaped(&page, "x fx_abcdefghijklmnopqrstuvwx"));
         assert!(!shaped(&page, "fx_short"));
+    }
+
+    #[test]
+    fn a_selector_that_tests_a_value_is_known() {
+        for probe in [
+            "input[value^=\"fx_a\"]",
+            "#key[ VALUE*=q]",
+            "input[v\\61lue^=fx]",
+            "form:has(input[value$=z])",
+            "input[*|value^=fx]",
+        ] {
+            assert!(probes_value(probe), "{probe}");
+        }
+        for fine in [
+            "#new-key",
+            "input[name=token]",
+            "[data-testid=key]",
+            "button.copy",
+        ] {
+            assert!(!probes_value(fine), "{fine}");
+        }
     }
 
     #[test]

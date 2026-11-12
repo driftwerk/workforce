@@ -823,6 +823,11 @@ pub fn install(
     let shots = shots_dir(config);
     let settings = Arc::new(SettingsFile::new(root.join("settings.json")));
     let chrome = crate::desk_chrome::install(root.join("chrome-profiles.json"));
+    // The hub itself is never a page the person's Chrome opens for Desk.
+    browser::keep_off_ports(crate::desk_driver::ports_of([
+        config.hub.listen.as_str(),
+        config.gateway.listen.as_str(),
+    ]));
     let _ = STOP_WITH.set((Arc::clone(state), computer.clone()));
     let hooks = Arc::new(DeskHooks {
         state: Arc::clone(state),

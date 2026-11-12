@@ -70,7 +70,20 @@ pub(super) fn link() -> Result<&'static Arc<dyn ExtensionLink>> {
 pub(super) fn may_show(url: &str) -> bool {
     use super::address::kind;
     let host = host_of(url);
-    super::address::opens_in_chrome(&kind(url)) && hooks::settings().sites.allows(host.as_deref())
+    super::address::opens_in_chrome(&kind(url))
+        && !super::address::on_own_port(url)
+        && hooks::settings().sites.allows(host.as_deref())
+}
+
+/// A selector on a key page that could test what a field holds is refused:
+/// whether it matched would read the key.
+fn selector_ok(url: &str, selector: Option<&str>) -> Result<()> {
+    match selector {
+        Some(s) if keys::is_key_page(url) && keys::probes_value(s) => {
+            Err(eyre!(keys::PROBES_VALUE))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Where the person's Chrome may not be, as a refusal.
@@ -278,35 +291,40 @@ impl ExtensionCell {
         }
     }
 
-    /// Whether the page shows a secret or is a key page now: no picture is
-    /// taken of it. A page that can't be read counts as one.
-    async fn unpicturable(&self) -> bool {
-        match self.ask("read", json!({ "what": "all" })).await {
-            Ok(page) => {
-                let url = page["url"].as_str().unwrap_or_default();
-                keys::is_key_page(url)
-                    || workforce_common::redact::contains_secret(
-                        page["text"].as_str().unwrap_or_default(),
-                    )
-            }
-            Err(_) => true,
+    /// A picture of Desk's tab, as the extension took it: the extension
+    /// checks, just before the picture, that the tab it pictures is Desk's
+    /// tab and the window's active one, and says that tab's address and
+    /// text, read in the same moment. A picture of a key page, of a page
+    /// that shows a secret, or one that doesn't say what it pictured, is
+    /// thrown away here; `Err` with why none was kept.
+    async fn capture(&self) -> Result<Vec<u8>> {
+        let shot = self
+            .ask("capture", json!({ "refuse": keys::refusals() }))
+            .await?;
+        if let Some(why) = shot["skipped"].as_str() {
+            return Err(eyre!(match why {
+                "minimised" => "Desk's Chrome window is minimised, so no picture was taken. Ask the person to bring it back.",
+                "not_front" => "Desk's tab isn't the one showing in its Chrome window, so no picture was taken. Call again.",
+                "moved" => "The page moved while it was pictured, so the picture was thrown away. Call again.",
+                _ => super::client::SHOWS_A_SECRET,
+            }));
         }
+        let (Some(url), Some(text)) = (shot["url"].as_str(), shot["text"].as_str()) else {
+            return Err(eyre!(super::client::SHOWS_A_SECRET));
+        };
+        if keys::is_key_page(url) || workforce_common::redact::contains_secret(text) {
+            return Err(eyre!(super::client::SHOWS_A_SECRET));
+        }
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(shot["png_base64"].as_str().unwrap_or_default())
+            .map_err(|_| eyre!("Chrome's picture couldn't be read"))
     }
 
     /// A picture of the page, for the activity row: none of a page that
     /// shows a secret or is a key page, none of a minimised window.
     async fn picture(&self) -> Option<Vec<u8>> {
-        if self.unpicturable().await {
-            return None;
-        }
-        let shot = self
-            .ask("capture", json!({ "refuse": keys::refusals() }))
-            .await
-            .ok()?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(shot["png_base64"].as_str()?)
-            .ok()
+        self.capture().await.ok()
     }
 
     /// Records what was done, with a picture of the page after.
@@ -362,10 +380,29 @@ impl ExtensionCell {
             let at = self.ask("navigate", json!({ "url": url })).await?;
             let landed_url = at["url"].as_str().unwrap_or_default().to_string();
             untrusted::on(&self.key, &landed_url);
+            // Where it landed passes the gate before anything of it is said
+            // or pictured: a redirect to a site the session may not visit
+            // is left at once, and its address and title go unsaid.
+            let landed = super::address::origin_of(&landed_url);
+            let allowed_visit = landed.is_some() && landed == *self.pending_visit.lock().unwrap();
+            let refused = match (&landed, hooks::hooks()) {
+                _ if !may_show(&landed_url) => Some(
+                    "It led to a page Desk may not show in your Chrome, so it was left.".to_string(),
+                ),
+                (Some(origin), Some(h)) if !allowed_visit => h
+                    .may_visit(&self.agent, origin)
+                    .err()
+                    .map(|_| "It led to a site this conversation hasn't been allowed to open, so it was left.".to_string()),
+                _ => None,
+            };
+            if let Some(why) = refused {
+                let _ = self.ask("navigate", json!({ "url": "about:blank" })).await;
+                untrusted::on(&self.key, "about:blank");
+                return Err(eyre!("{why} Desk's tab is blank now."));
+            }
             // Opened, by the call the person allowed, exactly the site it was
             // allowed to: it may stay.
-            let landed = super::address::origin_of(&landed_url);
-            if landed.is_some() && landed == *self.pending_visit.lock().unwrap() {
+            if allowed_visit {
                 *self.visited.lock().unwrap() = landed;
             }
             self.done("browser.navigate", Some(url)).await;
@@ -477,20 +514,7 @@ impl ExtensionCell {
 
     pub(super) async fn screenshot(&self) -> Result<Value> {
         self.with(async |_| {
-            if self.unpicturable().await {
-                return Err(eyre!(super::client::SHOWS_A_SECRET));
-            }
-            let shot = self.ask("capture", json!({ "refuse": keys::refusals() })).await?;
-            if let Some(why) = shot["skipped"].as_str() {
-                return Err(eyre!(match why {
-                    "minimised" => "Desk's Chrome window is minimised, so no picture was taken. Ask the person to bring it back.",
-                    _ => super::client::SHOWS_A_SECRET,
-                }));
-            }
-            use base64::Engine;
-            let png = base64::engine::general_purpose::STANDARD
-                .decode(shot["png_base64"].as_str().unwrap_or_default())
-                .map_err(|_| eyre!("Chrome's picture couldn't be read"))?;
+            let png = self.capture().await?;
             let size = png.len();
             stage_screenshot_artifact(png, size)
         })
@@ -499,6 +523,7 @@ impl ExtensionCell {
 
     pub(super) async fn click(&self, selector: &str) -> Result<Value> {
         self.with(async |url| {
+            selector_ok(url, Some(selector))?;
             self.hold(
                 url,
                 "browser.click",
@@ -525,6 +550,7 @@ impl ExtensionCell {
         resolve: impl FnOnce(&str, Option<&str>) -> Result<String>,
     ) -> Result<Value> {
         self.with(async move |url| {
+            selector_ok(url, Some(selector))?;
             self.hold(
                 url,
                 "browser.fill",
@@ -535,8 +561,13 @@ impl ExtensionCell {
             )
             .await?;
             let resolved = resolve(value, host_of(url).as_deref())?;
-            self.ask("fill", json!({ "selector": selector, "value": resolved }))
-                .await?;
+            // The extension types it only on the origin it was resolved for.
+            let origin = super::address::origin_of(url);
+            self.ask(
+                "fill",
+                json!({ "selector": selector, "value": resolved, "origin": origin }),
+            )
+            .await?;
             self.done("browser.fill", Some(selector)).await;
             Ok(json!({ "filled": true }))
         })
@@ -550,6 +581,7 @@ impl ExtensionCell {
         resolve: impl FnOnce(&str, Option<&str>) -> Result<String>,
     ) -> Result<Value> {
         self.with(async move |url| {
+            selector_ok(url, Some(selector))?;
             self.hold(
                 url,
                 "browser.type",
@@ -560,8 +592,12 @@ impl ExtensionCell {
             )
             .await?;
             let resolved = resolve(text, host_of(url).as_deref())?;
-            self.ask("type", json!({ "selector": selector, "text": resolved }))
-                .await?;
+            let origin = super::address::origin_of(url);
+            self.ask(
+                "type",
+                json!({ "selector": selector, "text": resolved, "origin": origin }),
+            )
+            .await?;
             self.done("browser.type", Some(selector)).await;
             Ok(json!({ "typed_chars": resolved.chars().count() }))
         })
@@ -570,6 +606,7 @@ impl ExtensionCell {
 
     pub(super) async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<Value> {
         self.with(async |url| {
+            selector_ok(url, selector)?;
             self.hold(url, "browser.press_key", Some(key), selector, true, &[])
                 .await?;
             self.ask("press", json!({ "selector": selector, "key": key }))
@@ -583,6 +620,7 @@ impl ExtensionCell {
 
     pub(super) async fn select_option(&self, selector: &str, value: &str) -> Result<Value> {
         self.with(async |url| {
+            selector_ok(url, Some(selector))?;
             self.hold(
                 url,
                 "browser.select_option",
@@ -606,7 +644,8 @@ impl ExtensionCell {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         let budget_ms = wait_budget_ms(timeout_ms, self.config.call_timeout_ms);
-        self.with(async |_| {
+        self.with(async |url| {
+            selector_ok(url, Some(selector))?;
             self.ask(
                 "wait",
                 json!({ "selector": selector, "timeout_ms": budget_ms }),
@@ -627,6 +666,7 @@ impl ExtensionCell {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         self.with(async |url| {
+            selector_ok(url, Some(selector))?;
             self.hold(url, "browser.upload_file", Some(selector), Some(selector), false, names)
                 .await?;
             self.ask(
@@ -650,6 +690,17 @@ impl ExtensionCell {
             return Err(eyre!(NO_BROWSER));
         };
         self.with(async |url| {
+            selector_ok(url, Some(selector))?;
+            // A key is kept for the conversation whose setup asked for it.
+            let conversation = CURRENT_SESSION_KEY
+                .try_with(|k| k.clone())
+                .ok()
+                .filter(|k| !k.is_empty());
+            let Some(conversation) = conversation else {
+                return Err(eyre!(
+                    "Desk keeps a new key only for the conversation setting the connector up, and this call came from none."
+                ));
+            };
             if !keys::matches(&page, url) {
                 return Err(eyre!(
                     "Desk's tab isn't on {connector}'s key page, so no key was read."
@@ -667,13 +718,14 @@ impl ExtensionCell {
                     "What Desk read there doesn't look like a {connector} key, so it wasn't kept."
                 ));
             }
-            let ends: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            // Only its length is said of it: nothing of the key itself.
+            let length = value.chars().count();
             let test = hooks
-                .keep_key(&self.user, connector, &value)
+                .keep_key(&self.user, &conversation, connector, &value)
                 .map_err(|e| eyre!(e))?;
             drop(value);
             self.done(keys::CAPTURE_KEY, None).await;
-            Ok(json!({ "kept": true, "connector": connector, "ends": format!("…{ends}"), "test": test }))
+            Ok(json!({ "kept": true, "connector": connector, "length": length, "test": test }))
         })
         .await
     }

@@ -134,10 +134,17 @@ pub trait BrowserHooks: Send + Sync {
         Ok(())
     }
     /// Keeps a new key `user`'s agent read off `connector`'s key page, for
-    /// the connection being set up, and tests it. What the test said
-    /// (`passed`, or why not); `Err` says why it wasn't kept. A hub with no
-    /// connections keeps nothing.
-    fn keep_key(&self, _user: &str, _connector: &str, _key: &str) -> Result<String, String> {
+    /// the setup of `connector` running in `conversation` (its session
+    /// key), and tests it. Without such a setup running, nothing is kept.
+    /// What the test said (`passed`, or why not); `Err` says why it wasn't
+    /// kept. A hub with no connections keeps nothing.
+    fn keep_key(
+        &self,
+        _user: &str,
+        _conversation: &str,
+        _connector: &str,
+        _key: &str,
+    ) -> Result<String, String> {
         Err("This hub doesn't set up connections from the browser.".into())
     }
     /// Whether the hub's gate decides every browser call before it is made
