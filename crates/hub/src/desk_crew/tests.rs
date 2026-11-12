@@ -3795,11 +3795,13 @@ async fn handed_session(
     uuid::Uuid,
     String,
 ) {
+    // What waits on the person isn't a check-in (the test's minutes are
+    // short): only the session's line gives the overseer its requests.
     let (overseer, crew, d, llm) = overseeing(
         dir,
         pool,
         "Answered.",
-        "[oversight]\nenabled = true\nlevel = \"act\"\n",
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.wake]\nwaiting_minutes = 0\n",
         &[],
     )
     .await;
