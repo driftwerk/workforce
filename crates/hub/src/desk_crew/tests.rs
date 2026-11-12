@@ -296,6 +296,7 @@ pub(crate) async fn new_session(
 ) -> workforce_desk::model::SessionView {
     d.create(
         NewSession {
+            fresh_worktree: false,
             engine: Engine::Claude,
             view: None,
             name: name.into(),

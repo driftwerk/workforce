@@ -222,7 +222,7 @@ pub async fn hub_agents(
     http: &reqwest::Client,
 ) -> Result<Vec<String>, RemoteError> {
     let at = format!("{}/mcp/agents", url.trim_end_matches('/'));
-    let resp = tokio::time::timeout(
+    let mut resp = tokio::time::timeout(
         PROBE_TIMEOUT,
         http.get(&at).bearer_auth(token.expose()).send(),
     )
@@ -231,11 +231,43 @@ pub async fn hub_agents(
     .map_err(|e| RemoteError::Offline(e.without_url().to_string()))?;
     match resp.status().as_u16() {
         401 => return Err(RemoteError::NoToken),
+        // Not allowed, or asked too often: said as such, never as "no
+        // agent has it".
+        403 => {
+            return Err(RemoteError::Refused(
+                "the hub doesn't let you see its agents".into(),
+            ))
+        }
+        429 => {
+            return Err(RemoteError::RateLimited {
+                retry_after_secs: resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse().ok()),
+            })
+        }
+        // An older hub without the route: only its default agent is asked.
         404 | 405 => return Ok(vec![]),
-        s if s >= 400 => return Ok(vec![]),
+        s if s >= 500 => return Err(RemoteError::Offline(format!("the hub answered {s}"))),
+        s if s >= 400 => return Err(RemoteError::Failed(format!("the hub answered {s}"))),
         _ => {}
     }
-    let body: Value = resp.json().await.unwrap_or_default();
+    // A bounded read: an answer this long isn't a list of agents.
+    let mut body = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(PROBE_TIMEOUT, resp.chunk())
+        .await
+        .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
+        .map_err(|e| RemoteError::Offline(e.without_url().to_string()))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > AGENTS_BODY_MAX {
+            return Err(RemoteError::Failed(
+                "the hub's list of agents is too long".into(),
+            ));
+        }
+    }
+    let body: Value = serde_json::from_slice(&body).unwrap_or_default();
     let mut agents: Vec<(bool, String)> = body["agents"]
         .as_array()
         .into_iter()
@@ -246,8 +278,18 @@ pub async fn hub_agents(
         })
         .collect();
     agents.sort();
-    Ok(agents.into_iter().map(|(_, id)| id).collect())
+    agents.dedup();
+    Ok(agents
+        .into_iter()
+        .take(MAX_AGENTS)
+        .map(|(_, id)| id)
+        .collect())
 }
+
+/// The most agents on a hub a board's probe asks.
+pub const MAX_AGENTS: usize = 16;
+/// The longest list of agents a hub may answer with.
+const AGENTS_BODY_MAX: usize = 64 * 1024;
 
 /// Where a board's tools were found: what reaches them, and the agent
 /// there that offers them (none: the default, or this hub).

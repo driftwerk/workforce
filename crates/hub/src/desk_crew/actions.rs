@@ -1462,6 +1462,7 @@ impl CrewHub {
             .desk
             .create_for(
                 NewSession {
+                    fresh_worktree: false,
                     engine,
                     view: Some(view),
                     name: label,
