@@ -29,6 +29,18 @@ use crate::store::DeskStore;
 pub const FILE_MAX: u64 = 20 * 1024 * 1024;
 /// The most files a ticket of the person's own holds.
 pub const UPLOADS_PER_TICKET: usize = 20;
+/// The most bytes of files dropped on the tickets of one board, together.
+pub const UPLOADS_PER_BOARD: i64 = 1024 * 1024 * 1024;
+
+/// What adding an upload came to.
+#[derive(Debug)]
+pub enum Uploaded {
+    Added(TicketFile),
+    /// The ticket holds [`UPLOADS_PER_TICKET`] files already.
+    TicketFull,
+    /// Its board's files would pass [`UPLOADS_PER_BOARD`].
+    BoardFull,
+}
 /// The most of a remote file's bytes kept, across every ticket; past it the
 /// least lately read go.
 pub const CACHE_MAX: i64 = 256 * 1024 * 1024;
@@ -618,8 +630,9 @@ impl DeskStore {
         Ok(changed)
     }
 
-    /// Adds an upload to `ticket`, its bytes with it, if the ticket holds
-    /// fewer than [`UPLOADS_PER_TICKET`]; `None` when it is full.
+    /// Adds an upload to `ticket`, its bytes with it, while the ticket
+    /// holds fewer than [`UPLOADS_PER_TICKET`] files and its board's
+    /// uploads stay within [`UPLOADS_PER_BOARD`].
     pub async fn add_upload(
         &self,
         ticket: Uuid,
@@ -627,12 +640,31 @@ impl DeskStore {
         media_type: &str,
         bytes: &[u8],
         by: &Party,
-    ) -> Result<Option<TicketFile>> {
+    ) -> Result<Uploaded> {
+        self.add_upload_within(ticket, name, media_type, bytes, by, UPLOADS_PER_BOARD)
+            .await
+    }
+
+    pub(crate) async fn add_upload_within(
+        &self,
+        ticket: Uuid,
+        name: &str,
+        media_type: &str,
+        bytes: &[u8],
+        by: &Party,
+        board_cap: i64,
+    ) -> Result<Uploaded> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
-        // One upload at a time per ticket, so the count holds.
-        tx.execute("SELECT 1 FROM tickets WHERE id = $1 FOR UPDATE", &[&ticket])
-            .await?;
+        // One upload at a time per board, so the counts hold.
+        let board: Uuid = tx
+            .query_one(
+                "SELECT b.id FROM boards b JOIN tickets t ON t.board = b.id WHERE t.id = $1 \
+                 FOR UPDATE OF b",
+                &[&ticket],
+            )
+            .await?
+            .try_get(0)?;
         let held: i64 = tx
             .query_one(
                 "SELECT count(*) FROM ticket_files WHERE ticket = $1 AND source = 'upload'",
@@ -641,7 +673,18 @@ impl DeskStore {
             .await?
             .try_get(0)?;
         if held as usize >= UPLOADS_PER_TICKET {
-            return Ok(None);
+            return Ok(Uploaded::TicketFull);
+        }
+        let on_board: i64 = tx
+            .query_one(
+                "SELECT coalesce(sum(octet_length(f.bytes)), 0)::bigint FROM ticket_files f \
+                 JOIN tickets t ON t.id = f.ticket WHERE t.board = $1 AND f.source = 'upload'",
+                &[&board],
+            )
+            .await?
+            .try_get(0)?;
+        if on_board + bytes.len() as i64 > board_cap {
+            return Ok(Uploaded::BoardFull);
         }
         let f = TicketFile {
             id: Uuid::new_v4(),
@@ -673,7 +716,7 @@ impl DeskStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(f))
+        Ok(Uploaded::Added(f))
     }
 
     /// Takes the upload `id` off `ticket`. Whether there was one.

@@ -536,7 +536,7 @@ impl LinearSkill {
                             "length": { "type": "integer" },
                             "workspace": { "type": "string" }
                         },
-                        "required": ["url"]
+                        "required": ["identifier", "url"]
                     }),
                 },
                 SkillTool {
