@@ -907,6 +907,20 @@ impl SurfaceRegistry {
             .map(|s| (s, ResolutionPath::Probe))
     }
 
+    /// The workspace `channel` of `platform` was last resolved in, when this
+    /// registry knows it: after [`Self::resolve_user_dm`] for a DM it opened,
+    /// say. The only workspace a single-workspace platform has, otherwise.
+    pub async fn workspace_of(&self, platform: &str, channel: &str) -> Option<String> {
+        if let Some(ws) = self.routes.lookup(platform, channel).await {
+            return Some(ws);
+        }
+        let mut only = self.candidates(platform).into_iter().map(|(ws, _)| ws);
+        match (only.next(), only.next()) {
+            (Some(ws), None) => Some(ws),
+            _ => None,
+        }
+    }
+
     fn candidates(&self, platform: &str) -> Vec<(String, Arc<dyn ChannelSurface>)> {
         self.surfaces
             .iter()

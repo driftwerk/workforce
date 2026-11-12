@@ -848,6 +848,7 @@ impl GatedExecutor {
                 turn.writer.clone(),
             ),
         };
+        let options = workforce_agent::tools::dispatch::options_for_tool(tools, name, options);
         let reason = asked.reason;
         let refused =
             |refusal: Refusal, reason| Held::refused(refusal.tool_result().into(), reason);

@@ -8,6 +8,8 @@
 //!   person's paired Desk holds: a channel alone grants nothing, and no route
 //!   or tool that takes a channel from its caller may start one with
 //!   [`BOSS_CHANNEL_PREFIX`] ([`refused_channel`]).
+//! - It may also be had in Slack, in a thread of the person's DM with the
+//!   agent that its link opened ([`super::slack`]).
 //! - [`BossConversation::of`] is the only test of one, and it holds only for
 //!   a turn of that very agent, as that very person, in a session no one
 //!   shares.
@@ -65,6 +67,43 @@ pub fn refused_for(
     (!opened).then_some(REFUSED)
 }
 
+/// The name of the group `session` is the boss conversation of, as its
+/// link registered it, plain and short: what the person reads in its
+/// prompts. "this group" when it names none.
+pub fn group_name(session: &Session) -> String {
+    let named: String = session
+        .metadata
+        .get(META_KEY)
+        .and_then(|m| m.get("groupName"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect();
+    match named.trim() {
+        "" => "this group".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// Whether a WebSocket of `owner`'s, with `agent` (the hub's default when
+/// none), may anchor on `channel`, a boss conversation's: only once its
+/// link opened it for that very person and agent.
+pub fn anchors(
+    state: &GatewayState,
+    owner: Option<&str>,
+    agent: Option<&str>,
+    channel: &str,
+) -> bool {
+    let service = state
+        .registry
+        .get(agent.unwrap_or(state.registry.default_id()));
+    owner
+        .zip(service)
+        .is_some_and(|(owner, service)| refused_for(&service, channel, owner).is_none())
+}
+
 /// One group's boss conversation, as a turn is in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BossConversation {
@@ -78,11 +117,16 @@ impl BossConversation {
     /// `person`: its channel, its metadata, its owner and agent all saying
     /// the same, and no one else in it. None for any other session.
     pub fn of(session: &Session, agent: &str, person: &str) -> Option<Self> {
-        let group_key = session.channel.strip_prefix(BOSS_CHANNEL_PREFIX)?;
         let meta = session.metadata.get(META_KEY)?;
         let said = |k: &str| meta.get(k).and_then(Value::as_str);
-        let ok = !group_key.is_empty()
-            && said("groupKey") == Some(group_key)
+        let group_key = said("groupKey").filter(|k| !k.is_empty())?;
+        // Where it is had: its Desk channel, or the Slack thread its link
+        // opened for it.
+        let here = match session.channel.strip_prefix(BOSS_CHANNEL_PREFIX) {
+            Some(key) => key == group_key && meta.get(super::slack::THREAD_KEY).is_none(),
+            None => super::slack::is_mapped_thread(session, meta),
+        };
+        let ok = here
             && said("person") == Some(person)
             && said("agent") == Some(agent)
             && session.owner == person
@@ -102,15 +146,25 @@ impl BossConversation {
     }
 }
 
+/// The group's boss conversation, as [`ensure`] opened it.
+#[derive(Debug)]
+pub struct Opened {
+    pub session_id: String,
+    pub channel: String,
+    /// Its Slack thread, when asked for.
+    pub slack: Option<super::slack::Thread>,
+}
+
 /// Makes sure the boss conversation of `person`'s link `token_id`, which
-/// `device_id` minted, exists with its metadata: its session id and
-/// channel.
-pub fn ensure(
+/// `device_id` minted, exists with its metadata, and, with `slack`, its
+/// thread in the person's Slack DM with the agent.
+pub async fn ensure(
     state: &GatewayState,
     person: Uuid,
     device_id: &str,
     token_id: Uuid,
-) -> Result<(String, String), (StatusCode, &'static str)> {
+    slack: bool,
+) -> Result<Opened, (StatusCode, &'static str)> {
     let not_found = (StatusCode::NOT_FOUND, "Link not found");
     let token = links::list(state, person, device_id)
         .map_err(|_| {
@@ -143,12 +197,9 @@ pub fn ensure(
         "agent": link.agent_id,
     });
     if session.metadata.get(META_KEY) != Some(&meta) {
-        if !session.metadata.is_object() {
-            session.metadata = json!({});
-        }
-        if let Some(o) = session.metadata.as_object_mut() {
-            o.insert(META_KEY.into(), meta);
-        }
+        session
+            .metadata_object_mut()
+            .insert(META_KEY.into(), meta.clone());
         service.sessions.save(&session).map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -156,7 +207,23 @@ pub fn ensure(
             )
         })?;
     }
-    Ok((session.id, channel))
+    let slack = match slack {
+        true => Some(super::slack::open_thread(&service, &mut session, &meta).await),
+        false => None,
+    };
+    Ok(Opened {
+        session_id: session.id,
+        channel,
+        slack,
+    })
+}
+
+/// What a Desk asks of [`open`].
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct OpenBody {
+    /// Open its thread in the person's Slack DM with the agent too.
+    pub slack: bool,
 }
 
 /// `POST /api/me/desk-boss-links/{id}/conversation`: the paired Desk opens
@@ -165,6 +232,7 @@ pub async fn open(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Option<Json<OpenBody>>,
 ) -> Result<Json<Value>, crate::api_handlers::desk_boss_links::Rejection> {
     use crate::api_handlers::desk_boss_links as api;
     links::require_enabled(&state).map_err(api::rejection)?;
@@ -172,7 +240,13 @@ pub async fn open(
         crate::api_handlers::remote_mcp_tokens::paired_device(&state, &headers).await?;
     crate::api_handlers::my_settings::enforce_action_rate_limit(&state, &person.to_string())?;
     let id = Uuid::parse_str(&id).map_err(|_| api::err(StatusCode::NOT_FOUND, "Link not found"))?;
-    let (session, channel) =
-        ensure(&state, person, &device.id, id).map_err(|(s, why)| api::err(s, why))?;
-    Ok(Json(json!({ "sessionId": session, "channel": channel })))
+    let slack = body.is_some_and(|Json(b)| b.slack);
+    let opened = ensure(&state, person, &device.id, id, slack)
+        .await
+        .map_err(|(s, why)| api::err(s, why))?;
+    let mut view = json!({ "sessionId": opened.session_id, "channel": opened.channel });
+    if let Some(thread) = &opened.slack {
+        view["slack"] = thread.view();
+    }
+    Ok(Json(view))
 }

@@ -772,10 +772,15 @@ async fn the_routes_are_a_paired_desks_alone() {
     let open = |bearer_token: String, id: String| {
         let state = Arc::clone(&hub.fx.state);
         async move {
-            crate::boss_links::conversation::open(State(state), bearer(&bearer_token), Path(id))
-                .await
-                .map(|Json(v)| v)
-                .map_err(|(status, _)| status)
+            crate::boss_links::conversation::open(
+                State(state),
+                bearer(&bearer_token),
+                Path(id),
+                None,
+            )
+            .await
+            .map(|Json(v)| v)
+            .map_err(|(status, _)| status)
         }
     };
     let opened = open(desk.clone(), id.to_string()).await.unwrap();
@@ -1636,21 +1641,69 @@ mod uplink_tests {
         }
     }
 
-    /// What a turn has besides the agent's own kept tools, and whether the
-    /// kept ones it has are exactly the hub's memory and data tools.
+    /// Allan and Bea, each an agent of its own on `hub`, as on a real hub,
+    /// both taking boss work.
+    async fn own_agents(hub: &Hub, dir: &std::path::Path) {
+        for id in ["allan", "bea"] {
+            let mut config = workforce_common::settings::WorkforceConfig::default();
+            config.hub.data_dir = dir.join(id).to_string_lossy().into_owned();
+            config.llm.api_key = Some("test-key".into());
+            config.agents = vec![workforce_common::settings::AgentConfig {
+                id: id.into(),
+                ..Default::default()
+            }];
+            let service =
+                <crate::serve::AgentService as crate::serve::Compose>::from_config(config, None)
+                    .await
+                    .unwrap();
+            std::fs::create_dir_all(&service.workspace).unwrap();
+            std::fs::write(
+                service
+                    .workspace
+                    .join(workforce_common::config_files::WORKSPACE_CONFIG),
+                "[desk_boss]\naccept = true\n",
+            )
+            .unwrap();
+            hub.fx.state.registry.insert(id, service);
+        }
+    }
+
+    /// Whether `name` asks the person first in `r`.
+    fn asks(r: &workforce_agent::tools::registry::ToolRegistry, name: &str) -> bool {
+        r.get(name)
+            .is_some_and(|t| t.approval_requirement().is_some())
+    }
+
+    /// What a turn runs freely besides the agent's own kept tools, having
+    /// checked the kept ones it has are exactly the hub's memory and data
+    /// tools, everything else of the agent's asks first, and none of this
+    /// hub's own crew is there.
     fn sorted(r: &workforce_agent::tools::registry::ToolRegistry) -> Vec<String> {
         let mut n = r.names();
         n.sort();
         let kept: Vec<&String> = n
             .iter()
-            .filter(|t| crate::boss_links::hold::kept_name(t))
+            .filter(|t| crate::boss_links::hold::kept_name(t) && !asks(r, t))
             .collect();
         assert_eq!(
             kept,
             ["data.inspect", "data.query", "memory"],
             "the hub's own, never a shadow"
         );
-        n.retain(|t| !crate::boss_links::hold::kept_name(t));
+        for held in [
+            "http.request",
+            "messaging.send",
+            "web.fetch",
+            // A shadow of a kept name is held, not kept.
+            workforce_agent::spill::RETRIEVE_TOOL_NAME,
+        ] {
+            assert!(asks(r, held), "{held} asks first");
+            let card = r.get(held).unwrap().approval_notice().unwrap_or_default();
+            assert!(card.contains("boss conversation"), "{card}");
+        }
+        // Nothing that would start a run of its own, asked or not.
+        assert!(!r.has("subagent"));
+        n.retain(|t| !crate::boss_links::hold::kept_name(t) && !asks(r, t));
         n
     }
 
@@ -1705,28 +1758,7 @@ mod uplink_tests {
 
         // Each agent its own service, as on a real hub.
         let dir = tempfile::tempdir().unwrap();
-        for id in ["allan", "bea"] {
-            let mut config = workforce_common::settings::WorkforceConfig::default();
-            config.hub.data_dir = dir.path().join(id).to_string_lossy().into_owned();
-            config.llm.api_key = Some("test-key".into());
-            config.agents = vec![workforce_common::settings::AgentConfig {
-                id: id.into(),
-                ..Default::default()
-            }];
-            let service =
-                <crate::serve::AgentService as crate::serve::Compose>::from_config(config, None)
-                    .await
-                    .unwrap();
-            std::fs::create_dir_all(&service.workspace).unwrap();
-            std::fs::write(
-                service
-                    .workspace
-                    .join(workforce_common::config_files::WORKSPACE_CONFIG),
-                "[desk_boss]\naccept = true\n",
-            )
-            .unwrap();
-            hub.fx.state.registry.insert(id, service);
-        }
+        own_agents(&hub, dir.path()).await;
         let allan = hub.fx.state.registry.get("allan").unwrap();
         assert_eq!(allan.agent_id.as_str(), "allan");
         let person = sam.id.to_string();
@@ -1742,12 +1774,19 @@ mod uplink_tests {
         let none = turn_tools(&hub, "allan", &forged, &person);
         assert!(sorted(&none).is_empty());
 
-        let (_, opened) = ensure(hub.state(), sam.id, &device.id, acme.record.id).unwrap();
-        assert_eq!(opened, channel);
+        let opened = ensure(hub.state(), sam.id, &device.id, acme.record.id, false)
+            .await
+            .unwrap();
+        assert_eq!(opened.channel, channel);
+        assert!(opened.slack.is_none(), "no Slack thread unless asked");
         assert!(refused_for(&allan, &channel, &person).is_none());
         assert!(refused_for(&allan, &channel, "mia").is_some());
         // Another device's link is "not found".
-        assert!(ensure(hub.state(), sam.id, "another-device", acme.record.id).is_err());
+        assert!(
+            ensure(hub.state(), sam.id, "another-device", acme.record.id, false)
+                .await
+                .is_err()
+        );
         let session = allan.sessions.find(&channel, &person).unwrap().unwrap();
 
         // In the group's conversation: the boss tools the engine serves and
@@ -1758,7 +1797,7 @@ mod uplink_tests {
             let t = tools.get(name).unwrap();
             assert_eq!(
                 t.description(),
-                crate::desk_crew::crew_describe(name),
+                crate::boss_links::tools::describe(name),
                 "the hub's own words"
             );
             assert_ne!(t.description(), "stub", "never this hub's own crew tool");
@@ -1777,13 +1816,17 @@ mod uplink_tests {
         assert!(plain.get("crew.overview").unwrap().description() == "stub");
         assert!(
             plain.has("http.request") && plain.has("messaging.send"),
+            "there as ever outside a boss conversation"
+        );
+        assert!(
+            !asks(&plain, "http.request") && !asks(&plain, "messaging.send"),
             "held only in a boss conversation"
         );
         let mia = Uuid::new_v4().to_string();
         let theirs = turn_tools(&hub, "allan", &session, &mia);
-        assert!(!theirs.has("crew.overview") && !theirs.has("http.request"));
+        assert!(!theirs.has("crew.overview") && asks(&theirs, "http.request"));
         let bea = turn_tools(&hub, "bea", &session, &person);
-        assert!(!bea.has("crew.overview") && !bea.has("http.request"));
+        assert!(!bea.has("crew.overview") && asks(&bea, "http.request"));
 
         // The overview goes to Acme's connected link alone, whatever link
         // the model names, and says the Mac isn't connected.
@@ -1887,5 +1930,248 @@ mod uplink_tests {
             &person
         )
         .is_none());
+    }
+
+    /// A Slack surface that opens one DM and records what it is sent.
+    #[derive(Default)]
+    struct FakeSlack(parking_lot::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl workforce_common::channels::ChannelSurface for FakeSlack {
+        fn platform(&self) -> &str {
+            "slack"
+        }
+        fn capabilities(&self) -> workforce_common::channels::ChannelCapabilities {
+            Default::default()
+        }
+        async fn add_reaction(&self, _: &workforce_common::channels::Reaction) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(
+            &self,
+            _: &workforce_common::channels::Reaction,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn open_conversation(&self, user_id: &str) -> eyre::Result<String> {
+            eyre::ensure!(user_id == "U0SAM", "no such user");
+            Ok("D0SAM".into())
+        }
+        async fn send_message(
+            &self,
+            message: &workforce_common::channels::OutboundMessage,
+        ) -> eyre::Result<workforce_common::channels::SentMessage> {
+            let mut sent = self.0.lock();
+            sent.push(format!(
+                "{}|{}",
+                message.thread_id.as_deref().unwrap_or(""),
+                message.text
+            ));
+            Ok(workforce_common::channels::SentMessage {
+                channel: message.channel.clone(),
+                message_id: format!("1700000000.00010{}", sent.len()),
+                thread_id: None,
+                platform: "slack".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slack_dm_thread_the_link_opens_is_the_groups_boss_conversation() {
+        use crate::boss_links::conversation::{ensure, BossConversation};
+        use crate::boss_links::slack::{session_key_for, Thread};
+        let hub = hub(on()).await;
+        let (mut sam, device, _) = hub.sam();
+        let dir = tempfile::tempdir().unwrap();
+        own_agents(&hub, dir.path()).await;
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&key(), "acme", "devbox"),
+        )
+        .unwrap();
+        let allan = hub.fx.state.registry.get("allan").unwrap();
+        allan.set_identity_store(hub.fx.identities.clone());
+        let person = sam.id.to_string();
+
+        // Without a Slack account linked, no thread.
+        let opened = ensure(hub.state(), sam.id, &device.id, acme.record.id, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(opened.slack, Some(Thread::Unavailable(_))),
+            "{:?}",
+            opened.slack
+        );
+
+        sam.linked_ids.insert("slack".into(), "U0SAM".into());
+        hub.fx.identities.update(&sam).unwrap();
+        let slack = Arc::new(FakeSlack::default());
+        allan.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as Arc<dyn workforce_common::channels::ChannelSurface>,
+        );
+        let opened = ensure(hub.state(), sam.id, &device.id, acme.record.id, true)
+            .await
+            .unwrap();
+        let Some(Thread::Opened(key)) = opened.slack else {
+            panic!("{:?}", opened.slack)
+        };
+        assert_eq!(key, "slack:T1:D0SAM:1700000000.000101");
+        // Once: asked again, the same thread, and nothing more posted.
+        let again = ensure(hub.state(), sam.id, &device.id, acme.record.id, true)
+            .await
+            .unwrap();
+        assert_eq!(again.slack, Some(Thread::Already(key.clone())));
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0].contains("acme · Desk"), "{posted:?}");
+
+        // The thread is the group's boss conversation, for Sam and Allan.
+        let thread = allan.sessions.find(&key, &person).unwrap().unwrap();
+        let desk = allan
+            .sessions
+            .find(&opened.channel, &person)
+            .unwrap()
+            .unwrap();
+        let mapped = BossConversation::of(&thread, "allan", &person).unwrap();
+        assert_eq!(
+            mapped,
+            BossConversation::of(&desk, "allan", &person).unwrap(),
+            "one conversation, two places"
+        );
+        assert!(BossConversation::of(&thread, "allan", "mia").is_none());
+        assert_eq!(
+            workforce_common::subscription::Origin::of_session_turn(&person, &thread, false),
+            workforce_common::subscription::Origin::DeskBoss
+        );
+        assert_eq!(
+            crate::memory_fence::fence_for_turn(&allan.agent_id, &allan.workspace, &key, || {
+                Some(thread.clone())
+            }),
+            crate::memory_fence::encode(
+                &allan.agent_id,
+                &workforce_memory::group_tagged::Fence::Boss(mapped.memory_tag())
+            )
+        );
+        let tools = turn_tools(&hub, "allan", &thread, &person);
+        assert!(tools.has("crew.overview"));
+        assert!(asks(&tools, "http.request"));
+
+        // A message in that thread runs there; any other stays the DM's.
+        let dm = "slack:T1:D0SAM".to_string();
+        let ts = key.rsplit(':').next().unwrap();
+        assert_eq!(
+            session_key_for(&allan, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            key
+        );
+        for (channel, thread_ts, who) in [
+            ("D0SAM", Some("1700000000.999999"), person.as_str()),
+            ("D0SAM", None, person.as_str()),
+            ("D0SAM", Some(ts), "mia"),
+            ("C0TEAM", Some(ts), person.as_str()),
+        ] {
+            assert_eq!(
+                session_key_for(&allan, "T1", channel, thread_ts, who, dm.clone()),
+                dm,
+                "{channel} {thread_ts:?} {who}"
+            );
+        }
+        // Another agent the DM routes to holds no such thread.
+        let bea = hub.fx.state.registry.get("bea").unwrap();
+        assert_eq!(
+            session_key_for(&bea, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            dm
+        );
+
+        // The link's metadata copied onto a channel's thread makes nothing.
+        let mut copied = allan
+            .sessions
+            .get_or_create(&format!("slack:T1:C0TEAM:{ts}"), &person, "allan")
+            .unwrap();
+        copied.metadata = thread.metadata.clone();
+        copied.context_type = Some(workforce_common::session::SessionContextType::Dm);
+        assert!(BossConversation::of(&copied, "allan", &person).is_none());
+        let tools = turn_tools(&hub, "allan", &copied, &person);
+        assert!(!tools.has("crew.overview") && asks(&tools, "http.request"));
+
+        // Allan leaving a local scope leaves the link's thread as it is, and
+        // the thread is told nothing.
+        let threads = crate::boss_links::slack::boss_threads(&allan);
+        assert_eq!(threads, [(key.clone(), "acme".to_string())]);
+        crate::memory_fence::leave_sessions(allan.sessions.as_ref(), "allan", "desk-group:g")
+            .unwrap();
+        crate::boss_links::slack::tell_ended(&allan, threads.clone()).await;
+        assert_eq!(slack.0.lock().len(), 1, "nothing to tell");
+        // Started afresh (`cmd: new`), it is still the group's.
+        allan.sessions.start_fresh(&key, &person, "allan").unwrap();
+        assert_eq!(
+            session_key_for(&allan, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            key
+        );
+        // A thread that does stop being one says so, once.
+        let mut ended = allan.sessions.find(&key, &person).unwrap().unwrap();
+        ended
+            .metadata_object_mut()
+            .remove(workforce_common::session::DESK_BOSS_KEY);
+        allan.sessions.save(&ended).unwrap();
+        assert_eq!(
+            session_key_for(&allan, "T1", "D0SAM", Some(ts), &person, dm.clone()),
+            dm,
+            "the thread is the DM's again"
+        );
+        crate::boss_links::slack::tell_ended(&allan, threads).await;
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 2, "{posted:?}");
+        assert!(
+            posted[1].starts_with(&format!("{ts}|")) && posted[1].contains("no longer acme"),
+            "{posted:?}"
+        );
+        // Told once: nothing is a boss thread any more.
+        assert!(crate::boss_links::slack::boss_threads(&allan).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_websocket_anchors_on_a_boss_conversation_only_for_its_person_and_agent() {
+        use crate::boss_links::conversation::{anchors, ensure};
+        let hub = hub(on()).await;
+        let (sam, device, _) = hub.sam();
+        let dir = tempfile::tempdir().unwrap();
+        own_agents(&hub, dir.path()).await;
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&key(), "acme", "devbox"),
+        )
+        .unwrap();
+        let person = sam.id.to_string();
+        let channel = format!("desk:boss:{}", acme.link.group_key);
+        assert!(
+            !anchors(hub.state(), Some(&person), Some("allan"), &channel),
+            "not opened yet"
+        );
+        ensure(hub.state(), sam.id, &device.id, acme.record.id, false)
+            .await
+            .unwrap();
+        assert!(anchors(hub.state(), Some(&person), Some("allan"), &channel));
+        let mia = Uuid::new_v4().to_string();
+        for (owner, agent) in [
+            (Some(mia.as_str()), Some("allan")),
+            (Some(person.as_str()), Some("bea")),
+            (None, Some("allan")),
+        ] {
+            assert!(
+                !anchors(hub.state(), owner, agent, &channel),
+                "{owner:?} {agent:?}"
+            );
+        }
+        assert!(!anchors(
+            hub.state(),
+            Some(&person),
+            Some("allan"),
+            "desk:boss:not-a-group"
+        ));
     }
 }

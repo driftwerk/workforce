@@ -2872,7 +2872,7 @@ pub(crate) fn spawn_turn_extraction(
     let turn_tokens = estimate_tokens(effective_message) + estimate_tokens(response);
     // What a boss conversation says of people isn't fenced to its group.
     let is_dm = session.context_type == Some(workforce_common::session::SessionContextType::Dm)
-        && !workforce_common::channels::is_desk_boss_channel(&session.channel);
+        && !session.claims_desk_boss();
     let (want_passive, want_relationship) = plan_turn_extraction(
         &mem,
         turn_tokens,
@@ -3743,7 +3743,7 @@ pub(crate) async fn process_admitted(
                 service,
                 &answer,
                 &result.tool_invocations,
-                Origin::of_turn(user, channel, session.is_voice_turn()),
+                Origin::of_session_turn(user, &session, session.is_voice_turn()),
             ),
         );
         let labelled = [
@@ -3792,7 +3792,7 @@ pub(crate) async fn process_admitted(
             service.agent_id.as_str(),
             &cost_model,
             TokenCounts::from(&result.total_usage),
-            Origin::of_turn(user, channel, session.is_voice_turn()),
+            Origin::of_session_turn(user, &session, session.is_voice_turn()),
         )
     });
     record_telemetry(
@@ -5310,7 +5310,7 @@ pub(crate) async fn stream_admitted(
             relayed: false,
         })
         .or_else(workforce_agent::runner::current_desk);
-    let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());
+    let origin_for_task = Origin::of_session_turn(user, &session, session.is_voice_turn());
     let precurated_for_task = turn_tools.exclusive;
     let principal_for_task = principal.to_string();
     let continuity_for_task = crate::agent_turn::Continuity::of(&session);
