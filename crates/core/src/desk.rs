@@ -331,6 +331,9 @@ pub enum DeskTurnError {
     TooManyHops,
     /// An edit not of the person's own message in the DM.
     EditOutsideDm,
+    /// An edit sent under the id of the message it replaces: sent again, it
+    /// would name its own new version and set that answer aside too.
+    EditReusesId,
 }
 
 impl std::fmt::Display for DeskTurnError {
@@ -340,6 +343,7 @@ impl std::fmt::Display for DeskTurnError {
             Self::WrongPlace => "the turn's place is not this conversation's",
             Self::TooManyHops => "agents have handed this on too many times already",
             Self::EditOutsideDm => "only your latest message in a direct message can be edited",
+            Self::EditReusesId => "an edit must be sent under a new message id",
         })
     }
 }
@@ -366,6 +370,9 @@ impl DeskTurn {
                 || replaces.chars().count() > EDIT_ID_CHARS
             {
                 return Err(DeskTurnError::EditOutsideDm);
+            }
+            if self.message.is_some_and(|id| id.to_string() == replaces) {
+                return Err(DeskTurnError::EditReusesId);
             }
         }
         Ok(Self {
@@ -1158,6 +1165,15 @@ mod tests {
             ..sent
         };
         assert_eq!(blank.validated("desk"), Err(DeskTurnError::EditOutsideDm));
+        let asked = Uuid::new_v4();
+        let reused = DeskTurn {
+            message: Some(asked),
+            edit: Some(DeskEdit {
+                replaces: asked.to_string(),
+            }),
+            ..turn(DeskPlace::Dm)
+        };
+        assert_eq!(reused.validated("desk"), Err(DeskTurnError::EditReusesId));
     }
 
     #[test]
