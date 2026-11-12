@@ -5,7 +5,7 @@
   "host": "xyz.driftwerk.desk",
   "hub_path": "/ws/desk/chrome",
   "to_hub": {
-    "hello": { "type": "hello", "protocol": 1, "version": "0.1.0", "key": "BKs5rC3gCRu8KbUqlT1fWJb0lGv9xwYbJZlCqEZCxhZ4XQ8cBoAbfsYQ0GTHo/V3TQ7jqvYwCc6xcz8OYQn3rLw=", "label": "1A2B-3C4D-5E6F-7A8B" },
+    "hello": { "type": "hello", "protocol": 1, "version": "0.1.0", "key": "<the profile's P-256 public key, raw, base64>", "label": "1A2B-3C4D-5E6F-7A8B" },
     "proof": { "type": "proof", "signature": "c2lnbmF0dXJl" },
     "result_ok": { "type": "result", "id": 7, "ok": true, "value": { "url": "https://shop.example/cart", "title": "Cart" } },
     "result_error": { "type": "result", "id": 8, "ok": false, "error": "Nothing on the page matches `#save`." },
