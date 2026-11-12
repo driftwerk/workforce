@@ -33,7 +33,7 @@ pub const READ: [&str; 5] = [
     super::spend::NAME,
     super::board::NAME,
 ];
-pub const ACT: [&str; 19] = [
+pub const ACT: [&str; 20] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -53,6 +53,7 @@ pub const ACT: [&str; 19] = [
     super::handover::NAME,
     "crew.handoff",
     "crew.set_mode",
+    super::own_settings::NAME,
 ];
 
 pub struct CrewTool {
@@ -73,8 +74,13 @@ impl CrewTool {
         scope: &Scope,
         watch_only: bool,
     ) -> Vec<Self> {
+        // Asking the person to change its own settings is a card at every
+        // level: one that only watches may still be asked to do more.
         READ.iter()
-            .chain(if watch_only { [].iter() } else { ACT.iter() })
+            .chain(
+                ACT.iter()
+                    .filter(move |n| !watch_only || **n == super::own_settings::NAME),
+            )
             .map(|name| Self {
                 name,
                 crew: Arc::downgrade(crew),
@@ -369,6 +375,10 @@ impl CrewTool {
         let mut kept = input.clone();
         if let Some(o) = kept.as_object_mut() {
             o.remove("ticket_id");
+            // Whose settings are its own, never another's it names.
+            if self.name == super::own_settings::NAME {
+                o.insert("agent_id".into(), json!(b.service.agent_id.as_str()));
+            }
         }
         let mut action = Action::parse(self.name, &kept)?;
         // Nothing outside its scope is looked into, before anything is said
@@ -635,6 +645,7 @@ impl Tool for CrewTool {
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
             super::handover::NAME => super::handover::DESCRIPTION,
+            super::own_settings::NAME => super::own_settings::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
@@ -672,6 +683,7 @@ impl Tool for CrewTool {
             super::plan::NAME => super::plan::schema(),
             super::plan::UPDATE => super::plan::update_schema(),
             super::handover::NAME => super::handover::schema(),
+            super::own_settings::NAME => super::own_settings::schema(),
             "crew.activity" => json!({ "type": "object", "properties": {
                 "subject_id": { "type": "string", "description": "An agent or session id" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100 }

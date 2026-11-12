@@ -342,9 +342,13 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 
 /// Every engine read again now, as after Desk installed one or signed one
 /// in, rather than at the hourly read.
+/// Reads every engine again; how often is counted for each caller.
 async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
-    guarded!(s, h, q);
-    Json(s.desk.engines_read_now().await).into_response()
+    let caller = match s.auth.authorize(&h, q.token.as_deref()).await {
+        Ok(caller) => caller,
+        Err(status) => return (status, Json(json!({ "error": "not allowed" }))).into_response(),
+    };
+    Json(s.desk.engines_read_now(caller.as_deref()).await).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1024,6 +1028,18 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
             },
         }
     }
+}
+
+/// What this hub can do that an older one can't, by name, so a newer Desk
+/// asks for it only here: `fresh-worktree` (a separate copy that is always
+/// a new branch), `folder-remotes` (a listing says its repository and where
+/// it comes from), `keep-tickets` (a board with tickets of its own links
+/// keeping them).
+pub const FEATURES: &[&str] = &["fresh-worktree", "folder-remotes", "keep-tickets"];
+
+async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(json!({ "features": FEATURES })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1821,6 +1837,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/features", get(features))
         .route("/api/desk/engines/read", post(engines_read))
         .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
         .route(
@@ -2011,8 +2028,15 @@ type P = State<Arc<ProvidersApi>>;
 
 impl IntoResponse for AccountError {
     fn into_response(self) -> Response {
+        if let AccountError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            AccountError::Invalid(_) => StatusCode::BAD_REQUEST,
+            AccountError::Invalid(_) | AccountError::Refused(_) => StatusCode::BAD_REQUEST,
             AccountError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AccountError::Internal(e) => {
                 tracing::error!(error = %e, "desk provider credentials failed");
@@ -2150,8 +2174,15 @@ async fn voice_relay(
 
 impl IntoResponse for SpeakError {
     fn into_response(self) -> Response {
+        if let SpeakError::Refused(said) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": said, "code": providers::KEY_REFUSED })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            SpeakError::Invalid(_) => StatusCode::BAD_REQUEST,
+            SpeakError::Invalid(_) | SpeakError::Refused(_) => StatusCode::BAD_REQUEST,
             SpeakError::NoKey(_) => StatusCode::SERVICE_UNAVAILABLE,
             SpeakError::Upstream(e) => {
                 tracing::warn!(error = %e, "desk speech synthesis failed");
@@ -2183,6 +2214,44 @@ async fn voice_speak(
     }
 }
 
+#[derive(Deserialize)]
+struct KeyBody {
+    key: String,
+}
+
+/// Tries a voice key and keeps it, or says why not. The key is never logged
+/// or echoed.
+async fn save_voice_key(
+    State(s): State<Arc<VoiceApi>>,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(name): Path<String>,
+    body: Result<Json<KeyBody>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Some(key) = crate::speech::VoiceKey::parse(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Desk keeps no voice key named {name:?}") })),
+        )
+            .into_response();
+    };
+    let Ok(Json(body)) = body else {
+        return SpeakError::Invalid("the body is {\"key\": \"…\"}".into()).into_response();
+    };
+    let value = body.key.trim();
+    if value.is_empty() {
+        return SpeakError::Invalid(format!("paste the {} key first", key.label())).into_response();
+    }
+    match s.speech.save_key(key, value).await {
+        Ok(()) => {
+            tracing::info!(provider = key.name(), "desk voice key saved");
+            Json(json!({ "saved": true })).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
 pub(crate) fn voice_router(
     auth: Arc<dyn Authorize>,
     realtime: Arc<Realtime>,
@@ -2192,6 +2261,7 @@ pub(crate) fn voice_router(
         .route("/api/desk/voice/session", post(voice_session))
         .route("/api/desk/voice/relay", get(voice_relay))
         .route("/api/desk/voice/speak", post(voice_speak))
+        .route("/api/desk/voice/keys/{provider}", post(save_voice_key))
         .with_state(Arc::new(VoiceApi {
             auth,
             realtime,
@@ -2595,6 +2665,22 @@ mod tests {
             assert!(!body.to_string().contains("sk-ant"), "{body}");
             assert!(desk.accounts().is_empty(), "nothing added");
 
+            // Signed in, but not an administrator: refused as well.
+            let member = super::sessions_router(desk.clone(), crate::testing::not_an_admin());
+            let (status, _) = call(&member, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 403);
+            let (status, body) = call(
+                &member,
+                "POST",
+                &path,
+                Some(json!({ "token": "sk-ant-oat01-anything-0123456789012345678901234567" })),
+            )
+            .await;
+            assert_eq!(status, 403);
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            assert!(desk.accounts().is_empty(), "nothing added");
+            assert_eq!(desk.engines_reads_this_minute(None), 0, "nothing read");
+
             // An id that isn't one is refused before anything else.
             let app = super::sessions_router(desk.clone(), allow_all());
             let (status, _) = call(
@@ -2621,10 +2707,15 @@ mod tests {
                 assert!(engines.as_array().is_some_and(|e| !e.is_empty()));
             }
             assert_eq!(
-                desk.engines_reads_this_minute(),
+                desk.engines_reads_this_minute(None),
                 crate::service::ENGINES_READS_A_MINUTE,
                 "only so many read"
             );
+            // Counted for each caller: another person asking still reads.
+            let ada = super::sessions_router(desk.clone(), crate::testing::identified("ada"));
+            let (status, _) = call(&ada, "POST", "/api/desk/engines/read", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(desk.engines_reads_this_minute(Some("ada")), 1);
         })
         .await;
     }
