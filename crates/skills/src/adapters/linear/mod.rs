@@ -500,6 +500,7 @@ impl LinearSkill {
                         "type": "object",
                         "properties": {
                             "limit": { "type": "integer" },
+                            "email": { "type": "string" },
                             "workspace": { "type": "string" }
                         }
                     }),

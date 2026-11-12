@@ -3417,6 +3417,15 @@ fn register_messaging_tools(
     tools.register(Arc::new(crate::identity_tool::WhoAmIIdentityTool::new(
         Arc::clone(identity_store_handle),
     )));
+    // Who the caller is on a shared Linear or Jira key, by the email their
+    // sign-in verified: zero or one user, never the directory.
+    for on in [crate::by_my_email::On::Linear, crate::by_my_email::On::Jira] {
+        tools.register(Arc::new(crate::by_my_email::ByMyEmail::new(
+            on,
+            tools,
+            Arc::clone(identity_store_handle),
+        )));
+    }
     tools.register(Arc::new(
         crate::identity_lifecycle_tool::IdentityLifecycleTool,
     ));
