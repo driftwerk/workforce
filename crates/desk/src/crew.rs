@@ -544,6 +544,16 @@ impl SuggestionState {
     }
 }
 
+/// The crew tool whose suggestion changes an overseer's own oversight
+/// settings: only the person who holds the hub may accept it.
+pub const OWN_OVERSIGHT_TOOL: &str = "crew.ask_oversight_change";
+
+/// Whether accepting `suggestion` is for the hub's holder alone: one that
+/// changes an overseer's own limits.
+pub fn holder_only(suggestion: &Suggestion) -> bool {
+    suggestion.action["tool"].as_str() == Some(OWN_OVERSIGHT_TOOL)
+}
+
 /// What the overseer proposed: `action` is the tool call it would have made
 /// (`{"tool": "crew.restart", "input": {…}}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -709,7 +719,7 @@ pub trait Crew: Send + Sync {
         _to: Option<&str>,
         _replace: bool,
     ) -> Result<(), String> {
-        Err("Desk can't move a boss on this hub.".into())
+        Err("Desk can't move a boss here.".into())
     }
 
     /// `assign`, as `by`: the overseer handing out a ticket is the overseer

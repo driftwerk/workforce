@@ -186,7 +186,7 @@ impl Desk {
         if self.0.opts.hub_internal.holds(std::path::Path::new(&r.cwd))
             || crate::ledger::agent_turn(&r.cwd, &r.name)
         {
-            return Err("What Desk remembers of sessions isn't open to the hub's own runs.".into());
+            return Err("What Desk remembers of sessions isn't open to Desk's own runs.".into());
         }
         let group = self
             .group_of_member(&session_item(caller))

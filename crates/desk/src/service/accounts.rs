@@ -934,18 +934,7 @@ impl Desk {
             .await
             .map_err(|e| DeskError::Internal(e.into()))?
             .map_err(DeskError::Internal)?;
-        let still = {
-            let mut st = self.0.state.lock();
-            let still = st.accounts.iter().any(|a| a.id == id);
-            if still {
-                st.signed_in_accounts.insert(id);
-                st.sign_in_problems.remove(&id);
-                st.links.remove(&id);
-                st.prints.remove(&super::identities::Raw::Account(id));
-                st.standing.remove(&Some(id));
-            }
-            still
-        };
+        let still = self.0.state.lock().accounts.iter().any(|a| a.id == id);
         if !still {
             if let Err(e) = tokio::task::spawn_blocking(move || keys.delete(id))
                 .await
@@ -958,11 +947,24 @@ impl Desk {
                 "that account was removed while it signed in".into(),
             ));
         }
+        // Forgotten in the store first: should that fail, Desk still knows
+        // what it knew, and a restart doesn't bring back one it forgot.
         self.0
             .store
             .put_account_link(id, None)
             .await
             .map_err(DeskError::Internal)?;
+        {
+            let mut st = self.0.state.lock();
+            // A removal since cleans up after itself (and deletes the token).
+            if st.accounts.iter().any(|a| a.id == id) {
+                st.signed_in_accounts.insert(id);
+                st.sign_in_problems.remove(&id);
+                st.links.remove(&id);
+                st.prints.remove(&super::identities::Raw::Account(id));
+                st.standing.remove(&Some(id));
+            }
+        }
         self.keep_prints();
         self.keep_standing();
         self.announce_accounts();

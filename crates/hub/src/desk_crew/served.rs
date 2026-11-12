@@ -215,6 +215,7 @@ pub fn served_oversight(g: &Grant) -> Oversight {
             workflows: Vec::new(),
             // Never anywhere: a served boss ships only where it is granted.
             anywhere: false,
+            budget_cleared_at: None,
         },
         ..Oversight::default()
     };
@@ -392,7 +393,7 @@ impl CrewHub {
         // is served here.
         if self.overseer_for(&o.scope).is_some() {
             return refused(format!(
-                "{} has a boss on this hub already, so no other is served for it.",
+                "{} already has a boss here, so no other is served for it.",
                 grant.name
             ));
         }

@@ -196,6 +196,14 @@ impl Spec {
         self.models.iter().map(|((id, _, _), _)| *id)
     }
 
+    /// The curated model new agents start on, if the provider has a table.
+    pub fn default_model(&self) -> Option<&'static str> {
+        self.models
+            .iter()
+            .find(|(_, default)| *default)
+            .map(|((id, _, _), _)| *id)
+    }
+
     /// Whether the models are the server's own, listed live.
     pub fn lists_installed(&self) -> bool {
         self.group == Group::Local
@@ -659,11 +667,19 @@ pub type Fields = BTreeMap<String, String>;
 pub enum AccountError {
     #[error("{0}")]
     Invalid(String),
+    /// The provider refused the key when it was tried: why, in the
+    /// person's words, with the fix. Answered with [`KEY_REFUSED`].
+    #[error("{0}")]
+    Refused(String),
     #[error("{0}")]
     Unavailable(String),
     #[error("{0}")]
     Internal(String),
 }
+
+/// The code a refusal of a tried key carries, so Desk shows its words as
+/// they are: they were written for the person.
+pub const KEY_REFUSED: &str = "key_refused";
 
 /// The hub's side of the providers: where their credentials live, and what
 /// its runtime honours.
@@ -679,8 +695,10 @@ pub trait Accounts: Send + Sync {
     fn model_efforts(&self, provider: &str, _model: &str) -> Vec<&'static str> {
         self.efforts(provider)
     }
-    /// Stores `fields` (already checked against the provider's) where the
-    /// hub reads `provider`'s credentials.
+    /// Tries `fields` (already checked against the provider's) with one
+    /// call as small as the provider takes, then stores them where the hub
+    /// reads `provider`'s credentials. A key the provider refuses is never
+    /// stored: [`AccountError::Refused`] says why in the person's words.
     async fn connect(&self, provider: &Spec, fields: &Fields) -> Result<(), AccountError>;
     /// Removes every credential the hub would read for `provider`.
     async fn disconnect(&self, provider: &Spec) -> Result<(), AccountError>;
@@ -997,6 +1015,15 @@ mod tests {
         }
 
         async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
+            if fields
+                .get("api_key")
+                .is_some_and(|k| k.ends_with("-refused"))
+            {
+                return Err(AccountError::Refused(format!(
+                    "{} didn't accept that key. Check it was copied whole.",
+                    spec.name
+                )));
+            }
             self.0.lock().unwrap().insert(spec.id, fields.clone());
             Ok(())
         }
@@ -1587,6 +1614,25 @@ mod tests {
         assert_eq!(ollama["models"][0]["id"], "llama4:8b");
         assert_eq!(ollama["models"][0]["default"], true);
         assert_eq!(ollama["models"][1]["default"], false);
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_a_bad_request_marked_so_desk_shows_its_words() {
+        let held = Arc::new(Held::default());
+        let (status, body) = call(
+            Arc::clone(&held),
+            Method::POST,
+            "/api/desk/providers/anthropic/connect",
+            Some(json!({ "fields": { "api_key": "sk-ant-api03-refused" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], KEY_REFUSED);
+        assert_eq!(
+            body["error"],
+            "Anthropic didn't accept that key. Check it was copied whole."
+        );
+        assert!(held.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
