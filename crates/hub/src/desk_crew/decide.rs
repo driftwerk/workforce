@@ -128,6 +128,9 @@ pub(crate) enum Outcome {
     Soon,
     /// Being decided now.
     Deciding,
+    /// Its session went to another boss while it was decided: that boss
+    /// decides it.
+    Handed,
     /// It waits on the person: why, as said in the boss's DM.
     Waits(String),
     /// The boss decided it but Desk refused it for now (its breaker, its
@@ -167,6 +170,11 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         let sessions: Vec<Uuid> = tokio::select! {
             () = cancel.cancelled() => return,
             Some(mut s) = said.recv() => {
+                // Handed to another boss: decided again, by that one.
+                if s.why.is_empty() {
+                    asked.remove(&s.approval);
+                    continue;
+                }
                 if let Some(a) = s.again.take() {
                     again.insert(s.approval, a);
                 }
@@ -379,6 +387,16 @@ impl CrewHub {
             let (why, again) = match decided {
                 Outcome::Waits(why) => (why, None),
                 Outcome::Refused(why, again) => (why, Some(*again)),
+                Outcome::Handed => {
+                    let _ = tx.send(Said {
+                        approval: p.id,
+                        boss,
+                        why: String::new(),
+                        text: String::new(),
+                        again: None,
+                    });
+                    return;
+                }
                 _ => return,
             };
             let _ = tx.send(Said {
@@ -498,6 +516,14 @@ impl CrewHub {
         if !now.as_ref().is_some_and(|v| self.still_decides(v, boss)) {
             if !still() {
                 return Outcome::NotOurs;
+            }
+            // Handed to another boss meanwhile: that one decides it.
+            if now
+                .as_ref()
+                .and_then(|v| self.boss_over(v))
+                .is_some_and(|b| b != boss)
+            {
+                return Outcome::Handed;
             }
             return Outcome::Waits(
                 "Act fully isn't in force for it now, so I didn't do what I decided; it's yours to answer"

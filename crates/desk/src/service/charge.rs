@@ -699,7 +699,8 @@ impl Desk {
                 &home,
             ),
             // What Desk doesn't read (an MCP server's tool): held when its
-            // input names a workspace, as it may write there.
+            // input names a workspace, as it may write there. Its input, as
+            // text, is no program Desk knows, so it counts as a write.
             _ => pending.request.as_ref().is_some_and(|r| {
                 command_may_touch_settings(
                     &r.input.to_string(),
@@ -1652,7 +1653,6 @@ pub(crate) fn may_write(command: &str) -> bool {
         "fgrep",
         "rg",
         "ls",
-        "tree",
         "wc",
         "stat",
         "file",
@@ -1731,16 +1731,24 @@ pub(crate) fn may_write(command: &str) -> bool {
             }
             let bare = |w: &&str| w.trim_matches(['\'', '"']).to_string();
             match program {
-                // `-i` in any spelling (`-Ei`, `-ni`, `--in-place=.bak`), or
-                // a script that writes (`w file`, `s/a/b/w file`).
+                // `-i` in any spelling (`-Ei`, `-ni`, `--in-place=.bak`), or a
+                // script that writes or runs a command: `w`, `W` or `e`
+                // after an address or alone (`1,$w f`, `/re/!w f`, `e cmd`),
+                // or as an `s` flag (`s/a/b/w f`, `s/a/b/e`).
                 "sed" => words.iter().skip(1).any(|w| {
                     let w = bare(w);
-                    (w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
-                        || w.starts_with("--in-place")
-                        || w == "w"
-                        || w.starts_with("w ")
-                        || w.contains("/w")
-                        || w.contains(";w")
+                    if w.starts_with("--") {
+                        return w.starts_with("--in-place");
+                    }
+                    if w.starts_with('-') {
+                        return w.contains('i');
+                    }
+                    let chars: Vec<char> = w.chars().collect();
+                    chars.iter().enumerate().any(|(i, c)| {
+                        "wWe".contains(*c)
+                            && (i == 0 || "0123456789$/~,!;{} ".contains(chars[i - 1]))
+                            && chars.get(i + 1).is_none_or(|n| n.is_whitespace())
+                    })
                 }),
                 "find" => words.iter().any(|w| {
                     matches!(
