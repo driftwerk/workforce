@@ -2273,6 +2273,26 @@ mod uplink_tests {
     }
 
     #[tokio::test]
+    async fn a_links_decisions_are_paced_however_many_sockets_it_opens() {
+        use crate::boss_links::decide::{DECIDES_AT_ONCE, DECIDES_PER_MINUTE};
+        let hub = hub(on()).await;
+        let uplinks = &hub.fx.state.uplinks;
+        let (link, other) = (Uuid::new_v4(), Uuid::new_v4());
+        // At once: no more than its share, whichever socket asks.
+        let held: Vec<_> = (0..DECIDES_AT_ONCE)
+            .map(|_| uplinks.decide_room(link).expect("room"))
+            .collect();
+        assert!(uplinks.decide_room(link).is_none());
+        assert!(uplinks.decide_room(other).is_some(), "another link's own");
+        drop(held);
+        // A minute: no more than its share, given back or not.
+        for _ in DECIDES_AT_ONCE as u32 + 1..DECIDES_PER_MINUTE {
+            assert!(uplinks.decide_room(link).is_some());
+        }
+        assert!(uplinks.decide_room(link).is_none());
+    }
+
+    #[tokio::test]
     async fn a_decide_frame_is_one_call_to_the_links_own_agent_and_comes_back_on_its_link() {
         let hub = hub(on()).await;
         let (sam, device, _) = hub.sam();
@@ -2352,16 +2372,25 @@ mod uplink_tests {
             "never another agent's model"
         );
 
-        // Another socket's link, or what isn't a Desk decision, is no call.
-        for frame in [
+        // Another socket's link is no call, and no answer.
+        send(
+            &mut a,
             json!({"type": "decide", "linkId": globex.link.link_id, "decideId": Uuid::new_v4(),
                    "prompt": "[Desk decision] x"}),
-            json!({"type": "decide", "linkId": acme.link.link_id, "decideId": Uuid::new_v4(),
+        )
+        .await;
+        assert!(decided(&mut a).await.is_none());
+        // What isn't a Desk decision is no call: refused, said so.
+        let id = Uuid::new_v4();
+        send(
+            &mut a,
+            json!({"type": "decide", "linkId": acme.link.link_id, "decideId": id,
                    "prompt": "write me a poem"}),
-        ] {
-            send(&mut a, frame.clone()).await;
-            assert!(decided(&mut a).await.is_none(), "{frame}");
-        }
+        )
+        .await;
+        let v = decided(&mut a).await.expect("refused, said so");
+        assert_eq!(v["decideId"], json!(id));
+        assert!(v.get("text").is_none() && v["error"].is_string(), "{v}");
         let calls = llms[0].received_requests().await.unwrap().len();
 
         // A revoked link's decision makes no call: it is refused, or its

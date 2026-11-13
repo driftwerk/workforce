@@ -179,6 +179,10 @@ pub struct Uplinks {
     wakes: std::sync::OnceLock<tokio::sync::mpsc::Sender<super::wake::Wake>>,
     /// How many of each link's wakes wait on the queue now.
     wakes_waiting: parking_lot::Mutex<HashMap<Uuid, usize>>,
+    /// Each link's decisions this minute, and the ones it runs now, however
+    /// many sockets it opens ([`super::decide`]).
+    decides: parking_lot::Mutex<HashMap<Uuid, (Instant, u32)>>,
+    deciding: parking_lot::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
     #[cfg(test)]
     pub(crate) hub: parking_lot::Mutex<Option<String>>,
 }
@@ -261,6 +265,22 @@ impl Drop for Unproved {
 }
 
 impl Uplinks {
+    /// Room for one more decision of `link` now: within its share this
+    /// minute and the ones it may run at once, whichever socket asks.
+    pub(crate) fn decide_room(&self, link: Uuid) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if past_share(
+            &mut self.decides.lock(),
+            link,
+            super::decide::DECIDES_PER_MINUTE,
+        ) {
+            return None;
+        }
+        let slots = Arc::clone(self.deciding.lock().entry(link).or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(super::decide::DECIDES_AT_ONCE))
+        }));
+        slots.try_acquire_owned().ok()
+    }
+
     /// Sends `frame` down whichever socket carries `link` now; false when
     /// none does or its queue is full.
     pub(crate) fn notify_link(&self, link: Uuid, frame: Value) -> bool {
@@ -867,8 +887,6 @@ async fn run(
     // Each link's events this minute: (since, how many).
     let mut events: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut asks: HashMap<Uuid, (Instant, u32)> = HashMap::new();
-    let mut decides: HashMap<Uuid, (Instant, u32)> = HashMap::new();
-    let deciding = Arc::new(tokio::sync::Semaphore::new(super::decide::DECIDES_AT_ONCE));
     let mut bad = 0u32;
     loop {
         if bad > MAX_BAD_FRAMES {
@@ -994,19 +1012,19 @@ async fn run(
                             bad += 1;
                             continue;
                         }
-                        let Some((id, prompt)) = super::decide::asked(&frame) else {
+                        let Some(id) = super::decide::id_of(&frame) else {
                             bad += 1;
                             continue;
                         };
                         let refuse = |why: &str| {
                             socket.notify(super::decide::answered(link, id, Err(why.to_string())));
                         };
-                        if past_share(&mut decides, link, super::decide::DECIDES_PER_MINUTE) {
-                            refuse("its hub decides no more this minute");
+                        let Some((id, prompt)) = super::decide::asked(&frame) else {
+                            refuse("not a decision its hub takes");
                             continue;
-                        }
-                        let Ok(permit) = Arc::clone(&deciding).try_acquire_owned() else {
-                            refuse("its hub is deciding as many as it can at once");
+                        };
+                        let Some(permit) = uplinks.decide_room(link) else {
+                            refuse("its hub decides no more for it just now");
                             continue;
                         };
                         let live = match uplinks.recheck(&state, &socket, link).await {

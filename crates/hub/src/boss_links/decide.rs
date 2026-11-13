@@ -13,9 +13,16 @@
 //!   decision's text (the session and its request, fenced by the engine as
 //!   the session's own words); the instructions, the model and the answer's
 //!   length are this hub's.
-//! - **Paced.** At most [`DECIDES_PER_MINUTE`] a link, [`DECIDES_AT_ONCE`]
-//!   a socket, each at most [`MAX_PROMPT`] characters: the rest are refused,
-//!   and the engine leaves those requests to the person.
+//! - **Paced, and paid as the link's person.** At most
+//!   [`DECIDES_PER_MINUTE`] and [`DECIDES_AT_ONCE`] a link, however many
+//!   sockets it opens, each at most [`MAX_PROMPT`] characters, and only
+//!   while the agent's budget admits it ([`CostGovernor`]): the rest are
+//!   refused, and the engine leaves those requests to the person. The call
+//!   runs as the link's person, so their logins and budget pay for it.
+//! - **Says little of this hub.** A call that fails goes down as a plain
+//!   reason; what the provider said is logged here only.
+//!
+//! [`CostGovernor`]: crate::hub_core::cost_governor::CostGovernor
 
 use std::sync::Arc;
 
@@ -24,28 +31,34 @@ use uuid::Uuid;
 
 use super::auth::LiveLink;
 use crate::desk_crew::decide::{decision_call, MARK, SYSTEM, WITHIN};
-
-/// How long its model may take here: under the engine's own wait for the
-/// answer ([`WITHIN`]), so it hears why rather than nothing.
-const HERE_WITHIN: std::time::Duration = WITHIN.saturating_sub(std::time::Duration::from_secs(5));
 use crate::gateway::GatewayState;
+
+/// How long its model may take here: 5 s under the engine's own wait for
+/// the answer ([`WITHIN`]), so the engine hears why rather than nothing.
+const HERE_WITHIN: std::time::Duration = WITHIN.saturating_sub(std::time::Duration::from_secs(5));
+const _: () = assert!(HERE_WITHIN.as_secs() > 0 && HERE_WITHIN.as_secs() < WITHIN.as_secs());
 
 /// The most `decide` frames one link is taken a minute.
 pub const DECIDES_PER_MINUTE: u32 = 30;
 
-/// The most decision calls one socket runs at once.
+/// The most decision calls one link runs at once.
 pub const DECIDES_AT_ONCE: usize = 3;
 
 /// The longest decision text taken, in characters.
-pub const MAX_PROMPT: usize = 64_000;
+pub const MAX_PROMPT: usize = 32_000;
 
 /// The longest answer sent back, in characters.
 const MAX_ANSWER: usize = 4_000;
 
+/// The decision `frame` names, when it names one: its id.
+pub fn id_of(frame: &Value) -> Option<Uuid> {
+    frame["decideId"].as_str()?.parse().ok()
+}
+
 /// What `frame` asks to be decided: its id and its text, when it reads as
-/// a decision at all.
+/// a decision this hub takes at all.
 pub fn asked(frame: &Value) -> Option<(Uuid, String)> {
-    let id: Uuid = frame["decideId"].as_str()?.parse().ok()?;
+    let id = id_of(frame)?;
     let prompt = frame["prompt"].as_str()?;
     (prompt.starts_with(MARK) && prompt.chars().count() <= MAX_PROMPT)
         .then(|| (id, prompt.to_string()))
@@ -62,17 +75,37 @@ pub fn answered(link: Uuid, id: Uuid, decided: Result<String, String>) -> Value 
     }
 }
 
-/// One decision call for `live`'s agent on `prompt`: its text, or why not.
-/// It runs on the agent's own model and keys, never under
+/// One decision call for `live`'s agent on `prompt`, as the link's
+/// person: its text, or why not in plain words. It runs on the agent's own
+/// model and keys, never under
 /// [`crate::hub_core::logins::install_pool::hub_own_work`]: that lends the
 /// install's person's accounts to the hub's own work for them, and a link's
 /// person needn't be that person.
 pub async fn decide(state: &GatewayState, live: &LiveLink, prompt: &str) -> Result<String, String> {
     let Some(service) = state.registry.get(&live.agent_id) else {
-        return Err("The boss isn't on its hub any more.".into());
+        return Err("the boss isn't on its hub any more".into());
     };
-    match tokio::time::timeout(HERE_WITHIN, decision_call(&service, SYSTEM, prompt)).await {
-        Ok(r) => r,
+    let person = live.person.id.to_string();
+    use crate::hub_core::cost_governor::Admission;
+    match service
+        .cost_governor
+        .preflight(service.agent_id.as_str(), Some(&person))
+    {
+        Admission::Deny(why) | Admission::Held(why) => {
+            tracing::info!(link = %live.link.link_id, why, "a boss's decision wasn't made: its budget holds it");
+            return Err("its hub's budget for it is spent".into());
+        }
+        Admission::Proceed | Admission::Warn(_) => {}
+    }
+    let principal = workforce_common::session::TurnPrincipal::run_as(Some(person));
+    let call =
+        crate::user_config::as_principal(&principal, decision_call(&service, SYSTEM, prompt));
+    match tokio::time::timeout(HERE_WITHIN, call).await {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => {
+            tracing::warn!(link = %live.link.link_id, error = %e, "a boss's decision call failed");
+            Err("its model failed".into())
+        }
         Err(_) => Err(format!(
             "its model didn't answer within {} seconds",
             HERE_WITHIN.as_secs()
