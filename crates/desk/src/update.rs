@@ -281,6 +281,10 @@ pub struct NeedsYou {
     /// How long it has waited, in words ("1 h").
     #[serde(default)]
     pub age: String,
+    /// The kind of case an answer would settle from then on, as
+    /// `extras.item` says it: the chat offers "Always" with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generalizes: Option<String>,
 }
 
 impl NeedsYou {
@@ -299,7 +303,8 @@ impl NeedsYou {
             Some(q) => crate::crew::one_line(&q, QUESTION_CHARS),
             None => crate::crew::one_line(&i.text, QUESTION_CHARS),
         };
-        let recommended = given(&l.recommended).map(|r| r.to_lowercase());
+        let recommended = given(&l.recommended)
+            .and_then(|r| crate::open_item::matching_option(&i.options, &r).map(str::to_string));
         Self {
             item_id: i.id.to_string(),
             question,
@@ -316,11 +321,12 @@ impl NeedsYou {
                 .iter()
                 .map(|o| AnswerOption {
                     label: o.clone(),
-                    recommended: recommended.as_deref() == Some(o.trim().to_lowercase().as_str()),
+                    recommended: recommended.as_deref() == Some(o.as_str()),
                 })
                 .collect(),
             not_blocking: given(&l.not_blocking),
             age: age(i.opened_at, now),
+            generalizes: given(&i.generalizes),
         }
     }
 }
@@ -480,6 +486,11 @@ pub fn composer_input(sessions: &[(Uuid, String, &Account, Vec<&Done>)]) -> Stri
     out
 }
 
+/// The most decisions the composer is given: the newest it acted on.
+pub const COMPOSED_DECISIONS: usize = 30;
+/// The most of a decision's message the composer is given, in characters.
+pub const COMPOSED_MESSAGE_CHARS: usize = 300;
+
 /// What the composer is given of each decision: its id, kind, what was
 /// decided and why, and the message it sent (to say what it did, never to
 /// quote).
@@ -494,7 +505,7 @@ pub fn composer_decisions(decisions: &[BossDecision]) -> String {
         if let Some(m) = &d.message {
             out.push_str(&format!(
                 "  message sent (don't quote it): {}\n",
-                crate::crew::clip(m, 1_000)
+                crate::crew::clip(m, COMPOSED_MESSAGE_CHARS)
             ));
         }
     }
@@ -857,6 +868,8 @@ mod tests {
             "Two staging records need a decision before PR 3 can go."
         );
         assert!(plain.items.is_empty() && plain.not_blocking.is_none());
+        assert!(plain.generalizes.is_none());
+        i.generalizes = Some("When a staging record has no owner".into());
         assert!(plain.options.iter().all(|o| !o.recommended));
         assert_eq!(plain.age, "1 h");
         i.layout = crate::open_item::AskLayout {
@@ -890,6 +903,7 @@ mod tests {
             assert!(v.get(k).is_some(), "{k} in {v}");
         }
         assert_eq!(v["options"][0]["recommended"], true);
+        assert_eq!(v["generalizes"], "When a staging record has no owner");
         let u = MentionedUpdate {
             needs_you: vec![laid],
             ..Default::default()

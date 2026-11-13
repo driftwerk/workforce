@@ -52,15 +52,18 @@ text_enum!(Undo {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionKind {
-    /// It did something for a session.
-    #[default]
-    Acted,
     /// It let a session wait, or sent it nothing.
     LeftAlone,
-    /// It gave a session's question to the person.
+    /// It gave a session's question to the person, or left an action to
+    /// them.
     Escalated,
     /// The person undid one of its decisions.
     Undone,
+    /// It did something for a session; a kind this build doesn't know
+    /// reads as this, so a read never fails on it.
+    #[default]
+    #[serde(other)]
+    Acted,
 }
 
 impl DecisionKind {
@@ -73,13 +76,14 @@ impl DecisionKind {
         }
     }
 
+    /// `s` as kept; one this build doesn't know is [`Self::Acted`].
     pub fn parse(s: &str) -> eyre::Result<Self> {
         Ok(match s {
             "acted" => Self::Acted,
             "left_alone" => Self::LeftAlone,
             "escalated" => Self::Escalated,
             "undone" => Self::Undone,
-            other => eyre::bail!("unknown DecisionKind {other:?}"),
+            _ => Self::Acted,
         })
     }
 }
@@ -271,7 +275,7 @@ fn sentence(text: &str) -> String {
 
 /// Whether `text` says `message`, or a good part of it: the short line
 /// and why never quote what was sent. A short message is found by its
-/// words together, a longer one by any run of six of them.
+/// words together, a longer one by any run of five of them.
 pub fn quotes(text: &str, message: Option<&str>) -> bool {
     let words = |s: &str| -> Vec<String> {
         s.split(|c: char| !c.is_alphanumeric())
@@ -292,10 +296,13 @@ pub fn quotes(text: &str, message: Option<&str>) -> bool {
 /// `text` as a decision's short line: one line, at most [`BRIEF_CHARS`],
 /// a sentence; none when empty or it quotes `message`.
 pub fn brief_line(text: &str, message: Option<&str>) -> Option<String> {
-    let line = crate::crew::one_line(text, BRIEF_CHARS - 1);
-    let line = sentence(&line);
-    (!line.is_empty() && line.chars().count() <= BRIEF_CHARS && !quotes(&line, message))
-        .then_some(line)
+    let cut = crate::crew::one_line(text, BRIEF_CHARS);
+    // Its full stop only where it fits: a line of exactly 70 stays whole.
+    let line = match sentence(&cut) {
+        s if s.chars().count() > BRIEF_CHARS => s.chars().take(BRIEF_CHARS).collect(),
+        s => s,
+    };
+    (!line.trim().is_empty() && !quotes(&line, message)).then_some(line)
 }
 
 /// `why` as one sentence, never quoting `message`: empty when it would.
@@ -401,6 +408,22 @@ pub struct DecisionLine {
     /// `acted` | `left_alone` | `escalated` | `undone`.
     #[serde(default)]
     pub kind: DecisionKind,
+}
+
+impl DecisionLine {
+    /// Its layout as `d`, its row, says it: the kind and message always,
+    /// the short line and why only where it has none (the composer's
+    /// words stay).
+    pub fn laid_out_from(&mut self, d: &BossDecision) {
+        self.kind = d.kind;
+        self.message = d.message.clone();
+        if self.action.trim().is_empty() {
+            self.action = d.brief();
+        }
+        if self.why.trim().is_empty() {
+            self.why = d.brief_why();
+        }
+    }
 }
 
 /// How many needs a boss settled itself, gave the person, or the person
@@ -627,5 +650,40 @@ mod tests {
         .unwrap();
         assert_eq!((old.action.as_str(), old.message), ("", None));
         assert_eq!(old.kind, DecisionKind::Acted);
+    }
+
+    #[test]
+    fn a_line_of_exactly_70_stays_whole_and_an_unknown_kind_reads_as_acted() {
+        let seventy = "a".repeat(BRIEF_CHARS);
+        let b = brief_line(&seventy, None).unwrap();
+        assert_eq!(b.chars().count(), BRIEF_CHARS);
+        assert!(b.starts_with('A') && !b.ends_with('…'), "{b}");
+        assert_eq!(brief_line("Held web.", None).as_deref(), Some("Held web."));
+        assert_eq!(DecisionKind::parse("later").unwrap(), DecisionKind::Acted);
+        let k: DecisionKind = serde_json::from_value(serde_json::json!("later")).unwrap();
+        assert_eq!(k, DecisionKind::Acted);
+    }
+
+    #[test]
+    fn an_update_line_takes_its_rows_layout_and_keeps_the_composers_words() {
+        let mut d = BossDecision::new("desk", Need::TurnEnd, "let web wait", "CI runs.", How::Own)
+            .briefly("let web wait", None);
+        d.kind = DecisionKind::LeftAlone;
+        // Kept before the layout: no short line, the full why.
+        let mut old: DecisionLine = serde_json::from_value(serde_json::json!({
+            "id": d.id.to_string(), "text": "let web wait", "why": ""
+        }))
+        .unwrap();
+        old.laid_out_from(&d);
+        assert_eq!(old.kind, DecisionKind::LeftAlone);
+        assert_eq!(
+            (old.action.as_str(), old.why.as_str()),
+            ("Let web wait.", "CI runs.")
+        );
+        // Composed: its words stay.
+        let mut composed = d.line();
+        composed.action = "Left web to its tests.".into();
+        composed.laid_out_from(&d);
+        assert_eq!(composed.action, "Left web to its tests.");
     }
 }

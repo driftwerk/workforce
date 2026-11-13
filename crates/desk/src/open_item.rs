@@ -60,10 +60,18 @@ pub struct AskLayout {
     pub not_blocking: Option<String>,
 }
 
-impl AskLayout {
-    pub fn is_empty(&self) -> bool {
-        self == &Self::default()
-    }
+/// The most points an ask's layout keeps, and the most characters each.
+pub const POINTS: usize = 6;
+pub const POINT_CHARS: usize = 120;
+
+/// The one of `options` that `answer` names, ignoring case and spaces at
+/// either end.
+pub fn matching_option<'a>(options: &'a [String], answer: &str) -> Option<&'a str> {
+    let want = answer.trim().to_lowercase();
+    options
+        .iter()
+        .find(|o| o.trim().to_lowercase() == want)
+        .map(String::as_str)
 }
 
 /// One thing the boss owes the person.

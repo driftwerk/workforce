@@ -86,7 +86,7 @@ pub fn schema(name: &str) -> Value {
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
             "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
             "question": { "type": "string", "description": "The ask in one line, shown bold above the rest, e.g. \"Two staging records need a decision before the next PR.\"" },
-            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers, each short, when there are several" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers, each one short line, at most 6, when there are several" },
             "recommended": { "type": "string", "description": "The one of options you recommend, word for word" },
             "not_blocking": { "type": "string", "description": "What carries on meanwhile, e.g. \"The docs PR doesn't depend on it\"" }
         }, "required": ["text"] }),
@@ -276,19 +276,56 @@ impl CrewHub {
                 .unwrap_or_default()
         };
         new.options = list("options");
-        // The answer recommended is one of the options, as offered.
-        let recommended = some("recommended").and_then(|r| {
-            new.options
-                .iter()
-                .find(|o| o.trim().eq_ignore_ascii_case(r.trim()))
-                .cloned()
-        });
-        new.layout = workforce_desk::open_item::AskLayout {
+        let recommended = match some("recommended") {
+            None => None,
+            Some(r) => {
+                // One of the options it offers: these, else those it
+                // offered when it asked this before.
+                let options = match new.options.is_empty() {
+                    false => new.options.clone(),
+                    true => self
+                        .desk
+                        .store()
+                        .items_not_closed(Some(boss))
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|i| i.dedupe_key == new.dedupe_key)
+                        .map(|i| i.options)
+                        .unwrap_or_default(),
+                };
+                match open_item::matching_option(&options, &r) {
+                    Some(o) => Some(o.to_string()),
+                    None if options.is_empty() => {
+                        return Err(
+                            "recommended must be one of the options, and none are offered: give options too."
+                                .into(),
+                        )
+                    }
+                    None => {
+                        return Err(format!(
+                            "recommended must be one of the options, word for word: {}.",
+                            options
+                                .iter()
+                                .map(|o| format!("“{o}”"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                }
+            }
+        };
+        let points: Vec<String> = list("items")
+            .iter()
+            .take(open_item::POINTS)
+            .map(|p| crew::one_line(p, open_item::POINT_CHARS))
+            .collect();
+        new.layout = open_item::AskLayout {
             question: some("question")
                 .map(|q| crew::one_line(&q, workforce_desk::update::QUESTION_CHARS)),
-            points: list("items"),
+            points,
             recommended,
-            not_blocking: some("not_blocking"),
+            not_blocking: some("not_blocking").map(|n| crew::one_line(&n, open_item::POINT_CHARS)),
         };
         // Its turn's reply is not also kept as a question of its own.
         self.asked_person

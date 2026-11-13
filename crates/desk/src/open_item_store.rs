@@ -171,7 +171,13 @@ impl DeskStore {
             || (!new.options.is_empty() && new.options != was.options)
             || (new.holding_up.is_some() && new.holding_up != was.holding_up)
             || (new.recommendation.is_some() && new.recommendation != was.recommendation)
-            || (!new.layout.is_empty() && new.layout != was.layout);
+            // The layout as it merges below: each part given replaces its own.
+            || (new.layout.question.is_some() && new.layout.question != was.layout.question)
+            || (!new.layout.points.is_empty() && new.layout.points != was.layout.points)
+            || (new.layout.recommended.is_some()
+                && new.layout.recommended != was.layout.recommended)
+            || (new.layout.not_blocking.is_some()
+                && new.layout.not_blocking != was.layout.not_blocking);
         let first_said = new.said && !was.said();
         let r = tx
             .query_one(

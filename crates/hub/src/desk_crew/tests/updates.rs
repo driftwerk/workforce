@@ -66,6 +66,17 @@ impl UpdateWriter for Deciding {
     }
 }
 
+/// A writer that counts its calls.
+struct Counting(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl UpdateWriter for Counting {
+    async fn write(&self, _: &str, _: &str, _: &str, _: &str) -> eyre::Result<String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("{\"sessions\": []}".into())
+    }
+}
+
 /// The DM's messages delivered as updates.
 fn updates(overseer: &AgentService) -> Vec<workforce_common::session::SessionMessage> {
     overseer
@@ -479,6 +490,39 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             .unwrap()
             .pending
             .is_none());
+    })
+    .await;
+}
+
+/// An update whose only news is the times the boss left a session alone
+/// asks the model nothing: those read as their rows, marked to fold.
+#[tokio::test(flavor = "multi_thread")]
+async fn left_alone_only_asks_the_composer_nothing() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let writer = Arc::new(Counting(Default::default()));
+        crew.set_update_writer(writer.clone());
+        begun(&crew).await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        crew.record_nothing("desk", s.id, true, "It is still running its tests.")
+            .await;
+        let posted = eventually("the update", async || updates(&overseer).into_iter().next()).await;
+        let u = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&posted.id))
+                .await
+                .unwrap()
+                .remove(&posted.id)
+                .and_then(|e| e.update)
+        })
+        .await;
+        let l = &u.decisions[0];
+        assert_eq!(l.kind, workforce_desk::decision::DecisionKind::LeftAlone);
+        assert_eq!(l.action, "Let acme-web wait.");
+        assert_eq!(l.why, "It is still running its tests.");
+        assert_eq!(l.message, None);
+        assert_eq!(writer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     })
     .await;
 }

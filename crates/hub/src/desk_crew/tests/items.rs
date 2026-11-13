@@ -97,7 +97,7 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
         // twice.
         let mut again = ask.clone();
         again["text"] = json!("Can acme-web merge #14 with CI red?");
-        let r = call(&crew, super::super::items::ASK, again).await;
+        let r = call(&crew, super::super::items::ASK, again.clone()).await;
         assert!(r.output.to_string().contains("already asked"), "{}", r.output);
         // The check-in's mark is the boss's alone, never said to the person.
         let items: Vec<_> = d
@@ -111,6 +111,41 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].id.to_string(), item.item_id);
         assert_eq!(dm_posts(&overseer, "**Needs you.**").len(), 1);
+
+        // The answer it recommends is one of its options: one that isn't
+        // is refused, naming them.
+        let mut wrong = again.clone();
+        wrong["recommended"] = json!("Ship it");
+        let r = call(&crew, super::super::items::ASK, wrong).await;
+        assert!(!r.success);
+        let said = r.error.clone().unwrap_or_default();
+        assert!(said.contains("“Merge”") && said.contains("“Wait for green”"), "{said}");
+        // Asked again with no options, it is matched against those it
+        // offered; its points and what carries on are kept short.
+        let mut laid = again.clone();
+        laid.as_object_mut().unwrap().remove("options");
+        laid["recommended"] = json!("wait FOR green ");
+        laid["question"] = json!("Merge with CI red?\nThe e2e job is flaky.");
+        laid["items"] = json!((0..9).map(|n| format!("Point {n} {}", "x".repeat(200))).collect::<Vec<_>>());
+        laid["not_blocking"] = json!("The docs PR carries on.\nSo does the export.");
+        let r = call(&crew, super::super::items::ASK, laid).await;
+        assert!(r.success, "{:?}", r.error);
+        let i = d
+            .store()
+            .open_item(items[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(i.layout.recommended.as_deref(), Some("Wait for green"));
+        assert_eq!(i.layout.question.as_deref(), Some("Merge with CI red?"));
+        assert_eq!(i.layout.points.len(), 6);
+        assert!(i.layout.points.iter().all(|p| p.chars().count() <= 120));
+        assert_eq!(i.layout.not_blocking.as_deref(), Some("The docs PR carries on."));
+        let n = workforce_desk::update::NeedsYou::of(&i, chrono::Utc::now());
+        assert_eq!(
+            n.options.iter().map(|o| o.recommended).collect::<Vec<_>>(),
+            vec![false, true]
+        );
 
         // Kept in Postgres, so its DM's rollover loses none of it.
         let mut dm = overseer
