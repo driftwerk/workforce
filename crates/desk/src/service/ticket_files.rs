@@ -2,7 +2,6 @@
 //! for its files when it is opened, a file's bytes (kept, or read through
 //! the board's sync), and the files dropped on a ticket of their own.
 
-use serde_json::json;
 use uuid::Uuid;
 
 use super::{Desk, DeskError, TicketView};
@@ -93,10 +92,15 @@ impl Desk {
         if (fresh && !force) || !e.synced {
             return self.view_ticket(t).await.map_err(fail);
         }
-        let (tool, args) = match e.system {
-            System::Jira => ("jira.get_issue", json!({ "issue_key": e.key })),
-            System::Linear => ("linear.issue_get", json!({ "identifier": e.key })),
-        };
+        // The board's link knows the Jira site's own fields.
+        let sync = self
+            .board_sync(t.board)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, s)| s);
+        let fields = sync.as_ref().and_then(|s| s.fields.as_ref());
+        let (tool, args) = crate::board_sync::read_issue_call(e.system, &e.key, fields);
         let v = crate::board_sync::call(remote, e.system, tool, args).await?;
         let issue = match e.system {
             System::Jira => crate::board_sync::jira_issue(&v, ""),
@@ -116,7 +120,8 @@ impl Desk {
         // here only what the view shows beside it, and when it was read.
         let mut t = self.ticket_of(id).await.map_err(fail)?;
         if let Some(ext) = t.external.as_mut() {
-            let mut details = crate::board_sync::details_of(&issue, Some(&ext.details));
+            let priorities = sync.as_ref().map_or(&[][..], crate::board_sync::priorities);
+            let mut details = crate::board_sync::details_of(&issue, Some(&ext.details), priorities);
             details.read_at = Some(now);
             ext.details = details;
         }

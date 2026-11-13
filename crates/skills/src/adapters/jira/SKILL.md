@@ -66,6 +66,7 @@ reload.
 | `jira.get_project` | Project detail with issue types. |
 | `jira.search_users` | Find users by name/email; returns `accountId`. |
 | `jira.myself` | Who you are on Jira: your `accountId`, display name and email. |
+| `jira.list_fields` | This site's custom fields by role (story points, sprint, start date, Development) and its priorities, highest first. |
 | `jira.list_boards` | List Jira Software boards (Agile API). |
 | `jira.list_sprints` | List sprints on a board, optionally filtered by state. |
 | `jira.add_worklog` | Log time on an issue. |
