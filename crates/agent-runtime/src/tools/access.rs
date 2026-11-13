@@ -62,7 +62,7 @@ impl ToolAccessSnapshot {
 /// turn's context. They stay on an agent's registry, so the board sync's
 /// gated route (remote MCP, or this hub's own) still reaches them as the
 /// person, and off every turn's tools ([`ToolAccessSnapshot::for_a_turn`]).
-pub const PROGRAM_ONLY_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_VIEW_TOOLS;
+pub const PROGRAM_ONLY_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_FILE_TOOLS;
 
 /// Why a turn can't call a [`PROGRAM_ONLY_TOOLS`] tool.
 pub const PROGRAM_ONLY: &str =

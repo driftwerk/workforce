@@ -172,12 +172,12 @@ fn unread(hub: &str, system: workforce_desk::board::System, e: FileRead) -> Resp
 
 /// The board sync of `t`, when the person asking is the one who linked
 /// it; why not, as an answer.
-async fn sync_of(
-    r: &Routes,
+pub(crate) async fn sync_of(
+    sync: &BoardSync,
     t: &Ticket,
     person: &str,
 ) -> Result<workforce_desk::board::Sync, Response> {
-    let s = match r.sync.desk.board_sync(t.board).await {
+    let s = match sync.desk.board_sync(t.board).await {
         Ok(Some((_, s))) => s,
         Ok(None) => {
             return Err(refusal(
@@ -190,7 +190,7 @@ async fn sync_of(
     if s.person != person {
         return Err(refusal(
             StatusCode::FORBIDDEN,
-            "Only the person who linked this board reads its issues' files.",
+            "Only the person who linked this board reads and writes its issues.",
         ));
     }
     Ok(s)
@@ -222,7 +222,7 @@ async fn file_bytes(
             "That's a link: open it where it is.",
         );
     }
-    let s = match sync_of(&r, &t, &person).await {
+    let s = match sync_of(&r.sync, &t, &person).await {
         Ok(s) => s,
         Err(refused) => return refused,
     };
@@ -292,7 +292,7 @@ async fn read_issue(
     if t.ticket.external.as_ref().is_none_or(|e| !e.synced) {
         return Json(t).into_response();
     }
-    let s = match sync_of(&r, &t.ticket, &person).await {
+    let s = match sync_of(&r.sync, &t.ticket, &person).await {
         Ok(s) => s,
         Err(refused) => return refused,
     };

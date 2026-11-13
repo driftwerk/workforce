@@ -244,7 +244,7 @@ async fn a_file_is_read_only_by_its_board_s_person_and_by_its_own_ticket() {
         assert_eq!(a.status, StatusCode::FORBIDDEN);
         assert_eq!(
             a.json()["error"],
-            "Only the person who linked this board reads its issues' files.",
+            "Only the person who linked this board reads and writes its issues.",
             "refused by the board's person, not by the hub"
         );
         let a = send(

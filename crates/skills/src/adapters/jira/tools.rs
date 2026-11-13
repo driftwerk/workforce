@@ -889,14 +889,16 @@ impl Tool for JiraListCommentsTool {
         "jira.list_comments"
     }
     fn description(&self) -> &str {
-        "List comments on a Jira issue."
+        "List comments on a Jira issue, oldest first, a page at a time: `total` says how many it has."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
-                "issue_key": { "type": "string" }
+                "issue_key": { "type": "string" },
+                "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" },
+                "start_at": { "type": "integer", "description": "Index of the first comment (default 0), to read the next page" }
             },
             "required": ["issue_key"]
         })
@@ -908,9 +910,19 @@ impl Tool for JiraListCommentsTool {
             Ok(s) => s.to_string(),
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let path = format!("{REST}/issue/{key}/comment?expand=renderedBody");
+        let max = coerce_to_u64(&input["max_results"])
+            .unwrap_or(50)
+            .clamp(1, 100)
+            .to_string();
+        let first = coerce_to_u64(&input["start_at"]).unwrap_or(0).to_string();
+        let query = [
+            ("expand", "renderedBody"),
+            ("maxResults", max.as_str()),
+            ("startAt", first.as_str()),
+        ];
+        let path = format!("{REST}/issue/{key}/comment");
         let duration_ms = start.elapsed().as_millis() as u64;
-        match client.get(&path).await {
+        match client.get_with_query(&path, &query).await {
             Ok(resp) => {
                 let comments: Vec<Value> = resp
                     .get("comments")
@@ -923,6 +935,7 @@ impl Tool for JiraListCommentsTool {
                             "id": c["id"],
                             "author": c["author"]["displayName"],
                             "author_account_id": c["author"]["accountId"],
+                            "author_account_type": c["author"]["accountType"],
                             "body_html": wrap_field(&c["renderedBody"], "jira.list_comments.body"),
                             "created": c["created"],
                             "updated": c["updated"],
@@ -930,7 +943,10 @@ impl Tool for JiraListCommentsTool {
                     })
                     .collect();
                 Ok(ToolResult::success(
-                    json!({ "issue_key": key, "count": comments.len(), "comments": comments }),
+                    // `total`: how many the issue has, which a page may hold
+                    // fewer of.
+                    json!({ "issue_key": key, "count": comments.len(), "start_at": resp["startAt"],
+                        "total": resp["total"], "comments": comments }),
                     duration_ms,
                 ))
             }
@@ -1983,6 +1999,40 @@ mod tests {
             wrap_field(&json!("report.pdf"), "jira.get_issue.attachment_filename"),
             "filename is routed through the external-content boundary"
         );
+    }
+
+    /// A page of an issue's comments as asked for, with how many it has.
+    #[tokio::test]
+    async fn list_comments_asks_for_a_page_and_says_the_total() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1/comment"))
+            .and(query_param("maxResults", "100"))
+            .and(query_param("startAt", "0"))
+            .and(query_param("expand", "renderedBody"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "startAt": 0, "maxResults": 100, "total": 120,
+                "comments": [ { "id": "1", "author": { "displayName": "Dana" },
+                    "renderedBody": "<p>hi</p>", "created": "2026-11-10T09:00:00.000+0000" } ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraListCommentsTool::new(clients, "acme".into(), Arc::default());
+        let r = tool
+            .execute(json!({ "issue_key": "ENG-1", "max_results": 500 }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["total"], 120);
+        assert_eq!(r.output["count"], 1);
     }
 
     /// Desk's read of an attachment: by its id only, a chunk at a time, the

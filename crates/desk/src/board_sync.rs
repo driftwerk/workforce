@@ -1138,6 +1138,7 @@ pub fn details_of(issue: &Issue, was: Option<&crate::board::Details>) -> crate::
         project: issue.project.clone(),
         due: issue.due,
         read_at: was.and_then(|d| d.read_at),
+        comments_at: was.and_then(|d| d.comments_at),
     }
 }
 

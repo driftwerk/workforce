@@ -465,6 +465,9 @@ pub struct Details {
     /// When its issue was last read whole, for its files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
+    /// When its issue's comments were last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_at: Option<DateTime<Utc>>,
 }
 
 impl External {
