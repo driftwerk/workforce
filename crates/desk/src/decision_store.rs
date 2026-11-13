@@ -7,12 +7,12 @@ use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::decision::{BossDecision, Handled, How, Need, Undo};
+use crate::decision::{BossDecision, DecisionKind, Handled, How, Need, Undo};
 use crate::store::DeskStore;
 
 const COLUMNS: &str =
     "id, boss, owner, at, session, need, need_ref, what, why, how, preference, action, undo, \
-     undone_at, event";
+     undone_at, event, brief, brief_why, message, kind";
 
 fn decision(r: &Row) -> Result<BossDecision> {
     Ok(BossDecision {
@@ -31,6 +31,10 @@ fn decision(r: &Row) -> Result<BossDecision> {
         undo: Undo::parse(r.try_get(12)?)?,
         undone_at: r.try_get(13)?,
         event: r.try_get(14)?,
+        brief: r.try_get(15)?,
+        brief_why: r.try_get(16)?,
+        message: r.try_get(17)?,
+        kind: DecisionKind::parse(r.try_get(18)?)?,
     })
 }
 
@@ -42,7 +46,8 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO boss_decisions ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     $16, $17, $18, $19)"
                 ),
                 &[
                     &d.id,
@@ -60,6 +65,10 @@ impl DeskStore {
                     &d.undo.as_str(),
                     &d.undone_at,
                     &d.event,
+                    &d.brief,
+                    &d.brief_why,
+                    &d.message,
+                    &d.kind.as_str(),
                 ],
             )
             .await?;
