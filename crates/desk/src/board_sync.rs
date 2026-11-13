@@ -1787,13 +1787,26 @@ pub(crate) fn linear_pr(a: &Value) -> Option<(String, String)> {
         .as_str()
         .or(m["state"].as_str())
         .unwrap_or_default();
-    let state = match (s.to_ascii_lowercase().as_str(), m["draft"].as_bool()) {
+    let mut state = match (s.to_ascii_lowercase().as_str(), m["draft"].as_bool()) {
+        _ if m["merged"].as_bool() == Some(true) => "merged".to_string(),
         (_, Some(true)) => "draft".to_string(),
         ("approved" | "reviewrequested" | "review_requested" | "inreview", _) => {
             "review".to_string()
         }
         (s, _) => pr_state(s),
     };
+    // GitHub's review decision says what an open PR waits on.
+    if matches!(state.as_str(), "open" | "review") {
+        match m["reviewDecision"]
+            .as_str()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("CHANGES_REQUESTED") => state = "changes".into(),
+            Some("APPROVED" | "REVIEW_REQUIRED") => state = "review".into(),
+            _ => {}
+        }
+    }
     Some((url.to_string(), state))
 }
 

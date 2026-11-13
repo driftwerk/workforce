@@ -179,12 +179,14 @@ fn a_jira_issue_s_links_say_their_app_or_host_and_only_https() {
 fn a_linear_issue_s_pr_attachments_are_prs_and_its_other_links_are_links() {
     let issue = json!({ "identifier": "ATL-7", "attachments": { "nodes": [
         { "id": "a1", "url": "https://github.com/acme/app/pull/31", "sourceType": "github",
-          "title": "Retry the upload", "metadata": { "status": "merged", "number": 31,
-          "title": "ATL-7 Retry the upload", "repoLogin": "acme", "repoName": "app",
+          "title": "ATL-7 Retry the upload", "metadata": { "status": "merged", "number": 31,
+          "repoLogin": "acme", "repoName": "app",
           "userLogin": "ada", "updatedAt": "2026-11-10T09:00:00.000Z" } },
         { "id": "a2", "url": "https://gitlab.com/acme/app/-/merge_requests/4", "sourceType": "gitlab",
           "title": "Draft it", "metadata": { "status": "opened", "draft": true } },
         { "id": "a3", "url": "https://www.figma.com/file/abc", "sourceType": "figma", "title": "Retry screen" },
+        { "id": "a7", "url": "https://github.com/acme/app/pull/33", "sourceType": "github",
+          "title": "Fix the copy", "metadata": { "status": "open", "reviewDecision": "CHANGES_REQUESTED" } },
         { "id": "a4", "url": "https://docs.example/page", "sourceType": "api", "title": null },
         { "id": "a5", "url": "https://uploads.linear.app/a/b/log.txt", "title": "log.txt" },
         { "id": "a6", "url": "http://insecure.example/x", "title": "Plain http" }
@@ -213,7 +215,18 @@ fn a_linear_issue_s_pr_attachments_are_prs_and_its_other_links_are_links() {
                 repo: None,
                 updated: None,
             },
-        ]
+            DevPr {
+                number: Some(33),
+                url: "https://github.com/acme/app/pull/33".into(),
+                title: "Fix the copy".into(),
+                state: "changes".into(),
+                checks: None,
+                author: None,
+                repo: None,
+                updated: None,
+            },
+        ],
+        "a PR's title is the attachment's own, and changes asked for say so"
     );
     assert!(work.branches.is_empty() && work.commits.is_none());
     assert_eq!(

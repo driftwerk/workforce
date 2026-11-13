@@ -217,9 +217,8 @@ pub fn linear_dev(issue: &Value) -> Option<(Work, Vec<RemoteLink>)> {
             };
             prs.push(DevPr {
                 number: count(&m["number"]).or_else(|| pr_number(&url)),
-                title: short(&m["title"], 200)
-                    .or_else(|| short(&a["title"], 200))
-                    .unwrap_or_else(|| url.clone()),
+                // The hub never passes the metadata's own title.
+                title: short(&a["title"], 200).unwrap_or_else(|| url.clone()),
                 state,
                 // Checks only when the metadata says them: it doesn't.
                 checks: None,

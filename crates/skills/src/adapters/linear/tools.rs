@@ -41,6 +41,12 @@ const RICH_ISSUE_FIELDS: &str = r#"
 /// pull request's status, number, whether it is a draft or merged, and its
 /// review decision): the rest is arbitrary JSON from the integration
 /// (titles, branch names, reviewers), so it never reaches a caller.
+///
+/// A ticket's development (H4) also reads who opened the PR, its repo and
+/// when it last changed: `userLogin`, `repoLogin` and `repoName` are
+/// GitHub's own identifiers (letters, digits, `-`, `_`, `.`), not text
+/// anyone writes, and `updatedAt` is a timestamp. A PR's title is the
+/// attachment's own `title`, never the metadata's.
 const ATTACHMENT_METADATA_KEYS: &[&str] = &[
     "status",
     "state",
@@ -48,6 +54,10 @@ const ATTACHMENT_METADATA_KEYS: &[&str] = &[
     "merged",
     "number",
     "reviewDecision",
+    "userLogin",
+    "repoLogin",
+    "repoName",
+    "updatedAt",
 ];
 
 /// `issue`'s attachments' metadata cut down to [`ATTACHMENT_METADATA_KEYS`],
@@ -4300,6 +4310,8 @@ mod tests {
         let mut issue = serde_json::json!({ "attachments": { "nodes": [
             { "url": "https://github.com/acme/app/pull/7", "metadata": {
                 "status": "open", "number": 7, "draft": false,
+                "userLogin": "ada", "repoLogin": "acme", "repoName": "app",
+                "updatedAt": "2026-11-10T09:00:00.000Z",
                 "title": "a title the integration wrote", "branch": "kh/secret-plan",
                 "reviewers": [{ "name": "Ana" }], "state": "x".repeat(200)
             } },
@@ -4308,7 +4320,9 @@ mod tests {
         slim_attachments(&mut issue);
         assert_eq!(
             issue["attachments"]["nodes"][0]["metadata"],
-            serde_json::json!({ "status": "open", "number": 7, "draft": false })
+            serde_json::json!({ "status": "open", "number": 7, "draft": false,
+                "userLogin": "ada", "repoLogin": "acme", "repoName": "app",
+                "updatedAt": "2026-11-10T09:00:00.000Z" })
         );
         assert!(issue["attachments"]["nodes"][1].get("metadata").is_none());
     }
