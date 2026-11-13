@@ -416,7 +416,9 @@ impl Desk {
     /// prompted it, wrote to it) less than `gap` ago, or they pinned its
     /// wheel. A session a boss runs counts only input since the boss last
     /// had its wheel, as its wheel does; one it only oversees, any. The
-    /// boss stays silent on its questions while this holds.
+    /// boss stays silent on its questions while this holds. `gap` is never
+    /// shorter than the hold (the hub's `answer_gap` makes sure), so an answer is
+    /// never queued behind the person's wheel.
     pub fn person_in_control(&self, id: Uuid, gap: chrono::Duration) -> bool {
         let st = self.0.state.lock();
         let input = Self::last_input(&st, id);

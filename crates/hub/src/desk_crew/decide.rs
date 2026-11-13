@@ -45,6 +45,10 @@ const SWEEP: Duration = Duration::from_secs(2);
 /// How long one decision call may take before it is tried again.
 pub(crate) const WITHIN: Duration = Duration::from_secs(30);
 
+/// How long a request may be in its decision call (two tries, and a
+/// margin): past it, it is decided or left to the person.
+pub(super) const DECIDING: chrono::TimeDelta = chrono::TimeDelta::seconds(70);
+
 /// What starts every decision call: how a reader (or a test) knows one.
 pub(crate) const MARK: &str = "[Desk decision]";
 
@@ -571,7 +575,6 @@ impl CrewHub {
             "now": account.as_ref().map(|a| &a.now),
             "next": account.as_ref().map(|a| &a.next),
             "waiting_on": account.as_ref().and_then(|a| a.waiting_on.as_ref()),
-            "last_prompt": view.last_prompt.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
             "last_reply": view.last_reply.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
         });
         let prefs = self
