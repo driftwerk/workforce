@@ -3565,8 +3565,13 @@ impl Desk {
             self.boss_decides(id, approval, decision, boss)?;
         }
         // Allowing what it asks drives it: in a mode that doesn't ask, only
-        // the person's or its unbound boss's.
-        if decision != Decision::Deny && decision != Decision::Cancel {
+        // the person's or an unbound boss's, which allows what any session
+        // it oversees asks (and types into only one it runs).
+        let unbound_allows = decision == Decision::Allow
+            && by.as_ref().is_some_and(|b| {
+                b.party.kind == crew::PartyKind::Manager && self.full_of(&b.party.id).unbound
+            });
+        if decision != Decision::Deny && decision != Decision::Cancel && !unbound_allows {
             self.mode_lets_anyone(id, by.as_ref())?;
         }
         let codex = self
@@ -3620,9 +3625,21 @@ impl Desk {
             }
             (answer, seen)
         };
+        // A boss's deny says why, and what to do instead, to the session.
+        let because = by
+            .as_ref()
+            .filter(|b| b.party.kind == crew::PartyKind::Manager)
+            .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
+            .map(|(name, r)| {
+                let r = r.trim_end_matches(" (unbound: no limits)");
+                format!("Denied by {name}, who oversees this session: {r}")
+            });
         let _ = answer.send(match decision {
             Decision::Allow => claude::allow(),
-            Decision::Deny => claude::deny(),
+            Decision::Deny => match &because {
+                Some(m) => claude::deny_saying(m),
+                None => claude::deny(),
+            },
             Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
                 claude::ask_in_terminal()
             }

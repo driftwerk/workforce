@@ -7,12 +7,12 @@ use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::decision::{BossDecision, Handled, How, Need, Undo};
+use crate::decision::{BossDecision, DecisionKind, Handled, How, Need, Undo};
 use crate::store::DeskStore;
 
 const COLUMNS: &str =
     "id, boss, owner, at, session, need, need_ref, what, why, how, preference, action, undo, \
-     undone_at, event";
+     undone_at, event, brief, brief_why, message, kind";
 
 fn decision(r: &Row) -> Result<BossDecision> {
     Ok(BossDecision {
@@ -31,6 +31,10 @@ fn decision(r: &Row) -> Result<BossDecision> {
         undo: Undo::parse(r.try_get(12)?)?,
         undone_at: r.try_get(13)?,
         event: r.try_get(14)?,
+        brief: r.try_get(15)?,
+        brief_why: r.try_get(16)?,
+        message: r.try_get(17)?,
+        kind: DecisionKind::parse(r.try_get(18)?)?,
     })
 }
 
@@ -42,7 +46,8 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO boss_decisions ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     $16, $17, $18, $19)"
                 ),
                 &[
                     &d.id,
@@ -60,6 +65,10 @@ impl DeskStore {
                     &d.undo.as_str(),
                     &d.undone_at,
                     &d.event,
+                    &d.brief,
+                    &d.brief_why,
+                    &d.message,
+                    &d.kind.as_str(),
                 ],
             )
             .await?;
@@ -126,6 +135,63 @@ impl DeskStore {
             }
         }
         Ok(h)
+    }
+
+    /// [`Self::decisions_handled`] per day at the person's `tz`, oldest
+    /// first: only the days with a need.
+    pub async fn decisions_handled_by_day(
+        &self,
+        boss: &str,
+        since: DateTime<Utc>,
+        tz: chrono_tz::Tz,
+    ) -> Result<Vec<(chrono::NaiveDate, Handled)>> {
+        let client = self.pool().get().await?;
+        let mut days: Vec<(chrono::NaiveDate, Handled)> = Vec::new();
+        for r in client
+            .query(
+                "SELECT (at AT TIME ZONE $3)::date AS day, need, how, count(*) AS n \
+                 FROM boss_decisions WHERE boss = $1 AND at >= $2 \
+                 GROUP BY day, need, how ORDER BY day",
+                &[&boss, &since, &tz.name()],
+            )
+            .await?
+        {
+            let day: chrono::NaiveDate = r.try_get("day")?;
+            let n: i64 = r.try_get("n")?;
+            let (Ok(need), Ok(how)) = (
+                Need::parse(r.try_get("need")?),
+                How::parse(r.try_get("how")?),
+            ) else {
+                continue;
+            };
+            if days.last().is_none_or(|(d, _)| *d != day) {
+                days.push((day, Handled::default()));
+            }
+            if let Some((_, h)) = days.last_mut() {
+                h.add(need, how, n as usize);
+            }
+        }
+        days.retain(|(_, h)| h.needs() > 0);
+        Ok(days)
+    }
+
+    /// Whether `boss` already gave the person the need `need_ref` since
+    /// `since`: a suggestion made again is one escalation, not two.
+    pub async fn decision_escalated_since(
+        &self,
+        boss: &str,
+        need_ref: &str,
+        since: DateTime<Utc>,
+    ) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM boss_decisions WHERE boss = $1 AND need_ref = $2 \
+                 AND how = 'escalated' AND at >= $3 LIMIT 1",
+                &[&boss, &need_ref, &since],
+            )
+            .await?
+            .is_some())
     }
 
     /// The decisions `ids` (as the chat's extras name them), by id.
