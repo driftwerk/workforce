@@ -376,6 +376,10 @@ pub struct Sync {
     /// The Jira site's own fields, once read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<JiraFields>,
+    /// Which of its epics' children's searches (by place, in key order) a
+    /// sweep reads first: one that ran out of calls goes on from there.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub children_next: usize,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.
@@ -684,6 +688,10 @@ pub struct JiraFields {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priorities: Vec<String>,
     pub read_at: DateTime<Utc>,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 fn is_zero_u32(n: &u32) -> bool {

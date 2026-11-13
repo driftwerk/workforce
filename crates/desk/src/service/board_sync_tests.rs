@@ -1887,6 +1887,10 @@ async fn a_pulled_blocker_never_makes_a_loop_of_needs() {
 /// outside the board's listing.
 struct EpicJira {
     calls: Mutex<Vec<(String, Value)>>,
+    /// The epic's children it says, of ACME-1, ACME-50 and ACME-51.
+    kids: Mutex<Vec<&'static str>>,
+    /// Its children's search says there is another page.
+    more: Mutex<bool>,
 }
 
 const EPIC_UPDATED: &str = "2026-11-09T10:00:00.000+0000";
@@ -1895,6 +1899,8 @@ impl EpicJira {
     fn new() -> Self {
         EpicJira {
             calls: Mutex::new(vec![]),
+            kids: Mutex::new(vec!["ACME-1", "ACME-50", "ACME-51"]),
+            more: Mutex::new(false),
         }
     }
 
@@ -1964,7 +1970,17 @@ impl Remote for EpicJira {
                     "status": "To Do", "status_category": "new", "direction": "inward",
                     "link_type": "Blocks", "relation": "is blocked by" }]);
                 let done = child("ACME-51", "Drop the old table", "Done", "done", 2.0);
-                Ok(json!({ "is_last": true, "issues": [done, blocked, one] }))
+                let kids = self.kids.lock().unwrap().clone();
+                let issues: Vec<Value> = [done, blocked, one]
+                    .into_iter()
+                    .filter(|c| kids.contains(&c["key"].as_str().unwrap()))
+                    .collect();
+                if *self.more.lock().unwrap() {
+                    return Ok(
+                        json!({ "is_last": false, "next_page_token": "p2", "issues": issues }),
+                    );
+                }
+                Ok(json!({ "is_last": true, "issues": issues }))
             }
             "jira.search" if jql.starts_with("parent in (ACME-1)") => Ok(json!({
                 "is_last": true,
@@ -2040,8 +2056,12 @@ async fn an_epic_s_children_come_in_with_one_search_and_are_never_imported() {
             })
         );
         assert_eq!(f.child_blocked, Some(1), "ACME-50 waits on ACME-60");
-        // Unchanged next pass: the epic keeps its children, and isn't
+        // A pass that isn't a sweep leaves them be.
+        d.pull_board(b.id, &remote).await.unwrap();
+        assert_eq!(remote.searches("parent in").len(), 1, "only on a sweep");
+        // Unchanged next sweep: the epic keeps its children, and isn't
         // announced again.
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
         let (_, mut events) = d.subscribe();
         d.pull_board(b.id, &remote).await.unwrap();
         assert_eq!(remote.searches("parent in").len(), 2);
@@ -2069,11 +2089,11 @@ async fn a_pass_out_of_calls_skips_the_epics_children() {
         let (b, s) = d.board_sync(b.id).await.unwrap().unwrap();
         let held = d.ticket_by_key("ACME-9").await.unwrap().ticket;
         let asked = remote.searches("parent in").len();
-        let spent = d
-            .pull_children(&b, &s, &remote, &mut Budget(0))
+        d.pull_children(&b, &s, &remote, &mut Budget(0))
             .await
-            .unwrap_err();
-        assert_eq!(spent, RemoteError::Spent);
+            .unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.children_next, 0, "the same search goes first next time");
         assert_eq!(remote.searches("parent in").len(), asked);
         let now = d.ticket_by_key("ACME-9").await.unwrap().ticket;
         assert_eq!(now.external, held.external);
@@ -2110,6 +2130,216 @@ async fn opening_a_story_fills_in_who_has_its_sub_tasks_and_a_pass_keeps_them() 
         d.pull_board(b.id, &remote).await.unwrap();
         let kept = sub(&d.ticket(story.id).await.unwrap().ticket);
         assert_eq!(kept, opened);
+    })
+    .await;
+}
+
+/// The ticket views of `ticket` announced on `events` so far.
+fn heard(events: &mut tokio::sync::broadcast::Receiver<DeskEvent>, ticket: uuid::Uuid) -> usize {
+    let mut n = 0;
+    while let Ok(e) = events.try_recv() {
+        if matches!(e, DeskEvent::Ticket { ticket: v } if v.ticket.id == ticket) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// A children's search cut short (another page, no calls left) changes
+/// nothing, and says nothing.
+#[tokio::test]
+async fn a_children_s_search_cut_short_changes_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = EpicJira::new();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let held = d.ticket_by_key("ACME-9").await.unwrap().ticket;
+        *remote.kids.lock().unwrap() = vec!["ACME-1"];
+        *remote.more.lock().unwrap() = true;
+        let (b, s) = d.board_sync(b.id).await.unwrap().unwrap();
+        let (_, mut events) = d.subscribe();
+        d.pull_children(&b, &s, &remote, &mut Budget(1))
+            .await
+            .unwrap();
+        let now = d.ticket_by_key("ACME-9").await.unwrap().ticket;
+        assert_eq!(now.external, held.external);
+        assert_eq!(heard(&mut events, held.id), 0);
+    })
+    .await;
+}
+
+/// A child gone from its epic there goes from its ticket, and what the
+/// children add up to is counted again, down to none at all.
+#[tokio::test]
+async fn a_child_that_left_its_epic_goes_and_the_counts_follow() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = EpicJira::new();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let facts = || async {
+            d.ticket_by_key("ACME-9")
+                .await
+                .unwrap()
+                .ticket
+                .external
+                .unwrap()
+                .details
+                .facts
+        };
+        assert_eq!(facts().await.children.len(), 3);
+        // ACME-50, the blocked one, left.
+        *remote.kids.lock().unwrap() = vec!["ACME-1", "ACME-51"];
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let f = facts().await;
+        let keys: Vec<&str> = f.children.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["ACME-1", "ACME-51"]);
+        assert_eq!(
+            f.sub_items,
+            Some(crate::board::Progress {
+                done: 1,
+                total: 2,
+                started: 1
+            })
+        );
+        assert_eq!(
+            f.child_points,
+            Some(crate::board::Progress {
+                done: 2,
+                total: 5,
+                started: 3
+            })
+        );
+        assert_eq!(f.child_blocked, None);
+        // None left at all.
+        *remote.kids.lock().unwrap() = vec![];
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let f = facts().await;
+        assert!(f.children.is_empty());
+        assert_eq!(
+            (f.sub_items, f.child_points, f.child_blocked),
+            (None, None, None)
+        );
+    })
+    .await;
+}
+
+/// A Jira board of eleven epics, ACME-101 to ACME-111, each with one child
+/// (ACME-201 to ACME-211) once `answer` holds; a search naming ACME-101
+/// fails while `refuse` holds.
+struct ManyEpics {
+    answer: Mutex<bool>,
+    refuse: Mutex<bool>,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl Remote for ManyEpics {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::callable(System::Jira)
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        *self.calls.lock().unwrap() += 1;
+        let jql = args["jql"].as_str().unwrap_or_default().to_string();
+        match tool {
+            "jira.list_fields" => Ok(json!({ "fields": {}, "priorities": [] })),
+            "jira.search" if jql.starts_with("parent in (") => {
+                if *self.refuse.lock().unwrap() && jql.contains("ACME-101") {
+                    return Err(RemoteError::Failed(
+                        "The issue key 'ACME-101' does not exist".into(),
+                    ));
+                }
+                let answer = *self.answer.lock().unwrap();
+                let inner = jql["parent in (".len()..].split(')').next().unwrap();
+                let issues: Vec<Value> = inner
+                    .split(", ")
+                    .filter(|_| answer)
+                    .map(|epic| {
+                        let n: u32 = epic.trim_start_matches("ACME-").parse().unwrap();
+                        json!({ "key": format!("ACME-{}", n + 100), "summary": "A child",
+                            "status": "To Do", "status_category": "new",
+                            "updated": EPIC_UPDATED, "parent": { "key": epic } })
+                    })
+                    .collect();
+                Ok(json!({ "is_last": true, "issues": issues }))
+            }
+            "jira.search" => Ok(json!({ "is_last": true, "issues": (101..=111)
+                .map(|n| json!({ "key": format!("ACME-{n}"), "summary": format!("Epic {n}"),
+                    "status": "To Do", "status_category": "new", "updated": EPIC_UPDATED,
+                    "labels": [], "description_html": "", "issuetype": "Epic",
+                    "issuetype_level": 1, "issuelinks": [] }))
+                .collect::<Vec<_>>() })),
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+/// Epics are searched ten at a time: a search read to its end is kept at
+/// once though the calls run out in the next, which goes first next time;
+/// one Jira refuses doesn't stop the others.
+#[tokio::test]
+async fn each_search_of_epics_read_through_is_kept_though_the_next_runs_out() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = ManyEpics {
+            answer: Mutex::new(false),
+            refuse: Mutex::new(false),
+            calls: Mutex::new(0),
+        };
+        d.pull_board(b.id, &remote).await.unwrap();
+        let kids = |key: &'static str| {
+            let d = &d;
+            async move {
+                d.ticket_by_key(key)
+                    .await
+                    .unwrap()
+                    .ticket
+                    .external
+                    .unwrap()
+                    .details
+                    .facts
+                    .children
+                    .len()
+            }
+        };
+        assert_eq!(kids("ACME-101").await, 0);
+        *remote.answer.lock().unwrap() = true;
+        let (b, s) = d.board_sync(b.id).await.unwrap().unwrap();
+        let spent = d.pull_children(&b, &s, &remote, &mut Budget(1)).await;
+        assert!(spent.is_ok(), "{spent:?}");
+        assert_eq!(kids("ACME-101").await, 1);
+        assert_eq!(kids("ACME-110").await, 1);
+        assert_eq!(kids("ACME-111").await, 0, "its search ran out of calls");
+        let (b, s) = d.board_sync(b.id).await.unwrap().unwrap();
+        assert_eq!(s.children_next, 1, "it goes first next time");
+        // Next time: ACME-111's search first, then round to the others,
+        // whose first search Jira now refuses.
+        *remote.refuse.lock().unwrap() = true;
+        d.pull_children(&b, &s, &remote, &mut Budget(5))
+            .await
+            .unwrap();
+        assert_eq!(kids("ACME-111").await, 1);
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(s.children_next, 1, "round to where it began");
+        // A search that names no epic is never made.
+        let calls = *remote.calls.lock().unwrap();
+        let none = d
+            .read_children(&s, &remote, &mut Budget(5), &mut Budget(5), &["x".into()])
+            .await
+            .unwrap();
+        assert_eq!(none, Some(Default::default()));
+        assert_eq!(*remote.calls.lock().unwrap(), calls);
     })
     .await;
 }

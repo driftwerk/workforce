@@ -137,8 +137,12 @@ impl Desk {
         });
         if let (true, Some(s)) = (parent, sync.as_ref()) {
             let mut budget = super::board_sync::Budget(CHILD_READS);
+            let mut pages = super::board_sync::Budget(CHILD_READS);
             let keys = [e.key.clone()];
-            match self.read_children(s, remote, &mut budget, &keys).await {
+            match self
+                .read_children(s, remote, &mut budget, &mut pages, &keys)
+                .await
+            {
                 Ok(Some(mut found)) => {
                     let ext = t.external.as_mut().expect("a synced ticket");
                     let epic = crate::board_sync::is_epic(&ext.details.facts);

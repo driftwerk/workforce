@@ -1466,6 +1466,17 @@ fn what_an_answer_can_t_say_of_children_is_kept() {
     let d = details_of(&epic, Some(&was(vec![known.clone()])), &[]);
     assert_eq!(d.facts.children, vec![known.clone()]);
     assert_eq!(d.facts.child_blocked, Some(2));
+    // An epic with sub-tasks of its own still keeps its search's children.
+    let busy = jira_issue(
+        &json!({ "key": "ACME-9", "summary": "E", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "issuetype": "Epic",
+            "issuetype_level": 1,
+            "subtasks": [{ "key": "ACME-77", "summary": "Its own", "status_category": "new" }] }),
+        "",
+    )
+    .unwrap();
+    let d = details_of(&busy, Some(&was(vec![known.clone()])), &[]);
+    assert_eq!(d.facts.children, vec![known.clone()]);
     let linear = linear_issue(&json!({
         "identifier": "ACME-1", "title": "Roles", "description": "x",
         "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" },

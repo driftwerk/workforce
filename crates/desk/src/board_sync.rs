@@ -1507,9 +1507,11 @@ pub fn details_of(
 /// row says it (`partial`) keeps who has it, its priority, points and PRs
 /// as the ticket's last open read them.
 pub fn keep_children(facts: &mut Facts, was: &Facts, partial: bool) {
-    if is_epic(facts) && facts.children.is_empty() {
+    // Even one with sub-tasks of its own: its children are its search's,
+    // or each pass would make them the sub-tasks and the search undo it.
+    if is_epic(facts) {
         facts.children = was.children.clone();
-        facts.sub_items = facts.sub_items.or(was.sub_items);
+        facts.sub_items = was.sub_items;
         facts.child_points = was.child_points;
         facts.child_blocked = was.child_blocked;
         return;
@@ -1561,7 +1563,10 @@ pub fn child_fields() -> Vec<&'static str> {
 }
 
 /// The most epics one children's search names.
-pub const EPICS_PER_SEARCH: usize = 50;
+pub const EPICS_PER_SEARCH: usize = 10;
+
+/// The most pages of epics' children one sweep reads.
+pub const CHILD_PAGES_PER_PASS: usize = 10;
 
 /// The `jira.search` arguments that list the children of `epics` (keys,
 /// already checked), whatever the board's filter, from page `page`.
@@ -1713,6 +1718,7 @@ pub fn jira_children(answer: &Value, priorities: &[String]) -> (Children, Option
         let blocked = jira_facts(row)
             .links
             .iter()
+            // A blocker not said to be done (its state unknown) blocks.
             .any(|l| l.rel == LinkRel::BlockedBy && l.issue.done != Some(true));
         if blocked {
             out.blocked.push(child.key.clone());
