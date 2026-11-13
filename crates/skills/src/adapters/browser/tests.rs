@@ -160,7 +160,7 @@ impl ExtensionLink for Stand {
 /// keys.
 struct TestHooks {
     done: Mutex<Vec<Done>>,
-    kept: Mutex<Vec<(String, String, String, String)>>,
+    kept: Mutex<Vec<(String, String, String, String, String)>>,
 }
 
 impl BrowserHooks for TestHooks {
@@ -190,18 +190,22 @@ impl BrowserHooks for TestHooks {
             _ => Ok(()),
         }
     }
-    fn keep_key(
+    fn key_page(
         &self,
-        user: &str,
-        conversation: &str,
+        _user: &str,
+        _agent: &str,
+        _conversation: &str,
         connector: &str,
-        key: &str,
-    ) -> Result<String, String> {
+    ) -> Option<keys::KeyPage> {
+        (connector == "fixture").then(keys::fixture_page)
+    }
+    fn keep_key(&self, read: KeyRead<'_>) -> Result<String, String> {
         self.kept.lock().unwrap().push((
-            user.into(),
-            conversation.into(),
-            connector.into(),
-            key.into(),
+            read.user.into(),
+            read.conversation.into(),
+            read.connector.into(),
+            read.key.into(),
+            format!("{}{}", read.origin, read.path),
         ));
         Ok("passed".into())
     }
@@ -486,7 +490,8 @@ async fn a_new_key_goes_to_the_secret_path_and_never_to_the_model() {
         "sarah".into(),
         "conv-1".into(),
         "fixture".into(),
-        key.into()
+        key.into(),
+        "https://keys.example/settings/api".into()
     )));
     // A selector that tests what a field holds would read the key a
     // character at a time: refused on a key page, by every call.
@@ -930,4 +935,22 @@ async fn a_page_kept_away_from_is_not_opened_for_the_person() {
     let why = bounced.error.unwrap();
     assert!(why.contains("hasn't been allowed"), "{why}");
     assert_eq!(calls_of("hand_over"), handed);
+}
+
+#[tokio::test]
+async fn show_brings_only_an_open_tab_of_that_agent_forward() {
+    let _serial = setup().await;
+    assert!(!client::show("nobody").await, "no tab, nothing shown");
+    page("https://shop.example/", Page::default());
+    run(
+        "shower",
+        "sarah",
+        "browser.navigate",
+        json!({ "url": "https://shop.example/" }),
+    )
+    .await;
+    assert!(client::show("shower").await);
+    assert!(!client::show("someone-else").await);
+    client::close(Which::Agent("shower")).await;
+    assert!(!client::show("shower").await, "a closed tab isn't shown");
 }

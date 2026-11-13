@@ -9295,6 +9295,7 @@ impl RemoteMcpConfig {
         "jira.add_comment",
         "jira.get_project",
         "jira.list_projects",
+        "jira.list_fields",
         "jira.myself",
         "identity.jira_user_by_my_email",
         "identity.jira_users_named",

@@ -274,6 +274,7 @@ impl Desk {
             listing: None,
             assignees_swept: true,
             local_before,
+            fields: None,
         };
         self.0
             .store
@@ -600,6 +601,7 @@ impl Desk {
             });
         }
         let mut budget = Budget(crate::board_sync::CALLS_PER_PASS);
+        let s = self.read_fields(id, s, remote, &mut budget, now).await?;
         // A board linked before who has each issue was kept reads it for
         // every ticket on its first pass.
         let sweep = !s.assignees_swept
@@ -623,6 +625,50 @@ impl Desk {
                 })
             }
         }
+    }
+
+    /// `s` with its Jira site's own fields (points, sprint, start date,
+    /// Development, priorities) read when they never were, or a day ago.
+    /// They are never needed: a hub that can't list them is asked again a
+    /// day later, and its cards show none.
+    async fn read_fields(
+        &self,
+        id: Uuid,
+        s: Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Sync, DeskError> {
+        let fresh = s
+            .fields
+            .as_ref()
+            .is_some_and(|f| now - f.read_at < crate::board_sync::FIELDS_FRESH);
+        if s.system != System::Jira || fresh || budget.take().is_err() {
+            return Ok(s);
+        }
+        let fields =
+            match crate::board_sync::call_quiet(remote, s.system, "jira.list_fields", json!({}))
+                .await
+            {
+                Ok(answer) => crate::board_sync::jira_fields(&answer, now),
+                // What was read before stays: one failed read never takes a
+                // board's points and sprints away. Asked again in a day.
+                Err(e) => {
+                    tracing::info!(board = %id, error = %e, "the Jira site's fields weren't read");
+                    board::JiraFields {
+                        read_at: now,
+                        ..s.fields.clone().unwrap_or_default()
+                    }
+                }
+            };
+        let kept = fields.clone();
+        Ok(self
+            .change_sync(id, move |s| s.fields = Some(kept))
+            .await?
+            .unwrap_or(Sync {
+                fields: Some(fields),
+                ..s
+            }))
     }
 
     /// The issues `s`'s filter matches since `since` (all, without), oldest
@@ -662,6 +708,7 @@ impl Desk {
                         "jql": crate::board_sync::jql(&s.target, &s.filter, since, shared_me),
                         "max_results": crate::board_sync::PAGE,
                         "fields": crate::board_sync::JIRA_FIELDS,
+                        "custom_fields": crate::board_sync::custom_fields_arg(s.fields.as_ref()),
                     });
                     if let Some(p) = &page {
                         args["next_page_token"] = json!(p);
@@ -699,10 +746,10 @@ impl Desk {
                     )
                     .await?;
                     let found = crate::board_sync::linear_issues(&answer);
-                    // A hub whose tool doesn't page answers one page of 100,
-                    // which may not be all.
+                    // A hub whose tool doesn't page answers one page, which
+                    // may not be all.
                     if !crate::board_sync::linear_pages(&answer) {
-                        out.complete = found.len() < crate::board_sync::PAGE;
+                        out.complete = found.len() < crate::board_sync::LINEAR_PAGE;
                         out.issues.extend(found);
                         break;
                     }
@@ -918,10 +965,7 @@ impl Desk {
         key: &str,
     ) -> Result<Option<Issue>, RemoteError> {
         budget.take()?;
-        let (tool, args) = match s.system {
-            System::Jira => ("jira.get_issue", json!({ "issue_key": key })),
-            System::Linear => ("linear.issue_get", json!({ "identifier": key })),
-        };
+        let (tool, args) = crate::board_sync::read_issue_call(s.system, key, s.fields.as_ref());
         let v = crate::board_sync::call(remote, s.system, tool, args).await?;
         let issue = match s.system {
             System::Jira => crate::board_sync::jira_issue(&v, ""),
@@ -959,7 +1003,7 @@ impl Desk {
                 && !crate::board_sync::has_escaped_newlines(&t.body)
                 && !crate::board_sync::rereads_html(e, &t.body)
             {
-                return self.refresh_assignee(t.clone(), issue).await.map_err(fail);
+                return self.refresh_listed(s, t.clone(), issue).await.map_err(fail);
             }
         }
         // A whole board takes in what is open; what is done there comes on
@@ -997,13 +1041,9 @@ impl Desk {
             return Ok(issue.clone());
         }
         budget.take()?;
-        let full = crate::board_sync::call(
-            remote,
-            s.system,
-            "jira.get_issue",
-            json!({ "issue_key": issue.key }),
-        )
-        .await?;
+        let (tool, args) =
+            crate::board_sync::read_issue_call(System::Jira, &issue.key, s.fields.as_ref());
+        let full = crate::board_sync::call(remote, s.system, tool, args).await?;
         let read = crate::board_sync::jira_issue(&full, "")
             .filter(|i| i.key == issue.key)
             .ok_or_else(|| RemoteError::Failed(format!("{} couldn't be read", issue.key)))?;
@@ -1024,6 +1064,126 @@ impl Desk {
             }
             _ => true,
         }
+    }
+
+    /// Keeps `t` in step with what a listing says of its unchanged issue:
+    /// who has it, what it says of itself (its points, sprint, links …) and
+    /// what blocks it there. No call is made.
+    async fn refresh_listed(
+        &self,
+        s: &Sync,
+        mut t: Ticket,
+        issue: &Issue,
+    ) -> Result<(), DeskError> {
+        let Some(e) = t.external.as_mut() else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if let Some(a) = crate::board_sync::assignee_changed_of(e, issue) {
+            e.assignee = Some(a);
+            changed = true;
+        }
+        let details = crate::board_sync::details_of(
+            issue,
+            Some(&e.details),
+            crate::board_sync::priorities(s),
+        );
+        let was = crate::board_sync::blockers(&e.details.facts);
+        if details != e.details {
+            e.details = details;
+            changed = true;
+        }
+        changed |= self.pulled_needs(s, &mut t, &was, issue).await?;
+        if !changed {
+            return Ok(());
+        }
+        self.save_ticket(&mut t).await?;
+        if let Ok(v) = self.view_ticket(t).await {
+            self.announce(DeskEvent::Ticket {
+                ticket: Box::new(v),
+            });
+        }
+        Ok(())
+    }
+
+    /// Makes what blocks `t`'s issue there (`issue.blocked_by`) its needs,
+    /// where the blocker is a ticket on the same board, and drops a need a
+    /// pull made once the issue no longer says so (`was`: what it said).
+    /// A need made here stays. Each is seen as sent, so a push never sends
+    /// it back. Whether anything changed; `t` is not saved.
+    async fn pulled_needs(
+        &self,
+        s: &Sync,
+        t: &mut Ticket,
+        was: &[String],
+        issue: &Issue,
+    ) -> Result<bool, DeskError> {
+        let Some(now) = &issue.blocked_by else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        // The board's needs, read once a blocker is to be added: a pull never
+        // makes a loop of needs, as the person can't.
+        let mut edges: Option<Vec<(Uuid, Uuid)>> = None;
+        // Every blocker it names, not only new ones: one imported since is
+        // made a need once it is on the board.
+        let added = now.iter();
+        let gone = was.iter().filter(|k| !now.contains(k));
+        for (key, add) in added.map(|k| (k, true)).chain(gone.map(|k| (k, false))) {
+            let Some(other) = self
+                .0
+                .store
+                .ticket_by_external(s.system, s.link, key)
+                .await
+                .map_err(internal)?
+                .filter(|o| o.board == t.board && o.id != t.id)
+            else {
+                continue;
+            };
+            let e = t.external.as_mut().expect("a synced ticket");
+            if add {
+                // Already a need; or one the person took off here since it
+                // was pulled, which stays off.
+                if t.needs.contains(&other.id) || e.seen.needs.contains(key) {
+                    continue;
+                }
+                if edges.is_none() {
+                    edges = Some(self.0.store.ticket_edges().await.map_err(internal)?);
+                }
+                let edges = edges.as_mut().expect("read above");
+                if board::cycles(t.id, other.id, edges) {
+                    tracing::debug!(ticket = %t.id, blocker = %key, "a pulled blocker would make a loop of needs");
+                    continue;
+                }
+                self.0
+                    .store
+                    .put_need(t.id, other.id)
+                    .await
+                    .map_err(internal)?;
+                edges.push((t.id, other.id));
+                t.needs.push(other.id);
+                e.seen.needs.push(key.clone());
+            } else {
+                // No longer blocked there: a need taken off here by hand is
+                // forgotten too, so a new block there is pulled again.
+                if !t.needs.contains(&other.id) {
+                    if e.seen.needs.contains(key) {
+                        e.seen.needs.retain(|n| n != key);
+                        changed = true;
+                    }
+                    continue;
+                }
+                self.0
+                    .store
+                    .delete_need(t.id, other.id)
+                    .await
+                    .map_err(internal)?;
+                t.needs.retain(|n| *n != other.id);
+                e.seen.needs.retain(|n| n != key);
+            }
+            changed = true;
+        }
+        Ok(changed)
     }
 
     /// Keeps who has `t`'s issue in step with `issue`, quietly: no history,
@@ -1106,7 +1266,12 @@ impl Desk {
             // Read with today's reader: never read again for its old shape.
             e.html_read = crate::board_sync::HTML_READ;
         }
-        e.details = crate::board_sync::details_of(issue, Some(&e.details));
+        let was = crate::board_sync::blockers(&e.details.facts);
+        e.details = crate::board_sync::details_of(
+            issue,
+            Some(&e.details),
+            crate::board_sync::priorities(s),
+        );
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
         e.synced = true;
         e.flagged = e.flagged || issue.flagged;
@@ -1119,6 +1284,7 @@ impl Desk {
         if p.state.is_some() {
             e.seen.state = Some(t.state);
         }
+        let needs = self.pulled_needs(s, &mut t, &was, issue).await?;
         // Its files never fail its pull: the list is kept next time.
         let files = match &issue.files {
             Some(files) => match self
@@ -1137,7 +1303,7 @@ impl Desk {
         };
         if said.is_empty() {
             self.save_ticket(&mut t).await?;
-            if files {
+            if files || needs {
                 if let Ok(v) = self.view_ticket(t).await {
                     self.announce(DeskEvent::Ticket {
                         ticket: Box::new(v),
@@ -1200,7 +1366,11 @@ impl Desk {
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
                 html_read: crate::board_sync::HTML_READ,
-                details: crate::board_sync::details_of(issue, None),
+                details: crate::board_sync::details_of(
+                    issue,
+                    None,
+                    crate::board_sync::priorities(s),
+                ),
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -1218,6 +1388,10 @@ impl Desk {
             if let Err(e) = self.0.store.put_remote_files(t.id, files, &by.party).await {
                 tracing::warn!(ticket = %t.id, error = %e, "an imported ticket's files weren't kept");
             }
+        }
+        // What blocks it there, among the tickets already on the board.
+        if self.pulled_needs(s, &mut t, &[], issue).await? {
+            self.save_ticket(&mut t).await?;
         }
         let text = format!(
             "imported {} “{}”",
@@ -1263,7 +1437,7 @@ impl Desk {
             }
             // Who has it is kept in step from the listing itself.
             if let Some(issue) = all.get(&e.key) {
-                self.refresh_assignee(t.clone(), issue)
+                self.refresh_listed(s, t.clone(), issue)
                     .await
                     .map_err(|e| RemoteError::Failed(e.to_string()))?;
                 continue;
@@ -1276,10 +1450,7 @@ impl Desk {
             if s.filter.is_all() && t.state == TicketState::Done {
                 continue;
             }
-            let tool = match s.system {
-                System::Jira => ("jira.get_issue", json!({ "issue_key": e.key })),
-                System::Linear => ("linear.issue_get", json!({ "identifier": e.key })),
-            };
+            let tool = crate::board_sync::read_issue_call(s.system, &e.key, s.fields.as_ref());
             budget.take()?;
             let mut closed = None;
             let gone = match crate::board_sync::call(remote, s.system, tool.0, tool.1).await {
