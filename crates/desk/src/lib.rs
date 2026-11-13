@@ -8,6 +8,7 @@ mod adopt;
 pub mod api;
 pub mod asking;
 pub mod attachments;
+pub mod away;
 mod background;
 pub mod board;
 mod board_api;
