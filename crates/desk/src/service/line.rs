@@ -1438,13 +1438,11 @@ impl Desk {
         Ok(())
     }
 
-    /// The pump's own loop: a session coming to its prompt (or running
-    /// again) gets what waits for it, and a hand-off the plugin never
-    /// finished goes again.
-    pub(super) async fn line_loop(self) {
-        let mut rx = self.0.events.subscribe();
-        let mut tick = tokio::time::interval(PUMP_EVERY);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    /// What the lines hold at the start, read before `start` returns: a
+    /// snapshot read by a task running beside the first calls could be
+    /// taken before a question is dismissed and laid down after it, putting
+    /// the question back among what waits on the person.
+    pub(super) async fn line_load(&self) {
         match self.0.store.line_waiting().await {
             Ok(rows) => {
                 let mut st = self.0.state.lock();
@@ -1478,6 +1476,15 @@ impl Desk {
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read when Desk's lines were last used"),
         }
+    }
+
+    /// The pump's own loop: a session coming to its prompt (or running
+    /// again) gets what waits for it, and a hand-off the plugin never
+    /// finished goes again.
+    pub(super) async fn line_loop(self) {
+        let mut rx = self.0.events.subscribe();
+        let mut tick = tokio::time::interval(PUMP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,

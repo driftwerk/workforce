@@ -261,6 +261,8 @@ async fn approve_for_me_starts_codex_with_its_reviewer_and_stays_on() {
             args.contains("-c approvals_reviewer=auto_review -c approval_policy=on-request -c sandbox_mode=workspace-write"),
             "{args}"
         );
+        // The row is queued as the session starts: written once the queue is.
+        d.persisted().await;
         assert!(store.get(s.id).await.unwrap().unwrap().approve_for_me, "kept, for its resume");
     })
     .await;
@@ -302,16 +304,12 @@ async fn fast_mode_starts_codex_on_the_priority_tier_and_stays_on() {
         until(|| std::fs::read_to_string(&args).is_ok_and(|a| a.ends_with('\n'))).await;
         let args = std::fs::read_to_string(&args).unwrap();
         assert!(args.contains("-c service_tier=\"priority\""), "{args}");
-        // The row is written as the session starts: wait for it.
-        let mut kept = false;
-        for _ in 0..100 {
-            if store.get(s.id).await.unwrap().is_some_and(|r| r.fast) {
-                kept = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(kept, "kept, for its resume");
+        // The row is queued as the session starts: written once the queue is.
+        d.persisted().await;
+        assert!(
+            store.get(s.id).await.unwrap().is_some_and(|r| r.fast),
+            "kept, for its resume"
+        );
     })
     .await;
 }

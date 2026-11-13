@@ -845,6 +845,20 @@ enum Persist {
     Turn(Box<TurnOp>),
     /// What a session asks the person now (nothing: it asks nothing).
     Asks(Uuid, Vec<asks::KeptAsk>),
+    /// Told once everything sent before it is written: how a test reads
+    /// what was queued without guessing how long the write takes.
+    #[cfg(test)]
+    Barrier(oneshot::Sender<()>),
+}
+
+#[cfg(test)]
+impl Desk {
+    /// Returns once everything queued to be written so far is written.
+    pub(super) async fn persisted(&self) {
+        let (done, wrote) = oneshot::channel();
+        self.0.persist.send(Persist::Barrier(done)).unwrap();
+        wrote.await.unwrap();
+    }
 }
 
 struct Inner {
@@ -1624,6 +1638,7 @@ impl Desk {
         desk.plans_load().await;
         desk.boards_ungrouped(&ungrouped_boards).await;
         tokio::spawn(desk.clone().watch_background());
+        desk.line_load().await;
         tokio::spawn(desk.clone().line_loop());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
@@ -6597,6 +6612,11 @@ async fn persist_loop(
                     Err(_) => unwritten.insert(session, asks),
                 };
                 put
+            }
+            #[cfg(test)]
+            Persist::Barrier(done) => {
+                let _ = done.send(());
+                Ok(())
             }
         };
         if let Err(e) = result {
