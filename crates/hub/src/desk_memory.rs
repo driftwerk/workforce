@@ -318,6 +318,34 @@ impl workforce_desk::account::Accountant for HubAccountant {
             .map(|(text, _)| text)
     }
 
+    fn shares_reads(&self) -> bool {
+        true
+    }
+
+    async fn answer_shared(
+        &self,
+        session: uuid::Uuid,
+        engine: workforce_desk::engine::Engine,
+        system: &str,
+        user: &str,
+    ) -> eyre::Result<Answered> {
+        let subject = workforce_desk::floor::Subject::Session {
+            id: session,
+            engine,
+        };
+        let (text, model) = self
+            .model
+            .answer_for(
+                Some(&subject),
+                None,
+                system,
+                user,
+                crate::floor::gists::Call::ACCOUNT_NOTES,
+            )
+            .await?;
+        Ok(Answered { text, model })
+    }
+
     async fn gist(
         &self,
         session: uuid::Uuid,
