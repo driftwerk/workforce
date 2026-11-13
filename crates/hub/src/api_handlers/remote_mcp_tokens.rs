@@ -94,7 +94,10 @@ fn any_service(state: &GatewayState) -> Result<(RemoteMcpTokenService, bool), Re
 /// Whether `token` is shown and revocable here while `[remote_mcp]` is `on`
 /// or not.
 fn reachable_kind(on: bool, token: &RemoteMcpToken) -> bool {
-    on || token.scope() == Some(TokenScope::DeskBoss)
+    on || matches!(
+        token.scope(),
+        Some(TokenScope::DeskBoss | TokenScope::DeskKnows)
+    )
 }
 
 fn store_error(e: eyre::Report) -> Rejection {

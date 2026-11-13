@@ -506,7 +506,7 @@ mod tests {
                 .unwrap();
             let refused = authenticate(&fx.state, &bearer(&minted.plaintext)).err();
             let want = match kind {
-                TokenScope::DeskBoss => AuthError::Unauthenticated,
+                TokenScope::DeskBoss | TokenScope::DeskKnows => AuthError::Unauthenticated,
                 TokenScope::RemoteMcp => AuthError::OutOfScope,
             };
             assert_eq!(refused, Some(want), "{kind:?}");

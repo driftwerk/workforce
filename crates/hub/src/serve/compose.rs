@@ -2037,6 +2037,7 @@ impl Setup {
         // Install-wide, set once; an inconsistent `[decision]` refuses to boot.
         crate::decide::install_from_config(&config.decision)?;
         crate::decision_store::install(config).await;
+        crate::desk_knows::install(config).await;
         crate::floor::install(config).await;
         #[cfg(feature = "postgres")]
         crate::surface_allows::install(config).await;
