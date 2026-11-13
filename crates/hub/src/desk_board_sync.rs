@@ -55,7 +55,7 @@ use workforce_desk::board_sync::{self as sync, Remote, RemoteError, RemoteState}
 use workforce_desk::{Desk, DeskError, LinkBoard};
 use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
 
-use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
+use crate::gateway::{resolve_caller_context, AuthFailure, CallerContext, GatewayState};
 use crate::vault::Vault;
 
 /// The longest the link dialog waits on one hub when asking which offers a
@@ -137,10 +137,13 @@ impl HubRemote {
         agent: Option<&str>,
     ) -> Result<Self, RemoteError> {
         let base = url.trim_end_matches('/');
+        // Marked as the board sync, a program: the hub offers it the file
+        // readers it keeps off a model's client.
+        let mark = workforce_core::desk::BOARD_SYNC_CALLER;
         let path = match agent {
-            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}"),
+            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}?{mark}"),
             Some(_) => return Err(RemoteError::Refused("that isn't an agent's id".into())),
-            None => format!("{base}/mcp"),
+            None => format!("{base}/mcp?{mark}"),
         };
         let endpoint = url::Url::parse(&path)
             .map_err(|_| RemoteError::Offline("the hub's address isn't one".into()))?;
@@ -453,6 +456,7 @@ impl LocalRemote {
                     identity_id: self.person.clone(),
                     agent_id: service.agent_id.to_string(),
                 },
+                program: true,
             },
             ctx,
             router: if quiet {
@@ -835,7 +839,7 @@ fn missing_words(hub: &str, system: System, _tools: &[String]) -> String {
     )
 }
 
-fn paused_words(hub: &str, system: System, p: &Paused) -> String {
+pub(crate) fn paused_words(hub: &str, system: System, p: &Paused) -> String {
     match p {
         Paused::Missing { tools } => missing_words(hub, system, tools),
         Paused::Refused { reason } if reason == NO_AGENT_LETS_YOU_IN => no_agent_words(hub),
@@ -856,14 +860,61 @@ struct TokenQuery {
     token: Option<String>,
 }
 
-fn refusal(status: StatusCode, error: &str) -> Response {
+pub(crate) fn refusal(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
 /// The person asking: signed in as themselves, holding this hub.
 async fn person(r: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<String, Response> {
-    let state = &r.sync.state;
-    let caller = resolve_caller_context(state, headers, token).await;
+    person_of(&r.sync, headers, token).await
+}
+
+/// The person asking `sync`'s hub: signed in as themselves, holding it.
+pub(crate) async fn person_of(
+    sync: &BoardSync,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<String, Response> {
+    let caller = resolve_caller_context(&sync.state, headers, token).await;
+    holder_of(sync, &caller)
+}
+
+/// The person themselves at their own Desk, for what goes out in their own
+/// words, unprefixed: [`person_of`], asking with their own sign-in or with
+/// the Desk app on a computer paired to them
+/// ([`crate::device_link::is_desktop_device`]), never with a phone's, a
+/// voice box's or any other device's token. A token made for an agent, a
+/// session or a tool (a remote MCP or boss link token) is no sign-in here
+/// at all.
+pub(crate) async fn person_at_desk(
+    sync: &BoardSync,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<String, Response> {
+    let caller = resolve_caller_context(&sync.state, headers, token).await;
+    let person = holder_of(sync, &caller)?;
+    if let Some(device) = caller.device_id.as_deref() {
+        let store = sync.state.identity_store.as_ref();
+        let at_desk = store.is_some_and(|store| {
+            crate::device_link::is_desktop_device(store.as_ref(), device)
+                && crate::device_link::identity_for_device(store.as_ref(), device).as_deref()
+                    == Some(person.as_str())
+        });
+        if !at_desk {
+            return Err(refusal(
+                StatusCode::FORBIDDEN,
+                "Only you, at Desk on your computer, post in your own words: not a paired phone or other device",
+            ));
+        }
+    }
+    Ok(person)
+}
+
+/// The person `caller` is, holding `sync`'s hub. The refusal is the
+/// answer, as [`person_of`]'s is.
+#[allow(clippy::result_large_err)]
+fn holder_of(sync: &BoardSync, caller: &CallerContext) -> Result<String, Response> {
+    let state = &sync.state;
     match caller.auth_failure {
         Some(AuthFailure::InvalidCredentials) => {
             return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
@@ -876,7 +927,7 @@ async fn person(r: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<
         }
         None => {}
     }
-    let Some(person) = caller.identity_id else {
+    let Some(person) = caller.identity_id.clone() else {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "A board's sync is a person's: ask as yourself, not as the hub",
@@ -1806,4 +1857,4 @@ pub fn install(state: &Arc<GatewayState>, desk: Desk) -> (Arc<BoardSync>, Router
 
 #[cfg(test)]
 #[path = "desk_board_sync_tests.rs"]
-mod tests;
+pub(crate) mod tests;
