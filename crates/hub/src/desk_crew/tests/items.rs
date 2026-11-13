@@ -888,7 +888,7 @@ async fn at_act_fully_what_only_the_person_can_do_is_one_line_with_done() {
 /// The second screenshot's case: a session's question while the person is
 /// typing in that session is theirs, and nothing is posted; one posted
 /// before they stepped in is settled at the next look, said as `settled`,
-/// and the update that listed it reads as settled by them.
+/// and reads as settled by them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -939,7 +939,7 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
         .await;
         let item = d.store().item_of_line(ask).await.unwrap().expect("its item");
         let (_, mut events) = d.subscribe();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         d.person_typing(other.id).unwrap();
         crew.look_at_updates().await;
         let closed = eventually("settled", async || {

@@ -574,8 +574,8 @@ pub fn brief(
 }
 
 /// The update's headline written plainly: what it did, what is the
-/// person's and what it left alone, in counts.
-pub fn plain_headline(u: &MentionedUpdate) -> String {
+/// person's (`for_you` in all) and what it left alone, in counts.
+pub fn plain_headline(u: &MentionedUpdate, for_you: usize) -> String {
     let count = |k: BriefKind| {
         u.brief
             .iter()
@@ -583,11 +583,10 @@ pub fn plain_headline(u: &MentionedUpdate) -> String {
             .filter(|i| i.kind == k)
             .count()
     };
-    let more = u.more_items as usize;
-    let for_you = count(BriefKind::ForYou);
-    // What only the person can do comes first: the lines left out are
-    // what it did.
-    let done = count(BriefKind::Done) + more;
+    // Lines left out are what only the person can do past those shown,
+    // then what it did.
+    let shown = count(BriefKind::ForYou);
+    let done = count(BriefKind::Done) + (u.more_items as usize).saturating_sub(for_you - shown.min(for_you));
     let waiting = u.needs_you.len();
     let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
     let mut parts: Vec<String> = Vec::new();
@@ -1319,7 +1318,7 @@ mod tests {
             more_items: more,
             ..Default::default()
         };
-        u.headline = plain_headline(&u);
+        u.headline = plain_headline(&u, 1);
         assert_eq!(u.headline, "4 done, 1 for you, 2 left alone.");
         let text = render(&u, &[]);
         assert_eq!(

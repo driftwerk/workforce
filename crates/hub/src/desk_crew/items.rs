@@ -1003,11 +1003,15 @@ impl CrewHub {
                 "That asks for an answer, not Done.".into(),
             ));
         }
-        store
+        match store
             .item_close(id, ClosedBy::Person, DONE_WHY)
             .await
-            .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?;
-        Ok("Done.".into())
+            .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
+        {
+            Some(_) => Ok("Done.".into()),
+            // Closed meanwhile, another way.
+            None => Err(ItemRefused::Closed),
+        }
     }
 
     /// What `boss` owes the person, as its turns are given it.
@@ -1392,6 +1396,7 @@ impl CrewHub {
             Err(_) => return,
         };
         self.resurface(&items).await;
+        self.post_held_questions().await;
     }
 }
 

@@ -217,7 +217,18 @@ impl CrewHub {
                 .collect(),
             false => Vec::new(),
         };
-        let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
+        let open: Vec<OpenItem> = store
+            .items_not_closed(Some(boss))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            // The person in that session now: theirs, nothing said of it,
+            // nor counted as said again.
+            .filter(|i| {
+                !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
+                    || i.session.is_none_or(|s| !self.person_in(s, i.opened_at))
+            })
+            .collect();
         let restated: Vec<(Uuid, bool)> = match composed {
             true => self
                 .due_again(&open, o, now)
@@ -235,8 +246,6 @@ impl CrewHub {
             .into_iter()
             .filter(|i| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
             .filter(|i| i.said() && i.state == OpenState::Open)
-            // The person in that session now: theirs, nothing said of it.
-            .filter(|i| i.session.is_none_or(|s| !self.person_in(s, i.opened_at)))
             .collect();
         let quiet = self
             .quiet_made
@@ -386,7 +395,7 @@ impl CrewHub {
             brief,
             more_items,
         };
-        u.headline = headline.unwrap_or_else(|| update::plain_headline(&u));
+        u.headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
         let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();
         let text = update::render(&u, &decided);
         (u, text)

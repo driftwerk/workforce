@@ -541,6 +541,18 @@ impl DeskStore {
                     l.laid_out_from(d);
                 }
             }
+            // The brief's lines of what it did: their undo as their rows'
+            // now (none once undone).
+            for u in e.update.iter_mut() {
+                for i in u.brief.iter_mut().flat_map(|g| g.items.iter_mut()) {
+                    if i.kind != crate::update::BriefKind::Done {
+                        continue;
+                    }
+                    if let Some(d) = rows.iter().find(|d| d.id.to_string() == i.id) {
+                        i.undo = d.line_now(delivery.get(&d.id).copied()).undo;
+                    }
+                }
+            }
         }
     }
 

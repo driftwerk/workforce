@@ -235,17 +235,18 @@ impl Desk {
         st.lines.spoke.insert(id, Utc::now());
     }
 
-    /// When the person last spoke to `id` while the hub ran, by prompt,
-    /// message or answer.
-    /// When the person last took part in `id` themselves: typed in its
-    /// terminal or Desk's composer, prompted it, wrote or answered on its
-    /// line. Never Desk's own deliveries for them. Kept in memory: what it
-    /// settles is kept by closing the item.
+    /// When the person last took part in `id` in the session itself: typed
+    /// in its terminal or Desk's composer, or prompted it. Never an answer
+    /// given from Desk's buttons (that is one ask's, not the session's), nor
+    /// Desk's own deliveries for them. Kept in memory: what it settles is
+    /// kept by closing the item.
     pub fn person_input_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
         let st = self.0.state.lock();
-        Desk::last_input(&st, id).max(st.lines.spoke.get(&id).copied())
+        Desk::last_input(&st, id)
     }
 
+    /// When the person last spoke to `id` while the hub ran, by prompt,
+    /// message or answer.
     pub fn person_spoke_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
         self.0.state.lock().lines.spoke.get(&id).copied()
     }

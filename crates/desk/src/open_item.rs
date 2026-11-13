@@ -40,12 +40,13 @@ text_enum!(ClosedBy {
 /// Why an ask closed when the person settled it in its session
 /// themselves: what tells it apart from one answered with Desk's buttons.
 pub const SETTLED_WHY: &str = "You settled it in the session.";
-/// How `i` was settled in its session, if it was: the person there
-/// ([`SETTLED_WHY`]), or the session itself.
+/// How `i` was settled apart from the update that lists it, if it was:
+/// by the person in its session ([`SETTLED_WHY`]) or by their Done
+/// ([`DONE_WHY`]), or by the session itself.
 pub fn settled_by(i: &OpenItem) -> Option<crate::update::SettledBy> {
     use crate::update::SettledBy;
     match (i.state, i.closed_by, i.closed_why.as_deref()) {
-        (OpenState::Closed, _, Some(SETTLED_WHY)) => Some(SettledBy::You),
+        (OpenState::Closed, _, Some(SETTLED_WHY | DONE_WHY)) => Some(SettledBy::You),
         (OpenState::Closed, Some(ClosedBy::Session), _) => Some(SettledBy::Session),
         _ => None,
     }
