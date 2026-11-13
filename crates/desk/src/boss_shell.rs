@@ -208,6 +208,9 @@ struct Spec {
     valued: &'static [&'static str],
     letters: &'static str,
     numbers: bool,
+    /// Flags whose value is only ever attached (`--format=…`, `-U3`,
+    /// `-j4`): the tool takes the next word as an option of its own.
+    attached: &'static [&'static str],
 }
 
 const NONE: Spec = Spec {
@@ -215,6 +218,7 @@ const NONE: Spec = Spec {
     valued: &[],
     letters: "",
     numbers: false,
+    attached: &[],
 };
 
 const fn letters(letters: &'static str) -> Spec {
@@ -223,6 +227,7 @@ const fn letters(letters: &'static str) -> Spec {
         valued: &[],
         letters,
         numbers: false,
+        attached: &[],
     }
 }
 
@@ -250,8 +255,11 @@ fn read_args<'a>(args: &'a [Word], spec: &Spec) -> Option<(Vec<&'a Word>, Vec<St
             values.push(it.next()?.text.clone());
             continue;
         }
+        if spec.attached.contains(&a) {
+            return None;
+        }
         if let Some((k, v)) = a.split_once('=') {
-            if spec.valued.contains(&k) || spec.flags.contains(&k) {
+            if spec.valued.contains(&k) || spec.flags.contains(&k) || spec.attached.contains(&k) {
                 values.push(v.to_string());
                 continue;
             }
@@ -271,6 +279,14 @@ fn read_args<'a>(args: &'a [Word], spec: &Spec) -> Option<(Vec<&'a Word>, Vec<St
                 break;
             };
             let flag = format!("-{c}");
+            if spec.attached.contains(&flag.as_str()) {
+                let rest = &a[1 + i + c.len_utf8()..];
+                if rest.is_empty() {
+                    return None;
+                }
+                values.push(rest.to_string());
+                break;
+            }
             if spec.valued.contains(&flag.as_str()) {
                 let rest = &a[1 + i + c.len_utf8()..];
                 values.push(if rest.is_empty() {
@@ -318,6 +334,7 @@ fn spec_of(program: &str) -> Option<Spec> {
             valued: &["-n", "-c"],
             letters: "qvfF",
             numbers: true,
+            attached: &[],
         },
         "wc" => letters("lwcmL"),
         "grep" | "egrep" | "fgrep" => Spec {
@@ -334,6 +351,7 @@ fn spec_of(program: &str) -> Option<Spec> {
             ],
             letters: "rRnilvwcEFHhoqsxLz",
             numbers: true,
+            attached: &[],
         },
         "echo" => letters("neE"),
         "pwd" => letters("LP"),
@@ -350,6 +368,7 @@ fn spec_of(program: &str) -> Option<Spec> {
             valued: &["-U"],
             letters: "urNqyiwbBa",
             numbers: false,
+            attached: &[],
         },
         "cut" => Spec {
             valued: &["-d", "-f", "-c", "-b"],
@@ -365,7 +384,8 @@ fn spec_of(program: &str) -> Option<Spec> {
         "printf" | "sleep" | "seq" | "nl" | "tac" | "rev" | "true" | "false" | "touch" | "cd"
         | "pushd" | "popd" | "just" | "node" => NONE,
         "make" => Spec {
-            valued: &["-j"],
+            flags: &["-j"],
+            attached: &["-j"],
             ..letters("ksn")
         },
         _ => return None,
@@ -375,12 +395,10 @@ fn spec_of(program: &str) -> Option<Spec> {
 /// Whether `w`, a word or an option's value, names a path outside `cwd`
 /// or a dotfile in `home`: one with `/` in it, or `~`, or `..`. A URL
 /// isn't a path.
-fn strays(w: &str, cwd: &Path, home: &Path) -> bool {
-    let url = w.split_once("://").is_some_and(|(s, _)| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-    });
+fn strays(w: &str, cwd: &Path, home: &Path, urls: bool) -> bool {
+    // Only a program that fetches takes a URL, and only over the web:
+    // `x://../..` is a folder `x:` and the way up from it, `file://` a file.
+    let url = urls && (w.starts_with("https://") || w.starts_with("http://"));
     if url || !(w.contains('/') || w.starts_with('~') || w == "..") {
         return false;
     }
@@ -435,11 +453,17 @@ pub fn readable(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
         let name = program.text.as_str();
         let args = &c.words[1..];
         // No word, nor an option's value, names a path outside the folder.
+        let urls = matches!(name, "curl" | "gh");
         let words_stray = args.iter().any(|w| {
-            strays(&w.text, cwd, home)
+            strays(&w.text, cwd, home, urls)
                 || w.text
                     .split_once('=')
-                    .is_some_and(|(_, v)| strays(v, cwd, home))
+                    .is_some_and(|(_, v)| strays(v, cwd, home, urls))
+                // A pattern a part of which may be `..` (`.*`, `.?`, `src/.[.]`).
+                || (w.pattern
+                    && w.text.split('/').any(|part| {
+                        part.starts_with('.') && part.contains(['*', '?', '['])
+                    }))
         });
         if words_stray {
             return false;
@@ -503,7 +527,12 @@ pub fn readable(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
                         writes = true;
                         operands.iter().all(|w| plain_inside(w))
                     }
-                    "cd" | "pushd" => operands.len() == 1 && plain_inside(operands[0]),
+                    // `cd -` and `cd +1` go where the shell was before.
+                    "cd" | "pushd" => {
+                        operands.len() == 1
+                            && !(operands[0].text == "-" || operands[0].text.starts_with('+'))
+                            && plain_inside(operands[0])
+                    }
                     "popd" => operands.is_empty(),
                     // Its second operand is a file it writes.
                     "uniq" => operands.len() <= 1,
@@ -671,6 +700,7 @@ fn cargo(args: &[Word]) -> bool {
                 ],
                 letters: "rqv",
                 numbers: false,
+                attached: &[],
             },
         )
         .is_some()
@@ -737,6 +767,7 @@ const PYTEST: Spec = Spec {
     valued: &["-k", "-m", "--tb", "--maxfail", "-n"],
     letters: "qvxsl",
     numbers: false,
+    attached: &[],
 };
 
 /// `python -m` with a known tool, or a script the folder holds, given
@@ -796,18 +827,15 @@ fn git(args: &[Word]) -> bool {
         ],
         valued: &[
             "-n",
-            "--format",
-            "--pretty",
             "--since",
             "--until",
             "--author",
             "--grep",
-            "-U",
             "--max-count",
-            "--date",
         ],
         letters: "pw",
         numbers: true,
+        attached: &["--format", "--pretty", "--date", "-U"],
     };
     let spec = match sub.text.as_str() {
         "diff" | "log" | "show" => SHOWING,
@@ -834,6 +862,7 @@ fn git(args: &[Word]) -> bool {
             valued: &["-m", "--message"],
             letters: "asq",
             numbers: false,
+            attached: &[],
         },
         "push" => Spec {
             flags: &["--set-upstream", "--follow-tags", "--tags"],
@@ -866,6 +895,7 @@ fn git(args: &[Word]) -> bool {
             valued: &["-m", "--message"],
             letters: "u",
             numbers: false,
+            attached: &[],
         },
         "rev-parse" => Spec {
             flags: &[
@@ -901,7 +931,19 @@ fn git(args: &[Word]) -> bool {
         },
         _ => return false,
     };
-    read(spec).is_some()
+    let Some((operands, _)) = read(spec) else {
+        return false;
+    };
+    // `:/` and other magic pathspecs reach past the folder.
+    if operands.iter().any(|o| o.text.starts_with(':')) {
+        return false;
+    }
+    // A remote by its name, never an address or a path.
+    let bare = |o: &&Word| !o.text.contains([':', '@', '/']);
+    match sub.text.as_str() {
+        "fetch" | "pull" | "push" => operands.first().is_none_or(bare),
+        _ => true,
+    }
 }
 
 /// `gh` reading pull requests, issues and runs.
@@ -939,7 +981,7 @@ fn gh(args: &[Word]) -> bool {
 /// `curl` fetching to its output, by the options it knows: no file
 /// written or read into what it sends, no method but GET, no body.
 fn curl(args: &[Word]) -> bool {
-    let Some((_, values)) = read_args(
+    let Some((operands, values)) = read_args(
         args,
         &Spec {
             flags: &[
@@ -961,12 +1003,16 @@ fn curl(args: &[Word]) -> bool {
             ],
             letters: "sSLfIi",
             numbers: false,
+            attached: &[],
         },
     ) else {
         return false;
     };
-    // A header from a file sends the file.
+    // A header from a file sends the file; only the web is fetched.
     !values.iter().any(|v| v.starts_with('@'))
+        && operands
+            .iter()
+            .all(|o| o.text.starts_with("https://") || o.text.starts_with("http://"))
 }
 
 #[cfg(test)]
@@ -993,6 +1039,13 @@ mod tests {
             "git status -sb",
             "git commit -am 'Fix the date picker'",
             "head -n5 src/main.rs",
+            "make -j4 test",
+            "make -j",
+            "git log --format='%h %s' -n 3",
+            "git log --pretty=oneline",
+            "git diff -U3",
+            "git fetch origin",
+            "git push -u origin feature/date-picker",
             "sed -n '1,20p' src/main.rs",
             "sed 's/foo/bar/g' notes.txt",
             "git commit -m \"fix: does a -> b work?\"",
@@ -1137,6 +1190,24 @@ mod tests {
             "sort --compress-program=x f",
             "date -f f",
             "cd",
+            // From the third review of the allowlist.
+            "mkdir x: && cat x://../../../../etc/passwd",
+            "curl -s file:///etc/passwd",
+            "curl -s gopher://localhost:6379/x",
+            "git fetch file:///srv/repo",
+            "git fetch ../other",
+            "git pull git@example.com:x/y",
+            "grep -rn KEY .*",
+            "ls -la .?",
+            "cat .[.]",
+            "cat src/.*/x",
+            "cd - && cat .env",
+            "pushd +1",
+            "make -j --eval='x'",
+            "git log -1 --pretty --output=src/x",
+            "git diff -U --output=src/x",
+            "git restore :/",
+            "git add :/",
         ] {
             assert!(!ok(c), "{c}");
         }
