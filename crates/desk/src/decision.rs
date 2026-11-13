@@ -133,6 +133,7 @@ impl BossDecision {
             undo: button.map(str::to_string),
             undone: self.undone_at.is_some(),
             preference: self.preference.map(|p| p.to_string()),
+            at: Some(self.at),
         }
     }
 
@@ -242,6 +243,9 @@ pub struct DecisionLine {
     pub undone: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference: Option<String>,
+    /// When it was decided: a catch-up says each one's time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// How many needs a boss settled itself, gave the person, or the person

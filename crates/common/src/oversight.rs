@@ -15,7 +15,7 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
-//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10 }
+//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
 //!
 //! `[oversight.updates]` holds the cheap model's day: every session's
@@ -30,6 +30,9 @@
 //! for `every_minutes` after the first result and sent by
 //! `max_wait_minutes` at the latest, as one update in the boss's DM.
 //! Off, updates are posted plainly from the rows.
+//! `away_after_minutes`: the person is away once the boss's posts have
+//! been unread that long; its updates then gather into one catch-up for
+//! their return.
 //!
 //! `full` is **Act fully**: everything `act` does, and, in the repositories
 //! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
@@ -340,6 +343,8 @@ pub struct Updates {
     pub every_minutes: u32,
     /// How long a small change waits at most.
     pub max_wait_minutes: u32,
+    /// How long the boss's posts go unread before the person is away.
+    pub away_after_minutes: u32,
 }
 
 /// The longest an update may gather or wait.
@@ -446,6 +451,7 @@ impl Default for Oversight {
                 enabled: true,
                 every_minutes: 3,
                 max_wait_minutes: 10,
+                away_after_minutes: 15,
             },
         }
     }
@@ -713,6 +719,15 @@ impl Oversight {
                 "The most minutes a small change waits for an update must be a whole number from {every_minutes} (how long an update gathers) to {MAX_UPDATE_MINUTES}."
             ),
         )?;
+        let away_after_minutes = whole(
+            updates,
+            "away_after_minutes",
+            d.updates.away_after_minutes,
+            1..=MAX_UPDATE_MINUTES,
+            &format!(
+                "The minutes before the person counts as away must be a whole number from 1 to {MAX_UPDATE_MINUTES}."
+            ),
+        )?;
         let minutes = |key: &str, default: u32, what: &str| {
             whole(
                 wake,
@@ -930,6 +945,7 @@ impl Oversight {
                 )?,
                 every_minutes,
                 max_wait_minutes,
+                away_after_minutes,
             },
         })
     }
@@ -1256,6 +1272,13 @@ mod tests {
         assert!(parse("[oversight]\nupdates = { every_minutes = 0 }\n")
             .unwrap_err()
             .contains("gathers"));
+        // Away after 15 minutes unread, or as set.
+        assert_eq!(d.updates.away_after_minutes, 15);
+        let away = parse("[oversight]\nupdates = { away_after_minutes = 45 }\n").unwrap();
+        assert_eq!(away.updates.away_after_minutes, 45);
+        assert!(parse("[oversight]\nupdates = { away_after_minutes = 0 }\n")
+            .unwrap_err()
+            .contains("away"));
     }
 
     /// Messaging agents and sessions started in another terminal are each

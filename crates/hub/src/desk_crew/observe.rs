@@ -75,7 +75,12 @@ impl CrewHub {
             if !message.starts_with(CHECK_IN) {
                 self.person_spoke();
             }
+            // The reply is running before anything waiting on the person
+            // looks again, so nothing posts into the middle of it.
+            self.manager_turns.lock().insert(sid.clone(), crew::now());
             if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
+                // Sent: no longer typing it, and here.
+                self.dm_sent(&agent_id);
                 // Messages queued into one turn are all its asks.
                 let mut turns = self.person_turns.lock();
                 let asked = turns.entry(sid.clone()).or_default();
@@ -84,7 +89,6 @@ impl CrewHub {
                 }
                 asked.push_str(message);
             }
-            self.manager_turns.lock().insert(sid.clone(), crew::now());
             return Some(Track {
                 crew: self.me(),
                 key: String::new(),
@@ -172,6 +176,8 @@ impl Track {
             }
             crew.manager_turns.lock().remove(&sid);
             crew.person_turns.lock().remove(&sid);
+            // An update held for this reply may go now.
+            crew.update_poke.notify_one();
             return;
         }
         crew.running.lock().remove(&self.key);
@@ -205,6 +211,7 @@ impl Drop for Track {
         if let Some(sid) = &self.manager_session {
             self.crew.manager_turns.lock().remove(sid);
             self.crew.person_turns.lock().remove(sid);
+            self.crew.update_poke.notify_one();
             return;
         }
         self.crew.running.lock().remove(&self.key);

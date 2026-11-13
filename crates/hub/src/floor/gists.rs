@@ -1152,6 +1152,16 @@ impl Call {
         description: "desk:account",
     };
 
+    /// A session's account refreshed and its new exchanges read for notes
+    /// in one call: room for both answers, booked apart so it shows on its
+    /// own in spend.
+    pub(crate) const ACCOUNT_NOTES: Call = Call {
+        max_tokens: workforce_desk::account::ANSWER_TOKENS
+            + workforce_desk::memory::derive::ANSWER_TOKENS,
+        task: workforce_desk::account::SHARED_TASK,
+        description: "desk:account-and-notes",
+    };
+
     /// A running turn's `now` in a session's account.
     pub(crate) const ACCOUNT_NOW: Call = Call {
         max_tokens: 200,

@@ -594,7 +594,10 @@ impl CrewHub {
 
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
-    /// for a check-in. Whether it went out.
+    /// for a check-in. While the person types to the boss it goes once they
+    /// pause or send, at most three minutes on, without holding up the
+    /// caller, and only while `i` is still open. Whether it went out, or
+    /// will.
     pub(crate) async fn post_item(
         &self,
         boss: &str,
@@ -602,26 +605,12 @@ impl CrewHub {
         text: String,
         approvals: Vec<MentionedApproval>,
     ) -> bool {
-        let Some((service, _)) = self.overseer_named(boss) else {
-            return false;
-        };
-        let Some(owner) = self.person(Some(&service)) else {
-            return false;
-        };
         let extras = Extras {
             item: Some(i.mention()),
             approvals,
             ..Default::default()
         };
-        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Question, text);
-        if let Err(e) = self
-            .deliver_with_extras(&service, &owner, delivery, &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
-            return false;
-        }
-        true
+        self.card(boss, Some(i.id), text, extras).await
     }
 
     /// A DM reply of `boss`'s, in a turn that started at `started`, that

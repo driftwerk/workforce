@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_common::channels::desk::DeliveryKind;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Extras, MentionedQuestion, PartyKind};
@@ -178,7 +177,7 @@ impl CrewHub {
                 .overseer_of_group(q.group.as_deref())
                 .map(|(s, _)| s.agent_id.as_str().to_string()),
         };
-        let Some((service, owner)) = boss.and_then(|b| self.dm(&b)) else {
+        let Some((service, _)) = boss.and_then(|b| self.dm(&b)) else {
             return;
         };
         let e = q.escalation.clone().unwrap_or(Escalation {
@@ -202,14 +201,15 @@ impl CrewHub {
         item.line_message = Some(q.id);
         item.options = e.options.clone();
         item.recommendation = e.draft.clone();
-        match self.desk.store().item_open(&item).await {
-            Ok(Opened::New(_)) => {}
+        let item_id = match self.desk.store().item_open(&item).await {
+            Ok(Opened::New(i)) => Some(i.id),
             Ok(Opened::Again(_)) => return,
             // Kept or not, the person still gets the question.
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "keeping a session's question as an open item failed");
+                None
             }
-        }
+        };
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
@@ -228,13 +228,10 @@ impl CrewHub {
             }],
             ..Default::default()
         };
-        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Question, text);
-        if let Err(e) = self
-            .deliver_with_extras(&service, &owner, delivery, &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "putting a session's question in the DM failed");
-        }
+        // While the person types to the boss, the card waits for a pause,
+        // at most three minutes, without holding up the caller.
+        self.card(service.agent_id.as_str(), item_id, text, extras)
+            .await;
     }
 
     /// Gives every question in `asks` (of `session`) to the person, saying
@@ -444,7 +441,7 @@ impl CrewHub {
 
     /// What the overseer reads for a session's messages to it, and its
     /// turn's end (`ended`) when it runs it.
-    fn line_prompt(
+    pub(super) fn line_prompt(
         &self,
         session: Uuid,
         messages: &[LineMessage],
