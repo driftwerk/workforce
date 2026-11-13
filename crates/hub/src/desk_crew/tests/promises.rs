@@ -145,11 +145,23 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
             .expect("kept");
         assert_eq!(kept.closed_by, Some(ClosedBy::Boss));
         assert_eq!(kept.closed_why.as_deref(), Some("Done: Merged #622 after CI went green"));
+        // Reported once, in the boss's next update.
         let report = eventually("the report back", async || {
-            said(&overseer, "The change you asked for at")
+            overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()?
+                .messages
+                .into_iter()
+                .find(|m| m.content.contains("The change you asked for at"))
+                .map(|m| m.content)
         })
         .await;
         assert!(report.contains("is merged: Merged #622"), "{report}");
+        assert!(
+            said(&overseer, "The change you asked for at").is_none(),
+            "not as a post of its own"
+        );
         // The order with no end stays.
         assert_eq!(
             d.store().open_item(order.id).await.unwrap().unwrap().state,

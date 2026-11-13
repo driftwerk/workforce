@@ -1129,6 +1129,12 @@ pub async fn mount(
         crate::desk_crew::Timing::default(),
         cancel_crew,
     );
+    crew.set_update_writer(Arc::new(crate::desk_crew::HubWriter {
+        model: crate::floor::gists::HubModel {
+            state: Arc::clone(state),
+            fallback: config.floor.fallback_providers,
+        },
+    }));
     // The boss links this engine holds, its key, and its uplinks to their
     // boss hubs.
     let app = app.merge(crate::gateway::hardened(crate::desk_uplink::routes(

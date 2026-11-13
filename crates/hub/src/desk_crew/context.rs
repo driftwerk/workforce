@@ -178,6 +178,7 @@ pub(super) fn body(
 pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) -> Option<String> {
     let about = match channel {
         DESK_CHANNEL => None,
+        c if c.starts_with(&format!("{DESK_CHANNEL}:checkin:")) => None,
         c => Some(
             c.strip_prefix(DESK_CHANNEL)?
                 .strip_prefix(":line:")?

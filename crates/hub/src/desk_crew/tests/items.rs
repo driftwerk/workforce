@@ -344,7 +344,9 @@ async fn an_unanswered_ask_is_restated_on_its_cadence_and_parked_after_three() {
             dir.path(),
             pool,
             "ok",
-            "[oversight]\nenabled = true\nlevel = \"act\"\nwake = { remind_minutes = 1 }\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nwake = { remind_minutes = 1 }\n\
+             # Its own posts, as without the composer.\n\
+             updates = { enabled = false }\n",
             &[],
         )
         .await;

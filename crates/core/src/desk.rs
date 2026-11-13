@@ -612,6 +612,9 @@ pub enum DeliveryKind {
     Question,
     /// A boss's plan for the person to approve, or a change to one.
     Plan,
+    /// A boss's update: what changed on the crew, what it decided, and
+    /// what still waits on the person.
+    Update,
     /// One a newer hub or Desk names, read by one that doesn't know it.
     #[serde(other)]
     Other,

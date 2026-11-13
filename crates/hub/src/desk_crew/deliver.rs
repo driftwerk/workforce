@@ -104,7 +104,9 @@ impl CrewHub {
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
             owner: owner.to_string(),
-            attended: in_dm,
+            // A quiet check-in is the DM's own turn, off it only so its
+            // words aren't posted: it acts as the DM's would.
+            attended: in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:")),
             relayed: true,
         };
         let progress = workforce_agent::runner::with_desk(

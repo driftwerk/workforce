@@ -1228,13 +1228,21 @@ impl CrewHub {
             .record_action(action, &who, &said, &done, &before)
             .await
         {
-            if matches!(
-                action,
-                Action::Nudge {
-                    reply_to: Some(_),
-                    ..
-                }
-            ) {
+            // An answer it gave a session is said at once, unless the
+            // composer is on: then it is an "I decided" line of the next
+            // update.
+            let composed = self
+                .overseer_named(&d.boss)
+                .is_some_and(|(_, o)| o.updates.enabled);
+            if !composed
+                && matches!(
+                    action,
+                    Action::Nudge {
+                        reply_to: Some(_),
+                        ..
+                    }
+                )
+            {
                 self.post_decision(&d).await;
             }
         }

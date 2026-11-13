@@ -1165,6 +1165,13 @@ impl Call {
         task: workforce_desk::account::QUESTION_TASK,
         description: "desk:account-question",
     };
+
+    /// The session paragraphs of a boss's update.
+    pub(crate) const UPDATE: Call = Call {
+        max_tokens: 700,
+        task: "desk_update",
+        description: "desk:update",
+    };
 }
 
 /// [`answer_on`], `quiet` as [`written_on`] has it, for `call`: the text,
