@@ -29,6 +29,7 @@ use crate::serve::AgentService;
 
 mod actions;
 mod allow;
+mod away;
 mod board;
 pub(crate) mod context;
 mod decisions;
@@ -170,6 +171,23 @@ pub struct CrewHub {
     /// next update to show.
     quiet_made:
         Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
+    /// The person typing in each boss's DM, by its agent: what it would
+    /// post waits for a pause.
+    dm_typing: Mutex<HashMap<String, workforce_desk::away::Typing>>,
+    /// What Desk last said of the person: its window attended, and which
+    /// DM is on screen.
+    presence: Mutex<Option<workforce_desk::away::Presence>>,
+    /// When the person last had each boss's DM on screen, as Desk said.
+    on_screen: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// Wakes the updates' look at once: the person paused typing, came
+    /// back, or wrote.
+    update_poke: tokio::sync::Notify,
+    /// Wakes what waits on the person's typing: they sent.
+    typing_done: tokio::sync::Notify,
+    /// How far the person read each boss's DM, for a test whose sessions
+    /// keep no read points.
+    #[cfg(test)]
+    test_reads: Mutex<HashMap<String, DateTime<Utc>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -543,6 +561,13 @@ impl CrewHub {
             update_writer: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
+            dm_typing: Mutex::default(),
+            presence: Mutex::default(),
+            on_screen: Mutex::default(),
+            update_poke: tokio::sync::Notify::new(),
+            typing_done: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_reads: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
@@ -1213,6 +1238,14 @@ impl Crew for CrewHub {
 
     async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
         self.me().drop_item(id).await
+    }
+
+    fn dm_typing(&self, agent: &str) -> bool {
+        self.typing_in(agent)
+    }
+
+    fn presence(&self, attending: bool, dm_on_screen: Option<&str>) {
+        self.present(attending, dm_on_screen);
     }
 
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {

@@ -1808,6 +1808,8 @@ mod items;
 mod promises;
 mod updates;
 
+mod away;
+
 mod remote_asks;
 mod served;
 mod unbound;
