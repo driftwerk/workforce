@@ -504,11 +504,17 @@ impl CrewHub {
                     .is_some_and(|v| match (&item.approval, &item.question) {
                         // Only while its call may still be deciding it: one
                         // it left to the person, or Desk refused, is raised.
-                        (Some(a), _) => {
+                        // Answered since the overview was read (often by the
+                        // decision call itself): it no longer waits.
+                        (Some(a), _)
+                            if v.pending.as_ref().is_none_or(|p| p.id.to_string() != a.id) =>
+                        {
+                            true
+                        }
+                        (Some(_), _) => {
                             (self.answers_at_once(&v)
                                 && v.pending.as_ref().is_some_and(|p| {
-                                    p.id.to_string() == a.id
-                                        && Utc::now() - p.since < super::decide::DECIDING
+                                    Utc::now() - p.since < super::decide::DECIDING
                                 }))
                                 || self.dialog_is_persons(&v, overseer)
                         }

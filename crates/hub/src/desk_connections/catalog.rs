@@ -2,6 +2,13 @@
 //! kept. Every path here is one the adapter already reads and
 //! `credential_catalog()` already lists: Connections is a view over the
 //! vault and invents no paths.
+//!
+//! A service holds several connections, each an instance of its adapter at
+//! the adapter's own multi-instance prefix (`skills/jira/workspaces/<key>/`).
+//! The flat paths (`skills/jira/api_token`) are where a connection was kept
+//! before; Connections moves one it finds to the instance `default`, which
+//! is the name the adapters already give flat mode. Slack keeps one
+//! connection, at its flat path.
 
 use serde::Serialize;
 use workforce_common::settings::VaultSource;
@@ -26,12 +33,21 @@ pub struct Field {
     pub secret: bool,
     pub required: bool,
     pub placeholder: &'static str,
-    /// Where it is kept, as the adapter reads it (before any `users/<id>/`).
+    /// Where a flat connection kept it, as the adapter reads it (before any
+    /// `users/<id>/`).
     #[serde(skip)]
     pub path: &'static str,
+    /// Where an instance keeps it, under `<prefix><key>/`.
+    #[serde(skip)]
+    pub sub: &'static str,
 }
 
-const fn secret(name: &'static str, label: &'static str, path: &'static str) -> Field {
+const fn secret(
+    name: &'static str,
+    label: &'static str,
+    path: &'static str,
+    sub: &'static str,
+) -> Field {
     Field {
         name,
         label,
@@ -39,6 +55,7 @@ const fn secret(name: &'static str, label: &'static str, path: &'static str) -> 
         required: true,
         placeholder: "",
         path,
+        sub,
     }
 }
 
@@ -47,6 +64,7 @@ const fn plain(
     label: &'static str,
     placeholder: &'static str,
     path: &'static str,
+    sub: &'static str,
 ) -> Field {
     Field {
         name,
@@ -55,6 +73,7 @@ const fn plain(
         required: true,
         placeholder,
         path,
+        sub,
     }
 }
 
@@ -78,11 +97,35 @@ pub struct Connector {
     /// Kept only in the shared tiers (Slack's bot token): "all my agents" is
     /// the hub-wide tier, "just this agent" the agent's own.
     pub shared: bool,
-    /// Every path a connection holds, so a disconnect removes it all.
+    /// Every path a flat connection holds, so a disconnect removes it all.
     pub held: &'static [&'static str],
-    /// The path whose value means it is connected.
+    /// The flat path whose value means it is connected.
     pub primary: &'static str,
+    /// Where its instances are kept (`skills/jira/workspaces/`); `None`
+    /// for a service of one connection (Slack).
+    pub prefix: Option<&'static str>,
+    /// Every path an instance holds under `<prefix><key>/`, its name
+    /// ([`LABEL`]) aside.
+    pub subs: &'static [&'static str],
+    /// The one whose value means the instance is connected.
+    pub primary_sub: &'static str,
+    /// The field that says where it is (a site, an address), shown beside
+    /// its name.
+    pub site: Option<&'static str>,
+    /// What a new connection's name should be, as the form says.
+    pub name_hint: &'static str,
+    /// Settings beside its keys that its adapter reads (not asked for by
+    /// the form): where a single connection kept each, and where an
+    /// instance does, under `<prefix><key>/`.
+    pub extras: &'static [(&'static str, &'static str)],
 }
+
+/// Where an instance keeps the name the person gave it.
+pub const LABEL: &str = "label";
+
+/// The instance a flat connection becomes: the one the adapters already
+/// expose flat mode as.
+pub const DEFAULT_INSTANCE: &str = "default";
 
 const GOOGLE_HELD: &[&str] = &[
     "skills/google/workspaces/default/refresh_token",
@@ -107,6 +150,7 @@ const GITHUB_FIELDS: &[Field] = &[secret(
     "token",
     "Personal access token",
     "skills/github/token",
+    "token",
 )];
 const EMAIL_FIELDS: &[Field] = &[
     plain(
@@ -114,17 +158,20 @@ const EMAIL_FIELDS: &[Field] = &[
         "Email address",
         "sarah@acme.example",
         "skills/email/accounts/default/username",
+        "username",
     ),
     secret(
         "password",
         "App password",
         "skills/email/accounts/default/password",
+        "password",
     ),
     plain(
         "imap_host",
         "IMAP server",
         "imap.gmail.com",
         "skills/email/accounts/default/imap_host",
+        "imap_host",
     ),
     // The loader skips an account without one.
     plain(
@@ -132,19 +179,47 @@ const EMAIL_FIELDS: &[Field] = &[
         "SMTP server",
         "smtp.gmail.com",
         "skills/email/accounts/default/smtp_host",
+        "smtp_host",
     ),
 ];
 const JIRA_FIELDS: &[Field] = &[
-    plain("site", "Site", "acme.atlassian.net", "skills/jira/site"),
-    plain("email", "Email", "sarah@acme.example", "skills/jira/email"),
-    secret("api_token", "API token", "skills/jira/api_token"),
+    plain(
+        "site",
+        "Site",
+        "acme.atlassian.net",
+        "skills/jira/site",
+        "site",
+    ),
+    plain(
+        "email",
+        "Email",
+        "sarah@acme.example",
+        "skills/jira/email",
+        "email",
+    ),
+    secret(
+        "api_token",
+        "API token",
+        "skills/jira/api_token",
+        "api_token",
+    ),
 ];
-const LINEAR_FIELDS: &[Field] = &[secret("api_key", "API key", "skills/linear/api_key")];
-const SLACK_FIELDS: &[Field] = &[secret("bot_token", "Bot token", "slack.bot_token")];
+const LINEAR_FIELDS: &[Field] = &[secret(
+    "api_key",
+    "API key",
+    "skills/linear/api_key",
+    "api_key",
+)];
+const SLACK_FIELDS: &[Field] = &[secret("bot_token", "Bot token", "slack.bot_token", "")];
 const DATADOG_FIELDS: &[Field] = &[
-    secret("api_key", "API key", "skills/datadog/api_key"),
-    secret("app_key", "Application key", "skills/datadog/app_key"),
-    optional(plain("site", "Site", "us1", "skills/datadog/site")),
+    secret("api_key", "API key", "skills/datadog/api_key", "api_key"),
+    secret(
+        "app_key",
+        "Application key",
+        "skills/datadog/app_key",
+        "app_key",
+    ),
+    optional(plain("site", "Site", "us1", "skills/datadog/site", "site")),
 ];
 const METABASE_FIELDS: &[Field] = &[
     plain(
@@ -152,8 +227,9 @@ const METABASE_FIELDS: &[Field] = &[
         "Address",
         "https://metabase.acme.example",
         "skills/metabase/site_url",
+        "site_url",
     ),
-    secret("api_key", "API key", "skills/metabase/api_key"),
+    secret("api_key", "API key", "skills/metabase/api_key", "api_key"),
 ];
 
 const GITHUB_HELD: &[&str] = &["skills/github/token"];
@@ -188,6 +264,16 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: GITHUB_HELD,
         primary: "skills/github/token",
+        prefix: Some("skills/github/workspaces/"),
+        subs: &["token"],
+        primary_sub: "token",
+        site: None,
+        name_hint: "The organisation or account it works in, like acme",
+        extras: &[
+            ("skills/github/base_url", "base_url"),
+            ("skills/github/app_id", "app_id"),
+            ("skills/github/app_private_key", "app_private_key"),
+        ],
     },
     Connector {
         id: "google",
@@ -198,6 +284,18 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: GOOGLE_HELD,
         primary: "skills/google/workspaces/default/refresh_token",
+        prefix: Some("skills/google/workspaces/"),
+        subs: &[
+            "refresh_token",
+            "access_token",
+            "expires_at",
+            "scopes",
+            "email",
+        ],
+        primary_sub: "refresh_token",
+        site: None,
+        name_hint: "Work, Personal",
+        extras: &[],
     },
     Connector {
         id: "email",
@@ -208,6 +306,25 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: EMAIL_HELD,
         primary: "skills/email/accounts/default/password",
+        prefix: Some("skills/email/accounts/"),
+        subs: &["username", "password", "imap_host", "smtp_host"],
+        primary_sub: "password",
+        site: None,
+        name_hint: "Work, Personal",
+        extras: &[
+            ("skills/email/accounts/default/imap_port", "imap_port"),
+            ("skills/email/accounts/default/smtp_port", "smtp_port"),
+            ("skills/email/accounts/default/tls", "tls"),
+            ("skills/email/accounts/default/display_name", "display_name"),
+            (
+                "skills/email/accounts/default/connect_timeout_secs",
+                "connect_timeout_secs",
+            ),
+            (
+                "skills/email/accounts/default/command_timeout_secs",
+                "command_timeout_secs",
+            ),
+        ],
     },
     Connector {
         id: "jira",
@@ -218,6 +335,12 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: JIRA_HELD,
         primary: "skills/jira/api_token",
+        prefix: Some("skills/jira/workspaces/"),
+        subs: &["site", "email", "api_token"],
+        primary_sub: "api_token",
+        site: Some("site"),
+        name_hint: "Acme",
+        extras: &[("skills/jira/default_project", "default_project")],
     },
     Connector {
         id: "linear",
@@ -228,6 +351,12 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: LINEAR_HELD,
         primary: "skills/linear/api_key",
+        prefix: Some("skills/linear/workspaces/"),
+        subs: &["api_key"],
+        primary_sub: "api_key",
+        site: None,
+        name_hint: "Acme",
+        extras: &[("skills/linear/default_team_id", "default_team_id")],
     },
     Connector {
         id: "slack",
@@ -238,6 +367,12 @@ pub const CATALOG: &[Connector] = &[
         shared: true,
         held: SLACK_HELD,
         primary: "slack.bot_token",
+        prefix: None,
+        subs: &[],
+        primary_sub: "",
+        site: None,
+        name_hint: "",
+        extras: &[],
     },
     Connector {
         id: "datadog",
@@ -248,6 +383,12 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: DATADOG_HELD,
         primary: "skills/datadog/api_key",
+        prefix: Some("skills/datadog/accounts/"),
+        subs: &["api_key", "app_key", "site"],
+        primary_sub: "api_key",
+        site: Some("site"),
+        name_hint: "Production",
+        extras: &[("skills/datadog/base_url", "base_url")],
     },
     Connector {
         id: "metabase",
@@ -258,6 +399,12 @@ pub const CATALOG: &[Connector] = &[
         shared: false,
         held: METABASE_HELD,
         primary: "skills/metabase/api_key",
+        prefix: Some("skills/metabase/instances/"),
+        subs: &["site_url", "api_key"],
+        primary_sub: "api_key",
+        site: Some("site_url"),
+        name_hint: "Acme",
+        extras: &[("skills/metabase/max_query_rows", "max_query_rows")],
     },
 ];
 
@@ -266,6 +413,68 @@ pub fn find(id: &str) -> Option<&'static Connector> {
 }
 
 impl Connector {
+    /// Whether it holds several connections.
+    pub fn named(&self) -> bool {
+        self.prefix.is_some()
+    }
+
+    /// Where `sub` of instance `key` is kept; a service of one connection
+    /// keeps `sub`'s field at its flat path.
+    pub fn at(&self, key: &str, sub: &str) -> String {
+        match self.prefix {
+            Some(prefix) => format!("{prefix}{key}/{sub}"),
+            None => self
+                .fields
+                .iter()
+                .find(|f| f.sub == sub)
+                .map_or(self.primary, |f| f.path)
+                .to_string(),
+        }
+    }
+
+    /// Where `field` of instance `key` is kept.
+    pub fn field_at(&self, field: &Field, key: &str) -> String {
+        match self.prefix {
+            Some(_) => self.at(key, field.sub),
+            None => field.path.to_string(),
+        }
+    }
+
+    /// The path whose value means instance `key` is connected.
+    pub fn primary_at(&self, key: &str) -> String {
+        match self.prefix {
+            Some(_) => self.at(key, self.primary_sub),
+            None => self.primary.to_string(),
+        }
+    }
+
+    /// Every path instance `key` holds, its name with them.
+    pub fn held_at(&self, key: &str) -> Vec<String> {
+        match self.prefix {
+            Some(_) => self
+                .subs
+                .iter()
+                .chain(self.extras.iter().map(|(_, sub)| sub))
+                .chain([&LABEL])
+                .map(|sub| self.at(key, sub))
+                .collect(),
+            None => self.held.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// Where instance `key`'s name is kept; a service of one connection
+    /// keeps none.
+    pub fn label_at(&self, key: &str) -> Option<String> {
+        self.prefix.map(|_| self.at(key, LABEL))
+    }
+
+    /// The key of the instance the logical path `path` is part of.
+    pub fn key_of<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let rest = path.strip_prefix(self.prefix?)?;
+        let (key, _) = rest.split_once('/')?;
+        (!key.is_empty()).then_some(key)
+    }
+
     /// The tiers a connection at `agent_level` is kept in, the one written
     /// first. The second is what was there before Connections: a key saved
     /// at the bare tier, which still counts and is what a disconnect at
@@ -316,7 +525,48 @@ mod tests {
             for f in c.fields {
                 assert!(c.held.contains(&f.path), "{} holds {}", c.id, f.path);
             }
+            // Every instance path, its name with them.
+            for path in c.held_at("acme") {
+                assert!(known(&path), "{path} is in credential_catalog()");
+            }
+            for f in c.fields {
+                assert!(
+                    c.held_at("acme").contains(&c.field_at(f, "acme")),
+                    "{} holds {}",
+                    c.id,
+                    f.name
+                );
+            }
+            if c.named() {
+                assert_eq!(c.key_of(&c.primary_at("acme")), Some("acme"));
+            }
+            // Each setting an instance holds is one the vault editor offers.
+            for (_, sub) in c.extras {
+                assert!(known(&c.at("acme", sub)), "{} holds {sub}", c.id);
+            }
         }
+    }
+
+    #[test]
+    fn a_flat_connection_becomes_the_default_instance_the_adapters_already_name() {
+        // Email and Google always kept theirs at `default`.
+        for id in ["email", "google"] {
+            let c = find(id).unwrap();
+            assert_eq!(c.primary, c.primary_at(DEFAULT_INSTANCE), "{id}");
+        }
+        let jira = find("jira").unwrap();
+        assert_eq!(
+            jira.primary_at("acme"),
+            "skills/jira/workspaces/acme/api_token"
+        );
+        assert_eq!(
+            jira.label_at("acme").as_deref(),
+            Some("skills/jira/workspaces/acme/label")
+        );
+        let slack = find("slack").unwrap();
+        assert!(!slack.named());
+        assert_eq!(slack.primary_at(DEFAULT_INSTANCE), "slack.bot_token");
+        assert_eq!(slack.held_at(DEFAULT_INSTANCE), ["slack.bot_token"]);
     }
 
     #[test]

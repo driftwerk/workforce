@@ -161,6 +161,7 @@ Use `jira.get_issue` first to discover the field IDs on your tenant, or query
 | `jira.transition_issue` | `POST /rest/api/3/issue/{key}/transitions` | Accepts a transition id (preferred) or name. Looks up the id by name automatically. |
 | `jira.add_attachment` | `POST /rest/api/3/issue/{key}/attachments` | Multipart upload. Sends `X-Atlassian-Token: no-check` automatically. |
 | `jira.list_projects` | `GET /rest/api/3/project/search` | Optional substring `query` filter. |
+| `jira.list_fields` | `GET /rest/api/3/field`, `GET /rest/api/3/priority/search` | The custom field ids for story points, sprint, start date and Development, and the priorities in the site's order. Pass the ids to `jira.search` / `jira.get_issue` as `custom_fields`. |
 | `jira.get_project` | `GET /rest/api/3/project/{keyOrId}` | Includes available issue types. |
 | `jira.search_users` | `GET /rest/api/3/user/search` | Returns `accountId`, `displayName`, `emailAddress`. |
 | `jira.list_boards` | `GET /rest/agile/1.0/board` | Agile API. |

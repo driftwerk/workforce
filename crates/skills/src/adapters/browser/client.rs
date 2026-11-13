@@ -103,6 +103,29 @@ pub async fn live() -> Vec<Live> {
     out
 }
 
+/// Brings `agent`'s open tab, its most recently used, to the front of the
+/// person's Chrome: what a setup card's "Show the sign-in page" asks. Nothing
+/// is read or done on the page. Whether one was brought forward.
+pub async fn show(agent: &str) -> bool {
+    let mut open: Vec<Arc<ExtensionCell>> = Vec::new();
+    for client in clients() {
+        let cells = client.cells.lock().await;
+        open.extend(
+            cells
+                .values()
+                .filter(|c| c.agent == agent && *c.open.lock().unwrap())
+                .cloned(),
+        );
+    }
+    open.sort_by_key(|c| c.last_used.lock().unwrap().elapsed());
+    for cell in open {
+        if cell.front().await {
+            return true;
+        }
+    }
+    false
+}
+
 /// Which tabs [`close`] closes.
 #[derive(Debug, Clone, Copy)]
 pub enum Which<'a> {

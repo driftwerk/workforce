@@ -1076,6 +1076,24 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
         .route("/api/me/desk-boss-links/{id}", axum::routing::delete(crate::api_handlers::desk_boss_links::revoke))
         .route("/api/me/desk-boss-links/{id}/conversation", post(crate::boss_links::conversation::open))
+        // A person's Desk sharing their work with an agent here (Sees): the
+        // device mints and revokes; the `wfk_` token pushes, forgets and
+        // reads its counts, each checking its own token.
+        .route("/api/me/desk-knows-tokens", post(crate::desk_knows::routes::mint))
+        .route("/api/me/desk-knows-tokens/{id}", axum::routing::delete(crate::desk_knows::routes::revoke))
+        .route(
+            "/api/desk-knows/push",
+            post(crate::desk_knows::routes::push).layer(axum::extract::DefaultBodyLimit::max(
+                crate::desk_knows::routes::MAX_BODY + 64 * 1024,
+            )),
+        )
+        .route(
+            "/api/desk-knows/forget",
+            post(crate::desk_knows::routes::forget).layer(axum::extract::DefaultBodyLimit::max(
+                4 * crate::desk_knows::routes::MAX_BODY + 64 * 1024,
+            )),
+        )
+        .route("/api/desk-knows/status", get(crate::desk_knows::routes::status))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──

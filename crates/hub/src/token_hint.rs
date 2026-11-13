@@ -58,6 +58,8 @@ fn kind_of(token: &str) -> &'static str {
         "device token"
     } else if token.starts_with("wfr_") {
         "API token"
+    } else if token.starts_with("wfk_") {
+        "Desk knows token"
     } else if token.starts_with("wfb_") {
         "Desk boss link token"
     } else if token.starts_with("eyJ") && token.matches('.').count() == 2 {

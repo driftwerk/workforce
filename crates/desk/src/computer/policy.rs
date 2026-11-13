@@ -78,6 +78,9 @@ pub const NAMESPACES: &[(&str, Namespace)] = &[
     ("obscura", Namespace::Connector),
     ("email", Namespace::Connector),
     ("slack", Namespace::Connector),
+    // An agent setting a connection up itself (`connections.*`): keeping a
+    // key it made, turning a connection on.
+    ("connections", Namespace::Connector),
 ];
 
 /// The namespace `tool` (`filesystem.read`) is in, if the verdict decides it.
@@ -495,6 +498,13 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     if call.tool.starts_with("browser.") && matches!(call.effect, Effect::Connector { .. }) {
         return browsing(p, grants, call);
     }
+    // Widening what an agent's connections reach: setting one up, turning
+    // one on, its own `[skills]` letting it reach more.
+    if matches!(&call.effect, Effect::Connector { connector, .. }
+        if connector == "connections" || connector.starts_with("connections:"))
+    {
+        return setting_up(p, call);
+    }
     let connector = match &call.effect {
         Effect::Connector { connector, write } => Some((connector.as_str(), *write)),
         _ => None,
@@ -745,6 +755,32 @@ fn once_or_session(call: &CallFacts, why: Why) -> Verdict {
     }
     choices.push(Choice::Deny);
     ask(choices, why)
+}
+
+/// The verdict on a call that widens what an agent's connections reach
+/// (setting one up, turning one on, its own `[skills]` letting it reach
+/// more): it runs for an unbound overseer, is refused for one that only
+/// suggests, and otherwise asks each time, Allow once or Deny: never for
+/// the session, never by Full access alone. After a hostile page it asks,
+/// unbound included. One that changes nothing runs.
+fn setting_up(p: &AgentPolicy, call: &CallFacts) -> Verdict {
+    if !matches!(call.effect, Effect::Connector { write: true, .. }) {
+        return Verdict::Run { by: By::Rule };
+    }
+    if p.browser.hostile {
+        return ask(vec![Choice::AllowOnce, Choice::Deny], Why::HostilePage);
+    }
+    match p.browser.browsing {
+        Browsing::Unbound => Verdict::Run { by: By::Rule },
+        Browsing::Suggests => refuse(
+            Refused::OutsideLevel,
+            format!(
+                "{} only suggests at its oversight level, so its connections weren't changed. Say what you would change, and the person does it in Settings → Connections.",
+                p.name
+            ),
+        ),
+        Browsing::Asks => ask(vec![Choice::AllowOnce, Choice::Deny], Why::ConnectorWrite),
+    }
 }
 
 /// The verdict on a `browser.*` call. Reading (a snapshot, a screenshot, a
