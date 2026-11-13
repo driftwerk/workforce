@@ -558,7 +558,11 @@ fn update(
     // Desk's own changes queue here, one at a time, so the lock's wait is
     // only ever for the CLI: never one of Desk's timing out behind its own.
     // By the file's real path, however it is named.
-    let queue = updating(&fs::canonicalize(&target).unwrap_or_else(|_| target.clone()));
+    // (Its folder: the file itself may not be there yet.)
+    let real = fs::canonicalize(dir)
+        .map(|d| d.join(target.file_name().unwrap_or_default()))
+        .unwrap_or_else(|_| target.clone());
+    let queue = updating(&real);
     let _ours = queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
