@@ -50,6 +50,7 @@ fn synced(state: TicketState) -> Ticket {
         },
         assignee: None,
         clipped: false,
+        html_read: 0,
     });
     t
 }
@@ -926,4 +927,110 @@ fn a_held_body_with_a_macro_code_block_is_read_again_unless_edited_here() {
     // Edited here since: the person's words stay.
     t.body = format!("{old}\nmine");
     assert!(pulled(&t, &issue, &BTreeMap::new()).body.is_none());
+}
+
+#[test]
+fn a_held_body_is_read_again_only_once_and_only_from_jira() {
+    let old = "The foundation established in\n    PLT-875\n\n    Done\n. This needs scoping out.";
+    let mut t = synced(TicketState::Todo);
+    t.body = old.into();
+    let e = t.external.as_mut().unwrap();
+    e.seen.body = old.into();
+    assert!(rereads_html(e, old));
+    // Read with today's reader, even when what came back is still indented:
+    // never again.
+    e.html_read = HTML_READ;
+    assert!(!rereads_html(e, old));
+    // Edited here and sent: a nested list the person wrote is theirs.
+    e.html_read = 0;
+    let mine = "Steps\n* one\n    * nested";
+    let sent = Seen {
+        title: "Fix the login".into(),
+        body: mine.into(),
+        state: Some(TicketState::Todo),
+        needs: vec![],
+    };
+    pushed(e, &sent, None, true);
+    assert!(!rereads_html(e, mine));
+    // A push that sent no words leaves an old body to be read again.
+    e.html_read = 0;
+    e.seen.body = old.into();
+    pushed(
+        e,
+        &Seen {
+            body: old.into(),
+            ..sent
+        },
+        None,
+        false,
+    );
+    assert!(rereads_html(e, old));
+    // Linear's markdown is its own: an indented line there is meant.
+    e.html_read = 0;
+    e.system = System::Linear;
+    assert!(!rereads_html(e, old));
+}
+
+#[test]
+fn a_no_break_space_never_indents_a_line() {
+    assert_eq!(
+        html_text("<p>&nbsp;&nbsp;&nbsp;&nbsp;indented</p><p>&#160;&#xa0; two</p>"),
+        "indented\ntwo"
+    );
+    assert!(!has_html_indent(&html_text(
+        "<p>&nbsp;&nbsp;&nbsp;&nbsp;indented</p>"
+    )));
+}
+
+#[test]
+fn an_address_that_would_break_its_link_is_dropped() {
+    // An entity is read before the address is checked: a quote it hides
+    // never reaches the link.
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a&quot;b\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a&amp;quot;b\">x</a></p>"),
+        "[x](https://x.test/a&quot;b)"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a\nb\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a)b\">x</a></p>"),
+        "x"
+    );
+    // Only `href` itself, in any case and spacing.
+    assert_eq!(
+        html_text("<p><a data-href=\"https://x.test/\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a HREF = 'https://x.test/'>x</a></p>"),
+        "[x](https://x.test/)"
+    );
+    // Words that would end the link text early are kept without the marks.
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/\">a] b\\ `c</a></p>"),
+        "[a b c](https://x.test/)"
+    );
+}
+
+#[test]
+fn preformatted_text_keeps_no_marks_and_its_own_fence() {
+    assert_eq!(
+        html_text("<pre><b>bold</b> <a href=\"https://x.test/\">x</a></pre>"),
+        "```\nbold x\n```"
+    );
+    assert_eq!(
+        html_text("<pre>```\nnested\n```</pre>"),
+        "````\n```\nnested\n```\n````"
+    );
+    assert_eq!(html_text("<p>a</p><pre>open"), "a\n```\nopen\n```");
+    assert_eq!(
+        html_text("<pre>&lt;tag&gt; &amp; x</pre>"),
+        "```\n<tag> & x\n```"
+    );
 }

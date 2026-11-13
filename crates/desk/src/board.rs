@@ -442,6 +442,15 @@ pub struct External {
     /// never sent back, so the issue's whole text is never cut.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clipped: bool,
+    /// The version of the HTML reader its body was last read with (Jira):
+    /// one held from before [`HTML_READ`](crate::board_sync::HTML_READ) is
+    /// read again, once.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub html_read: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl External {
