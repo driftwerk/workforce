@@ -34,6 +34,11 @@
 //! a second connect for a link takes it from the first. A call not answered
 //! before its socket went is sent again, with the same id, on the link's
 //! next socket; the engine never does it twice (`boss_calls`).
+//!
+//! An engine may also send `decide` up (`linkId`, `decideId`, `prompt`): a
+//! request at Act fully for the link's boss to decide on its own model,
+//! answered by `decided` (`decideId`, `text` or `error`); see
+//! [`super::decide`]. `ready` says `"decide"` among its `features`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -862,6 +867,8 @@ async fn run(
     // Each link's events this minute: (since, how many).
     let mut events: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut asks: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let mut decides: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let deciding = Arc::new(tokio::sync::Semaphore::new(super::decide::DECIDES_AT_ONCE));
     let mut bad = 0u32;
     loop {
         if bad > MAX_BAD_FRAMES {
@@ -971,6 +978,48 @@ async fn run(
                                 super::asks::closed(&state, &live, &frame).await;
                             });
                         }
+                    }
+                    // A request at Act fully for the link's boss to decide
+                    // on its own model ([`super::decide`]): bound to the
+                    // link this socket proved and still holds, checked
+                    // again, run as the link's agent whatever the frame
+                    // says. One past its share, or with no room, is
+                    // answered so, and the engine leaves it to the person.
+                    Some("decide") => {
+                        let Some(link) = frame["linkId"].as_str().and_then(|l| l.parse::<Uuid>().ok()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        if !socket.links.lock().contains_key(&link) {
+                            bad += 1;
+                            continue;
+                        }
+                        let Some((id, prompt)) = super::decide::asked(&frame) else {
+                            bad += 1;
+                            continue;
+                        };
+                        let refuse = |why: &str| {
+                            socket.notify(super::decide::answered(link, id, Err(why.to_string())));
+                        };
+                        if past_share(&mut decides, link, super::decide::DECIDES_PER_MINUTE) {
+                            refuse("its hub decides no more this minute");
+                            continue;
+                        }
+                        let Ok(permit) = Arc::clone(&deciding).try_acquire_owned() else {
+                            refuse("its hub is deciding as many as it can at once");
+                            continue;
+                        };
+                        let live = match uplinks.recheck(&state, &socket, link).await {
+                            Ok(live) => live,
+                            Err(r) => {
+                                refuse(&r.why);
+                                continue;
+                            }
+                        };
+                        let s = Arc::clone(&socket);
+                        super::decide::spawn(Arc::clone(&state), live, id, prompt, permit, move |v| {
+                            s.notify(v);
+                        });
                     }
                     // Frames of later versions (asks_open, catch_up, …):
                     // not counted against it.
@@ -1094,7 +1143,7 @@ fn handshake(
         })
         .collect();
     let ready = json!({"type": "ready", "links": links, "refused": refused,
-                       "engine": hello.engine.name, "features": ["asks"]});
+                       "engine": hello.engine.name, "features": ["asks", "decide"]});
     let _ = socket.tx.try_send(Message::Text(ready.to_string().into()));
     Ok(accepted)
 }

@@ -29,6 +29,7 @@
 pub mod asks;
 pub mod auth;
 pub mod conversation;
+pub mod decide;
 pub mod engine_key;
 pub mod hold;
 pub mod links;
