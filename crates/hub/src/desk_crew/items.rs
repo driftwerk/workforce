@@ -357,12 +357,12 @@ impl CrewHub {
                 Vec::new()
             }
             // A question isn't work done for the person: only what tells
-            // a session to do something is.
+            // a session to do something is ("Could you add …?" is that).
             Action::Nudge {
                 to: Target::Session(s),
                 reply_to: None,
                 message,
-            } if !message.trim_end().ends_with('?') => vec![*s],
+            } if !asks(message) => vec![*s],
             Action::StartSession { .. } => done.started.into_iter().collect(),
             Action::AssignTicket { to, .. } => match to {
                 Handout::Session(s) => vec![*s],
@@ -394,10 +394,23 @@ impl CrewHub {
         text: &str,
     ) {
         let boss = service.agent_id.as_str();
-        // This turn's acts, taken: its session, since it started.
+        // The DM's session now: the turn's own, or the one it rolled over
+        // to, where its tools ran.
+        let session = service.sessions.get(sid).ok().flatten().and_then(|s| {
+            if s.is_sealed() {
+                service.sessions.find(&s.channel, &s.owner).ok().flatten()
+            } else {
+                Some(s)
+            }
+        });
+        let rolled = session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .filter(|id| id != sid);
+        // This turn's acts, taken: its session's, since it started.
         let mut sessions: Vec<Uuid> = Vec::new();
         self.turn_acts.lock().retain(|(turn, at, s)| {
-            let ours = turn == sid && *at >= started;
+            let ours = (turn == sid || rolled.as_deref() == Some(turn.as_str())) && *at >= started;
             if ours && !sessions.contains(s) {
                 sessions.push(*s);
             }
@@ -407,13 +420,6 @@ impl CrewHub {
             return;
         }
         // Keyed by the person's message, found again after a rollover.
-        let session = service.sessions.get(sid).ok().flatten().and_then(|s| {
-            if s.is_sealed() {
-                service.sessions.find(&s.channel, &s.owner).ok().flatten()
-            } else {
-                Some(s)
-            }
-        });
         let message = session.and_then(|s| {
             s.messages
                 .iter()
@@ -1204,6 +1210,35 @@ pub(super) async fn items_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     }
 }
 
+/// Whether `message` to a session only asks it something: it opens with a
+/// question word and asks.
+fn asks(message: &str) -> bool {
+    let first = message
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or_default()
+        .to_lowercase();
+    message.contains('?')
+        && matches!(
+            first.as_str(),
+            "where"
+                | "what"
+                | "when"
+                | "which"
+                | "who"
+                | "why"
+                | "how"
+                | "is"
+                | "are"
+                | "was"
+                | "were"
+                | "did"
+                | "does"
+                | "has"
+                | "have"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1304,14 @@ mod tests {
         assert!(!said[1].1.contains("more"));
         assert!(said[1].1.starts_with("Still waiting on you: Q1? · 3 h"));
         assert_eq!(restatements(&due[..2], now).len(), 2);
+    }
+
+    #[test]
+    fn a_question_to_a_session_is_not_work_done_for_the_person() {
+        assert!(asks("Where is it? Reply when you can."));
+        assert!(asks("Which key did you use?"));
+        assert!(!asks("Could you add the picker endpoint?"));
+        assert!(!asks("Add the picker endpoint."));
     }
 
     #[test]

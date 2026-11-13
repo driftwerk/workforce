@@ -222,18 +222,23 @@ pub fn kept_by<'a>(
         let says = |phrases: &[&str]| phrases.iter().any(|p| said(&words, p));
         match want.as_str() {
             "merged" | "merge" | "the pr merged" | "pr merged" => {
+                // A merge of it, not of main into it or of a conflict.
                 has(d, RefKind::Pr)
-                    && says(&["merged", "merge"])
-                    && !says(&[
-                        "merged main",
-                        "merged master",
-                        "merged origin",
-                        "merged upstream",
-                        "merge main",
-                        "merge master",
-                        "merge conflict",
-                        "merge conflicts",
-                    ])
+                    && (0..words.len()).any(|i| {
+                        matches!(words[i].as_str(), "merged" | "merge")
+                            && !negated(&words, i)
+                            && !matches!(
+                                words.get(i + 1).map(String::as_str),
+                                Some(
+                                    "main"
+                                        | "master"
+                                        | "origin"
+                                        | "upstream"
+                                        | "conflict"
+                                        | "conflicts"
+                                )
+                            )
+                    })
             }
             "in production" | "live" | "in prod" => {
                 (has(d, RefKind::Deploy) && !negated_anywhere(&words) && !says(&["staging"]))
@@ -271,17 +276,19 @@ fn said(words: &[String], phrase: &str) -> bool {
             .iter()
             .zip(&want)
             .all(|(a, b)| a == b)
-            && !words[at.saturating_sub(3)..at].iter().any(|w| negation(w))
+            && !negated(words, at)
     })
+}
+
+/// Whether the words just before `at` turn it down.
+fn negated(words: &[String], at: usize) -> bool {
+    words[at.saturating_sub(2)..at].iter().any(|w| negation(w))
 }
 
 /// Whether `w` turns what follows it down: "not", "never", "couldn't"
 /// (split as "couldn" "t").
 fn negation(w: &str) -> bool {
-    matches!(
-        w,
-        "not" | "never" | "no" | "cannot" | "t" | "failed" | "unable" | "without"
-    )
+    matches!(w, "not" | "never" | "cannot" | "t" | "failed" | "unable")
 }
 
 /// Whether `words` say no anywhere, so a deploy ref isn't enough.
@@ -613,6 +620,18 @@ mod tests {
         ] {
             let list = vec![done(text, kind, 1)];
             assert!(kept_by(want, &list, since).is_none(), "{text} keeps {want}");
+        }
+        for (text, kind, want) in [
+            (
+                "Resolved merge conflicts and merged #622",
+                Some(RefKind::Pr),
+                "merged",
+            ),
+            ("No conflicts, merged #622", Some(RefKind::Pr), "merged"),
+            ("Deployed to production", None, "in production"),
+        ] {
+            let list = vec![done(text, kind, 1)];
+            assert!(kept_by(want, &list, since).is_some(), "{text} keeps {want}");
         }
         let list = vec![done("All the tests pass now", None, 1)];
         assert!(kept_by("tests pass", &list, since).is_some());
