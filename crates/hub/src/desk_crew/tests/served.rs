@@ -114,9 +114,7 @@ fn a_grant_gives_its_boss_its_own_group_and_switches_and_nothing_more() {
     // What this hub's person keeps is off below unbound, whatever the
     // grant says.
     let held = super::super::served::held_below_unbound(o.clone());
-    assert!(
-        !held.act.message_agents && !held.act.hand_off && !held.act.message_terminal_sessions
-    );
+    assert!(!held.act.message_agents && !held.act.hand_off && !held.act.message_terminal_sessions);
     assert!(held.act.nudge);
     assert_eq!(o.work.take_on, workforce_common::oversight::TakeOn::Handed);
     assert_eq!(

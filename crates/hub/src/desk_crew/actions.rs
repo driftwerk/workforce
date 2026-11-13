@@ -781,8 +781,7 @@ impl CrewHub {
     /// it does to a session it runs waits while the person is driving it
     /// (a plain message waits on its line as before).
     fn unbound_gate(&self, action: &Action, boss: Option<&str>) -> Gate {
-        let charged =
-            Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)));
+        let charged = Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)));
         if let Some(session) = charged {
             let driving = self.desk.wheel_of(session).is_some_and(|w| w.person());
             if driving && !matches!(action, Action::Nudge { reply_to: None, .. }) {
