@@ -212,12 +212,18 @@ impl DeskStore {
     pub async fn cards_due(&self, now: DateTime<Utc>) -> Result<Vec<HeldCard>> {
         let client = self.pool().get().await?;
         // A card a day past its time is no longer news: forgotten.
-        client
+        let swept = client
             .execute(
                 "DELETE FROM boss_held_cards WHERE post_by < $1::timestamptz - interval '1 day'",
                 &[&now],
             )
             .await?;
+        if swept > 0 {
+            tracing::warn!(
+                swept,
+                "held needs-you a day past their time were forgotten unposted"
+            );
+        }
         let rows = client
             .query(
                 "SELECT id, boss, item_id, text, extras, post_by FROM boss_held_cards \
