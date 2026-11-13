@@ -1383,55 +1383,54 @@ impl Tool for JiraAttachmentReadTool {
             Ok(k) => format!("jira:{k}:{issue}:{path}"),
             Err(e) => return Ok(ToolResult::from_report(&e, ms())),
         };
-        if let Some((bytes, media_type)) = memo().get(&key) {
-            return Ok(ToolResult::success(
-                file_read::chunk(&bytes, &media_type, range),
-                ms(),
-            ));
-        }
-        let listed = match client
-            .get(&format!("{REST}/issue/{issue}?fields=attachment"))
-            .await
-        {
-            Ok(i) => listed_attachment(&i["fields"], &id),
-            Err(e) => {
-                return Ok(ToolResult::from_report(
-                    &e.wrap_err(format!("Failed to read {issue}'s attachments")),
+        // Read once for every caller missing it at once, then kept.
+        let download = async {
+            let listed = match client
+                .get(&format!("{REST}/issue/{issue}?fields=attachment"))
+                .await
+            {
+                Ok(i) => listed_attachment(&i["fields"], &id),
+                Err(e) => {
+                    return Err(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {issue}'s attachments")),
+                        ms(),
+                    ))
+                }
+            };
+            let Some((listed_type, size)) = listed else {
+                return Err(ToolResult::failure(
+                    format!("{issue} has no attachment {id}"),
                     ms(),
-                ))
+                ));
+            };
+            if !thumbnail && size.is_some_and(|n| n > file_read::FILE_MAX) {
+                return Err(ToolResult::failure(
+                    format!(
+                        "Attachment {id} is over {} MB",
+                        file_read::FILE_MAX / (1024 * 1024)
+                    ),
+                    ms(),
+                ));
             }
-        };
-        let Some((listed_type, size)) = listed else {
-            return Ok(ToolResult::failure(
-                format!("{issue} has no attachment {id}"),
-                ms(),
-            ));
-        };
-        if !thumbnail && size.is_some_and(|n| n > file_read::FILE_MAX) {
-            return Ok(ToolResult::failure(
-                format!(
-                    "Attachment {id} is over {} MB",
-                    file_read::FILE_MAX / (1024 * 1024)
-                ),
-                ms(),
-            ));
-        }
-        let media_type = match thumbnail {
-            true => "image/png".to_string(),
-            false => listed_type,
-        };
-        let bytes = match client.get_file(&path).await {
-            Ok(b) => std::sync::Arc::new(b),
-            Err(e) => {
-                return Ok(ToolResult::from_report(
+            let media_type = match thumbnail {
+                true => "image/png".to_string(),
+                false => listed_type,
+            };
+            match client.get_file(&path).await {
+                Ok(b) => Ok((b, media_type)),
+                Err(e) => Err(ToolResult::from_report(
                     &e.wrap_err(format!("Failed to download attachment {id}")),
                     ms(),
-                ))
+                )),
             }
         };
-        let answer = file_read::chunk(&bytes, &media_type, range);
-        memo().put(key, bytes, media_type);
-        Ok(ToolResult::success(answer, ms()))
+        match memo().fetch_once(&key, download).await {
+            Ok((bytes, media_type)) => Ok(ToolResult::success(
+                file_read::chunk(&bytes, &media_type, range),
+                ms(),
+            )),
+            Err(failed) => Ok(failed),
+        }
     }
 }
 

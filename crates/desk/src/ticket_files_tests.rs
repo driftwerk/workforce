@@ -363,3 +363,52 @@ async fn a_board_s_uploads_stay_within_their_cap() {
     })
     .await;
 }
+
+/// An address or id too long to keep isn't listed: one such file never
+/// stops the rest, or the issue's pull.
+#[test]
+fn a_file_with_too_long_an_address_is_not_listed() {
+    let long = format!(
+        "https://uploads.linear.app/a1/{}.png",
+        "x".repeat(REMOTE_MAX)
+    );
+    let body = format!("![huge]({long}) and ![ok](https://uploads.linear.app/a1/b2/ok.png)");
+    let issue = json!({ "attachments": { "nodes": [
+        { "id": "att-1", "title": "long upload", "url": long },
+        { "id": "att-2", "title": "long link", "url": format!("https://example.com/{}", "y".repeat(REMOTE_MAX)) },
+        { "id": "att-3", "title": "Spec", "url": "https://example.com/spec" },
+    ]}});
+    let names: Vec<_> = linear_files(&issue, &body)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(names, ["ok", "Spec"]);
+}
+
+/// A file Postgres refuses, or one listed twice, is left out on its own:
+/// the rest of the ticket's files go in, and the call doesn't fail.
+#[tokio::test]
+async fn one_bad_file_never_fails_a_ticket_s_files() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let t = a_ticket(&store).await;
+        let mut long = remote("3", "long.png");
+        long.remote_id = "9".repeat(REMOTE_MAX + 1);
+        let files = [
+            remote("1", "a.png"),
+            // Postgres takes no NUL in text: its insert fails.
+            remote("2", "bad\0name.png"),
+            remote("1", "a again.png"),
+            long,
+            remote("4", "d.png"),
+        ];
+        assert!(store.put_remote_files(t, &files, &someone()).await.unwrap());
+        let kept: Vec<_> = store.files_of(&[t]).await.unwrap()[&t]
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(kept, ["a.png", "d.png"]);
+    })
+    .await;
+}

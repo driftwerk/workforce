@@ -2437,53 +2437,51 @@ impl Tool for LinearUploadReadTool {
             Ok(k) => format!("linear:{k}:{identifier}:{url}"),
             Err(e) => return Ok(ToolResult::from_report(&e, ms())),
         };
-        if let Some((bytes, media_type)) = memo().get(&key) {
-            return Ok(ToolResult::success(
-                file_read::chunk(&bytes, &media_type, range),
-                ms(),
-            ));
-        }
-        let query = r#"
-            query($id: String!) {
-                issue(id: $id) {
-                    description
-                    attachments(first: 50) { nodes { url } }
+        // Read once for every caller missing it at once, then kept.
+        let download = async {
+            let query = r#"
+                query($id: String!) {
+                    issue(id: $id) {
+                        description
+                        attachments(first: 50) { nodes { url } }
+                    }
+                }
+            "#;
+            match client
+                .query(query, serde_json::json!({ "id": identifier }))
+                .await
+            {
+                Ok(data) if issue_lists(&data["issue"], &url) => {}
+                Ok(_) => {
+                    return Err(ToolResult::failure(
+                        format!("{identifier} doesn't show or list that file"),
+                        ms(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {identifier}'s files")),
+                        ms(),
+                    ))
                 }
             }
-        "#;
-        match client
-            .query(query, serde_json::json!({ "id": identifier }))
-            .await
-        {
-            Ok(data) if issue_lists(&data["issue"], &url) => {}
-            Ok(_) => {
-                return Ok(ToolResult::failure(
-                    format!("{identifier} doesn't show or list that file"),
-                    ms(),
-                ))
+            match client.get_file(&url).await {
+                Ok(bytes) => Ok((bytes, upload_type(&url).to_string())),
+                Err(e) => {
+                    warn!(error = %e, "A Linear upload wasn't read");
+                    Err(ToolResult::from_report(
+                        &e.wrap_err("Failed to read the Linear upload"),
+                        ms(),
+                    ))
+                }
             }
-            Err(e) => {
-                return Ok(ToolResult::from_report(
-                    &e.wrap_err(format!("Failed to read {identifier}'s files")),
-                    ms(),
-                ))
-            }
-        }
-        match client.get_file(&url).await {
-            Ok(bytes) => {
-                let bytes = Arc::new(bytes);
-                let media_type = upload_type(&url).to_string();
-                let answer = file_read::chunk(&bytes, &media_type, range);
-                memo().put(key, bytes, media_type);
-                Ok(ToolResult::success(answer, ms()))
-            }
-            Err(e) => {
-                warn!(error = %e, "A Linear upload wasn't read");
-                Ok(ToolResult::from_report(
-                    &e.wrap_err("Failed to read the Linear upload"),
-                    ms(),
-                ))
-            }
+        };
+        match memo().fetch_once(&key, download).await {
+            Ok((bytes, media_type)) => Ok(ToolResult::success(
+                file_read::chunk(&bytes, &media_type, range),
+                ms(),
+            )),
+            Err(failed) => Ok(failed),
         }
     }
 }

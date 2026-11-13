@@ -19,6 +19,7 @@ use workforce_agent::runner::{
     current_progress_tx, current_turn_approvals, ApprovalRouter, SessionContext, ToolInvocation,
     SELF_SERVE_APPROVAL_TIMEOUT,
 };
+use workforce_agent::tools::access::PROGRAM_ONLY_TOOLS;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_agent::turn_journal::TurnJournal;
@@ -155,6 +156,7 @@ impl RoundTools {
                 identity_id: principal.to_string(),
                 agent_id: agent_id.clone(),
             },
+            program: false,
         };
         let turn = McpTurn {
             ctx,
@@ -386,7 +388,8 @@ pub fn exposed_tools(
 }
 
 fn turn_surface(turn: TurnTools) -> Surface {
-    let admits = |name: &str| !RUNNER_ONLY_TOOLS.contains(&name);
+    let admits =
+        |name: &str| !RUNNER_ONLY_TOOLS.contains(&name) && !PROGRAM_ONLY_TOOLS.contains(&name);
     match turn.exclusive {
         true => {
             let fixed = ToolRegistry::new();
@@ -406,11 +409,13 @@ fn turn_surface(turn: TurnTools) -> Surface {
 }
 
 /// Whether a coding or background round's `patterns` admit `name`: never a
-/// runner-only tool, nor one that would start a round of its own.
+/// runner-only tool, nor a program's (a round is a model too), nor one that
+/// would start a round of its own.
 fn pattern_filter(patterns: Arc<[String]>) -> impl Fn(&str) -> bool + Send + Sync + 'static {
     move |name: &str| {
         matches_any(name, &patterns)
             && !RUNNER_ONLY_TOOLS.contains(&name)
+            && !PROGRAM_ONLY_TOOLS.contains(&name)
             && !NESTED_ROUND_TOOLS.contains(&name)
     }
 }
@@ -1041,7 +1046,14 @@ mod tests {
         let service = service().await;
         register(
             &service,
-            &["context.status", "context.drop", "coding.session", "notes"],
+            &[
+                "context.status",
+                "context.drop",
+                "coding.session",
+                "notes",
+                "jira.attachment_read",
+                "linear.upload_read",
+            ],
         );
         let tools = bind_in_turn(
             &service,
@@ -1066,6 +1078,12 @@ mod tests {
                 .iter()
                 .any(|n| n == "context_status" || n == "context_drop"),
             "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "jira_attachment_read" || n == "linear_upload_read"),
+            "a program's tools are never a round's: {names:?}"
         );
     }
 
@@ -1592,6 +1610,7 @@ mod tests {
                         identity_id: "alice".into(),
                         agent_id: service.agent_id.to_string(),
                     },
+                    program: false,
                 },
                 ctx: SessionContext {
                     agent_id: Some(service.agent_id.to_string()),

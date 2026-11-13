@@ -309,12 +309,7 @@ impl Desk {
             .change_board_sync(id, move |_, old| Ok((None, old.or(Some(prefix)))))
             .await
             .map_err(internal)?;
-        // Its issues' files are no longer read: what was kept of them goes.
-        self.0
-            .store
-            .forget_remote_files(id)
-            .await
-            .map_err(internal)?;
+        // Its issues' files went with the link (`change_board_sync`).
         for mut t in self.0.store.board_tickets(id).await.map_err(internal)? {
             if let Some(e) = t.external.as_mut().filter(|e| e.synced) {
                 e.synced = false;
@@ -1120,13 +1115,20 @@ impl Desk {
         if p.state.is_some() {
             e.seen.state = Some(t.state);
         }
+        // Its files never fail its pull: the list is kept next time.
         let files = match &issue.files {
-            Some(files) => self
+            Some(files) => match self
                 .0
                 .store
                 .put_remote_files(t.id, files, &Self::pulled_by(s).party)
                 .await
-                .map_err(internal)?,
+            {
+                Ok(changed) => changed,
+                Err(e) => {
+                    tracing::warn!(ticket = %t.id, error = %e, "a ticket's files weren't kept");
+                    false
+                }
+            },
             None => false,
         };
         if said.is_empty() {
@@ -1208,11 +1210,9 @@ impl Desk {
             return Ok(false);
         }
         if let Some(files) = &issue.files {
-            self.0
-                .store
-                .put_remote_files(t.id, files, &by.party)
-                .await
-                .map_err(internal)?;
+            if let Err(e) = self.0.store.put_remote_files(t.id, files, &by.party).await {
+                tracing::warn!(ticket = %t.id, error = %e, "an imported ticket's files weren't kept");
+            }
         }
         let text = format!(
             "imported {} “{}”",

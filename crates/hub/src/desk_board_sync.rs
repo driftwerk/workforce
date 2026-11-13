@@ -453,6 +453,7 @@ impl LocalRemote {
                     identity_id: self.person.clone(),
                     agent_id: service.agent_id.to_string(),
                 },
+                program: true,
             },
             ctx,
             router: if quiet {

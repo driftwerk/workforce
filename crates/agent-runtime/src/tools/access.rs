@@ -43,7 +43,30 @@ impl ToolAccessSnapshot {
     pub fn blocked_names(&self) -> impl Iterator<Item = &str> {
         self.blocked.keys().map(String::as_str)
     }
+
+    /// This snapshot as a model's turn holds it: the
+    /// [`PROGRAM_ONLY_TOOLS`] blocked besides, so no turn is offered them
+    /// or runs one.
+    pub fn for_a_turn(mut self) -> Self {
+        for name in PROGRAM_ONLY_TOOLS {
+            self.blocked
+                .entry(name.to_string())
+                .or_insert_with(|| PROGRAM_ONLY.to_string());
+        }
+        self
+    }
 }
+
+/// Tools a program calls through the hub, never a model: Desk's board sync
+/// reading a ticket's file, a base64 chunk at a time, which would flood a
+/// turn's context. They stay on an agent's registry, so the board sync's
+/// gated route (remote MCP, or this hub's own) still reaches them as the
+/// person, and off every turn's tools ([`ToolAccessSnapshot::for_a_turn`]).
+pub const PROGRAM_ONLY_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_FILE_TOOLS;
+
+/// Why a turn can't call a [`PROGRAM_ONLY_TOOLS`] tool.
+const PROGRAM_ONLY: &str =
+    "This tool is for Desk's board sync, not for agents. To look at an attachment, use the integration's own attachment tool (like jira.get_attachment).";
 
 /// Computes a fresh [`ToolAccessSnapshot`] for the active user.
 /// Implementations should be cheap — called once per LLM round.
@@ -91,6 +114,22 @@ impl ToolAccess for CompositeToolAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_never_holds_a_program_s_tools() {
+        let snap = NoopToolAccess.snapshot().for_a_turn();
+        for name in ["jira.attachment_read", "linear.upload_read"] {
+            assert!(snap.is_blocked(name), "{name}");
+        }
+        assert!(!snap.is_blocked("jira.get_attachment"));
+        // A reason already given stands.
+        let snap = ToolAccessSnapshot::new(HashMap::from([(
+            "jira.attachment_read".to_string(),
+            "earlier".to_string(),
+        )]))
+        .for_a_turn();
+        assert_eq!(snap.block_reason("jira.attachment_read"), Some("earlier"));
+    }
 
     #[test]
     fn noop_snapshot_is_empty() {

@@ -48,6 +48,9 @@ pub const CACHE_MAX: i64 = 256 * 1024 * 1024;
 pub const LISTED_MAX: usize = 50;
 /// The largest chunk asked for at once.
 const CHUNK: u64 = 512 * 1024;
+/// The longest address or id of a remote file kept, in bytes: past it the
+/// file isn't listed (an index row holds about 2.7 KB).
+pub const REMOTE_MAX: usize = 2048;
 
 /// Where a file comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -203,6 +206,9 @@ pub fn linear_files(issue: &Value, body: &str) -> Vec<RemoteFile> {
         let Some(url) = a["url"].as_str().map(str::trim) else {
             continue;
         };
+        if url.len() > REMOTE_MAX {
+            continue;
+        }
         let title = name_of(&a["title"]);
         if is_linear_upload(url) {
             if seen.insert(url.to_string()) {
@@ -288,7 +294,7 @@ pub fn description_uploads(body: &str) -> Vec<(Option<String>, String)> {
             .filter(|t| !t.contains(['[', ']', '\n']))
             .map(|t| crate::crew::one_line(t.trim(), 200))
             .filter(|t| !t.is_empty());
-        if is_linear_upload(url) {
+        if url.len() <= REMOTE_MAX && is_linear_upload(url) {
             out.push((text, url.to_string()));
         }
         from = end.max(start);
@@ -475,6 +481,12 @@ pub async fn read_remote(
 const FILE: &str =
     "id, ticket, source, remote_id, name, media_type, size, url, thumb, added_by, created_at";
 
+/// Forgets every remote file of the tickets of the board `$1`, with what
+/// was kept of them: its link went, or reads through another hub or person
+/// now (`DeskStore::change_board_sync`).
+pub(crate) const FORGET_REMOTE_FILES: &str = "DELETE FROM ticket_files WHERE source <> 'upload' \
+     AND ticket IN (SELECT id FROM tickets WHERE board = $1)";
+
 fn file(row: &Row) -> Result<(Uuid, TicketFile)> {
     let size: Option<i64> = row.try_get("size")?;
     Ok((
@@ -493,6 +505,81 @@ fn file(row: &Row) -> Result<(Uuid, TicketFile)> {
             added_at: row.try_get("created_at")?,
         },
     ))
+}
+
+/// Keeps one of a ticket's remote files at `pos`, as `was` held it:
+/// whether it changed.
+async fn put_remote_file(
+    tx: &tokio_postgres::Transaction<'_>,
+    ticket: Uuid,
+    was: &[TicketFile],
+    f: &RemoteFile,
+    pos: usize,
+    by: &Value,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let size = f.size.map(|s| s.min(i64::MAX as u64) as i64);
+    let remote_id = Some(f.remote_id.clone());
+    let same = was
+        .iter()
+        .find(|w| w.source == f.source && w.remote_id == remote_id);
+    match same {
+        Some(w)
+            if w.name == f.name
+                && w.media_type == f.media_type
+                && w.size == f.size
+                && w.url == f.url
+                && w.thumb == f.thumb =>
+        {
+            tx.execute(
+                "UPDATE ticket_files SET position = $2 WHERE id = $1",
+                &[&w.id, &(pos as i32)],
+            )
+            .await?;
+            Ok(false)
+        }
+        Some(w) => {
+            tx.execute(
+                "UPDATE ticket_files SET name = $2, media_type = $3, size = $4, url = $5, \
+                 thumb = $6, position = $7, bytes = NULL, thumb_bytes = NULL, cached_at = NULL \
+                 WHERE id = $1",
+                &[
+                    &w.id,
+                    &f.name,
+                    &f.media_type,
+                    &size,
+                    &f.url,
+                    &f.thumb,
+                    &(pos as i32),
+                ],
+            )
+            .await?;
+            Ok(true)
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO ticket_files (id, ticket, source, remote_id, name, media_type, \
+                 size, url, thumb, position, added_by, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &Uuid::new_v4(),
+                    &ticket,
+                    &f.source.as_str(),
+                    &f.remote_id,
+                    &f.name,
+                    &f.media_type,
+                    &size,
+                    &f.url,
+                    &f.thumb,
+                    &(pos as i32),
+                    by,
+                    &now,
+                ],
+            )
+            .await?;
+            Ok(true)
+        }
+    }
 }
 
 impl DeskStore {
@@ -534,7 +621,9 @@ impl DeskStore {
 
     /// Keeps `ticket`'s remote files as its issue now lists them: new ones
     /// added, changed ones rewritten (their kept bytes forgotten), gone ones
-    /// deleted with what was kept of them. Uploads are never touched.
+    /// deleted with what was kept of them. Uploads are never touched. A
+    /// file that can't be kept (listed twice, its address too long, refused
+    /// by Postgres) is logged and left out: it never fails the ticket's pull.
     /// Whether anything changed.
     pub async fn put_remote_files(
         &self,
@@ -543,7 +632,7 @@ impl DeskStore {
         by: &Party,
     ) -> Result<bool> {
         let mut client = self.pool().get().await?;
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let was: Vec<TicketFile> = tx
             .query(
                 &format!(
@@ -557,58 +646,30 @@ impl DeskStore {
             .collect::<Result<_>>()?;
         let mut changed = false;
         let now = Utc::now();
+        let by = serde_json::to_value(by)?;
+        let mut listed = std::collections::HashSet::new();
         for (pos, f) in files.iter().enumerate() {
-            let size = f.size.map(|s| s.min(i64::MAX as u64) as i64);
-            let remote_id = Some(f.remote_id.clone());
-            let same = was
-                .iter()
-                .find(|w| w.source == f.source && w.remote_id == remote_id);
-            match same {
-                Some(w)
-                    if w.name == f.name
-                        && w.media_type == f.media_type
-                        && w.size == f.size
-                        && w.url == f.url
-                        && w.thumb == f.thumb =>
-                {
-                    tx.execute(
-                        "UPDATE ticket_files SET position = $2 WHERE id = $1",
-                        &[&w.id, &(pos as i32)],
-                    )
-                    .await?;
+            if f.remote_id.len() > REMOTE_MAX
+                || f.url.as_ref().is_some_and(|u| u.len() > REMOTE_MAX)
+            {
+                tracing::warn!(%ticket, source = f.source.as_str(), "a ticket's file has too long an address: left out");
+                continue;
+            }
+            if !listed.insert((f.source, f.remote_id.as_str())) {
+                tracing::warn!(%ticket, source = f.source.as_str(), "a ticket's file is listed twice: kept once");
+                continue;
+            }
+            // Each file on its own savepoint: one Postgres refuses is rolled
+            // back alone, and the rest still go in.
+            let sp = tx.transaction().await?;
+            match put_remote_file(&sp, ticket, &was, f, pos, &by, now).await {
+                Ok(c) => {
+                    sp.commit().await?;
+                    changed |= c;
                 }
-                Some(w) => {
-                    changed = true;
-                    tx.execute(
-                        "UPDATE ticket_files SET name = $2, media_type = $3, size = $4, url = $5, \
-                         thumb = $6, position = $7, bytes = NULL, thumb_bytes = NULL, cached_at = NULL \
-                         WHERE id = $1",
-                        &[&w.id, &f.name, &f.media_type, &size, &f.url, &f.thumb, &(pos as i32)],
-                    )
-                    .await?;
-                }
-                None => {
-                    changed = true;
-                    tx.execute(
-                        "INSERT INTO ticket_files (id, ticket, source, remote_id, name, media_type, \
-                         size, url, thumb, position, added_by, created_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                        &[
-                            &Uuid::new_v4(),
-                            &ticket,
-                            &f.source.as_str(),
-                            &f.remote_id,
-                            &f.name,
-                            &f.media_type,
-                            &size,
-                            &f.url,
-                            &f.thumb,
-                            &(pos as i32),
-                            &serde_json::to_value(by)?,
-                            &now,
-                        ],
-                    )
-                    .await?;
+                Err(e) => {
+                    sp.rollback().await?;
+                    tracing::warn!(%ticket, source = f.source.as_str(), error = %e, "a ticket's file wasn't kept: left out");
                 }
             }
         }
@@ -780,20 +841,6 @@ impl DeskStore {
                  UPDATE ticket_files f SET bytes = NULL, thumb_bytes = NULL, cached_at = NULL \
                  FROM kept WHERE f.id = kept.id AND kept.running > $1",
                 &[&cap],
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Forgets every remote file of the tickets of `board` (unlinked): the
-    /// issue's files are no longer read.
-    pub async fn forget_remote_files(&self, board: Uuid) -> Result<()> {
-        let client = self.pool().get().await?;
-        client
-            .execute(
-                "DELETE FROM ticket_files WHERE source <> 'upload' \
-                 AND ticket IN (SELECT id FROM tickets WHERE board = $1)",
-                &[&board],
             )
             .await?;
         Ok(())

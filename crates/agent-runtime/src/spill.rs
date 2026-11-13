@@ -23,17 +23,20 @@ use crate::tools::image_gen::GENERATED_IMAGES_KEY;
 const VIEWED_IMAGES_KEY: &str = "viewed_images";
 
 /// The `kind` of a chunk of a file a program reads a piece at a time (Desk's
-/// board sync reading a ticket's attachment): bytes, never staged, from
+/// board sync reading a ticket's attachment): bytes, from
 /// [`FILE_BYTES_TOOLS`] only.
 pub const FILE_BYTES_KIND: &str = "file_bytes";
 
-/// The tools whose `file_bytes` chunks are never staged; any other tool's
-/// output saying so is staged as usual.
-pub const FILE_BYTES_TOOLS: &[&str] = &["jira.attachment_read", "linear.upload_read"];
+/// The tools that answer `file_bytes` chunks: a program's, never a turn's
+/// ([`crate::tools::access::PROGRAM_ONLY_TOOLS`]).
+pub const FILE_BYTES_TOOLS: &[&str] = crate::tools::access::PROGRAM_ONLY_TOOLS;
 
 /// Whether `output` is a file chunk from a tool allowed to answer one, by
-/// its registry or its wire name (`jira_attachment_read`).
-fn is_file_chunk(tool_name: &str, output: &Value) -> bool {
+/// its registry or its wire name (`jira_attachment_read`). The spill never
+/// decides on this by itself: only a program's caller (the board sync's
+/// gated route) leaves a chunk unstaged, so a turn's output is staged as
+/// any other's.
+pub fn is_file_chunk(tool_name: &str, output: &Value) -> bool {
     output.get("kind").and_then(Value::as_str) == Some(FILE_BYTES_KIND)
         && FILE_BYTES_TOOLS
             .iter()
@@ -146,10 +149,7 @@ pub fn spill_tool_output(
     if !config.enabled || is_error || output_str.len() < config.threshold_bytes {
         return (output_str, output);
     }
-    if is_content_tool(tool_name, &config.skip_tools)
-        || manages_own_staging(&output)
-        || is_file_chunk(tool_name, &output)
-    {
+    if is_content_tool(tool_name, &config.skip_tools) || manages_own_staging(&output) {
         return (output_str, output);
     }
     let Some(store) = global_store() else {
@@ -523,10 +523,11 @@ mod tests {
         assert_eq!(v, big, "errors never spill");
     }
 
-    /// A chunk of a file a program reads in pieces is never staged, however
-    /// large: its reader needs the bytes, not a handle.
+    /// A file chunk is known only from its own tools; the spill itself
+    /// stages it like any other output, so only a program's caller, which
+    /// asks [`is_file_chunk`], leaves it whole.
     #[test]
-    fn a_file_chunk_is_never_staged_but_only_from_its_own_tools() {
+    fn a_file_chunk_is_known_by_its_own_tools_and_staged_on_a_turn() {
         install_test_global_store();
         let chunk = json!({
             "kind": FILE_BYTES_KIND,
@@ -536,32 +537,31 @@ mod tests {
             "length": 600_000,
             "data": "A".repeat(800_000),
         });
-        let spill_as = |tool: &str| {
-            CURRENT_AGENT_ID.sync_scope("spill-chunk".to_string(), || {
-                CURRENT_SESSION_ID.sync_scope("spill-session".to_string(), || {
-                    spill_tool_output(
-                        tool,
-                        chunk.to_string(),
-                        chunk.clone(),
-                        false,
-                        &SpillConfig::default(),
-                        RetrievalSurface::FULL,
-                    )
-                })
-            })
-        };
         for tool in [
             "jira.attachment_read",
             "linear.upload_read",
             "jira_attachment_read",
         ] {
-            let (s, v) = spill_as(tool);
-            assert_eq!(v, chunk, "{tool}");
-            assert_eq!(s, chunk.to_string(), "{tool}");
+            assert!(is_file_chunk(tool, &chunk), "{tool}");
         }
-        // Any other tool saying it is a file chunk is staged as usual.
-        let (_, v) = spill_as("mcp.fetch_rows");
-        assert_ne!(v, chunk, "another tool's output is no file chunk");
+        assert!(!is_file_chunk("mcp.fetch_rows", &chunk));
+        assert!(!is_file_chunk(
+            "jira.attachment_read",
+            &json!({"kind": "rows"})
+        ));
+        let (_, v) = CURRENT_AGENT_ID.sync_scope("spill-chunk".to_string(), || {
+            CURRENT_SESSION_ID.sync_scope("spill-session".to_string(), || {
+                spill_tool_output(
+                    "jira.attachment_read",
+                    chunk.to_string(),
+                    chunk.clone(),
+                    false,
+                    &SpillConfig::default(),
+                    RetrievalSurface::FULL,
+                )
+            })
+        });
+        assert_ne!(v, chunk, "a turn's output is staged");
     }
 
     #[test]
