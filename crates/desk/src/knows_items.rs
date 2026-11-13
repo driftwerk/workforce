@@ -95,6 +95,31 @@ pub fn hash(body: &Value) -> String {
     hex::encode(Sha256::digest(body.to_string().as_bytes()))
 }
 
+/// `text` redacted whole, before any of it is cut: a secret across a cut
+/// is never left half there.
+fn red(r: &dyn Redactor, text: &str) -> String {
+    r.stored(text).text.into_owned()
+}
+
+fn red_value(r: &dyn Redactor, v: &Value) -> Value {
+    let mut v = v.clone();
+    redact(&mut v, r);
+    v
+}
+
+fn red_list(r: &dyn Redactor, l: &[String]) -> Vec<String> {
+    l.iter().map(|t| red(r, t)).collect()
+}
+
+/// A group's name as it may be sent: redacted, one short plain line.
+pub fn group_label(r: &dyn Redactor, name: &str) -> String {
+    let plain: String = red(r, name)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cut(plain.trim(), 190)
+}
+
 fn finish(
     held: Held,
     place: &Where,
@@ -106,7 +131,11 @@ fn finish(
     redact(&mut body, redactor);
     Outgoing {
         held,
-        group_name: place.group_name.clone(),
+        group_name: place
+            .group_name
+            .as_deref()
+            .map(|g| group_label(redactor, g))
+            .filter(|g| !g.is_empty()),
         at,
         hash: again.then(|| hash(&body)),
         body,
@@ -142,6 +171,19 @@ pub fn account(
     home: Option<&str>,
     redactor: &dyn Redactor,
 ) -> Outgoing {
+    let r = redactor;
+    let a = &AccountRow {
+        name: red(r, &a.name),
+        cwd: red(r, &a.cwd),
+        purpose: red(r, &a.purpose),
+        plan: red(r, &a.plan),
+        now: red(r, &a.now),
+        next: red(r, &a.next),
+        waiting_on: a.waiting_on.as_deref().map(|w| red(r, w)),
+        done: red_value(r, &a.done),
+        decisions: red_value(r, &a.decisions),
+        ..a.clone()
+    };
     let done = texts(&a.done, "text", DONE_ITEMS);
     let decisions: Vec<Value> = a
         .decisions
@@ -205,6 +247,13 @@ pub fn account(
 
 /// A boss's question or confirmation for the person.
 pub fn need(n: &NeedRow, boss_name: &str, place: &Where, redactor: &dyn Redactor) -> Outgoing {
+    let r = redactor;
+    let n = &NeedRow {
+        session_name: n.session_name.as_deref().map(|x| red(r, x)),
+        text: red(r, &n.text),
+        holding_up: n.holding_up.as_deref().map(|x| red(r, x)),
+        ..n.clone()
+    };
     let body = json!({
         "boss": boss_name,
         "kind": n.kind,
@@ -239,6 +288,15 @@ pub fn decision(
     place: &Where,
     redactor: &dyn Redactor,
 ) -> Outgoing {
+    let r = redactor;
+    let d = &DecisionRow {
+        session_name: d.session_name.as_deref().map(|x| red(r, x)),
+        need: cut(&d.need, 40),
+        what: red(r, &d.what),
+        why: red(r, &d.why),
+        how: cut(&d.how, 40),
+        ..d.clone()
+    };
     let text = lines(&[
         ("Decided", cut(&d.what, FIELD_CHARS)),
         ("Why", cut(&d.why, FIELD_CHARS)),
@@ -273,6 +331,14 @@ pub fn decision(
 
 /// Something that happened on a board's ticket.
 pub fn board(b: &BoardRow, place: &Where, redactor: &dyn Redactor) -> Outgoing {
+    let r = redactor;
+    let b = &BoardRow {
+        by: red(r, &b.by),
+        text: red(r, &b.text),
+        board_name: red(r, &b.board_name),
+        title: red(r, &b.title),
+        ..b.clone()
+    };
     let body = json!({
         "board": cut(&b.board_name, 200),
         "ticket": b.ticket,
@@ -312,6 +378,23 @@ fn list(items: &[String]) -> Vec<String> {
 
 /// A closed exchange of a session.
 pub fn exchange(e: &ExchangeRow, place: &Where, redactor: &dyn Redactor) -> Outgoing {
+    let r = redactor;
+    let e = &ExchangeRow {
+        session_name: e.session_name.as_deref().map(|x| red(r, x)),
+        ask: red(r, &e.ask),
+        answer: red(r, &e.answer),
+        steps: red_value(r, &e.steps),
+        files: red_list(r, &e.files),
+        commands: red_list(r, &e.commands),
+        errors: red_list(r, &e.errors),
+        flagged: e
+            .flagged
+            .iter()
+            .take(LIST_ITEMS)
+            .map(|f| cut(f, 60))
+            .collect(),
+        ..e.clone()
+    };
     let steps: Vec<Value> = e
         .steps
         .as_array()
@@ -449,6 +532,7 @@ mod tests {
                 boss: "allan".into(),
                 kind: "ask".into(),
                 session: Some(s),
+                sessions: vec![s],
                 session_name: Some("atlas secret=q".into()),
                 text: "merge? secret=t".into(),
                 holding_up: None,
@@ -506,6 +590,37 @@ mod tests {
         assert!(e.hash.is_none() && b.hash.is_none());
         assert_eq!(e.held.reference, "claude:k");
         assert_eq!(b.held.board, Some(Uuid::from_u128(4)));
+    }
+
+    #[test]
+    fn a_secret_across_a_cut_is_redacted_whole_first() {
+        let place = Where::default();
+        let a = account(
+            &AccountRow {
+                session: Uuid::from_u128(1),
+                name: "n".into(),
+                engine: "claude".into(),
+                cwd: "/x".into(),
+                state: "working".into(),
+                purpose: format!("{}secret=abcdefgh", "x".repeat(FIELD_CHARS - 3)),
+                plan: String::new(),
+                now: String::new(),
+                next: String::new(),
+                waiting_on: None,
+                done: json!([]),
+                decisions: json!([]),
+                written_at: at(),
+            },
+            &place,
+            None,
+            &Hide,
+        );
+        let text = a.body.to_string();
+        assert!(!text.contains("sec"), "{}", &text[..200]);
+        assert_eq!(
+            group_label(&Hide, "Patch\nwork secret=1"),
+            "Patch work [REDACTED]"
+        );
     }
 
     #[test]
