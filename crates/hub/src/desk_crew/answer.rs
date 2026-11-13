@@ -201,7 +201,7 @@ impl CrewHub {
 
     /// Whether `view` waits on a question its dialog asks (not a permission
     /// request) while the person is in control of it, as `boss`'s settings
-    /// say: then nothing is said of it.
+    /// say: then nothing is raised about it.
     pub(crate) fn dialog_is_persons(&self, view: &SessionView, boss: &str) -> bool {
         self.desk.asks_in_dialog(view.id) && self.person_has_questions(view, boss)
     }

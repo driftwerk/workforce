@@ -12,12 +12,12 @@
 use super::decides_at_once::{calls_about, decides, said, THEIRS};
 use super::*;
 
-/// The person's settings that day, their questions theirs for 20 of the
-/// crew's minutes (two seconds here).
+/// The person's settings that day, their questions theirs for 30 of the
+/// crew's minutes (three seconds here).
 fn theirs() -> String {
     THEIRS.replace(
         "quiet_minutes = 30\n",
-        "quiet_minutes = 30\nanswer_after_minutes = 20\n",
+        "quiet_minutes = 30\nanswer_after_minutes = 30\n",
     )
 }
 
@@ -76,7 +76,7 @@ async fn act_fully_answers_a_sessions_question_itself_once_the_person_is_quiet_a
         )
         .await;
         let (_, o) = crew.overseer_service().unwrap();
-        assert_eq!(o.wake.answer_after_minutes, 20);
+        assert_eq!(o.wake.answer_after_minutes, 30);
         eventually("Desk to know it is unbound", async || {
             d.boss_unbound("desk").then_some(())
         })
@@ -228,7 +228,7 @@ async fn a_dialogs_question_is_left_alone_while_the_person_is_in_control() {
         .await;
         assert_eq!(answer, json!({}), "its terminal's dialog asks it");
         assert!(d.asks_in_dialog(s.id), "a dialog's question, not a permission");
-        // Within the gap (two seconds), past several of the crew's minutes:
+        // Within the gap (three seconds), past several of the crew's minutes:
         // no DM, no check-in naming it.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(said(&overseer, &["Cufflink Migration"]), 0, "nothing in the DM");
