@@ -54,6 +54,8 @@ pub(crate) struct Jira {
     pub files: BTreeMap<String, Vec<(String, String, String, Vec<u8>)>>,
     /// Each issue's comments: id, author, body, and whether an app wrote it.
     pub comments: BTreeMap<String, Vec<(String, String, String, bool)>>,
+    /// What `jira.list_comments` answers instead of the comments, when set.
+    pub comments_answer: Option<Value>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -222,6 +224,9 @@ impl Tool for FakeJiraTool {
                 ));
                 json!({ "key": key, "comment_id": id })
             }
+            "jira.list_comments" if j.comments_answer.is_some() => {
+                j.comments_answer.clone().unwrap_or_default()
+            }
             "jira.list_comments" => {
                 let comments: Vec<Value> = j
                     .comments
@@ -237,7 +242,7 @@ impl Tool for FakeJiraTool {
                             "created": at, "updated": at })
                     })
                     .collect();
-                json!({ "issue_key": key, "count": comments.len(), "comments": comments })
+                json!({ "issue_key": key, "count": comments.len(), "total": comments.len(), "comments": comments })
             }
             "jira.myself" => {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
@@ -534,6 +539,9 @@ pub(crate) struct LocalHub {
     pub person: Identity,
     pub jwt: String,
     pub vault: Arc<Vault>,
+    /// Its identities and tokens, for pairing a device or minting a token.
+    pub fx: crate::remote_mcp::testing::Fixture,
+    pub devices: Arc<workforce_pairing::SqlitePairingStore>,
 }
 
 pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
@@ -553,9 +561,17 @@ pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
     let state = Arc::try_unwrap(fx.state)
         .ok()
         .expect("the fixture's only handle");
+    let devices = Arc::new(
+        workforce_pairing::SqlitePairingStore::in_memory().expect("in-memory pairing store"),
+    );
+    let pairing = Arc::new(workforce_pairing::DevicePairingService::new(
+        Arc::clone(&devices) as Arc<dyn workforce_pairing::PairingStore>,
+        workforce_pairing::types::PairingConfig::default(),
+    ));
     let state = Arc::new(GatewayState {
         jwt_config: Some(jwt_config),
         vault: Some(Arc::clone(&vault)),
+        device_pairing: Some(pairing),
         ..state
     });
     let (sync, app) = install(&state, desk);
@@ -565,6 +581,12 @@ pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
         person,
         jwt,
         vault,
+        fx: crate::remote_mcp::testing::Fixture {
+            state,
+            identities: fx.identities,
+            tokens: fx.tokens,
+        },
+        devices,
     }
 }
 

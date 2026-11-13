@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError};
 use crate::board_sync::{Remote, RemoteError};
-use crate::crew::{self, By, Kind};
+use crate::crew::{self, By, Kind, PartyKind};
 use crate::ticket_comments::{self as comments, Comment, FRESH};
 
 fn internal(e: eyre::Report) -> DeskError {
@@ -24,6 +24,11 @@ pub enum CommentPost {
     Waiting,
     #[error("{0}")]
     Remote(RemoteError),
+    /// It is on the issue, but Desk couldn't keep its copy: it comes back
+    /// when the issue's comments are next read. Posting again would post it
+    /// twice.
+    #[error("posted, but not kept here")]
+    NotKept(Box<Comment>),
 }
 
 /// Where a synced ticket's comment goes: through `remote`, the board's sync,
@@ -70,10 +75,16 @@ impl Desk {
         let read = match e.system {
             crate::board::System::Jira => comments::jira_comments(&answer),
             crate::board::System::Linear => comments::linear_comments(&answer),
-        };
+        }
+        .map_err(|why| {
+            RemoteError::Failed(format!(
+                "{}'s comments weren't read: {why}",
+                e.system.title()
+            ))
+        })?;
         self.0
             .store
-            .put_remote_comments(id, &read)
+            .put_remote_comments(id, &read.comments, read.complete)
             .await
             .map_err(|e| fail(internal(e)))?;
         // When they were read: a version race only means they're read again.
@@ -88,7 +99,9 @@ impl Desk {
     }
 
     /// Posts `body` on ticket `id` as `by`: on a synced ticket, to its issue
-    /// through `via`, as the person; on a ticket of their own, kept here.
+    /// through `via`, as the person, and only when `by` is the person (their
+    /// words go there unprefixed, so no one else's may); on a ticket of
+    /// their own, kept here.
     pub async fn post_ticket_comment(
         &self,
         id: Uuid,
@@ -112,6 +125,13 @@ impl Desk {
         let at = crate::crew::now();
         let remote_id = match (&t.external, via) {
             (Some(e), Some(via)) => {
+                if by.party.kind != PartyKind::You {
+                    return Err(DeskError::Conflict(format!(
+                        "Only you post on {key}'s {} issue as yourself.",
+                        e.system.title()
+                    ))
+                    .into());
+                }
                 if !e.writable_by(via.link) {
                     return Err(DeskError::Conflict(format!(
                         "{key} isn't synced from this board any more: comment on it in {}.",
@@ -143,12 +163,20 @@ impl Desk {
             (None, _) => None,
         };
         let author = comments::author_from(&by.party);
-        let cid = self
+        let kept = self
             .0
             .store
             .add_comment(id, remote_id.as_deref(), &author, &by.party, &body, at)
-            .await
-            .map_err(internal)?;
+            .await;
+        let (cid, kept_ok) = match (kept, &remote_id) {
+            (Ok(cid), _) => (cid, true),
+            (Err(e), None) => return Err(internal(e).into()),
+            // On the issue already: said as posted, never as failed.
+            (Err(e), Some(_)) => {
+                tracing::warn!(ticket = %id, error = %e, "a posted comment wasn't kept here");
+                (Uuid::new_v4(), false)
+            }
+        };
         let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
         self.note(
             by.event(
@@ -159,7 +187,7 @@ impl Desk {
             .detail(json!({ "comment": body }))
             .about_ticket(t.id, group.as_deref()),
         );
-        Ok(Comment {
+        let comment = Comment {
             id: cid,
             remote_id,
             only_here: false,
@@ -169,6 +197,10 @@ impl Desk {
             flagged: false,
             at,
             edited_at: None,
-        })
+        };
+        match kept_ok {
+            true => Ok(comment),
+            false => Err(CommentPost::NotKept(Box::new(comment))),
+        }
     }
 }

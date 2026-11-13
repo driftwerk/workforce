@@ -5,12 +5,13 @@
 //!
 //! Who wrote one is said in this order of trust:
 //! 1. `posted_by`, recorded when Desk posted it: the one record of which
-//!    person, session or agent it was;
-//! 2. Desk's own move notes ("Desk, on my behalf: …"): labelled as what the
-//!    comment says, since anyone can type it;
-//! 3. an app (Linear's `botActor`, a Jira author whose account is an app):
+//!    person, session or agent it was, and the only thing that makes a
+//!    comment Desk's or the person's own;
+//! 2. an app (Linear's `botActor`, a Jira author whose account is an app):
 //!    an agent there, by the name it goes by;
-//! 4. anyone else: a person.
+//! 3. anyone else: a person there, whatever their words say. A remote name
+//!    that is one Desk gives its own ("You", "Desk") is said with where it
+//!    is from, so no one there passes for either.
 //!
 //! Every remote comment's body is someone else's words: kept as text,
 //! flagged when the hub warned it reads as instructions, and fenced
@@ -35,8 +36,9 @@ pub const READ_MAX: usize = 100;
 /// How long comments read from an issue are taken as current.
 pub const FRESH: chrono::Duration = chrono::Duration::seconds(60);
 
-/// What Desk's own notes on an issue begin with.
-pub const DESK_PREFIX: &str = "Desk, on my behalf:";
+/// The names Desk says its own comments by: a remote writer going by one
+/// is said with where they are ("You (Jira)").
+const RESERVED_NAMES: [&str; 2] = ["you", "desk"];
 
 /// Who wrote a comment, as the view says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +49,7 @@ pub enum AuthorKind {
     /// An agent or app: there (an app's comment), or here (a session's or
     /// an agent's note).
     Agent,
-    /// Desk's own note on the issue, as the comment says.
+    /// Desk's own, as `posted_by` records: never a remote writer's.
     Desk,
 }
 
@@ -110,17 +112,16 @@ fn name_of(v: &Value) -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
-/// Who wrote a comment whose body is `body`: Desk's note when it says so,
-/// else an app or a person there.
-fn author_of(system: System, body: &str, name: Option<String>, app: bool) -> Author {
+/// Who wrote a comment there: an app or a person, never Desk or the person
+/// themselves, whatever its words or name say ([`RESERVED_NAMES`]).
+fn author_of(system: System, name: Option<String>, app: bool) -> Author {
     let on = system.title().to_string();
-    if body.trim_start().starts_with(DESK_PREFIX) {
-        return Author {
-            kind: AuthorKind::Desk,
-            name: name.unwrap_or_else(|| "Desk".into()),
-            on,
-        };
-    }
+    let name = name.map(
+        |n| match RESERVED_NAMES.contains(&n.trim().to_lowercase().as_str()) {
+            true => format!("{n} ({on})"),
+            false => n,
+        },
+    );
     Author {
         kind: if app {
             AuthorKind::Agent
@@ -132,12 +133,42 @@ fn author_of(system: System, body: &str, name: Option<String>, app: bool) -> Aut
     }
 }
 
-/// The comments of a `jira.list_comments` answer.
-pub fn jira_comments(answer: &Value) -> Vec<RemoteComment> {
+/// An issue's comments as one answer listed them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteRead {
+    pub comments: Vec<RemoteComment>,
+    /// The answer listed every comment the issue has, and each was read: only
+    /// then is one it doesn't list taken as deleted there.
+    pub complete: bool,
+}
+
+/// An answer's `comments`, or why it lists none.
+fn listed(answer: &Value) -> Result<&Vec<Value>, String> {
     answer["comments"]
         .as_array()
-        .into_iter()
-        .flatten()
+        .ok_or_else(|| "its answer listed no comments".to_string())
+}
+
+/// `comments` as read from `listed` entries: complete when none was left
+/// out, none was cut off at [`READ_MAX`], and `total` (when the answer
+/// counts them) is no more than it listed.
+fn read_of(listed: usize, comments: Vec<RemoteComment>, total: Option<Option<u64>>) -> RemoteRead {
+    let counted = match total {
+        None => true,
+        Some(total) => total.is_some_and(|t| t <= listed as u64),
+    };
+    RemoteRead {
+        complete: comments.len() == listed && listed < READ_MAX && counted,
+        comments,
+    }
+}
+
+/// The comments of a `jira.list_comments` answer; Jira's `total` says
+/// whether that was all of them (an answer without it never is).
+pub fn jira_comments(answer: &Value) -> Result<RemoteRead, String> {
+    let all = listed(answer)?;
+    let comments = all
+        .iter()
         .filter_map(|c| {
             let id = match &c["id"] {
                 Value::String(s) => s.clone(),
@@ -148,7 +179,7 @@ pub fn jira_comments(answer: &Value) -> Vec<RemoteComment> {
             let body = held(&crate::board_sync::html_text(&html));
             let app = c["author_account_type"].as_str() == Some("app");
             Some(RemoteComment {
-                author: author_of(System::Jira, &body, name_of(&c["author"]), app),
+                author: author_of(System::Jira, name_of(&c["author"]), app),
                 remote_id: id,
                 flagged,
                 at: crate::board_sync::remote_time(&c["created"])?,
@@ -158,15 +189,16 @@ pub fn jira_comments(answer: &Value) -> Vec<RemoteComment> {
             })
         })
         .take(READ_MAX)
-        .collect()
+        .collect();
+    Ok(read_of(all.len(), comments, Some(answer["total"].as_u64())))
 }
 
-/// The comments of a `linear.comment_list` answer.
-pub fn linear_comments(answer: &Value) -> Vec<RemoteComment> {
-    answer["comments"]
-        .as_array()
-        .into_iter()
-        .flatten()
+/// The comments of a `linear.comment_list` answer, asked for at most
+/// [`READ_MAX`].
+pub fn linear_comments(answer: &Value) -> Result<RemoteRead, String> {
+    let all = listed(answer)?;
+    let comments = all
+        .iter()
         .filter_map(|c| {
             let id = c["id"].as_str()?.to_string();
             let (body, flagged) = unfence(c["body"].as_str().unwrap_or_default());
@@ -179,7 +211,7 @@ pub fn linear_comments(answer: &Value) -> Vec<RemoteComment> {
             };
             let at = crate::board_sync::remote_time(&c["createdAt"])?;
             Some(RemoteComment {
-                author: author_of(System::Linear, &body, name, app),
+                author: author_of(System::Linear, name, app),
                 remote_id: id,
                 flagged,
                 at,
@@ -188,7 +220,8 @@ pub fn linear_comments(answer: &Value) -> Vec<RemoteComment> {
             })
         })
         .take(READ_MAX)
-        .collect()
+        .collect();
+    Ok(read_of(all.len(), comments, None))
 }
 
 /// The id of the comment a `jira.add_comment` or `linear.comment_add`
@@ -264,12 +297,17 @@ fn comment(row: &Row, synced: bool) -> Result<Comment> {
         .context("reading who posted a comment")?;
     let mut author: Author =
         serde_json::from_value(row.try_get("author")?).context("reading a comment's author")?;
-    // Desk's record of who posted it outranks what the comment says.
-    if let Some(p) = &posted_by {
-        author = Author {
-            on: author.on,
-            ..author_from(p)
-        };
+    // Desk's record of who posted it outranks what the comment says, and
+    // nothing else makes a comment Desk's.
+    match &posted_by {
+        Some(p) => {
+            author = Author {
+                on: author.on,
+                ..author_from(p)
+            }
+        }
+        None if author.kind == AuthorKind::Desk => author.kind = AuthorKind::Person,
+        None => {}
     }
     Ok(Comment {
         id: row.try_get("id")?,
@@ -301,12 +339,15 @@ impl DeskStore {
     }
 
     /// Keeps `ticket`'s issue's comments as it now lists them: new ones
-    /// added, edited ones rewritten, gone ones deleted. Who in Desk posted
-    /// one stays; Desk-only comments are never touched.
+    /// added, edited ones rewritten, and, only when `complete` (the issue
+    /// listed them all), ones it no longer lists deleted. Who in Desk posted
+    /// one stays, and so does every one Desk posted; Desk-only comments are
+    /// never touched.
     pub async fn put_remote_comments(
         &self,
         ticket: Uuid,
         comments: &[RemoteComment],
+        complete: bool,
     ) -> Result<()> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
@@ -330,13 +371,15 @@ impl DeskStore {
             )
             .await?;
         }
-        let ids: Vec<&str> = comments.iter().map(|c| c.remote_id.as_str()).collect();
-        tx.execute(
-            "DELETE FROM ticket_comments WHERE ticket = $1 AND remote_id IS NOT NULL \
-             AND NOT (remote_id = ANY($2))",
-            &[&ticket, &ids],
-        )
-        .await?;
+        if complete {
+            let ids: Vec<&str> = comments.iter().map(|c| c.remote_id.as_str()).collect();
+            tx.execute(
+                "DELETE FROM ticket_comments WHERE ticket = $1 AND remote_id IS NOT NULL \
+                 AND posted_by IS NULL AND NOT (remote_id = ANY($2))",
+                &[&ticket, &ids],
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

@@ -12,7 +12,12 @@
 //!   holds for approval answers 202. A ticket of their own keeps it here.
 //!
 //! Only the person who linked a board reads or writes its issues' comments;
-//! a device's token, or the hub's own, is no person.
+//! the hub's own token is no person. Posting is the person's own words, so
+//! only they post, at their own Desk: with their sign-in or the Desk app on
+//! their computer, never a phone's or other device's token, and never a
+//! token made for an agent, a session or a tool
+//! ([`crate::desk_board_sync::person_at_desk`]). A ticket kept on its board
+//! after it stopped syncing takes none.
 
 use std::sync::Arc;
 
@@ -28,7 +33,7 @@ use workforce_desk::board_sync::RemoteError;
 use workforce_desk::crew::By;
 use workforce_desk::{CommentPost, PostVia};
 
-use crate::desk_board_sync::{paused_words, person_of, refusal, BoardSync};
+use crate::desk_board_sync::{paused_words, person_at_desk, person_of, refusal, BoardSync};
 use crate::desk_ticket_files::sync_of;
 
 struct Routes {
@@ -123,12 +128,24 @@ async fn post(
     Path(id): Path<Uuid>,
     Json(new): Json<NewComment>,
 ) -> Response {
-    let person = person!(r, h, q);
+    let person = match person_at_desk(&r.sync, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(refused) => return refused,
+    };
     let desk = &r.sync.desk;
     let t = match desk.ticket(id).await {
         Ok(v) => v.ticket,
         Err(e) => return e.into_response(),
     };
+    if let Some(e) = t.external.as_ref().filter(|e| !e.synced || e.kept) {
+        return refusal(
+            StatusCode::CONFLICT,
+            &format!(
+                "This ticket isn't synced with its {} issue any more: comment on it there.",
+                e.system.title()
+            ),
+        );
+    }
     let by = By::you();
     let posted = match t.external.as_ref().filter(|e| e.synced) {
         None => desk.post_ticket_comment(id, &new.body, &by, None).await,
@@ -181,6 +198,15 @@ async fn post(
     };
     match posted {
         Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
+        // On the issue: never answered as a failure, which would have it
+        // posted again.
+        Err(CommentPost::NotKept(c)) => {
+            let mut answer = serde_json::to_value(&*c).unwrap_or_else(|_| json!({}));
+            answer["message"] = json!(
+                "Posted. Desk couldn't keep its copy just now: it shows when the comments are read again."
+            );
+            (StatusCode::CREATED, Json(answer)).into_response()
+        }
         Err(CommentPost::Desk(e)) => e.into_response(),
         Err(e) => refusal(StatusCode::BAD_GATEWAY, &e.to_string()),
     }

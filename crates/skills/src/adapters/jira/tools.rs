@@ -931,7 +931,9 @@ impl Tool for JiraListCommentsTool {
                     })
                     .collect();
                 Ok(ToolResult::success(
-                    json!({ "issue_key": key, "count": comments.len(), "comments": comments }),
+                    // `total`: how many the issue has, which a page may hold
+                    // fewer of.
+                    json!({ "issue_key": key, "count": comments.len(), "total": resp["total"], "comments": comments }),
                     duration_ms,
                 ))
             }
