@@ -2,7 +2,9 @@
 //! crew as Floor and the overseer's DM read it, and the person's answers to
 //! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
 //! one of its decisions; `/items/{id}/answer` and `/drop`, the person
-//! settling what the boss asked them. `/unread` and `/reads`: what is unread on this
+//! settling what the boss asked them. `/preferences`: the person's
+//! preferences for their bosses, listed, changed, set aside, resumed and
+//! forgotten. `/unread` and `/reads`: what is unread on this
 //! Desk, and how far the person has read each place.
 
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -20,6 +22,8 @@ use crate::api::Authorize;
 use crate::crew::{
     By, Crew, Filter, GroupBoss, ItemRefused, Kind, ManagerView, SuggestionState, UndoRefused,
 };
+use crate::preference::{plain_when, PrefScope, PrefState, Preference};
+use crate::preference_store::PrefChange;
 use crate::reads::{AllScope, Read, ReadPut};
 use crate::rooms::YOU;
 use crate::service::{Desk, DeskError};
@@ -285,6 +289,143 @@ async fn item_drop(
     item_result(s.crew.drop_item(id).await)
 }
 
+/// A preference as Desk's boss settings show it.
+fn preference_json(p: &Preference) -> serde_json::Value {
+    json!({
+        "id": p.id,
+        "bossScope": p.boss_scope,
+        "whenText": p.when_text,
+        "thenText": p.then_text,
+        "scope": p.scope.text(),
+        "source": p.source.as_str(),
+        "fromItem": p.from_item,
+        "createdAt": p.created_at,
+        "changedAt": p.changed_at,
+        "appliedCount": p.applied_count,
+        "lastAppliedAt": p.last_applied_at,
+        "overruledCount": p.overruled_count,
+        "state": p.state.as_str(),
+    })
+}
+
+#[derive(Deserialize)]
+struct PrefsQuery {
+    token: Option<String>,
+    /// Retired ones too.
+    #[serde(default)]
+    all: bool,
+}
+
+/// The person's preferences for every boss, active and set aside (and,
+/// with `all`, forgotten): by boss scope, oldest first.
+async fn preferences(State(s): S, h: HeaderMap, Query(q): Query<PrefsQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match s.desk.store().preferences_all(YOU).await {
+        Ok(prefs) => Json(
+            prefs
+                .iter()
+                .filter(|p| q.all || p.state != PrefState::Retired)
+                .map(preference_json)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => failed(e),
+    }
+}
+
+const NO_PREFERENCE: &str = "That preference isn’t there any more.";
+
+/// The person's preference `id`, not forgotten.
+async fn kept_preference(s: &CrewApi, id: &str) -> Result<Preference, Response> {
+    let Ok(id) = id.parse::<uuid::Uuid>() else {
+        return Err(error(StatusCode::NOT_FOUND, NO_PREFERENCE));
+    };
+    match s.desk.store().preference(id).await {
+        Ok(Some(p)) if p.owner == YOU && p.state != PrefState::Retired => Ok(p),
+        Ok(_) => Err(error(StatusCode::NOT_FOUND, NO_PREFERENCE)),
+        Err(e) => Err(failed(e)),
+    }
+}
+
+fn preference_result(r: eyre::Result<Option<Preference>>) -> Response {
+    match r {
+        Ok(Some(p)) => Json(preference_json(&p)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, NO_PREFERENCE),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefPatch {
+    when_text: Option<String>,
+    then_text: Option<String>,
+    scope: Option<String>,
+}
+
+/// The person rewords preference `id`, or changes what it covers.
+async fn preference_patch(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+    Json(body): Json<PrefPatch>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let p = match kept_preference(&s, &id).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let words = |t: Option<String>| t.map(|t| t.trim().to_string());
+    let (when, then) = (words(body.when_text), words(body.then_text));
+    if when.as_deref() == Some("") || then.as_deref() == Some("") {
+        return error(StatusCode::BAD_REQUEST, "Say the case and what to do then.");
+    }
+    let scope = match body.scope.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(text) => match PrefScope::parse(text) {
+            Ok(scope) => Some(scope),
+            Err(why) => return error(StatusCode::BAD_REQUEST, why),
+        },
+    };
+    let change = PrefChange {
+        when_text: when.map(|w| plain_when(&w)),
+        then_text: then.map(|t| t.trim_end_matches('.').to_string()),
+        scope,
+    };
+    if change.when_text.is_none() && change.then_text.is_none() && change.scope.is_none() {
+        return error(StatusCode::BAD_REQUEST, "Say what changes.");
+    }
+    preference_result(s.desk.store().preference_change(p.id, &change).await)
+}
+
+/// The person sets preference `id` aside, resumes it, or forgets it.
+async fn preference_state(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path((id, to)): Path<(String, String)>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let state = match to.as_str() {
+        "pause" => PrefState::Paused,
+        "resume" => PrefState::Active,
+        "retire" => PrefState::Retired,
+        _ => return error(StatusCode::NOT_FOUND, "pause, resume or retire"),
+    };
+    let p = match kept_preference(&s, &id).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    preference_result(s.desk.store().preference_set_state(p.id, state).await)
+}
+
 #[derive(Deserialize, Default)]
 struct Always {
     #[serde(default)]
@@ -407,6 +548,9 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/items/{id}/drop", post(item_drop))
         .route("/api/desk/items/{id}/always", post(item_always))
         .route("/api/desk/handled", get(handled))
+        .route("/api/desk/preferences", get(preferences))
+        .route("/api/desk/preferences/{id}", patch(preference_patch))
+        .route("/api/desk/preferences/{id}/{to}", post(preference_state))
         .route("/api/desk/unread", get(unread))
         .route("/api/desk/reads", get(read_points).put(put_reads))
         .route("/api/desk/reads/all", post(all_read))
@@ -591,12 +735,138 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn the_preference_routes_list_change_and_set_aside_the_persons_own() {
+        with_test_pool(build_pool, |pool| async move {
+            use crate::preference::{PrefSource, Preference};
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let store = d.store();
+            let red = Preference::new(
+                "main",
+                "a session wants to merge with CI red",
+                "make it wait for green.",
+                PrefScope::All,
+                PrefSource::Said,
+            );
+            let key = Preference::new(
+                "grp-1",
+                "a staging test needs a key",
+                "use the staging key",
+                PrefScope::parse("repo:acme/web").unwrap(),
+                PrefSource::Asked,
+            );
+            let mut gone = Preference::new(
+                "main",
+                "a session asks to deploy",
+                "ask me",
+                PrefScope::All,
+                PrefSource::Said,
+            );
+            gone.state = PrefState::Retired;
+            for p in [&red, &key, &gone] {
+                store.preference_put(p).await.unwrap();
+            }
+            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+
+            let (status, list) = call(&app, "GET", "/api/desk/preferences").await;
+            assert_eq!(status, StatusCode::OK);
+            let ids: Vec<&str> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, [key.id.to_string(), red.id.to_string()]);
+            let first = &list[0];
+            assert_eq!(first["bossScope"], "grp-1");
+            assert_eq!(first["scope"], "repo:acme/web");
+            assert_eq!(first["source"], "asked");
+            assert_eq!(first["state"], "active");
+            assert_eq!(first["appliedCount"], 0);
+            assert!(first["lastAppliedAt"].is_null());
+            let (_, all) = call(&app, "GET", "/api/desk/preferences?all=true").await;
+            assert_eq!(all.as_array().unwrap().len(), 3);
+
+            let one = |id: uuid::Uuid, rest: &str| format!("/api/desk/preferences/{id}{rest}");
+            let (status, changed) = send_json(
+                &app,
+                "PATCH",
+                &one(red.id, ""),
+                &json!({ "thenText": " hold it until CI is green. ", "scope": "group:grp-1" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{changed}");
+            assert_eq!(changed["thenText"], "hold it until CI is green");
+            assert_eq!(changed["scope"], "group:grp-1");
+            assert_eq!(changed["whenText"], red.when_text);
+            for bad in [
+                json!({}),
+                json!({ "whenText": "  " }),
+                json!({ "scope": "planet:mars" }),
+            ] {
+                assert_eq!(
+                    send_json(&app, "PATCH", &one(red.id, ""), &bad).await.0,
+                    StatusCode::BAD_REQUEST,
+                    "{bad}"
+                );
+            }
+
+            let (status, paused) = call(&app, "POST", &one(red.id, "/pause")).await;
+            assert_eq!(
+                (status, paused["state"].as_str()),
+                (StatusCode::OK, Some("paused"))
+            );
+            let (_, resumed) = call(&app, "POST", &one(red.id, "/resume")).await;
+            assert_eq!(resumed["state"], "active");
+            let (_, retired) = call(&app, "POST", &one(red.id, "/retire")).await;
+            assert_eq!(retired["state"], "retired");
+            // Forgotten is gone: it can't be resumed or changed again.
+            for (method, rest) in [("POST", "/resume"), ("POST", "/pause")] {
+                assert_eq!(
+                    call(&app, method, &one(red.id, rest)).await.0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+            assert_eq!(
+                send_json(
+                    &app,
+                    "PATCH",
+                    &one(gone.id, ""),
+                    &json!({ "thenText": "x" })
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                call(&app, "POST", &one(key.id, "/explode")).await.0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                call(&app, "POST", "/api/desk/preferences/nope/pause")
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                store.preference(key.id).await.unwrap().unwrap().state,
+                PrefState::Active
+            );
+        })
+        .await;
+    }
+
     async fn call_json(app: &Router, uri: &str, body: &Value) -> (StatusCode, Value) {
+        send_json(app, "POST", uri, body).await
+    }
+
+    async fn send_json(app: &Router, method: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(method)
                     .uri(uri)
                     .header("authorization", "Bearer hub-token")
                     .header("content-type", "application/json")
