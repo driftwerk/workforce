@@ -505,6 +505,11 @@ pub struct WorkforceConfig {
     /// Off by default.
     #[serde(default)]
     pub desk_boss: DeskBossConfig,
+    /// `[desk_knows]`: whether a person's Desk may share what it knows of
+    /// their work with this hub's agents (Sees), and how long it is kept.
+    /// On by default; only the person's own turns with the agent read it.
+    #[serde(default)]
+    pub desk_knows: DeskKnowsConfig,
     /// OAuth pending-redirect state store. Default in-memory works
     /// for restart-stable flows; sqlite persists across restarts so a
     /// UI-initiated MCP install can complete its OAuth callback even
@@ -7819,6 +7824,11 @@ pub struct AgentWorkspaceConfig {
     /// team agent is made anyone's boss without an admin's say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk_boss: Option<AgentDeskBossConfig>,
+    /// Per-agent `[desk_knows]`: whether a person's Desk may share what it
+    /// knows of their work with this agent. On when absent; an admin turns
+    /// it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_knows: Option<AgentDeskKnowsConfig>,
     /// Per-agent `[computer]`: how far this agent reaches on this computer,
     /// read only on a hub with `[desk]`. Kept as written and read by
     /// [`crate::computer_access`], which says what is wrong with it in
@@ -7837,6 +7847,12 @@ impl AgentWorkspaceConfig {
     /// `[desk_boss] accept`, off when absent.
     pub fn accepts_desk_boss(&self) -> bool {
         self.desk_boss.as_ref().is_some_and(|d| d.accept)
+    }
+
+    /// Whether this agent takes what a person's Desk knows of their work:
+    /// its `[desk_knows] accept`, on when absent.
+    pub fn accepts_desk_knows(&self) -> bool {
+        self.desk_knows.as_ref().is_none_or(|d| d.accept)
     }
 
     /// This agent's `[computer]`, Full access asking first where it has
@@ -9103,6 +9119,89 @@ fn default_desk_boss_token_ttl_days() -> u32 {
 
 fn default_desk_boss_max_links_per_device() -> u32 {
     16
+}
+
+/// An agent's own `[desk_knows]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDeskKnowsConfig {
+    /// Whether a person's Desk may share their work with this agent. On by
+    /// default.
+    #[serde(default = "yes")]
+    pub accept: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `[desk_knows]` on a hub: what a person's Desk shares with this hub's
+/// agents of their work (Sees), pushed with a `wfk_` token their paired
+/// Desk mints (`POST /api/me/desk-knows-tokens`), and read only in that
+/// person's own turns with the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskKnowsConfig {
+    /// On by default. Off, pushes and mints are refused in plain words and
+    /// nothing kept is read; what is kept is still pruned.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Lifetime of a token in days, 1 to 90. Desk renews it before then.
+    #[serde(default = "default_desk_knows_token_ttl_days")]
+    pub token_ttl_days: u32,
+    /// Days a session's conversation is kept here, at least 1.
+    #[serde(default = "default_desk_knows_retain_days")]
+    pub retain_days: u32,
+    /// The most one person's Desk work may take for one agent, in MB, at
+    /// least 16: past it the oldest conversations go first.
+    #[serde(default = "default_desk_knows_max_mb")]
+    pub max_mb: u32,
+    /// When the daily digest is made, in the person's local time.
+    #[serde(default = "default_desk_knows_digest_at")]
+    pub digest_at: String,
+}
+
+impl Default for DeskKnowsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token_ttl_days: default_desk_knows_token_ttl_days(),
+            retain_days: default_desk_knows_retain_days(),
+            max_mb: default_desk_knows_max_mb(),
+            digest_at: default_desk_knows_digest_at(),
+        }
+    }
+}
+
+impl DeskKnowsConfig {
+    /// [`Self::token_ttl_days`] held to 1 to 90.
+    pub fn ttl_days(&self) -> u32 {
+        self.token_ttl_days.clamp(1, 90)
+    }
+
+    /// [`Self::retain_days`], at least 1.
+    pub fn retain(&self) -> u32 {
+        self.retain_days.max(1)
+    }
+
+    /// [`Self::max_mb`] in bytes, at least 16 MB.
+    pub fn max_bytes(&self) -> i64 {
+        i64::from(self.max_mb.max(16)) * 1024 * 1024
+    }
+}
+
+fn default_desk_knows_token_ttl_days() -> u32 {
+    30
+}
+
+fn default_desk_knows_retain_days() -> u32 {
+    90
+}
+
+fn default_desk_knows_max_mb() -> u32 {
+    2048
+}
+
+fn default_desk_knows_digest_at() -> String {
+    "08:00".into()
 }
 
 /// An agent's own `[desk_boss]`.
@@ -10943,6 +11042,13 @@ pub trait SecretStore: Send + Sync {
 
     /// List secret paths, optionally filtered by prefix. Never returns values.
     fn list(&self, prefix: Option<&str>) -> Vec<String>;
+
+    /// Whether this store's reads are pinned to an agent's connections (a
+    /// hub running Desk): where a credential is sent is then read only from
+    /// the tier the credential came from, or the hub's shared tier.
+    fn is_pinned(&self) -> bool {
+        false
+    }
 
     /// Read a secret only from user-scoped layers, ignoring shared/agent
     /// fallbacks. Returns `None` when no user identity is active or no

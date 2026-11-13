@@ -1313,7 +1313,15 @@ pub fn pushed(
     noted: Option<TicketState>,
     body_sent: bool,
 ) {
+    // A need pulled from a blocker there and taken off here is remembered
+    // as seen while the remote still names it, so it isn't pulled again: a
+    // push never takes a link away there, and only sends keys not seen.
+    let taken_off: Vec<String> = blockers(&e.details.facts)
+        .into_iter()
+        .filter(|k| e.seen.needs.contains(k) && !sent.needs.contains(k))
+        .collect();
     e.seen = sent.clone();
+    e.seen.needs.extend(taken_off);
     e.noted = noted;
     if body_sent {
         e.html_read = HTML_READ;
