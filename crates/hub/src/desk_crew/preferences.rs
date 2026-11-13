@@ -400,14 +400,12 @@ const CHANGE_IT: &str = "Change it";
 const KEEP_IT: &str = "Keep it";
 const FORGET_IT: &str = "Forget it";
 
-/// The person's answer to an ask, as it was closed with it: none for an
-/// answer that went on to a session (its words are the session's line's).
 /// What an "always" does, readable cold: an answer of its own words
 /// ("make it wait for green") as it is; a bare one ("Yes", "Merge") with the
 /// question it answered, so the rule says what it says yes to.
 fn rule_then(i: &OpenItem, answer: &str) -> String {
     let answer = answer.trim();
-    if answer.split_whitespace().count() >= 3 {
+    if answer.is_empty() || answer.split_whitespace().count() >= 3 {
         return answer.to_string();
     }
     let first = i
@@ -425,14 +423,12 @@ fn rule_then(i: &OpenItem, answer: &str) -> String {
     if asked.is_empty() {
         return answer.to_string();
     }
-    let mut said = answer.chars();
-    let lead = said
-        .next()
-        .map(|c| c.to_lowercase().collect::<String>() + said.as_str())
-        .unwrap_or_default();
-    format!("{lead}, to “{asked}”")
+    let answer = answer.trim_end_matches(['.', '!']);
+    format!("answer “{answer}” to “{asked}”")
 }
 
+/// The person's answer to an ask, as it was closed with it: none for an
+/// answer that went on to a session (its words are the session's line's).
 fn answer_of(i: &OpenItem) -> Option<String> {
     let why = i.closed_why.as_deref()?;
     ["You answered: ", "They answered: "]

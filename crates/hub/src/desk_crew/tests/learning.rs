@@ -180,7 +180,10 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
             .unwrap()
             .unwrap();
         // A bare answer is kept with the question it says yes to.
-        assert_eq!(kept.then_text, "deploy, to “deploy to staging now?”");
+        assert_eq!(
+            kept.then_text,
+            "answer “Deploy” to “deploy to staging now?”"
+        );
         d.store()
             .preference_set_state(kept.id, PrefState::Retired)
             .await
