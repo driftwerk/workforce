@@ -147,7 +147,8 @@ fn line_closed(asked: Option<Asked>, session: &str) -> Option<(ClosedBy, String)
 /// What a promise or order the boss kept says, once, at `tz`: when it was
 /// asked, what it was and what showed it done. None for anything else.
 pub(super) fn kept_line(closed: &OpenItem, tz: chrono_tz::Tz) -> Option<String> {
-    let why = closed.closed_why.as_deref()?.strip_prefix("Done: ")?;
+    let why = closed.closed_why.as_deref()?;
+    let why = why.strip_prefix("Done: ").unwrap_or(why);
     if closed.closed_by != Some(ClosedBy::Boss) || closed.done_when.as_deref() == Some(REPLIED) {
         return None;
     }

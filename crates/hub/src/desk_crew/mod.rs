@@ -163,6 +163,12 @@ pub struct CrewHub {
     relayed_turns: Mutex<std::collections::HashSet<String>>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
+    /// The bosses whose update is being looked at now.
+    updating: Mutex<std::collections::HashSet<String>>,
+    /// The suggestions each boss's quiet check-ins made, and when, for its
+    /// next update to show.
+    quiet_made:
+        Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -534,6 +540,8 @@ impl CrewHub {
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
             update_writer: Mutex::default(),
+            updating: Mutex::default(),
+            quiet_made: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),

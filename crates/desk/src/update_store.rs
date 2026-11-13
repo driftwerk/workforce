@@ -40,7 +40,13 @@ impl DeskStore {
             last_update_at: r.try_get(4)?,
             unread: u32::try_from(r.try_get::<_, i32>(5)?).unwrap_or(0),
             told,
-            pending: pending.and_then(|p| serde_json::from_value(p).ok()),
+            pending: pending.and_then(|p| match serde_json::from_value(p) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "a pending update couldn't be read; gathered again");
+                    None
+                }
+            }),
         })
     }
 
@@ -103,6 +109,21 @@ impl DeskStore {
             .execute(
                 "UPDATE boss_update_state SET pending_id = NULL, pending = NULL WHERE boss = $1",
                 &[&boss],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Stops gathering `boss`'s update: what it gathered says nothing now.
+    /// When it last told the person stays as it was.
+    pub async fn update_regather(&self, boss: &str, told: &HashMap<Uuid, Told>) -> Result<()> {
+        let client = self.pool().get().await?;
+        let told = serde_json::to_value(told)?;
+        client
+            .execute(
+                "UPDATE boss_update_state SET gather_since = NULL, result = false, told = $2 \
+                 WHERE boss = $1",
+                &[&boss, &told],
             )
             .await?;
         Ok(())

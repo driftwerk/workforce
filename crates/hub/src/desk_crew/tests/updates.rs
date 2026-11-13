@@ -288,6 +288,9 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             update: Default::default(),
             told: Default::default(),
             restated: vec![],
+            cutoff: None,
+            handed: false,
+            sent: None,
         };
         // Kept before it went: sent once.
         d.store()

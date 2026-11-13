@@ -176,7 +176,7 @@ impl CrewHub {
         let store = self.desk.store();
         let composed = o.updates.enabled;
         let decisions: Vec<BossDecision> = store
-            .decisions_since(boss, last, 20)
+            .decisions_since(boss, last, 500)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -187,7 +187,7 @@ impl CrewHub {
         let tz = self.desk.timezone();
         let kept: Vec<String> = match composed {
             true => store
-                .items_closed_since(boss, last, 20)
+                .items_closed_since(boss, last, 200)
                 .await
                 .unwrap_or_default()
                 .iter()
@@ -210,7 +210,12 @@ impl CrewHub {
             .filter(|i| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
             .filter(|i| i.said() && i.state == OpenState::Open)
             .collect();
-        if !decisions.is_empty() || !kept.is_empty() {
+        let quiet = self
+            .quiet_made
+            .lock()
+            .get(boss)
+            .is_some_and(|m| !m.is_empty());
+        if !decisions.is_empty() || !kept.is_empty() || quiet {
             change = Change::Result;
         }
         if !restated.is_empty() {
@@ -321,6 +326,12 @@ impl CrewHub {
     /// gone, starts gathering on news, and sends what is due.
     pub(crate) async fn look_at_updates(&self) {
         for (service, o) in self.overseers() {
+            let boss = service.agent_id.to_string();
+            // One look at a boss's update at a time: a wake-up's check-in
+            // may be writing it.
+            let Some(_one) = Updating::begin(&self.updating, &boss) else {
+                continue;
+            };
             if let Err(e) = self.update_of(&service, &o).await {
                 tracing::warn!(agent = %service.agent_id, error = %format!("{e:#}"), "a boss's update failed");
             }
@@ -335,23 +346,16 @@ impl CrewHub {
         let now = Utc::now();
         let store = self.desk.store();
         let state = store.update_state(boss, now).await?;
-        if let Some(p) = &state.pending {
-            return self.send(service, &owner, &state, p.clone()).await;
+        if let Some(p) = state.pending.clone() {
+            return self.resume(service, &owner, o, &state, p).await;
         }
         let b = self.batch(service, o, &state, now).await;
         let gather_since = match (b.change, state.gather_since) {
             (Change::None, None) => return Ok(()),
             (Change::None, Some(_)) => {
-                // What was gathered no longer says anything (it was all
-                // undone or told another way): nothing to send.
-                store
-                    .update_sent(
-                        boss,
-                        state.last_update_at.unwrap_or(state.since),
-                        &b.told,
-                        state.unread,
-                    )
-                    .await?;
+                // What was gathered no longer says anything (undone, or
+                // told another way): nothing to send.
+                store.update_regather(boss, &b.told).await?;
                 return Ok(());
             }
             (c, since) => {
@@ -382,27 +386,137 @@ impl CrewHub {
         ) {
             return Ok(());
         }
-        let (u, text) = self.written(boss, &owner, o, &b, now).await;
-        let pending = Pending {
+        let (level, _) = self.level_now(boss, o);
+        let p = self.pend(boss, &owner, o, &b, now, !level.acts()).await?;
+        self.resume(service, &owner, o, &state, p).await
+    }
+
+    /// `b` written and kept as `boss`'s pending update, before anything is
+    /// sent: `handed` to a check-in at Watch and Suggest.
+    async fn pend(
+        &self,
+        boss: &str,
+        owner: &str,
+        o: &Oversight,
+        b: &Batch,
+        now: DateTime<Utc>,
+        handed: bool,
+    ) -> eyre::Result<Pending> {
+        let (u, text) = self.written(boss, owner, o, b, now).await;
+        let p = Pending {
             id: Uuid::new_v4(),
             text,
             update: u,
-            told: b.told,
-            restated: b.restated,
+            told: b.told.clone(),
+            restated: b.restated.clone(),
+            cutoff: Some(now),
+            handed,
+            sent: None,
         };
-        // At Watch and Suggest the check-in is the one post, while one may
-        // run; otherwise, and at Act, the update is its own.
-        let (level, _) = self.level_now(boss, o);
-        if !level.acts() && matches!(self.budget(boss, o).await, Ok(Budget::Open)) {
-            return self.in_check_in(service, &owner, o, &state, pending).await;
-        }
-        store.update_pend(boss, &pending).await?;
-        let state = store.update_state(boss, now).await?;
-        self.send(service, &owner, &state, pending).await
+        self.desk.store().update_pend(boss, &p).await?;
+        Ok(p)
     }
 
-    /// Hands `p` to a check-in at Watch or Suggest: its message, with its
-    /// suggestions, is the update.
+    /// Sends the pending `p`, as it was written: handed to a check-in while
+    /// one may run (it ran already when its check-in answered), else as an
+    /// update of its own.
+    async fn resume(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        o: &Oversight,
+        state: &UpdateState,
+        p: Pending,
+    ) -> eyre::Result<()> {
+        let boss = service.agent_id.as_str();
+        if p.handed && p.sent.is_none() {
+            // A check-in that answered it before a restart was its post.
+            let answered = self
+                .desk
+                .store()
+                .latest_check_in(boss)
+                .await
+                .ok()
+                .flatten()
+                .filter(|c| c.prompt.contains(&marker(&p)))
+                .and_then(|c| c.reply);
+            if let Some(reply) = answered {
+                return self.answered(service, owner, state, &p, &reply).await;
+            }
+            if matches!(self.budget(boss, o).await, Ok(Budget::Open)) {
+                return self.in_check_in(service, owner, o, state, p).await;
+            }
+            // The check-ins are spent: the update goes out on its own.
+        }
+        self.send(service, owner, state, p).await
+    }
+
+    /// The prompt's part that hands `p` to a check-in, found again by its
+    /// id after a restart.
+    fn handing(p: &Pending) -> String {
+        format!(
+            "Your update to the person is due ({}). Here is what changed since you last told them, each session's \
+             paragraph already written:\n{}\n\n\
+             Give the person this update in your message: keep each session's paragraph and every line that \
+             starts \"I decided\", \"Still waiting on you\" or says what you kept, word for word, and add what you suggest.",
+            marker(p),
+            super::watcher::reported(&p.text, "your update"),
+        )
+    }
+
+    /// What a wake-up's check-in at Watch or Suggest also carries: the
+    /// boss's update, written now from what changed, as its one post. None
+    /// when nothing changed, or another look is writing it.
+    pub(super) async fn update_for_wake(
+        &self,
+        service: &AgentService,
+        o: &Oversight,
+    ) -> Option<(Pending, String, Updating<'_>)> {
+        let boss = service.agent_id.as_str();
+        let one = Updating::begin(&self.updating, boss)?;
+        let owner = self.person(Some(service))?;
+        let now = Utc::now();
+        let state = self.desk.store().update_state(boss, now).await.ok()?;
+        let p = match state.pending.clone() {
+            Some(p) if p.handed && p.sent.is_none() => p,
+            Some(_) => return None,
+            None => {
+                let b = self.batch(service, o, &state, now).await;
+                if b.change == Change::None {
+                    return None;
+                }
+                self.pend(boss, &owner, o, &b, now, true).await.ok()?
+            }
+        };
+        let handing = Self::handing(&p);
+        Some((p, handing, one))
+    }
+
+    /// A wake-up's check-in carried `p` and answered `reply`: told.
+    pub(super) async fn update_answered(
+        &self,
+        service: &Arc<AgentService>,
+        p: &Pending,
+        reply: &str,
+    ) {
+        let boss = service.agent_id.as_str();
+        let Some(owner) = self.person(Some(service)) else {
+            return;
+        };
+        let state = match self.desk.store().update_state(boss, Utc::now()).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "a boss's update state couldn't be read");
+                return;
+            }
+        };
+        if let Err(e) = self.answered(service, &owner, &state, p, reply).await {
+            tracing::warn!(error = %format!("{e:#}"), "marking a check-in's update told failed");
+        }
+    }
+
+    /// Hands `p` to a check-in of its own at Watch or Suggest: its message,
+    /// with its suggestions, is the update.
     async fn in_check_in(
         &self,
         service: &Arc<AgentService>,
@@ -413,51 +527,92 @@ impl CrewHub {
     ) -> eyre::Result<()> {
         let (level, _) = self.level_now(service.agent_id.as_str(), o);
         let prompt = format!(
-            "{CHECK_IN} Your update to the person is due (you oversee the crew at level {}). Here is what changed since you last told them, \
-             each session's paragraph already written:\n{}\n\n\
-             Give the person this update now in your own message: keep each session's paragraph and every line that \
-             starts \"I decided\", \"Still waiting on you\" or what you kept, word for word, and add what you suggest. {}",
+            "{CHECK_IN} {} (You oversee the crew at level {}.) {}",
+            Self::handing(&p),
             level.as_str(),
-            super::watcher::reported(&p.text, "your update"),
             match self.unbound_given(service, o) {
                 true => Self::boss_hint(o),
                 false => Self::level_hint(level, o),
             },
         );
         // A check-in like any other: it counts against the hour's.
-        let ran = self
+        if let Some(reply) = self
             .check_in_on(service, owner, "wake", &prompt, 0, None, false)
-            .await;
-        if ran.is_some() {
-            self.told(service, owner, state, &p).await?;
+            .await
+        {
+            self.answered(service, owner, state, &p, &reply).await?;
         }
         Ok(())
     }
 
+    /// A check-in answered `reply` for `p`: what of its decisions, what it
+    /// kept and what still waits the reply left out goes out as the rows
+    /// say it, so none is lost to its wording; then told.
+    async fn answered(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        state: &UpdateState,
+        p: &Pending,
+        reply: &str,
+    ) -> eyre::Result<()> {
+        let decided: Vec<String> = self
+            .desk
+            .store()
+            .decisions_of(
+                &p.update
+                    .decisions
+                    .iter()
+                    .filter_map(|d| d.id.parse().ok())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(BossDecision::said)
+            .collect();
+        let missing = update::missing_lines(p, &decided, reply);
+        if !missing.is_empty() {
+            let target =
+                DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+            let delivery =
+                crate::desk_surface::Delivery::text(DeliveryKind::Update, missing.join("\n\n"));
+            if let Err(e) = crate::desk_surface::deliver(service, owner, &target, delivery).await {
+                tracing::warn!(error = %e, "posting what a check-in's update left out failed");
+            }
+        }
+        self.told(service, owner, state, p).await
+    }
+
     /// Sends `p` as `service`'s update, once: when a restart finds it
-    /// already in the DM, it is only marked told.
+    /// already in the DM, it is only marked told; one that couldn't go is
+    /// kept, and sent as it is on a later look.
     async fn send(
         &self,
         service: &Arc<AgentService>,
         owner: &str,
         state: &UpdateState,
-        p: Pending,
+        mut p: Pending,
     ) -> eyre::Result<()> {
         let boss = service.agent_id.as_str();
         let id = p.id.to_string();
-        let gone = service
-            .sessions
-            .find(DESK_CHANNEL, owner)
-            .ok()
-            .flatten()
-            .and_then(|s| {
-                s.messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.desk.as_ref().and_then(|d| d.request_id.as_deref()) == Some(&id))
-                    .map(|m| m.id.clone())
-            });
-        let message = match gone {
+        let found = p.sent.clone().or_else(|| {
+            service
+                .sessions
+                .find(DESK_CHANNEL, owner)
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    s.messages
+                        .iter()
+                        .rev()
+                        .find(|m| {
+                            m.desk.as_ref().and_then(|d| d.request_id.as_deref()) == Some(&id)
+                        })
+                        .map(|m| m.id.clone())
+                })
+        });
+        let message = match found {
             Some(m) => m,
             None => {
                 let target =
@@ -465,18 +620,19 @@ impl CrewHub {
                 let mut delivery =
                     crate::desk_surface::Delivery::text(DeliveryKind::Update, p.text.clone());
                 delivery.request_id = Some(id);
-                match crate::desk_surface::deliver(service, owner, &target, delivery).await {
-                    Ok(d) => d.message_id,
-                    Err(e) => {
-                        // Not sent: gathered again, and sent on a later look.
-                        self.desk.store().update_unpend(boss).await?;
-                        return Err(e);
-                    }
-                }
+                let message = crate::desk_surface::deliver(service, owner, &target, delivery)
+                    .await?
+                    .message_id;
+                // Sent: kept so, before anything else, so a restart from
+                // here on finds it whatever the DM did since.
+                p.sent = Some(message.clone());
+                self.desk.store().update_pend(boss, &p).await?;
+                message
             }
         };
         let extras = Extras {
             update: Some(p.update.clone()),
+            suggestions: self.quiet_suggestions(boss, &p),
             ..Default::default()
         };
         if let Err(e) = self.desk.store().put_extras(&message, boss, &extras).await {
@@ -485,8 +641,59 @@ impl CrewHub {
         self.told(service, owner, state, &p).await
     }
 
-    /// The person was told `p`: its restated items counted, and the state
-    /// moved on.
+    /// The suggestions quiet check-ins made since `p`'s last update, shown
+    /// with it: no message of their own carries them.
+    fn quiet_suggestions(
+        &self,
+        boss: &str,
+        p: &Pending,
+    ) -> Vec<workforce_desk::crew::MentionedSuggestion> {
+        let cutoff = p.cutoff.unwrap_or_else(Utc::now);
+        self.quiet_made
+            .lock()
+            .get(boss)
+            .map(|made| {
+                made.iter()
+                    .filter(|(at, _)| *at <= cutoff)
+                    .map(|(_, s)| s.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keeps the suggestions `boss`'s quiet check-in made since `since`
+    /// for its next update.
+    pub(super) async fn keep_quiet_suggestions(&self, boss: &str, since: DateTime<Utc>) {
+        let made = match self.desk.store().suggestions_since(boss, since).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading a quiet check-in's suggestions failed");
+                return;
+            }
+        };
+        if made.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let mut kept = self.quiet_made.lock();
+        let list = kept.entry(boss.to_string()).or_default();
+        for s in made {
+            if !list.iter().any(|(_, k)| k.id == s.id) {
+                list.push((
+                    now,
+                    workforce_desk::crew::MentionedSuggestion {
+                        id: s.id,
+                        text: s.text,
+                        state: s.state,
+                    },
+                ));
+            }
+        }
+    }
+
+    /// The person was told `p`: its restated items counted, the
+    /// suggestions it carried let go, and the state moved on as of what it
+    /// was written from.
     async fn told(
         &self,
         service: &AgentService,
@@ -496,10 +703,14 @@ impl CrewHub {
     ) -> eyre::Result<()> {
         let store = self.desk.store();
         let now = Utc::now();
+        let cutoff = p.cutoff.unwrap_or(now);
         for (item, park) in &p.restated {
             if let Err(e) = store.item_said(*item, now, *park).await {
                 tracing::warn!(error = %e, "counting a restated item failed");
             }
+        }
+        if let Some(made) = self.quiet_made.lock().get_mut(service.agent_id.as_str()) {
+            made.retain(|(at, _)| *at > cutoff);
         }
         let read = service
             .sessions
@@ -510,8 +721,37 @@ impl CrewHub {
         // The last one unread as this one goes: one more in a row.
         let unread = update::streak(state.unread, state.last_update_at, read) + 1;
         store
-            .update_sent(service.agent_id.as_str(), now, &p.told, unread)
+            .update_sent(service.agent_id.as_str(), cutoff, &p.told, unread)
             .await
+    }
+}
+
+/// What a check-in's prompt names a handed update by.
+fn marker(p: &Pending) -> String {
+    format!("update {}", p.id)
+}
+
+/// A boss's update being looked at, by one look at a time; let go when
+/// dropped.
+pub(super) struct Updating<'a>(
+    &'a parking_lot::Mutex<std::collections::HashSet<String>>,
+    String,
+);
+
+impl<'a> Updating<'a> {
+    fn begin(
+        set: &'a parking_lot::Mutex<std::collections::HashSet<String>>,
+        boss: &str,
+    ) -> Option<Self> {
+        set.lock()
+            .insert(boss.to_string())
+            .then(|| Self(set, boss.to_string()))
+    }
+}
+
+impl Drop for Updating<'_> {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
     }
 }
 

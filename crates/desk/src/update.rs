@@ -170,6 +170,30 @@ pub struct Pending {
     /// The open items it restates, each with whether it parks after.
     #[serde(default)]
     pub restated: Vec<(Uuid, bool)>,
+    /// What it was written from, as of: decisions and kept items after it
+    /// are the next update's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff: Option<DateTime<Utc>>,
+    /// Handed to a check-in (Watch, Suggest), whose message is the post.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handed: bool,
+    /// The DM message it went out as, once it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<String>,
+}
+
+/// The lines of `p` that must reach the person word for word (decisions,
+/// what it kept, what still waits) that `said` leaves out.
+pub fn missing_lines(p: &Pending, decided: &[String], said: &str) -> Vec<String> {
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let said = flat(said);
+    decided
+        .iter()
+        .chain(&p.update.kept)
+        .cloned()
+        .chain(p.update.waiting.iter().map(|w| w.text.clone()))
+        .filter(|l| !said.contains(&flat(l)))
+        .collect()
 }
 
 /// A session as an update tells of it.
@@ -506,6 +530,37 @@ mod tests {
         assert!(out.ends_with("_Notes today: 410 of 500 cheap calls._"));
         assert_eq!(footer(399, 500), None);
         assert_eq!(u.sessions[0].refs.len(), 1);
+    }
+
+    #[test]
+    fn a_check_ins_reply_that_drops_a_row_is_caught() {
+        let p = Pending {
+            id: Uuid::new_v4(),
+            text: String::new(),
+            update: MentionedUpdate {
+                kept: vec!["What I promised at 10:00 (“Tell you”) is merged: #622".into()],
+                waiting: vec![WaitingItem {
+                    item_id: "i".into(),
+                    text: "Which key should staging use?".into(),
+                    age: String::new(),
+                    holding_up: None,
+                    recommendation: None,
+                    options: vec![],
+                }],
+                ..Default::default()
+            },
+            told: HashMap::new(),
+            restated: vec![],
+            cutoff: None,
+            handed: true,
+            sent: None,
+        };
+        let decided = vec!["I decided: told acme-api to wait — CI is red.".to_string()];
+        let reply = "Here is where things are.\n\nI decided: told acme-api to wait —   CI is red.\n\nStill waiting on you:\n- Which key should staging use?";
+        assert_eq!(
+            missing_lines(&p, &decided, reply),
+            vec!["What I promised at 10:00 (“Tell you”) is merged: #622".to_string()]
+        );
     }
 
     #[test]

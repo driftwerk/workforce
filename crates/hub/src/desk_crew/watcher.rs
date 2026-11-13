@@ -101,8 +101,9 @@ pub(super) struct Trigger {
 
 /// What an Act-level check-in is asked while the composer writes the
 /// boss's updates.
-pub(super) const QUIET_ACT: &str = "Act. What you do with the crew.* tools is kept as your decisions and \
-     reaches the person in your next update; give a reason each time, and say why when you choose not to act. \
+pub(super) const QUIET_ACT: &str =
+    "Act. What you do with the crew.* tools is kept as your decisions and \
+     reaches the person in your next update; give a reason each time. \
      Say nothing to the person unless something needs them, then use crew.ask_person.";
 
 /// The boss `agent`'s own check-in channel, off its DM: a quiet check-in's
@@ -649,13 +650,23 @@ impl CrewHub {
             false => "Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
                       them first. Name sessions and agents as above.",
         };
+        // At Watch and Suggest its message is also the boss's update: one
+        // post, not two.
+        let update = match !level.acts() && o.updates.enabled {
+            true => self.update_for_wake(&service, &o).await,
+            false => None,
+        };
         let prompt = format!(
             "{CHECK_IN} Here is what happened on the crew since you last looked (you oversee it at level {}):\n{}\n\n\
-             {ask} {}{}",
+             {ask} {}{}{}",
             level.as_str(),
             reported(&lines.join("\n"), "the crew's sessions and agents"),
             hint,
             why.map(|w| format!(" {w} Tell the person once if it matters.")).unwrap_or_default(),
+            update
+                .as_ref()
+                .map(|(_, handing, _)| format!("\n\n{handing}"))
+                .unwrap_or_default(),
         );
         let hop = triggers.iter().map(|t| t.hop).max().unwrap_or(0);
         let approvals: Vec<MentionedApproval> =
@@ -663,17 +674,28 @@ impl CrewHub {
         // Off the DM, so its own words aren't posted, unless it names
         // requests the person sees beside its message.
         let quiet = composed && approvals.is_empty();
-        self.check_in_on(
-            &service,
-            &owner,
-            "wake",
-            &prompt,
-            hop,
-            Some(approvals),
-            quiet,
-        )
-        .await
-        .is_some()
+        let started = Utc::now();
+        let reply = self
+            .check_in_on(
+                &service,
+                &owner,
+                "wake",
+                &prompt,
+                hop,
+                Some(approvals),
+                quiet,
+            )
+            .await;
+        if let (Some(reply), Some((p, _, _))) = (&reply, &update) {
+            self.update_answered(&service, p, reply).await;
+        }
+        // What it suggested where no message carries it goes with its
+        // next update.
+        if quiet && reply.is_some() {
+            self.keep_quiet_suggestions(service.agent_id.as_str(), started)
+                .await;
+        }
+        reply.is_some()
     }
 
     /// Puts what `service`'s own scheduled check-in (its heartbeat) found
