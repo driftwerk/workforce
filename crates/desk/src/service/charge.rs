@@ -309,6 +309,21 @@ impl Desk {
         repo_of_own(&own).is_some_and(|r| r.named(&named, &home))
     }
 
+    /// The repository session `id` works in, as its `origin` names it
+    /// (`owner/name`, lowercased): what a preference scoped to a
+    /// repository covers. `None` when it works in none (or it isn't here).
+    pub fn repo_of_session(&self, id: Uuid) -> Option<String> {
+        let view = self.view(id).ok()?;
+        let own = charge::own_folder(std::path::Path::new(&view.cwd));
+        git_line_within(
+            &own,
+            &["remote", "get-url", "origin"],
+            Duration::from_secs(2),
+        )
+        .and_then(|o| charge::repo_name(&o))
+        .map(|r| r.path)
+    }
+
     /// How long the person's input holds a session `boss` runs, as the hub
     /// last said.
     pub fn hold_for(&self, boss: &str) -> chrono::Duration {

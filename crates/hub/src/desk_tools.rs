@@ -169,6 +169,7 @@ fn caller(id: &str) -> Option<By> {
         reason: None,
         suggestion_id: None,
         hop: 0,
+        preference: None,
     })
 }
 

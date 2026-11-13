@@ -6031,6 +6031,7 @@ impl Desk {
                             reason: None,
                             suggestion_id: None,
                             hop: 0,
+                            preference: None,
                         };
                         if let Err(e) = self.interrupt(id, Some(breaker)) {
                             tracing::warn!(%id, error = %e, "couldn't end a held Codex turn");

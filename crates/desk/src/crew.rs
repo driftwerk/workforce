@@ -292,6 +292,9 @@ pub struct By {
     pub reason: Option<String>,
     pub suggestion_id: Option<String>,
     pub hop: i16,
+    /// The person's preference a boss applied in doing it (H9), checked
+    /// to be there and active: its decision cites it.
+    pub preference: Option<uuid::Uuid>,
 }
 
 impl By {
@@ -302,6 +305,7 @@ impl By {
             reason: Some(reason.to_string()).filter(|r| !r.trim().is_empty()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -311,6 +315,7 @@ impl By {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -320,6 +325,7 @@ impl By {
             reason: Some(reason.to_string()).filter(|r| !r.trim().is_empty()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 

@@ -2,9 +2,10 @@
 //! session's line and in a work turn: what Desk keeps of each session in
 //! its scope (an account's line each, and the whole account of the session
 //! the turn is about) and what it told the person lately, read from the DM
-//! archive so a rollover loses none of it, and what it owes the person
-//! (its open items, kept in Postgres). Capped at about 3k tokens: past
-//! that, quiet sessions drop to one short line first.
+//! archive so a rollover loses none of it, what it owes the person (its
+//! open items, kept in Postgres), and the person's preferences that cover
+//! what the turn is about. Capped at about 3k tokens: past that, quiet
+//! sessions drop to one short line first.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -219,6 +220,19 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         .collect();
     let posts = recent_posts(&boss, owner);
     let open = crew.items_context(boss.agent_id.as_str()).await;
+    // The person's preferences that cover what the turn is about: like
+    // what it owes them, never dropped for room.
+    let prefs = crew
+        .preferences_context(
+            &workforce_desk::preference::boss_scope_of(o.scope.group()),
+            about,
+            crew.unbound_given(&boss, &o),
+        )
+        .await;
+    let open = match (open, prefs) {
+        (Some(open), Some(prefs)) => Some(format!("{}\n\n{prefs}", open.trim_end())),
+        (open, prefs) => open.or(prefs),
+    };
     let body = body(
         &entries,
         about,
