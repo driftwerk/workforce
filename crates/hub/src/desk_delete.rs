@@ -323,6 +323,7 @@ pub(crate) async fn delete(
             "no such message in your conversation".into(),
         ));
     }
+    crate::desk_conversations::forget_parent(owner, &found.entry.id);
     Ok(Deleted {
         deleted: true,
         forgot,

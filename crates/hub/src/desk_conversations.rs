@@ -599,6 +599,46 @@ pub fn router(state: Arc<GatewayState>) -> axum::Router {
 /// The most threads one listing holds: the ones with the newest replies.
 const THREADS_MAX: usize = 200;
 
+/// Parents already found in a person's DM, by person, DM and message: a
+/// message stays in its conversation until it is deleted (which forgets it
+/// here), so a listing needn't walk the chain for it again. Only found ones are kept; a stray thread is looked for every time.
+static PARENTS_FOUND: std::sync::LazyLock<std::sync::Mutex<HashSet<(String, String, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The most parents remembered before they are forgotten and found again.
+const PARENTS_REMEMBERED: usize = 50_000;
+
+/// Forgets that `message` was found in `owner`'s DM: it was deleted, so a
+/// thread on it is no thread of the DM's.
+pub(crate) fn forget_parent(owner: &str, message: &str) {
+    if let Ok(mut seen) = PARENTS_FOUND.lock() {
+        seen.retain(|(o, _, m)| !(o == owner && m == message));
+    }
+}
+
+/// Whether `parent` is a message of the DM whose head is `dm`.
+fn parent_in_dm(
+    store: &dyn SessionStore,
+    dm: &str,
+    owner: &str,
+    parent: &str,
+) -> eyre::Result<bool> {
+    let key = (owner.to_string(), dm.to_string(), parent.to_string());
+    if PARENTS_FOUND.lock().is_ok_and(|found| found.contains(&key)) {
+        return Ok(true);
+    }
+    let found = crate::desk_surface::message_in_chain(store, dm, parent)?.is_some();
+    if found {
+        if let Ok(mut seen) = PARENTS_FOUND.lock() {
+            if seen.len() >= PARENTS_REMEMBERED {
+                seen.clear();
+            }
+            seen.insert(key);
+        }
+    }
+    Ok(found)
+}
+
 /// The threads on messages of `owner`'s DM with `service`'s agent: each
 /// thread's conversation is a session of its own on its channel.
 fn threads_of(
@@ -622,9 +662,7 @@ fn threads_of(
     for head in heads {
         let parent = workforce_core::desk::dm_thread_parent(&head.channel).unwrap_or_default();
         let on_a_message = match &dm {
-            Some(dm) => crate::desk_surface::message_in_chain(store, &dm.id, parent)
-                .map_err(internal)?
-                .is_some(),
+            Some(dm) => parent_in_dm(store, &dm.id, owner, parent).map_err(internal)?,
             None => false,
         };
         if on_a_message {
@@ -1166,6 +1204,20 @@ mod tests {
         // The thread's own conversation is untouched.
         let own = page(&store, &scout(), ME, &channel, Cursor::Newest, 10).unwrap();
         assert_eq!(own.messages.len(), 2);
+
+        // A parent found once is remembered, until it is deleted.
+        let remembered = || {
+            PARENTS_FOUND.lock().unwrap().contains(&(
+                ME.to_string(),
+                head.id.clone(),
+                parent.clone(),
+            ))
+        };
+        assert!(remembered());
+        forget_parent(ME, &parent);
+        assert!(!remembered());
+        assert!(parent_in_dm(&store, &head.id, ME, &parent).unwrap());
+        assert!(remembered());
 
         for thread_of in ["not-an-id", "7a8b4c1e-0000-4000-8000-000000000000"] {
             let refused = copy_to_dm(

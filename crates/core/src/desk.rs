@@ -1122,6 +1122,7 @@ mod tests {
         let target = DeskTarget::of_turn(&place, "whatever", Some("mac"), true);
         assert_eq!(target.place, place);
         assert_eq!(target.channel, dm_thread_channel(&parent));
+        assert_eq!(target.device, None);
         assert!(target.spoken);
         let dm = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         assert_eq!(dm.channel, DESK_CHANNEL);
