@@ -29,6 +29,8 @@ pub const TASK: &str = "desk_account";
 pub const QUESTION_TOKENS: u32 = 700;
 /// What a question's cost is booked as.
 pub const QUESTION_TASK: &str = "desk_account_question";
+/// What a refresh that also read the exchanges for notes is booked as.
+pub const SHARED_TASK: &str = "desk_account_notes";
 /// The longest a refresh's model call is given, as a gist's.
 pub const WRITE_WITHIN: Duration = crate::gist::WRITE_WITHIN;
 /// How often a running turn's `now` may be written again.
@@ -490,6 +492,9 @@ fn record(out: &mut String, ctx: &Context, delta: &[Exchange], tail: &Tail) {
     }
 }
 
+/// The last line of an account's prompt asked alone.
+const ANSWER_ALONE: &str = "\nAnswer with the JSON object only.";
+
 /// What the model is given to refresh `kept` from `delta` (and `tail`, when
 /// the exchanges don't say enough), wrapped as untrusted content with
 /// `nonce`.
@@ -512,7 +517,7 @@ pub fn prompt(
     out.push_str(&format!("\n<<<{boundary}>>>\n"));
     record(&mut out, ctx, delta, tail);
     out.push_str(&format!("<<<END_{boundary}>>>\n"));
-    out.push_str("\nAnswer with the JSON object only.");
+    out.push_str(ANSWER_ALONE);
     out
 }
 
@@ -628,6 +633,72 @@ pub fn question_prompt(
         defanged(&clip(&flat(question), 1000))
     ));
     out
+}
+
+/// What the model is told when one call refreshes the account and reads
+/// the same exchanges for notes: both jobs as each is told alone, and the
+/// one answer that holds both.
+pub fn shared_system() -> String {
+    format!(
+        "You do two jobs at once on one record of one of the person's coding sessions.\n\n\
+         The first job, the running account:\n{SYSTEM}\n\
+         The second job, the notes:\n{}\n\n\
+         The record is given in two parts: the first for the account, the second (with its refs \
+         x1, x2, ... and i1, i2, ...) for the notes. Answer with one JSON object alone, in this \
+         shape, instead of the shapes each job asks for on its own: \
+         {{\"account\": <the account's changes, as the first job asks>, \
+         \"notes\": <the notes, as the second job asks>}}",
+        crate::memory::derive::SYSTEM
+    )
+}
+
+/// What the model is given for both jobs: the account's prompt, then the
+/// notes' prompt, each wrapped as untrusted on its own.
+pub fn shared_prompt(account: &str, notes: &str) -> String {
+    // The wrapper's shape is the only one asked for.
+    let account = account
+        .strip_suffix(ANSWER_ALONE)
+        .unwrap_or(account)
+        .trim_end();
+    format!(
+        "For the account:\n\n{account}\n\nFor the notes:\n\n{notes}\n\n\
+         Answer with the one JSON object {{\"account\": ..., \"notes\": ...}} only."
+    )
+}
+
+/// One answer to both jobs, each part read back as when asked alone.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SharedAnswer {
+    pub account: Option<Written>,
+    pub notes: Option<crate::memory::derive::Out>,
+}
+
+/// The model's answer to both jobs read back: each part by its own
+/// parser. An answer with the account's object alone is read as one, with
+/// no notes.
+pub fn parse_shared(text: &str) -> SharedAnswer {
+    let both = text
+        .find('{')
+        .zip(text.rfind('}'))
+        .and_then(|(start, end)| text.get(start..=end))
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+        .filter(|v| v.get("account").is_some() || v.get("notes").is_some());
+    match both {
+        Some(v) => SharedAnswer {
+            account: v
+                .get("account")
+                .filter(|a| a.is_object())
+                .and_then(|a| parse(&a.to_string())),
+            notes: v
+                .get("notes")
+                .filter(|n| n.is_object())
+                .and_then(|n| crate::memory::derive::parse(&n.to_string())),
+        },
+        None => SharedAnswer {
+            account: parse(text),
+            notes: None,
+        },
+    }
 }
 
 /// The account's changes as the model wrote them.
@@ -898,6 +969,27 @@ pub trait Accountant: Send + Sync {
         call: Call,
     ) -> eyre::Result<String>;
 
+    /// Whether [`Self::answer_shared`] may be asked: one call that
+    /// refreshes an account and reads the same exchanges for notes.
+    fn shares_reads(&self) -> bool {
+        false
+    }
+
+    /// The model's answer to both jobs at once about session `session`
+    /// ([`shared_system`], [`shared_prompt`]), booked as such, and which
+    /// model gave it: its notes are kept as by that model.
+    async fn answer_shared(
+        &self,
+        _session: Uuid,
+        _engine: crate::engine::Engine,
+        _system: &str,
+        _user: &str,
+    ) -> eyre::Result<crate::memory::derive::Answered> {
+        Err(eyre::eyre!(
+            "this model doesn't read for notes with an account"
+        ))
+    }
+
     /// Hands the floor session `session`'s gist at its turn's end, said
     /// from its account: the floor writes no gist of its own for it then.
     async fn gist(
@@ -912,6 +1004,28 @@ pub trait Accountant: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_answer_is_read_part_by_part_by_each_parser() {
+        let both = parse_shared(
+            r#"```json
+{"account": {"now": "Waiting for CI.", "done": []},
+ "notes": {"add": [{"kind": "fact", "text": "CI runs on main.", "sources": ["x1"]}]}}
+```"#,
+        );
+        assert_eq!(
+            both.account.unwrap().now.as_deref(),
+            Some("Waiting for CI.")
+        );
+        assert_eq!(both.notes.unwrap().add.len(), 1);
+        // The account's object alone: no notes.
+        let alone = parse_shared(r#"{"now": "Waiting for CI."}"#);
+        assert!(alone.account.is_some() && alone.notes.is_none());
+        // Notes that aren't an object aren't read; the account still is.
+        let broken = parse_shared(r#"{"account": {"now": "Waiting."}, "notes": "none"}"#);
+        assert!(broken.account.is_some() && broken.notes.is_none());
+        assert_eq!(parse_shared("no JSON at all"), SharedAnswer::default());
+    }
 
     fn at(min: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + min * 60, 0).unwrap()
