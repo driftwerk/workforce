@@ -14,6 +14,9 @@ use crate::ticket_files::{self, FileRead, FileSource, TicketFile, FILE_MAX};
 /// How long a ticket's issue, read whole for its files, is taken as read.
 pub const READ_FRESH: chrono::Duration = chrono::Duration::minutes(5);
 
+/// The most pages of an issue's children one read of it takes.
+const CHILD_READS: usize = 3;
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -124,6 +127,34 @@ impl Desk {
             let mut details = crate::board_sync::details_of(&issue, Some(&ext.details), priorities);
             details.read_at = Some(now);
             ext.details = details;
+        }
+        // A Jira issue's sub-tasks say nothing of who has each, and an
+        // epic's children aren't on it: one search over its children says.
+        // It never fails the read: what was known stays.
+        let facts = t.external.as_ref().map(|e| &e.details.facts);
+        let parent = facts.is_some_and(|f| {
+            e.system == System::Jira && (!f.children.is_empty() || crate::board_sync::is_epic(f))
+        });
+        if let (true, Some(s)) = (parent, sync.as_ref()) {
+            let mut budget = super::board_sync::Budget(CHILD_READS);
+            let keys = [e.key.clone()];
+            match self.read_children(s, remote, &mut budget, &keys).await {
+                Ok(Some(mut found)) => {
+                    let ext = t.external.as_mut().expect("a synced ticket");
+                    let epic = crate::board_sync::is_epic(&ext.details.facts);
+                    let children = found.of.remove(&e.key).unwrap_or_default();
+                    crate::board_sync::set_children(
+                        &mut ext.details.facts,
+                        children,
+                        &found.blocked,
+                        epic,
+                    );
+                }
+                Ok(None) | Err(RemoteError::Spent) => {}
+                Err(err) => {
+                    tracing::info!(ticket = %id, error = %err, "an issue's children weren't read");
+                }
+            }
         }
         self.save_ticket(&mut t).await.map_err(fail)?;
         let v = self.view_ticket(t).await.map_err(fail)?;

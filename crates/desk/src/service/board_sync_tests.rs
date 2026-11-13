@@ -1774,7 +1774,11 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
         );
         assert_eq!(
             f.sub_items,
-            Some(crate::board::Progress { done: 1, total: 2 })
+            Some(crate::board::Progress {
+                done: 1,
+                total: 2,
+                started: 0
+            })
         );
         assert_eq!(f.comments, Some(4));
         assert_eq!(f.priority_rank, Some(3), "Next is third of four");
@@ -1803,6 +1807,239 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
             .filter(|(t, _)| t == "jira.list_fields")
             .count();
         assert_eq!(reads, 1);
+    })
+    .await;
+}
+
+/// A Jira board with the epic ACME-9 and its story ACME-1, which has the
+/// sub-task ACME-3. ACME-9's children are ACME-1 (under way), ACME-50
+/// (blocked by ACME-60, not done) and ACME-51 (done): the last two are
+/// outside the board's listing.
+struct EpicJira {
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+const EPIC_UPDATED: &str = "2026-11-09T10:00:00.000+0000";
+
+impl EpicJira {
+    fn new() -> Self {
+        EpicJira {
+            calls: Mutex::new(vec![]),
+        }
+    }
+
+    fn searches(&self, words: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, a)| t == "jira.search" && a["jql"].as_str().unwrap().contains(words))
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    fn story() -> Value {
+        json!({ "key": "ACME-1", "summary": "Map hub roles", "status": "In Progress",
+            "status_category": "indeterminate", "updated": EPIC_UPDATED, "labels": [],
+            "description_html": "<p>Roles.</p>", "issuetype": "Story", "issuetype_level": 0,
+            "parent": { "key": "ACME-9", "summary": "Permissions", "issuetype": "Epic",
+                "hierarchy_level": 1, "status": "In Progress", "status_category": "indeterminate" },
+            "subtasks": [{ "key": "ACME-3", "summary": "Write the migration", "issuetype": "Sub-task",
+                "hierarchy_level": -1, "status": "In Review", "status_category": "indeterminate" }],
+            "issuelinks": [] })
+    }
+}
+
+#[async_trait]
+impl Remote for EpicJira {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::callable(System::Jira)
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
+        let jql = args["jql"].as_str().unwrap_or_default().to_string();
+        let child = |key: &str, title: &str, status: &str, category: &str, points: f64| {
+            json!({ "key": key, "summary": title, "status": status,
+                "status_category": category, "issuetype": "Task", "issuetype_level": 0,
+                "updated": EPIC_UPDATED, "points": points, "issuelinks": [],
+                "parent": { "key": "ACME-9", "summary": "Permissions", "issuetype": "Epic",
+                    "hierarchy_level": 1 } })
+        };
+        match tool {
+            "jira.list_fields" => Ok(json!({
+                "fields": { "points": "customfield_10016" },
+                "priorities": [{ "name": "Now" }, { "name": "Soon" }, { "name": "Next" },
+                    { "name": "Later" }],
+            })),
+            "jira.search" if jql.starts_with("parent in (ACME-9)") => {
+                let mut one = child(
+                    "ACME-1",
+                    "Map hub roles",
+                    "In Progress",
+                    "indeterminate",
+                    3.0,
+                );
+                one["assignee"] = json!("Ana Diaz");
+                one["priority"] = json!("Now");
+                one["issuetype"] = json!("Story");
+                let mut blocked = child("ACME-50", "Audit old roles", "To Do", "new", 5.0);
+                blocked["issuelinks"] = json!([{ "key": "ACME-60", "summary": "Export roles",
+                    "status": "To Do", "status_category": "new", "direction": "inward",
+                    "link_type": "Blocks", "relation": "is blocked by" }]);
+                let done = child("ACME-51", "Drop the old table", "Done", "done", 2.0);
+                Ok(json!({ "is_last": true, "issues": [done, blocked, one] }))
+            }
+            "jira.search" if jql.starts_with("parent in (ACME-1)") => Ok(json!({
+                "is_last": true,
+                "issues": [{ "key": "ACME-3", "summary": "Write the migration",
+                    "status": "In Review", "status_category": "indeterminate",
+                    "issuetype": "Sub-task", "issuetype_level": -1, "assignee": "Lee Park",
+                    "priority": "Soon", "points": 1.0, "updated": EPIC_UPDATED,
+                    "parent": { "key": "ACME-1" } }],
+            })),
+            "jira.search" => Ok(json!({ "is_last": true, "issues": [
+                { "key": "ACME-9", "summary": "Permissions", "status": "In Progress",
+                  "status_category": "indeterminate", "updated": EPIC_UPDATED, "labels": [],
+                  "description_html": "<p>All of it.</p>", "issuetype": "Epic",
+                  "issuetype_level": 1, "subtasks": [], "issuelinks": [] },
+                EpicJira::story(),
+            ]})),
+            "jira.get_issue" if args["issue_key"] == "ACME-1" => Ok(EpicJira::story()),
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+/// An epic's children come in with one more search a pass, whatever the
+/// board's filter: listed on its ticket with what they add up to, never
+/// imported; and a pass that finds them unchanged says nothing.
+#[tokio::test]
+async fn an_epic_s_children_come_in_with_one_search_and_are_never_imported() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = EpicJira::new();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let searches = remote.searches("parent in");
+        assert_eq!(searches.len(), 1, "one search over the board's epics");
+        assert_eq!(searches[0]["jql"], "parent in (ACME-9) ORDER BY key ASC");
+        let fields = searches[0]["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f == "parent"));
+        assert!(
+            !fields.iter().any(|f| f == "description" || f == "comment"),
+            "no bodies: {fields:?}"
+        );
+        let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
+        let mut keys: Vec<_> = tickets.iter().filter_map(|t| t.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, ["ACME-1", "ACME-9"], "its children aren't imported");
+        let epic = tickets
+            .iter()
+            .find(|t| t.key.as_deref() == Some("ACME-9"))
+            .unwrap();
+        let f = &epic.ticket.external.as_ref().unwrap().details.facts;
+        let children: Vec<&str> = f.children.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(children, ["ACME-1", "ACME-50", "ACME-51"], "in key order");
+        let one = &f.children[0];
+        assert_eq!(one.assignee.as_deref(), Some("Ana Diaz"));
+        assert_eq!(one.priority_rank, Some(1));
+        assert_eq!(one.state_kind.as_deref(), Some("indeterminate"));
+        assert!(one.started && !one.done);
+        assert_eq!(
+            f.sub_items,
+            Some(crate::board::Progress {
+                done: 1,
+                total: 3,
+                started: 1
+            })
+        );
+        assert_eq!(
+            f.child_points,
+            Some(crate::board::Progress {
+                done: 2,
+                total: 10,
+                started: 3
+            })
+        );
+        assert_eq!(f.child_blocked, Some(1), "ACME-50 waits on ACME-60");
+        // Unchanged next pass: the epic keeps its children, and isn't
+        // announced again.
+        let (_, mut events) = d.subscribe();
+        d.pull_board(b.id, &remote).await.unwrap();
+        assert_eq!(remote.searches("parent in").len(), 2);
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Ticket { ticket } = e {
+                assert_ne!(ticket.ticket.id, epic.ticket.id, "nothing changed");
+            }
+        }
+        let again = d.ticket(epic.ticket.id).await.unwrap();
+        assert_eq!(&again.ticket.external.unwrap().details.facts, f);
+    })
+    .await;
+}
+
+/// A pass whose calls are spent skips the epics' children: nothing is
+/// asked, and what the epic held stays.
+#[tokio::test]
+async fn a_pass_out_of_calls_skips_the_epics_children() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = EpicJira::new();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let (b, s) = d.board_sync(b.id).await.unwrap().unwrap();
+        let held = d.ticket_by_key("ACME-9").await.unwrap().ticket;
+        let asked = remote.searches("parent in").len();
+        let spent = d
+            .pull_children(&b, &s, &remote, &mut Budget(0))
+            .await
+            .unwrap_err();
+        assert_eq!(spent, RemoteError::Spent);
+        assert_eq!(remote.searches("parent in").len(), asked);
+        let now = d.ticket_by_key("ACME-9").await.unwrap().ticket;
+        assert_eq!(now.external, held.external);
+    })
+    .await;
+}
+
+/// Opening a story reads who has each of its sub-tasks, which its own
+/// answer never says, and a pass after keeps them.
+#[tokio::test]
+async fn opening_a_story_fills_in_who_has_its_sub_tasks_and_a_pass_keeps_them() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = EpicJira::new();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let story = d.ticket_by_key("ACME-1").await.unwrap().ticket;
+        let sub = |t: &crate::board::Ticket| {
+            t.external.as_ref().unwrap().details.facts.children[0].clone()
+        };
+        let listed = sub(&story);
+        assert_eq!(listed.key, "ACME-3");
+        assert_eq!(listed.title, "Write the migration");
+        assert_eq!(listed.state.as_deref(), Some("In Review"));
+        assert_eq!(listed.kind_level, Some(-1));
+        assert_eq!(listed.assignee, None, "a search row doesn't say");
+        d.read_ticket_issue(story.id, &remote, true).await.unwrap();
+        assert_eq!(remote.searches("parent in (ACME-1)").len(), 1);
+        let opened = sub(&d.ticket(story.id).await.unwrap().ticket);
+        assert_eq!(opened.assignee.as_deref(), Some("Lee Park"));
+        assert_eq!(opened.priority_rank, Some(2));
+        assert_eq!(opened.points, Some(1.0));
+        d.pull_board(b.id, &remote).await.unwrap();
+        let kept = sub(&d.ticket(story.id).await.unwrap().ticket);
+        assert_eq!(kept, opened);
     })
     .await;
 }

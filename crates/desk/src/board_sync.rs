@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::board::{
-    Assignee, Facts, Filter, IssueLink, IssueRef, LinkRel, PrSummary, Progress, Sprint, System,
-    Ticket, TicketState,
+    Assignee, Child, Facts, Filter, IssueLink, IssueRef, LinkRel, PrSummary, Progress, Sprint,
+    System, Ticket, TicketState,
 };
 use crate::crew::{Party, PartyKind};
 
@@ -567,7 +567,7 @@ pub fn linear_args(
     after: Option<&str>,
 ) -> Value {
     // Rich: each issue's relations, sub-issues, estimate and cycle too, on
-    // pages of 50 (Linear's per-query complexity); a hub whose tool doesn't
+    // pages of 25 (Linear's per-query complexity); a hub whose tool doesn't
     // take it answers as before.
     let mut args = json!({ "team_id": team_id, "limit": LINEAR_PAGE, "rich": true });
     if let Some(since) = since {
@@ -856,6 +856,10 @@ pub struct Issue {
     pub files: Option<Vec<crate::ticket_files::RemoteFile>>,
     /// Everything else it says of itself.
     pub facts: Facts,
+    /// Its children are Jira sub-tasks as a search row or read says them:
+    /// without who has each, its priority, points or PRs, which the ticket
+    /// keeps from the children's own search.
+    pub children_partial: bool,
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
@@ -1404,6 +1408,7 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
         due: due_of(&i["duedate"]),
         files: crate::ticket_files::jira_files(i),
         facts: jira_facts(i),
+        children_partial: true,
         key,
     })
 }
@@ -1457,6 +1462,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         due: due_of(&i["dueDate"]),
         files: Some(files),
         facts,
+        children_partial: false,
     })
 }
 
@@ -1475,6 +1481,9 @@ pub fn details_of(
             .as_deref()
             .and_then(|p| priority_rank(p, priorities));
     }
+    if let Some(was) = was {
+        keep_children(&mut facts, &was.facts, issue.children_partial);
+    }
     crate::board::Details {
         priority: issue.priority.clone(),
         labels: issue
@@ -1488,6 +1497,250 @@ pub fn details_of(
         read_at: was.and_then(|d| d.read_at),
         comments_at: was.and_then(|d| d.comments_at),
         facts,
+    }
+}
+
+/// `facts` with what its issue's answer couldn't say of its children kept
+/// from `was`. An epic's children come from their own search
+/// ([`children_args`]), never with the epic: they, and what they add up
+/// to, are kept whole until that search says again. A sub-task as a search
+/// row says it (`partial`) keeps who has it, its priority, points and PRs
+/// as the ticket's last open read them.
+pub fn keep_children(facts: &mut Facts, was: &Facts, partial: bool) {
+    if is_epic(facts) && facts.children.is_empty() {
+        facts.children = was.children.clone();
+        facts.sub_items = facts.sub_items.or(was.sub_items);
+        facts.child_points = was.child_points;
+        facts.child_blocked = was.child_blocked;
+        return;
+    }
+    if !partial {
+        return;
+    }
+    for c in &mut facts.children {
+        let Some(w) = was.children.iter().find(|w| w.key == c.key) else {
+            continue;
+        };
+        if c.assignee.is_none() {
+            c.assignee = w.assignee.clone();
+        }
+        if c.priority_rank.is_none() {
+            c.priority_rank = w.priority_rank;
+        }
+        if c.points.is_none() {
+            c.points = w.points;
+        }
+        if c.prs.is_none() {
+            c.prs = w.prs.clone();
+        }
+    }
+}
+
+/// Whether `facts` are an epic's: its type's level is an epic's, or (a
+/// site that doesn't say levels) its type is called Epic.
+pub fn is_epic(facts: &Facts) -> bool {
+    facts.kind_level == Some(1)
+        || (facts.kind_level.is_none()
+            && facts
+                .kind
+                .as_deref()
+                .is_some_and(|k| k.eq_ignore_ascii_case("epic")))
+}
+
+// ── Children ─────────────────────────────────────────────────────────────
+
+/// The fields the epics' children's search asks for: the pull's, without
+/// any bodies (no description, files or comments), so a page of 100 stays
+/// small.
+pub fn child_fields() -> Vec<&'static str> {
+    JIRA_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| !matches!(*f, "description" | "attachment" | "comment" | "subtasks"))
+        .collect()
+}
+
+/// The most epics one children's search names.
+pub const EPICS_PER_SEARCH: usize = 50;
+
+/// The `jira.search` arguments that list the children of `epics` (keys,
+/// already checked), whatever the board's filter, from page `page`.
+pub fn children_args(
+    epics: &[String],
+    fields: Option<&crate::board::JiraFields>,
+    page: Option<&str>,
+) -> Value {
+    let keys: Vec<String> = epics.iter().filter_map(|k| parse_issue_key(k)).collect();
+    let mut args = json!({
+        "jql": format!("parent in ({}) ORDER BY key ASC", keys.join(", ")),
+        "max_results": PAGE,
+        "fields": child_fields(),
+        "custom_fields": custom_fields_arg(fields),
+    });
+    if let Some(p) = page {
+        args["next_page_token"] = json!(p);
+    }
+    args
+}
+
+/// A child as Jira says it: a sub-task in a search row or read (key,
+/// summary, status, status category, type), or a row of a children's
+/// search, which says who has it, its priority, points and PRs too.
+pub fn jira_child(v: &Value, priorities: &[String]) -> Option<Child> {
+    let category = v["status_category"].as_str();
+    let assignee = match &v["assignee"] {
+        Value::Object(a) => short(a.get("display_name").unwrap_or(&Value::Null), 80),
+        a => short(a, 80),
+    };
+    Some(Child {
+        key: parse_issue_key(v["key"].as_str()?)?,
+        title: short(&v["summary"], 200).unwrap_or_default(),
+        kind: short(&v["issuetype"], 40),
+        kind_level: v["issuetype_level"]
+            .as_i64()
+            .or(v["hierarchy_level"].as_i64())
+            .and_then(|l| i8::try_from(l).ok()),
+        state: short(&v["status"], 60),
+        state_kind: category.and_then(|c| short(&json!(c), 20)),
+        done: category == Some("done"),
+        started: category == Some("indeterminate"),
+        assignee,
+        priority_rank: priority_of(&v["priority"]).and_then(|p| priority_rank(&p, priorities)),
+        points: jira_points(v),
+        prs: jira_prs(v),
+    })
+}
+
+/// A child as Linear says it (`identifier`, `title`, `state`, `assignee`,
+/// `estimate`, `priority`).
+fn linear_child(v: &Value) -> Option<Child> {
+    let kind = v["state"]["type"].as_str();
+    Some(Child {
+        key: parse_issue_key(v["identifier"].as_str()?)?,
+        title: short(&v["title"], 200).unwrap_or_default(),
+        kind: None,
+        kind_level: None,
+        state: short(&v["state"]["name"], 60),
+        state_kind: kind.and_then(|k| short(&json!(k), 20)),
+        done: matches!(kind, Some("completed" | "canceled" | "cancelled")),
+        started: kind == Some("started"),
+        assignee: short(&v["assignee"]["name"], 80),
+        priority_rank: linear_rank(&v["priority"]),
+        points: v["estimate"]
+            .as_f64()
+            .filter(|p| p.is_finite() && *p >= 0.0),
+        prs: None,
+    })
+}
+
+/// How many of `children` are done, under way and in all: one cancelled
+/// there (Linear) counts in none.
+pub fn progress_of(children: &[Child]) -> Option<Progress> {
+    let live: Vec<&Child> = children
+        .iter()
+        .filter(|c| !matches!(c.state_kind.as_deref(), Some("canceled" | "cancelled")))
+        .collect();
+    (!children.is_empty()).then(|| Progress {
+        done: live.iter().filter(|c| c.done).count() as u32,
+        total: live.len() as u32,
+        started: live.iter().filter(|c| c.started && !c.done).count() as u32,
+    })
+}
+
+/// `children` in key order (`ACME-2` before `ACME-10`).
+fn sorted(mut children: Vec<Child>) -> Vec<Child> {
+    let order = |k: &str| {
+        let (p, n) = k.rsplit_once('-').unwrap_or((k, ""));
+        (p.to_string(), n.parse::<u64>().unwrap_or(0))
+    };
+    children.sort_by_key(|c| order(&c.key));
+    children.dedup_by(|a, b| a.key == b.key);
+    children
+}
+
+/// `facts` with `children` as its children (the counts are of them all,
+/// the list held to [`CHILDREN_MAX`](crate::board::CHILDREN_MAX)). An
+/// epic's (`epic`) also adds up its children's points, and how many are
+/// blocked there (`blocked`: the keys of those that are).
+pub fn set_children(facts: &mut Facts, children: Vec<Child>, blocked: &[String], epic: bool) {
+    let children = sorted(children);
+    facts.sub_items = progress_of(&children);
+    if epic {
+        let pointed: Vec<&Child> = children.iter().filter(|c| c.points.is_some()).collect();
+        let sum = |f: &dyn Fn(&Child) -> bool| {
+            pointed
+                .iter()
+                .filter(|c| f(c))
+                .filter_map(|c| c.points)
+                .sum::<f64>()
+                .round() as u32
+        };
+        facts.child_points = (!pointed.is_empty()).then(|| Progress {
+            done: sum(&|c| c.done),
+            total: sum(&|_| true),
+            started: sum(&|c| c.started && !c.done),
+        });
+        // One done there waits on nothing.
+        let n = children
+            .iter()
+            .filter(|c| !c.done && blocked.contains(&c.key))
+            .count() as u32;
+        facts.child_blocked = (n > 0).then_some(n);
+    }
+    facts.children = children
+        .into_iter()
+        .take(crate::board::CHILDREN_MAX)
+        .collect();
+}
+
+/// The children a children's search answered, by their parent's key, and
+/// the keys of those blocked there by an issue not yet done; and the next
+/// page's token.
+pub fn jira_children(answer: &Value, priorities: &[String]) -> (Children, Option<String>) {
+    let mut out = Children::default();
+    for row in answer
+        .get("issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(parent) = row["parent"]["key"].as_str().and_then(parse_issue_key) else {
+            continue;
+        };
+        let Some(child) = jira_child(row, priorities) else {
+            continue;
+        };
+        let blocked = jira_facts(row)
+            .links
+            .iter()
+            .any(|l| l.rel == LinkRel::BlockedBy && l.issue.done != Some(true));
+        if blocked {
+            out.blocked.push(child.key.clone());
+        }
+        out.of.entry(parent).or_default().push(child);
+    }
+    let next = answer
+        .get("next_page_token")
+        .and_then(Value::as_str)
+        .filter(|_| answer.get("is_last").and_then(Value::as_bool) != Some(true))
+        .map(str::to_string);
+    (out, next)
+}
+
+/// Children a search found: each parent's, and the keys of those blocked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Children {
+    pub of: BTreeMap<String, Vec<Child>>,
+    pub blocked: Vec<String>,
+}
+
+impl Children {
+    /// Another page's children, added to these.
+    pub fn extend(&mut self, more: Children) {
+        for (k, v) in more.of {
+            self.of.entry(k).or_default().extend(v);
+        }
+        self.blocked.extend(more.blocked);
     }
 }
 
@@ -1613,29 +1866,17 @@ fn jira_facts(i: &Value) -> Facts {
         })
         .take(50)
         .collect();
-    let sub_items = i["subtasks"]
+    let subtasks: Vec<Child> = i["subtasks"]
         .as_array()
-        .filter(|s| !s.is_empty())
-        .map(|s| Progress {
-            done: s
-                .iter()
-                .filter(|t| t["status_category"].as_str() == Some("done"))
-                .count() as u32,
-            total: s.len() as u32,
-        });
-    let prs = count_of(&i["development"]["count"])
-        .filter(|n| *n > 0)
-        .map(|count| PrSummary {
-            count,
-            state: pr_state(i["development"]["state"].as_str().unwrap_or_default()),
-            number: None,
-            url: None,
-        });
+        .into_iter()
+        .flatten()
+        .filter_map(|t| jira_child(t, &[]))
+        .collect();
     let reporter = match &i["reporter"] {
         Value::Object(r) => short(r.get("display_name").unwrap_or(&Value::Null), 80),
         r => short(r, 80),
     };
-    Facts {
+    let mut facts = Facts {
         priority_rank: None,
         kind: short(&i["issuetype"], 40),
         kind_level: level,
@@ -1643,9 +1884,9 @@ fn jira_facts(i: &Value) -> Facts {
         state_kind: None,
         parent,
         epic,
-        points: i["points"].as_f64().filter(|p| p.is_finite() && *p >= 0.0),
+        points: jira_points(i),
         sprint: jira_sprint(&i["sprint"]),
-        sub_items,
+        sub_items: None,
         links,
         components: names(&i["components"]),
         fix_versions: names(&i["fix_versions"]),
@@ -1653,8 +1894,35 @@ fn jira_facts(i: &Value) -> Facts {
         created: any_time(&i["created"]),
         start: due_of(&i["start_date"]),
         comments: count_of(&i["comment_total"]).or_else(|| count_of(&i["comment_count"])),
-        prs,
-    }
+        prs: jira_prs(i),
+        children: vec![],
+        child_points: None,
+        child_blocked: None,
+    };
+    set_children(&mut facts, subtasks, &[], false);
+    facts
+}
+
+/// A Jira issue's points, when its site's points field says.
+fn jira_points(i: &Value) -> Option<f64> {
+    i["points"].as_f64().filter(|p| p.is_finite() && *p >= 0.0)
+}
+
+/// A Jira issue's pull requests, from its Development field's summary.
+fn jira_prs(i: &Value) -> Option<PrSummary> {
+    count_of(&i["development"]["count"])
+        .filter(|n| *n > 0)
+        .map(|count| PrSummary {
+            count,
+            state: pr_state(i["development"]["state"].as_str().unwrap_or_default()),
+            number: None,
+            url: None,
+        })
+}
+
+/// A Linear priority as bars (1 urgent … 4 low); none for "no priority".
+fn linear_rank(v: &Value) -> Option<u8> {
+    v.as_u64().filter(|p| (1..=4).contains(p)).map(|p| p as u8)
 }
 
 /// A list of someone else's names, at most 20.
@@ -1702,19 +1970,12 @@ fn linear_facts(i: &Value) -> Facts {
             });
         }
     }
-    let children = i["children"]["nodes"].as_array().filter(|c| !c.is_empty());
-    let sub_items = children.map(|c| {
-        let kind = |n: &Value| n["state"]["type"].as_str().unwrap_or_default().to_string();
-        let live: Vec<String> = c
-            .iter()
-            .map(kind)
-            .filter(|k| !matches!(k.as_str(), "canceled" | "cancelled"))
-            .collect();
-        Progress {
-            done: live.iter().filter(|k| *k == "completed").count() as u32,
-            total: live.len() as u32,
-        }
-    });
+    let children: Vec<Child> = i["children"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(linear_child)
+        .collect();
     let cycle = &i["cycle"];
     let sprint = cycle.is_object().then(|| Sprint {
         name: short(&cycle["name"], 60),
@@ -1722,11 +1983,8 @@ fn linear_facts(i: &Value) -> Facts {
         starts: due_of(&cycle["startsAt"]),
         ends: due_of(&cycle["endsAt"]),
     });
-    Facts {
-        priority_rank: i["priority"]
-            .as_u64()
-            .filter(|p| (1..=4).contains(p))
-            .map(|p| p as u8),
+    let mut facts = Facts {
+        priority_rank: linear_rank(&i["priority"]),
         kind: None,
         kind_level: None,
         remote_state: short(&i["state"]["name"], 60),
@@ -1737,7 +1995,7 @@ fn linear_facts(i: &Value) -> Facts {
             .as_f64()
             .filter(|p| p.is_finite() && *p >= 0.0),
         sprint,
-        sub_items,
+        sub_items: None,
         links: links.into_iter().take(50).collect(),
         components: vec![],
         fix_versions: vec![],
@@ -1746,7 +2004,12 @@ fn linear_facts(i: &Value) -> Facts {
         start: None,
         comments: None,
         prs: linear_prs(i),
-    }
+        children: vec![],
+        child_points: None,
+        child_blocked: None,
+    };
+    set_children(&mut facts, children, &[], false);
+    facts
 }
 
 /// How a Linear relation that isn't blocking reads, from either side.
@@ -2103,8 +2366,9 @@ pub const CALLS_PER_PASS: usize = 60;
 pub const PAGES_PER_PASS: usize = 20;
 /// The most issues the link dialog counts: past it, it says "or more".
 pub const MATCH_CEILING: usize = 2000;
-/// A page of Linear issues, read rich: smaller than a Jira page.
-pub const LINEAR_PAGE: usize = 50;
+/// A page of Linear issues, read rich: smaller than a Jira page, so its
+/// sub-issues and relations stay within Linear's per-query complexity.
+pub const LINEAR_PAGE: usize = 25;
 /// A page of issues, as the sync asks for them.
 pub const PAGE: usize = 100;
 

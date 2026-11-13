@@ -419,10 +419,10 @@ pub struct Pulled {
 }
 
 /// The calls one pass may still make.
-struct Budget(usize);
+pub(super) struct Budget(pub(super) usize);
 
 impl Budget {
-    fn take(&mut self) -> Result<(), RemoteError> {
+    pub(super) fn take(&mut self) -> Result<(), RemoteError> {
         match self.0.checked_sub(1) {
             Some(left) => {
                 self.0 = left;
@@ -615,6 +615,14 @@ impl Desk {
         {
             Ok(end) => {
                 self.sync_ok(id, end, retry).await?;
+                // Its epics' children, with what the pass left: never the
+                // pass's failure, and skipped when its calls are spent.
+                match self.pull_children(&b, &s, remote, &mut budget).await {
+                    Ok(()) | Err(RemoteError::Spent) => {}
+                    Err(e) => {
+                        tracing::info!(board = %id, error = %e, "the epics' children weren't read")
+                    }
+                }
                 Ok(out)
             }
             Err(e) => {
@@ -625,6 +633,103 @@ impl Desk {
                 })
             }
         }
+    }
+
+    /// Keeps on each of board `b`'s Jira epics its children there, read in
+    /// one search over them all (paged, within `budget`), whatever the
+    /// board's filter: they are facts on the epic's ticket, never imported.
+    /// A search not read through changes nothing; an epic's ticket is saved
+    /// and announced only when what it holds changed.
+    async fn pull_children(
+        &self,
+        b: &Board,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+    ) -> Result<(), RemoteError> {
+        if s.system != System::Jira {
+            return Ok(());
+        }
+        let fail = |e: DeskError| RemoteError::Failed(e.to_string());
+        let epics: Vec<(Uuid, String)> = self
+            .0
+            .store
+            .board_tickets(b.id)
+            .await
+            .map_err(|e| fail(internal(e)))?
+            .into_iter()
+            .filter_map(|t| {
+                let e = t.external.as_ref()?;
+                (e.link == s.link
+                    && e.synced
+                    && !e.kept
+                    && crate::board_sync::is_epic(&e.details.facts))
+                .then(|| (t.id, e.key.clone()))
+            })
+            .collect();
+        if epics.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<String> = epics.iter().map(|(_, k)| k.clone()).collect();
+        let Some(mut found) = self.read_children(s, remote, budget, &keys).await? else {
+            return Ok(());
+        };
+        for (id, key) in epics {
+            let children = found.of.remove(&key).unwrap_or_default();
+            let mut t = self.ticket_of(id).await.map_err(fail)?;
+            let Some(e) = t.external.as_mut() else {
+                continue;
+            };
+            let mut facts = e.details.facts.clone();
+            crate::board_sync::set_children(&mut facts, children, &found.blocked, true);
+            if facts == e.details.facts {
+                continue;
+            }
+            e.details.facts = facts;
+            self.save_ticket(&mut t).await.map_err(fail)?;
+            if let Ok(v) = self.view_ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The children of the Jira issues `parents` (keys), whatever any
+    /// board's filter says, read through within `budget` in searches of
+    /// [`EPICS_PER_SEARCH`](crate::board_sync::EPICS_PER_SEARCH) parents;
+    /// `None` when they couldn't all be read in
+    /// [`PAGES_PER_PASS`](crate::board_sync::PAGES_PER_PASS) pages each.
+    pub(super) async fn read_children(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        parents: &[String],
+    ) -> Result<Option<crate::board_sync::Children>, RemoteError> {
+        let priorities = crate::board_sync::priorities(s);
+        let mut found = crate::board_sync::Children::default();
+        for chunk in parents.chunks(crate::board_sync::EPICS_PER_SEARCH) {
+            let mut page: Option<String> = None;
+            for n in 0.. {
+                if n == crate::board_sync::PAGES_PER_PASS {
+                    return Ok(None);
+                }
+                budget.take()?;
+                let args =
+                    crate::board_sync::children_args(chunk, s.fields.as_ref(), page.as_deref());
+                let answer =
+                    crate::board_sync::call(remote, System::Jira, "jira.search", args).await?;
+                let (more, next) = crate::board_sync::jira_children(&answer, priorities);
+                found.extend(more);
+                match next {
+                    Some(next) => page = Some(next),
+                    None => break,
+                }
+            }
+        }
+        Ok(Some(found))
     }
 
     /// `s` with its Jira site's own fields (points, sprint, start date,

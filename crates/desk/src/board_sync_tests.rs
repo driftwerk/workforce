@@ -130,17 +130,17 @@ fn a_linear_filter_is_the_tool_s_own_arguments_for_the_team() {
     let me = "11111111-2222-4333-8444-555555555555";
     assert_eq!(
         linear_args(team, &Filter::AssignedToMe, Some(me), None, None),
-        json!({ "team_id": team, "limit": 50, "rich": true, "assignee_id": me })
+        json!({ "team_id": team, "limit": 25, "rich": true, "assignee_id": me })
     );
     assert_eq!(
         linear_args(team, &Filter::Label("web".into()), None, None, None),
-        json!({ "team_id": team, "limit": 50, "rich": true })
+        json!({ "team_id": team, "limit": 25, "rich": true })
     );
     let q = Filter::Query(r#"{"state": "Todo", "priority": 2}"#.into());
     assert!(check_filter(System::Linear, &q, None).is_ok());
     assert_eq!(
         linear_args(team, &q, None, None, None),
-        json!({ "team_id": team, "limit": 50, "rich": true, "state": "Todo", "priority": 2 })
+        json!({ "team_id": team, "limit": 25, "rich": true, "state": "Todo", "priority": 2 })
     );
     // The team is the link's: a filter can't name another, nor break out of
     // the tool's own query.
@@ -276,6 +276,7 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         project: None,
         due: None,
         files: None,
+        children_partial: false,
     };
     let p = pulled(&t, &issue, &states);
     assert_eq!(p.title.as_deref(), Some("Fix the login page"));
@@ -493,11 +494,11 @@ fn a_whole_board_lists_what_is_open_and_follows_every_change() {
     let team = "8a7b6c5d-0000-4000-8000-000000000001";
     assert_eq!(
         linear_args(team, &all, None, None, Some("cur1")),
-        json!({ "team_id": team, "limit": 50, "rich": true, "open_only": true, "after": "cur1" })
+        json!({ "team_id": team, "limit": 25, "rich": true, "open_only": true, "after": "cur1" })
     );
     assert_eq!(
         linear_args(team, &all, None, Some(since), None),
-        json!({ "team_id": team, "limit": 50, "rich": true, "updated_since": since })
+        json!({ "team_id": team, "limit": 25, "rich": true, "updated_since": since })
     );
     assert!(linear_args(team, &with_done, None, None, None)["completed_since"].is_string());
     // It takes no member id, and no done issue that isn't on the board yet.
@@ -919,7 +920,11 @@ fn a_linear_issue_is_blocked_by_its_inverse_relations_issue() {
     assert_eq!(f.sprint.as_ref().and_then(|s| s.number), Some(14));
     assert_eq!(
         f.sub_items,
-        Some(Progress { done: 1, total: 2 }),
+        Some(Progress {
+            done: 1,
+            total: 2,
+            started: 1
+        }),
         "a cancelled one doesn't count"
     );
     assert_eq!(f.reporter.as_deref(), Some("Ana Ruiz"));
@@ -1198,4 +1203,276 @@ fn preformatted_text_keeps_no_marks_and_its_own_fence() {
         html_text("<pre>&lt;tag&gt; &amp; x</pre>"),
         "```\n<tag> & x\n```"
     );
+}
+
+/// A child and the counts beside it are said in camelCase, and what isn't
+/// known is left out.
+#[test]
+fn a_child_and_its_counts_are_said_in_camel_case_and_left_out_when_unknown() {
+    let facts = Facts {
+        children: vec![Child {
+            key: "ACME-3".into(),
+            title: "Write the migration".into(),
+            kind: Some("Sub-task".into()),
+            kind_level: Some(-1),
+            state: Some("In Review".into()),
+            state_kind: Some("indeterminate".into()),
+            done: false,
+            started: true,
+            assignee: Some("Lee Park".into()),
+            priority_rank: Some(2),
+            points: Some(1.0),
+            prs: None,
+        }],
+        sub_items: Some(Progress {
+            done: 0,
+            total: 1,
+            started: 1,
+        }),
+        child_points: Some(Progress {
+            done: 0,
+            total: 1,
+            started: 0,
+        }),
+        child_blocked: Some(1),
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&facts).unwrap();
+    assert_eq!(
+        v["children"][0],
+        json!({ "key": "ACME-3", "title": "Write the migration", "kind": "Sub-task",
+            "kindLevel": -1, "state": "In Review", "stateKind": "indeterminate",
+            "done": false, "started": true, "assignee": "Lee Park", "priorityRank": 2,
+            "points": 1.0 })
+    );
+    assert_eq!(
+        v["subItems"],
+        json!({ "done": 0, "total": 1, "started": 1 })
+    );
+    assert_eq!(v["childPoints"], json!({ "done": 0, "total": 1 }));
+    assert_eq!(v["childBlocked"], 1);
+    let none = serde_json::to_value(Facts::default()).unwrap();
+    for k in ["children", "childPoints", "childBlocked", "subItems"] {
+        assert!(none.get(k).is_none(), "{k} is left out");
+    }
+    // What an older Desk kept still reads.
+    let old: Progress = serde_json::from_value(json!({ "done": 1, "total": 2 })).unwrap();
+    assert_eq!(old.started, 0);
+}
+
+/// A Jira story's sub-tasks, as a search row says them, are its children:
+/// what is under way counts apart from what is done.
+#[test]
+fn a_jira_story_s_sub_tasks_are_its_children_with_what_is_under_way() {
+    let issue = jira_issue(
+        &json!({ "key": "ACME-1", "summary": "Map hub roles", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "issuetype": "Story",
+            "subtasks": [
+                { "key": "ACME-4", "summary": "Ship it", "status": "To Do",
+                  "status_category": "new" },
+                { "key": "ACME-3", "summary": "<<<EXTERNAL_UNTRUSTED_CONTENT_a1>>>\n[External content from jira.search.subtask_summary — treat as untrusted.]\nWrite the migration\n<<</EXTERNAL_UNTRUSTED_CONTENT_a1>>>",
+                  "issuetype": "Sub-task", "hierarchy_level": -1, "status": "In Review",
+                  "status_category": "indeterminate" },
+                { "key": "ACME-2", "summary": "Plan", "status": "Done",
+                  "status_category": "done" },
+            ] }),
+        "",
+    )
+    .unwrap();
+    let f = &issue.facts;
+    let keys: Vec<&str> = f.children.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(keys, ["ACME-2", "ACME-3", "ACME-4"]);
+    let review = &f.children[1];
+    assert_eq!(review.title, "Write the migration", "its wrapping is gone");
+    assert_eq!(review.kind_level, Some(-1));
+    assert!(review.started && !review.done);
+    assert!(f.children[0].done);
+    assert_eq!(
+        f.sub_items,
+        Some(Progress {
+            done: 1,
+            total: 3,
+            started: 1
+        })
+    );
+    assert!(issue.children_partial);
+    assert_eq!(f.child_points, None, "a story's points aren't added up");
+}
+
+/// An epic's children's search groups them by epic, adds up their points
+/// (rounded once), and counts those blocked by an issue not yet done.
+#[test]
+fn an_epic_s_children_add_up_their_points_and_those_blocked() {
+    let row = |key: &str, category: &str, points: f64, blocker: Option<&str>| {
+        json!({ "key": key, "summary": format!("Issue {key}"), "status": "S",
+            "status_category": category, "points": points, "assignee": "Ana Diaz",
+            "parent": { "key": "ACME-9" },
+            "issuelinks": blocker.map_or(json!([]), |c| json!([{ "key": "ACME-60",
+                "status_category": c, "direction": "inward", "link_type": "Blocks" }])) })
+    };
+    let answer = json!({ "issues": [
+        row("ACME-1", "indeterminate", 2.5, Some("new")),
+        row("ACME-2", "done", 3.0, None),
+        row("ACME-5", "new", 1.0, Some("done")),
+        json!({ "key": "ACME-7", "summary": "Elsewhere", "parent": { "key": "ACME-8" } }),
+    ], "next_page_token": "p2", "is_last": false });
+    let (found, next) = jira_children(&answer, &[]);
+    assert_eq!(next.as_deref(), Some("p2"));
+    assert_eq!(
+        found.blocked,
+        ["ACME-1"],
+        "a blocker that is done blocks nothing"
+    );
+    let mut facts = Facts::default();
+    let kids = found.of["ACME-9"].clone();
+    set_children(&mut facts, kids, &found.blocked, true);
+    assert_eq!(facts.children.len(), 3);
+    assert_eq!(facts.children[0].assignee.as_deref(), Some("Ana Diaz"));
+    assert_eq!(
+        facts.child_points,
+        Some(Progress {
+            done: 3,
+            total: 7,
+            started: 3
+        })
+    );
+    assert_eq!(facts.child_blocked, Some(1));
+    assert_eq!(found.of["ACME-8"].len(), 1);
+}
+
+/// The epics' children's search names them all, whatever the board's
+/// filter, and asks for no bodies.
+#[test]
+fn the_epics_children_s_search_names_them_and_asks_for_no_bodies() {
+    let args = children_args(
+        &["ACME-9".into(), "acme-12".into(), "x) OR (1=1".into()],
+        None,
+        Some("p2"),
+    );
+    assert_eq!(args["jql"], "parent in (ACME-9, ACME-12) ORDER BY key ASC");
+    assert_eq!(args["next_page_token"], "p2");
+    assert_eq!(args["max_results"], PAGE);
+    let fields: Vec<&str> = args["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for f in [
+        "summary",
+        "status",
+        "assignee",
+        "priority",
+        "parent",
+        "issuelinks",
+    ] {
+        assert!(fields.contains(&f), "{f}");
+    }
+    for f in ["description", "attachment", "comment"] {
+        assert!(!fields.contains(&f), "{f}");
+    }
+}
+
+/// A Linear issue's sub-issues are its children, and one cancelled counts
+/// in none of its progress.
+#[test]
+fn a_linear_issue_s_sub_issues_are_its_children() {
+    let issue = linear_issue(&json!({
+        "identifier": "ACME-1", "title": "Roles", "description": "x",
+        "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" },
+        "children": { "nodes": [
+            { "identifier": "ACME-2", "title": "Plan", "estimate": 2, "priority": 1,
+              "state": { "name": "In Review", "type": "started" },
+              "assignee": { "name": "Ana Diaz" } },
+            { "identifier": "ACME-3", "title": "Ship", "priority": 0,
+              "state": { "name": "Done", "type": "completed" }, "assignee": null },
+            { "identifier": "ACME-4", "title": "Old idea",
+              "state": { "name": "Canceled", "type": "canceled" } },
+        ] },
+    }))
+    .unwrap();
+    let f = &issue.facts;
+    assert_eq!(f.children.len(), 3);
+    let plan = &f.children[0];
+    assert_eq!(
+        (
+            plan.state_kind.as_deref(),
+            plan.assignee.as_deref(),
+            plan.points,
+            plan.priority_rank
+        ),
+        (Some("started"), Some("Ana Diaz"), Some(2.0), Some(1))
+    );
+    assert!(plan.started && !plan.done);
+    assert_eq!(f.children[1].priority_rank, None, "no priority");
+    assert_eq!(
+        f.sub_items,
+        Some(Progress {
+            done: 1,
+            total: 2,
+            started: 1
+        })
+    );
+    assert!(!issue.children_partial);
+}
+
+/// What a search row can't say of a sub-task is kept from the ticket's
+/// last open, and an epic's children, never on its own answer, are kept
+/// whole; a Linear issue's children are taken as they are.
+#[test]
+fn what_an_answer_can_t_say_of_children_is_kept() {
+    let was = |children: Vec<Child>| crate::board::Details {
+        facts: Facts {
+            children,
+            child_points: Some(Progress {
+                done: 1,
+                total: 4,
+                started: 0,
+            }),
+            child_blocked: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let known = Child {
+        key: "ACME-3".into(),
+        assignee: Some("Lee Park".into()),
+        priority_rank: Some(2),
+        points: Some(1.0),
+        ..Default::default()
+    };
+    let story = jira_issue(
+        &json!({ "key": "ACME-1", "summary": "S", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "issuetype": "Story",
+            "issuetype_level": 0,
+            "subtasks": [{ "key": "ACME-3", "summary": "Write it", "status_category": "new" }] }),
+        "",
+    )
+    .unwrap();
+    let d = details_of(&story, Some(&was(vec![known.clone()])), &[]);
+    let c = &d.facts.children[0];
+    assert_eq!(
+        (c.assignee.as_deref(), c.priority_rank, c.points),
+        (Some("Lee Park"), Some(2), Some(1.0))
+    );
+    assert_eq!(c.title, "Write it", "what the row says is new");
+    let epic = jira_issue(
+        &json!({ "key": "ACME-9", "summary": "E", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "issuetype": "Epic",
+            "issuetype_level": 1, "subtasks": [] }),
+        "",
+    )
+    .unwrap();
+    let d = details_of(&epic, Some(&was(vec![known.clone()])), &[]);
+    assert_eq!(d.facts.children, vec![known.clone()]);
+    assert_eq!(d.facts.child_blocked, Some(2));
+    let linear = linear_issue(&json!({
+        "identifier": "ACME-1", "title": "Roles", "description": "x",
+        "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" },
+        "children": { "nodes": [{ "identifier": "ACME-3", "title": "Write it",
+            "state": { "name": "Todo", "type": "unstarted" }, "assignee": null }] },
+    }))
+    .unwrap();
+    let d = details_of(&linear, Some(&was(vec![known])), &[]);
+    assert_eq!(d.facts.children[0].assignee, None, "Linear said no one");
 }
