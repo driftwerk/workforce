@@ -351,6 +351,7 @@ const READS: &[&str] = &[
     "find",
     "folders",
     "get",
+    "history",
     "inbox",
     "info",
     "items",
@@ -391,6 +392,7 @@ mod tests {
         for read in [
             "linear.issue_get",
             "linear.comment_list",
+            "linear.issue_history",
             "github.pr_diff",
             "github.workflow_run_logs",
             "google.gmail.search",

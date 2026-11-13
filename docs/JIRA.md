@@ -150,7 +150,7 @@ Use `jira.get_issue` first to discover the field IDs on your tenant, or query
 | Tool | Endpoint | Notes |
 |------|----------|-------|
 | `jira.search` | `POST /rest/api/3/search/jql` | New endpoint replacing the deprecated `/search`. Use `next_page_token` from the response for pagination. |
-| `jira.get_issue` | `GET /rest/api/3/issue/{key}?expand=renderedFields,changelog` | Returns summary, description (HTML), status, assignee, reporter, labels, comment count. |
+| `jira.get_issue` | `GET /rest/api/3/issue/{key}?expand=renderedFields,changelog` | Returns summary, description (HTML), status, assignee, reporter, labels, comment count; with `changelog: true`, the newest 100 changelog entries, their values wrapped. |
 | `jira.create_issue` | `POST /rest/api/3/issue` | Required: `summary`, `issue_type`. Auto-wraps `description` to ADF. |
 | `jira.update_issue` | `PUT /rest/api/3/issue/{key}` | Only sends supplied fields. Use `fields` for custom fields. |
 | `jira.delete_issue` | `DELETE /rest/api/3/issue/{key}` | Requires delete permission. |

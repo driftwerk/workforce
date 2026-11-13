@@ -1408,6 +1408,9 @@ impl Tool for LinearCommentListTool {
                                 name
                                 type
                             }
+                            parent {
+                                id
+                            }
                             createdAt
                             updatedAt
                             editedAt
@@ -4117,6 +4120,246 @@ impl Tool for LinearDocumentSearchTool {
     }
 }
 
+// ── linear.issue_history ─────────────────────────────────────────────────
+
+pub struct LinearIssueHistoryTool {
+    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    default_workspace: String,
+    prefix_map: Arc<HashMap<String, String>>,
+}
+
+impl LinearIssueHistoryTool {
+    pub fn new(
+        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        default_workspace: String,
+        prefix_map: Arc<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            clients,
+            default_workspace,
+            prefix_map,
+        }
+    }
+}
+
+/// An issue's history entries as `linear.issue_history` answers them:
+/// oldest first, held to the newest `limit`, with the words someone wrote
+/// (titles, an attachment's title) wrapped.
+fn history_entries(nodes: &Value, limit: usize) -> Vec<Value> {
+    let mut nodes: Vec<Value> = nodes.as_array().cloned().unwrap_or_default();
+    // Linear's order isn't promised: by when, oldest first.
+    nodes.sort_by(|a, b| {
+        a["createdAt"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["createdAt"].as_str().unwrap_or_default())
+    });
+    let from = nodes.len().saturating_sub(limit);
+    nodes
+        .drain(from..)
+        .map(|mut n| {
+            for k in ["fromTitle", "toTitle"] {
+                if let Some(t) = n[k].as_str().filter(|t| !t.is_empty()) {
+                    n[k] = Value::String(
+                        wrap_external_content(t, "Linear issue title").wrapped_content,
+                    );
+                }
+            }
+            if let Some(t) = n["attachment"]["title"].as_str().filter(|t| !t.is_empty()) {
+                n["attachment"]["title"] = Value::String(
+                    wrap_external_content(t, "Linear attachment title").wrapped_content,
+                );
+            }
+            n
+        })
+        .collect()
+}
+
+#[async_trait]
+impl Tool for LinearIssueHistoryTool {
+    fn name(&self) -> &str {
+        "linear.issue_history"
+    }
+
+    fn description(&self) -> &str {
+        "What happened to an issue: its changes of state, assignee, priority, estimate, cycle, parent, labels and links, by whom, oldest first."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "Issue identifier string like 'DW-107'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Most entries, the newest (integer, default: 50, max: 100)",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "workspace": {
+                    "type": "string",
+                    "description": workspace_description(&self.clients, &self.default_workspace)
+                }
+            },
+            "required": ["identifier"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+
+        let client = match resolve_client(
+            &self.clients,
+            &self.default_workspace,
+            &self.prefix_map,
+            &input,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    format!("{e}"),
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+        };
+
+        let Some(identifier) = input["identifier"].as_str() else {
+            return Ok(ToolResult::failure(
+                "Missing required 'identifier' parameter",
+                start.elapsed().as_millis() as u64,
+            ));
+        };
+
+        let limit = coerce_to_u64(&input["limit"]).unwrap_or(50).clamp(1, 100);
+
+        // As many as Linear gives at once, held to the newest `limit` here.
+        let query = r#"
+            query($id: String!, $first: Int) {
+                issue(id: $id) {
+                    id
+                    identifier
+                    createdAt
+                    creator {
+                        id
+                        name
+                    }
+                    history(first: $first) {
+                        nodes {
+                            id
+                            createdAt
+                            actor {
+                                id
+                                name
+                            }
+                            botActor {
+                                name
+                                type
+                            }
+                            fromState {
+                                name
+                                type
+                            }
+                            toState {
+                                name
+                                type
+                            }
+                            fromAssignee {
+                                id
+                                name
+                            }
+                            toAssignee {
+                                id
+                                name
+                            }
+                            fromPriority
+                            toPriority
+                            fromEstimate
+                            toEstimate
+                            fromCycle {
+                                number
+                                name
+                            }
+                            toCycle {
+                                number
+                                name
+                            }
+                            fromParent {
+                                identifier
+                            }
+                            toParent {
+                                identifier
+                            }
+                            fromProject {
+                                name
+                            }
+                            toProject {
+                                name
+                            }
+                            fromTitle
+                            toTitle
+                            fromDueDate
+                            toDueDate
+                            addedLabels {
+                                name
+                            }
+                            removedLabels {
+                                name
+                            }
+                            relationChanges {
+                                identifier
+                                type
+                            }
+                            attachment {
+                                title
+                                url
+                                sourceType
+                            }
+                            updatedDescription
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let variables = serde_json::json!({ "id": identifier, "first": 100 });
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match client.query(query, variables).await {
+            Ok(data) => {
+                let issue = &data["issue"];
+                if !issue.is_object() {
+                    return Ok(ToolResult::failure(
+                        format!("Issue '{identifier}' not found"),
+                        duration_ms,
+                    ));
+                }
+                let history = history_entries(&issue["history"]["nodes"], limit as usize);
+                info!(identifier, count = history.len(), "Read an issue's history");
+                Ok(ToolResult::success(
+                    serde_json::json!({
+                        "identifier": identifier,
+                        "created_at": issue["createdAt"],
+                        "creator": issue["creator"],
+                        "count": history.len(),
+                        "history": history,
+                    }),
+                    duration_ms,
+                ))
+            }
+            Err(e) => {
+                warn!(error = %e, identifier, "Failed to read an issue's history");
+                Ok(ToolResult::from_report(
+                    &e.wrap_err("Failed to read the issue's history"),
+                    duration_ms,
+                ))
+            }
+        }
+    }
+}
+
 // ── linear.issue_children ────────────────────────────────────────────────
 
 pub struct LinearIssueChildrenTool {
@@ -4295,6 +4538,31 @@ impl Tool for LinearIssueChildrenTool {
 
 #[cfg(test)]
 mod tests {
+    /// An issue's history comes back oldest first, held to the newest, and
+    /// what someone wrote in it is wrapped.
+    #[test]
+    fn history_entries_are_oldest_first_held_and_wrapped() {
+        let nodes = serde_json::json!([
+            { "id": "h3", "createdAt": "2026-11-10T09:03:00.000Z", "toTitle": "New title", "fromTitle": "" },
+            { "id": "h1", "createdAt": "2026-11-10T09:01:00.000Z", "toState": { "name": "Done" } },
+            { "id": "h2", "createdAt": "2026-11-10T09:02:00.000Z",
+              "attachment": { "title": "Fix the login", "url": "https://github.com/acme/web/pull/7", "sourceType": "github" } },
+        ]);
+        let got = super::history_entries(&nodes, 2);
+        let ids: Vec<&str> = got.iter().filter_map(|n| n["id"].as_str()).collect();
+        assert_eq!(ids, ["h2", "h3"]);
+        assert!(got[0]["attachment"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("EXTERNAL_UNTRUSTED_CONTENT"));
+        assert!(got[1]["toTitle"]
+            .as_str()
+            .unwrap()
+            .contains("EXTERNAL_UNTRUSTED_CONTENT"));
+        assert_eq!(got[1]["fromTitle"], "", "nothing to wrap stays as it is");
+        assert!(super::history_entries(&serde_json::Value::Null, 50).is_empty());
+    }
+
     #[test]
     fn an_attachment_s_metadata_keeps_only_what_desk_reads() {
         let mut issue = serde_json::json!({ "attachments": { "nodes": [
