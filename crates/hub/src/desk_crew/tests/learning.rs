@@ -80,7 +80,14 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
         assert_eq!(p.scope, PrefScope::Repo("acme/acme-web".into()));
         let again = crew.always_item(item.id, None).await.unwrap();
         assert!(again.starts_with("Already kept"), "{again}");
-        assert_eq!(d.store().preferences_of("you", MAIN, false).await.unwrap().len(), 1);
+        assert_eq!(
+            d.store()
+                .preferences_of("you", MAIN, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // An ask that settles no case keeps nothing.
         call(&crew, super::super::items::ASK, json!({ "text": "Lunch?" })).await;
@@ -173,6 +180,34 @@ async fn an_undo_of_a_preferences_decision_is_an_overrule() {
             .filter(|i| i.dedupe_key == format!("overrule:{}", p.id))
             .collect::<Vec<_>>();
         assert_eq!(asked.len(), 1, "asked once while it is open: {asked:?}");
+        assert!(
+            asked[0].text.contains("set it aside") && asked[0].text.contains(&p.id.to_string()),
+            "says it set it aside, and which: {}",
+            asked[0].text
+        );
+        // "Change it" goes on to the boss for the new words: nothing here
+        // changes it.
+        crew.answer_item(asked[0].id, "Change it").await.unwrap();
+        assert_eq!(
+            d.store().preference(p.id).await.unwrap().unwrap().state,
+            PrefState::Paused
+        );
+
+        // Back on, undone again: "Forget it" forgets it.
+        d.store()
+            .preference_set_state(p.id, PrefState::Active)
+            .await
+            .unwrap();
+        let x = apply().await;
+        crew.undo(x.id).await.unwrap();
+        let asked: Vec<_> = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.dedupe_key == format!("overrule:{}", p.id))
+            .collect();
         let forgot = crew.answer_item(asked[0].id, "Forget it").await.unwrap();
         assert!(forgot.starts_with("Forgot"), "{forgot}");
         assert_eq!(
@@ -218,22 +253,30 @@ async fn the_handled_counts_add_up_in_all_and_per_day() {
         let today = crew.handled_counts(None, None).await.unwrap();
         assert_eq!(today["needs"], 5, "{today}");
         assert_eq!(today["yourself"], 3);
-        assert_eq!(today["byPreference"], 1);
-        let parts = ["own", "byPreference", "escalated", "personFirst"]
+        assert_eq!(today["preference"], 1);
+        let parts = ["own", "preference", "escalated", "personFirst"]
             .iter()
             .map(|k| today[*k].as_u64().unwrap())
             .sum::<u64>();
         assert_eq!(parts, 5, "the counts add up: {today}");
-        assert_eq!(today["said"], "handled 3 of 5 myself, 1 by your preferences");
+        assert_eq!(
+            today["said"],
+            "handled 3 of 5 myself, 1 by your preferences"
+        );
         let week = crew
-            .handled_counts(Some("desk"), Some(chrono::Utc::now() - chrono::Duration::days(7)))
+            .handled_counts(
+                Some("desk"),
+                Some(chrono::Utc::now() - chrono::Duration::days(7)),
+            )
             .await
             .unwrap();
         assert_eq!(week["needs"], 6);
         let days = week["days"].as_array().unwrap();
         assert_eq!(days.len(), 2, "{week}");
         assert_eq!(
-            days.iter().map(|d| d["needs"].as_u64().unwrap()).sum::<u64>(),
+            days.iter()
+                .map(|d| d["needs"].as_u64().unwrap())
+                .sum::<u64>(),
             6
         );
         assert!(crew.handled_counts(Some("nobody"), None).await.is_none());

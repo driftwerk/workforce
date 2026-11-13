@@ -230,8 +230,9 @@ impl DeskStore {
         Ok(())
     }
 
-    /// The person undid a decision `id` made: counted, and an active one
-    /// set aside at [`PAUSE_AFTER_OVERRULES`]. The preference as it now is.
+    /// The person undid a decision `id` made: counted, and set aside at
+    /// [`PAUSE_AFTER_OVERRULES`]. The preference as it now is; `None` when it
+    /// is no longer active (set aside or forgotten since), so not counted.
     pub async fn preference_overruled(&self, id: Uuid) -> Result<Option<Preference>> {
         let client = self.pool().get().await?;
         client
@@ -241,7 +242,7 @@ impl DeskStore {
                        changed_at = now(), \
                        state = CASE WHEN state = 'active' AND overruled_count + 1 >= $2 \
                                     THEN 'paused' ELSE state END \
-                     WHERE id = $1 RETURNING {COLUMNS}"
+                     WHERE id = $1 AND state = 'active' RETURNING {COLUMNS}"
                 ),
                 &[&id, &PAUSE_AFTER_OVERRULES],
             )

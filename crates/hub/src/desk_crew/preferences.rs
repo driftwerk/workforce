@@ -452,7 +452,10 @@ impl CrewHub {
             .map(str::trim)
             .filter(|g| !g.is_empty())
             .ok_or_else(|| {
-                ItemRefused::Cant("That question doesn't settle a kind of case, so there is nothing to keep.".into())
+                ItemRefused::Cant(
+                    "That question doesn't settle a kind of case, so there is nothing to keep."
+                        .into(),
+                )
             })?;
         if item.state != OpenState::Closed {
             return Err(ItemRefused::Cant("Answer it first.".into()));
@@ -460,7 +463,9 @@ impl CrewHub {
         let then = then
             .map(str::to_string)
             .or_else(|| answer_of(&item))
-            .ok_or_else(|| ItemRefused::Cant("Say what to do then: your answer went to the session.".into()))?;
+            .ok_or_else(|| {
+                ItemRefused::Cant("Say what to do then: your answer went to the session.".into())
+            })?;
         let Some((_, o)) = self.overseer_named(&item.boss) else {
             return Err(ItemRefused::Cant("Its boss isn't here any more.".into()));
         };
@@ -471,20 +476,34 @@ impl CrewHub {
         let boss_scope = preference::boss_scope_of(o.scope.group());
         let mut p = Preference::new(&boss_scope, when, &then, scope, PrefSource::Asked);
         p.from_item = Some(id);
+        // Kept first, so a failure loses nothing; a second press racing
+        // this one finds it kept (one per item, by the index).
+        if let Err(e) = store.preference_put(&p).await {
+            if let Ok(Some(kept)) = store.preference_from_item(id).await {
+                return Ok(format!(
+                    "Already kept, from {}: when {}, {}.",
+                    kept.date(tz),
+                    kept.when_text,
+                    kept.then_text
+                ));
+            }
+            return Err(cant(e));
+        }
         // The same case and scope kept before gives way to this one.
         for old in store
             .preferences_of(YOU, &boss_scope, false)
             .await
             .map_err(cant)?
             .into_iter()
-            .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
+            .filter(|o| {
+                o.id != p.id && o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text)
+            })
         {
             store
                 .preference_set_state(old.id, PrefState::Retired)
                 .await
                 .map_err(cant)?;
         }
-        store.preference_put(&p).await.map_err(cant)?;
         Ok(format!(
             "From now on: when {}, {} (for {}).",
             p.when_text,
@@ -508,25 +527,34 @@ impl CrewHub {
             }
         };
         let tz = self.desk.timezone();
-        let paused = match p.state {
-            PrefState::Paused => " I've set it aside until you say otherwise, as you undid it twice.",
-            _ => "",
+        // Only an active one is counted, so set aside now is by this undo.
+        let set_aside = p.state == PrefState::Paused;
+        let paused = match set_aside {
+            true => " I've set it aside until you say otherwise, as you undid it twice.",
+            false => "",
         };
         let mut new = NewItem::ask(
             boss,
             OpenKind::Ask,
             None,
             &format!(
-                "You undid “{}”, which I did per your preference from {} ({}). Should I change that preference?{paused}",
+                "You undid “{}”, which I did per your preference from {} ({}; preference {}). Should I change that preference?{paused}",
                 undone.trim_end_matches('.'),
                 p.date(tz),
-                p.rule()
+                p.rule(),
+                p.id
             ),
         );
         new.dedupe_key = format!("{OVERRULED}{pref}");
         new.options = vec![CHANGE_IT.into(), KEEP_IT.into(), FORGET_IT.into()];
         match store.item_open(&new).await {
             Ok(Opened::New(i)) => {
+                self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
+                    .await;
+            }
+            // Asked already; set aside by this undo, it is said again so
+            // the person knows.
+            Ok(Opened::Again(i)) if set_aside => {
                 self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
                     .await;
             }
@@ -539,7 +567,11 @@ impl CrewHub {
     /// overruled preference: kept or forgotten here, and said; `None` for
     /// any other item, or "Change it", which goes on to the boss for the
     /// new words.
-    pub(crate) async fn overrule_answered(&self, closed: &OpenItem, answer: &str) -> Option<String> {
+    pub(crate) async fn overrule_answered(
+        &self,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<String> {
         let pref: Uuid = closed.dedupe_key.strip_prefix(OVERRULED)?.parse().ok()?;
         let state = match answer.trim() {
             a if a.eq_ignore_ascii_case(KEEP_IT) => PrefState::Active,
@@ -594,7 +626,7 @@ impl CrewHub {
             json!({
                 "needs": h.needs(),
                 "yourself": h.itself(),
-                "byPreference": h.preference,
+                "preference": h.preference,
                 "own": h.own,
                 "escalated": h.escalated,
                 "personFirst": h.person_first,
