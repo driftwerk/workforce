@@ -216,6 +216,10 @@ async fn only_the_board_s_person_comments_and_a_local_ticket_keeps_its_own() {
         assert_eq!(status, StatusCode::CREATED);
         let (_, got) = send(&local, &local.jwt, "GET", &uri, json!(null)).await;
         assert_eq!(got["comments"][0]["body"], "A note to self");
+        assert!(
+            got.get("history").is_none(),
+            "a local ticket has none: {got}"
+        );
         assert_eq!(
             got["comments"][0]["onlyHere"], false,
             "a local ticket's are all here"
@@ -420,6 +424,122 @@ async fn a_malformed_read_keeps_every_comment() {
     .await;
 }
 
+fn fenced(s: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(
+        s,
+        "jira.get_issue.changelog",
+    )
+    .wrapped_content
+}
+
+/// Opening a ticket reads its issue's history beside its comments, in the
+/// shape Desk reads (`history`, camelCase, unwrapped, oldest first); and a
+/// Jira issue's comments past a page are all read, a page at a time.
+#[tokio::test]
+async fn history_comes_beside_the_comments_and_comments_past_a_page_are_read() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        for n in 0..130 {
+            said(
+                &remote.jira,
+                "ACME-1",
+                &format!("{}", 1000 + n),
+                "Dana Kim",
+                &format!("Note {n}"),
+                false,
+            );
+        }
+        remote.jira.lock().unwrap().history.insert(
+            "ACME-1".into(),
+            json!({
+                "created": "2026-11-01T09:00:00.000+0000",
+                "reporter": { "display_name": "Dana Kim", "account_id": "acc-dana" },
+                "changelog": { "total": 2, "histories": [
+                    { "id": "2", "created": "2026-11-03T09:00:00.000+0000", "author": "Sam",
+                      "author_account_id": crate::desk_board_sync::tests::SAM_ACCOUNT,
+                      "author_account_type": "atlassian",
+                      "items": [{ "field": "assignee", "field_id": "assignee", "from": null, "to": fenced("Sam") }] },
+                    { "id": "1", "created": "2026-11-02T09:00:00.000+0000", "author": "Dana Kim",
+                      "author_account_id": "acc-dana", "author_account_type": "atlassian",
+                      "items": [
+                        { "field": "status", "field_id": "status", "from": fenced("To Do"), "to": fenced("In Progress") },
+                        { "field": "Rank", "field_id": "customfield_10019", "from": null, "to": fenced("Ranked higher") },
+                      ] },
+                ] }
+            }),
+        );
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        let uri = format!("/api/desk/tickets/{}/comments", t.ticket.id);
+
+        let (status, got) = send(&local, &local.jwt, "GET", &uri, json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(
+            got["history"],
+            json!([
+                { "at": "2026-11-01T09:00:00Z", "actor": "Dana Kim", "by": "remote", "kind": "created" },
+                { "at": "2026-11-02T09:00:00Z", "actor": "Dana Kim", "by": "remote", "kind": "state",
+                  "from": "To Do", "to": "In Progress" },
+                { "at": "2026-11-03T09:00:00Z", "actor": "Sam", "by": "remote", "kind": "assignee", "to": "Sam" },
+            ]),
+            "on the person's own key, their account's changes are theirs"
+        );
+        let asked = calls_of(&remote.jira, "jira.get_issue");
+        assert!(
+            asked.iter().any(|a| a["changelog"] == json!(true)),
+            "{asked:?}"
+        );
+        let c = got["comments"].as_array().unwrap();
+        assert_eq!(c.len(), 130, "past the first page");
+        assert_eq!(c[129]["body"], "Note 129");
+        assert!(c.iter().all(|c| c.get("parent").is_none()), "Jira's are flat");
+        let pages: Vec<Value> = calls_of(&remote.jira, "jira.list_comments")
+            .iter()
+            .map(|a| a["start_at"].clone())
+            .collect();
+        assert_eq!(pages, [json!(0), json!(100)]);
+
+        // Read lately: neither is read again, and what was read is kept.
+        let (_, again) = send(&local, &local.jwt, "GET", &uri, json!(null)).await;
+        assert_eq!(again["history"], got["history"]);
+        assert_eq!(calls_of(&remote.jira, "jira.list_comments").len(), 2);
+    })
+    .await;
+}
+
+/// An issue whose history can't be read still shows its comments, with no
+/// problem said, and no `history`.
+#[tokio::test]
+async fn a_history_that_can_t_be_read_never_stops_the_comments() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        said(
+            &remote.jira,
+            "ACME-1",
+            "10",
+            "Dana Kim",
+            "Keep it short.",
+            false,
+        );
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        // An older hub: its issue comes back without a changelog.
+        let uri = format!("/api/desk/tickets/{}/comments", t.ticket.id);
+        let (status, got) = send(&local, &local.jwt, "GET", &uri, json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["comments"].as_array().unwrap().len(), 1);
+        assert!(got["problem"].is_null(), "{got}");
+        assert!(got.get("history").is_none(), "{got}");
+    })
+    .await;
+}
+
 /// A comment posted but not kept here is answered as posted, with no id:
 /// one would name nothing Desk could find again.
 #[test]
@@ -439,6 +559,7 @@ fn a_comment_not_kept_is_answered_with_no_id() {
         at: chrono::Utc::now(),
         edited_at: None,
         only_here: false,
+        parent: None,
     };
     let answer = super::not_kept(&c);
     assert!(answer["id"].is_null(), "{answer}");
