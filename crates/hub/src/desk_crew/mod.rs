@@ -1244,6 +1244,34 @@ impl Crew for CrewHub {
         self.me().drop_item(id).await
     }
 
+    async fn always_item(
+        &self,
+        id: uuid::Uuid,
+        then: Option<&str>,
+    ) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().always_item(id, then).await
+    }
+
+    async fn keep_preference(
+        &self,
+        when: &str,
+        then: &str,
+        scope: &str,
+        from_item: Option<uuid::Uuid>,
+        boss_scope: Option<&str>,
+    ) -> Result<workforce_desk::preference::Preference, workforce_desk::crew::ItemRefused> {
+        self.person_prefers(when, then, scope, from_item, boss_scope)
+            .await
+    }
+
+    async fn handled(
+        &self,
+        agent: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        self.handled_counts(agent, since).await
+    }
+
     fn dm_typing(&self, agent: &str) -> bool {
         self.typing_in(agent)
     }

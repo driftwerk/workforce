@@ -252,6 +252,7 @@ pub struct DecisionLine {
 /// got to first, of `decisions`: what "handled 23 of 25 myself" is
 /// counted from. Choices and the turns it let wait are not needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Handled {
     pub own: usize,
     pub preference: usize,
@@ -288,6 +289,21 @@ impl Handled {
     pub fn itself(&self) -> usize {
         self.own + self.preference
     }
+}
+
+/// The count as the person reads it: "handled 23 of 25 myself, 4 by your
+/// preferences"; empty when there were no needs.
+pub fn handled_said(h: &Handled) -> String {
+    if h.needs() == 0 {
+        return String::new();
+    }
+    let mut s = format!("handled {} of {} myself", h.itself(), h.needs());
+    match h.preference {
+        0 => {}
+        1 => s.push_str(", 1 by your preferences"),
+        n => s.push_str(&format!(", {n} by your preferences")),
+    }
+    s
 }
 
 #[cfg(test)]
@@ -383,6 +399,16 @@ mod tests {
         ];
         let h = Handled::of(&all);
         assert_eq!((h.itself(), h.needs()), (2, 4));
+        assert_eq!(
+            h.own + h.preference + h.escalated + h.person_first,
+            h.needs(),
+            "the counts add up"
+        );
+        assert_eq!(
+            handled_said(&h),
+            "handled 2 of 4 myself, 1 by your preferences"
+        );
+        assert_eq!(handled_said(&Handled::default()), "");
         assert_eq!(h.escalated, 1);
         assert_eq!(h.person_first, 1);
     }

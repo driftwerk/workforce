@@ -1823,6 +1823,7 @@ mod decides_at_once;
 
 mod decisions;
 mod items;
+mod learning;
 mod preferences;
 mod promises;
 mod updates;

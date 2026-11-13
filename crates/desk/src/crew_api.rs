@@ -1,8 +1,9 @@
 //! `/api/desk/activity`, `/overview`, `/manager` and `/suggestions`: the
 //! crew as Floor and the overseer's DM read it, and the person's answers to
 //! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
-//! one of its decisions; `/items/{id}/answer` and `/drop`, the person
-//! settling what the boss asked them; `/dm/{agent}/typing` and
+//! one of its decisions; `/items/{id}/answer`, `/drop` and `/always`, the
+//! person settling what the boss asked them (and keeping the answer);
+//! `/handled`, what the boss handled and how; `/dm/{agent}/typing` and
 //! `/presence`, the person typing to a boss and whether its DM is on
 //! screen. `/preferences`: the person's preferences for their bosses,
 //! listed, changed, set aside, resumed and forgotten. `/unread` and
@@ -16,6 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -112,24 +114,38 @@ async fn manager(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Resp
         return r;
     }
     let o = s.crew.overseer();
-    let bosses = s
-        .desk
-        .bosses()
-        .into_iter()
-        .filter_map(|b| {
-            Some(GroupBoss {
-                group: b.scope.group()?.to_string(),
-                agent_id: b.agent,
-                name: b.name,
-                level: b.level,
-            })
-        })
-        .collect();
+    let today = s.crew.midnight();
+    // Today's counts: a boss whose log can't be read shows none.
+    let handled = async |boss: &str| match s.desk.store().decisions_handled(boss, today).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::info!(error = %format!("{e:#}"), "a boss's handled counts couldn't be read");
+            None
+        }
+    };
+    let mut bosses = Vec::new();
+    for b in s.desk.bosses() {
+        let Some(group) = b.scope.group().map(str::to_string) else {
+            continue;
+        };
+        bosses.push(GroupBoss {
+            handled: handled(&b.agent).await,
+            group,
+            agent_id: b.agent,
+            name: b.name,
+            level: b.level,
+        });
+    }
+    let main = match &o {
+        Some(o) => handled(&o.id).await,
+        None => None,
+    };
     Json(ManagerView {
         agent_id: o.as_ref().map(|o| o.id.clone()),
         level: o.map(|o| o.level),
         bosses,
         sealed: s.desk.sealed(),
+        handled: main,
     })
     .into_response()
 }
@@ -242,6 +258,10 @@ async fn undo(
 #[derive(Deserialize)]
 struct ItemAnswer {
     answer: String,
+    /// "Always": the answer is kept as a preference for the kind of case
+    /// the item settles, at once.
+    #[serde(default)]
+    always: bool,
 }
 
 fn item_result(r: Result<String, ItemRefused>) -> Response {
@@ -271,7 +291,27 @@ async fn item_answer(
     if body.answer.trim().is_empty() {
         return error(StatusCode::BAD_REQUEST, "Say your answer.");
     }
-    item_result(s.crew.answer_item(id, body.answer.trim()).await)
+    let done = match s.crew.answer_item(id, body.answer.trim()).await {
+        Ok(done) => done,
+        Err(e) => return item_result(Err(e)),
+    };
+    if !body.always {
+        return Json(json!({ "done": done })).into_response();
+    }
+    // Answered either way: what keeping it said, or why it couldn't.
+    match s.crew.always_item(id, Some(body.answer.trim())).await {
+        Ok(kept) => Json(json!({ "done": done, "kept": kept })).into_response(),
+        Err(e) => Json(json!({ "done": done, "notKept": refused_why(&e) })).into_response(),
+    }
+}
+
+/// What a refusal says to the person.
+fn refused_why(e: &ItemRefused) -> String {
+    match e {
+        ItemRefused::NotFound => "That isn’t open any more.".into(),
+        ItemRefused::Closed => "That was already settled.".into(),
+        ItemRefused::Cant(why) => why.clone(),
+    }
 }
 
 /// The person drops one of the boss's open items unanswered.
@@ -406,6 +446,58 @@ fn preference_result(r: eyre::Result<Option<Preference>>) -> Response {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PrefNew {
+    when_text: String,
+    then_text: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    from_item: Option<String>,
+    #[serde(default)]
+    boss_scope: Option<String>,
+}
+
+/// The person keeps a preference themselves, or from one of the boss's
+/// asks (`fromItem`): the same case and scope gives way to it.
+async fn preference_new(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<PrefNew>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let from_item = match body
+        .from_item
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        Some(f) => match f.parse::<uuid::Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return error(StatusCode::NOT_FOUND, "That isn’t open any more."),
+        },
+        None => None,
+    };
+    match s
+        .crew
+        .keep_preference(
+            &body.when_text,
+            &body.then_text,
+            body.scope.as_deref().unwrap_or(""),
+            from_item,
+            body.boss_scope.as_deref(),
+        )
+        .await
+    {
+        Ok(p) => (StatusCode::CREATED, Json(preference_json(&p))).into_response(),
+        Err(e) => item_result(Err(e)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrefPatch {
     when_text: Option<String>,
     then_text: Option<String>,
@@ -474,6 +566,65 @@ async fn preference_state(
     preference_result(s.desk.store().preference_set_state(p.id, state).await)
 }
 
+#[derive(Deserialize, Default)]
+struct Always {
+    #[serde(default)]
+    then: Option<String>,
+}
+
+/// "Always": the person's answer to one of the boss's asks becomes one of
+/// their preferences, for the case the ask said it settles.
+async fn item_always(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+    body: Option<Json<Always>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<uuid::Uuid>() else {
+        return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
+    };
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let then = body
+        .then
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    item_result(s.crew.always_item(id, then).await)
+}
+
+#[derive(Deserialize)]
+struct HandledQuery {
+    token: Option<String>,
+    agent: Option<String>,
+    since: Option<String>,
+}
+
+/// How much the boss handled itself, by preference, escalated, or the
+/// person got to first: since a time (the start of today by default), in
+/// all and per day. For the catch-up's "handled 23 of 25 myself" and the
+/// Floor.
+async fn handled(State(s): S, h: HeaderMap, Query(q): Query<HandledQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let since = match q.since.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => match t.parse::<DateTime<Utc>>() {
+            Ok(t) => Some(t),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "since is an RFC 3339 time."),
+        },
+        None => None,
+    };
+    let agent = q.agent.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    match s.crew.handled(agent, since).await {
+        Some(v) => Json(v).into_response(),
+        None => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
 #[derive(Deserialize)]
 struct Puts {
     puts: Vec<ReadPut>,
@@ -539,9 +690,14 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/decisions/{id}/undo", post(undo))
         .route("/api/desk/items/{id}/answer", post(item_answer))
         .route("/api/desk/items/{id}/drop", post(item_drop))
+        .route("/api/desk/items/{id}/always", post(item_always))
+        .route("/api/desk/handled", get(handled))
         .route("/api/desk/dm/{agent}/typing", post(dm_typing))
         .route("/api/desk/presence", post(presence))
-        .route("/api/desk/preferences", get(preferences))
+        .route(
+            "/api/desk/preferences",
+            get(preferences).post(preference_new),
+        )
         .route("/api/desk/preferences/{id}", patch(preference_patch))
         .route("/api/desk/preferences/{id}/{to}", post(preference_state))
         .route("/api/desk/unread", get(unread))
@@ -556,7 +712,6 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use chrono::{DateTime, Utc};
     use parking_lot::Mutex;
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
@@ -607,9 +762,27 @@ mod tests {
                 _ => Err(UndoRefused::NotFound),
             }
         }
+        async fn always_item(
+            &self,
+            id: uuid::Uuid,
+            then: Option<&str>,
+        ) -> Result<String, ItemRefused> {
+            match id.as_u128() {
+                1 => Ok(format!("From now on: {}", then.unwrap_or("your answer"))),
+                _ => Err(ItemRefused::NotFound),
+            }
+        }
+        async fn handled(
+            &self,
+            agent: Option<&str>,
+            since: Option<DateTime<Utc>>,
+        ) -> Option<Value> {
+            (agent.is_none_or(|a| a == "desk"))
+                .then(|| json!({ "needs": 25, "yourself": 23, "since": since }))
+        }
         async fn answer_item(&self, id: uuid::Uuid, answer: &str) -> Result<String, ItemRefused> {
             match id.as_u128() {
-                1 => Ok(format!("Sent: {answer}")),
+                1 | 5 => Ok(format!("Sent: {answer}")),
                 2 => Err(ItemRefused::Closed),
                 3 => Err(ItemRefused::Cant("acme-web went ahead without you.".into())),
                 _ => Err(ItemRefused::NotFound),
@@ -684,6 +857,52 @@ mod tests {
                     .await
                     .0,
                 StatusCode::BAD_REQUEST
+            );
+            // "Always" with the answer: answered, and kept or said why not.
+            let with_always = json!({ "answer": "Wait for green", "always": true });
+            let (status, said) = call_json(&app, &answer(1), &with_always).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(said["done"], "Sent: Wait for green");
+            assert_eq!(said["kept"], "From now on: Wait for green");
+            let (status, said) = call_json(&app, &answer(5), &with_always).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(said["done"], "Sent: Wait for green");
+            assert_eq!(said["notKept"], "That isn’t open any more.");
+            assert!(said.get("kept").is_none());
+            assert_eq!(
+                call_json(&app, &answer(2), &with_always).await.0,
+                StatusCode::CONFLICT,
+                "not answered: nothing kept"
+            );
+            let always = |n: u128| format!("/api/desk/items/{}/always", uuid::Uuid::from_u128(n));
+            let (status, said) = call_json(&app, &always(1), &json!({ "then": " wait " })).await;
+            assert_eq!(
+                (status, said["done"].as_str()),
+                (StatusCode::OK, Some("From now on: wait"))
+            );
+            let (status, said) = call(&app, "POST", &always(1)).await;
+            assert_eq!(
+                (status, said["done"].as_str()),
+                (StatusCode::OK, Some("From now on: your answer")),
+                "no body: their answer"
+            );
+            assert_eq!(
+                call(&app, "POST", &always(2)).await.0,
+                StatusCode::NOT_FOUND
+            );
+            let (status, h) = call(&app, "GET", "/api/desk/handled").await;
+            assert_eq!((status, h["yourself"].as_u64()), (StatusCode::OK, Some(23)));
+            let (_, h) = call(&app, "GET", "/api/desk/handled?since=2026-11-12T18:00:00Z").await;
+            assert_eq!(h["since"], "2026-11-12T18:00:00Z");
+            assert_eq!(
+                call(&app, "GET", "/api/desk/handled?since=yesterday")
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                call(&app, "GET", "/api/desk/handled?agent=nobody").await.0,
+                StatusCode::NOT_FOUND
             );
             let drop = |n: u128| format!("/api/desk/items/{}/drop", uuid::Uuid::from_u128(n));
             assert_eq!(call(&app, "POST", &drop(1)).await.0, StatusCode::OK);
@@ -767,6 +986,27 @@ mod tests {
                 store.preference_put(p).await.unwrap();
             }
             let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            // Keeping one goes to the bosses' hub: with none, it says so.
+            let (status, said) = send_json(
+                &app,
+                "POST",
+                "/api/desk/preferences",
+                &json!({ "whenText": "x", "thenText": "y" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(said["error"], "There is no boss here.");
+            assert_eq!(
+                send_json(
+                    &app,
+                    "POST",
+                    "/api/desk/preferences",
+                    &json!({ "whenText": "x", "thenText": "y", "fromItem": "nope" }),
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
 
             let (status, list) = call(&app, "GET", "/api/desk/preferences").await;
             assert_eq!(status, StatusCode::OK);
@@ -996,7 +1236,10 @@ mod tests {
             let (_, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(
                 m,
-                json!({"agentId": "desk", "level": "suggest", "bosses": [], "sealed": []})
+                json!({
+                    "agentId": "desk", "level": "suggest", "bosses": [], "sealed": [],
+                    "handled": {"own": 0, "preference": 0, "escalated": 0, "personFirst": 0},
+                })
             );
 
             let made = |text: &str| Suggestion {
@@ -1179,13 +1422,33 @@ mod tests {
             .unwrap();
             d.bound_groups(["g-acme".to_string(), "g-globex".to_string()])
                 .await;
+            use crate::decision::{BossDecision, How, Need};
+            for (boss, need, how) in [
+                ("desk", Need::Approval, How::Own),
+                ("desk", Need::Question, How::Preference),
+                ("desk", Need::Choice, How::Own),
+                ("sarah", Need::Stall, How::Escalated),
+            ] {
+                d.store()
+                    .decision_put(&BossDecision::new(boss, need, "did it", "because", how))
+                    .await
+                    .unwrap();
+            }
             let (status, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(m["agentId"], "desk");
             assert_eq!(m["sealed"], json!(["g-globex"]));
+            // Today's counts on each boss's row: needs only, not choices.
+            assert_eq!(
+                m["handled"],
+                json!({"own": 1, "preference": 1, "escalated": 0, "personFirst": 0})
+            );
             assert_eq!(
                 m["bosses"],
-                json!([{"agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act"}])
+                json!([{
+                    "agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act",
+                    "handled": {"own": 0, "preference": 0, "escalated": 1, "personFirst": 0},
+                }])
             );
         })
         .await;
