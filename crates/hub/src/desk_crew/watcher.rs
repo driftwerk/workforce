@@ -492,19 +492,22 @@ impl CrewHub {
                 continue;
             }
             // A session's question the person is in control of, or its Act
-            // fully boss answers itself (`answer`): not raised here.
+            // fully boss answers itself (`answer`), and a request its decision
+            // call has (`decide`): not raised here.
             if item.kind == ItemKind::Session
-                && item.approval.is_none()
-                && item.question.is_some()
                 && item
                     .id
                     .parse()
                     .ok()
                     .and_then(|s| self.desk.view(s).ok())
-                    .is_some_and(|v| {
-                        super::answer::question_of(&v).is_some()
-                            && (self.person_has_questions(&v, overseer)
-                                || self.answers_question_itself(&v))
+                    .is_some_and(|v| match (&item.approval, &item.question) {
+                        (Some(_), _) => self.answers_at_once(&v),
+                        (None, Some(_)) => {
+                            super::answer::question_of(&v).is_some()
+                                && (self.person_has_questions(&v, overseer)
+                                    || self.answers_question_itself(&v))
+                        }
+                        (None, None) => false,
                     })
             {
                 continue;
