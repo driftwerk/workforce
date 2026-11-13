@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+use workforce_common::channels::desk::DeliveryKind;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_core::budget::Status;
@@ -451,22 +451,6 @@ impl CrewHub {
         let Some(owner) = self.person(Some(service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Plan, text.to_string()),
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(plan = %p.id, error = %e, "a plan card didn't reach the DM");
-                return;
-            }
-        };
         let extras = Extras {
             plan: Some(MentionedPlan {
                 id: p.id,
@@ -474,13 +458,12 @@ impl CrewHub {
             }),
             ..Default::default()
         };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Plan, text.to_string());
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, service.agent_id.as_str(), &extras)
+            .deliver_with_extras(service, &owner, delivery, &extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping a plan card failed");
+            tracing::warn!(plan = %p.id, error = %e, "a plan card didn't reach the DM");
         }
     }
 

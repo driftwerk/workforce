@@ -683,35 +683,32 @@ impl CrewHub {
                         .map(|m| m.id.clone())
                 })
         });
-        let message = match found {
-            Some(m) => m,
-            None => {
-                let target =
-                    DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-                let kind = match p.away {
-                    Some(_) => DeliveryKind::Away,
-                    None => DeliveryKind::Update,
-                };
-                let mut delivery = crate::desk_surface::Delivery::text(kind, p.text.clone());
-                delivery.request_id = Some(id);
-                let message = crate::desk_surface::deliver(service, owner, &target, delivery)
-                    .await?
-                    .message_id;
-                // Sent: kept so, before anything else, so a restart from
-                // here on finds it whatever the DM did since.
-                p.sent = Some(message.clone());
-                self.desk.store().update_pend(boss, &p).await?;
-                message
-            }
-        };
         let extras = Extras {
             update: Some(p.update.clone()),
             away: p.away.clone(),
             suggestions: self.quiet_suggestions(boss, &p),
             ..Default::default()
         };
-        if let Err(e) = self.desk.store().put_extras(&message, boss, &extras).await {
-            tracing::warn!(error = %e, "keeping an update's extras failed");
+        match found {
+            Some(m) => self.keep_extras_of(&m, boss, &extras).await,
+            None => {
+                let kind = match p.away {
+                    Some(_) => DeliveryKind::Away,
+                    None => DeliveryKind::Update,
+                };
+                let mut delivery = crate::desk_surface::Delivery::text(kind, p.text.clone());
+                delivery.request_id = Some(id);
+                // Its extras kept first: the update is read whole the
+                // moment it is in the DM.
+                let message = self
+                    .deliver_with_extras(service, owner, delivery, &extras)
+                    .await?
+                    .message_id;
+                // Sent: kept so, before anything else, so a restart from
+                // here on finds it whatever the DM did since.
+                p.sent = Some(message);
+                self.desk.store().update_pend(boss, &p).await?;
+            }
         }
         self.told(service, owner, state, &p).await
     }
