@@ -437,7 +437,7 @@ mod tests {
             fn serves(&self, _: uuid::Uuid) -> bool {
                 true
             }
-            fn cooling(&self, _: &str, _: chrono::DateTime<Utc>) {}
+            fn cooling(&self, _: &str, _: chrono::DateTime<Utc>, _: chrono::DateTime<Utc>) {}
             fn plan_key(&self, id: &str) -> Option<String> {
                 (id == "starmoire").then(|| "planofstarmoire".to_string())
             }

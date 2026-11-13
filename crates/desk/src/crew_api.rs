@@ -2,9 +2,11 @@
 //! crew as Floor and the overseer's DM read it, and the person's answers to
 //! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
 //! one of its decisions; `/items/{id}/answer` and `/drop`, the person
-//! settling what the boss asked them. `/preferences`: the person's
-//! preferences for their bosses, listed, changed, set aside, resumed and
-//! forgotten. `/unread` and `/reads`: what is unread on this
+//! settling what the boss asked them; `/dm/{agent}/typing` and
+//! `/presence`, the person typing to a boss and whether its DM is on
+//! screen. `/preferences`: the person's preferences for their bosses,
+//! listed, changed, set aside, resumed and forgotten. `/unread` and
+//! `/reads`: what is unread on this
 //! Desk, and how far the person has read each place.
 
 use std::sync::Arc;
@@ -288,6 +290,52 @@ async fn item_drop(
     item_result(s.crew.drop_item(id).await)
 }
 
+/// The person is typing in the boss `agent`'s DM: Desk sends it every few
+/// seconds while the composer has keystrokes, and the boss's posts wait
+/// for a pause.
+async fn dm_typing(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(agent): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match s.crew.dm_typing(&agent) {
+        true => StatusCode::NO_CONTENT.into_response(),
+        false => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresenceBody {
+    attending: bool,
+    #[serde(default)]
+    dm_on_screen: Option<String>,
+}
+
+/// Whether Desk's window is attended and which boss's DM is on screen:
+/// sent on focus and view changes, and each minute.
+async fn presence(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<PresenceBody>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let dm = b
+        .dm_on_screen
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    s.crew.presence(b.attending, dm);
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// A preference as Desk's boss settings show it.
 fn preference_json(p: &Preference) -> serde_json::Value {
     json!({
@@ -491,6 +539,8 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/decisions/{id}/undo", post(undo))
         .route("/api/desk/items/{id}/answer", post(item_answer))
         .route("/api/desk/items/{id}/drop", post(item_drop))
+        .route("/api/desk/dm/{agent}/typing", post(dm_typing))
+        .route("/api/desk/presence", post(presence))
         .route("/api/desk/preferences", get(preferences))
         .route("/api/desk/preferences/{id}", patch(preference_patch))
         .route("/api/desk/preferences/{id}/{to}", post(preference_state))
@@ -571,6 +621,13 @@ mod tests {
                 _ => Err(ItemRefused::NotFound),
             }
         }
+        fn dm_typing(&self, agent: &str) -> bool {
+            self.0.lock().push(format!("typing {agent}"));
+            agent == "desk"
+        }
+        fn presence(&self, attending: bool, dm: Option<&str>) {
+            self.0.lock().push(format!("presence {attending} {dm:?}"));
+        }
     }
 
     #[tokio::test]
@@ -634,6 +691,44 @@ mod tests {
             assert_eq!(
                 call(&app, "POST", "/api/desk/items/nope/drop").await.0,
                 StatusCode::NOT_FOUND
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn typing_and_presence_reach_the_boss() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let hub = Arc::new(Hub::default());
+            let app = crew_router(d, Arc::new(Bearer), hub.clone());
+            assert_eq!(
+                call(&app, "POST", "/api/desk/dm/desk/typing").await.0,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                call(&app, "POST", "/api/desk/dm/nobody/typing").await.0,
+                StatusCode::NOT_FOUND
+            );
+            let on = json!({ "attending": true, "dmOnScreen": "desk" });
+            assert_eq!(
+                call_json(&app, "/api/desk/presence", &on).await.0,
+                StatusCode::NO_CONTENT
+            );
+            let off = json!({ "attending": false, "dmOnScreen": " " });
+            assert_eq!(
+                call_json(&app, "/api/desk/presence", &off).await.0,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                *hub.0.lock(),
+                vec![
+                    "typing desk".to_string(),
+                    "typing nobody".to_string(),
+                    "presence true Some(\"desk\")".to_string(),
+                    "presence false None".to_string(),
+                ]
             );
         })
         .await;
