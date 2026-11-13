@@ -21,14 +21,17 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
+use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_common::session::MessageRole;
 use workforce_desk::away::{self, MentionedAway, ParkedItem, Presence, Typing};
+use workforce_desk::crew::Extras;
 use workforce_desk::decision::{BossDecision, Handled};
 use workforce_desk::model::SessionState;
 use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
 use workforce_desk::update::{Change, MentionedUpdate, Pending, UpdateState, WaitingItem};
+use workforce_desk::update_store::HeldCard;
 
 use super::{CrewHub, CHECK_IN};
 use crate::serve::AgentService;
@@ -81,6 +84,8 @@ impl CrewHub {
     /// and they are here.
     pub(super) fn dm_sent(&self, boss: &str) {
         self.dm_typing.lock().remove(boss);
+        // What waits on their typing goes now.
+        self.typing_done.notify_waiters();
         self.update_poke.notify_one();
     }
 
@@ -105,10 +110,13 @@ impl CrewHub {
     }
 
     /// Waits while the person types in `boss`'s DM, at most the cap from
-    /// now.
+    /// now: until they pause, or send.
     pub(super) async fn after_typing(&self, boss: &str) {
         let until = Utc::now() + self.cap();
         loop {
+            let sent = self.typing_done.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
             let Some(release) = self.typing_release(boss) else {
                 return;
             };
@@ -117,8 +125,139 @@ impl CrewHub {
             if at <= now {
                 return;
             }
-            tokio::time::sleep((at - now).to_std().unwrap_or_default()).await;
+            let wait = (at - now).to_std().unwrap_or_default();
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = &mut sent => {}
+            }
         }
+    }
+
+    /// Puts a needs-you card (`text`, with `extras`' buttons) in `boss`'s
+    /// DM: at once, or while the person types to it, once they pause or
+    /// send, at most three minutes from when the typing began. A held card
+    /// is kept in Postgres, so a restart still posts it, and it goes only
+    /// while its item (`item_id`) is still open. Whether it went out, or
+    /// will.
+    pub(super) async fn card(
+        &self,
+        boss: &str,
+        item_id: Option<Uuid>,
+        text: String,
+        extras: Extras,
+    ) -> bool {
+        if self.overseer_named(boss).is_none() {
+            return false;
+        }
+        let (quiet, cap) = (self.quiet(), self.cap());
+        let typing = self
+            .dm_typing
+            .lock()
+            .get(boss)
+            .copied()
+            .filter(|t| t.holds(Utc::now(), quiet, cap));
+        let Some(typing) = typing else {
+            return self.deliver_card(boss, &text, &extras).await;
+        };
+        let card = HeldCard {
+            id: Uuid::new_v4(),
+            boss: boss.to_string(),
+            item_id,
+            text,
+            extras,
+            post_by: typing.first + cap,
+        };
+        let kept = match self.desk.store().card_hold(&card).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "keeping a held needs-you failed: it waits in memory only");
+                false
+            }
+        };
+        let crew = self.me();
+        tokio::spawn(async move {
+            crew.after_typing(&card.boss).await;
+            crew.post_held(card, kept).await;
+        });
+        true
+    }
+
+    /// Posts the held `card` (kept in Postgres when `kept`) unless another
+    /// look took it, or its item was settled while it waited.
+    async fn post_held(&self, card: HeldCard, kept: bool) -> bool {
+        let store = self.desk.store();
+        if kept {
+            match store.card_take(card.id).await {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => {
+                    // Left kept: the next look past its time posts it.
+                    tracing::info!(error = %format!("{e:#}"), "taking a held needs-you failed");
+                    return false;
+                }
+            }
+        }
+        if let Some(id) = card.item_id {
+            match store.open_item(id).await {
+                Ok(Some(i)) if i.state == OpenState::Open => {}
+                Ok(_) => return false,
+                Err(e) => {
+                    tracing::info!(error = %format!("{e:#}"), "a held needs-you's item couldn't be read: it goes");
+                }
+            }
+        }
+        self.deliver_card(&card.boss, &card.text, &card.extras)
+            .await
+    }
+
+    /// Posts the held cards whose time is past that no wait is left to
+    /// post, as after a restart.
+    pub(super) async fn post_due_cards(&self) {
+        let due = match self.desk.store().cards_due(Utc::now()).await {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "the held needs-you couldn't be read");
+                return;
+            }
+        };
+        for card in due {
+            self.post_held(card, true).await;
+        }
+    }
+
+    /// Puts a needs-you card in `boss`'s DM now, and keeps its buttons.
+    async fn deliver_card(&self, boss: &str, text: &str, extras: &Extras) -> bool {
+        let Some((service, _)) = self.overseer_named(boss) else {
+            return false;
+        };
+        let Some(owner) = self.person(Some(&service)) else {
+            return false;
+        };
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+        let delivered = match crate::desk_surface::deliver(
+            &service,
+            &owner,
+            &target,
+            crate::desk_surface::Delivery::text(DeliveryKind::Question, text.to_string()),
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "putting what needs the person in the boss's DM failed");
+                return false;
+            }
+        };
+        if let Err(e) = self
+            .desk
+            .store()
+            .put_extras(&delivered.message_id, boss, extras)
+            .await
+        {
+            tracing::warn!(error = %e, "keeping a needs-you's buttons failed");
+        }
+        true
     }
 
     /// Looks at the updates again once the person's typing in `boss`'s DM
@@ -224,7 +363,22 @@ impl CrewHub {
         let boss = service.agent_id.as_str();
         let now = Utc::now();
         let store = self.desk.store();
-        let b = self.batch(service, o, state, now, Some(since)).await;
+        // All since the last post they read: the one that began the absence
+        // went unread too.
+        let read_post = service
+            .sessions
+            .find(DESK_CHANNEL, owner)
+            .ok()
+            .flatten()
+            .and_then(|dm| {
+                dm.messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::Assistant && m.timestamp < since)
+                    .map(|m| m.timestamp)
+                    .max()
+            })
+            .unwrap_or(state.since);
+        let b = self.batch(service, o, state, now, Some(read_post)).await;
         let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
         let asks = |i: &&OpenItem| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm);
         let waiting: Vec<&OpenItem> = open

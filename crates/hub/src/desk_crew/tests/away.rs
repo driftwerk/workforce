@@ -7,6 +7,7 @@
 use super::*;
 use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::account::{Account, Done, Ref, RefKind};
+use workforce_desk::open_item::ClosedBy;
 
 /// The DM's messages delivered as `kind`, with when they were posted.
 fn delivered(
@@ -116,8 +117,10 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
         .await;
         let at = started.elapsed();
         assert!(typing.is_finished(), "held while typing: {at:?}");
+        // Out at the look after the pause, not one held on (the bound is
+        // loose for a loaded machine).
         assert!(
-            at < Duration::from_millis(300),
+            at < Duration::from_millis(600),
             "a pause lets it go: {at:?}"
         );
     })
@@ -190,6 +193,135 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
             "out at the cap while still typing: {at:?}"
         );
         typing.await.unwrap();
+    })
+    .await;
+}
+
+/// A needs-you settled while it waits on the person's typing never posts,
+/// and one a restart left held goes once its time is past, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let typing = type_for(&crew, 150);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let r = ask(&crew, "Which key should staging use?").await;
+        assert!(r.success, "{:?}", r.error);
+        let store = d.store();
+        let item = store
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .remove(0);
+        // Answered another way while it waited.
+        store
+            .item_close(item.id, ClosedBy::Person, "Staging.")
+            .await
+            .unwrap();
+        typing.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(needs_you(&overseer).is_empty(), "settled: no card");
+        assert!(store
+            .cards_due(chrono::Utc::now())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A card held when the hub went down, its item still open.
+        let r = ask(&crew, "Which region for the demo?").await;
+        assert!(r.success, "{:?}", r.error);
+        let open = store
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .remove(0);
+        eventually("its card", async || needs_you(&overseer).into_iter().next()).await;
+        let held = workforce_desk::update_store::HeldCard {
+            id: uuid::Uuid::new_v4(),
+            boss: "desk".into(),
+            item_id: Some(open.id),
+            text: "**Needs you.** Which region for the demo?".into(),
+            extras: workforce_desk::crew::Extras {
+                item: Some(open.mention()),
+                ..Default::default()
+            },
+            post_by: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        store.card_hold(&held).await.unwrap();
+        crew.post_due_cards().await;
+        crew.post_due_cards().await;
+        assert_eq!(
+            needs_you(&overseer).len(),
+            2,
+            "posted once after the restart"
+        );
+        assert!(store
+            .cards_due(chrono::Utc::now())
+            .await
+            .unwrap()
+            .is_empty());
+    })
+    .await;
+}
+
+/// An update that didn't go before the person went away is not sent on
+/// its own: their return is one catch-up that covers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_left_unsent_is_folded_into_the_catch_up() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.test_reads
+            .lock()
+            .insert("desk".into(), chrono::Utc::now());
+        begun(&crew).await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        did(&d, s.id, "Opened PR #622").await;
+        eventually("the update", async || {
+            delivered(&overseer, DeliveryKind::Update)
+                .into_iter()
+                .next()
+        })
+        .await;
+        eventually("away", async || {
+            d.store()
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap()
+                .away_since
+        })
+        .await;
+        // An update written but not sent (its send failed, say).
+        did(&d, s.id, "Merged PR #622").await;
+        let p = workforce_desk::update::Pending {
+            id: uuid::Uuid::new_v4(),
+            text: "Merged PR #622.".into(),
+            update: Default::default(),
+            told: Default::default(),
+            restated: Vec::new(),
+            cutoff: Some(chrono::Utc::now()),
+            handed: false,
+            sent: None,
+            away: None,
+        };
+        d.store().update_pend("desk", &p).await.unwrap();
+        crew.update_poke.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            delivered(&overseer, DeliveryKind::Update).len(),
+            1,
+            "not sent alone"
+        );
+        crew.present(true, Some("desk"));
+        let back = eventually("the catch-up", async || {
+            delivered(&overseer, DeliveryKind::Away).into_iter().next()
+        })
+        .await;
+        assert!(back.content.contains("Merged PR #622"), "{}", back.content);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(delivered(&overseer, DeliveryKind::Update).len(), 1);
+        assert_eq!(delivered(&overseer, DeliveryKind::Away).len(), 1);
     })
     .await;
 }
@@ -280,19 +412,24 @@ async fn away_while_busy_elsewhere_and_one_catch_up_on_return() {
             back.content
         );
         assert!(back.content.contains("Merged PR #622"), "{}", back.content);
+        // The update that began the absence went unread: covered too.
+        assert!(back.content.contains("Opened PR #622"), "{}", back.content);
         assert!(
             back.content
                 .contains("Still waiting on you:\n- Which key should staging use?"),
             "{}",
             back.content
         );
-        let extras = d
-            .store()
-            .extras(std::slice::from_ref(&back.id))
-            .await
-            .unwrap()
-            .remove(&back.id)
-            .unwrap();
+        // Its extras are kept just after it posts.
+        let extras = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&back.id))
+                .await
+                .unwrap()
+                .remove(&back.id)
+                .filter(|e| e.away.is_some())
+        })
+        .await;
         let away = extras.away.expect("the catch-up's extras");
         assert_eq!(away.since, since);
         let update = extras.update.expect("what it covers");

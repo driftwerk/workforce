@@ -595,8 +595,9 @@ impl CrewHub {
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
     /// for a check-in. While the person types to the boss it goes once they
-    /// pause, at most three minutes on, without holding up the caller.
-    /// Whether it went out, or will.
+    /// pause or send, at most three minutes on, without holding up the
+    /// caller, and only while `i` is still open. Whether it went out, or
+    /// will.
     pub(crate) async fn post_item(
         &self,
         boss: &str,
@@ -604,64 +605,12 @@ impl CrewHub {
         text: String,
         approvals: Vec<MentionedApproval>,
     ) -> bool {
-        if self.typing_release(boss).is_none() {
-            return self.post_item_now(boss, i, text, approvals).await;
-        }
-        if self.overseer_named(boss).is_none() {
-            return false;
-        }
-        let crew = self.me();
-        let (boss, i) = (boss.to_string(), i.clone());
-        tokio::spawn(async move {
-            crew.after_typing(&boss).await;
-            crew.post_item_now(&boss, &i, text, approvals).await;
-        });
-        true
-    }
-
-    async fn post_item_now(
-        &self,
-        boss: &str,
-        i: &OpenItem,
-        text: String,
-        approvals: Vec<MentionedApproval>,
-    ) -> bool {
-        let Some((service, _)) = self.overseer_named(boss) else {
-            return false;
-        };
-        let Some(owner) = self.person(Some(&service)) else {
-            return false;
-        };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
-                return false;
-            }
-        };
         let extras = Extras {
             item: Some(i.mention()),
             approvals,
             ..Default::default()
         };
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, boss, &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "keeping an open item's buttons failed");
-        }
-        true
+        self.card(boss, Some(i.id), text, extras).await
     }
 
     /// A DM reply of `boss`'s, in a turn that started at `started`, that

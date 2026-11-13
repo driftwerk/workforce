@@ -367,12 +367,21 @@ impl CrewHub {
         // While the person types to it, or its reply is being written,
         // nothing of this goes out: the next look sends it.
         let held = self.update_held(boss, dm.session.as_deref());
+        let mut state = state;
         if let Some(p) = state.pending.clone() {
-            if held && p.sent.is_none() {
+            // An update that didn't go before the person went away (a
+            // failed send, a restart): the catch-up covers it, rather than
+            // a second message for one return.
+            let away = state.away_since.is_some() || dm.away.is_some();
+            if away && p.away.is_none() && p.sent.is_none() && !p.handed {
+                store.update_unpend(boss).await?;
+                state.pending = None;
+            } else if held && p.sent.is_none() {
                 self.poke_at_release(boss);
                 return Ok(());
+            } else {
+                return self.resume(service, &owner, o, &state, p).await;
             }
-            return self.resume(service, &owner, o, &state, p).await;
         }
         // Away: what changes gathers for their return. Back: one catch-up.
         let away = match (state.away_since, dm.away) {
@@ -384,7 +393,10 @@ impl CrewHub {
             (Some(since), None) if !held => {
                 return self.catch_up(service, &owner, o, &state, since).await;
             }
-            (Some(_), None) => return Ok(()),
+            (Some(_), None) => {
+                self.poke_at_release(boss);
+                return Ok(());
+            }
             (None, None) => false,
         };
         let b = self.batch(service, o, &state, now, None).await;
@@ -832,7 +844,11 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = every.tick() => crew.look_at_updates().await,
+            _ = every.tick() => {
+                // Held needs-you a restart left: theirs by now.
+                crew.post_due_cards().await;
+                crew.look_at_updates().await;
+            }
             // The person paused typing, came back, or wrote: look now.
             () = crew.update_poke.notified() => crew.look_at_updates().await,
         }

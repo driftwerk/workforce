@@ -181,6 +181,8 @@ pub struct CrewHub {
     /// Wakes the updates' look at once: the person paused typing, came
     /// back, or wrote.
     update_poke: tokio::sync::Notify,
+    /// Wakes what waits on the person's typing: they sent.
+    typing_done: tokio::sync::Notify,
     /// How far the person read each boss's DM, for a test whose sessions
     /// keep no read points.
     #[cfg(test)]
@@ -562,6 +564,7 @@ impl CrewHub {
             presence: Mutex::default(),
             on_screen: Mutex::default(),
             update_poke: tokio::sync::Notify::new(),
+            typing_done: tokio::sync::Notify::new(),
             #[cfg(test)]
             test_reads: Mutex::default(),
             work: Mutex::default(),

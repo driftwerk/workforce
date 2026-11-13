@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use eyre::Result;
 use uuid::Uuid;
 
+use crate::crew::Extras;
 use crate::store::DeskStore;
 use crate::update::{Pending, Told, UpdateState};
 
@@ -159,4 +160,73 @@ impl DeskStore {
             .await?;
         Ok(n == 1)
     }
+
+    /// Keeps a needs-you card held while the person types to `card.boss`,
+    /// to go out by `card.post_by` at the latest, a restart or not.
+    pub async fn card_hold(&self, card: &HeldCard) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO boss_held_cards (id, boss, item_id, text, extras, post_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+                &[
+                    &card.id,
+                    &card.boss,
+                    &card.item_id,
+                    &card.text,
+                    &serde_json::to_value(&card.extras)?,
+                    &card.post_by,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Takes held card `id` to post it: whether this call took it (another
+    /// caller, or a look after a restart, finds it gone).
+    pub async fn card_take(&self, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute("DELETE FROM boss_held_cards WHERE id = $1", &[&id])
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// The held cards due by `now`: those whose hold no live wait is left
+    /// to end, as after a restart.
+    pub async fn cards_due(&self, now: DateTime<Utc>) -> Result<Vec<HeldCard>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT id, boss, item_id, text, extras, post_by FROM boss_held_cards \
+                 WHERE post_by <= $1 ORDER BY post_by LIMIT 100",
+                &[&now],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(HeldCard {
+                    id: r.try_get(0)?,
+                    boss: r.try_get(1)?,
+                    item_id: r.try_get(2)?,
+                    text: r.try_get(3)?,
+                    extras: serde_json::from_value(r.try_get(4)?).unwrap_or_default(),
+                    post_by: r.try_get(5)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A needs-you card held while the person types in its boss's DM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldCard {
+    pub id: Uuid,
+    pub boss: String,
+    /// The open item it puts to the person, while it has one.
+    pub item_id: Option<Uuid>,
+    pub text: String,
+    pub extras: Extras,
+    /// When it goes out at the latest.
+    pub post_by: DateTime<Utc>,
 }

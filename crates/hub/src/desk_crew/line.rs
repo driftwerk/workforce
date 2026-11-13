@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Extras, MentionedQuestion, PartyKind};
@@ -178,7 +177,7 @@ impl CrewHub {
                 .overseer_of_group(q.group.as_deref())
                 .map(|(s, _)| s.agent_id.as_str().to_string()),
         };
-        let Some((service, owner)) = boss.and_then(|b| self.dm(&b)) else {
+        let Some((service, _)) = boss.and_then(|b| self.dm(&b)) else {
             return;
         };
         let e = q.escalation.clone().unwrap_or(Escalation {
@@ -202,59 +201,21 @@ impl CrewHub {
         item.line_message = Some(q.id);
         item.options = e.options.clone();
         item.recommendation = e.draft.clone();
-        match self.desk.store().item_open(&item).await {
-            Ok(Opened::New(_)) => {}
+        let item_id = match self.desk.store().item_open(&item).await {
+            Ok(Opened::New(i)) => Some(i.id),
             Ok(Opened::Again(_)) => return,
             // Kept or not, the person still gets the question.
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "keeping a session's question as an open item failed");
+                None
             }
-        }
-        // While the person types to the boss, the card waits for a pause,
-        // at most three minutes, without holding up the caller.
-        let boss = service.agent_id.as_str().to_string();
-        if self.typing_release(&boss).is_some() {
-            let crew = self.me();
-            let q = q.clone();
-            tokio::spawn(async move {
-                crew.after_typing(&boss).await;
-                crew.question_card(&service, &owner, &q, e).await;
-            });
-            return;
-        }
-        self.question_card(&service, &owner, q, e).await;
-    }
-
-    /// Puts `q`'s card in `service`'s DM with `owner`, asked with `e`.
-    async fn question_card(
-        &self,
-        service: &Arc<AgentService>,
-        owner: &str,
-        q: &LineMessage,
-        e: Escalation,
-    ) {
+        };
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
             crew::one_line(q.headline(), 400),
             e.why
         );
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = crate::desk_surface::deliver(
-            service,
-            owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await;
-        let delivered = match delivered {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting a session's question in the DM failed");
-                return;
-            }
-        };
         let extras = Extras {
             questions: vec![MentionedQuestion {
                 message_id: q.id.to_string(),
@@ -267,14 +228,10 @@ impl CrewHub {
             }],
             ..Default::default()
         };
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, service.agent_id.as_str(), &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "keeping a question card failed");
-        }
+        // While the person types to the boss, the card waits for a pause,
+        // at most three minutes, without holding up the caller.
+        self.card(service.agent_id.as_str(), item_id, text, extras)
+            .await;
     }
 
     /// Gives every question in `asks` (of `session`) to the person, saying

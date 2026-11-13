@@ -197,14 +197,16 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
                 "written plainly: {}",
                 posted.content
             );
-            let extras = d
-                .store()
-                .extras(std::slice::from_ref(&posted.id))
-                .await
-                .unwrap()
-                .remove(&posted.id)
-                .and_then(|e| e.update)
-                .unwrap();
+            // Its extras are kept just after it posts.
+            let extras = eventually("its extras", async || {
+                d.store()
+                    .extras(std::slice::from_ref(&posted.id))
+                    .await
+                    .unwrap()
+                    .remove(&posted.id)
+                    .and_then(|e| e.update)
+            })
+            .await;
             assert_eq!(extras.decisions, vec![row.line()]);
         })
         .await;
