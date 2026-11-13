@@ -1801,6 +1801,16 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
         d.pull_board(b.id, &remote).await.unwrap();
         let again = d.ticket(one.ticket.id).await.unwrap();
         assert!(again.ticket.needs.is_empty(), "{:?}", again.ticket.needs);
+        // Nor after a change of its own goes out.
+        let mut t = again.ticket.clone();
+        let e = t.external.as_mut().unwrap();
+        let sent = crate::board::Seen {
+            title: "Renamed here".into(),
+            needs: vec![],
+            ..e.seen.clone()
+        };
+        crate::board_sync::pushed(e, &sent, None, false);
+        assert_eq!(e.seen.needs, vec!["ACME-2".to_string()]);
         // Unblocked there: the need a pull made goes.
         *remote.blocked.lock().unwrap() = false;
         *remote.updated.lock().unwrap() = "2026-11-09T11:00:00.000+0000".into();
