@@ -15,6 +15,68 @@ use super::client::LinearClient;
 
 use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
 
+/// The largest page a `rich` listing reads: its relations and sub-issues
+/// raise each issue's share of Linear's per-query complexity.
+const RICH_PAGE: u64 = 50;
+
+/// What a `rich` listing and `issue_get` select besides an issue's own
+/// fields: its estimate, cycle, creator, what it blocks and is blocked by
+/// (Linear keeps "A blocks B" once: in A's `relations`, with B as
+/// `relatedIssue`, and in B's `inverseRelations`, with A as `issue`), and
+/// its sub-issues' states, for "n of m done". `linear.issue_get` asks for
+/// the same counts, so a ticket read whole says what its listing says.
+const RICH_ISSUE_FIELDS: &str = r#"
+                        estimate
+                        cycle { number name startsAt endsAt }
+                        creator { name }
+                        relations(first: 10) {
+                            nodes { type relatedIssue { identifier title state { name type } } }
+                        }
+                        inverseRelations(first: 10) {
+                            nodes { type issue { identifier title state { name type } } }
+                        }
+                        children(first: 25) { nodes { identifier state { type } } }"#;
+
+/// The few things Desk reads of an attachment's integration `metadata` (a
+/// pull request's status, number, whether it is a draft or merged, and its
+/// review decision): the rest is arbitrary JSON from the integration
+/// (titles, branch names, reviewers), so it never reaches a caller.
+const ATTACHMENT_METADATA_KEYS: &[&str] = &[
+    "status",
+    "state",
+    "draft",
+    "merged",
+    "number",
+    "reviewDecision",
+];
+
+/// `issue`'s attachments' metadata cut down to [`ATTACHMENT_METADATA_KEYS`],
+/// each a number, a bool or a short string.
+fn slim_attachments(issue: &mut Value) {
+    let Some(nodes) = issue
+        .get_mut("attachments")
+        .and_then(|a| a.get_mut("nodes"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for node in nodes {
+        let Some(meta) = node.get_mut("metadata") else {
+            continue;
+        };
+        let kept: serde_json::Map<String, Value> = ATTACHMENT_METADATA_KEYS
+            .iter()
+            .filter_map(|k| {
+                let v = meta.get(*k)?;
+                let small =
+                    v.is_number() || v.is_boolean() || v.as_str().is_some_and(|s| s.len() <= 40);
+                small.then(|| ((*k).to_string(), v.clone()))
+            })
+            .collect();
+        *meta = Value::Object(kept);
+    }
+}
+
 /// A description that arrives as one line with its newlines written out
 /// (`\n` as two characters, as a model sometimes sends them) is turned
 /// into real line breaks; text with real ones is left alone.
@@ -222,6 +284,10 @@ impl Tool for LinearIssueListTool {
                     "type": "string",
                     "description": "With open_only: also issues completed at or after this ISO 8601 time"
                 },
+                "rich": {
+                    "type": "boolean",
+                    "description": "Also each issue's estimate, cycle, creator, relations, sub-issues' states and attachment metadata (pages of at most 50)"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -249,7 +315,14 @@ impl Tool for LinearIssueListTool {
             }
         };
 
-        let limit = coerce_to_u64(&input["limit"]).unwrap_or(50).min(100);
+        // A board's sync asks for more of each issue (`rich`): its relations,
+        // sub-issues' states, estimate, cycle and creator. That costs more of
+        // Linear's per-query complexity, so its pages are smaller.
+        let rich = input["rich"].as_bool() == Some(true);
+        let limit =
+            coerce_to_u64(&input["limit"])
+                .unwrap_or(50)
+                .min(if rich { RICH_PAGE } else { 100 });
 
         // Build filter conditions
         let mut filters = Vec::new();
@@ -375,28 +448,40 @@ impl Tool for LinearIssueListTool {
                                 subtitle
                                 url
                                 sourceType
-                                createdAt
+                                createdAt{}
                             }}
                         }}
                         createdAt
                         updatedAt
-                        url
+                        url{}
                     }}
                 }}
             }}
             "#,
-            params, limit, page, filter_clause
+            params,
+            limit,
+            page,
+            filter_clause,
+            if rich {
+                "\n                                metadata"
+            } else {
+                ""
+            },
+            if rich { RICH_ISSUE_FIELDS } else { "" },
         );
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match client.query(&query, Value::Object(variables)).await {
             Ok(data) => {
-                let issues = data
+                let mut issues = data
                     .get("issues")
                     .and_then(|i| i.get("nodes"))
                     .cloned()
                     .unwrap_or(serde_json::json!([]));
+                if let Some(nodes) = issues.as_array_mut() {
+                    nodes.iter_mut().for_each(slim_attachments);
+                }
                 let count = issues.as_array().map(|a| a.len()).unwrap_or(0);
                 let info = &data["issues"]["pageInfo"];
                 let page_info = serde_json::json!({
@@ -532,16 +617,26 @@ impl Tool for LinearIssueGetTool {
                         identifier
                         title
                     }
-                    children(first: 50) {
+                    children(first: 25) {
                         nodes {
                             id
                             identifier
                             title
                             state {
                                 name
+                                type
                             }
                             priority
                         }
+                    }
+                    estimate
+                    cycle { number name startsAt endsAt }
+                    creator { name }
+                    relations(first: 10) {
+                        nodes { type relatedIssue { identifier title state { name type } } }
+                    }
+                    inverseRelations(first: 10) {
+                        nodes { type issue { identifier title state { name type } } }
                     }
                     labels {
                         nodes {
@@ -559,6 +654,7 @@ impl Tool for LinearIssueGetTool {
                             url
                             sourceType
                             createdAt
+                            metadata
                         }
                     }
                     createdAt
@@ -581,7 +677,9 @@ impl Tool for LinearIssueGetTool {
                         ));
                     }
                     info!(identifier, "Retrieved Linear issue");
-                    let wrapped_issue = wrap_description_field(issue, "Linear issue description");
+                    let mut issue = issue.clone();
+                    slim_attachments(&mut issue);
+                    let wrapped_issue = wrap_description_field(&issue, "Linear issue description");
                     Ok(ToolResult::success(
                         serde_json::json!({ "issue": wrapped_issue }),
                         duration_ms,
@@ -4197,6 +4295,24 @@ impl Tool for LinearIssueChildrenTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_attachment_s_metadata_keeps_only_what_desk_reads() {
+        let mut issue = serde_json::json!({ "attachments": { "nodes": [
+            { "url": "https://github.com/acme/app/pull/7", "metadata": {
+                "status": "open", "number": 7, "draft": false,
+                "title": "a title the integration wrote", "branch": "kh/secret-plan",
+                "reviewers": [{ "name": "Ana" }], "state": "x".repeat(200)
+            } },
+            { "url": "https://example.test/doc" }
+        ] } });
+        slim_attachments(&mut issue);
+        assert_eq!(
+            issue["attachments"]["nodes"][0]["metadata"],
+            serde_json::json!({ "status": "open", "number": 7, "draft": false })
+        );
+        assert!(issue["attachments"]["nodes"][1].get("metadata").is_none());
+    }
+
     use super::*;
 
     #[test]

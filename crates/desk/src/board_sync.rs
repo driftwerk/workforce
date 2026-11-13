@@ -14,7 +14,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::board::{Assignee, Filter, System, Ticket, TicketState};
+use crate::board::{
+    Assignee, Facts, Filter, IssueLink, IssueRef, LinkRel, PrSummary, Progress, Sprint, System,
+    Ticket, TicketState,
+};
 use crate::crew::{Party, PartyKind};
 
 // ── Tools ────────────────────────────────────────────────────────────────
@@ -453,13 +456,97 @@ pub const JIRA_FIELDS: &[&str] = &[
     "priority",
     "duedate",
     "attachment",
+    "issuetype",
+    "parent",
+    "subtasks",
+    "issuelinks",
+    "components",
+    "fixVersions",
+    "comment",
+    "created",
+    "reporter",
 ];
+
+/// The site's own custom fields a Jira call asks for, by role
+/// (`jira.search`'s and `jira.get_issue`'s `custom_fields`): none before
+/// they are read, or on a site without them.
+pub fn custom_fields_arg(fields: Option<&crate::board::JiraFields>) -> Value {
+    let Some(f) = fields else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (role, id) in [
+        ("points", &f.points),
+        ("sprint", &f.sprint),
+        ("start_date", &f.start_date),
+        ("development", &f.development),
+    ] {
+        if let Some(id) = id {
+            out.insert(role.into(), json!(id));
+        }
+    }
+    Value::Object(out)
+}
+
+/// The tool and arguments that read `key`'s issue whole on `system`, with
+/// a Jira site's own fields when they are known.
+pub fn read_issue_call(
+    system: System,
+    key: &str,
+    fields: Option<&crate::board::JiraFields>,
+) -> (&'static str, Value) {
+    match system {
+        System::Jira => (
+            "jira.get_issue",
+            json!({ "issue_key": key, "custom_fields": custom_fields_arg(fields) }),
+        ),
+        System::Linear => ("linear.issue_get", json!({ "identifier": key })),
+    }
+}
+
+/// A Jira site's priorities, highest first, once read; none on Linear,
+/// whose issues rank their own.
+pub fn priorities(s: &crate::board::Sync) -> &[String] {
+    s.fields.as_ref().map_or(&[], |f| f.priorities.as_slice())
+}
+
+/// How long a Jira site's fields, once read, are kept before they are read
+/// again.
+pub const FIELDS_FRESH: Duration = Duration::days(1);
+
+/// The site's fields `jira.list_fields` answered, read at `at`.
+pub fn jira_fields(answer: &Value, at: DateTime<Utc>) -> crate::board::JiraFields {
+    let id = |role: &str| {
+        answer["fields"][role]
+            .as_str()
+            .filter(|id| id.starts_with("customfield_"))
+            .map(str::to_string)
+    };
+    crate::board::JiraFields {
+        points: id("points"),
+        sprint: id("sprint"),
+        start_date: id("start_date"),
+        development: id("development"),
+        priorities: answer["priorities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| short(&p["name"], 60))
+            .take(50)
+            .collect(),
+        read_at: at,
+    }
+}
 
 /// A priority as an issue names it: none when it says it has none.
 fn priority_of(v: &Value) -> Option<String> {
     let p = name_of(v)?;
     let lower = p.to_ascii_lowercase();
-    (!matches!(lower.as_str(), "no priority" | "none" | "")).then_some(p)
+    (!matches!(
+        lower.trim(),
+        "no priority" | "none" | "" | "not prioritised" | "not prioritized" | "unprioritised"
+    ))
+    .then_some(p)
 }
 
 /// A due date as Jira or Linear writes it (`2026-11-14`).
@@ -479,7 +566,10 @@ pub fn linear_args(
     since: Option<&str>,
     after: Option<&str>,
 ) -> Value {
-    let mut args = json!({ "team_id": team_id, "limit": 100 });
+    // Rich: each issue's relations, sub-issues, estimate and cycle too, on
+    // pages of 50 (Linear's per-query complexity); a hub whose tool doesn't
+    // take it answers as before.
+    let mut args = json!({ "team_id": team_id, "limit": LINEAR_PAGE, "rich": true });
     if let Some(since) = since {
         args["updated_since"] = json!(since);
     }
@@ -764,6 +854,8 @@ pub struct Issue {
     /// The files it holds, when the answer says (`None`: an older hub's,
     /// which leaves what is known).
     pub files: Option<Vec<crate::ticket_files::RemoteFile>>,
+    /// Everything else it says of itself.
+    pub facts: Facts,
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
@@ -1217,7 +1309,15 @@ pub fn pushed(
     noted: Option<TicketState>,
     body_sent: bool,
 ) {
+    // A need pulled from a blocker there and taken off here is remembered
+    // as seen while the remote still names it, so it isn't pulled again: a
+    // push never takes a link away there, and only sends keys not seen.
+    let taken_off: Vec<String> = blockers(&e.details.facts)
+        .into_iter()
+        .filter(|k| e.seen.needs.contains(k) && !sent.needs.contains(k))
+        .collect();
     e.seen = sent.clone();
+    e.seen.needs.extend(taken_off);
     e.noted = noted;
     if body_sent {
         e.html_read = HTML_READ;
@@ -1300,7 +1400,8 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
             .filter_map(Value::as_str)
             .map(|l| unfence(l).0)
             .collect(),
-        blocked_by: None,
+        // Its links say what blocks it, when the answer carries them.
+        blocked_by: i.get("issuelinks").map(|_| blockers(&jira_facts(i))),
         assignee: jira_assignee(i),
         closed: i
             .get("status_category")
@@ -1310,6 +1411,7 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
         project: None,
         due: due_of(&i["duedate"]),
         files: crate::ticket_files::jira_files(i),
+        facts: jira_facts(i),
         key,
     })
 }
@@ -1332,16 +1434,9 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let (body, f2) = text_field(&i["description"]);
     let (body, clipped) = held_body(unescape_newlines(&body));
     let files = crate::ticket_files::linear_files(i, &body);
-    let blocked_by = i.get("relations").map(|r| {
-        r.get("nodes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|n| n["type"].as_str() == Some("blocks"))
-            .filter_map(|n| n["relatedIssue"]["identifier"].as_str())
-            .filter_map(parse_issue_key)
-            .collect()
-    });
+    let facts = linear_facts(i);
+    // What blocks it is in its inverse relations, when the answer has them.
+    let blocked_by = i.get("inverseRelations").map(|_| blockers(&facts));
     Some(Issue {
         key,
         id: i.get("id").and_then(Value::as_str).map(str::to_string),
@@ -1369,13 +1464,25 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         project: name_of(&i["project"]["name"]),
         due: due_of(&i["dueDate"]),
         files: Some(files),
+        facts,
     })
 }
 
 /// What `issue` says of itself, kept on its ticket: its priority, labels,
 /// project and due date, with when its issue was last read whole carried
 /// over from `was`.
-pub fn details_of(issue: &Issue, was: Option<&crate::board::Details>) -> crate::board::Details {
+pub fn details_of(
+    issue: &Issue,
+    was: Option<&crate::board::Details>,
+    priorities: &[String],
+) -> crate::board::Details {
+    let mut facts = issue.facts.clone();
+    if facts.priority_rank.is_none() {
+        facts.priority_rank = issue
+            .priority
+            .as_deref()
+            .and_then(|p| priority_rank(p, priorities));
+    }
     crate::board::Details {
         priority: issue.priority.clone(),
         labels: issue
@@ -1388,7 +1495,353 @@ pub fn details_of(issue: &Issue, was: Option<&crate::board::Details>) -> crate::
         due: issue.due,
         read_at: was.and_then(|d| d.read_at),
         comments_at: was.and_then(|d| d.comments_at),
+        facts,
     }
+}
+
+// ── What an issue says of itself ─────────────────────────────────────────
+
+/// A time as Jira (`2026-09-09T11:15:54.466+0100`) or Linear writes it.
+fn any_time(v: &Value) -> Option<DateTime<Utc>> {
+    let s = v.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// A count as an answer gives it.
+fn count_of(v: &Value) -> Option<u32> {
+    v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// Someone else's short words (a name, a component), on one line.
+fn short(v: &Value, max: usize) -> Option<String> {
+    let s = unfence(v.as_str()?).0;
+    let s = crate::crew::one_line(s.trim(), max);
+    (!s.is_empty()).then_some(s)
+}
+
+/// Another issue as Jira's search or read says it (`key`, `summary`,
+/// `issuetype`, `status`, `status_category`).
+fn jira_ref(v: &Value) -> Option<IssueRef> {
+    Some(IssueRef {
+        key: parse_issue_key(v["key"].as_str()?)?,
+        title: short(&v["summary"], 200).unwrap_or_default(),
+        kind: short(&v["issuetype"], 40),
+        state: short(&v["status"], 60),
+        done: v["status_category"].as_str().map(|c| c == "done"),
+    })
+}
+
+/// Another issue as Linear says it (`identifier`, `title`, `state`).
+fn linear_ref(v: &Value) -> Option<IssueRef> {
+    Some(IssueRef {
+        key: parse_issue_key(v["identifier"].as_str()?)?,
+        title: short(&v["title"], 200).unwrap_or_default(),
+        kind: None,
+        state: short(&v["state"]["name"], 60),
+        done: v["state"]["type"]
+            .as_str()
+            .map(|k| matches!(k, "completed" | "canceled" | "cancelled")),
+    })
+}
+
+/// A Jira PR state as Desk says it.
+fn pr_state(state: &str) -> String {
+    match state.to_ascii_lowercase().as_str() {
+        "merged" => "merged",
+        "declined" | "closed" => "declined",
+        "draft" => "draft",
+        "review" | "in_review" | "inreview" => "review",
+        "changes_requested" | "changesrequested" | "changes" => "changes",
+        _ => "open",
+    }
+    .to_string()
+}
+
+/// A pull request's number, from its address (`…/pull/248`).
+fn pr_number(url: &str) -> Option<u32> {
+    let (_, rest) = url
+        .split_once("/pull/")
+        .or_else(|| url.split_once("/merge_requests/"))?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The sprint a Jira issue is in: its active one, else the next to come,
+/// else the last it was in.
+fn jira_sprint(v: &Value) -> Option<Sprint> {
+    let all = v.as_array()?;
+    let state = |s: &&Value, st: &str| s["state"].as_str() == Some(st);
+    let s = all
+        .iter()
+        .find(|s| state(s, "active"))
+        .or_else(|| all.iter().find(|s| state(s, "future")))
+        .or_else(|| all.last())?;
+    Some(Sprint {
+        name: short(&s["name"], 60),
+        number: None,
+        starts: due_of(&s["start"]),
+        ends: due_of(&s["end"]),
+    })
+}
+
+/// What a `jira.search` row or `jira.get_issue` answer says of its issue
+/// besides its words.
+fn jira_facts(i: &Value) -> Facts {
+    let level = i["issuetype_level"]
+        .as_i64()
+        .and_then(|l| i8::try_from(l).ok());
+    let parent = jira_ref(&i["parent"]);
+    let epic = parent
+        .clone()
+        .filter(|_| i["parent"]["hierarchy_level"].as_i64() == Some(1));
+    let links = i["issuelinks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            let issue = jira_ref(l)?;
+            let blocks = l["link_type"].as_str() == Some("Blocks");
+            let rel = match (blocks, l["direction"].as_str()) {
+                (true, Some("inward")) => LinkRel::BlockedBy,
+                (true, Some("outward")) => LinkRel::Blocks,
+                _ => LinkRel::Other,
+            };
+            Some(IssueLink {
+                words: (rel == LinkRel::Other)
+                    .then(|| short(&l["relation"], 40))
+                    .flatten(),
+                rel,
+                issue,
+            })
+        })
+        .take(50)
+        .collect();
+    let sub_items = i["subtasks"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .map(|s| Progress {
+            done: s
+                .iter()
+                .filter(|t| t["status_category"].as_str() == Some("done"))
+                .count() as u32,
+            total: s.len() as u32,
+        });
+    let prs = count_of(&i["development"]["count"])
+        .filter(|n| *n > 0)
+        .map(|count| PrSummary {
+            count,
+            state: pr_state(i["development"]["state"].as_str().unwrap_or_default()),
+            number: None,
+            url: None,
+        });
+    let reporter = match &i["reporter"] {
+        Value::Object(r) => short(r.get("display_name").unwrap_or(&Value::Null), 80),
+        r => short(r, 80),
+    };
+    Facts {
+        priority_rank: None,
+        kind: short(&i["issuetype"], 40),
+        kind_level: level,
+        remote_state: short(&i["status"], 60),
+        state_kind: None,
+        parent,
+        epic,
+        points: i["points"].as_f64().filter(|p| p.is_finite() && *p >= 0.0),
+        sprint: jira_sprint(&i["sprint"]),
+        sub_items,
+        links,
+        components: names(&i["components"]),
+        fix_versions: names(&i["fix_versions"]),
+        reporter,
+        created: any_time(&i["created"]),
+        start: due_of(&i["start_date"]),
+        comments: count_of(&i["comment_total"]).or_else(|| count_of(&i["comment_count"])),
+        prs,
+    }
+}
+
+/// A list of someone else's names, at most 20.
+fn names(v: &Value) -> Vec<String> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| short(n, 60))
+        .take(20)
+        .collect()
+}
+
+/// What a Linear issue says of itself besides its words.
+fn linear_facts(i: &Value) -> Facts {
+    let mut links: Vec<IssueLink> = vec![];
+    // "A blocks B" is in A's relations (B the related issue) and in B's
+    // inverse relations (A the issue).
+    for n in i["inverseRelations"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(issue) = linear_ref(&n["issue"]) {
+            let rel = match n["type"].as_str() {
+                Some("blocks") => LinkRel::BlockedBy,
+                _ => LinkRel::Other,
+            };
+            links.push(IssueLink {
+                words: linear_words(&n["type"], false).filter(|_| rel == LinkRel::Other),
+                rel,
+                issue,
+            });
+        }
+    }
+    for n in i["relations"]["nodes"].as_array().into_iter().flatten() {
+        if let Some(issue) = linear_ref(&n["relatedIssue"]) {
+            let rel = match n["type"].as_str() {
+                Some("blocks") => LinkRel::Blocks,
+                _ => LinkRel::Other,
+            };
+            links.push(IssueLink {
+                words: linear_words(&n["type"], true).filter(|_| rel == LinkRel::Other),
+                rel,
+                issue,
+            });
+        }
+    }
+    let children = i["children"]["nodes"].as_array().filter(|c| !c.is_empty());
+    let sub_items = children.map(|c| {
+        let kind = |n: &Value| n["state"]["type"].as_str().unwrap_or_default().to_string();
+        let live: Vec<String> = c
+            .iter()
+            .map(kind)
+            .filter(|k| !matches!(k.as_str(), "canceled" | "cancelled"))
+            .collect();
+        Progress {
+            done: live.iter().filter(|k| *k == "completed").count() as u32,
+            total: live.len() as u32,
+        }
+    });
+    let cycle = &i["cycle"];
+    let sprint = cycle.is_object().then(|| Sprint {
+        name: short(&cycle["name"], 60),
+        number: count_of(&cycle["number"]),
+        starts: due_of(&cycle["startsAt"]),
+        ends: due_of(&cycle["endsAt"]),
+    });
+    Facts {
+        priority_rank: i["priority"]
+            .as_u64()
+            .filter(|p| (1..=4).contains(p))
+            .map(|p| p as u8),
+        kind: None,
+        kind_level: None,
+        remote_state: short(&i["state"]["name"], 60),
+        state_kind: i["state"]["type"].as_str().map(str::to_string),
+        parent: linear_ref(&i["parent"]),
+        epic: None,
+        points: i["estimate"]
+            .as_f64()
+            .filter(|p| p.is_finite() && *p >= 0.0),
+        sprint,
+        sub_items,
+        links: links.into_iter().take(50).collect(),
+        components: vec![],
+        fix_versions: vec![],
+        reporter: short(&i["creator"]["name"], 80),
+        created: any_time(&i["createdAt"]),
+        start: None,
+        comments: None,
+        prs: linear_prs(i),
+    }
+}
+
+/// How a Linear relation that isn't blocking reads, from either side.
+fn linear_words(kind: &Value, outward: bool) -> Option<String> {
+    Some(
+        match (kind.as_str()?, outward) {
+            ("duplicate", true) => "duplicates",
+            ("duplicate", false) => "is duplicated by",
+            ("similar", _) => "is similar to",
+            _ => "relates to",
+        }
+        .to_string(),
+    )
+}
+
+/// A Linear issue's pull requests, from the GitHub or GitLab attachments
+/// the integration keeps on it: how many, and the state they add up to.
+fn linear_prs(i: &Value) -> Option<PrSummary> {
+    let prs: Vec<(&Value, String)> = i["attachments"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let url = a["url"].as_str()?;
+            let source = a["sourceType"].as_str().unwrap_or_default();
+            let is_pr = pr_number(url).is_some()
+                && (source.starts_with("github")
+                    || source.starts_with("gitlab")
+                    || source.is_empty());
+            is_pr.then(|| (a, url.to_string()))
+        })
+        .collect();
+    if prs.is_empty() {
+        return None;
+    }
+    let state_of = |a: &Value| {
+        let m = &a["metadata"];
+        let s = m["status"]
+            .as_str()
+            .or(m["state"].as_str())
+            .unwrap_or_default();
+        match (s.to_ascii_lowercase().as_str(), m["draft"].as_bool()) {
+            (_, Some(true)) => "draft".to_string(),
+            ("approved" | "reviewrequested" | "review_requested" | "inreview", _) => {
+                "review".to_string()
+            }
+            (s, _) => pr_state(s),
+        }
+    };
+    let states: Vec<String> = prs.iter().map(|(a, _)| state_of(a)).collect();
+    // Open work comes first: one PR still open makes the issue's open.
+    let state = ["changes", "review", "open", "draft", "merged", "declined"]
+        .into_iter()
+        .find(|s| states.iter().any(|x| x == s))
+        .unwrap_or("open")
+        .to_string();
+    let one = (prs.len() == 1).then(|| prs[0].1.clone());
+    Some(PrSummary {
+        count: prs.len() as u32,
+        state,
+        number: one.as_deref().and_then(pr_number),
+        url: one,
+    })
+}
+
+/// The bars a Jira priority shows, by where it stands in the site's
+/// priorities, highest first: four or fewer take one each, more are spread
+/// over the four.
+pub fn priority_rank(name: &str, priorities: &[String]) -> Option<u8> {
+    let at = priorities.iter().position(|p| p.trim() == name.trim())?;
+    let n = priorities.len();
+    let rank = match n {
+        0 => return None,
+        1..=4 => at + 1,
+        _ => 1 + (at * 3 + (n - 1) / 2) / (n - 1),
+    };
+    Some(rank.clamp(1, 4) as u8)
+}
+
+/// The keys of the issues `facts` says it is blocked by.
+pub fn blockers(facts: &Facts) -> Vec<String> {
+    facts
+        .links
+        .iter()
+        .filter(|l| l.rel == LinkRel::BlockedBy)
+        .map(|l| l.issue.key.clone())
+        .collect()
 }
 
 // ── States ───────────────────────────────────────────────────────────────
@@ -1488,7 +1941,11 @@ impl Pulled {
 /// Who has `t`'s issue now, when `issue` says and it isn't who `t` last
 /// saw: kept in step whenever the issue is read, changed or not.
 pub fn assignee_changed(t: &Ticket, issue: &Issue) -> Option<Option<Assignee>> {
-    let e = t.external.as_ref()?;
+    assignee_changed_of(t.external.as_ref()?, issue)
+}
+
+/// The same, for the ticket's issue `e`.
+pub fn assignee_changed_of(e: &crate::board::External, issue: &Issue) -> Option<Option<Assignee>> {
     issue
         .assignee
         .clone()
@@ -1654,6 +2111,8 @@ pub const CALLS_PER_PASS: usize = 60;
 pub const PAGES_PER_PASS: usize = 20;
 /// The most issues the link dialog counts: past it, it says "or more".
 pub const MATCH_CEILING: usize = 2000;
+/// A page of Linear issues, read rich: smaller than a Jira page.
+pub const LINEAR_PAGE: usize = 50;
 /// A page of issues, as the sync asks for them.
 pub const PAGE: usize = 100;
 

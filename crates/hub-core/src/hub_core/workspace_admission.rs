@@ -342,6 +342,7 @@ mod tests {
         for ok in [
             "",
             "[skills]\nenabled = [\"linear\"]\nread_only = [\"linear\"]\nown_credential = [\"linear\"]\n",
+            "[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n\n[skills.connections]\njira = [\"acme\", \"globex\"]\n",
         ] {
             assert!(desk.review_toml(ok).unwrap().is_empty(), "{ok}");
             assert!(server.review_toml(ok).unwrap().is_empty(), "{ok}");

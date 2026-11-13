@@ -68,6 +68,7 @@ mod groups;
 mod handoff;
 #[cfg(test)]
 mod handoff_tests;
+mod knows;
 pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
 mod lifecycle;
 mod line;

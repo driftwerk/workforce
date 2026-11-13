@@ -2285,7 +2285,8 @@ mod uplink_tests {
         assert!(uplinks.decide_room(link).is_none());
         assert!(uplinks.decide_room(other).is_some(), "another link's own");
         drop(held);
-        // A minute: no more than its share, given back or not.
+        // A minute: no more than its share, given back or not; the one
+        // refused for room above counted too.
         for _ in DECIDES_AT_ONCE as u32 + 1..DECIDES_PER_MINUTE {
             assert!(uplinks.decide_room(link).is_some());
         }

@@ -698,8 +698,12 @@ pub(crate) async fn decision_call(
     .await;
     let response = response.map_err(|e| e.to_string())?;
     let model = response.model.clone();
+    // Charged to whom it runs as, when anyone: a remote boss's call, run as
+    // its link's person, counts against their budget too.
+    let identity = crate::user_config::current_billing_identity_id();
     service.cost_tracker.record(CostEntry {
         task_type: Some("desk_decision"),
+        identity_id: identity.as_deref(),
         description: Some("desk:decision"),
         served,
         ..CostEntry::new(

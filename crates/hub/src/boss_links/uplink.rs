@@ -1020,6 +1020,8 @@ async fn run(
                             socket.notify(super::decide::answered(link, id, Err(why.to_string())));
                         };
                         let Some((id, prompt)) = super::decide::asked(&frame) else {
+                            // Answered, and counted: a flood of them closes it.
+                            bad += 1;
                             refuse("not a decision its hub takes");
                             continue;
                         };
