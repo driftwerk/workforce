@@ -662,6 +662,25 @@ async fn an_account_closes_an_ask_only_with_the_switch_on() {
                 .clone();
             let mut a = workforce_desk::account::Account::new(s.id, "", chrono::Utc::now());
             a.by_model = true;
+            // A choice it made before it was asked settles nothing.
+            a.decisions.push(workforce_desk::account::Decision {
+                what: "Kept the export as it was".into(),
+                why: "Before the ask".into(),
+                at: i.opened_at - chrono::Duration::hours(1),
+            });
+            d.store().session_account_put(&a).await.unwrap();
+            crew.look_at_items().await;
+            assert_eq!(
+                d.store().open_item(i.id).await.unwrap().unwrap().state,
+                OpenState::Open,
+                "an older choice doesn't close it"
+            );
+            let mut a = d
+                .store()
+                .session_account(s.id)
+                .await
+                .unwrap()
+                .unwrap();
             a.decisions.push(workforce_desk::account::Decision {
                 what: "Went ahead without the export change".into(),
                 why: "The person didn't answer".into(),
@@ -680,4 +699,70 @@ async fn an_account_closes_an_ask_only_with_the_switch_on() {
         })
         .await;
     }
+}
+
+/// An answer from its button that doesn't reach the boss is never lost: the
+/// item is open again and the person is told.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_doesnt_reach_the_boss_opens_its_item_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let i = d
+            .store()
+            .item_open(&NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                None,
+                "Ship the docs today?",
+            ))
+            .await
+            .unwrap()
+            .item()
+            .clone();
+        let closed = d
+            .store()
+            .item_close(i.id, ClosedBy::Person, "You answered: Tomorrow")
+            .await
+            .unwrap()
+            .unwrap();
+        crew.answer_lost(&overseer, PERSON, &closed).await;
+        let again = d.store().open_item(i.id).await.unwrap().unwrap();
+        assert_eq!(again.state, OpenState::Open);
+        assert_eq!(again.closed_by, None);
+        eventually("the person told", async || {
+            dm_posts(
+                &overseer,
+                "Your answer to “Ship the docs today?” didn't reach",
+            )
+            .into_iter()
+            .next()
+        })
+        .await;
+        // Another of its key opened since: it isn't reopened over it.
+        let closed = d
+            .store()
+            .item_close(i.id, ClosedBy::Person, "You answered: Tomorrow")
+            .await
+            .unwrap()
+            .unwrap();
+        d.store()
+            .item_open(&NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                None,
+                "Ship the docs today?",
+            ))
+            .await
+            .unwrap();
+        assert!(!d.store().item_reopen(closed.id).await.unwrap());
+    })
+    .await;
 }

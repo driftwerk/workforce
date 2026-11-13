@@ -460,40 +460,50 @@ impl CrewHub {
                 .await
             {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
-                // Never lost: it is open again, and said so.
-                let reopened = crew
-                    .desk
-                    .store()
-                    .item_reopen(closed.id)
-                    .await
-                    .unwrap_or(false);
-                let text = match reopened {
-                    true => format!(
-                        "Your answer to “{}” didn't reach {} just now, so it is still open: answer it again.",
-                        crew::one_line(&closed.text, 200),
-                        super::name_of(&service)
-                    ),
-                    false => format!(
-                        "Your answer to “{}” didn't reach {} just now: say it again in this chat.",
-                        crew::one_line(&closed.text, 200),
-                        super::name_of(&service)
-                    ),
-                };
-                let target =
-                    DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-                if let Err(e) = crate::desk_surface::deliver(
-                    &service,
-                    &owner,
-                    &target,
-                    crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, "saying an answer didn't reach the boss failed");
-                }
+                crew.answer_lost(&service, &owner, &closed).await;
             }
         });
         Ok("Answered.".into())
+    }
+
+    /// The person's answer to `closed` didn't reach its boss: never lost,
+    /// the item is open again (when it can be), and the person is told.
+    pub(crate) async fn answer_lost(
+        &self,
+        service: &Arc<crate::serve::AgentService>,
+        owner: &str,
+        closed: &OpenItem,
+    ) {
+        let reopened = self
+            .desk
+            .store()
+            .item_reopen(closed.id)
+            .await
+            .unwrap_or(false);
+        let text = match reopened {
+            true => format!(
+                "Your answer to “{}” didn't reach {} just now, so it is still open: answer it again.",
+                crew::one_line(&closed.text, 200),
+                super::name_of(service)
+            ),
+            false => format!(
+                "Your answer to “{}” didn't reach {} just now: say it again in this chat.",
+                crew::one_line(&closed.text, 200),
+                super::name_of(service)
+            ),
+        };
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+        if let Err(e) = crate::desk_surface::deliver(
+            service,
+            owner,
+            &target,
+            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "saying an answer didn't reach the boss failed");
+        }
     }
 
     /// The person drops item `id` unanswered: a session's question is set
