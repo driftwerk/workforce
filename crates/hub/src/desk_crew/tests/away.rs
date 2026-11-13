@@ -108,20 +108,23 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
 
         // A short burst: out once they pause, before the cap.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let started = std::time::Instant::now();
-        let typing = type_for(&crew, 120);
+        let started = chrono::Utc::now();
+        let typing = type_for(&crew, 60);
         did(&d, s.id, "Merged PR #622").await;
-        eventually("the second update", async || {
-            (delivered(&overseer, DeliveryKind::Update).len() == 2).then_some(())
+        let second = eventually("the second update", async || {
+            delivered(&overseer, DeliveryKind::Update)
+                .into_iter()
+                .nth(1)
         })
         .await;
-        let at = started.elapsed();
-        assert!(typing.is_finished(), "held while typing: {at:?}");
-        // Out at the look after the pause, not one held on (the bound is
-        // loose for a loaded machine).
+        assert!(typing.is_finished(), "held while typing");
+        // Posted at the pause, before the cap (300 ms from when the typing
+        // began) would have let it go: when it was posted, not when the
+        // test saw it.
+        let at = second.timestamp - started;
         assert!(
-            at < Duration::from_millis(600),
-            "a pause lets it go: {at:?}"
+            at < chrono::Duration::milliseconds(280),
+            "a pause lets it go before the cap: {at:?}"
         );
     })
     .await;
@@ -508,6 +511,78 @@ async fn away_without_pings_from_the_read_point_alone() {
             .unwrap()
             .away_since
             .is_none());
+    })
+    .await;
+}
+
+/// At Watch and Suggest a check-in is the update: while the person is away
+/// it gathers for their return, rather than posting into the DM.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_in_that_only_tells_gathers_while_away() {
+    use workforce_desk::crew::{Event, Kind};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "acme-web finished.",
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n\
+             wake = { waiting_minutes = 0, quiet_minutes = 0 }\n\
+             updates = { every_minutes = 1, max_wait_minutes = 1, away_after_minutes = 5 }\n",
+            &[],
+        )
+        .await;
+        crew.test_reads
+            .lock()
+            .insert("desk".into(), chrono::Utc::now());
+        crew.present(true, None);
+        let store = d.store();
+        let s = session_party("acme-web");
+        d.note(Event::new(
+            Kind::Finished,
+            s.clone(),
+            Some(s),
+            "finished · all green",
+        ));
+        let first = eventually("the check-in", async || {
+            store.latest_check_in("desk").await.unwrap()
+        })
+        .await
+        .id;
+        // Its post unread, in the terminals: away.
+        eventually("away", async || {
+            crew.present(true, None);
+            store
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap()
+                .away_since
+        })
+        .await;
+        let s = session_party("workforce-e7");
+        d.note(Event::new(
+            Kind::Finished,
+            s.clone(),
+            Some(s),
+            "finished · merged",
+        ));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            store.latest_check_in("desk").await.unwrap().map(|c| c.id),
+            Some(first.clone()),
+            "gathered while away"
+        );
+        // Back: it goes.
+        crew.present(true, Some("desk"));
+        let next = eventually("the gathered check-in", async || {
+            store
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.id != first)
+        })
+        .await;
+        assert!(next.prompt.contains("workforce-e7"), "{}", next.prompt);
     })
     .await;
 }

@@ -8,6 +8,9 @@ CREATE TABLE boss_held_cards (
     item_id   UUID,
     text      TEXT        NOT NULL,
     extras    JSONB       NOT NULL,
-    post_by   TIMESTAMPTZ NOT NULL
+    post_by   TIMESTAMPTZ NOT NULL,
+    -- Taken to post until then: a post that fails or dies with the hub
+    -- leaves it to be taken again after.
+    claimed_until TIMESTAMPTZ
 );
 CREATE INDEX boss_held_cards_post_by ON boss_held_cards (post_by);

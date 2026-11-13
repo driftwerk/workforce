@@ -206,6 +206,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_held_cards",
+        "post_by",
+        NotPersonal("the time a held needs-you goes out by, not a party"),
+    ),
+    (
+        "desk",
         "boss_open_items",
         "closed_by",
         NotPersonal("which side closed it (person, session, boss, superseded, lapsed), not who"),

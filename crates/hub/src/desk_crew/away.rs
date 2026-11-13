@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
@@ -109,6 +109,17 @@ impl CrewHub {
         });
     }
 
+    /// Whether the person is away from `boss`'s DM, as last judged.
+    pub(super) async fn away_now(&self, boss: &str) -> bool {
+        match self.desk.store().update_state(boss, Utc::now()).await {
+            Ok(state) => state.away_since.is_some(),
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "whether the person is away couldn't be read");
+                false
+            }
+        }
+    }
+
     /// Waits while the person types in `boss`'s DM, at most the cap from
     /// now: until they pause, or send.
     pub(super) async fn after_typing(&self, boss: &str) {
@@ -157,7 +168,7 @@ impl CrewHub {
             .copied()
             .filter(|t| t.holds(Utc::now(), quiet, cap));
         let Some(typing) = typing else {
-            return self.deliver_card(boss, &text, &extras).await;
+            return self.deliver_card(boss, &text, &extras, None).await;
         };
         let card = HeldCard {
             id: Uuid::new_v4(),
@@ -183,7 +194,9 @@ impl CrewHub {
     }
 
     /// Posts the held `card` (kept in Postgres when `kept`) unless another
-    /// look took it, or its item was settled while it waited.
+    /// look has it, it already went, or its item was settled while it
+    /// waited. A kept card is forgotten only once it went out (or never
+    /// will), so a failed post or a restart midway posts it later, once.
     async fn post_held(&self, card: HeldCard, kept: bool) -> bool {
         let store = self.desk.store();
         if kept {
@@ -197,17 +210,57 @@ impl CrewHub {
                 }
             }
         }
+        let done = |posted: bool| async move {
+            if kept {
+                if let Err(e) = store.card_done(card.id).await {
+                    tracing::info!(error = %format!("{e:#}"), "forgetting a held needs-you failed");
+                }
+            }
+            posted
+        };
         if let Some(id) = card.item_id {
             match store.open_item(id).await {
                 Ok(Some(i)) if i.state == OpenState::Open => {}
-                Ok(_) => return false,
+                Ok(_) => return done(false).await,
                 Err(e) => {
                     tracing::info!(error = %format!("{e:#}"), "a held needs-you's item couldn't be read: it goes");
                 }
             }
         }
-        self.deliver_card(&card.boss, &card.text, &card.extras)
+        let request = card.id.to_string();
+        if self.in_dm(&card.boss, &request) {
+            // Posted before a restart cut it short.
+            return done(true).await;
+        }
+        if self
+            .deliver_card(&card.boss, &card.text, &card.extras, Some(request))
             .await
+        {
+            return done(true).await;
+        }
+        // Left taken: tried again once its minute is past.
+        false
+    }
+
+    /// Whether `boss`'s DM already has the post made for `request`.
+    fn in_dm(&self, boss: &str, request: &str) -> bool {
+        let Some((service, _)) = self.overseer_named(boss) else {
+            return false;
+        };
+        let Some(owner) = self.person(Some(&service)) else {
+            return false;
+        };
+        service
+            .sessions
+            .find(DESK_CHANNEL, &owner)
+            .ok()
+            .flatten()
+            .is_some_and(|dm| {
+                dm.messages
+                    .iter()
+                    .rev()
+                    .any(|m| m.desk.as_ref().and_then(|d| d.request_id.as_deref()) == Some(request))
+            })
     }
 
     /// Posts the held cards whose time is past that no wait is left to
@@ -226,7 +279,13 @@ impl CrewHub {
     }
 
     /// Puts a needs-you card in `boss`'s DM now, and keeps its buttons.
-    async fn deliver_card(&self, boss: &str, text: &str, extras: &Extras) -> bool {
+    async fn deliver_card(
+        &self,
+        boss: &str,
+        text: &str,
+        extras: &Extras,
+        request: Option<String>,
+    ) -> bool {
         let Some((service, _)) = self.overseer_named(boss) else {
             return false;
         };
@@ -239,7 +298,10 @@ impl CrewHub {
             &service,
             &owner,
             &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text.to_string()),
+            crate::desk_surface::Delivery {
+                request_id: request,
+                ..crate::desk_surface::Delivery::text(DeliveryKind::Question, text.to_string())
+            },
         )
         .await
         {
@@ -373,11 +435,17 @@ impl CrewHub {
             .and_then(|dm| {
                 dm.messages
                     .iter()
-                    .filter(|m| m.role == MessageRole::Assistant && m.timestamp < since)
+                    .filter(|m| {
+                        m.role == MessageRole::Assistant && m.timestamp.trunc_subsecs(6) < since
+                    })
                     .map(|m| m.timestamp)
                     .max()
             })
-            .unwrap_or(state.since);
+            // No earlier post (a new DM, or one that rolled over): from
+            // when the boss began, but never more than a day before the
+            // absence.
+            .unwrap_or(state.since)
+            .max(since - Duration::hours(24));
         let b = self.batch(service, o, state, now, Some(read_post)).await;
         let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
         let asks = |i: &&OpenItem| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm);

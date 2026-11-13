@@ -75,6 +75,9 @@ impl CrewHub {
             if !message.starts_with(CHECK_IN) {
                 self.person_spoke();
             }
+            // The reply is running before anything waiting on the person
+            // looks again, so nothing posts into the middle of it.
+            self.manager_turns.lock().insert(sid.clone(), crew::now());
             if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
                 // Sent: no longer typing it, and here.
                 self.dm_sent(&agent_id);
@@ -86,7 +89,6 @@ impl CrewHub {
                 }
                 asked.push_str(message);
             }
-            self.manager_turns.lock().insert(sid.clone(), crew::now());
             return Some(Track {
                 crew: self.me(),
                 key: String::new(),

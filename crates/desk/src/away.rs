@@ -17,7 +17,7 @@
 //!   ([`handled_line`]), and what still waits on them, parked items by
 //!   title ([`MentionedAway`], [`render`]).
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::decision::Handled;
@@ -106,7 +106,13 @@ pub fn away_since(
     if on_screen {
         return None;
     }
-    let first = posts.iter().copied().filter(|p| *p > seen).min()?;
+    // A read point is kept to the microsecond, a post's time to the
+    // nanosecond: the post read last is not after it.
+    let first = posts
+        .iter()
+        .copied()
+        .filter(|p| p.trunc_subsecs(6) > seen)
+        .min()?;
     (now - first >= after).then_some(first)
 }
 
@@ -279,6 +285,15 @@ mod tests {
         assert_eq!(away_since(&posts, at(0), true, at(99_999), after), None);
         // No posts: here.
         assert_eq!(away_since(&[], at(0), false, at(99_999), after), None);
+        // Read to the last post, whose time has nanoseconds the read point
+        // (kept to the microsecond) lacks: here.
+        let last = at(1200) + Duration::nanoseconds(123_456_789);
+        let read = last.trunc_subsecs(6);
+        assert!(read < last);
+        assert_eq!(
+            away_since(&[at(0), last], read, false, at(99_999), after),
+            None
+        );
     }
 
     #[test]

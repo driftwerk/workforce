@@ -182,14 +182,29 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Takes held card `id` to post it: whether this call took it (another
-    /// caller, or a look after a restart, finds it gone).
+    /// Takes held card `id` to post it, for a minute: whether this call
+    /// took it (another caller holds it, or it went). A post that fails
+    /// or dies with the hub leaves it to be taken again once the minute
+    /// is past.
     pub async fn card_take(&self, id: Uuid) -> Result<bool> {
         let client = self.pool().get().await?;
         let n = client
-            .execute("DELETE FROM boss_held_cards WHERE id = $1", &[&id])
+            .execute(
+                "UPDATE boss_held_cards SET claimed_until = now() + interval '1 minute' \
+                 WHERE id = $1 AND (claimed_until IS NULL OR claimed_until < now())",
+                &[&id],
+            )
             .await?;
         Ok(n == 1)
+    }
+
+    /// Held card `id` went out, or never will: forgotten.
+    pub async fn card_done(&self, id: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute("DELETE FROM boss_held_cards WHERE id = $1", &[&id])
+            .await?;
+        Ok(())
     }
 
     /// The held cards due by `now`: those whose hold no live wait is left
@@ -199,7 +214,8 @@ impl DeskStore {
         let rows = client
             .query(
                 "SELECT id, boss, item_id, text, extras, post_by FROM boss_held_cards \
-                 WHERE post_by <= $1 ORDER BY post_by LIMIT 100",
+                 WHERE post_by <= $1 AND (claimed_until IS NULL OR claimed_until < $1) \
+                 ORDER BY post_by LIMIT 100",
                 &[&now],
             )
             .await?;
@@ -210,7 +226,10 @@ impl DeskStore {
                     boss: r.try_get(1)?,
                     item_id: r.try_get(2)?,
                     text: r.try_get(3)?,
-                    extras: serde_json::from_value(r.try_get(4)?).unwrap_or_default(),
+                    extras: serde_json::from_value(r.try_get(4)?).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "a held needs-you's buttons couldn't be read: it goes without them");
+                        Extras::default()
+                    }),
                     post_by: r.try_get(5)?,
                 })
             })

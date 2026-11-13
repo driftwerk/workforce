@@ -1080,7 +1080,14 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             // A check-in that speaks in the DM waits while the person types
             // to the boss (at most the typing cap); a quiet one acts now.
             let (level, _) = crew.level_now(&id, &o);
-            if !(level.acts() && o.updates.enabled) && crew.typing_release(&id).is_some() {
+            let asks = w.pending.iter().any(|t| !t.approvals.is_empty());
+            let speaks = !(level.acts() && o.updates.enabled) || asks;
+            if speaks && crew.typing_release(&id).is_some() {
+                continue;
+            }
+            // Away, a check-in that would only tell the person gathers for
+            // their return; one with requests for them still goes.
+            if speaks && !asks && crew.away_now(&id).await {
                 continue;
             }
             // Held by Desk's breaker, it takes no turns: what it would have
