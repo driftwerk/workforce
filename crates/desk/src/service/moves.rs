@@ -713,6 +713,7 @@ impl Desk {
             reason: Some("You moved it.".into()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let mut problems = Vec::new();
         let made = match &row.item {

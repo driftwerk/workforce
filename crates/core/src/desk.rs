@@ -615,6 +615,9 @@ pub enum DeliveryKind {
     /// A boss's update: what changed on the crew, what it decided, and
     /// what still waits on the person.
     Update,
+    /// A boss's catch-up when the person is back after an absence: what
+    /// finished, what's open, what it decided, and what waits on them.
+    Away,
     /// One a newer hub or Desk names, read by one that doesn't know it.
     #[serde(other)]
     Other,

@@ -156,6 +156,9 @@ pub struct UpdateState {
     pub unread: u32,
     pub told: HashMap<Uuid, Told>,
     pub pending: Option<Pending>,
+    /// Since when the person is away (overseer H8): updates gather into
+    /// one catch-up for their return.
+    pub away_since: Option<DateTime<Utc>>,
 }
 
 /// An update written and about to go out: kept first, so a restart posts
@@ -180,6 +183,10 @@ pub struct Pending {
     /// The DM message it went out as, once it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent: Option<String>,
+    /// A catch-up for the person's return, not an update: the absence it
+    /// covers, and what it says beyond an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away: Option<crate::away::MentionedAway>,
 }
 
 /// The lines of `p` that must reach the person word for word (its
@@ -554,6 +561,7 @@ mod tests {
             cutoff: None,
             handed: true,
             sent: None,
+            away: None,
         };
         let decided = vec!["I decided: told acme-api to wait — CI is red.".to_string()];
         let reply = "Here is where things are.\n\nI decided: told acme-api to wait —   CI is red.\n\nStill waiting on you:\n- Which key should staging use?";
