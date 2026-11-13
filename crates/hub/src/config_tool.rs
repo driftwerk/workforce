@@ -317,7 +317,7 @@ impl ConfigTool {
                 widened.join("; ")
             );
             let target = DeskTarget::of_turn(
-                &DeskPlace::Dm,
+                &DeskPlace::Dm { thread: None },
                 workforce_common::channels::DESK_CHANNEL,
                 None,
                 false,
