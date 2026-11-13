@@ -257,9 +257,9 @@ impl CrewHub {
         // At Act fully the boss decides and acts; it asks only what it
         // truly can't decide, and says why.
         if kind != OpenKind::Todo && cant_decide.is_none() {
-            let full = self
-                .overseer_named(boss)
-                .is_some_and(|(_, o)| self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full);
+            let full = self.overseer_named(boss).is_some_and(|(_, o)| {
+                self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full
+            });
             if full {
                 return Err(ACT_FULLY_ASK.into());
             }
@@ -715,7 +715,9 @@ impl CrewHub {
     /// now: then the boss says nothing about its questions.
     pub(crate) fn person_in(&self, session: Uuid, since: DateTime<Utc>) -> bool {
         // Since then, or within the wheel's hold of now: they are at it.
-        let since = since.min(crew::now() - workforce_desk::charge::HOLD);
+        let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
+        let hold = minute * workforce_desk::charge::HOLD.num_minutes() as i32;
+        let since = since.min(crew::now() - hold);
         self.desk
             .person_input_at(session)
             .is_some_and(|at| at > since)
@@ -793,9 +795,9 @@ impl CrewHub {
     ) -> bool {
         // At Act fully the boss recommends nothing, and offers answers only
         // where it said why it couldn't decide.
-        let full = self
-            .overseer_named(boss)
-            .is_some_and(|(_, o)| self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full);
+        let full = self.overseer_named(boss).is_some_and(|(_, o)| {
+            self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full
+        });
         let extras = Extras {
             item: Some(i.mention_at(full)),
             approvals,

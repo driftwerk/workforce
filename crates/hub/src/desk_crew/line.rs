@@ -185,14 +185,20 @@ impl CrewHub {
         // a moment before it asked, it waits for them to leave it a hold's
         // time ([`CrewHub::post_held_questions`]).
         if let Some(s) = q.from_session() {
-            let since_asked = self
+            // Theirs for good: input since it asked, or the wheel pinned or
+            // taken by a click since. A wheel that is theirs only from
+            // input a moment before holds it, as that input does.
+            use workforce_desk::charge::Wheel;
+            let taken = self
                 .desk
-                .person_input_at(s)
-                .is_some_and(|at| at > q.at)
-                || self
-                    .desk
-                    .wheel_of(s)
-                    .is_some_and(workforce_desk::charge::Wheel::person);
+                .charge_of(s)
+                .filter(|c| c.live())
+                .is_some_and(|c| match c.wheel {
+                    Wheel::PersonPinned => true,
+                    Wheel::Person => c.wheel_since.unwrap_or(c.since) > q.at,
+                    Wheel::Boss => false,
+                });
+            let since_asked = taken || self.desk.person_input_at(s).is_some_and(|at| at > q.at);
             if since_asked {
                 self.held_questions.lock().remove(&q.id);
                 return;
@@ -229,10 +235,12 @@ impl CrewHub {
             "" => "It gave the person the session's question.".to_string(),
             why => why.to_string(),
         });
-        let full = self.overseer_named(service.agent_id.as_str()).is_some_and(|(_, o)| {
-            self.level_now(service.agent_id.as_str(), &o).0
-                == workforce_common::oversight::Level::Full
-        });
+        let full = self
+            .overseer_named(service.agent_id.as_str())
+            .is_some_and(|(_, o)| {
+                self.level_now(service.agent_id.as_str(), &o).0
+                    == workforce_common::oversight::Level::Full
+            });
         let item_id = match self.desk.store().item_open(&item).await {
             Ok(Opened::New(i)) => Some(i.id),
             Ok(Opened::Again(_)) => return,

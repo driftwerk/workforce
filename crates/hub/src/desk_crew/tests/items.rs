@@ -915,8 +915,10 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
         let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
         let q = d.store().line_message(ask).await.unwrap().unwrap();
         crew.post_question(&q).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Within the hold (two test minutes) it waits for them.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(dm_posts(&overseer, "acme-web asks:").is_empty(), "nothing posted");
+        assert!(crew.held_questions.lock().contains(&ask));
         assert!(d.store().item_of_line(ask).await.unwrap().is_none());
 
         // Asked of the person before they stepped in: posted, then settled.
@@ -973,6 +975,91 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
             Some(workforce_desk::update::SettledBy::You)
         );
         assert!(!card.content.is_empty());
+    })
+    .await;
+}
+
+/// A session's question asked a moment after the person was at that
+/// session is held, not dropped, in a session a boss runs too; once they
+/// have left it a hold's time, the next look posts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_asked_just_after_the_person_left_is_held_then_posted() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let ask_in = async |s: uuid::Uuid, text: &str| {
+            let asked = d
+                .line_call(
+                    s,
+                    "ask",
+                    &json!({"to": "desk", "text": text, "wait_seconds": 60}),
+                    Some(std::time::Duration::from_millis(10)),
+                )
+                .await
+                .unwrap();
+            let id: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+            // Given to the person by the boss, as crew.escalate does.
+            let q = d
+                .line_escalate(
+                    id,
+                    &By::manager("desk", "Desk", "It can't be undone."),
+                    workforce_desk::line::Escalation {
+                        why: "It can't be undone.".into(),
+                        options: Vec::new(),
+                        draft: None,
+                    },
+                )
+                .await
+                .unwrap();
+            crew.post_question(&q).await;
+            id
+        };
+        // A session the boss runs: the wheel is theirs from that input.
+        let run = new_session(&d, dir.path(), "acme-web").await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(
+            run.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.person_typing(run.id).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ask = ask_in(run.id, "May I rerun the flaky e2e job?").await;
+        assert!(
+            crew.held_questions.lock().contains(&ask),
+            "held, not dropped"
+        );
+        assert!(d.store().item_of_line(ask).await.unwrap().is_none());
+
+        // One no boss runs: held, then posted once a hold's time passed.
+        let free = new_session(&d, dir.path(), "acme-api").await;
+        d.person_typing(free.id).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ask = ask_in(
+            free.id,
+            "May I bump the API's rate limit for the load test?",
+        )
+        .await;
+        assert!(crew.held_questions.lock().contains(&ask));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        crew.look_at_items().await;
+        eventually("the held card", async || {
+            dm_posts(&overseer, "acme-api asks:").into_iter().next()
+        })
+        .await;
+        assert!(!crew.held_questions.lock().contains(&ask));
+        assert!(d.store().item_of_line(ask).await.unwrap().is_some());
     })
     .await;
 }
