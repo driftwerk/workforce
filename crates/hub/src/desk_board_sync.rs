@@ -137,10 +137,13 @@ impl HubRemote {
         agent: Option<&str>,
     ) -> Result<Self, RemoteError> {
         let base = url.trim_end_matches('/');
+        // Marked as the board sync, a program: the hub offers it the file
+        // readers it keeps off a model's client.
+        let mark = workforce_core::desk::BOARD_SYNC_CALLER;
         let path = match agent {
-            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}"),
+            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}?{mark}"),
             Some(_) => return Err(RemoteError::Refused("that isn't an agent's id".into())),
-            None => format!("{base}/mcp"),
+            None => format!("{base}/mcp?{mark}"),
         };
         let endpoint = url::Url::parse(&path)
             .map_err(|_| RemoteError::Offline("the hub's address isn't one".into()))?;

@@ -364,25 +364,83 @@ async fn a_board_s_uploads_stay_within_their_cap() {
     .await;
 }
 
-/// An address or id too long to keep isn't listed: one such file never
-/// stops the rest, or the issue's pull.
+/// An id too long to keep (an upload's address is its id) isn't listed:
+/// one such file never stops the rest, or the issue's pull. A link's long
+/// address is no id: the link is kept, with it, or past [`URL_MAX`] without.
 #[test]
-fn a_file_with_too_long_an_address_is_not_listed() {
+fn a_file_with_too_long_an_id_is_not_listed() {
     let long = format!(
         "https://uploads.linear.app/a1/{}.png",
         "x".repeat(REMOTE_MAX)
     );
     let body = format!("![huge]({long}) and ![ok](https://uploads.linear.app/a1/b2/ok.png)");
+    let signed = format!("https://example.com/{}", "y".repeat(REMOTE_MAX));
+    let huge = format!("https://example.com/{}", "z".repeat(URL_MAX));
     let issue = json!({ "attachments": { "nodes": [
         { "id": "att-1", "title": "long upload", "url": long },
-        { "id": "att-2", "title": "long link", "url": format!("https://example.com/{}", "y".repeat(REMOTE_MAX)) },
+        { "id": "att-2", "title": "long link", "url": signed },
         { "id": "att-3", "title": "Spec", "url": "https://example.com/spec" },
+        { "id": "att-4", "title": "huge link", "url": huge },
     ]}});
-    let names: Vec<_> = linear_files(&issue, &body)
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
-    assert_eq!(names, ["ok", "Spec"]);
+    let files = linear_files(&issue, &body);
+    let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["ok", "long link", "Spec", "huge link"]);
+    assert_eq!(files[1].url.as_deref(), Some(signed.as_str()));
+    assert_eq!(files[3].url, None, "past URL_MAX, kept without it");
+}
+
+/// A link whose address is long is kept whole; only an id is held to
+/// [`REMOTE_MAX`].
+#[tokio::test]
+async fn a_link_s_long_address_is_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let t = a_ticket(&store).await;
+        let url = format!(
+            "https://bucket.s3.amazonaws.com/design.fig?X-Amz-Signature={}",
+            "a".repeat(REMOTE_MAX * 2)
+        );
+        let link = RemoteFile {
+            source: FileSource::LinearLink,
+            remote_id: "att-1".into(),
+            name: "Design".into(),
+            media_type: "text/uri-list".into(),
+            size: None,
+            url: Some(url.clone()),
+            thumb: false,
+        };
+        assert!(store
+            .put_remote_files(t, &[link], &someone())
+            .await
+            .unwrap());
+        let kept = &store.files_of(&[t]).await.unwrap()[&t];
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].url.as_deref(), Some(url.as_str()));
+    })
+    .await;
+}
+
+/// A file already here whose rewrite Postgres refuses goes, its kept bytes
+/// with it: never left as it was, read from what it was.
+#[tokio::test]
+async fn a_file_whose_rewrite_fails_goes_with_its_bytes() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let t = a_ticket(&store).await;
+        let files = [remote("1", "a.png"), remote("2", "b.png")];
+        assert!(store.put_remote_files(t, &files, &someone()).await.unwrap());
+        // Now b's new name is one Postgres refuses.
+        let files = [remote("1", "a.png"), remote("2", "b\0new.png")];
+        assert!(store.put_remote_files(t, &files, &someone()).await.unwrap());
+        let kept: Vec<_> = store.files_of(&[t]).await.unwrap()[&t]
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(kept, ["a.png"]);
+    })
+    .await;
 }
 
 /// A file Postgres refuses, or one listed twice, is left out on its own:
