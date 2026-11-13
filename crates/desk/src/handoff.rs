@@ -306,10 +306,13 @@ impl Lineage {
     /// work can go on from `session` again: the old link stays, as how the
     /// work went.
     pub fn continues_in(&self, session: Uuid, open: impl Fn(Uuid) -> bool) -> Option<Uuid> {
-        // Followed from the work's first session: one it went on from,
-        // closed or not, never hands it on while another holds it.
-        let head = self.head(self.work_of(session));
-        (head != session && open(head)).then_some(head)
+        // Followed from the work's first session too: one it went on
+        // from, closed or not, never hands it on while another holds it.
+        // From `session` itself still, for when that first one was
+        // forgotten.
+        [self.head(self.work_of(session)), self.head(session)]
+            .into_iter()
+            .find(|&h| h != session && open(h))
     }
 
     /// Every session `session`'s work was handed on to, and on from those,
@@ -695,6 +698,10 @@ mod tests {
         let mut fork = l.clone();
         fork.hand_on(a, Uuid::from_u128(4), link(a, a, 3));
         assert_eq!(fork.continues_in(b, |_| true), Some(Uuid::from_u128(4)));
+        // Its first session forgotten, still where it is now.
+        let mut gone = l.clone();
+        gone.forget(a);
+        assert_eq!(gone.continues_in(b, |s| s != a), Some(c));
         // Handed back: it holds the work again.
         l.hand_on(c, a, link(a, c, 3));
         assert_eq!(l.continues_in(a, |_| true), None);

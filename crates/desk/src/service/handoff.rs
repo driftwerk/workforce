@@ -229,7 +229,7 @@ impl Desk {
             None => true,
             Some(r) => match self.0.store.kept_a_turn(id).await {
                 Ok(kept) => {
-                    let acted = busy || kept || r.last_reply.is_some() || wrote(r);
+                    let acted = busy || kept || r.last_reply.is_some() || wrote(r).await;
                     rules::took_none_up(&link, r.created_at, acted)
                 }
                 Err(e) => {
@@ -1288,13 +1288,19 @@ struct Checked {
 
 /// Whether `r`'s engine wrote anything of its own to its transcript; so
 /// when it can't be told.
-fn wrote(r: &SessionRecord) -> bool {
-    let Some(path) = r.transcript.as_deref() else {
+async fn wrote(r: &SessionRecord) -> bool {
+    let Some(path) = r.transcript.clone() else {
         return false;
     };
-    match crate::transcript::engine_acted(Path::new(path), r.engine == Engine::Codex) {
-        Ok(acted) => acted,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    let codex = r.engine == Engine::Codex;
+    let read = tokio::task::spawn_blocking(move || {
+        crate::transcript::engine_acted(Path::new(&path), codex)
+    })
+    .await;
+    match read {
+        Ok(Ok(acted)) => acted,
+        Ok(Err(e)) => e.kind() != std::io::ErrorKind::NotFound,
+        Err(_) => true,
     }
 }
 
