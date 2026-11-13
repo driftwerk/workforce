@@ -467,6 +467,16 @@ impl CrewHub {
                     approval: p.id,
                 };
                 if let Err(refused) = self.perform(&action, By::manager(boss, &name, &text)).await {
+                    // Let go meanwhile (the person took the session, or the
+                    // hold ran out): it is theirs, and nothing is said.
+                    let held = self.desk.view(view.id).ok().filter(|v| {
+                        v.pending
+                            .as_ref()
+                            .is_some_and(|q| q.id == p.id && q.answerable)
+                    });
+                    if held.is_none_or(|v| self.person_has_questions(&v, boss)) {
+                        return release();
+                    }
                     tracing::warn!(session = %view.id, %boss, %refused, "a boss's answer to a dialog was refused");
                     release();
                     self.record_question_left(

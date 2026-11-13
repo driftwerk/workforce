@@ -334,6 +334,27 @@ async fn act_fully_answers_a_dialogs_questions_in_its_place() {
                 .then_some(())
         })
         .await;
+        // A request in front of its open dialog, decided: the question shows
+        // again as its dialog's alone, and nothing more is said of it.
+        decides(&llm, "ls -la ./notes", "ALLOW: it only lists a folder").await;
+        let allowed = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": "ls -la ./notes"}})),
+        )
+        .await
+        .expect("decided");
+        assert_eq!(allowed["hookSpecificOutput"]["decision"]["behavior"], "allow", "{allowed}");
+        let back = eventually("its question to show again", async || {
+            d.view(s.id).unwrap().pending.filter(|p| p.detail.starts_with("Which customer"))
+        })
+        .await;
+        assert!(!back.answerable, "only its dialog answers it now");
+        // A few sweeps.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(said(&overseer, &["Cufflink Migration asks: which customer gets the first invite?"]), 1, "asked once");
+        assert_eq!(said(&overseer, &["refused"]), 0);
+        assert_eq!(said(&overseer, &["Which customer first", "waiting on you"]), 0);
         let call = format!("toolu_{}", "Which customer first, Acme or Globex?".len());
         hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": call})).await;
 

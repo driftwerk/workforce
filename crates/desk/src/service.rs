@@ -439,7 +439,9 @@ impl Live {
             self.pending = Some(next.pending);
             self.held = Some(next.raised);
             self.answer = next.answer;
-        } else if let Some((question, raised)) = self.open_question.clone() {
+        } else if let Some((mut question, raised)) = self.open_question.clone() {
+            // Nothing holds it for an answer any more: its dialog asks.
+            question.answerable = false;
             self.pending = Some(question);
             self.held = Some(raised);
         }
@@ -3612,9 +3614,12 @@ impl Desk {
                     "only Codex's requests take that answer".into(),
                 ));
             }
+            // Its hook gave up waiting (a dialog's hold timed out): nothing
+            // is answered here.
             let answer = live
                 .answer
                 .take()
+                .filter(|a| !a.is_closed())
                 .ok_or_else(|| DeskError::Conflict("the terminal is asking for this one".into()))?;
             // A dialog's question held at its start: its boss's deny is its
             // answer.
@@ -5104,8 +5109,14 @@ impl Desk {
                         question: true,
                         call,
                     };
+                    // What shows again once an ask in front of it ends: only
+                    // its dialog answers it then, as its hold has no sender.
                     if inside.is_none() {
-                        l.open_question = Some((pending.clone(), raised.clone()));
+                        let shown = PendingApproval {
+                            answerable: false,
+                            ..pending.clone()
+                        };
+                        l.open_question = Some((shown, raised.clone()));
                     }
                     l.held = Some(raised);
                     if hold.is_some() {

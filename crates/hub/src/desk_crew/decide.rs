@@ -251,13 +251,15 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         for id in sessions {
             crew.look_at(id, &mut asked, &tx, &cancel, &mut slots);
         }
-        // Only what still waits is remembered.
+        // Only what still waits is remembered: a dialog's question behind
+        // another ask too, so it isn't said again when it shows again.
         if !told.is_empty() || !asked.is_empty() || !again.is_empty() {
             let open: HashSet<Uuid> = crew
                 .desk
                 .list()
                 .into_iter()
                 .filter_map(|v| v.pending.map(|p| p.id))
+                .chain(crew.desk.questions_behind())
                 .collect();
             told.retain(|a, _| open.contains(a));
             asked.retain(|a| open.contains(a));

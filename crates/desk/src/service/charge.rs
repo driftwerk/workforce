@@ -366,6 +366,18 @@ impl Desk {
         }
     }
 
+    /// The questions sessions' dialogs ask that wait behind another ask:
+    /// still open, though not what their sessions wait on now.
+    pub fn questions_behind(&self) -> Vec<Uuid> {
+        self.0
+            .state
+            .lock()
+            .live
+            .values()
+            .filter_map(|l| l.open_question.as_ref().map(|(q, _)| q.id))
+            .collect()
+    }
+
     /// Lets session `id`'s question `pending`, held at its start for its
     /// boss, go to its dialog: the person answers it there.
     pub fn release_dialog(&self, id: Uuid, pending: Uuid) {
