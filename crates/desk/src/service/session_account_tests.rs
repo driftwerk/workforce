@@ -15,6 +15,7 @@ use super::{AccountMoment as Moment, Boss, Desk};
 use crate::account::{Account, Accountant, Call, Limits};
 use crate::engine::Engine;
 use crate::ledger_store::Cursor;
+use crate::memory::derive::fake::FakeDeriver;
 use crate::memory::record::{Asker, Exchange, Step};
 use crate::memory_store::RecordWrite;
 use crate::scope::Scope;
@@ -33,6 +34,12 @@ struct Fake {
     slow: Mutex<Duration>,
     /// Runs as the call is made: another writer, in the middle.
     during: Mutex<Option<Box<dyn Fn() -> tokio::task::JoinHandle<()> + Send + Sync>>>,
+    /// It may refresh an account and read notes in one call.
+    shares: Mutex<bool>,
+    /// What each such call answers, the first first; an `Err` fails it.
+    shared_answers: Mutex<Vec<Result<String, String>>>,
+    /// What each such call was told and given.
+    shared_asked: Mutex<Vec<(String, String)>>,
 }
 
 impl Fake {
@@ -43,7 +50,14 @@ impl Fake {
     }
 
     fn calls(&self) -> usize {
-        self.asked.lock().len()
+        self.asked.lock().len() + self.shared_asked.lock().len()
+    }
+
+    /// It shares reads with notes, answering `shared` in turn.
+    fn sharing(self: Arc<Self>, shared: Vec<Result<String, String>>) -> Arc<Self> {
+        *self.shares.lock() = true;
+        *self.shared_answers.lock() = shared;
+        self
     }
 }
 
@@ -68,6 +82,34 @@ impl Accountant for Fake {
             .lock()
             .pop()
             .ok_or_else(|| eyre::eyre!("no answer left"))
+    }
+
+    fn shares_reads(&self) -> bool {
+        *self.shares.lock()
+    }
+
+    async fn answer_shared(
+        &self,
+        _session: Uuid,
+        _engine: Engine,
+        system: &str,
+        user: &str,
+    ) -> eyre::Result<crate::memory::derive::Answered> {
+        self.shared_asked
+            .lock()
+            .push((system.to_string(), user.to_string()));
+        let next = {
+            let mut answers = self.shared_answers.lock();
+            match answers.is_empty() {
+                true => Err("no answer left".to_string()),
+                false => answers.remove(0),
+            }
+        };
+        next.map(|text| crate::memory::derive::Answered {
+            text,
+            model: "fake-shared".into(),
+        })
+        .map_err(|e| eyre::eyre!(e))
     }
 
     async fn gist(
@@ -140,16 +182,30 @@ async fn start(
     dir: &std::path::Path,
     fake: &Arc<Fake>,
 ) -> (Desk, Uuid, tokio_util::sync::CancellationToken) {
+    start_with(pool, dir, fake, None, |_| {}).await
+}
+
+/// As [`start`], with a model that notes decisions too, and options.
+async fn start_with(
+    pool: &workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+    fake: &Arc<Fake>,
+    deriver: Option<&Arc<FakeDeriver>>,
+    tune: impl FnOnce(&mut super::Options),
+) -> (Desk, Uuid, tokio_util::sync::CancellationToken) {
     DeskStore::migrate(pool).await.unwrap();
     let store = DeskStore::from_pool(pool.clone());
     let r = record_fixture("login-fix");
     store.put(&r).await.unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
+    let mut opts = crate::testing::options(dir);
+    tune(&mut opts);
     let d = Desk::start(
         DeskStore::from_pool(pool.clone()),
-        crate::testing::options(dir),
+        opts,
         super::Floor {
             accountant: Some(Arc::clone(fake) as Arc<dyn Accountant>),
+            deriver: deriver.map(|d| Arc::clone(d) as Arc<dyn crate::memory::derive::Deriver>),
             redactor: Some(Arc::new(crate::memory::record::tests::Plain)),
             ..Default::default()
         },
@@ -608,6 +664,317 @@ async fn a_question_is_answered_from_the_conversation_or_not_at_all() {
             "past the share it couldn't be looked up, which isn't the record saying nothing"
         );
         assert_eq!(fake.calls(), 2);
+    })
+    .await;
+}
+
+/// One answer to both jobs: the account, and two notes of which one cites
+/// nothing the record holds.
+fn both_answer() -> String {
+    let account: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+    serde_json::json!({
+        "account": account,
+        "notes": {"add": [
+            {"kind": "decision", "text": "Keep the old cookie name for the mobile app.", "sources": ["x1"]},
+            {"kind": "decision", "text": "Ship on Friday.", "sources": []},
+        ]},
+    })
+    .to_string()
+}
+
+async fn derived_to(store: &DeskStore, session: Uuid) -> i32 {
+    let client = store.pool().get().await.unwrap();
+    client
+        .query_opt(
+            "SELECT derived_to FROM memory_derive WHERE session = $1",
+            &[&session],
+        )
+        .await
+        .unwrap()
+        .map_or(0, |r| r.get(0))
+}
+
+/// Lets the derivation worker go idle after starting, before anything is
+/// harvested: it then looks again only when poked or after half a minute.
+async fn worker_idle() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Pokes the worker until `check` holds.
+async fn until(d: &Desk, what: &str, mut check: impl AsyncFnMut() -> bool) {
+    for _ in 0..600 {
+        if check().await {
+            return;
+        }
+        d.derive_poke();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never: {what}");
+}
+
+/// Lets the worker do what it would.
+async fn settle(d: &Desk) {
+    for _ in 0..8 {
+        d.derive_poke();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_turn_end_with_noting_due_reads_its_exchanges_once_for_both() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[]).sharing(vec![Ok(both_answer())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |_| {}).await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        let a = d
+            .account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1, "one call");
+        assert!(
+            fake.asked.lock().is_empty(),
+            "the account isn't asked alone"
+        );
+        let (system, user) = fake.shared_asked.lock()[0].clone();
+        assert!(system.contains("running account") && system.contains("keep notes"));
+        assert!(user.contains("The account so far") && user.contains("New exchanges:"));
+        assert!(user.contains("Please do x1"));
+        // The account is written from its part.
+        assert_eq!(a.purpose, "Fix the login page so people can sign in again.");
+        assert!(a.by_model);
+        // The notes as the worker keeps them: the one citing nothing goes.
+        let notes = d.session_memory(id).await.unwrap().notes;
+        assert_eq!(notes.counts.decisions, 1);
+        assert_eq!(
+            notes.decisions[0].text,
+            "Keep the old cookie name for the mobile app."
+        );
+        assert!(notes.decisions[0].noted_by_desk);
+        let by: String = {
+            let client = store.pool().get().await.unwrap();
+            client
+                .query_one("SELECT by FROM memory_items WHERE session = $1", &[&id])
+                .await
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(by, "model:fake-shared");
+        assert_eq!(
+            derived_to(&store, id).await,
+            1,
+            "derivation is moved past it"
+        );
+        // Counted once against each day's ceiling.
+        let day = d.derive_day();
+        assert_eq!(store.cheap_calls(day).await.unwrap(), 1);
+        assert_eq!(store.derive_calls(day).await.unwrap(), 1);
+        // The worker has nothing of them left to read.
+        settle(&d).await;
+        assert_eq!(deriver.calls(), 0, "the same exchanges are read once");
+        assert_eq!(derived_to(&store, id).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_with_noting_held_or_behind_is_refreshed_alone_and_noting_reads_its_own() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER, ANSWER]).sharing(vec![Ok(both_answer())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |_| {}).await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        // A worker holds the session's reading: the account doesn't wait.
+        let held = store.derive_claim(300.0).await.unwrap().expect("it is due");
+        assert_eq!(held.session, id);
+        let started = std::time::Instant::now();
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "promptly");
+        assert_eq!(fake.asked.lock().len(), 1, "alone");
+        assert!(fake.shared_asked.lock().is_empty());
+        // The worker lets it go; the next turn reads x2 only, and noting,
+        // behind at x1, isn't shared.
+        store.derive_release(&held, Some(Utc::now())).await.unwrap();
+        harvested(
+            &store,
+            id,
+            &[exchange("x2", 5, &"Fixed it. ".repeat(60), 2)],
+        )
+        .await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.asked.lock().len(), 2, "alone again");
+        assert!(!fake.asked.lock()[1].2.contains("Please do x1"));
+        assert!(fake.shared_asked.lock().is_empty(), "noting is behind");
+        let day = d.derive_day();
+        assert_eq!(store.derive_calls(day).await.unwrap(), 0);
+        // The worker reads its own backlog, both at once.
+        until(&d, "noting reads its backlog", async || {
+            derived_to(&store, id).await == 2
+        })
+        .await;
+        assert_eq!(deriver.calls(), 1);
+        let asked = deriver.asked.lock()[0].1.clone();
+        assert!(asked.contains("Please do x1") && asked.contains("Please do x2"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_with_memory_paused_is_refreshed_alone_and_sends_nothing_for_notes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER]).sharing(vec![Ok(both_answer())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |_| {}).await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        store
+            .put_setting(crate::memory_store::PAUSED, &serde_json::json!(true))
+            .await
+            .unwrap();
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        assert!(fake.shared_asked.lock().is_empty(), "alone");
+        assert!(
+            !fake.asked.lock()[0].2.contains("New exchanges:"),
+            "nothing for notes"
+        );
+        settle(&d).await;
+        assert_eq!(deriver.calls(), 0);
+        assert_eq!(derived_to(&store, id).await, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_with_noting_off_for_the_desk_is_refreshed_alone() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER]).sharing(vec![Ok(both_answer())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |o| {
+            o.memory.derive = false;
+        })
+        .await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        d.account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        assert!(fake.shared_asked.lock().is_empty(), "alone");
+        assert!(!fake.asked.lock()[0].2.contains("New exchanges:"));
+        settle(&d).await;
+        assert_eq!(deriver.calls(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_shared_call_still_writes_the_account_and_leaves_the_notes_to_the_worker() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER]).sharing(vec![Err("the model is down".into())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |_| {}).await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        let a = d
+            .account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.shared_asked.lock().len(), 1);
+        assert_eq!(fake.asked.lock().len(), 1, "the account is asked alone");
+        assert_eq!(a.purpose, "Fix the login page so people can sign in again.");
+        assert!(a.by_model);
+        // The failed call is given back on both counts.
+        let day = d.derive_day();
+        assert_eq!(store.cheap_calls(day).await.unwrap(), 1);
+        assert_eq!(store.derive_calls(day).await.unwrap(), 0);
+        until(&d, "the worker reads the notes", async || {
+            derived_to(&store, id).await == 1
+        })
+        .await;
+        assert_eq!(deriver.calls(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_shared_answer_whose_notes_dont_parse_keeps_the_account_and_the_worker_reads_them() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        // The account's object alone.
+        let fake = Fake::answering(&[]).sharing(vec![Ok(ANSWER.to_string())]);
+        let deriver = Arc::new(FakeDeriver::default());
+        let (d, id, _cancel) = start_with(&pool, dir.path(), &fake, Some(&deriver), |_| {}).await;
+        worker_idle().await;
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        let a = d
+            .account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(a.purpose, "Fix the login page so people can sign in again.");
+        assert_eq!(derived_to(&store, id).await, 0, "no notes kept");
+        until(&d, "the worker reads the notes", async || {
+            derived_to(&store, id).await == 1
+        })
+        .await;
+        assert_eq!(deriver.calls(), 1);
     })
     .await;
 }

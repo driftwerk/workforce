@@ -91,6 +91,8 @@ pub struct Claim {
 pub struct Unread {
     pub id: Uuid,
     pub seq: i32,
+    /// The exchange's key, as an account's cursor reads it.
+    pub key: String,
     pub at: DateTime<Utc>,
     pub ended: Option<DateTime<Utc>>,
     pub engine: Engine,
@@ -264,6 +266,37 @@ impl DeskStore {
             .transpose()
     }
 
+    /// Claims session `session` for `lease_secs`, as [`Self::derive_claim`]
+    /// would, but only when it is due now: none while a worker holds it, or
+    /// while its reading waits out [`DEBOUNCE_MINUTES`].
+    pub async fn derive_claim_session(
+        &self,
+        session: Uuid,
+        lease_secs: f64,
+    ) -> Result<Option<Claim>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                "UPDATE memory_derive d SET due_at = now() + make_interval(secs => $2) \
+                 FROM (SELECT session FROM memory_derive WHERE session = $1 AND due_at <= now() \
+                   FOR UPDATE SKIP LOCKED) c \
+                 WHERE d.session = c.session \
+                 RETURNING d.session, d.derived_to, d.tries, d.due_at",
+                &[&session, &lease_secs],
+            )
+            .await
+            .context("claiming a session's reading for notes with its account")?
+            .map(|r| {
+                Ok(Claim {
+                    session: r.try_get(0)?,
+                    derived_to: r.try_get(1)?,
+                    tries: r.try_get(2)?,
+                    lease: r.try_get(3)?,
+                })
+            })
+            .transpose()
+    }
+
     /// Lets `claim` go, due again at `due` (none: not until a turn's end or
     /// the panel asks), unless a turn's end changed it meanwhile.
     pub async fn derive_release(&self, claim: &Claim, due: Option<DateTime<Utc>>) -> Result<()> {
@@ -379,7 +412,7 @@ impl DeskStore {
         client
             .query(
                 "SELECT id, seq, at, ended, engine, group_id, project, asker, ask, answer, steps, \
-                   cardinality(flagged) > 0 \
+                   cardinality(flagged) > 0, key \
                  FROM memory_exchanges WHERE session = $1 AND group_id IS NOT DISTINCT FROM $4 \
                    AND seq > $2 ORDER BY seq LIMIT $3",
                 &[&session, &after, &limit, &group],
@@ -401,6 +434,7 @@ impl DeskStore {
                     answer: r.try_get(9)?,
                     steps: serde_json::from_value(r.try_get(10)?).unwrap_or_default(),
                     flagged: r.try_get(11)?,
+                    key: r.try_get(12)?,
                 })
             })
             .collect()

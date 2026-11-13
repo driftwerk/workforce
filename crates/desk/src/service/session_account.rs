@@ -7,7 +7,7 @@
 //! account. Past the day's ceiling, or for a short turn, an account is
 //! said plainly. The floor's turn-end gist is said from the same answer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -107,6 +107,14 @@ pub struct AccountRead {
     pub refreshed: bool,
     /// Older than it should be: say how fresh it is.
     pub stale: bool,
+}
+
+/// What a refresh's call shared with a reading for notes gave.
+enum WithNotes {
+    /// No reading was shared: the account is asked alone.
+    Alone,
+    /// The account's part of the answer, if it could be read.
+    Answered(Option<Written>),
 }
 
 /// What a refresh found to say.
@@ -482,8 +490,9 @@ impl Desk {
                 },
                 Moment::Read | Moment::TurnEnd => {
                     let ended = moment == Moment::TurnEnd || !working;
+                    let share = moment == Moment::TurnEnd;
                     match self
-                        .account_delta(id, &v, &kept, &ctx, ended, working)
+                        .account_delta(id, &v, &kept, &ctx, (ended, working), share)
                         .await?
                     {
                         Some(s) => s,
@@ -741,14 +750,16 @@ impl Desk {
     /// The changes a turn's end (or a read) makes: from the exchanges not
     /// yet read, the transcript and screen when they don't say enough;
     /// plainly for a short turn or past the ceiling. None with nothing new.
+    /// With `share` (a turn's end), the same call reads the exchanges for
+    /// notes when that reading is due.
     async fn account_delta(
         &self,
         id: Uuid,
         v: &crate::model::SessionView,
         kept: &Account,
         ctx: &Context,
-        ended: bool,
-        working: bool,
+        (ended, working): (bool, bool),
+        share: bool,
     ) -> eyre::Result<Option<Said>> {
         // A first account starts from the newest exchanges (its goal says
         // what came before); after that every exchange is read in order,
@@ -824,17 +835,28 @@ impl Desk {
         }
         let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
         let prompt = account::prompt(kept, ctx, delta, &tail, &nonce);
-        let answer = self
-            .account_ask(
-                id,
-                v.engine,
-                CheapKind::Account,
-                Call::Refresh,
-                account::SYSTEM,
-                &prompt,
-            )
-            .await?;
-        let written = answer.as_deref().and_then(account::parse);
+        let shared = match share {
+            true => {
+                let read: HashSet<&str> = reads.iter().map(|r| r.key.as_str()).collect();
+                self.account_shared(id, v.engine, &prompt, &read).await?
+            }
+            false => WithNotes::Alone,
+        };
+        let written = match shared {
+            WithNotes::Answered(written) => written,
+            WithNotes::Alone => self
+                .account_ask(
+                    id,
+                    v.engine,
+                    CheapKind::Account,
+                    Call::Refresh,
+                    account::SYSTEM,
+                    &prompt,
+                )
+                .await?
+                .as_deref()
+                .and_then(account::parse),
+        };
         Ok(Some(match written {
             Some(w) => Said {
                 written: w,
@@ -849,6 +871,92 @@ impl Desk {
                 more,
             },
         }))
+    }
+
+    /// The account's refresh `prompt` and session `id`'s reading for notes
+    /// in one call, when that reading is due and starts among the exchanges
+    /// `read`: Alone when it isn't, or no model took the call (the account
+    /// is then asked alone, as ever). Counted once among the day's cheap
+    /// calls and once among its readings for notes; it never waits on the
+    /// worker.
+    async fn account_shared(
+        &self,
+        id: Uuid,
+        engine: crate::engine::Engine,
+        prompt: &str,
+        read: &HashSet<&str>,
+    ) -> eyre::Result<WithNotes> {
+        let Some(accountant) = self
+            .0
+            .accounts
+            .accountant
+            .clone()
+            .filter(|a| a.shares_reads())
+        else {
+            return Ok(WithNotes::Alone);
+        };
+        let Some(share) = self.derive_shared(id, read).await else {
+            return Ok(WithNotes::Alone);
+        };
+        // Past the ceiling, or the count can't be read: the account's own
+        // path says it plainly.
+        if !self.account_take(CheapKind::Account).await.unwrap_or(false) {
+            self.derive_unshare(share).await;
+            return Ok(WithNotes::Alone);
+        }
+        match self.derive_shared_take().await {
+            Ok(true) => {}
+            taken => {
+                if let Err(e) = taken {
+                    tracing::info!(session = %id, error = format!("{e:#}"), "couldn't count a reading for notes; the account is refreshed alone");
+                }
+                self.derive_unshare(share).await;
+                self.0
+                    .store
+                    .cheap_untake(self.derive_day(), CheapKind::Account)
+                    .await?;
+                return Ok(WithNotes::Alone);
+            }
+        }
+        self.0
+            .accounts
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
+        let user =
+            account::shared_prompt(prompt, &crate::memory::derive::prompt(&share.input, &nonce));
+        let asked = tokio::time::timeout(
+            account::WRITE_WITHIN,
+            accountant.answer_shared(id, engine, &account::shared_system(), &user),
+        )
+        .await;
+        match asked {
+            Ok(Ok(answered)) => {
+                let both = account::parse_shared(&answered.text);
+                self.derive_shared_kept(share, both.notes.as_ref(), &answered.model)
+                    .await;
+                Ok(WithNotes::Answered(both.account))
+            }
+            Ok(Err(e)) => {
+                // No model took it: both counts are given back, the worker
+                // reads the notes, and the account is asked alone.
+                tracing::info!(session = %id, error = format!("{e:#}"), "the model couldn't refresh an account and read notes in one call; the account is asked alone");
+                self.derive_unshare(share).await;
+                self.derive_shared_untake().await;
+                self.0
+                    .store
+                    .cheap_untake(self.derive_day(), CheapKind::Account)
+                    .await?;
+                Ok(WithNotes::Alone)
+            }
+            Err(_) => {
+                // It may have been spent: it stays counted, as either call
+                // alone would. The account is said plainly.
+                tracing::info!(session = %id, "the model gave no account and notes in time; the account is said plainly");
+                self.derive_unshare(share).await;
+                Ok(WithNotes::Answered(None))
+            }
+        }
     }
 
     /// A running turn's `now`, from the transcript's latest words and the
