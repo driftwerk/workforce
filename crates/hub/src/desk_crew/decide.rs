@@ -285,7 +285,7 @@ fn quoted(ask: &str) -> String {
 impl CrewHub {
     /// The boss over `view`: the one that runs it, else the overseer whose
     /// scope sees it and tracks its kind.
-    fn boss_over(&self, view: &SessionView) -> Option<String> {
+    pub(super) fn boss_over(&self, view: &SessionView) -> Option<String> {
         if let Some(c) = self.desk.charge_of(view.id).filter(|c| c.live()) {
             return Some(c.boss);
         }
@@ -296,7 +296,7 @@ impl CrewHub {
 
     /// Whether `boss` still decides `view`'s request: it is over the
     /// session, and at Act fully in force.
-    fn still_decides(&self, view: &SessionView, boss: &str) -> bool {
+    pub(super) fn still_decides(&self, view: &SessionView, boss: &str) -> bool {
         self.desk.boss_unbound(boss) && self.boss_over(view).as_deref() == Some(boss)
     }
 
@@ -437,7 +437,8 @@ impl CrewHub {
         let mut failed = String::new();
         let mut decided = None;
         for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decision_call(&service, &prompt)).await {
+            match tokio::time::timeout(WITHIN, self.decision_call(&service, SYSTEM, &prompt)).await
+            {
                 Ok(Ok(text)) => match verdict(&text) {
                     Some(v) => {
                         decided = Some(v);
@@ -547,32 +548,19 @@ impl CrewHub {
         }
     }
 
-    /// What the boss's model is given to decide `p`: the whole request, the
-    /// session's purpose, account and last reply, and the person's
-    /// preferences.
-    async fn decision_prompt(
+    /// What a decision call is told of `view`: the session (its purpose,
+    /// account and last reply), as JSON, and the person's preferences.
+    pub(super) async fn session_brief(
         &self,
         view: &SessionView,
-        p: &PendingApproval,
         o: &workforce_common::oversight::Oversight,
-    ) -> String {
+    ) -> (serde_json::Value, String) {
         let account = self
             .desk
             .session_accounts_of(&[view.id])
             .await
             .ok()
             .and_then(|a| a.into_iter().next());
-        let request = match &p.request {
-            Some(r) => {
-                // The session's own account of it is no evidence of what it does.
-                let mut input = r.input.clone();
-                if let Some(o) = input.as_object_mut() {
-                    o.remove("description");
-                }
-                serde_json::json!({"tool": r.tool, "input": input, "cwd": r.cwd})
-            }
-            None => serde_json::json!({"tool": p.tool, "detail": p.detail}),
-        };
         let session = serde_json::json!({
             "name": view.label(),
             "engine": view.engine.title(),
@@ -583,6 +571,7 @@ impl CrewHub {
             "now": account.as_ref().map(|a| &a.now),
             "next": account.as_ref().map(|a| &a.next),
             "waiting_on": account.as_ref().and_then(|a| a.waiting_on.as_ref()),
+            "last_prompt": view.last_prompt.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
             "last_reply": view.last_reply.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
         });
         let prefs = self
@@ -594,6 +583,30 @@ impl CrewHub {
             .await
             .map(|p| format!("\n\n{}\n{}", p.listed, p.how))
             .unwrap_or_default();
+        (session, prefs)
+    }
+
+    /// What the boss's model is given to decide `p`: the whole request, the
+    /// session's purpose, account and last reply, and the person's
+    /// preferences.
+    async fn decision_prompt(
+        &self,
+        view: &SessionView,
+        p: &PendingApproval,
+        o: &workforce_common::oversight::Oversight,
+    ) -> String {
+        let request = match &p.request {
+            Some(r) => {
+                // The session's own account of it is no evidence of what it does.
+                let mut input = r.input.clone();
+                if let Some(o) = input.as_object_mut() {
+                    o.remove("description");
+                }
+                serde_json::json!({"tool": r.tool, "input": input, "cwd": r.cwd})
+            }
+            None => serde_json::json!({"tool": p.tool, "detail": p.detail}),
+        };
+        let (session, prefs) = self.session_brief(view, o).await;
         format!(
             "{MARK} A session you oversee asks to do this. Decide it now.\n\n{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
@@ -602,16 +615,17 @@ impl CrewHub {
     }
 
     /// One call to `service`'s own model for a decision: its text.
-    async fn decision_call(
+    pub(super) async fn decision_call(
         &self,
         service: &crate::serve::AgentService,
+        system: &str,
         prompt: &str,
     ) -> Result<String, String> {
         // The hub's own work for the person whose Desk this is: it may run
         // on their accounts when the install's login is at its limit.
         let (response, served) = crate::hub_core::logins::install_pool::hub_own_work(
             with_served_log(service.llm.create_message(
-                Some(SYSTEM),
+                Some(system),
                 &[LlmMessage::user(prompt.to_string())],
                 &[],
                 None,
@@ -654,7 +668,7 @@ impl CrewHub {
     }
 
     /// Says `text` in `boss`'s DM, as a notice.
-    async fn tell_dm(&self, boss: &str, text: &str) {
+    pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
         let Some((service, _)) = self.overseer_named(boss) else {
             tracing::warn!(%boss, text, "no DM to say a waiting request in");
             return;

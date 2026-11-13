@@ -384,6 +384,17 @@ impl CrewHub {
             return None;
         }
         let unbound = self.unbound(o);
+        let view = || subject.id.parse().ok().and_then(|s| self.desk.view(s).ok());
+        // A question the person is in control of is theirs: nothing is said
+        // of it (`answer`). One its Act fully boss answers itself wakes
+        // nothing else.
+        if event.kind == Kind::Question
+            && view().is_some_and(|v| {
+                self.person_has_questions(&v, overseer) || self.answers_question_itself(&v)
+            })
+        {
+            return None;
+        }
         let wanted = match event.kind {
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
@@ -477,6 +488,22 @@ impl CrewHub {
                 origin: item.origin,
             };
             if !tracked(o, &party) {
+                continue;
+            }
+            // A session's question the person is in control of, or its Act
+            // fully boss answers itself (`answer`): not raised here.
+            if item.kind == ItemKind::Session
+                && item.approval.is_none()
+                && item.question.is_some()
+                && item
+                    .id
+                    .parse()
+                    .ok()
+                    .and_then(|s| self.desk.view(s).ok())
+                    .is_some_and(|v| {
+                        self.person_has_questions(&v, overseer) || self.answers_question_itself(&v)
+                    })
+            {
                 continue;
             }
             let (key, trigger) = match item.state {

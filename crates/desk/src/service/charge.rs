@@ -411,6 +411,21 @@ impl Desk {
         Some(Self::wheel_now(&st, c))
     }
 
+    /// Whether the person is in control of `id` for a question it asks:
+    /// they gave it input (typed in its terminal or Desk's composer,
+    /// prompted it, wrote to it) less than `gap` ago, or they pinned its
+    /// wheel. A session a boss runs counts only input since the boss last
+    /// had its wheel, as its wheel does; one it only oversees, any. The
+    /// boss stays silent on its questions while this holds.
+    pub fn person_in_control(&self, id: Uuid, gap: chrono::Duration) -> bool {
+        let st = self.0.state.lock();
+        let input = Self::last_input(&st, id);
+        match st.charges.rows.get(&id).filter(|c| c.live()) {
+            Some(c) => charge::wheel(c, input, gap, Utc::now()).person(),
+            None => input.is_some_and(|t| Utc::now() - t < gap),
+        }
+    }
+
     /// Whether the person has the wheel of `id`, which a boss runs: its
     /// boss's messages to it wait.
     pub(crate) fn person_driving(&self, id: Uuid) -> bool {
