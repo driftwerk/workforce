@@ -110,13 +110,20 @@ fn a_grant_gives_its_boss_its_own_group_and_switches_and_nothing_more() {
     );
     assert!(o.act.nudge);
     assert!(!o.act.interrupt, "what the grant doesn't say is off");
-    assert!(!o.act.message_agents && !o.act.hand_off && !o.act.message_terminal_sessions);
+    assert!(!o.full.anywhere, "nor anywhere");
+    // What this hub's person keeps is off below unbound, whatever the
+    // grant says.
+    let held = super::super::served::held_below_unbound(o.clone());
+    assert!(
+        !held.act.message_agents && !held.act.hand_off && !held.act.message_terminal_sessions
+    );
+    assert!(held.act.nudge);
     assert_eq!(o.work.take_on, workforce_common::oversight::TakeOn::Handed);
     assert_eq!(
         o.work.parallel as i64,
         workforce_common::oversight::MAX_PARALLEL
     );
-    // Act fully has no budget until leases give one: it acts within Desk.
+    // Act fully with no budget in its grant acts within Desk.
     assert_eq!(o.level, workforce_common::oversight::Level::Full);
     assert!(super::super::fully_for("devbox/sarah", &o, Some(0.0)).is_err());
     assert!(

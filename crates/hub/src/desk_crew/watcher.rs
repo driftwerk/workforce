@@ -638,7 +638,7 @@ impl CrewHub {
         };
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
-        let hint = match self.unbound_given(&service, &o) {
+        let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
             true => Self::boss_hint(&o),
             false => Self::level_hint(level, &o),
         };

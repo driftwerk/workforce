@@ -14,9 +14,11 @@
 //! 3. the caller is the grant's boss, exactly;
 //! 4. the tool is one served, and what it names is this engine's session in
 //!    the grant (`members` or `born`), or it is "not ours";
-//! 5. the never-list, at every level;
+//! 5. the never-list, at every level short of unbound;
 //! 6. the level: the grant's, never the caller's word, through the same
-//!    gate a local overseer's calls go through, the boss named;
+//!    gate a local overseer's calls go through, the boss named, unbound
+//!    by the same check ([`CrewHub::unbound_given`]): Act fully, anywhere,
+//!    every switch on and a daily budget, as the grant says now;
 //! 7. what it may see ([`workforce_desk::sees`]), every string redacted
 //!    whole and capped.
 //!
@@ -106,6 +108,29 @@ pub fn act_of(act: &Value) -> Act {
 pub struct Ceiling {
     pub level: Level,
     pub act: Act,
+    /// `[oversight.full] anywhere` at its home: off when not said, so a
+    /// home that doesn't say it never makes it unbound here.
+    pub anywhere: bool,
+}
+
+impl Ceiling {
+    /// What a relayed call says of its boss: its level, and `act` with
+    /// its switches and `anywhere`, each off unless said so.
+    pub fn of(level: Level, act: &Value) -> Self {
+        Self {
+            level,
+            act: act_of(act),
+            anywhere: switch_on(act, "anywhere"),
+        }
+    }
+
+    /// As a relayed call carries it: the switches and `anywhere` in one
+    /// object, which a machine that doesn't know `anywhere` reads past.
+    pub fn act_value(&self) -> Value {
+        let mut v = serde_json::to_value(self.act).unwrap_or_else(|_| json!({}));
+        v["anywhere"] = json!(self.anywhere);
+        v
+    }
 }
 
 fn rank(l: Level) -> u8 {
@@ -133,7 +158,29 @@ pub fn narrowed(mut o: Oversight, c: &Ceiling) -> Oversight {
     a.message_agents &= b.message_agents;
     a.message_terminal_sessions &= b.message_terminal_sessions;
     a.hand_off &= b.hand_off;
+    a.set_mode &= b.set_mode;
+    o.full.anywhere &= c.anywhere;
     o
+}
+
+/// `o` for a served boss short of unbound: what this hub's person keeps,
+/// whatever the grant says (messaging agents and terminals' sessions,
+/// continuing in another engine, a session's mode), off. Unbound, it is
+/// held only as a local unbound boss is.
+pub fn held_below_unbound(mut o: Oversight) -> Oversight {
+    o.act.message_agents = false;
+    o.act.message_terminal_sessions = false;
+    o.act.hand_off = false;
+    o.act.set_mode = false;
+    o
+}
+
+/// The daily budget `act` gives, in cents: an amount in dollars above 0
+/// and up to Act fully's most; none for anything else.
+fn budget_of(act: &Value) -> Option<u64> {
+    let usd = act.get("budget_usd_per_day")?.as_f64()?;
+    (usd.is_finite() && usd > 0.0 && usd <= workforce_common::oversight::MAX_FULL_BUDGET_USD)
+        .then(|| ((usd * 100.0).round() as u64).max(1))
 }
 
 /// What became of it.
@@ -170,13 +217,14 @@ fn refused(why: impl Into<String>) -> (ServedStatus, Value) {
 }
 
 /// The oversight a grant gives its boss, and nothing else: its level, its
-/// act switches (each one off unless the grant turns it on), sessions only
-/// as handed or started, Act fully's repositories with no budget (so Act
-/// fully isn't in force until leases give one, RB8). There is no field that
-/// widens it beyond the grant's group: never Ungrouped for a boss on
-/// another hub, never anywhere.
+/// act switches, `anywhere` and daily budget (`budget_usd_per_day`), each
+/// off or none unless the grant says so, sessions only as handed or
+/// started, and Act fully's repositories. Short of a budget, Act fully
+/// isn't in force ([`super::fully_for`]). There is no field that widens it
+/// beyond the grant's group: never Ungrouped for a boss on another hub.
+/// What this hub's person keeps below unbound is taken off as each call is
+/// decided ([`held_below_unbound`]).
 pub fn served_oversight(g: &Grant) -> Oversight {
-    let on = |k: &str| switch_on(&g.act, k);
     let parallel = g
         .act
         .get("parallel")
@@ -196,27 +244,12 @@ pub fn served_oversight(g: &Grant) -> Oversight {
             grant::Level::Act => Level::Act,
             grant::Level::Full => Level::Full,
         },
-        act: Act {
-            nudge: on("nudge"),
-            resume_restart: on("resume_restart"),
-            read_only_approvals: on("read_only_approvals"),
-            hand_out_work: on("hand_out_work"),
-            interrupt: on("interrupt"),
-            answer_sessions: on("answer_sessions"),
-            // Agents, other terminals' sessions and other engines are this
-            // hub's person's own: never a served boss's.
-            message_agents: false,
-            message_terminal_sessions: false,
-            hand_off: false,
-            // A session's mode is this hub's person's to loosen.
-            set_mode: false,
-        },
+        act: act_of(&g.act),
         full: Full {
             repos: g.repos.clone(),
-            budget_cents_per_day: None,
+            budget_cents_per_day: budget_of(&g.act),
             workflows: Vec::new(),
-            // Never anywhere: a served boss ships only where it is granted.
-            anywhere: false,
+            anywhere: switch_on(&g.act, "anywhere"),
             budget_cleared_at: None,
         },
         ..Oversight::default()
@@ -387,6 +420,11 @@ impl CrewHub {
             return refused(workforce_desk::scope::not_ours(None));
         }
         let boss = call.boss.party_id();
+        // What a boss relayed from the home says it may do there is what it
+        // is judged by here until its next call says otherwise.
+        if let Some(c) = &call.ceiling {
+            self.ceilings.lock().insert(boss.clone(), c.clone());
+        }
         let o = match &call.ceiling {
             Some(c) => narrowed(served_oversight(&grant), c),
             None => served_oversight(&grant),
@@ -404,7 +442,16 @@ impl CrewHub {
                 .await
                 .map(|v| (ServedStatus::Ok, v))
         } else {
-            self.served_act(tool, &call.input, &grant, &o, &boss).await
+            // Whether it is unbound, judged now, from the grant as it is
+            // and today's spend read now: never kept from an earlier call.
+            self.read_served_spent(&boss).await;
+            let unbound = self.served_full(&boss).is_some_and(|f| f.unbound);
+            let o = match unbound {
+                true => o,
+                false => held_below_unbound(o),
+            };
+            self.served_act(tool, &call.input, &grant, &o, &boss, unbound)
+                .await
         };
         // The boss answered a request itself: its ask to the person is
         // closed.
@@ -798,6 +845,7 @@ impl CrewHub {
         g: &Grant,
         o: &Oversight,
         boss: &str,
+        unbound: bool,
     ) -> Result<(ServedStatus, Value), String> {
         let reason = input["reason"]
             .as_str()
@@ -860,8 +908,9 @@ impl CrewHub {
             }
         }
         self.know_question(&action).await;
-        // What no boss does, at every level, before the level is looked at.
-        if let Some(n) = self.never_said(&action) {
+        // What no boss does, at every level short of unbound, before the
+        // level is looked at.
+        if let Some(n) = self.never_said(&action).filter(|_| !unbound) {
             if o.level == Level::Watch {
                 return Err("You only watch: tell the person what you would do instead.".into());
             }
@@ -886,8 +935,16 @@ impl CrewHub {
                 ));
             }
         }
-        let by = By::manager(boss, &boss_name(g), reason);
-        match self.gate_as(&action, o, Some(boss), true) {
+        // Unbound, what it does says so, in Activity and its decisions.
+        let by = match unbound {
+            true => By::manager(
+                boss,
+                &boss_name(g),
+                &format!("{} (unbound: no limits)", reason.trim_end()),
+            ),
+            false => By::manager(boss, &boss_name(g), reason),
+        };
+        match self.gate_for(&action, o, Some(boss), unbound, true) {
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }
@@ -902,6 +959,98 @@ impl CrewHub {
                 Ok((ServedStatus::Ok, json!({ "done": done })))
             }
         }
+    }
+
+    /// Where the boss served from a grant `boss` (`<hub>/<agent>`) acts
+    /// fully now, judged afresh each time from its live grants here (and,
+    /// for a boss relayed from the home, the level and switches its last
+    /// call said it has there), by the one unbound check every boss goes
+    /// through ([`Self::unbound_given`]): only when it is served (no local
+    /// overseer of its group) and unbound by every grant that names it.
+    /// Short of unbound, none: it acts within Desk.
+    pub(crate) fn served_full(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
+        if !grant::is_served(boss) {
+            return None;
+        }
+        let ceiling = self.ceilings.lock().get(boss).cloned();
+        let mut repos: Vec<String> = Vec::new();
+        let mut any = false;
+        for (g, not_live) in self.desk.grants_bossed() {
+            let Some(b) = g.boss.as_ref().filter(|b| b.party_id() == boss) else {
+                continue;
+            };
+            if not_live.is_some() {
+                continue;
+            }
+            if !b.servable() {
+                return None;
+            }
+            let o = match (b, &ceiling) {
+                (_, Some(c)) => narrowed(served_oversight(&g), c),
+                // Relayed from the home, and what it may do there not said
+                // yet: not unbound until a call says.
+                (BossRef::Local { .. }, None) => return None,
+                (BossRef::Remote { .. }, None) => served_oversight(&g),
+            };
+            if self.overseer_for(&o.scope).is_some() || !self.unbound_given(boss, &o) {
+                return None;
+            }
+            any = true;
+            for r in &g.repos {
+                if !repos.contains(r) {
+                    repos.push(r.clone());
+                }
+            }
+        }
+        any.then(|| workforce_desk::charge::FullGrant {
+            repos,
+            workflows: Vec::new(),
+            anywhere: true,
+            unbound: true,
+        })
+    }
+
+    /// Reads the real money the sessions of `boss`'s live grants at Act
+    /// fully with a budget spent today here (calls a key paid for, never
+    /// the person's plans), for [`Self::fully`]: one that can't be read
+    /// leaves none, so Act fully waits.
+    pub(crate) async fn read_served_spent(&self, boss: &str) {
+        let now = chrono::Utc::now();
+        let midnight = self
+            .desk
+            .period_start(workforce_desk::ledger::Period::Day, now);
+        let mut total = 0.0;
+        let mut any = false;
+        for (g, not_live) in self.desk.grants_bossed() {
+            if not_live.is_some() || g.boss.as_ref().map(BossRef::party_id).as_deref() != Some(boss)
+            {
+                continue;
+            }
+            let o = served_oversight(&g);
+            if o.level != Level::Full || o.full.budget_cents_per_day.is_none() {
+                continue;
+            }
+            let filter = workforce_desk::ledger_store::Filter {
+                seen: Some(self.desk.seen_by(&o.scope)),
+                ..Default::default()
+            };
+            match self.desk.billed_usd(midnight, now, &filter).await {
+                Ok(usd) => {
+                    total += usd;
+                    any = true;
+                }
+                Err(e) => {
+                    tracing::warn!(%boss, error = %e, "couldn't read a served boss's spend today; Act fully waits until it can");
+                    self.spent_today.lock().remove(boss);
+                    return;
+                }
+            }
+        }
+        let mut today = self.spent_today.lock();
+        match any {
+            true => today.insert(boss.to_string(), total),
+            false => today.remove(boss),
+        };
     }
 
     fn served_suggestion(&self, action: &Action, why: &str) -> (ServedStatus, Value) {

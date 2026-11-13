@@ -59,7 +59,9 @@
 //! request and question itself, does every crew action, and checks in as
 //! often as the work needs; the never-list doesn't hold it. Only its
 //! budget (when set), the person's Stop and kill switches, the hold while
-//! they type, and the activity log remain. A remote boss is never unbound.
+//! they type, and the activity log remain. A boss served from a grant is
+//! unbound the same way, by what its grant here says, and only with a daily
+//! budget.
 //!
 //! `group` is the sidebar group it oversees, as that group's boss: it sees
 //! only that group, and the main overseer (no `group`) sees nothing inside
@@ -960,12 +962,11 @@ impl Oversight {
     /// `[oversight.act]` switch on. Unbound, no word or list holds the
     /// overseer back and it answers every request itself; only the person's
     /// budget, their Stop and kill switches, the hold while they type, and
-    /// the activity log remain. `local`: the overseer is an agent of this
-    /// hub. A remote boss is never unbound.
-    pub fn unbound(&self, local: bool) -> bool {
+    /// the activity log remain. A boss served from a grant is judged by the
+    /// same words, its grant's.
+    pub fn unbound(&self) -> bool {
         let a = &self.act;
-        local
-            && self.level == Level::Full
+        self.level == Level::Full
             && self.full.anywhere
             && a.nudge
             && a.resume_restart
@@ -1462,11 +1463,10 @@ mod tests {
         hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
 
     #[test]
-    fn unbound_is_act_fully_anywhere_with_every_switch_on_and_never_remote() {
+    fn unbound_is_act_fully_anywhere_with_every_switch_on() {
         let o = parse(UNBOUND).unwrap();
         assert!(o.full.anywhere);
-        assert!(o.unbound(true));
-        assert!(!o.unbound(false), "a remote boss is never unbound");
+        assert!(o.unbound());
         // Anywhere needs no repositories, and no budget.
         assert!(o.fully().is_ok());
         for off in [
@@ -1482,16 +1482,16 @@ mod tests {
             "set_mode",
         ] {
             let one = UNBOUND.replace(&format!("{off} = true"), &format!("{off} = false"));
-            assert!(!parse(&one).unwrap().unbound(true), "{off} off");
+            assert!(!parse(&one).unwrap().unbound(), "{off} off");
         }
         let listed = UNBOUND.replace("anywhere = true", "anywhere = false");
-        assert!(!parse(&listed).unwrap().unbound(true), "not anywhere");
+        assert!(!parse(&listed).unwrap().unbound(), "not anywhere");
         assert_eq!(
             parse(&listed).unwrap().fully().unwrap_err(),
             Some(FULL_NO_REPOS)
         );
         let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
-        assert!(!parse(&act).unwrap().unbound(true), "at act");
+        assert!(!parse(&act).unwrap().unbound(), "at act");
         assert_eq!(
             parse("[oversight.full]\nanywhere = 1\n").unwrap_err(),
             "Whether Act fully anywhere is on or off must be true or false."

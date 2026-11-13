@@ -252,6 +252,14 @@ pub struct FullGrant {
     pub unbound: bool,
 }
 
+/// Where a boss served from a grant (`<hub>/<agent>`) acts fully now, as
+/// the hub judges it each time it is asked, from that boss's grant here as
+/// it is then: none when it doesn't. Never kept, so a grant turned down
+/// holds at the next thing asked.
+pub trait ServedFull: Send + Sync {
+    fn full_of(&self, boss: &str) -> Option<FullGrant>;
+}
+
 /// A repository as a remote's address names it: its host, when said, and
 /// its `owner/name`, lowercased, without `.git`.
 #[derive(Debug, Clone, PartialEq, Eq)]

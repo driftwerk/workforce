@@ -270,7 +270,9 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         assert_eq!(sent.boss, BossRef::Local { agent: "desk".into() }.key());
         assert_eq!(sent.link_id, "home-relay");
         assert_eq!(sent.level, workforce_common::oversight::Level::Act);
-        assert!(sent.act.interrupt);
+        assert_eq!(sent.act["interrupt"], json!(true));
+        // Anywhere is said too, off unless it is on here.
+        assert_eq!(sent.act["anywhere"], json!(false));
         assert_eq!(sent.input["session_id"], json!(remote.to_string()));
 
         // The overview has devbox's part of Acme, said as devbox said it.

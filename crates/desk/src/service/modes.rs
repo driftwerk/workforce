@@ -91,9 +91,7 @@ impl Desk {
     /// Whether `boss` may keep a session in a mode that doesn't ask: it is
     /// unbound and runs `id`.
     fn unbound_runs(&self, id: Uuid, boss: &str) -> bool {
-        // A boss served from a grant is never unbound.
-        !crate::grant::is_served(boss)
-            && self.full_of(boss).unbound
+        self.full_of(boss).unbound
             && self
                 .charge_of(id)
                 .is_some_and(|c| c.live() && c.boss == boss)

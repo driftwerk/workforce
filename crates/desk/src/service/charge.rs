@@ -274,8 +274,19 @@ impl Desk {
         self.0.state.lock().charges.full_budgets.get(boss).cloned()
     }
 
-    /// Where `boss` acts fully now; nowhere when it doesn't.
+    /// Who judges where each boss served from a grant acts fully: the
+    /// hub's crew. Without one, none does.
+    pub fn served_full_with(&self, judge: std::sync::Arc<dyn charge::ServedFull>) {
+        *self.0.served_full.lock() = Some(judge);
+    }
+
+    /// Where `boss` acts fully now; nowhere when it doesn't. A boss served
+    /// from a grant is judged afresh, each time ([`charge::ServedFull`]).
     pub(crate) fn full_of(&self, boss: &str) -> charge::FullGrant {
+        if crate::grant::is_served(boss) {
+            let judge = self.0.served_full.lock().clone();
+            return judge.and_then(|j| j.full_of(boss)).unwrap_or_default();
+        }
         self.0
             .state
             .lock()
@@ -464,6 +475,12 @@ impl Desk {
     ) -> Option<String> {
         let boss = self.charge_of(id).filter(Charge::live)?.boss;
         if !crate::grant::is_served(&boss) {
+            return None;
+        }
+        // Unbound, it is as a local boss unbound: its sessions' calls go on
+        // to what they ask, and it allows what they ask (its own settings
+        // aside, [`Self::boss_decides`]).
+        if self.full_of(&boss).unbound {
             return None;
         }
         let pending = crate::model::PendingApproval {

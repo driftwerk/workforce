@@ -72,7 +72,7 @@ pub fn changes_a_page(tool: &str) -> bool {
 ///
 /// [`Oversight::unbound`]: workforce_common::oversight::Oversight::unbound
 pub fn unbound(o: &workforce_common::oversight::Oversight) -> bool {
-    o.enabled && o.unbound(true)
+    o.enabled && o.unbound()
 }
 
 /// Where an agent stands in a browser, by its `[oversight]`: an overseer

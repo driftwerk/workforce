@@ -69,10 +69,10 @@ pub struct RelayCall {
     /// `local:<agent>`: the overseer that made it.
     pub boss: String,
     pub link_id: &'static str,
-    /// The overseer's own level and switches here: the machine decides at
-    /// no more than these and its grant's.
+    /// The overseer's own level and switches here, `anywhere` among them:
+    /// the machine decides at no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
-    pub act: workforce_common::oversight::Act,
+    pub act: Value,
 }
 
 /// What a machine answered.
@@ -158,7 +158,7 @@ impl CrewHub {
                     .key(),
                     link_id: RELAY_LINK,
                     level: ceiling.level,
-                    act: ceiling.act,
+                    act: ceiling.act_value(),
                 },
                 Instant::now(),
             ));
@@ -413,10 +413,7 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
                 boss,
                 link_id: Some(RELAY_LINK.to_string()),
                 call_id: Some(r.id),
-                ceiling: Some(super::served::Ceiling {
-                    level,
-                    act: super::served::act_of(&r.act),
-                }),
+                ceiling: Some(super::served::Ceiling::of(level, &r.act)),
             },
             &r.group,
         )

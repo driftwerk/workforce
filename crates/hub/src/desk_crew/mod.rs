@@ -137,6 +137,10 @@ pub struct CrewHub {
     /// keys paid for, never the person's plans. Act fully holds only under
     /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
+    /// What each boss relayed from the home last said it may do there, by
+    /// its `<hub>/<agent>`: a call is decided at no more than it, and so is
+    /// whether it is unbound between its calls ([`Self::served_full`]).
+    ceilings: Mutex<HashMap<String, served::Ceiling>>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
     tooled: Mutex<HashMap<String, (Scope, String)>>,
@@ -214,7 +218,7 @@ pub(crate) fn dm_oversight_hint(service: &AgentService) -> Option<String> {
     let crew = for_service(service)?;
     let (service, o) = crew.overseer_named(service.agent_id.as_str())?;
     let (level, _) = crew.level_now(service.agent_id.as_str(), &o);
-    let unbound = o.level != Level::Watch && crew.unbound_given(&service, &o);
+    let unbound = o.level != Level::Watch && crew.unbound_given(service.agent_id.as_str(), &o);
     Some(CrewHub::dm_hint(level, &o, unbound))
 }
 
@@ -489,6 +493,16 @@ pub(crate) fn counted_from(
     cleared_today(midnight, now, full).unwrap_or(midnight)
 }
 
+/// Desk's judge of where a boss served from a grant acts fully
+/// ([`CrewHub::served_full`]).
+struct ServedJudge(Weak<CrewHub>);
+
+impl workforce_desk::charge::ServedFull for ServedJudge {
+    fn full_of(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
+        self.0.upgrade()?.served_full(boss)
+    }
+}
+
 /// When the person cleared today's count, as it counts: today's, and
 /// never after `now`.
 fn cleared_today(
@@ -531,6 +545,7 @@ impl CrewHub {
             sent: Mutex::default(),
             read: Mutex::default(),
             spent_today: Mutex::default(),
+            ceilings: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
@@ -562,6 +577,10 @@ impl CrewHub {
         crew.overseers();
         crew.desk
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
+        // Desk asks the crew, each time, where a boss served from a grant
+        // acts fully: from its grant as it is then.
+        crew.desk
+            .served_full_with(Arc::new(ServedJudge(Arc::downgrade(&crew))));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
@@ -688,8 +707,8 @@ impl CrewHub {
                         workforce_desk::charge::FullGrant {
                             repos: full.repos.clone(),
                             workflows: full.workflows.clone(),
-                            anywhere: full.anywhere && self.boss_is_local(s),
-                            unbound: self.unbound_given(s, o),
+                            anywhere: full.anywhere,
+                            unbound: self.unbound_given(s.agent_id.as_str(), o),
                         },
                     ))
                 })
@@ -762,7 +781,7 @@ impl CrewHub {
     pub(crate) fn by_at_level(&self, mut by: By, o: &Oversight) -> By {
         let unbound = self
             .overseer_named(&by.party.id)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o));
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o));
         if unbound {
             by.reason = Some(match by.reason.take() {
                 Some(r) => format!("{} (unbound: no limits)", r.trim_end()),
@@ -779,27 +798,19 @@ impl CrewHub {
         by
     }
 
-    /// Whether `service`, an overseer, is an agent this hub runs. A boss
-    /// served from a grant (a remote boss) never is, and is never unbound
-    /// nor anywhere: what it does is the remote hub's to judge, not this
-    /// one's to wave through.
-    pub(crate) fn boss_is_local(&self, service: &AgentService) -> bool {
-        let id = service.agent_id.as_str();
-        !workforce_desk::grant::is_served(id)
-            && self.services().iter().any(|s| s.agent_id.as_str() == id)
-    }
-
-    /// Whether `service`, overseeing with `o`, is unbound now: it chose
-    /// it ([`Oversight::unbound`]), it is local, and Act fully is in force
-    /// (its budget, when set, isn't spent).
-    pub(crate) fn unbound_given(&self, service: &AgentService, o: &Oversight) -> bool {
-        o.unbound(self.boss_is_local(service)) && self.fully(service.agent_id.as_str(), o).is_ok()
+    /// Whether the boss `agent`, overseeing with `o`, is unbound now: it
+    /// chose it ([`Oversight::unbound`]) and Act fully is in force (its
+    /// budget, when set, isn't spent; a boss served from a grant needs
+    /// one, [`fully_for`]). One check for every boss: this hub's own with
+    /// its config, one served from a grant with what its grant here says.
+    pub(crate) fn unbound_given(&self, agent: &str, o: &Oversight) -> bool {
+        o.unbound() && self.fully(agent, o).is_ok()
     }
 
     /// Whether the overseer of `o`'s scope is unbound now.
     pub(crate) fn unbound(&self, o: &Oversight) -> bool {
         self.overseer_for(&o.scope)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o))
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o))
     }
 
     /// Whether the overseer of `o`'s scope acts fully in the repository
@@ -881,7 +892,13 @@ impl CrewHub {
                 );
             }
         }
-        *self.spent_today.lock() = spent;
+        {
+            // A boss served from a grant's spend is read as its calls are
+            // decided ([`Self::read_served_spent`]): kept here.
+            let mut today = self.spent_today.lock();
+            today.retain(|agent, _| workforce_desk::grant::is_served(agent));
+            today.extend(spent);
+        }
         self.desk.set_full_budgets(shown);
     }
 

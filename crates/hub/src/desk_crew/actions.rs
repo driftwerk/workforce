@@ -527,6 +527,22 @@ impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer of `o`'s scope
     /// do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        let boss = self.boss_id(o);
+        let unbound = self.unbound(o);
+        self.gate_for(action, o, boss.as_deref(), unbound, false)
+    }
+
+    /// [`Self::gate`] for `boss`, named, and `unbound` as
+    /// [`Self::unbound_given`] judged it for this call: every boss, this
+    /// hub's own or one served from a grant (`served`), goes through it.
+    pub(crate) fn gate_for(
+        &self,
+        action: &Action,
+        o: &Oversight,
+        boss: Option<&str>,
+        unbound: bool,
+        served: bool,
+    ) -> Gate {
         // Unbound, every crew action runs: Desk answers what it asks for
         // itself (`boss_decides`), and only the hold while the person types
         // into a session it runs waits, as a courtesy.
@@ -537,14 +553,13 @@ impl CrewHub {
                 "your own limits are the person's to change, never yours: they approve it with one click".into(),
             );
         }
-        let boss = self.boss_id(o);
-        if o.level != Level::Watch && self.unbound(o) {
-            if let Some(held) = self.mode_hold(action, o, boss.as_deref()) {
+        if o.level != Level::Watch && unbound {
+            if let Some(held) = self.mode_hold(action, o, boss) {
                 return held;
             }
-            return self.unbound_gate(action, o);
+            return self.unbound_gate(action, boss);
         }
-        self.gate_as(action, o, boss.as_deref(), false)
+        self.gate_as(action, o, boss, served)
     }
 
     /// A session still running in a mode that doesn't ask, set while a
@@ -588,8 +603,7 @@ impl CrewHub {
             return held;
         }
         // A mode that doesn't ask is an unbound overseer's alone: not even
-        // suggested, as Desk refuses it from anyone else. A boss served
-        // from a grant is never unbound.
+        // suggested, as Desk refuses it from anyone else.
         if let Action::SetMode { mode, .. } = action {
             if !mode.asks() {
                 return Gate::Refuse;
@@ -766,10 +780,9 @@ impl CrewHub {
     /// [`Self::gate`] for an unbound overseer: everything runs, but what
     /// it does to a session it runs waits while the person is driving it
     /// (a plain message waits on its line as before).
-    fn unbound_gate(&self, action: &Action, o: &Oversight) -> Gate {
-        let boss = self.boss_id(o);
+    fn unbound_gate(&self, action: &Action, boss: Option<&str>) -> Gate {
         let charged =
-            Self::session_of(action).filter(|s| boss.as_deref().is_some_and(|b| self.runs(*s, b)));
+            Self::session_of(action).filter(|s| boss.is_some_and(|b| self.runs(*s, b)));
         if let Some(session) = charged {
             let driving = self.desk.wheel_of(session).is_some_and(|w| w.person());
             if driving && !matches!(action, Action::Nudge { reply_to: None, .. }) {
@@ -790,7 +803,7 @@ impl CrewHub {
         by.party.kind == crew::PartyKind::Manager
             && self
                 .overseer_named(&by.party.id)
-                .is_some_and(|(s, o)| self.unbound_given(&s, &o))
+                .is_some_and(|(s, o)| self.unbound_given(s.agent_id.as_str(), &o))
     }
 
     /// The hard limit what `action` says, or the question it answers,

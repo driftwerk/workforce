@@ -649,6 +649,7 @@ impl CrewTool {
         let ceiling = super::served::Ceiling {
             level: b.oversight.level,
             act: b.oversight.act,
+            anywhere: b.oversight.full.anywhere,
         };
         let ceiling = &ceiling;
         let asks = machines.iter().map(|m| {
@@ -709,6 +710,7 @@ impl CrewTool {
         let ceiling = super::served::Ceiling {
             level: b.oversight.level,
             act: b.oversight.act,
+            anywhere: b.oversight.full.anywhere,
         };
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());

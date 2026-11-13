@@ -162,12 +162,21 @@ fn why_of(by: &By) -> String {
 
 impl CrewHub {
     /// The boss a decision by `by` is recorded for: a boss overseeing
-    /// here. The person (saying yes to a suggestion), Desk, and a remote
-    /// boss acting on this machine's sessions through its grant record none
-    /// here: their decisions are kept where they are made.
+    /// here, or one served from a grant while it is unbound here, whose
+    /// every decision this engine keeps, as it waves through what this
+    /// engine's sessions ask. The person (saying yes to a suggestion), Desk,
+    /// and a served boss short of unbound record none here: theirs are kept
+    /// where they are made.
     pub(crate) fn deciding_boss(&self, by: &By) -> Option<String> {
-        (by.party.kind == PartyKind::Manager && self.overseer_named(&by.party.id).is_some())
-            .then(|| by.party.id.clone())
+        if by.party.kind != PartyKind::Manager {
+            return None;
+        }
+        let id = &by.party.id;
+        let here = match workforce_desk::grant::is_served(id) {
+            true => self.served_full(id).is_some_and(|f| f.unbound),
+            false => self.overseer_named(id).is_some(),
+        };
+        here.then(|| id.clone())
     }
 
     /// How many decisions `boss` has recorded about `session` (and about no
@@ -262,6 +271,12 @@ impl CrewHub {
                 }
             }
             _ => crew::clip(said, 240),
+        };
+        // A boss served from a grant is named with its hub, in the line the
+        // person reads.
+        let what = match boss.split_once('/') {
+            Some((hub, agent)) => format!("{what} (by {agent} on {hub})"),
+            None => what,
         };
         let mut d = BossDecision::new(&boss, need, &what, &why_of(by), How::Own);
         d.need_ref = need_ref;
