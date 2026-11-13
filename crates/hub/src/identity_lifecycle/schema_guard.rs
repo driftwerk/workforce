@@ -383,6 +383,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     // What a person's Desk shared with this hub's agents (Sees,
     // `desk_knows`): erased with their decisions.
     ("hub", "items", "person", By(C::DecisionRecords)),
+    ("hub", "owners", "person", By(C::DecisionRecords)),
     ("hub", "identity_pictures", "identity_id", By(C::Pictures)),
     ("hub", "intents", "person", By(C::KnowHow)),
     ("hub", "provenance", "person", By(C::KnowHow)),

@@ -118,6 +118,8 @@ impl Failed {
 struct Spent {
     sent: VecDeque<(Instant, usize, usize)>,
     backoff: Option<(Instant, Duration)>,
+    /// The digest the agent's hub last took; none since this hub started.
+    digest: Option<&'static str>,
 }
 
 impl Spent {
@@ -293,17 +295,20 @@ impl KnowsSync {
             )
             .await
             .map_err(|e| Failed::Retry(e.to_string()))?;
-        if pending.is_empty() {
+        let digest = rule.digest.as_str();
+        let told = self.spent.lock().get(agent).and_then(|s| s.digest) == Some(digest);
+        if pending.is_empty() && told {
             return Ok(());
         }
         let size: usize = pending.iter().map(Outgoing::bytes).sum();
-        let landed = self.push(&target, &pending).await;
+        let landed = self.push(&target, &pending, digest).await;
         {
             let mut spent = self.spent.lock();
             let s = spent.entry(agent.to_string()).or_default();
             match &landed {
                 Ok(()) => {
                     s.backoff = None;
+                    s.digest = Some(digest);
                     s.sent.push_back((now, pending.len(), size));
                 }
                 Err(e) => s.failed(now, matches!(e, Failed::Refused(_))),
@@ -318,7 +323,12 @@ impl KnowsSync {
         Ok(())
     }
 
-    async fn push(&self, target: &Target, pending: &[Outgoing]) -> Result<(), Failed> {
+    async fn push(
+        &self,
+        target: &Target,
+        pending: &[Outgoing],
+        digest: &str,
+    ) -> Result<(), Failed> {
         let items: Vec<Item> = pending
             .iter()
             .map(|o| Item {
@@ -335,6 +345,10 @@ impl KnowsSync {
                 let store = super::installed()
                     .ok_or_else(|| Failed::Refused("this hub keeps no Desk work".into()))?;
                 store
+                    .set_digest(owner, digest, Utc::now())
+                    .await
+                    .map_err(|e| Failed::Retry(format!("{e:#}")))?;
+                store
                     .push(owner, &items, Utc::now())
                     .await
                     .map(|_| ())
@@ -350,6 +364,7 @@ impl KnowsSync {
                         "at": i.at,
                         "body": i.body,
                     })).collect::<Vec<_>>(),
+                    "digest": digest,
                 });
                 self.call(link, "push", &body).await
             }

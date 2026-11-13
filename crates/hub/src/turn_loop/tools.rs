@@ -215,7 +215,7 @@ fn without_disabled_tools(
 /// of their screens, or a Slack DM. Nowhere else may reach their machine —
 /// in a channel, a thread, a desk room or a shared conversation, what others
 /// write would act on it, and an automated run's output can leave them.
-fn is_own_conversation(session: &Session) -> bool {
+pub(crate) fn is_own_conversation(session: &Session) -> bool {
     use workforce_common::channels::{is_platform, CONVERSATIONAL_CHANNELS};
     !session.is_shared_conversation()
         && (CONVERSATIONAL_CHANNELS.contains(&session.channel.as_str())
@@ -228,6 +228,62 @@ fn is_own_conversation(session: &Session) -> bool {
 /// turn's person has connected, when the node acts for them and the session
 /// is [their own conversation](is_own_conversation).
 async fn session_registry(
+    service: &AgentService,
+    session: &Session,
+) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
+    let base = node_registry(service, session).await;
+    match desk_work(service, session).await {
+        Some(work) => {
+            let registry = workforce_agent::tools::registry::ToolRegistry::follow(&base, |_| true);
+            for tool in crate::desk_knows::tools::tools(&work) {
+                registry.register(tool);
+            }
+            Arc::new(registry)
+        }
+        None => base,
+    }
+}
+
+/// What the person's Desk shared with this agent, for the person's own
+/// conversation with it (Sees K4): only when the turn runs as them, in a
+/// conversation that is theirs alone, and they hold something.
+pub(crate) async fn desk_work(
+    service: &AgentService,
+    session: &Session,
+) -> Option<crate::desk_knows::tools::Work> {
+    desk_work_in(
+        crate::desk_knows::installed()?,
+        service.agent_id.as_str(),
+        session,
+    )
+    .await
+}
+
+async fn desk_work_in(
+    store: Arc<dyn crate::desk_knows::store::KnowsStore>,
+    agent: &str,
+    session: &Session,
+) -> Option<crate::desk_knows::tools::Work> {
+    if !is_own_conversation(session) {
+        return None;
+    }
+    let person = uuid::Uuid::parse_str(&crate::user_config::current_identity_id()?).ok()?;
+    let reader = crate::desk_knows::store::Reader {
+        person,
+        agent: agent.to_string(),
+    };
+    match store.holds(&reader).await {
+        Ok(true) => Some(crate::desk_knows::tools::Work { store, reader }),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "what Desk shared couldn't be checked");
+            None
+        }
+    }
+}
+
+/// The agent's registry with the turn's person's nodes' tools.
+async fn node_registry(
     service: &AgentService,
     session: &Session,
 ) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
@@ -490,6 +546,71 @@ pub(crate) mod tests {
         ] {
             let elsewhere = offered("alice", channel, owner).await;
             assert!(!elsewhere.has("node.studio.desk_sessions"), "{channel}");
+        }
+    }
+
+    /// What a person's Desk shared reaches their own conversation with the
+    /// agent on any channel, and no one else's, nor a shared one (Sees K4).
+    #[tokio::test]
+    async fn desk_work_reaches_only_the_persons_own_conversations() {
+        use crate::desk_knows::store::{Item, KnowsStore, MemoryKnows, Owner};
+        use workforce_agent::runner::CURRENT_USER_ID;
+
+        let alice = uuid::Uuid::from_u128(7).to_string();
+        let bob = uuid::Uuid::from_u128(8).to_string();
+        let store = MemoryKnows::new();
+        store
+            .push(
+                &Owner {
+                    person: uuid::Uuid::from_u128(7),
+                    source: "mac".into(),
+                    agent: "allan".into(),
+                },
+                &[Item {
+                    kind: "account".into(),
+                    reference: "s1".into(),
+                    session: Some("s1".into()),
+                    group_name: None,
+                    at: chrono::Utc::now(),
+                    body: serde_json::json!({"name": "atlas", "text": "atlas"}),
+                }],
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn KnowsStore> = store;
+        let reaches = |person: String, channel: &str, owner: &str, agent: &'static str| {
+            let session = Session::new(channel, owner, agent);
+            let store = Arc::clone(&store);
+            CURRENT_USER_ID.scope(person, async move {
+                desk_work_in(store, agent, &session).await.is_some()
+            })
+        };
+        assert!(reaches(alice.clone(), "desk", &alice, "allan").await);
+        assert!(reaches(alice.clone(), "ios", &alice, "allan").await);
+        assert!(reaches(alice.clone(), "web", &alice, "allan").await);
+        // Her Slack DM with him too.
+        let mut dm = Session::new("slack:D123", &alice, "allan");
+        dm.context_type = Some(workforce_common::session::SessionContextType::Dm);
+        let in_dm = CURRENT_USER_ID.scope(alice.clone(), {
+            let store = Arc::clone(&store);
+            async move { desk_work_in(store, "allan", &dm).await.is_some() }
+        });
+        assert!(in_dm.await);
+        // Another person's turn with the same agent holds nothing of hers.
+        assert!(!reaches(bob.clone(), "desk", &bob, "allan").await);
+        // Another agent holds nothing she gave Allan.
+        assert!(!reaches(alice.clone(), "desk", &alice, "lattice").await);
+        for (channel, owner) in [
+            ("desk:release", alice.as_str()),
+            ("slack:C1", "shared:1700000000.0001"),
+            ("slack:C1:1700000000.0001", alice.as_str()),
+            ("scheduler:job-1", alice.as_str()),
+        ] {
+            assert!(
+                !reaches(alice.clone(), channel, owner, "allan").await,
+                "{channel}"
+            );
         }
     }
 

@@ -992,6 +992,42 @@ pub(crate) async fn build_enhanced_prompt(
 /// `session.metadata` before the caller's `sessions.save(&session)` —
 /// otherwise the metadata is clobbered by the local-session save and
 /// Phase C reinforcement reads an empty set.
+/// The `[DESK WORK]` block for `person`'s turn in `session_id`, if it is
+/// their own conversation and their Desk asked for one.
+async fn desk_work_digest(
+    service: &AgentService,
+    session_id: Option<&str>,
+    person: Option<&str>,
+) -> Option<String> {
+    let session = service.sessions.get(session_id?).ok().flatten()?;
+    // The turn runs as the person whose copies these are, and no other.
+    if person? != crate::user_config::current_identity_id()?.as_str() {
+        return None;
+    }
+    let work = tools::desk_work(service, &session).await?;
+    let mode = work.store.digest(&work.reader).await.ok().flatten()?;
+    let block = match mode.as_str() {
+        "live" => work.digest(None, None).await,
+        "daily" => {
+            let tz = service.identity.read().await.user_timezone;
+            let (from, to) = crate::desk_knows::tools::daily_window(
+                chrono::Utc::now(),
+                &service.config.desk_knows.digest_at,
+                tz,
+            )?;
+            work.digest(Some(from), Some(to)).await
+        }
+        _ => return None,
+    };
+    match block {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "the Desk work digest wasn't read");
+            None
+        }
+    }
+}
+
 pub(crate) async fn build_enhanced_prompt_with_context(
     service: &AgentService,
     session_id: Option<&str>,
@@ -1715,6 +1751,20 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     drop(identity);
 
     turn_context.push_str(&dynamic);
+
+    // ── [DESK WORK] (Sees K4) ──────────────────────────────────────
+    // What the person's Desk shares with this agent, as a short block, in
+    // their own conversation alone, as they asked for it (live, or once a
+    // day when something changed). Never written to memory.
+    if !mechanical_session {
+        if let Some(block) =
+            desk_work_digest(service, session_id, recall_identity_id.as_deref()).await
+        {
+            turn_context.push('\n');
+            turn_context.push_str(&block);
+            turn_context.push('\n');
+        }
+    }
 
     // ── Context-Aware Memories (Layer 2) ──────────────────────────
     // See `recall_injection_suppressed` for why steps and recap

@@ -67,6 +67,49 @@ pub struct KindCount {
     pub bytes: i64,
 }
 
+/// Who reads what is kept: the person, from any of their Desks, in their
+/// own turns with the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reader {
+    pub person: Uuid,
+    pub agent: String,
+}
+
+impl Reader {
+    fn reads(&self, o: &Owner) -> bool {
+        o.person == self.person && o.agent == self.agent
+    }
+}
+
+/// A read of what is kept, newest first unless `oldest_first`.
+#[derive(Debug, Clone, Default)]
+pub struct Read {
+    /// None: every kind.
+    pub kinds: Option<Vec<String>>,
+    pub session: Option<String>,
+    /// Only what is of `at` at or after this.
+    pub since: Option<DateTime<Utc>>,
+    /// Only what is of `at` after this (paging on).
+    pub after: Option<DateTime<Utc>>,
+    pub oldest_first: bool,
+    pub limit: i64,
+}
+
+impl Read {
+    fn takes(&self, i: &Item) -> bool {
+        self.kinds.as_ref().is_none_or(|k| k.contains(&i.kind))
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|s| i.session.as_ref() == Some(s))
+            && self.since.is_none_or(|t| i.at >= t)
+            && self.after.is_none_or(|t| i.at > t)
+    }
+}
+
+/// The digest modes Desk may set.
+pub const DIGESTS: [&str; 3] = ["off", "live", "daily"];
+
 #[async_trait]
 pub trait KnowsStore: Send + Sync {
     /// Keeps `items` for `owner`, each replacing what it had under its kind
@@ -81,6 +124,16 @@ pub trait KnowsStore: Send + Sync {
     async fn prune(&self, before: DateTime<Utc>, max_bytes: i64) -> Result<u64>;
     /// Everything kept for `person`, gone.
     async fn forget_person(&self, person: Uuid) -> Result<u64>;
+    /// Whether `reader` holds anything.
+    async fn holds(&self, reader: &Reader) -> Result<bool>;
+    /// What `reader` holds that `read` asks for.
+    async fn read(&self, reader: &Reader, read: &Read) -> Result<Vec<Item>>;
+    /// What `reader` holds whose text matches `query`, best first.
+    async fn search(&self, reader: &Reader, query: &str, read: &Read) -> Result<Vec<Item>>;
+    /// How `owner`'s Desk wants the agent to hear of its work.
+    async fn set_digest(&self, owner: &Owner, digest: &str, now: DateTime<Utc>) -> Result<()>;
+    /// The digest the person's most recently set Desk asked for, if any.
+    async fn digest(&self, reader: &Reader) -> Result<Option<String>>;
 }
 
 /// The kind a session's conversation is shared as.
@@ -92,7 +145,7 @@ pub const TRANSCRIPT: &str = "transcript";
 type Kept = BTreeMap<(Owner, String, String), (Item, DateTime<Utc>)>;
 
 #[derive(Default)]
-pub struct MemoryKnows(Mutex<Kept>);
+pub struct MemoryKnows(Mutex<Kept>, Mutex<BTreeMap<Owner, (String, DateTime<Utc>)>>);
 
 impl MemoryKnows {
     pub fn new() -> Arc<Self> {
@@ -186,10 +239,75 @@ impl KnowsStore for MemoryKnows {
     }
 
     async fn forget_person(&self, person: Uuid) -> Result<u64> {
+        self.1.lock().retain(|o, _| o.person != person);
         let mut kept = self.0.lock();
         let before = kept.len();
         kept.retain(|(o, _, _), _| o.person != person);
         Ok((before - kept.len()) as u64)
+    }
+
+    async fn holds(&self, reader: &Reader) -> Result<bool> {
+        Ok(self.0.lock().keys().any(|(o, _, _)| reader.reads(o)))
+    }
+
+    async fn read(&self, reader: &Reader, read: &Read) -> Result<Vec<Item>> {
+        let mut out: Vec<Item> = self
+            .0
+            .lock()
+            .iter()
+            .filter(|((o, _, _), (i, _))| reader.reads(o) && read.takes(i))
+            .map(|(_, (i, _))| i.clone())
+            .collect();
+        out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.reference.cmp(&b.reference)));
+        if !read.oldest_first {
+            out.reverse();
+        }
+        out.truncate(usize::try_from(read.limit).unwrap_or(0));
+        Ok(out)
+    }
+
+    async fn search(&self, reader: &Reader, query: &str, read: &Read) -> Result<Vec<Item>> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let all = self
+            .read(
+                reader,
+                &Read {
+                    limit: i64::MAX,
+                    ..read.clone()
+                },
+            )
+            .await?;
+        let mut hits: Vec<Item> = all
+            .into_iter()
+            .filter(|i| {
+                let text = i
+                    .body
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase();
+                !words.is_empty() && words.iter().all(|w| text.contains(w))
+            })
+            .collect();
+        hits.truncate(usize::try_from(read.limit).unwrap_or(0));
+        Ok(hits)
+    }
+
+    async fn set_digest(&self, owner: &Owner, digest: &str, now: DateTime<Utc>) -> Result<()> {
+        self.1
+            .lock()
+            .insert(owner.clone(), (digest.to_string(), now));
+        Ok(())
+    }
+
+    async fn digest(&self, reader: &Reader) -> Result<Option<String>> {
+        Ok(self
+            .1
+            .lock()
+            .iter()
+            .filter(|(o, _)| reader.reads(o))
+            .max_by_key(|(_, (_, at))| *at)
+            .map(|(_, (d, _))| d.clone()))
     }
 }
 
@@ -363,10 +481,115 @@ pub mod postgres {
 
         async fn forget_person(&self, person: Uuid) -> Result<u64> {
             let client = self.pool.get().await?;
+            client
+                .execute("DELETE FROM owners WHERE person = $1", &[&person])
+                .await?;
             Ok(client
                 .execute("DELETE FROM items WHERE person = $1", &[&person])
                 .await?)
         }
+
+        async fn holds(&self, reader: &Reader) -> Result<bool> {
+            let client = self.pool.get().await?;
+            Ok(client
+                .query_opt(
+                    "SELECT 1 FROM items WHERE person = $1 AND agent = $2 LIMIT 1",
+                    &[&reader.person, &reader.agent],
+                )
+                .await?
+                .is_some())
+        }
+
+        async fn read(&self, reader: &Reader, read: &Read) -> Result<Vec<Item>> {
+            let client = self.pool.get().await?;
+            let order = if read.oldest_first { "ASC" } else { "DESC" };
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT kind, ref, session, group_name, at, body FROM items \
+                         WHERE person = $1 AND agent = $2 \
+                           AND ($3::text[] IS NULL OR kind = ANY($3)) \
+                           AND ($4::text IS NULL OR session = $4) \
+                           AND ($5::timestamptz IS NULL OR at >= $5) \
+                           AND ($6::timestamptz IS NULL OR at > $6) \
+                         ORDER BY at {order}, ref {order} LIMIT $7"
+                    ),
+                    &[
+                        &reader.person,
+                        &reader.agent,
+                        &read.kinds,
+                        &read.session,
+                        &read.since,
+                        &read.after,
+                        &read.limit,
+                    ],
+                )
+                .await?;
+            rows.iter().map(item_of).collect()
+        }
+
+        async fn search(&self, reader: &Reader, query: &str, read: &Read) -> Result<Vec<Item>> {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "SELECT kind, ref, session, group_name, at, body FROM items, \
+                       websearch_to_tsquery('simple', $3) q \
+                     WHERE person = $1 AND agent = $2 AND tsv @@ q \
+                       AND ($4::text[] IS NULL OR kind = ANY($4)) \
+                       AND ($5::text IS NULL OR session = $5) \
+                       AND ($6::timestamptz IS NULL OR at >= $6) \
+                     ORDER BY ts_rank(tsv, q) / (1 + extract(epoch FROM (now() - at)) / 604800.0) DESC \
+                     LIMIT $7",
+                    &[
+                        &reader.person,
+                        &reader.agent,
+                        &query,
+                        &read.kinds,
+                        &read.session,
+                        &read.since,
+                        &read.limit,
+                    ],
+                )
+                .await?;
+            rows.iter().map(item_of).collect()
+        }
+
+        async fn set_digest(&self, owner: &Owner, digest: &str, now: DateTime<Utc>) -> Result<()> {
+            let client = self.pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO owners (person, source, agent, digest, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (person, source, agent) \
+                     DO UPDATE SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+                    &[&owner.person, &owner.source, &owner.agent, &digest, &now],
+                )
+                .await?;
+            Ok(())
+        }
+
+        async fn digest(&self, reader: &Reader) -> Result<Option<String>> {
+            let client = self.pool.get().await?;
+            Ok(client
+                .query_opt(
+                    "SELECT digest FROM owners WHERE person = $1 AND agent = $2 \
+                     ORDER BY updated_at DESC LIMIT 1",
+                    &[&reader.person, &reader.agent],
+                )
+                .await?
+                .map(|r| r.try_get(0))
+                .transpose()?)
+        }
+    }
+
+    fn item_of(r: &tokio_postgres::Row) -> Result<Item> {
+        Ok(Item {
+            kind: r.try_get(0)?,
+            reference: r.try_get(1)?,
+            session: r.try_get(2)?,
+            group_name: r.try_get(3)?,
+            at: r.try_get(4)?,
+            body: r.try_get(5)?,
+        })
     }
 
     #[cfg(test)]
@@ -379,6 +602,7 @@ pub mod postgres {
             with_test_pool(PostgresKnows::build_pool, |pool| async move {
                 let store = PostgresKnows::with_pool(pool).await.unwrap();
                 super::super::tests::exercise(&store).await;
+                super::super::tests::exercise_reads(&store).await;
             })
             .await;
         }
@@ -398,6 +622,114 @@ pub(crate) mod tests {
             at,
             body: serde_json::json!({ "text": format!("{kind} {reference} of {session}") }),
         }
+    }
+
+    /// What a person reads of what their Desks sent, and only that.
+    pub(crate) async fn exercise_reads(store: &dyn KnowsStore) {
+        let now = Utc::now();
+        let mac = Owner {
+            person: Uuid::from_u128(1),
+            source: "mac".into(),
+            agent: "allan".into(),
+        };
+        let laptop = Owner {
+            source: "laptop".into(),
+            ..mac.clone()
+        };
+        let other = Owner {
+            person: Uuid::from_u128(2),
+            ..mac.clone()
+        };
+        let me = Reader {
+            person: mac.person,
+            agent: "allan".into(),
+        };
+        assert!(!store.holds(&me).await.unwrap());
+        let mut x1 = item(TRANSCRIPT, "x1", "s1", now - chrono::Duration::hours(2));
+        x1.body = serde_json::json!({ "text": "we fixed the gem credentials loader" });
+        let mut x2 = item(TRANSCRIPT, "x2", "s1", now - chrono::Duration::hours(1));
+        x2.body = serde_json::json!({ "text": "then shipped the release" });
+        store.push(&mac, &[x1, x2], now).await.unwrap();
+        store
+            .push(&laptop, &[item("account", "a2", "s2", now)], now)
+            .await
+            .unwrap();
+        let mut theirs = item(TRANSCRIPT, "x9", "s9", now);
+        theirs.body = serde_json::json!({ "text": "gem credentials of someone else" });
+        store.push(&other, &[theirs], now).await.unwrap();
+        assert!(store.holds(&me).await.unwrap());
+        // Both of the person's Desks, newest first; never another person's.
+        let all = store
+            .read(
+                &me,
+                &Read {
+                    limit: 10,
+                    ..Read::default()
+                },
+            )
+            .await
+            .unwrap();
+        let refs: Vec<&str> = all.iter().map(|i| i.reference.as_str()).collect();
+        assert_eq!(refs, ["a2", "x2", "x1"]);
+        // A session's conversation in order, paged on.
+        let first = store
+            .read(
+                &me,
+                &Read {
+                    kinds: Some(vec![TRANSCRIPT.into()]),
+                    session: Some("s1".into()),
+                    oldest_first: true,
+                    limit: 1,
+                    ..Read::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first[0].reference, "x1");
+        let next = store
+            .read(
+                &me,
+                &Read {
+                    kinds: Some(vec![TRANSCRIPT.into()]),
+                    session: Some("s1".into()),
+                    after: Some(first[0].at),
+                    oldest_first: true,
+                    limit: 1,
+                    ..Read::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(next[0].reference, "x2");
+        // Search finds the person's own, never someone else's.
+        let hits = store
+            .search(
+                &me,
+                "gem credentials",
+                &Read {
+                    limit: 5,
+                    ..Read::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|i| i.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["x1"]
+        );
+        // The digest of the Desk set last.
+        assert_eq!(store.digest(&me).await.unwrap(), None);
+        store
+            .set_digest(&mac, "live", now - chrono::Duration::minutes(1))
+            .await
+            .unwrap();
+        store.set_digest(&laptop, "daily", now).await.unwrap();
+        assert_eq!(store.digest(&me).await.unwrap().as_deref(), Some("daily"));
+        store.forget_person(mac.person).await.unwrap();
+        assert!(!store.holds(&me).await.unwrap());
+        assert_eq!(store.digest(&me).await.unwrap(), None);
     }
 
     pub(crate) async fn exercise(store: &dyn KnowsStore) {
@@ -485,5 +817,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn kept_upserted_forgotten_counted_and_pruned_in_memory() {
         exercise(MemoryKnows::new().as_ref()).await;
+        exercise_reads(MemoryKnows::new().as_ref()).await;
     }
 }
