@@ -502,6 +502,19 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_STALE: Duration = Duration::from_secs(20);
 /// How many times a change is made again when the file changed under it.
 const TRIES: usize = 5;
+/// One per config Desk changes, held while it changes it: its changes to
+/// one file, from any thread, are made one after another.
+static UPDATING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The queue for Desk's own changes to `path`.
+fn updating(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let mut all = UPDATING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(all.entry(path.to_path_buf()).or_default())
+}
 
 /// Changes the config by `change` (its text, none when there is no file,
 /// to the new text, none for nothing to change): under its lock, read again
@@ -540,6 +553,12 @@ fn update(
     if let Ok(Ok(None)) = read(&target).map(|t| change(t.as_deref())) {
         return Ok(false);
     }
+    // Desk's own changes queue here, one at a time, so the lock's wait is
+    // only ever for the CLI: never one of Desk's timing out behind its own.
+    let queue = updating(&target);
+    let _ours = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(_lock) = Lock::take(path) else {
         eyre::bail!("{} stayed locked; left for its CLI to ask", path.display());
     };
