@@ -5469,16 +5469,32 @@ impl Desk {
         if let Some(p) = path.clone() {
             let desk = self.clone();
             tokio::spawn(async move {
-                let (login, ok_at) = tokio::task::spawn_blocking(move || {
-                    transcript::read_tail(Path::new(&p))
-                        .ok()
-                        .map(|t| (t.last_login, t.ok_at))
-                })
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+                let read = |p: String| async move {
+                    tokio::task::spawn_blocking(move || {
+                        transcript::read_tail(Path::new(&p))
+                            .ok()
+                            .map(|t| (t.last_login, t.ok_at))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                };
+                let (login, mut ok_at) = read(p.clone()).await;
                 desk.login_in_transcript(id, login).await;
+                // The hook fires before Claude Code writes the reply: its
+                // line is waited for a little, else the last one before it
+                // stands (the safe side: it clears only older stops).
+                if ended_well {
+                    for wait in [250, 1000, 3000] {
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        let (_, later) = read(p.clone()).await;
+                        if later > ok_at {
+                            ok_at = later;
+                            break;
+                        }
+                    }
+                }
                 if let Some(ok) = ok_at.filter(|_| ended_well) {
                     let raw = {
                         let st = desk.0.state.lock();
