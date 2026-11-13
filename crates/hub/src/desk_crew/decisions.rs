@@ -356,7 +356,8 @@ impl CrewHub {
             why.trim().trim_end_matches('.')
         );
         let mut d = BossDecision::new(&boss, need, &what, &why, How::Escalated)
-            .briefly("Left it to you.", message_of(action));
+            // A draft left to the person was never sent: no message.
+            .briefly("Left it to you.", None);
         d.kind = DecisionKind::Escalated;
         d.need_ref = need_ref;
         d.session = session_of(action, &Done::default());

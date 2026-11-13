@@ -548,6 +548,10 @@ async fn bound_what_a_setting_leaves_to_the_person_names_it() {
         assert!(left.what.starts_with("left it to you:"), "{}", left.what);
         assert!(left.why.contains("I couldn't do it myself"), "{}", left.why);
         assert!(left.why.to_lowercase().contains("interrupt"), "names the setting: {}", left.why);
+        // Laid out as left to the person: nothing was sent.
+        assert_eq!(left.kind, workforce_desk::decision::DecisionKind::Escalated);
+        assert_eq!(left.brief, "Left it to you.");
+        assert_eq!(left.message, None);
     })
     .await;
 }

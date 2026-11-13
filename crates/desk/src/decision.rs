@@ -305,13 +305,36 @@ pub fn brief_line(text: &str, message: Option<&str>) -> Option<String> {
     (!line.trim().is_empty() && !quotes(&line, message)).then_some(line)
 }
 
-/// `why` as one sentence, never quoting `message`: empty when it would.
+/// `why` as one sentence, never quoting `message`: its first sentence
+/// that doesn't, or empty when none is left.
 pub fn why_line(why: &str, message: Option<&str>) -> String {
-    let line = sentence(&crate::crew::one_line(why, WHY_CHARS - 1));
-    match quotes(&line, message) {
-        true => String::new(),
-        false => line,
+    sentences(why)
+        .into_iter()
+        .map(|s| sentence(&crate::crew::clip(s, WHY_CHARS - 1)))
+        .find(|s| !s.is_empty() && !quotes(s, message))
+        .unwrap_or_default()
+}
+
+/// `text`'s sentences in order: each line's, split after `.`, `!` or `?`
+/// followed by a space or the line's end.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['#', '>', '-', '*']).trim();
+        let mut start = 0;
+        for (i, c) in line.char_indices() {
+            let end = i + c.len_utf8();
+            if matches!(c, '.' | '!' | '?')
+                && line[end..].chars().next().is_none_or(char::is_whitespace)
+            {
+                out.push(line[start..end].trim());
+                start = end;
+            }
+        }
+        out.push(line[start..].trim());
     }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// What undoing a decision does, kept with it when it is recorded: never
@@ -417,10 +440,12 @@ impl DecisionLine {
     pub fn laid_out_from(&mut self, d: &BossDecision) {
         self.kind = d.kind;
         self.message = d.message.clone();
+        // A line kept before the layout (no short line) takes the row's
+        // short line and one-sentence why; a composed one keeps its words.
         if self.action.trim().is_empty() {
             self.action = d.brief();
-        }
-        if self.why.trim().is_empty() {
+            self.why = d.brief_why();
+        } else if self.why.trim().is_empty() {
             self.why = d.brief_why();
         }
     }
@@ -592,6 +617,14 @@ mod tests {
             None
         );
         assert_eq!(why_line(message, Some(message)), "");
+        // A reason whose first sentence quotes it says the next one.
+        assert_eq!(
+            why_line(
+                &format!("I told it: {message} The check failed twice.\nIt may be flaky."),
+                Some(message)
+            ),
+            "The check failed twice."
+        );
         assert!(quotes("Told web “5433”.", Some("5433")));
         assert!(!quotes("Answered web's question.", Some("5433")));
         // At most 70 characters, counted as characters, ellipsis and all.
@@ -680,6 +713,13 @@ mod tests {
             (old.action.as_str(), old.why.as_str()),
             ("Let web wait.", "CI runs.")
         );
+        // Kept before the layout with the full why: one sentence of it.
+        let mut long: DecisionLine = serde_json::from_value(serde_json::json!({
+            "id": d.id.to_string(), "text": "let web wait", "why": "CI runs. It takes an hour."
+        }))
+        .unwrap();
+        long.laid_out_from(&d);
+        assert_eq!(long.why, "CI runs.");
         // Composed: its words stay.
         let mut composed = d.line();
         composed.action = "Left web to its tests.".into();

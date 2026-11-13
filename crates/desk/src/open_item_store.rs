@@ -166,6 +166,14 @@ impl DeskStore {
             true => new.text.clone(),
             false => was.text.clone(),
         };
+        // The answer recommended: the one given, else the one kept while it
+        // is still among the options (new options can drop it).
+        let recommended = new.layout.recommended.clone().or_else(|| {
+            was.layout.recommended.clone().filter(|r| {
+                new.options.is_empty()
+                    || crate::open_item::matching_option(&new.options, r).is_some()
+            })
+        });
         let changed = text != was.text
             || new.sessions.iter().any(|s| !was.sessions.contains(s))
             || (!new.options.is_empty() && new.options != was.options)
@@ -174,8 +182,7 @@ impl DeskStore {
             // The layout as it merges below: each part given replaces its own.
             || (new.layout.question.is_some() && new.layout.question != was.layout.question)
             || (!new.layout.points.is_empty() && new.layout.points != was.layout.points)
-            || (new.layout.recommended.is_some()
-                && new.layout.recommended != was.layout.recommended)
+            || recommended != was.layout.recommended
             || (new.layout.not_blocking.is_some()
                 && new.layout.not_blocking != was.layout.not_blocking);
         let first_said = new.said && !was.said();
@@ -196,7 +203,7 @@ impl DeskStore {
                      sessions = ARRAY(SELECT DISTINCT unnest(sessions || $13::uuid[])), \
                      question = COALESCE($14, question), \
                      points = CASE WHEN $15 = '[]'::jsonb THEN points ELSE $15 END, \
-                     recommended = COALESCE($16, recommended), \
+                     recommended = $16, \
                      not_blocking = COALESCE($17, not_blocking) \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
@@ -216,7 +223,7 @@ impl DeskStore {
                     &new.sessions,
                     &new.layout.question,
                     &points,
-                    &new.layout.recommended,
+                    &recommended,
                     &new.layout.not_blocking,
                 ],
             )

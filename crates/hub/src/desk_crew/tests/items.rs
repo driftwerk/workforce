@@ -146,6 +146,13 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
             n.options.iter().map(|o| o.recommended).collect::<Vec<_>>(),
             vec![false, true]
         );
+        // New options without the one recommended drop it.
+        let mut moved = again.clone();
+        moved["options"] = json!(["Merge now", "Revert the fix"]);
+        let r = call(&crew, super::super::items::ASK, moved).await;
+        assert!(r.success, "{:?}", r.error);
+        let i = d.store().open_item(items[0].id).await.unwrap().unwrap();
+        assert_eq!(i.layout.recommended, None);
 
         // Kept in Postgres, so its DM's rollover loses none of it.
         let mut dm = overseer
