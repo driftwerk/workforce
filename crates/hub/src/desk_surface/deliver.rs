@@ -134,6 +134,19 @@ pub(crate) async fn deliver<'a>(
     target: &DeskTarget,
     delivery: Delivery,
 ) -> eyre::Result<Delivered> {
+    deliver_as(outbox, owner, target, delivery, Uuid::new_v4().to_string()).await
+}
+
+/// [`deliver`], the message saved as `message_id`: what the caller keeps by
+/// the message (its extras) is kept before it, so whoever reads the message
+/// once it is announced reads it whole.
+pub(crate) async fn deliver_as<'a>(
+    outbox: impl Into<Outbox<'a>>,
+    owner: &str,
+    target: &DeskTarget,
+    delivery: Delivery,
+    message_id: String,
+) -> eyre::Result<Delivered> {
     let outbox = outbox.into();
     let sessions = outbox.sessions;
     let closed = closed_room(sessions, &target.channel, owner)?;
@@ -143,7 +156,7 @@ pub(crate) async fn deliver<'a>(
         None => delivery.text,
     });
     let message = SessionMessage {
-        id: Uuid::new_v4().to_string(),
+        id: message_id,
         role: MessageRole::Assistant,
         content: text.clone(),
         tool_data: None,

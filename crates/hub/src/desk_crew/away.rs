@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+use workforce_common::channels::desk::DeliveryKind;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_common::session::MessageRole;
@@ -301,32 +301,18 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return false;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery {
-                request_id: request,
-                ..crate::desk_surface::Delivery::text(DeliveryKind::Question, text.to_string())
-            },
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting what needs the person in the boss's DM failed");
-                return false;
-            }
+        let delivery = crate::desk_surface::Delivery {
+            request_id: request,
+            ..crate::desk_surface::Delivery::text(DeliveryKind::Question, text.to_string())
         };
+        // Its buttons kept first: the person's Desk reads the card whole
+        // the moment it is in the DM.
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, boss, extras)
+            .deliver_with_extras(&service, &owner, delivery, extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping a needs-you's buttons failed");
+            tracing::warn!(error = %e, "putting what needs the person in the boss's DM failed");
+            return false;
         }
         true
     }
