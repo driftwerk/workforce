@@ -501,7 +501,15 @@ impl CrewHub {
                     .ok()
                     .and_then(|s| self.desk.view(s).ok())
                     .is_some_and(|v| match (&item.approval, &item.question) {
-                        (Some(_), _) => self.answers_at_once(&v),
+                        // Only while its call may still be deciding it: one
+                        // it left to the person, or Desk refused, is raised.
+                        (Some(a), _) => {
+                            self.answers_at_once(&v)
+                                && v.pending.as_ref().is_some_and(|p| {
+                                    p.id.to_string() == a.id
+                                        && Utc::now() - p.since < super::decide::DECIDING
+                                })
+                        }
                         (None, Some(_)) => {
                             super::answer::question_of(&v).is_some()
                                 && (self.person_has_questions(&v, overseer)

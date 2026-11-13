@@ -45,6 +45,10 @@ const SWEEP: Duration = Duration::from_secs(2);
 /// How long one decision call may take before it is tried again.
 pub(super) const WITHIN: Duration = Duration::from_secs(30);
 
+/// How long a request may be in its decision call (two tries, and a
+/// margin): past it, it is decided or left to the person.
+pub(super) const DECIDING: chrono::TimeDelta = chrono::TimeDelta::seconds(70);
+
 /// What starts every decision call: how a reader (or a test) knows one.
 pub(super) const MARK: &str = "[Desk decision]";
 
