@@ -75,6 +75,12 @@ impl CrewHub {
         if let Some(listed) = listed {
             self.listed.lock().insert(sid.clone(), listed);
         }
+        // What another overseer sent on is never the person's word.
+        let _relayed = (in_dm
+            && author
+                .as_ref()
+                .is_some_and(|a| a.kind != workforce_desk::conversations::SpeakerKind::You))
+        .then(|| Relayed::mark(&self.relayed_turns, &sid));
         // A message of the DM is found again by a mark of its own.
         let relay = author
             .is_some()
@@ -164,6 +170,26 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+/// A DM session marked as running a relayed message, unmarked when the
+/// turn is done.
+struct Relayed<'a>(
+    &'a parking_lot::Mutex<std::collections::HashSet<String>>,
+    String,
+);
+
+impl<'a> Relayed<'a> {
+    fn mark(set: &'a parking_lot::Mutex<std::collections::HashSet<String>>, sid: &str) -> Self {
+        set.lock().insert(sid.to_string());
+        Self(set, sid.to_string())
+    }
+}
+
+impl Drop for Relayed<'_> {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
     }
 }
 

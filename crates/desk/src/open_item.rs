@@ -66,6 +66,9 @@ pub struct OpenItem {
     pub said_count: i32,
     /// Last put to the boss in a check-in.
     pub raised_at: Option<DateTime<Utc>>,
+    /// The sessions a promise or order is linked to (with `session`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<Uuid>,
     pub changed_at: DateTime<Utc>,
     pub state: OpenState,
     pub closed_at: Option<DateTime<Utc>>,
@@ -90,6 +93,8 @@ pub struct NewItem {
     /// It is said to the person as it opens (a card, a needs-you post, the
     /// reply it came from).
     pub said: bool,
+    /// The sessions a promise or order is linked to.
+    pub sessions: Vec<Uuid>,
 }
 
 impl NewItem {
@@ -108,6 +113,7 @@ impl NewItem {
             done_when: None,
             dedupe_key: ask_key(session, None, text),
             said: true,
+            sessions: Vec::new(),
         }
     }
 
@@ -127,6 +133,32 @@ impl NewItem {
             done_when: None,
             dedupe_key: key.to_string(),
             said: false,
+            sessions: Vec::new(),
+        }
+    }
+
+    /// A promise of `boss`'s to the person about `session`, kept when
+    /// `done_when` ("merged", "in production", "replied").
+    pub fn promise(boss: &str, session: Uuid, text: &str, done_when: &str) -> Self {
+        Self {
+            done_when: Some(done_when.trim().to_string()),
+            dedupe_key: promise_key(session, done_when),
+            sessions: vec![session],
+            ..Self::ask(boss, OpenKind::Promise, Some(session), text)
+        }
+    }
+
+    /// The person's order, in their words, with the sessions working on it;
+    /// keyed by their message (`message`) when it came from one, else by its
+    /// words.
+    pub fn order(boss: &str, text: &str, sessions: Vec<Uuid>, message: Option<&str>) -> Self {
+        Self {
+            dedupe_key: match message {
+                Some(m) => format!("order:{m}"),
+                None => format!("order:text:{}", normalised(text)),
+            },
+            sessions,
+            ..Self::ask(boss, OpenKind::Order, None, text)
         }
     }
 
@@ -161,6 +193,134 @@ pub fn approval_key(session: &str, approval: &str) -> String {
     format!("approval:{session}:{approval}")
 }
 
+/// The key of a promise: its session and when it is kept.
+pub fn promise_key(session: Uuid, done_when: &str) -> String {
+    format!("promise:{session}:{}", normalised(done_when))
+}
+
+/// What `done` (a session's account's done list) says kept `done_when`
+/// since `since`, if anything: "merged" by a PR it merged, "in production"
+/// or "deployed" by a deploy, "PR open" by a PR it opened, and anything
+/// else by its words, whole. Words said as not done ("not merged yet",
+/// "couldn't deploy") and other merges ("merged main into the branch")
+/// keep nothing.
+pub fn kept_by<'a>(
+    done_when: &str,
+    done: &'a [crate::account::Done],
+    since: DateTime<Utc>,
+) -> Option<&'a crate::account::Done> {
+    use crate::account::RefKind;
+    let want = normalised(done_when);
+    let has = |d: &crate::account::Done, k: RefKind| d.refs.iter().any(|r| r.kind == k);
+    done.iter().filter(|d| d.at >= since).find(|d| {
+        let words: Vec<&str> = d
+            .text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        let says = |phrases: &[&str]| phrases.iter().any(|p| said(&words, p));
+        match want.as_str() {
+            "merged" | "merge" | "the pr merged" | "pr merged" => {
+                // A merge of it, not of main into it or of a conflict.
+                has(d, RefKind::Pr)
+                    && (0..words.len()).any(|i| {
+                        matches!(words[i].as_str(), "merged" | "merge")
+                            && !negated(&words, i)
+                            && !matches!(
+                                words.get(i + 1).map(String::as_str),
+                                Some(
+                                    "main"
+                                        | "master"
+                                        | "origin"
+                                        | "upstream"
+                                        | "conflict"
+                                        | "conflicts"
+                                )
+                            )
+                    })
+            }
+            "in production" | "live" | "in prod" => {
+                (has(d, RefKind::Deploy) && !negated_anywhere(&words) && !says(&["staging"]))
+                    || says(&[
+                        "in production",
+                        "to production",
+                        "to prod",
+                        "in prod",
+                        "went live",
+                        "is live",
+                    ])
+            }
+            "deployed" | "deploy" | "released" | "shipped" => {
+                (has(d, RefKind::Deploy) && !negated_anywhere(&words))
+                    || says(&["deployed", "released", "shipped"])
+            }
+            "pr open" | "pr opened" | "the pr open" | "a pr open" => {
+                has(d, RefKind::Pr) && says(&["opened", "open", "raised", "created"])
+            }
+            "" => false,
+            w => said(&words, w),
+        }
+    })
+}
+
+/// Whether `words` say `phrase` (normalised words) as done: whole words,
+/// and not just after a "not" or "couldn't".
+fn said(words: &[String], phrase: &str) -> bool {
+    let want: Vec<&str> = phrase.split(' ').filter(|w| !w.is_empty()).collect();
+    if want.is_empty() || want.len() > words.len() {
+        return false;
+    }
+    (0..=words.len() - want.len()).any(|at| {
+        words[at..at + want.len()]
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a == b)
+            && !negated(words, at)
+    })
+}
+
+/// Whether the words just before `at` turn it down.
+fn negated(words: &[String], at: usize) -> bool {
+    words[at.saturating_sub(2)..at].iter().any(|w| negation(w))
+}
+
+/// Whether `w` turns what follows it down: "not", "never", "couldn't"
+/// (split as "couldn" "t").
+fn negation(w: &str) -> bool {
+    matches!(w, "not" | "never" | "cannot" | "t" | "failed" | "unable")
+}
+
+/// Whether `words` say no anywhere, so a deploy ref isn't enough.
+fn negated_anywhere(words: &[String]) -> bool {
+    words.iter().any(|w| negation(w))
+}
+
+/// How long a promise or order is kept with nothing changing.
+pub const LAPSE_AFTER: Duration = Duration::days(3);
+
+/// Why a promise or order of `i`'s lapses at `now`, if it does: every
+/// session it is linked to has ended (`ended` says of one), or nothing
+/// changed for `after`.
+pub fn lapsed(
+    i: &OpenItem,
+    now: DateTime<Utc>,
+    after: Duration,
+    ended: impl Fn(Uuid) -> bool,
+) -> Option<String> {
+    if !matches!(i.kind, OpenKind::Promise | OpenKind::Order) {
+        return None;
+    }
+    let linked = i.linked();
+    if !linked.is_empty() && linked.iter().all(|s| ended(*s)) {
+        return Some(match linked.len() {
+            1 => "its session ended".into(),
+            _ => "its sessions ended".into(),
+        });
+    }
+    (now - i.changed_at >= after).then(|| "nothing changed for 3 days".into())
+}
+
 /// The key of the boss's own ask: by the case it would settle, or by what
 /// it says.
 pub fn ask_key(session: Option<Uuid>, generalizes: Option<&str>, text: &str) -> String {
@@ -177,6 +337,17 @@ impl OpenItem {
     /// said.
     pub fn restated(&self) -> i32 {
         (self.said_count - 1).max(0)
+    }
+
+    /// The sessions it is about or linked to, each once.
+    pub fn linked(&self) -> Vec<Uuid> {
+        let mut out: Vec<Uuid> = Vec::new();
+        for s in self.session.iter().chain(self.sessions.iter()) {
+            if !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        out
     }
 
     /// Whether the person was ever told of it: an item never said is only
@@ -356,6 +527,7 @@ mod tests {
             last_said_at: last.map(|l| now - Duration::minutes(l)),
             said_count: said,
             raised_at: None,
+            sessions: vec![],
             changed_at: now,
             state: OpenState::Open,
             closed_at: None,
@@ -394,6 +566,111 @@ mod tests {
         let mut promise = item(500, 1, Some(500));
         promise.kind = OpenKind::Promise;
         assert!(!promise.due(now, first, remind), "promises aren't nagged");
+    }
+
+    #[test]
+    fn a_promise_is_kept_by_what_its_session_did_and_lapses_when_it_cant_be() {
+        use crate::account::{Done, Ref, RefKind};
+        let now = Utc::now();
+        let done = |text: &str, kind: Option<RefKind>, mins: i64| Done {
+            text: text.into(),
+            refs: kind
+                .map(|k| Ref {
+                    kind: k,
+                    id: "#622".into(),
+                    url: None,
+                })
+                .into_iter()
+                .collect(),
+            at: now - Duration::minutes(mins),
+        };
+        let list = vec![
+            done("Opened PR #622 for the lead picker", Some(RefKind::Pr), 30),
+            done("Merged #622 after CI went green", Some(RefKind::Pr), 5),
+        ];
+        let since = now - Duration::minutes(20);
+        assert_eq!(kept_by("merged", &list, since).unwrap().text, list[1].text);
+        assert!(kept_by("in production", &list, since).is_none());
+        assert!(
+            kept_by("PR open", &list, since).is_none(),
+            "the PR was opened before the promise"
+        );
+        assert!(kept_by("merged", &list, now).is_none());
+        let deployed = vec![done("Promoted to prod", Some(RefKind::Deploy), 1)];
+        assert!(kept_by("in production", &deployed, since).is_some());
+        // What only reads like it keeps the promise doesn't.
+        for (text, kind, want) in [
+            ("Merged main into the branch", Some(RefKind::Pr), "merged"),
+            ("PR #622 is not merged yet", Some(RefKind::Pr), "merged"),
+            (
+                "Resolved a merge conflict in #622",
+                Some(RefKind::Pr),
+                "merged",
+            ),
+            ("Merged the two config files", None, "merged"),
+            ("Wrote a reproduction of the bug", None, "in production"),
+            (
+                "Couldn't deploy: the pipeline is red",
+                Some(RefKind::Deploy),
+                "deployed",
+            ),
+            ("Ran the query against production", None, "in production"),
+            ("Reviewed the pricing page", Some(RefKind::Pr), "PR open"),
+            ("The tests didn't pass", None, "tests pass"),
+        ] {
+            let list = vec![done(text, kind, 1)];
+            assert!(kept_by(want, &list, since).is_none(), "{text} keeps {want}");
+        }
+        for (text, kind, want) in [
+            (
+                "Resolved merge conflicts and merged #622",
+                Some(RefKind::Pr),
+                "merged",
+            ),
+            ("No conflicts, merged #622", Some(RefKind::Pr), "merged"),
+            ("Deployed to production", None, "in production"),
+        ] {
+            let list = vec![done(text, kind, 1)];
+            assert!(kept_by(want, &list, since).is_some(), "{text} keeps {want}");
+        }
+        let list = vec![done("All the tests pass now", None, 1)];
+        assert!(kept_by("tests pass", &list, since).is_some());
+        let list = vec![done("Deployed #622 to staging", None, 1)];
+        assert!(kept_by("deployed", &list, since).is_some());
+        assert!(kept_by("in production", &list, since).is_none());
+
+        let mut p = item(10, 1, None);
+        p.kind = OpenKind::Promise;
+        p.session = Some(Uuid::new_v4());
+        p.sessions = vec![p.session.unwrap()];
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |_| true).as_deref(),
+            Some("its session ended")
+        );
+        assert_eq!(lapsed(&p, now, LAPSE_AFTER, |_| false), None);
+        p.sessions.push(Uuid::new_v4());
+        let one = p.session.unwrap();
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |s| s == one),
+            None,
+            "one still runs"
+        );
+        p.changed_at = now - Duration::days(4);
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |_| false).as_deref(),
+            Some("nothing changed for 3 days")
+        );
+        let ask = item(10, 1, None);
+        assert_eq!(
+            lapsed(&ask, now, Duration::zero(), |_| true),
+            None,
+            "an ask never lapses"
+        );
+        assert!(NewItem::order("desk", "Ship it", vec![], Some("m1")).dedupe_key == "order:m1");
+        assert_eq!(
+            NewItem::promise("desk", one, "x", " Merged ").dedupe_key,
+            format!("promise:{one}:merged")
+        );
     }
 
     #[test]

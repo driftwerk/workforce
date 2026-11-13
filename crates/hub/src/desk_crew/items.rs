@@ -33,13 +33,17 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
+use workforce_desk::crew::By;
 use workforce_desk::crew::{self, Extras, ItemRefused, MentionedApproval};
 use workforce_desk::line::{Asked, LineKind};
 use workforce_desk::model::{DeskEvent, SessionState};
 use workforce_desk::open_item::{
-    self, ClosedBy, NewItem, OpenItem, OpenKind, OpenState, FIRST_RESTATE, RESTATED_AT_ONCE,
-    SWEEP_AFTER,
+    self, ClosedBy, NewItem, OpenItem, OpenKind, OpenState, FIRST_RESTATE, LAPSE_AFTER,
+    RESTATED_AT_ONCE, SWEEP_AFTER,
 };
+
+use super::actions::{Action, Handout, Target, STATUS_QUESTION};
+use super::decisions::Done;
 use workforce_desk::open_item_store::Opened;
 use workforce_desk::Speaker;
 
@@ -49,10 +53,17 @@ use super::CrewHub;
 pub const ASK: &str = "crew.ask_person";
 pub const CLOSE: &str = "crew.close_item";
 pub const OPEN: &str = "crew.open_items";
+pub const PROMISE: &str = "crew.promise";
+pub const ORDER: &str = "crew.order";
 
 pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself.";
-pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
+pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
+pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
+pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, your promises, their orders, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
+
+/// A promise to report back what a session says to a status question.
+const REPLIED: &str = "replied";
 
 /// The state key the nightly sweep keeps its last day under.
 const SWEPT: &str = "hub.crew.items_swept";
@@ -74,6 +85,16 @@ pub fn schema(name: &str) -> Value {
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
             "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" }
+        }, "required": ["text"] }),
+        PROMISE => json!({ "type": "object", "properties": {
+            "session_id": { "type": "string" },
+            "text": { "type": "string", "description": "What you promised, in full" },
+            "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" }
+        }, "required": ["session_id", "text", "done_when"] }),
+        ORDER => json!({ "type": "object", "properties": {
+            "text": { "type": "string", "description": "The person's order, in their words" },
+            "session_ids": { "type": "array", "items": { "type": "string" } },
+            "done_when": { "type": "string" }
         }, "required": ["text"] }),
         CLOSE => json!({ "type": "object", "properties": {
             "item_id": { "type": "string" },
@@ -166,6 +187,7 @@ impl CrewHub {
         match name {
             ASK => self.ask_person(b, input).await,
             CLOSE => self.close_item_tool(boss, input).await,
+            PROMISE | ORDER => self.keep_tool(name, b, input).await,
             OPEN => {
                 let items = self
                     .desk
@@ -251,6 +273,249 @@ impl CrewHub {
                 i.id
             ))),
         }
+    }
+
+    /// `crew.promise` and `crew.order`.
+    async fn keep_tool(&self, name: &str, b: &Bound, input: &Value) -> Result<Value, String> {
+        let boss = b.service.agent_id.as_str();
+        let some = |k: &str| {
+            input[k]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let session = |s: &str| -> Result<Uuid, String> {
+            let id: Uuid = s
+                .parse()
+                .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
+            self.session_seen(id, &b.seen)?;
+            Ok(id)
+        };
+        let text = some("text").ok_or("Say it in full (text).")?;
+        let new = match name {
+            PROMISE => {
+                let s = session(
+                    input["session_id"]
+                        .as_str()
+                        .ok_or("Say which session it is about (session_id).")?,
+                )?;
+                let done_when = some("done_when").ok_or("Say when it is kept (done_when).")?;
+                NewItem::promise(boss, s, &text, &done_when)
+            }
+            _ => {
+                let mut sessions = Vec::new();
+                for s in input["session_ids"].as_array().into_iter().flatten() {
+                    sessions.push(session(s.as_str().unwrap_or_default())?);
+                }
+                let mut o = NewItem::order(boss, &text, sessions, None);
+                o.done_when = some("done_when");
+                o
+            }
+        };
+        let opened = self
+            .desk
+            .store()
+            .item_open(&new)
+            .await
+            .map_err(Self::item_err)?;
+        Ok(json!(format!(
+            "Kept as item {}: it is tracked until it is done, and in every turn of yours till then.",
+            opened.item().id
+        )))
+    }
+
+    /// After `action` was done by `by` (left in `done`): a status question
+    /// to a session is a promise to report back its reply, and what acted on
+    /// a session is kept for the turn's order.
+    pub(crate) async fn after_action(&self, action: &Action, by: &By, done: &Done) {
+        let Some(boss) = self.deciding_boss(by) else {
+            return;
+        };
+        let now = crew::now();
+        let acted: Vec<Uuid> = match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                message,
+                reply_to: None,
+            } if message.starts_with(STATUS_QUESTION) => {
+                let question = message.trim_start_matches(STATUS_QUESTION).trim();
+                let name = self.name_of_session(*s);
+                let mut p = NewItem::promise(
+                    &boss,
+                    *s,
+                    &format!(
+                        "Report back what {name} says to “{}”",
+                        crew::one_line(question, 200)
+                    ),
+                    REPLIED,
+                );
+                p.line_message = done.line.as_ref().map(|(id, _)| *id);
+                if let Err(e) = self.desk.store().item_open(&p).await {
+                    tracing::warn!(error = %format!("{e:#}"), "keeping the promise to report back failed");
+                }
+                Vec::new()
+            }
+            // A question isn't work done for the person: only what tells
+            // a session to do something is ("Could you add …?" is that).
+            Action::Nudge {
+                to: Target::Session(s),
+                reply_to: None,
+                message,
+            } if !asks(message) => vec![*s],
+            Action::StartSession { .. } => done.started.into_iter().collect(),
+            Action::AssignTicket { to, .. } => match to {
+                Handout::Session(s) => vec![*s],
+                Handout::NewSession { .. } => done.started.into_iter().collect(),
+                Handout::Agent(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        // Only what a turn did is that turn's: outside one, nothing is.
+        let turn = workforce_agent::runner::CURRENT_SESSION_ID
+            .try_with(Clone::clone)
+            .ok();
+        let (Some(turn), false) = (turn, acted.is_empty()) else {
+            return;
+        };
+        let mut list = self.turn_acts.lock();
+        list.retain(|(_, at, _)| now - *at < chrono::Duration::hours(1));
+        list.extend(acted.into_iter().map(|s| (turn.clone(), now, s)));
+    }
+
+    /// The person's message `text`, in `boss`'s DM turn that started at
+    /// `started` in `sid`: an order, with the sessions the turn acted on,
+    /// when it acted on any.
+    pub(crate) async fn order_from_turn(
+        &self,
+        service: &crate::serve::AgentService,
+        sid: &str,
+        started: DateTime<Utc>,
+        text: &str,
+    ) {
+        let boss = service.agent_id.as_str();
+        // The DM's session now: the turn's own, or the one it rolled over
+        // to, where its tools ran.
+        let session = service.sessions.get(sid).ok().flatten().and_then(|s| {
+            if s.is_sealed() {
+                service.sessions.find(&s.channel, &s.owner).ok().flatten()
+            } else {
+                Some(s)
+            }
+        });
+        let rolled = session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .filter(|id| id != sid);
+        // This turn's acts, taken: its session's, since it started.
+        let mut sessions: Vec<Uuid> = Vec::new();
+        self.turn_acts.lock().retain(|(turn, at, s)| {
+            let ours = (turn == sid || rolled.as_deref() == Some(turn.as_str())) && *at >= started;
+            if ours && !sessions.contains(s) {
+                sessions.push(*s);
+            }
+            !ours
+        });
+        if sessions.is_empty() || text.trim().is_empty() {
+            return;
+        }
+        // Keyed by the person's message, found again after a rollover.
+        let message = session.and_then(|s| {
+            s.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == workforce_common::session::MessageRole::User)
+                .map(|m| m.id.clone())
+        });
+        let new = NewItem::order(boss, text.trim(), sessions, message.as_deref());
+        if let Err(e) = self.desk.store().item_open(&new).await {
+            tracing::warn!(error = %format!("{e:#}"), "keeping the person's order failed");
+        }
+    }
+
+    /// A session's message on its line to its boss keeps the boss's promise
+    /// to report what it says: closed, and its reply said once.
+    pub(super) async fn replied(&self, m: &workforce_desk::line::LineMessage) {
+        let (Some(session), true) = (m.from_session(), m.to.kind == crew::PartyKind::Manager)
+        else {
+            return;
+        };
+        let key = open_item::promise_key(session, REPLIED);
+        let items = match self.desk.store().items_not_closed(Some(&m.to.id)).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the boss's promises failed");
+                return;
+            }
+        };
+        // The answer to the question it was asked, or, as a session's
+        // reply to a plain message isn't threaded, its next word that
+        // answers nothing else.
+        let Some(p) = items.into_iter().find(|i| {
+            i.dedupe_key == key
+                && i.opened_at <= m.at
+                && match m.in_reply_to {
+                    Some(asked) => i.line_message == Some(asked),
+                    None => true,
+                }
+        }) else {
+            return;
+        };
+        let reply = crew::one_line(&m.text, 600);
+        let why = format!("{} replied.", m.from.name);
+        if let Ok(Some(closed)) = self
+            .desk
+            .store()
+            .item_close(p.id, ClosedBy::Boss, &why)
+            .await
+        {
+            let text = format!(
+                "{} answered what I asked it at {}: {reply}",
+                m.from.name,
+                closed
+                    .opened_at
+                    .with_timezone(&self.desk.timezone())
+                    .format("%H:%M")
+            );
+            self.say(&closed.boss, text).await;
+        }
+    }
+
+    /// Says `text` in `boss`'s DM, as a notice.
+    async fn say(&self, boss: &str, text: String) {
+        let Some((service, _)) = self.overseer_named(boss) else {
+            return;
+        };
+        let Some(owner) = self.person(Some(&service)) else {
+            return;
+        };
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+        if let Err(e) = crate::desk_surface::deliver(
+            &service,
+            &owner,
+            &target,
+            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
+        )
+        .await
+        {
+            tracing::info!(error = %e, "a notice in the boss's DM failed");
+        }
+    }
+
+    /// A promise or order kept by what its sessions' accounts say they did
+    /// since it opened, if one: what did it.
+    async fn kept(&self, i: &OpenItem) -> Option<String> {
+        let done_when = i.done_when.as_deref().filter(|d| *d != REPLIED)?;
+        let linked = i.linked();
+        if linked.is_empty() {
+            return None;
+        }
+        let accounts = self.desk.session_accounts_of(&linked).await.ok()?;
+        accounts
+            .iter()
+            .find_map(|a| open_item::kept_by(done_when, &a.done, i.opened_at))
+            .map(|d| d.text.clone())
     }
 
     async fn close_item_tool(&self, boss: &str, input: &Value) -> Result<Value, String> {
@@ -636,6 +901,24 @@ impl CrewHub {
         if i.state == OpenState::Parked {
             return None;
         }
+        // A promise or order ends when it is kept, or lapses.
+        if matches!(i.kind, OpenKind::Promise | OpenKind::Order) {
+            if let Some(what) = self.kept(i).await {
+                return Some((
+                    ClosedBy::Boss,
+                    format!("Done: {}", crew::one_line(&what, 200)),
+                ));
+            }
+            let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
+            let after = minute * LAPSE_AFTER.num_minutes() as i32;
+            // Gone or closed ended it; a view that failed says nothing.
+            let ended = |s: Uuid| match self.desk.view(s) {
+                Ok(v) => v.state == SessionState::Closed,
+                Err(workforce_desk::DeskError::NotFound) => true,
+                Err(_) => false,
+            };
+            return open_item::lapsed(i, now, after, ended).map(|why| (ClosedBy::Lapsed, why));
+        }
         let view = match i.session {
             Some(s) => match self.desk.view(s) {
                 Ok(v) if v.state == SessionState::Closed => {
@@ -704,9 +987,44 @@ impl CrewHub {
             match self.desk.store().item_close(i.id, by, &why).await {
                 Ok(Some(closed)) => {
                     tracing::info!(item = %closed.id, by = by.as_str(), %why, "an open item closed");
-                    // A session's question shows its own end where it is.
-                    if closed.said() && closed.line_message.is_none() && by != ClosedBy::Person {
-                        self.say_closed(&closed, &why).await;
+                    let tz = self.desk.timezone();
+                    let at = closed.opened_at.with_timezone(&tz).format("%H:%M");
+                    match (closed.kind, by) {
+                        // Kept: reported once, with when it was asked.
+                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss) => {
+                            let what = match closed.kind {
+                                OpenKind::Order => format!("The change you asked for at {at}"),
+                                _ => format!("What I promised at {at}"),
+                            };
+                            self.say(
+                                &closed.boss,
+                                format!(
+                                    "{what} (“{}”) is {}: {}",
+                                    crew::one_line(&closed.text, 200),
+                                    closed.done_when.as_deref().unwrap_or("done"),
+                                    why.trim_start_matches("Done: ")
+                                ),
+                            )
+                            .await;
+                        }
+                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Lapsed) => {
+                            self.say(
+                                &closed.boss,
+                                format!(
+                                    "I'm no longer tracking “{}”: {why}.",
+                                    crew::one_line(&closed.text, 200)
+                                ),
+                            )
+                            .await;
+                        }
+                        // A session's question shows its own end where it is.
+                        _ if closed.said()
+                            && closed.line_message.is_none()
+                            && by != ClosedBy::Person =>
+                        {
+                            self.say_closed(&closed, &why).await;
+                        }
+                        _ => {}
                     }
                 }
                 Ok(None) => {}
@@ -866,6 +1184,11 @@ pub(super) async fn items_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         tokio::select! {
             () = cancel.cancelled() => return,
             received = events.recv() => match received {
+                Ok(DeskEvent::Line { message, removed: false })
+                    if message.kind != LineKind::Ask && message.from_session().is_some() =>
+                {
+                    crew.replied(&message).await;
+                }
                 Ok(DeskEvent::Line { message, .. }) if message.kind == LineKind::Ask => {
                     let name = message.from.name.clone();
                     if let Some((by, why)) = line_closed(message.asked, &name) {
@@ -885,6 +1208,35 @@ pub(super) async fn items_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             }
         }
     }
+}
+
+/// Whether `message` to a session only asks it something: it opens with a
+/// question word and asks.
+fn asks(message: &str) -> bool {
+    let first = message
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or_default()
+        .to_lowercase();
+    message.contains('?')
+        && matches!(
+            first.as_str(),
+            "where"
+                | "what"
+                | "when"
+                | "which"
+                | "who"
+                | "why"
+                | "how"
+                | "is"
+                | "are"
+                | "was"
+                | "were"
+                | "did"
+                | "does"
+                | "has"
+                | "have"
+        )
 }
 
 #[cfg(test)]
@@ -929,6 +1281,7 @@ mod tests {
                     // The first said twice already: this is its third.
                     said_count: if n == 0 { 3 } else { 1 },
                     raised_at: None,
+                    sessions: vec![],
                     changed_at: now,
                     state: OpenState::Open,
                     closed_at: None,
@@ -951,6 +1304,14 @@ mod tests {
         assert!(!said[1].1.contains("more"));
         assert!(said[1].1.starts_with("Still waiting on you: Q1? · 3 h"));
         assert_eq!(restatements(&due[..2], now).len(), 2);
+    }
+
+    #[test]
+    fn a_question_to_a_session_is_not_work_done_for_the_person() {
+        assert!(asks("Where is it? Reply when you can."));
+        assert!(asks("Which key did you use?"));
+        assert!(!asks("Could you add the picker endpoint?"));
+        assert!(!asks("Add the picker endpoint."));
     }
 
     #[test]

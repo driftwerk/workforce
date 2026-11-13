@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 10] = [
+pub const READ: [&str; 12] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -38,6 +38,8 @@ pub const READ: [&str; 10] = [
     super::items::ASK,
     super::items::CLOSE,
     super::items::OPEN,
+    super::items::PROMISE,
+    super::items::ORDER,
 ];
 pub const ACT: [&str; 21] = [
     "crew.nudge",
@@ -374,9 +376,11 @@ impl CrewTool {
                     .await
             }
             super::board::NAME => crew.board(seen).await,
-            super::items::ASK | super::items::CLOSE | super::items::OPEN => {
-                crew.items_tool(self.name, b, input).await
-            }
+            super::items::ASK
+            | super::items::CLOSE
+            | super::items::OPEN
+            | super::items::PROMISE
+            | super::items::ORDER => crew.items_tool(self.name, b, input).await,
             _ => Err("not a reading tool".into()),
         }
     }
@@ -744,6 +748,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::items::ASK => super::items::ASK_DESCRIPTION,
             super::items::CLOSE => super::items::CLOSE_DESCRIPTION,
             super::items::OPEN => super::items::OPEN_DESCRIPTION,
+            super::items::PROMISE => super::items::PROMISE_DESCRIPTION,
+            super::items::ORDER => super::items::ORDER_DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,

@@ -15,7 +15,7 @@ use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
-     said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at";
+     said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -44,6 +44,7 @@ fn item(r: &Row) -> Result<OpenItem> {
             .transpose()?,
         closed_why: r.try_get(20)?,
         raised_at: r.try_get(21)?,
+        sessions: r.try_get(22)?,
     })
 }
 
@@ -93,9 +94,10 @@ impl DeskStore {
                     &format!(
                         "INSERT INTO boss_open_items (id, boss, owner, kind, session, line_message, \
                          text, holding_up, recommendation, options, generalizes, done_when, \
-                         dedupe_key, opened_at, last_said_at, said_count, changed_at, state) \
+                         dedupe_key, opened_at, last_said_at, said_count, changed_at, state, \
+                         sessions) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                         $16, $14, 'open') \
+                         $16, $14, 'open', $17) \
                          ON CONFLICT (boss, dedupe_key) WHERE state <> 'closed' DO NOTHING \
                          RETURNING {COLUMNS}"
                     ),
@@ -116,6 +118,7 @@ impl DeskStore {
                         &now,
                         &said_at,
                         &said,
+                        &new.sessions,
                     ],
                 )
                 .await?;
@@ -152,6 +155,7 @@ impl DeskStore {
             false => was.text.clone(),
         };
         let changed = text != was.text
+            || new.sessions.iter().any(|s| !was.sessions.contains(s))
             || (!new.options.is_empty() && new.options != was.options)
             || (new.holding_up.is_some() && new.holding_up != was.holding_up)
             || (new.recommendation.is_some() && new.recommendation != was.recommendation);
@@ -169,7 +173,8 @@ impl DeskStore {
                      session = COALESCE(session, $10), \
                      said_count = CASE WHEN $8 THEN 1 ELSE said_count END, \
                      last_said_at = CASE WHEN $8 THEN $11 ELSE last_said_at END, \
-                     changed_at = CASE WHEN $12 OR $8 THEN $11 ELSE changed_at END \
+                     changed_at = CASE WHEN $12 OR $8 THEN $11 ELSE changed_at END, \
+                     sessions = ARRAY(SELECT DISTINCT unnest(sessions || $13::uuid[])) \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
                 &[
@@ -185,6 +190,7 @@ impl DeskStore {
                     &new.session,
                     &now,
                     &changed,
+                    &new.sessions,
                 ],
             )
             .await?;

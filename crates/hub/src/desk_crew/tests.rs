@@ -1803,6 +1803,7 @@ mod act_fully_budget;
 
 mod decisions;
 mod items;
+mod promises;
 
 mod remote_asks;
 mod served;

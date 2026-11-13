@@ -1223,6 +1223,7 @@ impl CrewHub {
         let who = by.clone();
         let mut done = Done::default();
         let said = self.perform_as(action, by, &mut done).await?;
+        self.after_action(action, &who, &done).await;
         if let Some(d) = self
             .record_action(action, &who, &said, &done, &before)
             .await
