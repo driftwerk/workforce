@@ -653,6 +653,7 @@ impl Desk {
             }
             None => {}
         }
+        self.handoff_ended(id).await;
         let view = self.view(id)?;
         if let Some(by) = by {
             self.note(by.event(

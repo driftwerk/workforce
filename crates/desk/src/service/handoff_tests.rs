@@ -145,6 +145,14 @@ struct World {
     _cancel: tokio_util::sync::CancellationToken,
 }
 
+/// Desk's options, running stand-in CLIs that keep what they were started
+/// with in `dir`.
+fn stand_ins(dir: &Path) -> super::Options {
+    crate::testing::options(dir)
+        .with_program(Engine::Claude, fake_cli(dir, "claude"))
+        .with_program(Engine::Codex, fake_cli(dir, "codex"))
+}
+
 /// Desk with an Acme and a Globex session harvested, on this computer or
 /// (`machine`) a machine's engine, running stand-in CLIs.
 async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: bool) -> World {
@@ -174,9 +182,7 @@ async fn world(pool: &workforce_postgres::PostgresPool, dir: &Path, machine: boo
                 .unwrap();
         }
     }
-    let mut opts = crate::testing::options(dir)
-        .with_program(Engine::Claude, fake_cli(dir, "claude"))
-        .with_program(Engine::Codex, fake_cli(dir, "codex"));
+    let mut opts = stand_ins(dir);
     opts.memory.machine = machine;
     let cancel = tokio_util::sync::CancellationToken::new();
     let logged = Arc::new(super::tests::Logged::default());
@@ -860,6 +866,249 @@ async fn with_only_the_goal_nothing_but_the_goal_goes() {
             ),
             (0, 0, 0, 0, 0, 0)
         );
+    })
+    .await;
+}
+
+/// Where `id`'s work continues, as the registry keeps it, and whether it
+/// holds a lineage row of its own.
+async fn kept(store: &DeskStore, source: Uuid, target: Uuid) -> (Option<Uuid>, bool) {
+    let client = store.pool().get().await.unwrap();
+    let handed: Option<Uuid> = client
+        .query_one("SELECT handed_to FROM sessions WHERE id = $1", &[&source])
+        .await
+        .unwrap()
+        .get(0);
+    let row: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM work_lineage WHERE session = $1)",
+            &[&target],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    (handed, row)
+}
+
+fn confirmed(engine: Engine) -> Ask {
+    Ask {
+        egress_confirmed: true,
+        ..to(engine)
+    }
+}
+
+#[tokio::test]
+async fn ending_the_session_a_work_went_to_before_it_took_it_up_undoes_the_handoff() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let target =
+            w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        until("its record kept", async || {
+            w.store.get(target).await.unwrap().is_some()
+        })
+        .await;
+        assert_eq!(kept(&w.store, w.acme, target).await, (Some(target), true));
+        // It came up and never ran a turn; the person ends it.
+        w.d.end(target, Some(By::you())).await.unwrap();
+        assert_eq!(
+            kept(&w.store, w.acme, target).await,
+            (None, false),
+            "undone, as kept"
+        );
+        let l = w.d.lineage();
+        assert_eq!(l.head(w.acme), w.acme, "undone, as held");
+        assert!(!l.links.contains_key(&target));
+        assert_eq!(w.d.work_sessions(w.acme), vec![w.acme]);
+        // Handed on again, as if the first was never made.
+        let again =
+            w.d.handoff(w.acme, &confirmed(Engine::Claude), By::you())
+                .await
+                .unwrap();
+        assert_eq!(w.d.lineage().head(w.acme), again.session.id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_work_whose_session_ended_after_doing_some_can_be_handed_on_again_and_keeps_how_it_went()
+{
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let first =
+            w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        // While it is open, the work continues there.
+        let e =
+            w.d.handoff(w.acme, &confirmed(Engine::Claude), By::you())
+                .await
+                .unwrap_err();
+        assert!(e.to_string().contains("already continues"), "{e}");
+        // It took the work up, then was ended.
+        w.d.change(first, |r, _| r.last_reply = Some("Fixed the race.".into()));
+        w.d.end(first, Some(By::you())).await.unwrap();
+        assert_eq!(
+            kept(&w.store, w.acme, first).await,
+            (Some(first), true),
+            "kept as how it went"
+        );
+        assert_eq!(w.d.work_sessions(w.acme), vec![w.acme, first]);
+        let again =
+            w.d.handoff(w.acme, &confirmed(Engine::Claude), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        let l = w.d.lineage();
+        assert_eq!(l.head(w.acme), again);
+        assert_eq!(
+            w.d.work_sessions(w.acme),
+            vec![w.acme, first, again],
+            "one work, all of it"
+        );
+        assert_eq!(kept(&w.store, w.acme, again).await, (Some(again), true));
+        // After a restart, where a closed session isn't loaded, the same.
+        *w.d.0.handoff.lineage.lock() = Default::default();
+        w.d.lineage_load().await;
+        assert_eq!(w.d.lineage().head(w.acme), again);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_handoff_a_restart_cut_short_is_undone_at_start() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let target =
+            w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        until("its record kept", async || {
+            w.store.get(target).await.unwrap().is_some()
+        })
+        .await;
+        // The last hub also kept a brief for a session it never got to make.
+        let unmade = Uuid::new_v4();
+        let link = w.d.lineage().links[&target].clone();
+        w.store
+            .put_lineage(&crate::lineage_store::LineageWrite {
+                session: unmade,
+                link: &crate::handoff::Link {
+                    from: w.globex,
+                    ..link
+                },
+                account: None,
+                brief: Some("a brief"),
+                included: &Default::default(),
+            })
+            .await
+            .unwrap();
+        // And Globex's was handed on to a session ended before it took the
+        // work up, by a hub that didn't undo it then.
+        let ended =
+            w.d.handoff(w.globex, &confirmed(Engine::Claude), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        until("its record kept", async || {
+            w.store.get(ended).await.unwrap().is_some()
+        })
+        .await;
+        w._cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let client = w.store.pool().get().await.unwrap();
+            client
+                .execute(
+                    "UPDATE sessions SET state = 'closed' WHERE id = $1",
+                    &[&ended],
+                )
+                .await
+                .unwrap();
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let next = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            stand_ins(dir.path()),
+            super::Floor {
+                redactor: Some(Arc::new(Plain) as Arc<dyn crate::memory::Redactor>),
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kept(&w.store, w.acme, target).await,
+            (None, false),
+            "undone"
+        );
+        assert_eq!(
+            kept(&w.store, w.globex, ended).await,
+            (None, false),
+            "undone, closed"
+        );
+        assert_eq!(next.lineage().head(w.globex), w.globex);
+        assert_eq!(
+            kept(&w.store, w.globex, unmade).await,
+            (None, false),
+            "its brief went"
+        );
+        let l = next.lineage();
+        assert_eq!(l.head(w.acme), w.acme);
+        assert!(l.links.is_empty(), "{l:?}");
+        let t = next.view(target).unwrap();
+        assert_eq!(
+            t.state,
+            crate::model::SessionState::Closed,
+            "its empty card closed"
+        );
+        assert!(
+            next.restore_offer().iter().all(|s| s.id != target),
+            "never offered to be restored"
+        );
+        // The work can be handed on again from where it is.
+        let again = next
+            .handoff(w.acme, &confirmed(Engine::Claude), By::you())
+            .await
+            .unwrap();
+        assert_eq!(next.lineage().head(w.acme), again.session.id);
+        cancel.cancel();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_source_still_starting_is_stopped_when_its_work_is_handed_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        w.d.resume(w.acme, None, None).await.unwrap();
+        let v = w.d.view(w.acme).unwrap();
+        assert!(v.live && v.state == crate::model::SessionState::Starting);
+        // Nothing said of what becomes of it: in no turn, so stopped now,
+        // never left waiting for a turn to end.
+        w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+            .await
+            .unwrap();
+        until("the source stopped", async || {
+            let v = w.d.view(w.acme).unwrap();
+            !v.live && v.state == crate::model::SessionState::Stopped
+        })
+        .await;
     })
     .await;
 }

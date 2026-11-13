@@ -92,7 +92,8 @@ pub struct Facts {
     pub redactor: bool,
     /// The source's group now; none ungrouped.
     pub source_group: Option<String>,
-    /// The work already continues in another session.
+    /// The work already continues in another session, one still open
+    /// ([`Lineage::continues_in`]).
     pub handed_to: Option<Uuid>,
     /// The target's engine.
     pub target: Engine,
@@ -300,6 +301,15 @@ impl Lineage {
         self.handed_to.contains_key(&session)
     }
 
+    /// The session `session`'s work goes on in now, when that is another
+    /// one still `open`. Once the one it went on in is closed or gone, the
+    /// work can go on from `session` again: the old link stays, as how the
+    /// work went.
+    pub fn continues_in(&self, session: Uuid, open: impl Fn(Uuid) -> bool) -> Option<Uuid> {
+        let head = self.head(session);
+        (head != session && open(head)).then_some(head)
+    }
+
     /// Every session `session`'s work was handed on to, and on from those,
     /// in the order they were handed it: whose gists may carry its
     /// purpose.
@@ -337,6 +347,14 @@ impl Lineage {
         self.handed_to.insert(from, to);
         self.handed_to.remove(&to);
     }
+}
+
+/// Whether a session given work with `link` took none of it up: it was
+/// started for the handoff (made once it was handed the work, so never one
+/// handed back to), and no turn of it answered or was kept. Its handoff is
+/// undone once it ends or is lost so, as if it was never made.
+pub fn took_none_up(link: &Link, created_at: DateTime<Utc>, replied: bool, kept: bool) -> bool {
+    created_at >= link.at && !replied && !kept
 }
 
 /// The name a handoff's new worktree's branch takes: the source's branch
@@ -656,6 +674,41 @@ mod tests {
         assert_eq!(l.head(a), a);
         assert!(!l.handed_off(a));
         assert_eq!(l.sessions(a), vec![a, b]);
+    }
+
+    #[test]
+    fn the_work_continues_elsewhere_only_while_its_head_is_open() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let mut l = Lineage::default();
+        l.hand_on(a, b, link(a, a, 1));
+        assert_eq!(l.continues_in(a, |_| true), Some(b));
+        assert_eq!(l.continues_in(a, |s| s != b), None, "closed or gone");
+        assert_eq!(l.continues_in(b, |_| true), None, "it holds the work");
+        // On along a chain: what decides is where it is now.
+        l.hand_on(b, c, link(a, b, 2));
+        assert_eq!(l.continues_in(a, |s| s != b), Some(c), "a step closed");
+        assert_eq!(l.continues_in(a, |s| s != c), None, "its head closed");
+        // Handed back: it holds the work again.
+        l.hand_on(c, a, link(a, c, 3));
+        assert_eq!(l.continues_in(a, |_| true), None);
+        assert_eq!(l.continues_in(c, |_| true), Some(a));
+    }
+
+    #[test]
+    fn a_session_took_up_its_work_once_it_answered_or_kept_a_turn() {
+        let l = link(Uuid::nil(), Uuid::nil(), 10);
+        let at = |min| DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::minutes(min);
+        assert!(
+            took_none_up(&l, at(10), false, false),
+            "started for it, nothing since"
+        );
+        assert!(took_none_up(&l, at(11), false, false));
+        assert!(!took_none_up(&l, at(11), true, false), "it answered");
+        assert!(!took_none_up(&l, at(11), false, true), "a turn was kept");
+        assert!(
+            !took_none_up(&l, at(9), false, false),
+            "handed back to: it was there before"
+        );
     }
 
     #[test]
