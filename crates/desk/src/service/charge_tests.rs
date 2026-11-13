@@ -192,6 +192,15 @@ async fn the_persons_hold_lasts_two_minutes_after_their_last_input_unless_the_bo
         typed(chrono::Duration::seconds(30));
         assert_eq!(d.wheel_of(s.id), Some(Wheel::Person), "still typing");
         assert!(d.boss_holds(s.id, Some(&by)).is_err());
+        // Unbound (Act fully), the person typing holds it back from nothing.
+        let unbound = crate::charge::FullGrant {
+            unbound: true,
+            ..Default::default()
+        };
+        d.set_full([("sarah".to_string(), unbound)].into());
+        assert!(d.boss_holds(s.id, Some(&by)).is_ok(), "unbound");
+        d.set_full(std::collections::HashMap::new());
+        assert!(d.boss_holds(s.id, Some(&by)).is_err());
         typed(chrono::Duration::minutes(3));
         assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss), "stopped typing");
         assert!(d.boss_holds(s.id, Some(&by)).is_ok());
@@ -1084,4 +1093,89 @@ async fn a_held_bosss_queued_messages_are_withdrawn() {
         assert!(withdrawn, "what it queued is withdrawn");
     })
     .await;
+}
+
+/// What may change an agent's own settings is told however it is written:
+/// what Act fully allows at once must never be one of them. Reading them,
+/// and every ordinary command, goes.
+#[test]
+fn a_command_that_may_change_an_agents_settings_is_told_however_it_is_written() {
+    let home = std::path::Path::new("/h");
+    let ws = std::path::Path::new("/h/.workforce/agents/desk");
+    let settings = vec![
+        ws.join("config.toml"),
+        ws.join("heartbeats"),
+        ws.join(".local"),
+    ];
+    let elsewhere = std::path::Path::new("/h/dev/acme");
+    let may = |c: &str| command_may_touch_settings(c, elsewhere, &settings, home);
+    for c in [
+        "echo x >> /h/.workforce/agents/desk/config.toml",
+        "sed -i s/a/b/ ~/.workforce/agents/desk/config.toml",
+        "sed -i s/a/b/ $HOME/.workforce/agents/desk/config.toml",
+        "sed -i s/a/b/ ${HOME}/.workforce//agents/desk/./config.toml",
+        "cd /h/.workforce/agents/desk && sed -i s/a/b/ config.toml",
+        "M=/h/.workforce/agents/desk; echo x >> $M/config.toml",
+        "sed -i s/a/b/ $W/config.toml",
+        "rm ../../.workforce/agents/*/config.toml",
+        "cd ~ && sed -i s/x/y/ .workforce/agents/desk/config.toml",
+        "cd /h/.workforce/agents && sed -i s/x/y/ desk/config.toml",
+        "find /h/.workforce -name config.toml -exec sed -i s/x/y/ {} +",
+        "cp -r /tmp/w/. /h/.workforce/",
+        "cd /h/dev && tee ../.workforce/agents/desk/config.toml < x",
+        "python3 -c 'open(\"/h/.workforce/agents/desk/config.toml\",\"w\")'",
+        "env cp /tmp/x /h/.workforce/agents/desk/config.toml",
+        "env sed -i s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed -Ei s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed --in-place=.bak s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed -n 's/a/b/w /h/.workforce/agents/desk/config.toml' /tmp/x",
+        "awk -i inplace 1 /h/.workforce/agents/desk/config.toml",
+        "yq -i .a=1 /h/.workforce/agents/desk/config.toml",
+        "sort -o /h/.workforce/agents/desk/config.toml /tmp/x",
+        "sed -n '1,$w /h/.workforce/agents/desk/config.toml' /tmp/x",
+        "sed -n '/x/!W /h/.workforce/agents/desk/config.toml' /tmp/x",
+        "sed 'e cp /tmp/x /h/.workforce/agents/desk/config.toml' /tmp/y",
+        "tree -o /h/.workforce/agents/desk/config.toml",
+        "sed -n '1,$w/h/.workforce/agents/desk/config.toml' /tmp/x",
+        "sed -n --expression='1,$w /h/.workforce/agents/desk/config.toml' /tmp/x",
+        "find /h/.workforce -fprintf /h/.workforce/agents/desk/config.toml x",
+        "sed -i s/a/b/ /h/.work\"force\"/agents/desk/config.toml",
+        "sed -i s/a/b/ /h/.work\\force/agents/desk/config.toml",
+        "D=/h/.work; cd ${D}force/agents/desk && sed -i x config.toml",
+        "cd /h/.workf*/agents/desk && sed -i x config.toml",
+        "{\"path\":\"/h/.workforce/agents/desk/config.toml\",\"content\":\"x\"}",
+    ] {
+        assert!(may(c), "{c}");
+    }
+    assert!(
+        command_may_touch_settings("sed -i s/a/b/ config.toml", ws, &settings, home),
+        "run inside a workspace"
+    );
+    assert!(
+        command_may_touch_settings(
+            "sed -i s/x/y/ .workforce/agents/desk/config.toml",
+            home,
+            &settings,
+            home
+        ),
+        "a relative path from home"
+    );
+    for c in [
+        // The person's own words that day, and ordinary work.
+        "export PATH=$HOME/.local/bin:$PATH; cargo test",
+        "M=/x/memory; cat $M/a.md | head -80",
+        "cat /h/.workforce/agents/desk/config.toml",
+        "M=/h/.workforce/agents/desk; sed -n 1,5p $M/config.toml",
+        "grep -r budget ~/.workforce/agents/desk/ 2>/dev/null | head",
+        "cat config.toml",
+        "cargo test -p acme 2>&1 | tail -20",
+        "gh pr view 551",
+        "cat $REPO/AGENTS.md",
+        "sed -n '/window/p' /h/.workforce/agents/desk/config.toml",
+        "sed -n 1,5p /h/.workforce/agents/desk/config.toml",
+        "ls ~/dev",
+        "cd ~ && ls",
+    ] {
+        assert!(!may(c), "{c}");
+    }
 }

@@ -585,8 +585,14 @@ pub fn allow() -> Value {
 }
 
 pub fn deny() -> Value {
+    deny_saying("Denied from Desk.")
+}
+
+/// A deny with why and what to do instead, which the session reads and
+/// goes on from.
+pub fn deny_saying(message: &str) -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest",
-        "decision": { "behavior": "deny", "message": "Denied from Desk." } } })
+        "decision": { "behavior": "deny", "message": message } } })
 }
 
 /// A tool call the person allowed for the session: it runs without a

@@ -1,15 +1,22 @@
-//! Unbound (`level = "full"`, `[oversight.full] anywhere`, every
-//! `[oversight.act]` switch on): the overseer allows whatever its sessions
-//! ask, publishing, force pushes and secrets included, but never what reads
-//! or changes an agent's own settings; it sends whatever it says; every
-//! crew action runs; and it sweeps its scope. With any one switch off, Act
-//! fully is as it was.
+//! Unbound (`level = "full"`, whatever its switches and lists say): Desk
+//! allows whatever its sessions ask at once, publishing, force pushes and
+//! secrets included, but never what reads or changes an agent's own
+//! settings; it sends whatever it says; every crew action runs; and it
+//! sweeps its scope. Below Act fully, none of it.
 
 use super::super::actions::{Action, Gate, Target};
 use super::act_fully::repo;
 use super::*;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{Event, Party};
+
+/// The settings file of `agent`, which no boss allows a session to read.
+fn own_settings(agent: &AgentService) -> String {
+    format!(
+        "echo 'level = \"full\"' >> {}",
+        agent.workspace.join("config.toml").display()
+    )
+}
 
 pub(super) const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
     act = { nudge = true, resume_restart = true, read_only_approvals = true, hand_out_work = true, \
@@ -47,7 +54,8 @@ async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let acme = base.join("acme-web");
         repo(&acme, "git@github.com:acme/acme-web.git");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.approve").then_some(())
         })
@@ -70,6 +78,7 @@ async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
             d.acts_fully_in(s.id, "desk").then_some(())
         })
         .await;
+        // Desk allows each the moment it is asked, with no turn of the boss's.
         for command in [
             "cargo publish -p acme-core",
             "git push --force origin main",
@@ -77,23 +86,15 @@ async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
             "gh workflow run cleanup.yml",
             "npm run deploy",
         ] {
-            let asked = ask(&url, command);
-            let a = pending(&d, s.id, command).await;
-            let done = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
-            assert!(done.output["done"].is_string(), "{command}: {done:?}");
-            assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
+            assert_eq!(decided(ask(&url, command).await.unwrap()), "allow", "{command}");
         }
         // A session it doesn't run, too.
         let other = new_session(&d, &acme, "acme-web two").await;
         let other_url = hook_url(&base, other.id).await;
-        let asked = ask(&other_url, "npm publish");
-        let a = pending(&d, other.id, "npm publish").await;
-        let done = tool("crew.approve").execute(approve(other.id, a)).await.unwrap();
-        assert!(done.output["done"].is_string(), "{done:?}");
-        assert_eq!(decided(asked.await.unwrap()), "allow");
+        assert_eq!(decided(ask(&other_url, "npm publish").await.unwrap()), "allow");
 
         // Its own settings, where its budget is, stay the person's.
-        let own = format!("cat {}", overseer.workspace.join("config.toml").display());
+        let own = own_settings(&overseer);
         let asked = ask(&url, &own);
         let a = pending(&d, s.id, &own).await;
         let held = tool("crew.approve").execute(approve(s.id, a)).await.unwrap();
@@ -141,43 +142,42 @@ async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn with_one_switch_off_act_fully_is_as_it_was() {
+async fn with_switches_off_and_a_list_of_repositories_act_fully_is_unbound_all_the_same() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let acme = base.join("acme-web");
         repo(&acme, "git@github.com:acme/acme-web.git");
-        let one_off = UNBOUND.replace("interrupt = true", "interrupt = false");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", &one_off, &[]).await;
-        eventually("the overseer's tools", async || {
-            overseer.tools.has("crew.approve").then_some(())
-        })
-        .await;
+        let listed = UNBOUND
+            .replace("interrupt = true", "interrupt = false")
+            .replace("hand_off = true", "hand_off = false")
+            .replace("anywhere = true", "repos = [\"globex/globex-api\"]");
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &listed, &[]).await;
+        super::boss_allows(&llm).await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
         });
         let (_, o) = crew.overseer_service().unwrap();
-        assert!(!crew.unbound(&o));
+        assert!(crew.unbound(&o));
         let boss = Party::manager("desk", &super::super::name_of(&overseer));
         let s = new_session(&d, &acme, "acme-web").await;
         let url = hook_url(&base, s.id).await;
         d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
-        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
         for command in ["cargo publish -p acme-core", "git push --force origin main"] {
-            let asked = ask(&url, command);
-            let a = pending(&d, s.id, command).await;
-            let held = tool("crew.approve")
-                .execute(approve(s.id, a))
-                .await
-                .unwrap();
-            assert!(held.output["suggested"].is_string(), "{command}: {held:?}");
-            tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
-            assert_eq!(decided(asked.await.unwrap()), "deny", "{command}");
+            assert_eq!(
+                decided(ask(&url, command).await.unwrap()),
+                "allow",
+                "{command}"
+            );
         }
-        assert!(matches!(
+        assert_eq!(
             crew.gate(
                 &Action::Handoff {
                     session: s.id,
@@ -186,15 +186,8 @@ async fn with_one_switch_off_act_fully_is_as_it_was() {
                 },
                 &o
             ),
-            Gate::Suggest(_)
-        ));
-        // Its messages still go whatever their words, as at Act.
-        let note = Action::Nudge {
-            to: Target::Session(s.id),
-            message: OVERNIGHT_NOTE.into(),
-            reply_to: None,
-        };
-        assert_eq!(crew.gate(&note, &o), Gate::Run);
+            Gate::Run
+        );
     })
     .await;
 }
@@ -206,7 +199,8 @@ async fn with_one_switch_off_act_fully_is_as_it_was() {
 async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        let (_, crew, d, llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         let (_, o) = crew.overseer_service().unwrap();
         let web = new_session(&d, dir.path(), "acme-web").await;
         let party = Party::session(&web);
@@ -236,7 +230,7 @@ async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
 async fn at_act_what_waits_waits_its_minutes_and_nothing_sweeps() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(
+        let (_, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -244,6 +238,7 @@ async fn at_act_what_waits_waits_its_minutes_and_nothing_sweeps() {
             &[],
         )
         .await;
+        super::boss_allows(&llm).await;
         let (_, o) = crew.overseer_service().unwrap();
         let web = new_session(&d, dir.path(), "acme-web").await;
         let party = Party::session(&web);
@@ -299,7 +294,8 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -373,7 +369,7 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
 async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_asks() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(
+        let (_, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -381,6 +377,7 @@ async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_a
             &[],
         )
         .await;
+        super::boss_allows(&llm).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
         let (_, mut o) = crew.overseer_service().unwrap();
         let set = |mode| Action::SetMode {
@@ -419,7 +416,8 @@ async fn a_mode_waits_for_the_turn_and_bypass_is_only_on_a_session_it_runs() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -438,8 +436,14 @@ async fn a_mode_waits_for_the_turn_and_bypass_is_only_on_a_session_it_runs() {
             d.acts_fully_in(s.id, "desk").then_some(())
         })
         .await;
-        let asked = ask(&url, "npm test");
-        let a = pending(&d, s.id, "npm test").await;
+        // A request Desk doesn't allow at once (its own settings) stays.
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let own = own_settings(&overseer);
+        let asked = ask(&url, &own);
+        let a = pending(&d, s.id, &own).await;
         let held = tool.execute(set("auto")).await.unwrap();
         assert!(held.output["done"].is_null(), "{held:?}");
         assert_eq!(d.view(s.id).unwrap().pending.map(|p| p.id), Some(a), "its request stays");
@@ -518,7 +522,8 @@ async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -556,11 +561,11 @@ async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
         assert!(!args.contains("--permission-mode"), "{args}");
         assert_eq!(d.view(web).unwrap().mode, None);
 
-        // A box unticked: it is no longer unbound, and the other starts in
+        // Down to Act: it is no longer unbound, and the other starts in
         // its own mode at its next start, whoever starts it.
         write_config(
             &overseer,
-            &UNBOUND.replace("interrupt = true", "interrupt = false"),
+            &UNBOUND.replace("level = \"full\"", "level = \"act\""),
         );
         eventually("no longer unbound", async || {
             let (_, o) = crew.overseer_service()?;
@@ -575,12 +580,11 @@ async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
         assert!(!args.contains("--permission-mode"), "{args}");
         assert_eq!(d.view(api).unwrap().mode, None);
 
-        // Unbound ends too with Anywhere off, or its budget spent.
+        // Unbound ends too with its budget spent; never with Anywhere off.
         let (_, mut o) = crew.overseer_service().unwrap();
-        o.act.interrupt = true;
+        o.level = workforce_common::oversight::Level::Full;
         o.full.anywhere = false;
-        assert!(!crew.unbound(&o));
-        o.full.anywhere = true;
+        assert!(o.unbound());
         o.full.budget_cents_per_day = Some(500);
         assert!(super::super::fully_given(&o, Some(5.0)).is_err(), "spent");
         assert!(super::super::fully_given(&o, Some(1.0)).is_ok());
@@ -588,73 +592,10 @@ async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
     .await;
 }
 
-/// Act fully anywhere, but not unbound: it ships in a repository nobody
-/// named and runs a workflow nobody listed, and what no overseer does
-/// stays the person's.
-#[tokio::test(flavor = "multi_thread")]
-async fn anywhere_ships_in_any_repository_and_the_hard_limits_still_hold() {
-    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
-        let globex = base.join("globex-api");
-        repo(&globex, "git@github.com:globex/globex-api.git");
-        let (overseer, crew, d, _llm) = overseeing(
-            &base,
-            pool,
-            "ok",
-            "[oversight]\nenabled = true\nlevel = \"full\"\n[oversight.full]\nanywhere = true\n",
-            &[],
-        )
-        .await;
-        eventually("the overseer's tools", async || {
-            overseer.tools.has("crew.approve").then_some(())
-        })
-        .await;
-        d.boss_bounds_with(workforce_desk::charge::Bounds {
-            home: base.clone(),
-            ..Default::default()
-        });
-        let (_, o) = crew.overseer_service().unwrap();
-        assert!(!crew.unbound(&o));
-        let boss = Party::manager("desk", &super::super::name_of(&overseer));
-        let s = new_session(&d, &globex, "globex-api").await;
-        let url = hook_url(&base, s.id).await;
-        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
-            .await
-            .unwrap();
-        eventually("Desk to know it acts anywhere", async || {
-            d.acts_fully_in(s.id, "desk").then_some(())
-        })
-        .await;
-        let tool = |name: &str| overseer.tools.get(name).unwrap();
-        for command in ["gh workflow run cleanup.yml", "gh pr merge 42 --squash"] {
-            let asked = ask(&url, command);
-            let a = pending(&d, s.id, command).await;
-            let done = tool("crew.approve")
-                .execute(approve(s.id, a))
-                .await
-                .unwrap();
-            assert!(done.output["done"].is_string(), "{command}: {done:?}");
-            assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
-        }
-        let asked = ask(&url, "cargo publish");
-        let a = pending(&d, s.id, "cargo publish").await;
-        let held = tool("crew.approve")
-            .execute(approve(s.id, a))
-            .await
-            .unwrap();
-        assert!(held.output["suggested"].is_string(), "{held:?}");
-        tool("crew.deny").execute(approve(s.id, a)).await.unwrap();
-        assert_eq!(decided(asked.await.unwrap()), "deny");
-    })
-    .await;
-}
-
 /// What ends an unbound boss's hold over a running session in auto mode.
 #[derive(Debug, Clone, Copy)]
 enum Ends {
-    BoxUnticked,
-    AnywhereOff,
+    DownToAct,
     BudgetSpent,
     Released,
     AnotherBoss,
@@ -674,7 +615,8 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             "anywhere = true\n",
             "anywhere = true\nbudget_usd_per_day = 1\n",
         );
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -682,8 +624,7 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
         let boss = Party::manager("desk", &super::super::name_of(&overseer));
         let tool = overseer.tools.get("crew.set_mode").unwrap();
         for (i, ends) in [
-            Ends::BoxUnticked,
-            Ends::AnywhereOff,
+            Ends::DownToAct,
             Ends::BudgetSpent,
             Ends::Released,
             Ends::AnotherBoss,
@@ -757,17 +698,10 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             .await;
             let before = starts_of(&base, s.id);
             match ends {
-                Ends::BoxUnticked => {
+                Ends::DownToAct => {
                     write_config(
                         &overseer,
-                        &UNBOUND.replace("interrupt = true", "interrupt = false"),
-                    );
-                    super::super::config_saved(&overseer);
-                }
-                Ends::AnywhereOff => {
-                    write_config(
-                        &overseer,
-                        &UNBOUND.replace("anywhere = true", "anywhere = false"),
+                        &UNBOUND.replace("level = \"full\"", "level = \"act\""),
                     );
                     super::super::config_saved(&overseer);
                 }
@@ -957,7 +891,8 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -987,6 +922,12 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
         })
         .await;
         let url = hook_of(&args, s.id);
+        // What it asks below is one Desk never allows at once.
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let own = own_settings(&overseer);
         let tools = crate::desk_tools::DeskTool::all(&d, "scout");
         let tool = |name: &str| tools.iter().find(|t| t.name() == name).unwrap();
         let drives = async |when: &str| {
@@ -999,8 +940,8 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
                 typed.error.as_deref().unwrap_or_default().contains("bypass permissions mode"),
                 "{when}: {typed:?}"
             );
-            let asked = ask(&url, "git push origin main");
-            let a = pending(&d, s.id, "git push origin main").await;
+            let asked = ask(&url, &own);
+            let a = pending(&d, s.id, &own).await;
             let allowed = tool("desk.approve")
                 .execute(json!({"session_id": s.id.to_string(), "approval_id": a.to_string(), "allow": true}))
                 .await
@@ -1015,14 +956,14 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
         };
         drives("unbound").await;
 
-        // Mid-turn, a box unticked: on its way back, and still not another's.
+        // Mid-turn, down to Act: on its way back, and still not another's.
         hook(
             &url,
             json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1",
                 "tool_input": {"command": "npm test"}}),
         )
         .await;
-        write_config(&overseer, &UNBOUND.replace("interrupt = true", "interrupt = false"));
+        write_config(&overseer, &UNBOUND.replace("level = \"full\"", "level = \"act\""));
         super::super::config_saved(&overseer);
         eventually("no longer unbound", async || {
             let (_, o) = crew.overseer_service()?;
