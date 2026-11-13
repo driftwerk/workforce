@@ -224,6 +224,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_held_cards",
+        "post_by",
+        NotPersonal("the time a held needs-you goes out by, not a party"),
+    ),
+    (
+        "desk",
         "boss_open_items",
         "prefer_scope",
         NotPersonal("what an \"always\" answer's preference covers: all, a group, or a repository"),

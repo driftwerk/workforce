@@ -1,10 +1,13 @@
 //! `/api/desk/activity`, `/overview`, `/manager` and `/suggestions`: the
 //! crew as Floor and the overseer's DM read it, and the person's answers to
 //! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
-//! one of its decisions; `/items/{id}/answer` and `/drop`, the person
-//! settling what the boss asked them. `/preferences`: the person's
-//! preferences for their bosses, listed, changed, set aside, resumed and
-//! forgotten. `/unread` and `/reads`: what is unread on this
+//! one of its decisions; `/items/{id}/answer`, `/drop` and `/always`, the
+//! person settling what the boss asked them (and keeping the answer);
+//! `/handled`, what the boss handled and how; `/dm/{agent}/typing` and
+//! `/presence`, the person typing to a boss and whether its DM is on
+//! screen. `/preferences`: the person's preferences for their bosses,
+//! listed, changed, set aside, resumed and forgotten. `/unread` and
+//! `/reads`: what is unread on this
 //! Desk, and how far the person has read each place.
 
 use std::sync::Arc;
@@ -255,6 +258,10 @@ async fn undo(
 #[derive(Deserialize)]
 struct ItemAnswer {
     answer: String,
+    /// "Always": the answer is kept as a preference for the kind of case
+    /// the item settles, at once.
+    #[serde(default)]
+    always: bool,
 }
 
 fn item_result(r: Result<String, ItemRefused>) -> Response {
@@ -284,7 +291,27 @@ async fn item_answer(
     if body.answer.trim().is_empty() {
         return error(StatusCode::BAD_REQUEST, "Say your answer.");
     }
-    item_result(s.crew.answer_item(id, body.answer.trim()).await)
+    let done = match s.crew.answer_item(id, body.answer.trim()).await {
+        Ok(done) => done,
+        Err(e) => return item_result(Err(e)),
+    };
+    if !body.always {
+        return Json(json!({ "done": done })).into_response();
+    }
+    // Answered either way: what keeping it said, or why it couldn't.
+    match s.crew.always_item(id, None).await {
+        Ok(kept) => Json(json!({ "done": done, "kept": kept })).into_response(),
+        Err(e) => Json(json!({ "done": done, "notKept": refused_why(&e) })).into_response(),
+    }
+}
+
+/// What a refusal says to the person.
+fn refused_why(e: &ItemRefused) -> String {
+    match e {
+        ItemRefused::NotFound => "That isn’t open any more.".into(),
+        ItemRefused::Closed => "That was already settled.".into(),
+        ItemRefused::Cant(why) => why.clone(),
+    }
 }
 
 /// The person drops one of the boss's open items unanswered.
@@ -301,6 +328,52 @@ async fn item_drop(
         return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
     };
     item_result(s.crew.drop_item(id).await)
+}
+
+/// The person is typing in the boss `agent`'s DM: Desk sends it every few
+/// seconds while the composer has keystrokes, and the boss's posts wait
+/// for a pause.
+async fn dm_typing(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(agent): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match s.crew.dm_typing(&agent) {
+        true => StatusCode::NO_CONTENT.into_response(),
+        false => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresenceBody {
+    attending: bool,
+    #[serde(default)]
+    dm_on_screen: Option<String>,
+}
+
+/// Whether Desk's window is attended and which boss's DM is on screen:
+/// sent on focus and view changes, and each minute.
+async fn presence(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<PresenceBody>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let dm = b
+        .dm_on_screen
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    s.crew.presence(b.attending, dm);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// A preference as Desk's boss settings show it.
@@ -368,6 +441,58 @@ fn preference_result(r: eyre::Result<Option<Preference>>) -> Response {
         Ok(Some(p)) => Json(preference_json(&p)).into_response(),
         Ok(None) => error(StatusCode::NOT_FOUND, NO_PREFERENCE),
         Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefNew {
+    when_text: String,
+    then_text: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    from_item: Option<String>,
+    #[serde(default)]
+    boss_scope: Option<String>,
+}
+
+/// The person keeps a preference themselves, or from one of the boss's
+/// asks (`fromItem`): the same case and scope gives way to it.
+async fn preference_new(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<PrefNew>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let from_item = match body
+        .from_item
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        Some(f) => match f.parse::<uuid::Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return error(StatusCode::NOT_FOUND, "That isn’t open any more."),
+        },
+        None => None,
+    };
+    match s
+        .crew
+        .keep_preference(
+            &body.when_text,
+            &body.then_text,
+            body.scope.as_deref().unwrap_or(""),
+            from_item,
+            body.boss_scope.as_deref(),
+        )
+        .await
+    {
+        Ok(p) => (StatusCode::CREATED, Json(preference_json(&p))).into_response(),
+        Err(e) => item_result(Err(e)),
     }
 }
 
@@ -567,7 +692,12 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/items/{id}/drop", post(item_drop))
         .route("/api/desk/items/{id}/always", post(item_always))
         .route("/api/desk/handled", get(handled))
-        .route("/api/desk/preferences", get(preferences))
+        .route("/api/desk/dm/{agent}/typing", post(dm_typing))
+        .route("/api/desk/presence", post(presence))
+        .route(
+            "/api/desk/preferences",
+            get(preferences).post(preference_new),
+        )
         .route("/api/desk/preferences/{id}", patch(preference_patch))
         .route("/api/desk/preferences/{id}/{to}", post(preference_state))
         .route("/api/desk/unread", get(unread))
@@ -652,7 +782,7 @@ mod tests {
         }
         async fn answer_item(&self, id: uuid::Uuid, answer: &str) -> Result<String, ItemRefused> {
             match id.as_u128() {
-                1 => Ok(format!("Sent: {answer}")),
+                1 | 5 => Ok(format!("Sent: {answer}")),
                 2 => Err(ItemRefused::Closed),
                 3 => Err(ItemRefused::Cant("acme-web went ahead without you.".into())),
                 _ => Err(ItemRefused::NotFound),
@@ -663,6 +793,13 @@ mod tests {
                 1 => Ok("Dropped.".into()),
                 _ => Err(ItemRefused::NotFound),
             }
+        }
+        fn dm_typing(&self, agent: &str) -> bool {
+            self.0.lock().push(format!("typing {agent}"));
+            agent == "desk"
+        }
+        fn presence(&self, attending: bool, dm: Option<&str>) {
+            self.0.lock().push(format!("presence {attending} {dm:?}"));
         }
     }
 
@@ -721,6 +858,22 @@ mod tests {
                     .0,
                 StatusCode::BAD_REQUEST
             );
+            // "Always" with the answer: answered, and kept or said why not.
+            let with_always = json!({ "answer": "Wait for green", "always": true });
+            let (status, said) = call_json(&app, &answer(1), &with_always).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(said["done"], "Sent: Wait for green");
+            assert_eq!(said["kept"], "From now on: your answer");
+            let (status, said) = call_json(&app, &answer(5), &with_always).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(said["done"], "Sent: Wait for green");
+            assert_eq!(said["notKept"], "That isn’t open any more.");
+            assert!(said.get("kept").is_none());
+            assert_eq!(
+                call_json(&app, &answer(2), &with_always).await.0,
+                StatusCode::CONFLICT,
+                "not answered: nothing kept"
+            );
             let always = |n: u128| format!("/api/desk/items/{}/always", uuid::Uuid::from_u128(n));
             let (status, said) = call_json(&app, &always(1), &json!({ "then": " wait " })).await;
             assert_eq!(
@@ -763,6 +916,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typing_and_presence_reach_the_boss() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let hub = Arc::new(Hub::default());
+            let app = crew_router(d, Arc::new(Bearer), hub.clone());
+            assert_eq!(
+                call(&app, "POST", "/api/desk/dm/desk/typing").await.0,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                call(&app, "POST", "/api/desk/dm/nobody/typing").await.0,
+                StatusCode::NOT_FOUND
+            );
+            let on = json!({ "attending": true, "dmOnScreen": "desk" });
+            assert_eq!(
+                call_json(&app, "/api/desk/presence", &on).await.0,
+                StatusCode::NO_CONTENT
+            );
+            let off = json!({ "attending": false, "dmOnScreen": " " });
+            assert_eq!(
+                call_json(&app, "/api/desk/presence", &off).await.0,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                *hub.0.lock(),
+                vec![
+                    "typing desk".to_string(),
+                    "typing nobody".to_string(),
+                    "presence true Some(\"desk\")".to_string(),
+                    "presence false None".to_string(),
+                ]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn the_preference_routes_list_change_and_set_aside_the_persons_own() {
         with_test_pool(build_pool, |pool| async move {
             use crate::preference::{PrefSource, Preference};
@@ -795,6 +986,27 @@ mod tests {
                 store.preference_put(p).await.unwrap();
             }
             let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            // Keeping one goes to the bosses' hub: with none, it says so.
+            let (status, said) = send_json(
+                &app,
+                "POST",
+                "/api/desk/preferences",
+                &json!({ "whenText": "x", "thenText": "y" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(said["error"], "There is no boss here.");
+            assert_eq!(
+                send_json(
+                    &app,
+                    "POST",
+                    "/api/desk/preferences",
+                    &json!({ "whenText": "x", "thenText": "y", "fromItem": "nope" }),
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
 
             let (status, list) = call(&app, "GET", "/api/desk/preferences").await;
             assert_eq!(status, StatusCode::OK);

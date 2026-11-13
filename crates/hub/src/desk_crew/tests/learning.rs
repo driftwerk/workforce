@@ -61,6 +61,13 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
             .into_iter()
             .find(|i| i.generalizes.is_some())
             .unwrap();
+        // Its card proposes the case and what it would cover.
+        let m = item.mention();
+        assert_eq!(
+            m.generalizes.as_deref(),
+            Some("When a session wants to merge with CI red")
+        );
+        assert_eq!(m.prefer_scope.as_deref(), Some("repo:acme/acme-web"));
         assert!(
             crew.always_item(item.id, None).await.is_err(),
             "not before it is answered"
@@ -106,6 +113,47 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
         let kept = d.store().preferences_of("you", MAIN, false).await.unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].when_text, "CI is red on a merge");
+        // The person keeping one from the same ask in Desk's settings
+        // replaces it too; one of their own is said, for the main boss.
+        use workforce_desk::crew::Crew;
+        let mine = crew
+            .keep_preference(
+                "a deploy is asked for on a Friday",
+                "wait for Monday",
+                "all",
+                Some(item.id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mine.source, PrefSource::Asked);
+        assert_eq!(mine.boss_scope, MAIN);
+        let own = crew
+            .keep_preference("a key is asked for", "use the staging key", "", None, None)
+            .await
+            .unwrap();
+        assert_eq!(own.source, PrefSource::Said);
+        let kept = d.store().preferences_of("you", MAIN, false).await.unwrap();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().any(|p| p.id == mine.id) && kept.iter().any(|p| p.id == own.id));
+        assert!(crew
+            .keep_preference("x", "y", "", None, Some("no-such-group"))
+            .await
+            .is_err());
+        assert!(crew
+            .keep_preference(" ", "y", "", None, None)
+            .await
+            .is_err());
+        assert!(crew
+            .keep_preference("x", "y", "everywhere", None, None)
+            .await
+            .is_err());
+        for p in [&mine, &own] {
+            d.store()
+                .preference_set_state(p.id, PrefState::Retired)
+                .await
+                .unwrap();
+        }
 
         // An ask that settles no case keeps nothing.
         call(&crew, super::super::items::ASK, json!({ "text": "Lunch?" })).await;

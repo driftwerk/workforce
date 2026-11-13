@@ -223,39 +223,18 @@ impl CrewHub {
             },
         );
         p.from_item = item;
-        let store = self.desk.store();
-        // The same case and scope said again replaces the older one.
-        let mut same: Vec<Preference> = store
-            .preferences_of(YOU, boss_scope, false)
+        // The same case and scope said again, or kept from the same ask,
+        // gives way to this one.
+        let tz = self.desk.timezone();
+        let replaced: Vec<String> = self
+            .desk
+            .store()
+            .preference_keep(&p)
             .await
             .map_err(Self::pref_err)?
-            .into_iter()
-            .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
+            .iter()
+            .map(|o| format!("{} (from {})", o.rule(), o.date(tz)))
             .collect();
-        // So does the one kept from the same ask (its "Always", say): one
-        // preference per ask.
-        if let Some(item) = item {
-            if let Some(kept) = store
-                .preference_from_item(item)
-                .await
-                .map_err(Self::pref_err)?
-                .filter(|k| !same.iter().any(|o| o.id == k.id))
-            {
-                same.push(kept);
-            }
-        }
-        // The older one goes first, so a failure never leaves two that
-        // both apply.
-        let tz = self.desk.timezone();
-        let mut replaced = Vec::new();
-        for o in &same {
-            store
-                .preference_set_state(o.id, PrefState::Retired)
-                .await
-                .map_err(Self::pref_err)?;
-            replaced.push(format!("{} (from {})", o.rule(), o.date(tz)));
-        }
-        store.preference_put(&p).await.map_err(Self::pref_err)?;
         let mut said = format!(
             "Kept as preference {}: when {}, {} (for {}).",
             p.id,
@@ -437,6 +416,69 @@ impl CrewHub {
     /// "Always" on item `id`: the person's answer becomes their preference
     /// for the case the item said it settles, from then on. Once: pressed
     /// again, the one kept is said.
+    /// The person keeps a preference themselves (Desk's boss settings):
+    /// for the boss of the ask it came from when `from_item`, else of
+    /// `boss_scope` (the main boss when none), which must be a boss here.
+    pub(crate) async fn person_prefers(
+        &self,
+        when: &str,
+        then: &str,
+        scope: &str,
+        from_item: Option<Uuid>,
+        boss_scope: Option<&str>,
+    ) -> Result<Preference, ItemRefused> {
+        let cant = |e: eyre::Report| ItemRefused::Cant(Self::pref_err(e));
+        let (when, then) = (when.trim(), then.trim());
+        if when.is_empty() {
+            return Err(ItemRefused::Cant("Say the kind of case.".into()));
+        }
+        if then.is_empty() {
+            return Err(ItemRefused::Cant("Say what to do then.".into()));
+        }
+        let scope = PrefScope::parse(scope).map_err(ItemRefused::Cant)?;
+        let store = self.desk.store();
+        let boss_scope = match from_item {
+            Some(id) => {
+                let item = store
+                    .open_item(id)
+                    .await
+                    .map_err(cant)?
+                    .ok_or(ItemRefused::NotFound)?;
+                let Some((_, o)) = self.overseer_named(&item.boss) else {
+                    return Err(ItemRefused::Cant("Its boss isn't here any more.".into()));
+                };
+                preference::boss_scope_of(o.scope.group())
+            }
+            None => {
+                let named = boss_scope
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or(preference::MAIN);
+                if !self
+                    .overseers()
+                    .iter()
+                    .any(|(_, o)| preference::boss_scope_of(o.scope.group()) == named)
+                {
+                    return Err(ItemRefused::Cant("There is no boss for that here.".into()));
+                }
+                named.to_string()
+            }
+        };
+        let mut p = Preference::new(
+            &boss_scope,
+            when,
+            then,
+            scope,
+            match from_item {
+                Some(_) => PrefSource::Asked,
+                None => PrefSource::Said,
+            },
+        );
+        p.from_item = from_item;
+        store.preference_keep(&p).await.map_err(cant)?;
+        Ok(p)
+    }
+
     pub(crate) async fn always_item(
         &self,
         id: Uuid,

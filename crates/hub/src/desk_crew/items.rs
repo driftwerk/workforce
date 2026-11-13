@@ -280,20 +280,24 @@ impl CrewHub {
         self.asked_person
             .lock()
             .insert(boss.to_string(), crew::now());
-        let opened = self
+        let mut opened = self
             .desk
             .store()
             .item_open(&new)
             .await
             .map_err(Self::item_err)?;
         if let (Some(scope), true) = (&prefer_scope, opened.item().generalizes.is_some()) {
-            if let Err(e) = self
+            match self
                 .desk
                 .store()
                 .item_set_prefer_scope(opened.item().id, scope)
                 .await
             {
-                tracing::warn!(error = %e, "an ask's preference scope wasn't kept");
+                // Its card says what an "always" would cover.
+                Ok(()) => match &mut opened {
+                    Opened::New(i) | Opened::Again(i) => i.prefer_scope = Some(scope.clone()),
+                },
+                Err(e) => tracing::warn!(error = %e, "an ask's preference scope wasn't kept"),
             }
         }
         let tz = self.desk.timezone();
@@ -611,7 +615,10 @@ impl CrewHub {
 
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
-    /// for a check-in. Whether it went out.
+    /// for a check-in. While the person types to the boss it goes once they
+    /// pause or send, at most three minutes on, without holding up the
+    /// caller, and only while `i` is still open. Whether it went out, or
+    /// will.
     pub(crate) async fn post_item(
         &self,
         boss: &str,
@@ -619,42 +626,12 @@ impl CrewHub {
         text: String,
         approvals: Vec<MentionedApproval>,
     ) -> bool {
-        let Some((service, _)) = self.overseer_named(boss) else {
-            return false;
-        };
-        let Some(owner) = self.person(Some(&service)) else {
-            return false;
-        };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
-                return false;
-            }
-        };
         let extras = Extras {
             item: Some(i.mention()),
             approvals,
             ..Default::default()
         };
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, boss, &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "keeping an open item's buttons failed");
-        }
-        true
+        self.card(boss, Some(i.id), text, extras).await
     }
 
     /// A DM reply of `boss`'s, in a turn that started at `started`, that
@@ -1336,6 +1313,7 @@ mod tests {
                     said_count: if n == 0 { 3 } else { 1 },
                     raised_at: None,
                     sessions: vec![],
+                    prefer_scope: None,
                     changed_at: now,
                     state: OpenState::Open,
                     closed_at: None,

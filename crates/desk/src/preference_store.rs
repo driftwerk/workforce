@@ -217,6 +217,33 @@ impl DeskStore {
             .transpose()
     }
 
+    /// Keeps `p` as its owner's rule for its case: their active one for
+    /// the same boss, case and scope is retired first, and so is the one
+    /// kept from the same ask (one preference per ask), so a failure never
+    /// leaves two that both apply. The ones it replaced, oldest first.
+    pub async fn preference_keep(&self, p: &Preference) -> Result<Vec<Preference>> {
+        let mut same: Vec<Preference> = self
+            .preferences_of(&p.owner, &p.boss_scope, false)
+            .await?
+            .into_iter()
+            .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
+            .collect();
+        if let Some(item) = p.from_item {
+            if let Some(kept) = self
+                .preference_from_item(item)
+                .await?
+                .filter(|k| !same.iter().any(|o| o.id == k.id))
+            {
+                same.push(kept);
+            }
+        }
+        for o in &same {
+            self.preference_set_state(o.id, PrefState::Retired).await?;
+        }
+        self.preference_put(p).await?;
+        Ok(same)
+    }
+
     /// `id` made a decision: counted, with when.
     pub async fn preference_applied(&self, id: Uuid) -> Result<()> {
         let client = self.pool().get().await?;

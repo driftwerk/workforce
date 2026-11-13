@@ -604,6 +604,10 @@ pub struct Extras {
     /// A boss's update, as the chat renders it in place of its text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<crate::update::MentionedUpdate>,
+    /// A catch-up on the person's return: the absence it covers, its
+    /// headline, and what it says beyond its `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away: Option<crate::away::MentionedAway>,
 }
 
 impl Extras {
@@ -615,6 +619,7 @@ impl Extras {
             && self.decisions.is_empty()
             && self.item.is_none()
             && self.update.is_none()
+            && self.away.is_none()
     }
 }
 
@@ -736,6 +741,20 @@ pub trait Crew: Send + Sync {
     ) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
     }
+    /// The person keeps a preference themselves: `when`, `then`, what it
+    /// covers (`scope`), for the boss of the ask `from_item` when given,
+    /// else of `boss_scope` (the main boss when none). The same case and
+    /// scope, or the one kept from the same ask, gives way to it.
+    async fn keep_preference(
+        &self,
+        _when: &str,
+        _then: &str,
+        _scope: &str,
+        _from_item: Option<uuid::Uuid>,
+        _boss_scope: Option<&str>,
+    ) -> Result<crate::preference::Preference, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
     /// How many needs the boss `agent` (the main boss when none is named)
     /// handled itself, by the person's preferences, gave the person, or the
     /// person got to first, since `since` (the start of today when none),
@@ -748,6 +767,14 @@ pub trait Crew: Send + Sync {
     ) -> Option<serde_json::Value> {
         None
     }
+    /// The person is typing in the boss `agent`'s DM: what it would post
+    /// waits for a pause. False when `agent` is no boss here.
+    fn dm_typing(&self, _agent: &str) -> bool {
+        false
+    }
+    /// What Desk says of the person: whether its window is attended, and
+    /// which boss's DM (by its agent) is on screen.
+    fn presence(&self, _attending: bool, _dm_on_screen: Option<&str>) {}
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {
