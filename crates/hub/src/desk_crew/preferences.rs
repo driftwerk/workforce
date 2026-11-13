@@ -402,6 +402,37 @@ const FORGET_IT: &str = "Forget it";
 
 /// The person's answer to an ask, as it was closed with it: none for an
 /// answer that went on to a session (its words are the session's line's).
+/// What an "always" does, readable cold: an answer of its own words
+/// ("make it wait for green") as it is; a bare one ("Yes", "Merge") with the
+/// question it answered, so the rule says what it says yes to.
+fn rule_then(i: &OpenItem, answer: &str) -> String {
+    let answer = answer.trim();
+    if answer.split_whitespace().count() >= 3 {
+        return answer.to_string();
+    }
+    let first = i
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // The question itself, past a "<session> asks:" lead.
+    let asked = first.split_once(" asks: ").map_or(first, |(_, q)| q).trim();
+    let asked: String = match asked.chars().count() > 160 {
+        true => asked.chars().take(159).collect::<String>() + "…",
+        false => asked.to_string(),
+    };
+    if asked.is_empty() {
+        return answer.to_string();
+    }
+    let mut said = answer.chars();
+    let lead = said
+        .next()
+        .map(|c| c.to_lowercase().collect::<String>() + said.as_str())
+        .unwrap_or_default();
+    format!("{lead}, to “{asked}”")
+}
+
 fn answer_of(i: &OpenItem) -> Option<String> {
     let why = i.closed_why.as_deref()?;
     ["You answered: ", "They answered: "]
@@ -413,9 +444,6 @@ fn answer_of(i: &OpenItem) -> Option<String> {
 }
 
 impl CrewHub {
-    /// "Always" on item `id`: the person's answer becomes their preference
-    /// for the case the item said it settles, from then on. Once: pressed
-    /// again, the one kept is said.
     /// The person keeps a preference themselves (Desk's boss settings):
     /// for the boss of the ask it came from when `from_item`, else of
     /// `boss_scope` (the main boss when none), which must be a boss here.
@@ -479,6 +507,9 @@ impl CrewHub {
         Ok(p)
     }
 
+    /// "Always" on item `id`: the person's answer becomes their preference
+    /// for the case the item said it settles, from then on. Once: pressed
+    /// again, the one kept is said.
     pub(crate) async fn always_item(
         &self,
         id: Uuid,
@@ -531,6 +562,7 @@ impl CrewHub {
             None => PrefScope::All,
         };
         let boss_scope = preference::boss_scope_of(o.scope.group());
+        let then = rule_then(&item, &then);
         let mut p = Preference::new(&boss_scope, when, &then, scope, PrefSource::Asked);
         p.from_item = Some(id);
         // Kept first, so a failure loses nothing; a second press racing
