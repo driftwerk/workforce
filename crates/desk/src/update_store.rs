@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use eyre::Result;
 use uuid::Uuid;
 
+use crate::crew::Extras;
 use crate::store::DeskStore;
 use crate::update::{Pending, Told, UpdateState};
 
@@ -25,7 +26,8 @@ impl DeskStore {
             .await?;
         let r = client
             .query_one(
-                "SELECT boss, since, gather_since, result, last_update_at, unread, told, pending \
+                "SELECT boss, since, gather_since, result, last_update_at, unread, told, pending, \
+                   away_since \
                  FROM boss_update_state WHERE boss = $1",
                 &[&boss],
             )
@@ -47,6 +49,7 @@ impl DeskStore {
                     None
                 }
             }),
+            away_since: r.try_get(8)?,
         })
     }
 
@@ -128,4 +131,134 @@ impl DeskStore {
             .await?;
         Ok(())
     }
+
+    /// The person is away from `boss`'s DM since `since`, unless they
+    /// already were: the first time it is noticed is kept.
+    pub async fn update_away(&self, boss: &str, since: DateTime<Utc>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_update_state SET away_since = COALESCE(away_since, $2) \
+                 WHERE boss = $1",
+                &[&boss, &since],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The person is back from the absence that began at `since`: whether
+    /// this call ended it (a second caller, or one after a restart, finds
+    /// it ended).
+    pub async fn update_back(&self, boss: &str, since: DateTime<Utc>) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_update_state SET away_since = NULL \
+                 WHERE boss = $1 AND away_since = $2",
+                &[&boss, &since],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Keeps a needs-you card held while the person types to `card.boss`,
+    /// to go out by `card.post_by` at the latest, a restart or not.
+    pub async fn card_hold(&self, card: &HeldCard) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO boss_held_cards (id, boss, item_id, text, extras, post_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+                &[
+                    &card.id,
+                    &card.boss,
+                    &card.item_id,
+                    &card.text,
+                    &serde_json::to_value(&card.extras)?,
+                    &card.post_by,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Takes held card `id` to post it, for a minute: whether this call
+    /// took it (another caller holds it, or it went). A post that fails
+    /// or dies with the hub leaves it to be taken again once the minute
+    /// is past.
+    pub async fn card_take(&self, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_held_cards SET claimed_until = now() + interval '1 minute' \
+                 WHERE id = $1 AND (claimed_until IS NULL OR claimed_until < now())",
+                &[&id],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Held card `id` went out, or never will: forgotten.
+    pub async fn card_done(&self, id: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute("DELETE FROM boss_held_cards WHERE id = $1", &[&id])
+            .await?;
+        Ok(())
+    }
+
+    /// The held cards due by `now`: those whose hold no live wait is left
+    /// to end, as after a restart.
+    pub async fn cards_due(&self, now: DateTime<Utc>) -> Result<Vec<HeldCard>> {
+        let client = self.pool().get().await?;
+        // A card a day past its time is no longer news: forgotten.
+        let swept = client
+            .execute(
+                "DELETE FROM boss_held_cards WHERE post_by < $1::timestamptz - interval '1 day'",
+                &[&now],
+            )
+            .await?;
+        if swept > 0 {
+            tracing::warn!(
+                swept,
+                "held needs-you a day past their time were forgotten unposted"
+            );
+        }
+        let rows = client
+            .query(
+                "SELECT id, boss, item_id, text, extras, post_by FROM boss_held_cards \
+                 WHERE post_by <= $1 AND (claimed_until IS NULL OR claimed_until < now()) \
+                 ORDER BY post_by LIMIT 100",
+                &[&now],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(HeldCard {
+                    id: r.try_get(0)?,
+                    boss: r.try_get(1)?,
+                    item_id: r.try_get(2)?,
+                    text: r.try_get(3)?,
+                    extras: serde_json::from_value(r.try_get(4)?).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "a held needs-you's buttons couldn't be read: it goes without them");
+                        Extras::default()
+                    }),
+                    post_by: r.try_get(5)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A needs-you card held while the person types in its boss's DM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldCard {
+    pub id: Uuid,
+    pub boss: String,
+    /// The open item it puts to the person, while it has one.
+    pub item_id: Option<Uuid>,
+    pub text: String,
+    pub extras: Extras,
+    /// When it goes out at the latest.
+    pub post_by: DateTime<Utc>,
 }

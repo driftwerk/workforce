@@ -19,7 +19,9 @@ use workforce_common::trust::TrustLevel;
 #[cfg(feature = "postgres")]
 pub(crate) use close::{close, is_room, message_in_chain};
 pub(crate) use context::{desk_context, person_name};
-pub(crate) use deliver::{deliver, deliver_file, resumed, save_on_head, Delivery, Outbox};
+pub(crate) use deliver::{
+    deliver, deliver_as, deliver_file, resumed, save_on_head, Delivered, Delivery, Outbox,
+};
 pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
 

@@ -28,8 +28,10 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 mod actions;
+mod away;
 mod board;
 pub(crate) mod context;
+mod decide;
 mod decisions;
 mod deliver;
 mod extras;
@@ -39,6 +41,7 @@ mod line;
 mod observe;
 mod own_settings;
 mod plan;
+mod preferences;
 mod read_only;
 mod reading;
 pub(crate) mod relay;
@@ -169,6 +172,23 @@ pub struct CrewHub {
     /// next update to show.
     quiet_made:
         Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
+    /// The person typing in each boss's DM, by its agent: what it would
+    /// post waits for a pause.
+    dm_typing: Mutex<HashMap<String, workforce_desk::away::Typing>>,
+    /// What Desk last said of the person: its window attended, and which
+    /// DM is on screen.
+    presence: Mutex<Option<workforce_desk::away::Presence>>,
+    /// When the person last had each boss's DM on screen, as Desk said.
+    on_screen: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// Wakes the updates' look at once: the person paused typing, came
+    /// back, or wrote.
+    update_poke: tokio::sync::Notify,
+    /// Wakes what waits on the person's typing: they sent.
+    typing_done: tokio::sync::Notify,
+    /// How far the person read each boss's DM, for a test whose sessions
+    /// keep no read points.
+    #[cfg(test)]
+    test_reads: Mutex<HashMap<String, DateTime<Utc>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -214,7 +234,7 @@ pub(crate) fn dm_oversight_hint(service: &AgentService) -> Option<String> {
     let crew = for_service(service)?;
     let (service, o) = crew.overseer_named(service.agent_id.as_str())?;
     let (level, _) = crew.level_now(service.agent_id.as_str(), &o);
-    let unbound = o.level != Level::Watch && crew.unbound_given(&service, &o);
+    let unbound = o.level != Level::Watch && crew.unbound_given(service.agent_id.as_str(), &o);
     Some(CrewHub::dm_hint(level, &o, unbound))
 }
 
@@ -445,13 +465,16 @@ pub(crate) fn fully_given(
         return Ok(full);
     };
     match spent {
-        None => Err(
-            "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
-        ),
+        None => Err(FULL_SPEND_UNREAD.into()),
         Some(spent) if spent >= budget => Err(full_spent_why(spent, budget)),
         Some(_) => Ok(full),
     }
 }
+
+/// Why Act fully isn't in force for a moment, at a start: today's spend
+/// isn't read yet.
+pub(crate) const FULL_SPEND_UNREAD: &str =
+    "Act fully waits until today's spend is read, so it acts within Desk for now.";
 
 /// [`fully_given`] for the overseer `agent`: a boss served from a grant
 /// acts fully only under a daily budget its grant gives; this hub's own
@@ -542,6 +565,13 @@ impl CrewHub {
             update_writer: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
+            dm_typing: Mutex::default(),
+            presence: Mutex::default(),
+            on_screen: Mutex::default(),
+            update_poke: tokio::sync::Notify::new(),
+            typing_done: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_reads: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
@@ -564,6 +594,7 @@ impl CrewHub {
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
@@ -688,8 +719,8 @@ impl CrewHub {
                         workforce_desk::charge::FullGrant {
                             repos: full.repos.clone(),
                             workflows: full.workflows.clone(),
-                            anywhere: full.anywhere && self.boss_is_local(s),
-                            unbound: self.unbound_given(s, o),
+                            anywhere: full.anywhere,
+                            unbound: self.unbound_given(s.agent_id.as_str(), o),
                         },
                     ))
                 })
@@ -762,7 +793,7 @@ impl CrewHub {
     pub(crate) fn by_at_level(&self, mut by: By, o: &Oversight) -> By {
         let unbound = self
             .overseer_named(&by.party.id)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o));
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o));
         if unbound {
             by.reason = Some(match by.reason.take() {
                 Some(r) => format!("{} (unbound: no limits)", r.trim_end()),
@@ -779,27 +810,19 @@ impl CrewHub {
         by
     }
 
-    /// Whether `service`, an overseer, is an agent this hub runs. A boss
-    /// served from a grant (a remote boss) never is, and is never unbound
-    /// nor anywhere: what it does is the remote hub's to judge, not this
-    /// one's to wave through.
-    pub(crate) fn boss_is_local(&self, service: &AgentService) -> bool {
-        let id = service.agent_id.as_str();
-        !workforce_desk::grant::is_served(id)
-            && self.services().iter().any(|s| s.agent_id.as_str() == id)
-    }
-
-    /// Whether `service`, overseeing with `o`, is unbound now: it chose
-    /// it ([`Oversight::unbound`]), it is local, and Act fully is in force
-    /// (its budget, when set, isn't spent).
-    pub(crate) fn unbound_given(&self, service: &AgentService, o: &Oversight) -> bool {
-        o.unbound(self.boss_is_local(service)) && self.fully(service.agent_id.as_str(), o).is_ok()
+    /// Whether the boss `agent`, overseeing with `o`, is unbound now: it
+    /// is at Act fully ([`Oversight::unbound`]) and Act fully is in force
+    /// (its budget, when set, isn't spent; a boss served from a grant needs
+    /// one, [`fully_for`]). One check for every boss, this hub's own and
+    /// one served from a grant.
+    pub(crate) fn unbound_given(&self, agent: &str, o: &Oversight) -> bool {
+        o.unbound() && self.fully(agent, o).is_ok()
     }
 
     /// Whether the overseer of `o`'s scope is unbound now.
     pub(crate) fn unbound(&self, o: &Oversight) -> bool {
         self.overseer_for(&o.scope)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o))
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o))
     }
 
     /// Whether the overseer of `o`'s scope acts fully in the repository
@@ -1219,6 +1242,42 @@ impl Crew for CrewHub {
 
     async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
         self.me().drop_item(id).await
+    }
+
+    async fn always_item(
+        &self,
+        id: uuid::Uuid,
+        then: Option<&str>,
+    ) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().always_item(id, then).await
+    }
+
+    async fn keep_preference(
+        &self,
+        when: &str,
+        then: &str,
+        scope: &str,
+        from_item: Option<uuid::Uuid>,
+        boss_scope: Option<&str>,
+    ) -> Result<workforce_desk::preference::Preference, workforce_desk::crew::ItemRefused> {
+        self.person_prefers(when, then, scope, from_item, boss_scope)
+            .await
+    }
+
+    async fn handled(
+        &self,
+        agent: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        self.handled_counts(agent, since).await
+    }
+
+    fn dm_typing(&self, agent: &str) -> bool {
+        self.typing_in(agent)
+    }
+
+    fn presence(&self, attending: bool, dm_on_screen: Option<&str>) {
+        self.present(attending, dm_on_screen);
     }
 
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {

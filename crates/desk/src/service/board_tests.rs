@@ -970,6 +970,7 @@ async fn a_write_from_an_older_read_never_undoes_a_change_made_meanwhile() {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let late = d.move_read(read, to(TicketState::Review), &by).await;
         assert!(matches!(late, Err(DeskError::Conflict(_))), "{late:?}");

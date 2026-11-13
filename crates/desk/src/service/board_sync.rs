@@ -1049,6 +1049,7 @@ impl Desk {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -2144,6 +2145,7 @@ impl Desk {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let text = format!("created {key} on {} for it", s.system.title());
         let group = b.group.clone();

@@ -15,7 +15,7 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
-//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10 }
+//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
 //!
 //! `[oversight.updates]` holds the cheap model's day: every session's
@@ -30,36 +30,30 @@
 //! for `every_minutes` after the first result and sent by
 //! `max_wait_minutes` at the latest, as one update in the boss's DM.
 //! Off, updates are posted plainly from the rows.
+//! `away_after_minutes`: the person is away once the boss's posts have
+//! been unread that long; its updates then gather into one catch-up for
+//! their return.
 //!
-//! `full` is **Act fully**: everything `act` does, and, in the repositories
-//! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
-//! remote's URL, or a local checkout's path), answering and allowing, in
-//! the sessions it runs and, with `answer_sessions`, in the others too:
-//! merging a pull request by its number, pushing the default branch to
-//! `origin`, creating and pushing one tag, `gh release create <tag>`, and
-//! `gh workflow run` of a workflow `workflows` lists (by its file name
-//! exactly) on the default branch, with no inputs. Deploys run through
-//! those workflows: deploy tools and the project's own release, deploy and
-//! promote scripts stay the person's. It needs named repositories;
-//! `budget_usd_per_day` is optional (with none, only the check-in
-//! ceilings and Stop bound it), and when set it holds only while today's
-//! spend is under it. The budget counts real money only: calls
-//! paid by an API key or a cloud vendor (Bedrock, Vertex), never those on
-//! the person's Claude or ChatGPT plans, whose API-equivalent value the
-//! ledger keeps but nobody is billed for. `budget_cleared_at` (an RFC 3339
-//! time, written when the person clears a spent budget) starts today's
-//! count again from then. Short of any of it, it acts as `act` and
-//! says why ([`Oversight::fully`]). What no overseer does at any level, Act
-//! fully included, is Desk's own list (`workforce_desk::never`).
-//!
-//! `anywhere = true` takes the lists away: Act fully ships in any
-//! repository and runs any workflow.
-//! With `level = "full"`, `anywhere` and every `[oversight.act]` switch on,
-//! the overseer is **unbound** ([`Oversight::unbound`]): it answers every
-//! request and question itself, does every crew action, and checks in as
-//! often as the work needs; the never-list doesn't hold it. Only its
-//! budget (when set), the person's Stop and kill switches, the hold while
-//! they type, and the activity log remain. A remote boss is never unbound.
+//! `full` is **Act fully**, and Act fully is unbound (below). `[oversight.full]`
+//! `repos` (`owner/name`, which is GitHub's, a remote's URL, or a local
+//! checkout's path) and `workflows` (file names, matched exactly) are kept
+//! for what reads them, but no longer limit it. `budget_usd_per_day` is
+//! optional (with none, only Stop bounds it), and when set Act fully holds
+//! only while today's spend is under it; spent, it acts as `act` and says
+//! why. The budget counts real money only: calls paid by an API key or a
+//! cloud vendor (Bedrock, Vertex), never those on the person's Claude or
+//! ChatGPT plans, whose API-equivalent value the ledger keeps but nobody
+//! is billed for. `budget_cleared_at` (an RFC 3339 time, written when the
+//! person clears a spent budget) starts today's count again from then.
+//! `anywhere = true` is kept as said; it changes nothing more.
+//! At `level = "full"` the overseer is **unbound** ([`Oversight::unbound`]),
+//! whatever its lists and switches say, this hub's own boss or one served
+//! from a grant: Desk allows every request its sessions ask the moment it
+//! shows, and the boss answers every question itself, does every crew
+//! action, and checks in as often as the work needs; the never-list
+//! doesn't hold it. Only its budget (when set), the person's Stop and kill
+//! switches, and the activity log (each decision kept, with its Undo)
+//! remain.
 //!
 //! `group` is the sidebar group it oversees, as that group's boss: it sees
 //! only that group, and the main overseer (no `group`) sees nothing inside
@@ -273,9 +267,6 @@ impl Full {
     }
 }
 
-/// Why Act fully isn't in force though chosen: no repositories named.
-pub const FULL_NO_REPOS: &str =
-    "Act fully needs at least one repository named, so it acts within Desk for now.";
 /// Why a boss served from a grant doesn't act fully: its grant gives no
 /// daily budget (one of this hub's own may leave it blank).
 pub const FULL_NO_BUDGET: &str = "Act fully needs a daily budget, so it acts within Desk for now.";
@@ -340,6 +331,8 @@ pub struct Updates {
     pub every_minutes: u32,
     /// How long a small change waits at most.
     pub max_wait_minutes: u32,
+    /// How long the boss's posts go unread before the person is away.
+    pub away_after_minutes: u32,
 }
 
 /// The longest an update may gather or wait.
@@ -446,6 +439,7 @@ impl Default for Oversight {
                 enabled: true,
                 every_minutes: 3,
                 max_wait_minutes: 10,
+                away_after_minutes: 15,
             },
         }
     }
@@ -713,6 +707,15 @@ impl Oversight {
                 "The most minutes a small change waits for an update must be a whole number from {every_minutes} (how long an update gathers) to {MAX_UPDATE_MINUTES}."
             ),
         )?;
+        let away_after_minutes = whole(
+            updates,
+            "away_after_minutes",
+            d.updates.away_after_minutes,
+            1..=MAX_UPDATE_MINUTES,
+            &format!(
+                "The minutes before the person counts as away must be a whole number from 1 to {MAX_UPDATE_MINUTES}."
+            ),
+        )?;
         let minutes = |key: &str, default: u32, what: &str| {
             whole(
                 wake,
@@ -930,12 +933,15 @@ impl Oversight {
                 )?,
                 every_minutes,
                 max_wait_minutes,
+                away_after_minutes,
             },
         })
     }
 
     /// Whether Act fully is in force by its settings, or why not: it is
-    /// chosen, with repositories named (or anywhere). Its daily budget is
+    /// chosen. No list of repositories is needed: Act fully is unbound
+    /// ([`Self::unbound`]), and the lists only say where it ships when it
+    /// isn't. Its daily budget is
     /// optional: with none, only the check-in ceilings and Stop bound it,
     /// as on plans alone, where no real money is spent. (Whether today's
     /// spend is under a budget is the hub's to read; a boss served from a
@@ -945,38 +951,17 @@ impl Oversight {
         if self.level != Level::Full {
             return Err(None);
         }
-        // Anywhere, no list limits it, and a budget is the person's to set
-        // or leave blank.
-        if self.full.anywhere {
-            return Ok(&self.full);
-        }
-        if self.full.repos.is_empty() {
-            return Err(Some(FULL_NO_REPOS));
-        }
         Ok(&self.full)
     }
 
-    /// Whether it is **unbound**: Act fully, anywhere, with every
-    /// `[oversight.act]` switch on. Unbound, no word or list holds the
-    /// overseer back and it answers every request itself; only the person's
-    /// budget, their Stop and kill switches, the hold while they type, and
-    /// the activity log remain. `local`: the overseer is an agent of this
-    /// hub. A remote boss is never unbound.
-    pub fn unbound(&self, local: bool) -> bool {
-        let a = &self.act;
-        local
-            && self.level == Level::Full
-            && self.full.anywhere
-            && a.nudge
-            && a.resume_restart
-            && a.read_only_approvals
-            && a.hand_out_work
-            && a.interrupt
-            && a.message_agents
-            && a.message_terminal_sessions
-            && a.answer_sessions
-            && a.hand_off
-            && a.set_mode
+    /// Whether it is **unbound**: Act fully, nothing else. Unbound, no word,
+    /// list or switch holds the overseer back: Desk allows every request
+    /// its sessions ask at once, and it answers every question itself. Only
+    /// the person's budget, their Stop and kill switches, and the activity
+    /// log remain. The same for this hub's own boss and one served from a
+    /// grant (whose level is its grant's).
+    pub fn unbound(&self) -> bool {
+        self.level == Level::Full
     }
 
     /// `[oversight]` as a config holds it: absent is the defaults (off).
@@ -1066,11 +1051,12 @@ mod tests {
             "When its budget was last cleared must be a time."
         );
 
-        // Short of either, it acts as act and says why; not chosen, it's
+        // No list is needed: Act fully is unbound. Not chosen, it's
         // nothing to say.
         let no_repos =
             parse("[oversight]\nlevel = \"full\"\nfull = { budget_usd_per_day = 5 }\n").unwrap();
-        assert_eq!(no_repos.fully(), Err(Some(FULL_NO_REPOS)));
+        assert!(no_repos.fully().is_ok());
+        assert!(no_repos.unbound());
         let no_budget =
             parse("[oversight]\nlevel = \"full\"\nfull = { repos = [\"acme/acme-web\"] }\n")
                 .unwrap();
@@ -1256,6 +1242,13 @@ mod tests {
         assert!(parse("[oversight]\nupdates = { every_minutes = 0 }\n")
             .unwrap_err()
             .contains("gathers"));
+        // Away after 15 minutes unread, or as set.
+        assert_eq!(d.updates.away_after_minutes, 15);
+        let away = parse("[oversight]\nupdates = { away_after_minutes = 45 }\n").unwrap();
+        assert_eq!(away.updates.away_after_minutes, 45);
+        assert!(parse("[oversight]\nupdates = { away_after_minutes = 0 }\n")
+            .unwrap_err()
+            .contains("away"));
     }
 
     /// Messaging agents and sessions started in another terminal are each
@@ -1462,11 +1455,10 @@ mod tests {
         hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
 
     #[test]
-    fn unbound_is_act_fully_anywhere_with_every_switch_on_and_never_remote() {
+    fn unbound_is_act_fully_whatever_its_lists_and_switches_say() {
         let o = parse(UNBOUND).unwrap();
         assert!(o.full.anywhere);
-        assert!(o.unbound(true));
-        assert!(!o.unbound(false), "a remote boss is never unbound");
+        assert!(o.unbound());
         // Anywhere needs no repositories, and no budget.
         assert!(o.fully().is_ok());
         for off in [
@@ -1482,16 +1474,22 @@ mod tests {
             "set_mode",
         ] {
             let one = UNBOUND.replace(&format!("{off} = true"), &format!("{off} = false"));
-            assert!(!parse(&one).unwrap().unbound(true), "{off} off");
+            assert!(parse(&one).unwrap().unbound(), "{off} off");
         }
         let listed = UNBOUND.replace("anywhere = true", "anywhere = false");
-        assert!(!parse(&listed).unwrap().unbound(true), "not anywhere");
-        assert_eq!(
-            parse(&listed).unwrap().fully().unwrap_err(),
-            Some(FULL_NO_REPOS)
-        );
+        assert!(parse(&listed).unwrap().unbound(), "not anywhere");
+        assert!(parse(&listed).unwrap().fully().is_ok());
+        // The person's own Act fully: a list of repositories, switches
+        // short of every one, a few check-ins an hour.
+        let theirs = parse(
+            "[oversight]\nenabled = true\nlevel = \"full\"\nmax_checkins_per_hour = 6\n\
+             [oversight.act]\nnudge = true\nanswer_sessions = true\n\
+             [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 200\n",
+        )
+        .unwrap();
+        assert!(theirs.unbound());
         let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
-        assert!(!parse(&act).unwrap().unbound(true), "at act");
+        assert!(!parse(&act).unwrap().unbound(), "at act");
         assert_eq!(
             parse("[oversight.full]\nanywhere = 1\n").unwrap_err(),
             "Whether Act fully anywhere is on or off must be true or false."

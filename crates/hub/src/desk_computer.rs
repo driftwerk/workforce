@@ -67,12 +67,12 @@ pub fn changes_a_page(tool: &str) -> bool {
     tool.starts_with("browser.") && !BROWSER_READS.contains(&tool)
 }
 
-/// Whether an overseer of this hub is unbound: Act fully, anywhere, every
-/// `[oversight.act]` switch on ([`Oversight::unbound`]), and overseeing.
+/// Whether an overseer of this hub is unbound: at Act fully
+/// ([`Oversight::unbound`]), and overseeing.
 ///
 /// [`Oversight::unbound`]: workforce_common::oversight::Oversight::unbound
 pub fn unbound(o: &workforce_common::oversight::Oversight) -> bool {
-    o.enabled && o.unbound(true)
+    o.enabled && o.unbound()
 }
 
 /// Where an agent stands in a browser, by its `[oversight]`: an overseer
@@ -1386,7 +1386,7 @@ mod tests {
         hand_off = true, set_mode = true }\nfull = { anywhere = true }\n";
 
     #[test]
-    fn unbound_is_act_fully_anywhere_with_every_switch_on() {
+    fn unbound_is_act_fully_whatever_its_lists_and_switches_say() {
         let parse = |body: &str| {
             let value: toml::Value = toml::from_str(body).unwrap();
             workforce_common::oversight::Oversight::of(value.get("oversight")).unwrap()
@@ -1395,7 +1395,7 @@ mod tests {
         let one_off = UNBOUND.replace("hand_off = true", "hand_off = false");
         assert_eq!(
             browsing_of(&parse(&one_off)),
-            Browsing::Asks,
+            Browsing::Unbound,
             "one switch off"
         );
         let listed = UNBOUND.replace(
@@ -1404,7 +1404,7 @@ mod tests {
         );
         assert_eq!(
             browsing_of(&parse(&listed)),
-            Browsing::Asks,
+            Browsing::Unbound,
             "Act fully, not anywhere"
         );
         let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
@@ -2285,7 +2285,9 @@ mod tests {
 
     /// At Full access, deleting outside the folder asks once per folder: the
     /// "always" kept is a delete grant on the folder the card showed, and
-    /// then `rm -rf node_modules` there runs.
+    /// then `rm -rf node_modules` there runs. Unix only: its scratch is
+    /// named through a symlink.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn an_always_for_a_delete_is_kept_for_the_folder_the_card_showed() {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -2303,9 +2305,16 @@ mod tests {
                 &hub.config,
                 &hub.subject,
             );
-            // The test's folders are under $TMPDIR, scratch space itself:
-            // only /tmp is scratch here.
-            gate.policy.scratch = scratch_of(&[PathBuf::from("/tmp")]);
+            // The test's folders are in the temp dir, which is scratch space
+            // itself (`$TMPDIR` on macOS, `/tmp` on Linux): only a folder of
+            // the test's own, beside the repo, is scratch here. It is named
+            // by a link, as `/tmp` is on macOS, so a command naming it as
+            // written is scratch as much as its real folder.
+            let root = repo.ancestors().nth(2).unwrap();
+            let scratch = root.join("scratch");
+            std::fs::create_dir_all(root.join("scratch-real")).unwrap();
+            std::os::unix::fs::symlink(root.join("scratch-real"), &scratch).unwrap();
+            gate.policy.scratch = scratch_of(std::slice::from_ref(&scratch));
             let rm = |cwd: &Path, command: &str| Effect::Exec {
                 command: command.into(),
                 cwd: Some(cwd.to_path_buf()),
@@ -2342,7 +2351,10 @@ mod tests {
                 Verdict::Ask { .. }
             ));
             // Scratch space never asks.
-            let tmp = rm(&repo, "rm -rf /tmp/scratch-build");
+            let tmp = rm(
+                &repo,
+                &format!("rm -rf {}", scratch.join("build").display()),
+            );
             assert!(matches!(
                 as_sarah(|| gate.verdict("exec.run", &tmp)),
                 Verdict::Run { .. }

@@ -318,6 +318,7 @@ impl Desk {
             reason: Some("It moved to another group.".into()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let mut said = Vec::new();
         for effect in crate::scope::move_effects(from, to, &ids, charged, &bossed) {
