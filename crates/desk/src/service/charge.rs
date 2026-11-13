@@ -439,6 +439,22 @@ impl Desk {
         }
     }
 
+    /// Whether what `id` waits on is a question its dialog asks the person
+    /// (Claude's AskUserQuestion or plan, Codex's question or an MCP
+    /// server's), not a permission request.
+    pub fn asks_in_dialog(&self, id: Uuid) -> bool {
+        let st = self.0.state.lock();
+        let Some(l) = st.live.get(&id) else {
+            return false;
+        };
+        let Some(p) = l.pending.as_ref() else {
+            return false;
+        };
+        l.holder().is_some_and(|h| h.question)
+            || l.open_question.as_ref().is_some_and(|(q, _)| q.id == p.id)
+            || l.codex_question.as_ref().is_some_and(|(_, q)| q.id == p.id)
+    }
+
     /// Whether the person has the wheel of `id`, which a boss runs: its
     /// boss's messages to it wait.
     pub(crate) fn person_driving(&self, id: Uuid) -> bool {

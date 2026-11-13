@@ -368,6 +368,12 @@ impl CrewHub {
             return Outcome::Soon;
         }
         if !p.answerable {
+            // A question its dialog asks while the person is in control of
+            // the session is theirs: nothing is said of it until they are
+            // quiet (`answer`).
+            if self.dialog_is_persons(&view, &boss) {
+                return Outcome::Soon;
+            }
             return waits(
                 "it asks in its own terminal, where Desk can't answer it; answer it there".into(),
             );
