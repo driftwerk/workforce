@@ -756,11 +756,13 @@ impl Desk {
                 .await
             {
                 Ok(answer) => crate::board_sync::jira_fields(&answer, now),
+                // What was read before stays: one failed read never takes a
+                // board's points and sprints away. Asked again in a day.
                 Err(e) => {
                     tracing::info!(board = %id, error = %e, "the Jira site's fields weren't read");
                     board::JiraFields {
                         read_at: now,
-                        ..Default::default()
+                        ..s.fields.clone().unwrap_or_default()
                     }
                 }
             };
@@ -1169,8 +1171,6 @@ impl Desk {
         }
     }
 
-    /// Keeps who has `t`'s issue in step with `issue`, quietly: no history,
-    /// only the ticket announced, so a board catches up without noise.
     /// Keeps `t` in step with what a listing says of its unchanged issue:
     /// who has it, what it says of itself (its points, sprint, links …) and
     /// what blocks it there. No call is made.
@@ -1227,6 +1227,9 @@ impl Desk {
             return Ok(false);
         };
         let mut changed = false;
+        // The board's needs, read once a blocker is to be added: a pull never
+        // makes a loop of needs, as the person can't.
+        let mut edges: Option<Vec<(Uuid, Uuid)>> = None;
         // Every blocker it names, not only new ones: one imported since is
         // made a need once it is on the board.
         let added = now.iter();
@@ -1244,7 +1247,17 @@ impl Desk {
             };
             let e = t.external.as_mut().expect("a synced ticket");
             if add {
-                if t.needs.contains(&other.id) {
+                // Already a need; or one the person took off here since it
+                // was pulled, which stays off.
+                if t.needs.contains(&other.id) || e.seen.needs.contains(key) {
+                    continue;
+                }
+                if edges.is_none() {
+                    edges = Some(self.0.store.ticket_edges().await.map_err(internal)?);
+                }
+                let edges = edges.as_mut().expect("read above");
+                if board::cycles(t.id, other.id, edges) {
+                    tracing::debug!(ticket = %t.id, blocker = %key, "a pulled blocker would make a loop of needs");
                     continue;
                 }
                 self.0
@@ -1252,12 +1265,17 @@ impl Desk {
                     .put_need(t.id, other.id)
                     .await
                     .map_err(internal)?;
+                edges.push((t.id, other.id));
                 t.needs.push(other.id);
-                if !e.seen.needs.contains(key) {
-                    e.seen.needs.push(key.clone());
-                }
+                e.seen.needs.push(key.clone());
             } else {
+                // No longer blocked there: a need taken off here by hand is
+                // forgotten too, so a new block there is pulled again.
                 if !t.needs.contains(&other.id) {
+                    if e.seen.needs.contains(key) {
+                        e.seen.needs.retain(|n| n != key);
+                        changed = true;
+                    }
                     continue;
                 }
                 self.0
@@ -1273,6 +1291,8 @@ impl Desk {
         Ok(changed)
     }
 
+    /// Keeps who has `t`'s issue in step with `issue`, quietly: no history,
+    /// only the ticket announced, so a board catches up without noise.
     async fn refresh_assignee(&self, mut t: Ticket, issue: &Issue) -> Result<(), DeskError> {
         let Some(a) = crate::board_sync::assignee_changed(&t, issue) else {
             return Ok(());

@@ -1663,6 +1663,8 @@ async fn a_board_s_remote_files_go_when_its_link_reads_as_someone_else() {
 /// story in the epic ACME-9, blocked by ACME-2 while `blocked` holds.
 struct RichJira {
     blocked: Mutex<bool>,
+    /// `jira.list_fields` fails while set.
+    fields_fail: Mutex<bool>,
     updated: Mutex<String>,
     calls: Mutex<Vec<(String, Value)>>,
 }
@@ -1684,6 +1686,9 @@ impl Remote for RichJira {
         let updated = self.updated.lock().unwrap().clone();
         let blocked = *self.blocked.lock().unwrap();
         match tool {
+            "jira.list_fields" if *self.fields_fail.lock().unwrap() => {
+                Err(RemoteError::Failed("503".into()))
+            }
             "jira.list_fields" => Ok(json!({
                 "fields": { "points": "customfield_10016", "sprint": "customfield_10020",
                     "start_date": null, "development": "customfield_10000" },
@@ -1736,6 +1741,7 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
         let b = synced(&d, "Acme", None).await;
         let remote = RichJira {
             blocked: Mutex::new(true),
+            fields_fail: Mutex::new(false),
             updated: Mutex::new("2026-11-09T10:00:00.000+0000".into()),
             calls: Mutex::new(vec![]),
         };
@@ -1791,6 +1797,14 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
         assert_eq!(one.ticket.needs, vec![two.ticket.id]);
         assert_eq!(e.seen.needs, vec!["ACME-2".to_string()]);
         assert!(crate::board_sync::push_of(&one.ticket, &["ACME-2".into()]).is_empty());
+        // Taken off here by hand: it stays off, though Jira still says so.
+        d.need_ticket(one.ticket.id, two.ticket.id, false, &By::you())
+            .await
+            .unwrap();
+        *remote.updated.lock().unwrap() = "2026-11-09T10:30:00.000+0000".into();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let again = d.ticket(one.ticket.id).await.unwrap();
+        assert!(again.ticket.needs.is_empty(), "{:?}", again.ticket.needs);
         // Unblocked there: the need a pull made goes.
         *remote.blocked.lock().unwrap() = false;
         *remote.updated.lock().unwrap() = "2026-11-09T11:00:00.000+0000".into();
@@ -1807,6 +1821,62 @@ async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
             .filter(|(t, _)| t == "jira.list_fields")
             .count();
         assert_eq!(reads, 1);
+        // A day on, a failed read keeps what was read before.
+        d.change_sync(b.id, |s| {
+            if let Some(f) = s.fields.as_mut() {
+                f.read_at -= chrono::Duration::days(2);
+            }
+        })
+        .await
+        .unwrap();
+        *remote.fields_fail.lock().unwrap() = true;
+        d.pull_board(b.id, &remote).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        let kept = s.fields.unwrap();
+        assert_eq!(kept.points.as_deref(), Some("customfield_10016"));
+        assert_eq!(kept.priorities.len(), 4);
+        assert!(chrono::Utc::now() - kept.read_at < chrono::Duration::hours(1));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pulled_blocker_never_makes_a_loop_of_needs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = RichJira {
+            blocked: Mutex::new(true),
+            fields_fail: Mutex::new(false),
+            updated: Mutex::new("2026-11-09T10:00:00.000+0000".into()),
+            calls: Mutex::new(vec![]),
+        };
+        d.pull_board(b.id, &remote).await.unwrap();
+        let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
+        let id = |key: &str| {
+            tickets
+                .iter()
+                .find(|t| t.key.as_deref() == Some(key))
+                .unwrap()
+                .ticket
+                .id
+        };
+        let (one, two) = (id("ACME-1"), id("ACME-2"));
+        // Pulled, ACME-1 needs ACME-2. Unblocked there, the need goes; then
+        // ACME-2 is made to need ACME-1 here, and Jira blocks ACME-1 on
+        // ACME-2 again: the pull leaves it rather than make a loop.
+        assert_eq!(d.ticket(one).await.unwrap().ticket.needs, vec![two]);
+        *remote.blocked.lock().unwrap() = false;
+        *remote.updated.lock().unwrap() = "2026-11-09T11:00:00.000+0000".into();
+        d.pull_board(b.id, &remote).await.unwrap();
+        assert!(d.ticket(one).await.unwrap().ticket.needs.is_empty());
+        d.need_ticket(two, one, true, &By::you()).await.unwrap();
+        *remote.blocked.lock().unwrap() = true;
+        *remote.updated.lock().unwrap() = "2026-11-09T12:00:00.000+0000".into();
+        d.pull_board(b.id, &remote).await.unwrap();
+        assert!(d.ticket(one).await.unwrap().ticket.needs.is_empty());
+        assert_eq!(d.ticket(two).await.unwrap().ticket.needs, vec![one]);
     })
     .await;
 }
