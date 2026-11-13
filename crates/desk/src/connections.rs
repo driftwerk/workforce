@@ -202,6 +202,9 @@ impl DeskStore {
         from: &str,
         to: &str,
     ) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
         let client = self.pool().get().await?;
         client
             .execute(

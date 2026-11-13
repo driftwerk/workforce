@@ -1187,6 +1187,27 @@ async fn a_flat_github_moves_to_default_and_still_reaches_every_owner() {
             );
         })
         .await;
+    // Beside the person's, a bare shared flat token can't be `default`, so
+    // it stays flat, where git still reads it.
+    let h2 = hub().await;
+    h2.global
+        .set(&mine("skills/github/token"), GH_GOOD)
+        .unwrap();
+    h2.global
+        .set("skills/github/token", "ghp_sharedtoken0123456789abcd")
+        .unwrap();
+    h2.c.migrate(SARAH).await;
+    assert_eq!(
+        h2.global.get("skills/github/token").as_deref(),
+        Some("ghp_sharedtoken0123456789abcd")
+    );
+    assert!(h2
+        .global
+        .get(&mine("skills/github/workspaces/default/token"))
+        .is_some());
+    assert!(keys(&h2.global)
+        .iter()
+        .all(|k| !k.contains("workspaces/shared")));
     // An agent's own flat token stays its `default` too.
     let h = hub().await;
     h.allan.set(&mine("skills/github/token"), GH_GOOD).unwrap();

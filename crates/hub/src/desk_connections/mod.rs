@@ -901,6 +901,17 @@ impl Connections {
         } else if taken {
             key = self.new_key(c, person, &name);
         }
+        // A flat GitHub token reaches every owner; under any key but
+        // `default` git, Claude Code and benches would read it for none
+        // (`resolve_github_pat`). One that can't be `default` stays flat, as
+        // it works today.
+        if c.id == "github" && key != DEFAULT_INSTANCE {
+            tracing::debug!(
+                tier = ?tier,
+                "a flat GitHub token stays flat: beside another connection it can't be the default git reads"
+            );
+            return Ok(None);
+        }
         let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
         // Email's or Google's own `default`: it only needs a name.
         if native && key == DEFAULT_INSTANCE {
@@ -1651,23 +1662,40 @@ impl Connections {
             expires_in: Option<u64>,
             interval: Option<u64>,
         }
-        let response = self
-            .services
-            .http
-            .post(format!("{}/login/device/code", self.services.github_web))
-            .header("Accept", "application/json")
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("scope", "repo read:org"),
-            ])
-            .send()
-            .await
-            .map_err(|_| Refusal::Unavailable("GitHub couldn't be reached".into()))?;
-        let code: DeviceCode = response
-            .json()
-            .await
-            .map_err(|_| Refusal::Unavailable("GitHub didn't start the sign-in".into()))?;
+        // The flow holds its key from now, before GitHub is asked: a second
+        // sign-in started meanwhile takes another.
         let flow = self.insert_flow(person, c.id, level.clone(), key, name);
+        let asked = async {
+            let response = self
+                .services
+                .http
+                .post(format!("{}/login/device/code", self.services.github_web))
+                .header("Accept", "application/json")
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("scope", "repo read:org"),
+                ])
+                .send()
+                .await
+                .map_err(|_| Refusal::Unavailable("GitHub couldn't be reached".into()))?;
+            response
+                .json::<DeviceCode>()
+                .await
+                .map_err(|_| Refusal::Unavailable("GitHub didn't start the sign-in".into()))
+        }
+        .await;
+        let code = match asked {
+            Ok(code) => code,
+            Err(refused) => {
+                self.settle(
+                    &flow,
+                    FlowState::Failed {
+                        error: "GitHub didn't start the sign-in".into(),
+                    },
+                );
+                return Err(refused);
+            }
+        };
         let expires_in = code.expires_in.unwrap_or(900);
         let this = Arc::clone(self);
         let (flow_id, person) = (flow.clone(), person.to_string());
