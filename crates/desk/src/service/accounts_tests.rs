@@ -3141,19 +3141,25 @@ async fn a_call_that_succeeds_on_an_account_ends_its_stop() {
         d.hub_cooling(work, week, now - chrono::Duration::minutes(5));
         assert!(work_standing(&d, work).full(now).is_some());
         // The hub's own call on it succeeded.
-        d.hub_served(work);
+        d.hub_served(work, chrono::Utc::now());
         assert_eq!(work_standing(&d, work).full(chrono::Utc::now()), None);
         assert!(d.pool_accounts()[0].2.is_some(), "the pool is told");
         // Refused again, then a session's turn on it ends well.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        d.hub_cooling(work, week, chrono::Utc::now());
+        let refused = chrono::Utc::now();
+        d.hub_cooling(work, week, refused);
         assert!(work_standing(&d, work).full(chrono::Utc::now()).is_some());
         std::thread::sleep(std::time::Duration::from_millis(5));
         {
             let mut st = d.0.state.lock();
             let raw = Desk::raw_running(&st, a);
-            assert!(
+            // A reply written before that refusal, read late, ends nothing:
+            // the refusal is newer.
+            let earlier = refused - chrono::Duration::milliseconds(1);
+            assert_eq!(Desk::mark_ok(&mut st, &raw, earlier), Some(false));
+            assert_eq!(
                 Desk::mark_ok(&mut st, &raw, chrono::Utc::now()),
+                Some(true),
                 "it ended a stop"
             );
         }

@@ -790,9 +790,10 @@ impl Standing {
         let fresh = match (self.read_at, self.started_at) {
             (Some(read), Some(started)) => read >= started,
             _ => true,
-        } && match (self.read_at, self.signed_in_at) {
-            // Read before the account was signed in again: another sign-in's.
-            (Some(read), Some(signed_in)) => read > signed_in,
+        } && match (self.read_at, self.cleared_at()) {
+            // Read before the account was signed in again (another sign-in's)
+            // or before a call on it succeeded: it has room since.
+            (Some(read), Some(cleared)) => read > cleared,
             _ => true,
         };
         let full_window = self
@@ -896,8 +897,10 @@ impl Standing {
         let soon = now + chrono::Duration::minutes(2);
         // A start in the future can only be a wrong clock: not kept.
         s.started_at = s.started_at.filter(|t| *t <= soon);
-        s.signed_in_at = s.signed_in_at.filter(|t| *t <= soon);
-        s.ok_at = s.ok_at.filter(|t| *t <= soon);
+        // Never later than now here: a sign-in or success "from the future"
+        // would hide a refusal heard here since.
+        s.signed_in_at = s.signed_in_at.filter(|t| *t <= soon).map(|t| t.min(now));
+        s.ok_at = s.ok_at.filter(|t| *t <= soon).map(|t| t.min(now));
         if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
             return None;
         }

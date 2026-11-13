@@ -49,9 +49,9 @@ impl InstallPool for DeskPool {
         }
     }
 
-    fn served(&self, id: &str) {
+    fn served(&self, id: &str, at: DateTime<Utc>) {
         if let Ok(id) = Uuid::parse_str(id) {
-            self.desk.hub_served(id);
+            self.desk.hub_served(id, at);
         }
     }
 

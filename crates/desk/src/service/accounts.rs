@@ -595,7 +595,11 @@ impl Desk {
             // Kept as the account's own: the call ran on its token.
             let raw = super::identities::Raw::Account(account);
             let standing = Self::standing_mut(&mut st, &raw);
-            if standing.hit_at.is_some_and(|kept| kept > at) {
+            // A later stop already kept stands; the same one told again
+            // (the hub still cooling it) is nothing new.
+            if standing.hit_at.is_some_and(|kept| kept > at)
+                || (standing.hit_at == Some(at) && standing.hit_until == Some(until))
+            {
                 return;
             }
             standing.hit_at = Some(at);
@@ -611,26 +615,19 @@ impl Desk {
         }
     }
 
-    /// A call of the hub's own on `account` succeeded: whatever stop it had
-    /// is over.
-    pub fn hub_served(&self, account: Uuid) {
-        let ended = {
-            let mut st = self.0.state.lock();
-            if !st.accounts.iter().any(|a| a.id == account) {
-                return;
-            }
-            let raw = super::identities::Raw::Account(account);
-            Self::mark_ok(&mut st, &raw, Utc::now())
-        };
-        if !ended {
+    /// A call of the hub's own on `account`, begun at `at`, succeeded: a
+    /// stop it had from before then is over.
+    pub fn hub_served(&self, account: Uuid, at: chrono::DateTime<Utc>) {
+        if !self.0.state.lock().accounts.iter().any(|a| a.id == account) {
             return;
         }
-        tracing::info!(%account, "the hub's own call succeeded on an account that was stopped: it has room again");
-        self.keep_standing();
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let desk = self.clone();
-            rt.spawn(async move { desk.accounts_moved().await });
+        // Told from wherever a login is settled, which may have no runtime.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let raw = super::identities::Raw::Account(account);
+            Self::mark_ok(&mut self.0.state.lock(), &raw, at);
+            return;
         }
+        self.ok_seen(&super::identities::Raw::Account(account), at);
     }
 
     /// An account by the name the person or an agent gave it.

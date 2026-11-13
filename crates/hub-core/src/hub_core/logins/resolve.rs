@@ -238,20 +238,25 @@ impl Login {
                 Notice::Other => return None,
             },
             (None, false) => {
-                self.served_well();
+                // Only a round that answered: one that timed out, found no
+                // session, or ran out of turns may have made no call at all.
+                if round.succeeded {
+                    self.served_well(round.started_at);
+                }
                 return None;
             }
         };
         Some(self.cool(&limit, caller))
     }
 
-    /// A round on this login succeeded: it isn't at its limit, whatever was
-    /// heard before, here or (for a pool account) in Desk.
-    fn served_well(&self) {
-        CooldownStore::global().clear_since(&self.key, Utc::now());
+    /// A round on this login, begun at `began`, succeeded: a refusal heard
+    /// before it began is over, here and (for a pool account) in Desk. One
+    /// heard while it ran (another call's) stands.
+    fn served_well(&self, began: DateTime<Utc>) {
+        CooldownStore::global().clear_since(&self.key, began);
         if let Credential::Pooled(id) = &self.credential {
             if let Some(pool) = super::install_pool::of(&self.slot.vault) {
-                pool.served(id);
+                pool.served(id, began);
             }
         }
     }
@@ -264,6 +269,10 @@ pub struct RoundEnd<'a> {
     /// How full the plan's windows were, as the round last reported them.
     pub usage: Vec<workforce_common::usage::Window>,
     pub failed: bool,
+    /// Whether it answered: a round that ended on its own, well.
+    pub succeeded: bool,
+    /// When it began: a refusal heard before then is behind a success.
+    pub started_at: DateTime<Utc>,
     pub notice: &'a str,
     pub stderr_tail: &'a str,
     /// The line a refusal names as its reason.
@@ -1252,7 +1261,7 @@ mod tests {
             self.told.lock().push((id.into(), until));
             self.told_at.lock().push(at);
         }
-        fn served(&self, id: &str) {
+        fn served(&self, id: &str, _at: DateTime<Utc>) {
             self.served.lock().push(id.into());
         }
     }
@@ -1472,26 +1481,51 @@ mod tests {
         )
         .unwrap();
         let reset = Utc::now() + chrono::Duration::days(2);
-        CooldownStore::global().note(
-            &login.key,
-            &LimitSignal {
-                status: LimitStatus::Rejected,
-                resets_at: Some(reset),
-                window: None,
-            },
-            Utc::now() - chrono::Duration::minutes(1),
-        );
-        let round = RoundEnd {
+        let refuse = |at: DateTime<Utc>| {
+            CooldownStore::global().note(
+                &login.key,
+                &LimitSignal {
+                    status: LimitStatus::Rejected,
+                    resets_at: Some(reset),
+                    window: None,
+                },
+                at,
+            )
+        };
+        let began = Utc::now() - chrono::Duration::seconds(30);
+        let round = |succeeded| RoundEnd {
             limit: None,
             usage: Vec::new(),
             failed: false,
+            succeeded,
+            started_at: began,
             notice: "",
             stderr_tail: "",
             failure_line: String::new(),
         };
-        assert!(login.settle(&round, "desk").is_none());
+        // Refused while this round ran (another call's): it stands.
+        refuse(began + chrono::Duration::seconds(10));
+        assert!(login.settle(&round(true), "desk").is_none());
+        assert_eq!(
+            CooldownStore::global().until(&login.key, Utc::now()),
+            Some(reset)
+        );
+        CooldownStore::global().clear_since(&login.key, Utc::now());
+        // Refused before it began: over.
+        refuse(began - chrono::Duration::minutes(1));
+        // A round that timed out (or found no session) answered nothing.
+        assert!(login.settle(&round(false), "desk").is_none());
+        assert_eq!(
+            CooldownStore::global().until(&login.key, Utc::now()),
+            Some(reset)
+        );
+        assert_eq!(pool.served.lock().len(), 1, "the first round told Desk");
+        assert!(login.settle(&round(true), "desk").is_none());
         assert_eq!(CooldownStore::global().until(&login.key, Utc::now()), None);
-        assert_eq!(pool.served.lock().clone(), vec!["served-once".to_string()]);
+        assert_eq!(
+            pool.served.lock().clone(),
+            vec!["served-once".to_string(); 2]
+        );
         super::super::install_pool::set(&f.global, None);
     }
 

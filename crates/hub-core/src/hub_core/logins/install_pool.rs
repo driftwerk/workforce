@@ -62,8 +62,9 @@ pub trait InstallPool: Send + Sync {
     /// at `at`.
     fn cooling(&self, id: &str, until: DateTime<Utc>, at: DateTime<Utc>);
 
-    /// A call here on account `id` succeeded: whatever stop it had is over.
-    fn served(&self, _id: &str) {}
+    /// A call here on account `id`, begun at `at`, succeeded: a stop it had
+    /// from before then is over.
+    fn served(&self, _id: &str, _at: DateTime<Utc>) {}
 
     /// The key account `id`'s plan readings are kept under, as the Floor
     /// names its card: a call's reading on it is the account's.

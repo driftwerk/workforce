@@ -5378,7 +5378,12 @@ impl Desk {
             false => asked_at_end(&denials, said.as_deref()),
         };
         let said_whole = said.clone().filter(|_| unsure);
-        let said_ok = said.clone();
+        // It ended well: a call on its sign-in succeeded, so a stop on that
+        // sign-in from before is over.
+        let ended_well = !failed
+            && said
+                .as_deref()
+                .is_none_or(|s| !crate::limit::says_plan_limit(s));
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
         // A refusal whose words aren't the plan's, on an account whose
@@ -5457,34 +5462,38 @@ impl Desk {
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
             self.read_later(id, end, reader, reply);
         }
-        // A `/login` inside it whose `auth_success` went unheard.
+        // A `/login` inside it whose `auth_success` went unheard. Only once
+        // that is known is the success marked, on the sign-in it ran on, as
+        // of the last reply its transcript has (never later than the call
+        // that made it: another session's refusal since stands).
         if let Some(p) = path.clone() {
             let desk = self.clone();
             tokio::spawn(async move {
-                let login = tokio::task::spawn_blocking(move || {
+                let (login, ok_at) = tokio::task::spawn_blocking(move || {
                     transcript::read_tail(Path::new(&p))
                         .ok()
-                        .and_then(|t| t.last_login)
+                        .map(|t| (t.last_login, t.ok_at))
                 })
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .unwrap_or_default();
                 desk.login_in_transcript(id, login).await;
+                if let Some(ok) = ok_at.filter(|_| ended_well) {
+                    let raw = {
+                        let st = desk.0.state.lock();
+                        // Still read for a `/login` inside it: which sign-in
+                        // it ran on isn't known yet.
+                        (!st.scan_pending.contains(&id) && st.records.contains_key(&id))
+                            .then(|| Self::raw_running(&st, id))
+                    };
+                    if let Some(raw) = raw {
+                        desk.ok_seen(&raw, ok);
+                    }
+                }
             });
         }
         if let Some(on) = on {
-            // It ended well: the call it ran on its sign-in succeeded, so a
-            // stop on that account from before is over.
-            let ended_well = !failed
-                && said_ok
-                    .as_deref()
-                    .is_none_or(|s| !crate::limit::says_plan_limit(s));
-            if ended_well && Self::mark_ok(&mut self.0.state.lock(), &on, Utc::now()) {
-                tracing::info!(session = %id, "a turn ended well on an account that was stopped: it has room again");
-                self.keep_standing();
-                let desk = self.clone();
-                tokio::spawn(async move { desk.accounts_moved().await });
-            }
             if let Some(hit) = &limit {
                 // On its limit: the account is full now, whatever it left
                 // running (a turn waiting on background work isn't over to
@@ -5603,16 +5612,35 @@ impl Desk {
     }
 
     /// A call on `raw` succeeded at `at` (a session's turn ended well): a
-    /// stop on its limit from before is over. Whether it ended one.
-    fn mark_ok(st: &mut State, raw: &identities::Raw, at: DateTime<Utc>) -> bool {
+    /// stop on its limit from before is over. `None` when nothing new was
+    /// learned; else whether it ended a stop, on the side `raw` counts for
+    /// (its account, when the CLI's sign-in is one).
+    fn mark_ok(st: &mut State, raw: &identities::Raw, at: DateTime<Utc>) -> Option<bool> {
         let at = at.min(Utc::now());
-        let standing = Self::standing_mut(st, raw);
-        if standing.ok_at.is_some_and(|ok| ok >= at) {
-            return false;
+        if Self::standing_mut(st, raw).ok_at.is_some_and(|ok| ok >= at) {
+            return None;
         }
-        let was = standing.hit_at.is_some_and(|hit| standing.counts(hit));
-        standing.ok_at = Some(at);
-        was && standing.hit_at.is_some_and(|hit| hit <= at)
+        let side = Self::side_of_raw(st, raw);
+        let full = |st: &State| {
+            side.is_some_and(|side| Self::standing_of(st, side).full(Utc::now()).is_some())
+        };
+        let was = full(st);
+        Self::standing_mut(st, raw).ok_at = Some(at);
+        Some(was && !full(st))
+    }
+
+    /// [`Self::mark_ok`], then kept, and the accounts told when it ended a
+    /// stop.
+    fn ok_seen(&self, raw: &identities::Raw, at: DateTime<Utc>) {
+        let Some(ended) = Self::mark_ok(&mut self.0.state.lock(), raw, at) else {
+            return;
+        };
+        self.keep_standing();
+        if ended {
+            tracing::info!(%at, "a call succeeded on an account that was stopped: it has room again");
+            let desk = self.clone();
+            tokio::spawn(async move { desk.accounts_moved().await });
+        }
     }
 
     /// Session `id`'s turn stopped `account` on its limit now; kept as the
@@ -6429,10 +6457,8 @@ impl Desk {
                             // succeeded then.
                             if let Some(ok) = t.ok_at {
                                 let raw = Self::raw_running(&st, id);
-                                if Self::mark_ok(&mut st, &raw, ok) {
-                                    drop(st);
-                                    self.keep_standing();
-                                }
+                                drop(st);
+                                self.ok_seen(&raw, ok);
                             }
                         }
                         self.change(id, |r, _| {
@@ -6493,12 +6519,8 @@ impl Desk {
                     let new_id = r.id;
                     self.save(r);
                     if let Some(ok) = ok_at {
-                        let mut st = self.0.state.lock();
-                        let raw = Self::raw_running(&st, new_id);
-                        if Self::mark_ok(&mut st, &raw, ok) {
-                            drop(st);
-                            self.keep_standing();
-                        }
+                        let raw = Self::raw_running(&self.0.state.lock(), new_id);
+                        self.ok_seen(&raw, ok);
                     }
                 }
             }
