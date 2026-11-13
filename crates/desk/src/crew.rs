@@ -585,6 +585,10 @@ pub struct Extras {
     /// What the boss decided, each with its Undo where it has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<crate::decision::DecisionLine>,
+    /// What the boss asks of the person (needs you, still waiting), with
+    /// its answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<crate::open_item::MentionedItem>,
 }
 
 impl Extras {
@@ -594,6 +598,7 @@ impl Extras {
             && self.questions.is_empty()
             && self.plan.is_none()
             && self.decisions.is_empty()
+            && self.item.is_none()
     }
 }
 
@@ -646,6 +651,15 @@ pub enum UndoRefused {
     Cant(String),
 }
 
+/// Why an open item wasn't answered or dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemRefused {
+    NotFound,
+    /// Closed already.
+    Closed,
+    Cant(String),
+}
+
 /// The hub's side of the crew: its agents, the overseer, and doing what a
 /// suggestion proposed.
 #[async_trait::async_trait]
@@ -685,6 +699,16 @@ pub trait Crew: Send + Sync {
         Err(UndoRefused::Cant(
             "There is no boss here to undo it.".into(),
         ))
+    }
+    /// Answers the boss's open item `id` with `answer`, as you: the item
+    /// is closed here, in the same request, and the answer goes on to
+    /// whoever asked.
+    async fn answer_item(&self, _id: uuid::Uuid, _answer: &str) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here to answer.".into()))
+    }
+    /// Drops the boss's open item `id` unanswered, as you.
+    async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
     }
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.

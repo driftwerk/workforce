@@ -34,6 +34,7 @@ mod decisions;
 mod deliver;
 mod extras;
 mod handover;
+mod items;
 mod line;
 mod observe;
 mod own_settings;
@@ -146,6 +147,9 @@ pub struct CrewHub {
     /// How many decisions (and suggestions) each boss made, by the session
     /// they were about: a line or work turn that moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
+    /// When each boss last asked the person with `crew.ask_person`: its
+    /// turn's reply then isn't also kept as a question of its own.
+    asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -512,6 +516,7 @@ impl CrewHub {
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
             acted: Mutex::default(),
+            asked_person: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
@@ -535,6 +540,7 @@ impl CrewHub {
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }
@@ -1175,6 +1181,18 @@ impl Crew for CrewHub {
         id: uuid::Uuid,
     ) -> Result<String, workforce_desk::crew::UndoRefused> {
         self.me().undo(id).await
+    }
+
+    async fn answer_item(
+        &self,
+        id: uuid::Uuid,
+        answer: &str,
+    ) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().answer_item(id, answer).await
+    }
+
+    async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().drop_item(id).await
     }
 
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {

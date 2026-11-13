@@ -200,6 +200,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_open_items",
+        "owner",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
+        "boss_open_items",
+        "closed_by",
+        NotPersonal("which side closed it (person, session, boss, superseded, lapsed), not who"),
+    ),
+    (
+        "desk",
         "session_accounts",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

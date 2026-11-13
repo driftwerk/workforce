@@ -280,6 +280,16 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             .collect(),
         "crew.board" => vec![(json!({}), false)],
         "crew.decisions" => vec![(json!({}), false)],
+        "crew.open_items" => vec![(json!({}), false)],
+        "crew.ask_person" => vec![(
+            json!({ "text": "Shall I merge it?", "session_id": s }),
+            true,
+        )],
+        // Only its own items: another's is refused as one that isn't there.
+        "crew.close_item" => vec![(
+            json!({ "item_id": uuid::Uuid::new_v4().to_string(), "why": "Settled." }),
+            false,
+        )],
         "crew.account" => vec![
             (json!({ "session_id": s }), true),
             (json!({ "session_id": s, "question": "Which key?" }), true),
