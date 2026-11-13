@@ -165,7 +165,7 @@ impl CrewHub {
     /// here. The person (saying yes to a suggestion), Desk, and a remote
     /// boss acting on this machine's sessions through its grant record none
     /// here: their decisions are kept where they are made.
-    fn deciding_boss(&self, by: &By) -> Option<String> {
+    pub(crate) fn deciding_boss(&self, by: &By) -> Option<String> {
         (by.party.kind == PartyKind::Manager && self.overseer_named(&by.party.id).is_some())
             .then(|| by.party.id.clone())
     }
@@ -312,7 +312,7 @@ impl CrewHub {
         self.record(&d).await;
     }
 
-    fn name_of_session(&self, id: Uuid) -> String {
+    pub(crate) fn name_of_session(&self, id: Uuid) -> String {
         self.desk
             .view(id)
             .map(|v| v.label().to_string())

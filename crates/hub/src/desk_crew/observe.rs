@@ -71,10 +71,13 @@ impl CrewHub {
             .and_then(|sid| self.hops.lock().remove(sid))
             .unwrap_or(0);
         if overseer && channel == DESK_CHANNEL {
+            let sid = session_id?.to_string();
             if !message.starts_with(CHECK_IN) {
                 self.person_spoke();
+                self.person_turns
+                    .lock()
+                    .insert(sid.clone(), message.to_string());
             }
-            let sid = session_id?.to_string();
             self.manager_turns.lock().insert(sid.clone(), crew::now());
             return Some(Track {
                 crew: self.me(),
@@ -152,9 +155,17 @@ impl Track {
                 let started = crew.manager_turns.lock().get(&sid).copied();
                 if let Some(started) = started {
                     crew.ask_from_reply(&self.party.id, started, answer).await;
+                    // What the person asked for, when the turn acted on
+                    // sessions for it, is an order kept to done.
+                    let asked = crew.person_turns.lock().get(&sid).cloned();
+                    let service = crew.state.registry.get(&self.party.id);
+                    if let (Some(asked), Some(service)) = (asked, service) {
+                        crew.order_from_turn(&service, &sid, started, &asked).await;
+                    }
                 }
             }
             crew.manager_turns.lock().remove(&sid);
+            crew.person_turns.lock().remove(&sid);
             return;
         }
         crew.running.lock().remove(&self.key);
@@ -187,6 +198,7 @@ impl Drop for Track {
         }
         if let Some(sid) = &self.manager_session {
             self.crew.manager_turns.lock().remove(sid);
+            self.crew.person_turns.lock().remove(sid);
             return;
         }
         self.crew.running.lock().remove(&self.key);

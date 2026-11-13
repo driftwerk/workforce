@@ -150,6 +150,11 @@ pub struct CrewHub {
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The sessions each boss acted on lately (started, told, handed
+    /// work), and when: what a DM turn did for the person's order.
+    turn_acts: Mutex<Vec<(String, DateTime<Utc>, uuid::Uuid)>>,
+    /// The person's message each boss DM turn is answering, by session.
+    person_turns: Mutex<HashMap<String, String>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -517,6 +522,8 @@ impl CrewHub {
             questions: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
+            turn_acts: Mutex::default(),
+            person_turns: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
