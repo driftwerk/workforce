@@ -183,6 +183,10 @@ fn parse(command: &str) -> Option<Vec<Command>> {
                 if matches!(c, '*' | '?' | '[') {
                     w.pattern = true;
                 }
+                // The shell takes `~` after `=` or `:` as home (`A=x:~/.ssh`).
+                if c == '~' && w.text.ends_with(['=', ':']) {
+                    return None;
+                }
                 w.text.push(c);
             }
         }
@@ -231,6 +235,15 @@ const fn letters(letters: &'static str) -> Spec {
     }
 }
 
+/// The word after an option as its value: never one that is an option
+/// itself, as a tool whose option may go without one reads it (`cargo
+/// build --bin --config …`); a negative number is a value.
+fn value(w: &Word) -> Option<String> {
+    let t = w.text.as_str();
+    let number = t.len() > 1 && t[1..].chars().all(|c| c.is_ascii_digit());
+    (!t.starts_with('-') || number).then(|| w.text.clone())
+}
+
 /// `args`'s operands, as `spec` reads them, with each option's value
 /// (to be checked as paths too); none when any option isn't in it. After
 /// `--`, every word is an operand.
@@ -252,7 +265,7 @@ fn read_args<'a>(args: &'a [Word], spec: &Spec) -> Option<(Vec<&'a Word>, Vec<St
             continue;
         }
         if spec.valued.contains(&a) {
-            values.push(it.next()?.text.clone());
+            values.push(value(it.next()?)?);
             continue;
         }
         if spec.attached.contains(&a) {
@@ -290,7 +303,7 @@ fn read_args<'a>(args: &'a [Word], spec: &Spec) -> Option<(Vec<&'a Word>, Vec<St
             if spec.valued.contains(&flag.as_str()) {
                 let rest = &a[1 + i + c.len_utf8()..];
                 values.push(if rest.is_empty() {
-                    it.next()?.text.clone()
+                    value(it.next()?)?
                 } else {
                     rest.to_string()
                 });
@@ -512,7 +525,7 @@ pub fn readable(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
             "node" => args
                 .first()
                 .is_some_and(|s| !s.text.starts_with('-') && plain_inside(s)),
-            "git" => git(args),
+            "git" => git(args, cwd),
             "gh" => gh(args),
             "curl" => curl(args),
             _ => {
@@ -525,7 +538,18 @@ pub fn readable(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
                 match name {
                     "cp" | "mv" | "mkdir" | "touch" | "tee" | "rm" => {
                         writes = true;
-                        operands.iter().all(|w| plain_inside(w))
+                        // What is copied or moved is a file, never a link
+                        // nor a folder that may hold one: moved, a link to
+                        // `../x` points elsewhere.
+                        let file = |w: &&Word| {
+                            std::fs::symlink_metadata(cwd.join(&w.text))
+                                .is_ok_and(|m| m.file_type().is_file())
+                        };
+                        let sources = match name {
+                            "cp" | "mv" => &operands[..operands.len().saturating_sub(1)],
+                            _ => &[][..],
+                        };
+                        operands.iter().all(|w| plain_inside(w)) && sources.iter().all(file)
                     }
                     // `cd -` and `cd +1` go where the shell was before.
                     "cd" | "pushd" => {
@@ -624,7 +648,13 @@ fn sed_command(s: &str) -> bool {
 /// are given.
 fn cargo(args: &[Word]) -> bool {
     let args = match args.first() {
-        Some(t) if t.text.starts_with('+') => &args[1..],
+        // A toolchain not installed is fetched into the home folder.
+        Some(t) if t.text.starts_with('+') => {
+            if !matches!(t.text.as_str(), "+stable" | "+beta" | "+nightly") {
+                return false;
+            }
+            &args[1..]
+        }
         _ => args,
     };
     let Some(sub) = args.first() else {
@@ -686,10 +716,6 @@ fn cargo(args: &[Word]) -> bool {
                     "--package",
                     "--features",
                     "-F",
-                    "--bin",
-                    "--test",
-                    "--example",
-                    "--bench",
                     "-j",
                     "--jobs",
                     "--target",
@@ -700,7 +726,8 @@ fn cargo(args: &[Word]) -> bool {
                 ],
                 letters: "rqv",
                 numbers: false,
-                attached: &[],
+                // Each may go without a name, and then takes no word.
+                attached: &["--bin", "--test", "--example", "--bench"],
             },
         )
         .is_some()
@@ -794,7 +821,7 @@ fn python(args: &[Word], cwd: &Path, home: &Path) -> bool {
 
 /// `git` working on the repository, by a subcommand and options it knows:
 /// never an option before the subcommand (`-c`, `-C`, `--git-dir`).
-fn git(args: &[Word]) -> bool {
+fn git(args: &[Word], cwd: &Path) -> bool {
     let Some(sub) = args.first() else {
         return false;
     };
@@ -939,7 +966,9 @@ fn git(args: &[Word]) -> bool {
         return false;
     }
     // A remote by its name, never an address or a path.
-    let bare = |o: &&Word| !o.text.contains([':', '@', '/']);
+    let bare = |o: &&Word| {
+        !o.text.contains([':', '@', '/']) && std::fs::symlink_metadata(cwd.join(&o.text)).is_err()
+    };
     match sub.text.as_str() {
         "fetch" | "pull" | "push" => operands.first().is_none_or(bare),
         _ => true,
@@ -1025,6 +1054,16 @@ mod tests {
         let home = dir.path().join("home");
         let cwd = home.join("acme-api");
         std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("a")).unwrap();
+        std::fs::create_dir_all(home.join("other")).unwrap();
+        std::fs::write(cwd.join("a.rs"), "").unwrap();
+        #[cfg(unix)]
+        {
+            // A link up and out, as `node_modules/.bin` holds; one to nothing.
+            std::os::unix::fs::symlink("../../other", cwd.join("a/link")).unwrap();
+            std::os::unix::fs::symlink("../newout", cwd.join("dang")).unwrap();
+            std::os::unix::fs::symlink("../other", cwd.join("peer")).unwrap();
+        }
         let ok = |c: &str| readable(c, Some(&cwd), &home);
         for c in [
             "cargo build --release",
@@ -1059,6 +1098,11 @@ mod tests {
             "[ -f Cargo.toml ] && cargo build",
             "cat src/*.rs",
             "echo done",
+            "cargo build --bin=desk",
+            "cargo +nightly fmt",
+            "git log HEAD~1",
+            "head -n -5 a.rs",
+            "echo 'A=x:~/b'",
         ] {
             assert!(ok(c), "{c}");
         }
@@ -1208,6 +1252,26 @@ mod tests {
             "git diff -U --output=src/x",
             "git restore :/",
             "git add :/",
+            // An option that may go without a value doesn't take the next.
+            "cargo build --bin --config 'build.target-dir=\"/tmp/x\"'",
+            "cargo test --test --config x",
+            "cargo build -p --config x",
+            "cargo +evil build",
+            // A link moved, or one to nothing, leads out.
+            "mv a/link link && cat link/f",
+            "mv a/link link && echo x > link/pwn",
+            "cp -P a/link l",
+            "mv a b",
+            "echo x > dang",
+            "cp a.rs dang",
+            "tee dang/x < a.rs",
+            "touch dang",
+            // `~` after `=` or `:` is home.
+            "echo A=x:~/.ssh",
+            "echo --x=~/.ssh",
+            // A remote that is a folder beside it.
+            "git push peer",
+            "git fetch peer",
         ] {
             assert!(!ok(c), "{c}");
         }

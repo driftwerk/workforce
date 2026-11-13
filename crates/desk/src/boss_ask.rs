@@ -649,21 +649,42 @@ pub(crate) fn real_path(path: &Path) -> PathBuf {
 }
 
 fn real(path: &Path) -> PathBuf {
+    real_at(path, 0)
+}
+
+/// `path` with its links followed, a link to nothing included (`dang ->
+/// ../new`, written, makes `../new`). One it can't follow is taken as the
+/// root, outside any folder.
+fn real_at(path: &Path, depth: usize) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = path.to_path_buf();
+    let finish = |mut out: PathBuf, rest: &[std::ffi::OsString]| {
+        for part in rest.iter().rev() {
+            out.push(part);
+        }
+        out
+    };
     loop {
         if let Ok(r) = std::fs::canonicalize(&at) {
-            let mut out = r;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
+            return finish(r, &rest);
+        }
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            let Some(to) = std::fs::read_link(&at).ok().filter(|_| depth < 40) else {
+                return PathBuf::from("/");
+            };
+            let to = match at.parent() {
+                Some(parent) if to.is_relative() => parent.join(to),
+                _ => to,
+            };
+            return finish(real_at(&to, depth + 1), &rest);
         }
         match (at.file_name().map(|f| f.to_os_string()), at.parent()) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
                 at = parent.to_path_buf();
             }
+            // A way up from what isn't there (`gone/..`) leads anywhere.
+            (None, Some(_)) => return PathBuf::from("/"),
             _ => return path.to_path_buf(),
         }
     }
@@ -1430,7 +1451,8 @@ mod tests {
         for c in [
             "cargo build > build.log 2>&1",
             "cargo test 2>/dev/null | tee out/test.txt",
-            "mkdir -p target/x && cp a.rs src/b.rs",
+            // Copying needs the file there (`only_what_is_read_whole_is_readable`).
+            "mkdir -p target/x && touch target/x/b.rs",
             "cargo build 2>&1 >&2",
             "cd src && cargo build",
             "curl -s \"https://api.example.com/a?b=1\"",
