@@ -84,6 +84,9 @@ pub struct Claim {
     /// What `due_at` was set to as it was claimed: while it still is, the
     /// claim holds, and a turn's end meanwhile changes it.
     pub lease: DateTime<Utc>,
+    /// When it was due before it was claimed: a claim let go unread goes
+    /// back to its place in the queue.
+    pub was: Option<DateTime<Utc>>,
 }
 
 /// An exchange after a session's `derived_to`, as derivation reads it.
@@ -247,10 +250,10 @@ impl DeskStore {
         client
             .query_opt(
                 "UPDATE memory_derive d SET due_at = now() + make_interval(secs => $1) \
-                 FROM (SELECT session FROM memory_derive WHERE due_at <= now() \
+                 FROM (SELECT session, due_at AS was FROM memory_derive WHERE due_at <= now() \
                    ORDER BY due_at, session LIMIT 1 FOR UPDATE SKIP LOCKED) c \
                  WHERE d.session = c.session \
-                 RETURNING d.session, d.derived_to, d.tries, d.due_at",
+                 RETURNING d.session, d.derived_to, d.tries, d.due_at, c.was",
                 &[&lease_secs],
             )
             .await
@@ -261,6 +264,7 @@ impl DeskStore {
                     derived_to: r.try_get(1)?,
                     tries: r.try_get(2)?,
                     lease: r.try_get(3)?,
+                    was: r.try_get(4)?,
                 })
             })
             .transpose()
@@ -278,10 +282,10 @@ impl DeskStore {
         client
             .query_opt(
                 "UPDATE memory_derive d SET due_at = now() + make_interval(secs => $2) \
-                 FROM (SELECT session FROM memory_derive WHERE session = $1 AND due_at <= now() \
-                   FOR UPDATE SKIP LOCKED) c \
+                 FROM (SELECT session, due_at AS was FROM memory_derive \
+                   WHERE session = $1 AND due_at <= now() FOR UPDATE SKIP LOCKED) c \
                  WHERE d.session = c.session \
-                 RETURNING d.session, d.derived_to, d.tries, d.due_at",
+                 RETURNING d.session, d.derived_to, d.tries, d.due_at, c.was",
                 &[&session, &lease_secs],
             )
             .await
@@ -292,6 +296,7 @@ impl DeskStore {
                     derived_to: r.try_get(1)?,
                     tries: r.try_get(2)?,
                     lease: r.try_get(3)?,
+                    was: r.try_get(4)?,
                 })
             })
             .transpose()

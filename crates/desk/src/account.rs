@@ -492,6 +492,9 @@ fn record(out: &mut String, ctx: &Context, delta: &[Exchange], tail: &Tail) {
     }
 }
 
+/// The last line of an account's prompt asked alone.
+const ANSWER_ALONE: &str = "\nAnswer with the JSON object only.";
+
 /// What the model is given to refresh `kept` from `delta` (and `tail`, when
 /// the exchanges don't say enough), wrapped as untrusted content with
 /// `nonce`.
@@ -514,7 +517,7 @@ pub fn prompt(
     out.push_str(&format!("\n<<<{boundary}>>>\n"));
     record(&mut out, ctx, delta, tail);
     out.push_str(&format!("<<<END_{boundary}>>>\n"));
-    out.push_str("\nAnswer with the JSON object only.");
+    out.push_str(ANSWER_ALONE);
     out
 }
 
@@ -652,6 +655,11 @@ pub fn shared_system() -> String {
 /// What the model is given for both jobs: the account's prompt, then the
 /// notes' prompt, each wrapped as untrusted on its own.
 pub fn shared_prompt(account: &str, notes: &str) -> String {
+    // The wrapper's shape is the only one asked for.
+    let account = account
+        .strip_suffix(ANSWER_ALONE)
+        .unwrap_or(account)
+        .trim_end();
     format!(
         "For the account:\n\n{account}\n\nFor the notes:\n\n{notes}\n\n\
          Answer with the one JSON object {{\"account\": ..., \"notes\": ...}} only."

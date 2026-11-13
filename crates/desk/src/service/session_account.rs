@@ -69,6 +69,9 @@ pub(super) struct AccountRun {
     read_refreshed: Mutex<HashMap<Uuid, Instant>>,
     /// Model calls made, for tests.
     pub(super) calls: std::sync::atomic::AtomicUsize,
+    /// The longest a refresh shared with a reading for notes is given: as
+    /// long as the worker gives its own reading.
+    pub(super) shared_within: Mutex<Duration>,
 }
 
 impl AccountRun {
@@ -82,6 +85,7 @@ impl AccountRun {
             ended: Mutex::default(),
             read_refreshed: Mutex::default(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            shared_within: Mutex::new(super::memory_derive::CALL_WITHIN),
         }
     }
 }
@@ -911,10 +915,7 @@ impl Desk {
                     tracing::info!(session = %id, error = format!("{e:#}"), "couldn't count a reading for notes; the account is refreshed alone");
                 }
                 self.derive_unshare(share).await;
-                self.0
-                    .store
-                    .cheap_untake(self.derive_day(), CheapKind::Account)
-                    .await?;
+                self.account_untake(id).await;
                 return Ok(WithNotes::Alone);
             }
         }
@@ -925,8 +926,11 @@ impl Desk {
         let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
         let user =
             account::shared_prompt(prompt, &crate::memory::derive::prompt(&share.input, &nonce));
+        // Room for the notes too: the turn's end waits on them as long as
+        // the worker would.
+        let within = *self.0.accounts.shared_within.lock();
         let asked = tokio::time::timeout(
-            account::WRITE_WITHIN,
+            within,
             accountant.answer_shared(id, engine, &account::shared_system(), &user),
         )
         .await;
@@ -943,10 +947,7 @@ impl Desk {
                 tracing::info!(session = %id, error = format!("{e:#}"), "the model couldn't refresh an account and read notes in one call; the account is asked alone");
                 self.derive_unshare(share).await;
                 self.derive_shared_untake().await;
-                self.0
-                    .store
-                    .cheap_untake(self.derive_day(), CheapKind::Account)
-                    .await?;
+                self.account_untake(id).await;
                 Ok(WithNotes::Alone)
             }
             Err(_) => {
@@ -956,6 +957,18 @@ impl Desk {
                 self.derive_unshare(share).await;
                 Ok(WithNotes::Answered(None))
             }
+        }
+    }
+
+    /// Gives back an account refresh's count that no model took.
+    async fn account_untake(&self, id: Uuid) {
+        if let Err(e) = self
+            .0
+            .store
+            .cheap_untake(self.derive_day(), CheapKind::Account)
+            .await
+        {
+            tracing::info!(session = %id, error = format!("{e:#}"), "couldn't give back a cheap call's count");
         }
     }
 

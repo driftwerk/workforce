@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use parking_lot::Mutex;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -21,7 +22,7 @@ use crate::memory_derive_store::{model_name, Apply, Claim, ItemRow, Unread, Unre
 /// stopped mid-call finds the session due again.
 const LEASE: Duration = Duration::from_secs(5 * 60);
 /// The longest a model call is given.
-const CALL_WITHIN: Duration = Duration::from_secs(2 * 60);
+pub(super) const CALL_WITHIN: Duration = Duration::from_secs(2 * 60);
 /// How often an idle worker looks for sessions due.
 const IDLE_EVERY: Duration = Duration::from_secs(30);
 /// How often a worker at the day's limit looks again.
@@ -54,6 +55,9 @@ pub const DERIVE_FAILED: &str =
 pub(super) struct DeriveRun {
     pub(super) deriver: Option<Arc<dyn Deriver>>,
     poke: tokio::sync::Notify,
+    /// Sessions whose reading an account's refresh is making: a turn's end
+    /// meanwhile makes them due again, and the worker leaves them be.
+    sharing: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl DeriveRun {
@@ -61,7 +65,21 @@ impl DeriveRun {
         Self {
             deriver,
             poke: tokio::sync::Notify::new(),
+            sharing: Arc::default(),
         }
+    }
+}
+
+/// A session's place among those whose reading an account's refresh is
+/// making, given up as it ends however it ends.
+struct Sharing {
+    sessions: Arc<Mutex<HashSet<Uuid>>>,
+    session: Uuid,
+}
+
+impl Drop for Sharing {
+    fn drop(&mut self) {
+        self.sessions.lock().remove(&self.session);
     }
 }
 
@@ -224,6 +242,7 @@ pub(super) struct SharedRead {
     group: Option<String>,
     rows: Vec<Unread>,
     pub(super) input: Input,
+    _sharing: Sharing,
 }
 
 /// What one turn of the worker found.
@@ -331,6 +350,13 @@ impl Desk {
         let Some(claim) = self.0.store.derive_claim(LEASE.as_secs_f64()).await? else {
             return Ok(Did::Idle);
         };
+        if self.0.derive.sharing.lock().contains(&claim.session) {
+            // An account's refresh is reading it: what a turn's end added
+            // meanwhile is read after that, as its debounce says.
+            let later = Utc::now() + chrono::Duration::from_std(IDLE_EVERY).unwrap_or_default();
+            self.0.store.derive_release(&claim, Some(later)).await?;
+            return Ok(Did::Work);
+        }
         // Each group is read on its own: the first whose sessions may be
         // read, so one that may not holds only its own place.
         let mut chosen: Option<UnreadGroup> = None;
@@ -561,14 +587,19 @@ impl Desk {
         else {
             return Ok(None);
         };
-        match self.derive_shared_of(claim.clone(), deriver, read).await {
+        self.0.derive.sharing.lock().insert(id);
+        let sharing = Sharing {
+            sessions: Arc::clone(&self.0.derive.sharing),
+            session: id,
+        };
+        match self
+            .derive_shared_of(claim.clone(), deriver, read, sharing)
+            .await
+        {
             Ok(Some(s)) => Ok(Some(s)),
             left => {
-                // Still due: the worker reads it as it would have.
-                self.0
-                    .store
-                    .derive_release(&claim, Some(Utc::now()))
-                    .await?;
+                // Back in its place: the worker reads it as it would have.
+                self.0.store.derive_release(&claim, claim.was).await?;
                 left
             }
         }
@@ -582,9 +613,12 @@ impl Desk {
         claim: Claim,
         deriver: &dyn Deriver,
         read: &HashSet<&str>,
+        sharing: Sharing,
     ) -> eyre::Result<Option<SharedRead>> {
         let groups = self.0.store.derive_unread_groups(claim.session).await?;
-        // More than one group waits: the worker reads them in turn.
+        // More than one group waits (a session moved between groups): the
+        // worker reads them in turn, the one waiting longest first and none
+        // whose group isn't read yet, so the account doesn't pick for it.
         let [g] = groups.as_slice() else {
             return Ok(None);
         };
@@ -650,6 +684,7 @@ impl Desk {
             rows: rows.to_vec(),
             input,
             claim,
+            _sharing: sharing,
         }))
     }
 
@@ -670,15 +705,10 @@ impl Desk {
         }
     }
 
-    /// The shared reading wasn't made: the session is due as it was, and
-    /// the worker reads it.
+    /// The shared reading wasn't made: the session goes back to its place
+    /// in the queue, and the worker reads it.
     pub(super) async fn derive_unshare(&self, s: SharedRead) {
-        if let Err(e) = self
-            .0
-            .store
-            .derive_release(&s.claim, Some(Utc::now()))
-            .await
-        {
+        if let Err(e) = self.0.store.derive_release(&s.claim, s.claim.was).await {
             tracing::info!(session = %s.claim.session, error = format!("{e:#}"), "couldn't let a session's reading for notes go; it is due once its lease is up");
         }
     }
