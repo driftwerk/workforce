@@ -103,12 +103,15 @@ enum Failed {
     /// Refused as it stands (sharing off there, the agent declines, the
     /// token gone): try again only after the longest back-off.
     Refused(String),
+    /// What was sent was refused as it is (400, 413): sent again it would
+    /// be again.
+    Rejected(String),
 }
 
 impl Failed {
     fn words(&self) -> &str {
         match self {
-            Self::Retry(w) | Self::Refused(w) => w,
+            Self::Retry(w) | Self::Refused(w) | Self::Rejected(w) => w,
         }
     }
 }
@@ -169,6 +172,8 @@ pub struct KnowsSync {
     person: PersonOf,
     http: reqwest::Client,
     spent: Mutex<HashMap<String, Spent>>,
+    /// Each delete's back-off, so one hub out of reach holds up no other.
+    retry_delete: Mutex<HashMap<Uuid, Spent>>,
     wake: tokio::sync::Notify,
 }
 
@@ -192,6 +197,7 @@ impl KnowsSync {
             person,
             http,
             spent: Mutex::new(HashMap::new()),
+            retry_delete: Mutex::new(HashMap::new()),
             wake: tokio::sync::Notify::new(),
         }
     }
@@ -236,22 +242,27 @@ impl KnowsSync {
         }
     }
 
-    /// Where `agent`'s copies go now, if anywhere.
-    fn target(&self, agent: &str) -> Option<Target> {
+    /// Where `agent`'s copies go now, if anywhere. For `taking_back` what
+    /// it holds, whether it still takes Desk work doesn't matter: a person
+    /// can always take back what was sent.
+    fn target(&self, agent: &str, taking_back: bool) -> Option<Target> {
         let (hub, id) = agent.split_once('/')?;
         if hub == workforce_desk::rooms::LOCAL_HUB {
-            let service = self.state.registry.get(id)?;
-            let accepts = service.config.desk_knows.enabled
-                && AgentWorkspaceConfig::load(&service.workspace)
-                    .ok()
-                    .flatten()
-                    .is_none_or(|c| c.accepts_desk_knows());
             let person = Uuid::parse_str(&(self.person)()?).ok()?;
-            return accepts.then(|| {
+            let service = self.state.registry.get(id);
+            let accepts = service.as_ref().is_some_and(|service| {
+                service.config.desk_knows.enabled
+                    && AgentWorkspaceConfig::load(&service.workspace)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|c| c.accepts_desk_knows())
+            });
+            let agent = service.map_or_else(|| id.to_string(), |s| s.agent_id.to_string());
+            return (accepts || taking_back).then(|| {
                 Target::Local(Owner {
                     person,
                     source: LOCAL_SOURCE.into(),
-                    agent: service.agent_id.to_string(),
+                    agent,
                 })
             });
         }
@@ -275,7 +286,7 @@ impl KnowsSync {
         if items == 0 || bytes == 0 {
             return Ok(());
         }
-        let Some(target) = self.target(agent) else {
+        let Some(target) = self.target(agent, false) else {
             return Ok(());
         };
         let home = std::env::var("HOME").ok();
@@ -301,7 +312,25 @@ impl KnowsSync {
             return Ok(());
         }
         let size: usize = pending.iter().map(Outgoing::bytes).sum();
-        let landed = self.push(&target, &pending, digest).await;
+        let mut landed = self.push(&target, &pending, digest).await;
+        // One item the agent's hub won't take must not hold up the rest:
+        // each is tried alone, and one refused as it is is passed over (it
+        // would be refused again), named in the log by its kind and ref.
+        if matches!(landed, Err(Failed::Rejected(_))) {
+            landed = Ok(());
+            for o in &pending {
+                match self.push(&target, std::slice::from_ref(o), digest).await {
+                    Ok(()) => {}
+                    Err(Failed::Rejected(why)) => {
+                        tracing::warn!(agent = %agent, kind = %o.held.kind, reference = %o.held.reference, why = %why, "the agent's hub won't take an item; passed over");
+                    }
+                    Err(e) => {
+                        landed = Err(e);
+                        break;
+                    }
+                }
+            }
+        }
         {
             let mut spent = self.spent.lock();
             let s = spent.entry(agent.to_string()).or_default();
@@ -393,11 +422,12 @@ impl KnowsSync {
             .unwrap_or_else(|| status.to_string());
         if matches!(
             status,
-            StatusCode::UNAUTHORIZED
-                | StatusCode::FORBIDDEN
-                | StatusCode::NOT_FOUND
-                | StatusCode::BAD_REQUEST
-                | StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
+        ) {
+            Err(Failed::Rejected(words))
+        } else if matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
         ) {
             Err(Failed::Refused(words))
         } else {
@@ -414,9 +444,28 @@ impl KnowsSync {
                 return;
             }
         };
+        let now = Instant::now();
         for (agent, log) in pending {
-            if let Err(e) = self.delete(&agent, &log).await {
-                tracing::debug!(agent = %agent, error = %e.words(), "a delete is waiting on the agent's hub");
+            if self
+                .retry_delete
+                .lock()
+                .get(&log.id)
+                .is_some_and(|s| s.waiting(now))
+            {
+                continue;
+            }
+            match self.delete(&agent, &log).await {
+                Ok(()) => {
+                    self.retry_delete.lock().remove(&log.id);
+                }
+                Err(e) => {
+                    self.retry_delete
+                        .lock()
+                        .entry(log.id)
+                        .or_default()
+                        .failed(now, false);
+                    tracing::debug!(agent = %agent, error = %e.words(), "a delete is waiting on the agent's hub");
+                }
             }
         }
     }
@@ -432,14 +481,14 @@ impl KnowsSync {
             // nothing Desk can reach: its hub forgot it with the link, or
             // this hub's own store did with the agent. The delete waits for
             // a link, if one comes back.
-            let Some(target) = self.target(agent) else {
+            let Some(target) = self.target(agent, true) else {
                 return Err(Failed::Retry("no way to the agent's hub".into()));
             };
             for chunk in items.chunks(FORGET_ITEMS) {
                 match &target {
                     Target::Local(owner) => {
                         let Some(kept) = super::installed() else {
-                            break;
+                            return Err(Failed::Retry("this hub keeps no Desk work".into()));
                         };
                         kept.forget(
                             owner,
@@ -566,6 +615,10 @@ async fn put_link(
         );
     }
     tracing::info!(target: "sentinel.audit", hub = %hub, agent = %agent, person = %person, "an agent's link for Desk work was kept");
+    // A token refused before is no reason to wait now.
+    if let Some(s) = r.spent.lock().get_mut(&format!("{hub}/{agent}")) {
+        s.backoff = None;
+    }
     r.kick();
     StatusCode::NO_CONTENT.into_response()
 }

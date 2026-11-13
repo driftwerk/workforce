@@ -257,6 +257,29 @@ impl DeskStore {
             .collect()
     }
 
+    /// What was sent of a forgotten session after it was forgotten (a push
+    /// in flight then): marked for deleting as the forgetting did.
+    pub async fn knows_forget_late(&self) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let ids: Vec<Uuid> = tx
+            .query(
+                "SELECT DISTINCT k.session FROM knows_sent k \
+                 JOIN knows_forgotten f ON f.session = k.session \
+                 WHERE k.deleted_at IS NULL AND k.deleting IS NULL",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        if !ids.is_empty() {
+            knows_forget_sessions_in(&tx, &ids).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Logs the person's choice for `items` (kind, ref) that `agent` holds
     /// outside its rule, and marks them, in one transaction: kept, done at
     /// once; or being deleted, until the agent's hub has deleted them
@@ -316,7 +339,7 @@ impl DeskStore {
         client
             .query(
                 "SELECT agent, id, at, what, detail, done_at FROM knows_log \
-                 WHERE what = 'delete' AND done_at IS NULL ORDER BY at LIMIT 100",
+                 WHERE what = 'delete' AND done_at IS NULL ORDER BY at",
                 &[],
             )
             .await?
@@ -429,6 +452,12 @@ pub(crate) async fn knows_forget_sessions_in(
     tx: &tokio_postgres::Transaction<'_>,
     ids: &[Uuid],
 ) -> Result<()> {
+    tx.execute(
+        "INSERT INTO knows_forgotten (session, at) SELECT unnest($1::uuid[]), now() \
+         ON CONFLICT DO NOTHING",
+        &[&ids],
+    )
+    .await?;
     tx.execute(
         "WITH hit AS ( \
            SELECT agent, kind, ref, session FROM knows_sent \

@@ -46,6 +46,8 @@ pub struct NeedRow {
     pub boss: String,
     pub kind: String,
     pub session: Option<Uuid>,
+    /// Every session it is about, `session` among them.
+    pub sessions: Vec<Uuid>,
     pub session_name: Option<String>,
     pub text: String,
     pub holding_up: Option<String>,
@@ -160,7 +162,9 @@ impl DeskStore {
                 "SELECT a.session, s.name, s.engine, s.cwd, s.state, a.purpose, a.plan, a.now, \
                    a.next, a.waiting_on, a.done, a.decisions, a.written_at \
                  FROM session_accounts a JOIN sessions s ON s.id = a.session \
-                 WHERE s.memory <> 'off' ORDER BY a.written_at",
+                 WHERE s.memory = 'on' \
+                   AND NOT EXISTS (SELECT 1 FROM knows_forgotten f WHERE f.session = a.session) \
+                 ORDER BY a.written_at",
                 &[],
             )
             .await?
@@ -193,10 +197,16 @@ impl DeskStore {
         client
             .query(
                 "SELECT o.id, o.boss, o.kind, o.session, s.name, o.text, o.holding_up, o.state, \
-                   o.opened_at, o.changed_at \
+                   o.opened_at, o.changed_at, o.sessions \
                  FROM boss_open_items o LEFT JOIN sessions s ON s.id = o.session \
                  WHERE o.kind IN ('ask', 'confirm') AND (o.state <> 'closed' OR o.changed_at >= $1) \
-                   AND (s.memory IS NULL OR s.memory <> 'off') ORDER BY o.changed_at",
+                   AND (o.session IS NULL OR s.memory = 'on') \
+                   AND NOT EXISTS (SELECT 1 FROM unnest(o.sessions) x(id) \
+                     LEFT JOIN sessions y ON y.id = x.id \
+                     WHERE y.id IS NULL OR y.memory <> 'on') \
+                   AND NOT EXISTS (SELECT 1 FROM knows_forgotten f \
+                     WHERE f.session = o.session OR f.session = ANY(o.sessions)) \
+                 ORDER BY o.changed_at",
                 &[&since],
             )
             .await?
@@ -213,6 +223,7 @@ impl DeskStore {
                     state: r.try_get(7)?,
                     opened_at: r.try_get(8)?,
                     changed_at: r.try_get(9)?,
+                    sessions: r.try_get(10)?,
                 })
             })
             .collect()
@@ -228,7 +239,9 @@ impl DeskStore {
                    d.undone_at \
                  FROM boss_decisions d LEFT JOIN sessions s ON s.id = d.session \
                  WHERE coalesce(d.undone_at, d.at) >= $1 \
-                   AND (s.memory IS NULL OR s.memory <> 'off') ORDER BY d.at",
+                   AND (d.session IS NULL OR s.memory = 'on') \
+                   AND NOT EXISTS (SELECT 1 FROM knows_forgotten f WHERE f.session = d.session) \
+                 ORDER BY d.at",
                 &[&since],
             )
             .await?
@@ -316,12 +329,13 @@ impl DeskStore {
         let sql = format!(
             "SELECT e.engine || ':' || e.key, e.session, s.name, e.group_id, e.at, e.ended, \
                e.asker, e.ask, e.answer, e.steps, e.files, e.commands, e.errors, e.flagged \
-             FROM memory_exchanges e LEFT JOIN sessions s ON s.id = e.session \
+             FROM memory_exchanges e JOIN sessions s ON s.id = e.session \
              WHERE e.ended IS NOT NULL AND e.ended >= $2 \
                AND ($3 OR e.session = ANY($4)) \
                AND (e.group_id IS NULL OR NOT e.group_id = ANY($5)) \
                AND NOT e.session = ANY($7) \
-               AND (s.memory IS NULL OR s.memory <> 'off') \
+               AND s.memory = 'on' \
+               AND NOT EXISTS (SELECT 1 FROM knows_forgotten f WHERE f.session = e.session) \
                AND {} \
              ORDER BY e.ended, e.id LIMIT $6",
             unsent(TRANSCRIPT, "e.engine || ':' || e.key")

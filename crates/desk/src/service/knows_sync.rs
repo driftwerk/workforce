@@ -62,9 +62,15 @@ impl Desk {
             .map(|g| (g.id.as_str(), g.name.as_str()))
             .collect();
         let mut place_of: HashMap<Uuid, Where> = HashMap::new();
+        // A session in any group whose harvest is off is off, whatever
+        // other group also has it.
+        let mut session_off: HashSet<Uuid> = HashSet::new();
         for g in &world.layout.groups {
             for item in &g.items {
                 if let Some(id) = item.strip_prefix("session:").and_then(|s| s.parse().ok()) {
+                    if groups_off.contains(&g.id) {
+                        session_off.insert(id);
+                    }
                     place_of.insert(
                         id,
                         Where {
@@ -85,6 +91,7 @@ impl Desk {
         };
         // Of a group whose harvest is off, nothing.
         let off = |w: &Where| w.group.as_ref().is_some_and(|g| groups_off.contains(g));
+        let off_session = |s: Option<Uuid>| s.is_some_and(|s| session_off.contains(&s));
         let since = now - cap.backfill;
 
         let states = store
@@ -113,7 +120,10 @@ impl Desk {
 
         for a in store.knows_accounts().await.map_err(internal)? {
             let w = place(Some(a.session));
-            if off(&w) || !covered.covers(Some(a.session), w.group.as_deref(), None, None) {
+            if off(&w)
+                || off_session(Some(a.session))
+                || !covered.covers(Some(a.session), w.group.as_deref(), None, None)
+            {
                 continue;
             }
             let o = items::account(&a, &w, home, redactor);
@@ -123,7 +133,16 @@ impl Desk {
         }
         for n in store.knows_needs(since).await.map_err(internal)? {
             let w = place(n.session);
+            // Every session it is about must be covered and on, not only
+            // the one it names.
+            let about_all = n.sessions.iter().all(|s| {
+                !off_session(Some(*s))
+                    && !off(&place(Some(*s)))
+                    && covered.covers(Some(*s), place(Some(*s)).group.as_deref(), None, None)
+            });
             if off(&w)
+                || off_session(n.session)
+                || !about_all
                 || !covered.covers(n.session, w.group.as_deref(), None, Some(n.boss.as_str()))
             {
                 continue;
@@ -136,6 +155,7 @@ impl Desk {
         for d in store.knows_decisions(since).await.map_err(internal)? {
             let w = place(d.session);
             if off(&w)
+                || off_session(d.session)
                 || !covered.covers(d.session, w.group.as_deref(), None, Some(d.boss.as_str()))
             {
                 continue;
@@ -152,11 +172,7 @@ impl Desk {
             boards: covered.boards.iter().copied().collect(),
             groups: covered.groups.iter().cloned().collect(),
             groups_off: groups_off.iter().cloned().collect(),
-            sessions_off: place_of
-                .iter()
-                .filter(|(_, w)| off(w))
-                .map(|(s, _)| *s)
-                .collect(),
+            sessions_off: session_off.iter().copied().collect(),
         };
         let room = |out: &Vec<Outgoing>| i64::try_from(cap.items - out.len()).unwrap_or(0);
         if room(&out) > 0 {
@@ -210,7 +226,9 @@ impl Desk {
         self.store()
             .knows_sent_put(agent, &rows, now)
             .await
-            .map_err(internal)
+            .map_err(internal)?;
+        // A session forgotten while this was on its way: taken back too.
+        self.store().knows_forget_late().await.map_err(internal)
     }
 }
 
@@ -405,6 +423,21 @@ mod tests {
                 .await
                 .unwrap();
             assert!(out.is_empty(), "own work alone, and Allan runs nothing");
+            // A boss's question naming no one session, about the private one
+            // among others: never sent.
+            store
+                .pool()
+                .get()
+                .await
+                .unwrap()
+                .execute(
+                    "INSERT INTO boss_open_items (id, boss, kind, session, sessions, text, dedupe_key, \
+                       opened_at, changed_at) \
+                     VALUES ($1, 'allan', 'ask', NULL, $2, 'about private and atlas', 'k', now(), now())",
+                    &[&Uuid::from_u128(9), &vec![off, acme]],
+                )
+                .await
+                .unwrap();
             let everything = Rule::new(&["all".into()], false, Digest::Live).unwrap();
             let out = d
                 .knows_pending(allan, &everything, &CAP, &Hide, None, now)
