@@ -253,3 +253,97 @@ async fn a_dialogs_question_is_left_alone_while_the_person_is_in_control() {
     })
     .await;
 }
+
+/// At Act fully a dialog's questions (Claude's AskUserQuestion) are held at
+/// their start and answered by the boss in their place, so the dialog
+/// never opens; left to the person, or while they are in control, it opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn act_fully_answers_a_dialogs_questions_in_its_place() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        decides(
+            &llm,
+            "Send the three messages",
+            "ANSWER: Sending: At once. Counts: Yes.\nWHY: it is faster and the counts are read-only",
+        )
+        .await;
+        decides(&llm, "Which customer first", "ASK: which customer gets the first invite?").await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let since = chrono::Utc::now();
+        let dialog = |q: &str| {
+            json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": format!("toolu_{}", q.len()),
+                "tool_input": {"questions": [
+                    {"question": q, "header": "Sending", "multiSelect": false,
+                     "options": [{"label": "At once", "description": "Fast."}, {"label": "One after another", "description": "Slow."}]},
+                    {"question": "Run the read-only counts first?", "header": "Counts", "multiSelect": false,
+                     "options": [{"label": "Yes", "description": "Before."}, {"label": "No", "description": "Skip."}]}]}})
+        };
+        let s = new_session(&d, &base, "Cufflink Migration").await;
+        let url = hook_url(&base, s.id).await;
+        // A sweep tells Desk which sessions' dialogs the boss answers.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Its boss answers every question in the dialog's place.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook(&url, dialog("Send the three messages at once or one after another?")),
+        )
+        .await
+        .expect("answered within its hold");
+        let out = &answer["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny", "{answer}");
+        let said_to_it = out["permissionDecisionReason"].as_str().unwrap_or_default();
+        assert!(
+            said_to_it.ends_with("answered this for the person: Sending: At once. Counts: Yes."),
+            "{said_to_it}"
+        );
+        let call = calls_about(&llm, "Send the three messages").await;
+        assert_eq!(call.len(), 1);
+        assert!(call[0].contains("Run the read-only counts first?"), "every question");
+        let v = d.view(s.id).unwrap();
+        assert!(v.pending.is_none(), "nothing waits: {:?}", v.pending);
+        let kept = eventually("its decision", async || {
+            let rows = d.store().decisions_since("desk", since, 50).await.unwrap();
+            rows.into_iter().find(|r| r.session == Some(s.id))
+        })
+        .await;
+        assert!(
+            kept.what.starts_with("answered Cufflink Migration's question “Send the three messages"),
+            "{kept:?}"
+        );
+
+        // Left to the person: its dialog opens, and the DM asks in one line.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook(&url, dialog("Which customer first, Acme or Globex?")),
+        )
+        .await
+        .expect("let go within its hold");
+        assert_eq!(answer, json!({}), "its dialog asks the person");
+        eventually("the DM to ask the person", async || {
+            (said(&overseer, &["Cufflink Migration asks: which customer gets the first invite?"]) == 1)
+                .then_some(())
+        })
+        .await;
+        let call = format!("toolu_{}", "Which customer first, Acme or Globex?".len());
+        hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": call})).await;
+
+        // The person in control: its dialog opens at once, held for no one.
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "now the sends"})).await;
+        let started = std::time::Instant::now();
+        let answer = hook(&url, dialog("Send them now or tomorrow morning, then?")).await;
+        assert_eq!(answer, json!({}));
+        assert!(started.elapsed() < Duration::from_secs(2), "not held");
+        assert!(calls_about(&llm, "Send them now or tomorrow").await.is_empty());
+    })
+    .await;
+}

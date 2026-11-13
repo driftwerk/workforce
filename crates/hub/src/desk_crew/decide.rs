@@ -202,8 +202,14 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             _ = sweep.tick() => {
                 swept = true;
                 match crew.desk.any_boss_unbound() {
-                    true => waiting(&crew),
-                    false => Vec::new(),
+                    true => {
+                        crew.desk.set_dialog_answerers(crew.dialog_answerers());
+                        waiting(&crew)
+                    }
+                    false => {
+                        crew.desk.set_dialog_answerers(HashMap::new());
+                        Vec::new()
+                    }
                 }
             }
         };
@@ -367,8 +373,9 @@ impl CrewHub {
         if !p.answerable {
             // A question its dialog asks while the person is in control of
             // the session is theirs: nothing is said of it until they are
-            // quiet (`answer`).
-            if self.dialog_is_persons(&view, &boss) {
+            // quiet (`answer`). One the boss had at its start and let go to
+            // the person was said then.
+            if self.dialog_is_persons(&view, &boss) || asked.contains(&p.id) {
                 return Outcome::Soon;
             }
             return waits(
@@ -386,6 +393,19 @@ impl CrewHub {
                 .entry(boss.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(AT_ONCE))),
         );
+        // A dialog's questions, held at their start: answered, not allowed.
+        if self.desk.asks_in_dialog(view.id) {
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = cancel.cancelled() => {}
+                    () = async {
+                        let _slot = slot.acquire().await;
+                        crew.answer_dialog(&view, &p, &boss).await
+                    } => {}
+                }
+            });
+            return Outcome::Deciding;
+        }
         tokio::spawn(async move {
             let decided = tokio::select! {
                 () = cancel.cancelled() => return,

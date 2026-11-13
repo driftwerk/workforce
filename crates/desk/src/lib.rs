@@ -100,6 +100,7 @@ mod worktree;
 
 pub use adopt::HubInternal;
 pub use api::{router, sessions_router, Authorize};
+pub use claude::DIALOG_HOLD;
 pub use conversations::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,
     Conversations, Copied, CopyToChat, Cursor, Delete, Deleted, Match, Matches, Page, PutRead,
