@@ -178,16 +178,14 @@ async fn nothing_changed_is_no_post_and_a_result_goes_out_within_the_gather() {
             "{}",
             posted.content
         );
-        // Its extras are kept just after it posts.
-        let extras = eventually("the update's extras", async || {
-            d.store()
-                .extras(std::slice::from_ref(&posted.id))
-                .await
-                .unwrap()
-                .remove(&posted.id)
-                .and_then(|e| e.update)
-        })
-        .await;
+        let extras = d
+            .store()
+            .extras(std::slice::from_ref(&posted.id))
+            .await
+            .unwrap()
+            .remove(&posted.id)
+            .and_then(|e| e.update)
+            .expect("the update's extras");
         assert_eq!(extras.sessions.len(), 1);
         assert_eq!(extras.sessions[0].session_id, s.id.to_string());
         assert_eq!(extras.sessions[0].refs[0].id, "#622");
