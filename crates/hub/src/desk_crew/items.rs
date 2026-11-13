@@ -608,34 +608,18 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return false;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
-                return false;
-            }
-        };
         let extras = Extras {
             item: Some(i.mention()),
             approvals,
             ..Default::default()
         };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Question, text);
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, boss, &extras)
+            .deliver_with_extras(&service, &owner, delivery, &extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping an open item's buttons failed");
+            tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
+            return false;
         }
         true
     }

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+use workforce_common::channels::desk::DeliveryKind;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Extras, MentionedQuestion, PartyKind};
@@ -216,22 +216,6 @@ impl CrewHub {
             crew::one_line(q.headline(), 400),
             e.why
         );
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await;
-        let delivered = match delivered {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting a session's question in the DM failed");
-                return;
-            }
-        };
         let extras = Extras {
             questions: vec![MentionedQuestion {
                 message_id: q.id.to_string(),
@@ -244,13 +228,12 @@ impl CrewHub {
             }],
             ..Default::default()
         };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Question, text);
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, service.agent_id.as_str(), &extras)
+            .deliver_with_extras(&service, &owner, delivery, &extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping a question card failed");
+            tracing::warn!(error = %e, "putting a session's question in the DM failed");
         }
     }
 
