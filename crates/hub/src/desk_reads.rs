@@ -2,7 +2,7 @@
 //! on the agent's own hub so every Desk of theirs agrees, and what is
 //! unread after it: counted from the transcript, newest first.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use workforce_common::channels::desk::{DeliveryKind, ReadPoint, DESK_CHANNEL};
 use workforce_common::session::SessionStore;
 use workforce_desk::{Author, ConversationRead, ConversationUnread, Cursor, Page, Speaker};
@@ -14,6 +14,11 @@ pub(crate) const UNREAD_CAP: i64 = 100;
 /// first, after `point` (or `floor`, when it is later): the agent's
 /// messages, a notice only new. `more` says older messages remain beyond
 /// the page.
+///
+/// A point is kept to the microsecond, as Postgres keeps time, and a
+/// message in the live session is stamped to the nanosecond: it is
+/// compared at the microsecond, or the message a point was set at would
+/// read as after it.
 pub(crate) fn unread_of(
     page: &Page,
     point: Option<&ReadPoint>,
@@ -27,7 +32,7 @@ pub(crate) fn unread_of(
         .collect();
     let unread: Vec<_> = theirs
         .iter()
-        .filter(|m| m.at > from)
+        .filter(|m| m.at.trunc_subsecs(6) > from)
         .rev()
         .take(UNREAD_CAP as usize)
         .collect();
@@ -36,7 +41,10 @@ pub(crate) fn unread_of(
             .as_ref()
             .is_some_and(|mark| mark.delivery == Some(DeliveryKind::Notice))
     };
-    let reached_start = page.messages.first().is_none_or(|m| m.at <= from);
+    let reached_start = page
+        .messages
+        .first()
+        .is_none_or(|m| m.at.trunc_subsecs(6) <= from);
     ConversationUnread {
         count: unread.len() as i64,
         for_you: unread.iter().filter(|m| !notice(m)).count() as i64,
@@ -106,6 +114,29 @@ mod tests {
             client_id: None,
             seq: None,
         }
+    }
+
+    /// A point is kept to the microsecond and a live message is stamped to
+    /// the nanosecond: reading through a message leaves nothing after it.
+    #[test]
+    fn a_message_is_read_by_a_point_kept_to_the_microsecond() {
+        let mut m = said("a1", Author::Agent, 1, None);
+        m.at += chrono::Duration::nanoseconds(1_234_567);
+        let page = Page {
+            messages: vec![m.clone()],
+            more: false,
+            ..Page::default()
+        };
+        let point = ReadPoint {
+            at: m.at.trunc_subsecs(6),
+            message: Some("a1".into()),
+        };
+        assert!(
+            point.at < m.at,
+            "the point is kept shorter than the message"
+        );
+        let unread = unread_of(&page, Some(&point), at(0));
+        assert_eq!((unread.count, unread.for_you), (0, 0));
     }
 
     #[test]
