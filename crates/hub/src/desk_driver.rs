@@ -77,6 +77,8 @@ pub fn register_tools(service: &AgentService) {
             service.tools.register(Arc::new(tool));
         }
     }
+    // Setting a connection up itself, in Desk's own browser.
+    crate::desk_connections::setup::register(service);
 }
 
 struct SystemAdmins(Arc<GatewayState>);

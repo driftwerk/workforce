@@ -105,6 +105,7 @@ static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
         ("SLACK_APP_TOKEN", r"xapp-[a-zA-Z0-9-]{20,}"),
         ("LINEAR_API_TOKEN", r"lin_api_[a-zA-Z0-9]{20,}"),
         ("ATLASSIAN_API_TOKEN", r"ATATT[a-zA-Z0-9_-]{20,}"),
+        ("METABASE_API_KEY", r"mb_[a-zA-Z0-9+/=_-]{20,}"),
         ("NOTION_TOKEN", r"ntn_[a-zA-Z0-9]{30,}"),
         ("NOTION_LEGACY_TOKEN", r"secret_[a-zA-Z0-9]{43}"),
         ("HUBSPOT_PAT", r"pat-(?:na1|eu1)-[a-f0-9-]{36}"),
@@ -631,6 +632,19 @@ mod tests {
         let result = redact_secrets(input);
         assert!(!result.contains("abcdefghijklmnopqrstuvwxyz"));
         assert!(result.contains("sk-ant...7890"));
+    }
+
+    #[test]
+    fn a_key_a_connection_is_set_up_with_is_caught_whatever_its_service() {
+        for key in [
+            concat!("lin_api_", "0123456789abcdefghijABCDEFGHIJ"),
+            concat!("ATATT3xFfGF0", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            concat!("mb_", "AbCdEfGhIjKlMnOpQrStUv+/0123456789="),
+            concat!("github_pat_", "11ABCDEFG0123456789_abcdefghijklmnop"),
+        ] {
+            let said = redact_secrets(&format!("Your new key is {key} — copy it now"));
+            assert!(!said.contains(key), "{key}: {said}");
+        }
     }
 
     #[test]

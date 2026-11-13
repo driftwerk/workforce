@@ -114,6 +114,20 @@ impl From<Kept> for Settings {
     }
 }
 
+/// A new key the extension read off a key page, for
+/// [`BrowserHooks::keep_key`].
+pub struct KeyRead<'a> {
+    pub user: &'a str,
+    pub agent: &'a str,
+    /// The conversation's session key.
+    pub conversation: &'a str,
+    pub connector: &'a str,
+    /// Where the extension says it read it, read in the same call.
+    pub origin: &'a str,
+    pub path: &'a str,
+    pub key: &'a str,
+}
+
 /// The hub's side.
 pub trait BrowserHooks: Send + Sync {
     /// The person's browser settings.
@@ -133,18 +147,25 @@ pub trait BrowserHooks: Send + Sync {
     fn may_visit(&self, _agent: &str, _origin: &str) -> Result<(), String> {
         Ok(())
     }
-    /// Keeps a new key `user`'s agent read off `connector`'s key page, for
-    /// the setup of `connector` running in `conversation` (its session
-    /// key), and tests it. Without such a setup running, nothing is kept.
-    /// What the test said (`passed`, or why not); `Err` says why it wasn't
-    /// kept. A hub with no connections keeps nothing.
-    fn keep_key(
+    /// The key page `user`'s `agent` may read a new key of `connector` off
+    /// in `conversation` (its session key): the page of the setup of
+    /// `connector` that conversation is running. `None` when no setup there
+    /// is waiting on a key, and nothing is read. A hub with no connections
+    /// has none.
+    fn key_page(
         &self,
         _user: &str,
+        _agent: &str,
         _conversation: &str,
         _connector: &str,
-        _key: &str,
-    ) -> Result<String, String> {
+    ) -> Option<super::keys::KeyPage> {
+        None
+    }
+    /// Holds a new key `read` says was read, for the setup [`Self::key_page`]
+    /// gave its page for. What the setup says next (`ready: …`, or what it
+    /// still needs); `Err` says why it wasn't kept. Nothing of the key is in
+    /// either. A hub with no connections keeps nothing.
+    fn keep_key(&self, _read: KeyRead<'_>) -> Result<String, String> {
         Err("This hub doesn't set up connections from the browser.".into())
     }
     /// Whether the hub's gate decides every browser call before it is made
