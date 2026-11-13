@@ -413,7 +413,7 @@ async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_it
     let (scout, _llm) = agent(dir.path(), "scout", "ok", Duration::ZERO).await;
     let sink = crate::mcp_gate::media_sinks(&scout).deliver;
     let person = uuid::Uuid::new_v4().to_string();
-    let dm = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+    let dm = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
     let conversation = scout
         .sessions
         .get_or_create(DESK_CHANNEL, &person, "scout")
@@ -534,7 +534,12 @@ async fn a_file_a_workflow_run_delivers_into_desk_is_served_to_its_person() {
         &workforce_agent::runner::SessionContext {
             user_id: Some(alice_id.clone()),
             desk: Some(DeskScope {
-                target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+                target: DeskTarget::of_turn(
+                    &DeskPlace::Dm { thread: None },
+                    DESK_CHANNEL,
+                    None,
+                    false,
+                ),
                 attended: false,
                 relayed: false,
                 owner: alice_id.clone(),
@@ -1508,7 +1513,7 @@ async fn a_file_uploaded_to_desk_is_delivered_into_the_conversation() {
     let (scout, _llm) = agent(dir.path(), "scout", "ok", Duration::ZERO).await;
     let person = uuid::Uuid::new_v4().to_string();
     let scope = DeskScope {
-        target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+        target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
         attended: true,
         relayed: false,
         owner: person.clone(),

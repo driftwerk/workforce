@@ -20,8 +20,8 @@ use workforce_common::session::{
 };
 use workforce_desk::attachments::{Attachment, MAX_PER_MESSAGE};
 use workforce_desk::{
-    Active, Author, Close, Closed, ConversationError, ConversationRead, Conversations, Cursor,
-    Match, Matches, Page, PutRead, Said, Speaker,
+    Active, Author, Close, Closed, ConversationError, ConversationRead, Conversations, Copied,
+    CopyToChat, Cursor, Match, Matches, Page, PutRead, Said, Speaker, Thread, Threads,
 };
 
 use crate::desk_surface::shown;
@@ -596,6 +596,144 @@ pub fn router(state: Arc<GatewayState>) -> axum::Router {
     workforce_desk::conversations::router(Arc::new(HubConversations(state)))
 }
 
+/// The most threads one listing holds: the ones with the newest replies.
+const THREADS_MAX: usize = 200;
+
+/// The threads on messages of `owner`'s DM with `service`'s agent: each
+/// thread's conversation is a session of its own on its channel.
+fn threads_of(
+    store: &dyn SessionStore,
+    speaker: &Speaker,
+    owner: &str,
+    running: impl Fn(&str) -> bool,
+) -> Result<Threads, ConversationError> {
+    let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
+    let mut heads: Vec<Session> = store
+        .list_for_owner(owner, 10_000)
+        .map_err(internal)?
+        .into_iter()
+        .filter(|s| !s.is_sealed() && workforce_core::desk::dm_thread_parent(&s.channel).is_some())
+        .collect();
+    heads.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    // A thread is on a message of the DM: one whose parent the DM doesn't
+    // hold is no thread of it.
+    let dm = store.find(DESK_CHANNEL, owner).map_err(internal)?;
+    let mut held = Vec::new();
+    for head in heads {
+        let parent = workforce_core::desk::dm_thread_parent(&head.channel).unwrap_or_default();
+        let on_a_message = match &dm {
+            Some(dm) => crate::desk_surface::message_in_chain(store, &dm.id, parent)
+                .map_err(internal)?
+                .is_some(),
+            None => false,
+        };
+        if on_a_message {
+            held.push(head);
+        }
+        if held.len() == THREADS_MAX {
+            break;
+        }
+    }
+    let heads = held;
+    let mut threads = Vec::new();
+    for head in heads {
+        let Some(parent) = workforce_core::desk::dm_thread_parent(&head.channel) else {
+            continue;
+        };
+        let (page, _) = read(
+            store,
+            speaker,
+            owner,
+            &head.channel,
+            Cursor::Newest,
+            workforce_desk::conversations::PAGE_MAX,
+        )?;
+        let Some(last) = page.messages.last() else {
+            continue;
+        };
+        let mut authors = Vec::new();
+        for said in &page.messages {
+            if !authors.contains(&said.from) {
+                authors.push(said.from);
+            }
+        }
+        threads.push(Thread {
+            parent: parent.to_string(),
+            replies: page.messages.len(),
+            last_at: last.at,
+            authors,
+            working: running(&head.id),
+        });
+    }
+    threads.sort_by_key(|t| std::cmp::Reverse(t.last_at));
+    Ok(Threads { threads })
+}
+
+/// Appends the person's reply in a thread to their DM, in its transcript and
+/// its context, marked as the thread's and as a copy. No turn runs for it.
+/// Refused when the DM has no such message to be a thread of, or can't be
+/// written.
+fn copy_to_dm(
+    store: &dyn SessionStore,
+    agent_id: &str,
+    owner: &str,
+    copy: CopyToChat,
+) -> Result<Copied, ConversationError> {
+    let unwritable = |e: eyre::Report| ConversationError::Unavailable(format!("{e:#}"));
+    if workforce_core::desk::dm_thread_parent(&workforce_core::desk::dm_thread_channel(
+        &copy.thread_of,
+    ))
+    .is_none()
+    {
+        return Err(ConversationError::Invalid(
+            "a thread is on a message of the conversation, named by its id".into(),
+        ));
+    }
+    let head = store
+        .find(DESK_CHANNEL, owner)
+        .map_err(unwritable)?
+        .ok_or_else(|| {
+            ConversationError::NotFound("no such message in your conversation".into())
+        })?;
+    if crate::desk_surface::message_in_chain(store, &head.id, &copy.thread_of)
+        .map_err(unwritable)?
+        .is_none()
+    {
+        return Err(ConversationError::NotFound(
+            "no such message in your conversation".into(),
+        ));
+    }
+    let text = copy.text.trim().to_string();
+    let message = workforce_common::session::SessionMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: MessageRole::User,
+        tokens: workforce_common::session::estimate_tokens(&text),
+        content: text,
+        tool_data: None,
+        timestamp: Utc::now(),
+        external_id: None,
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: Some(workforce_core::desk::DeskMark {
+            speaker: Some(workforce_core::desk::DeskSpeaker::Person),
+            thread_of: Some(copy.thread_of),
+            thread_copy: true,
+            ..Default::default()
+        }),
+    };
+    let session_id = crate::desk_surface::save_on_head(
+        store,
+        || store.get_or_create(DESK_CHANNEL, owner, agent_id),
+        &message,
+    )
+    .map_err(unwritable)?;
+    if let Err(e) = store.append_to_archive(&session_id, &message) {
+        tracing::warn!(%session_id, error = %e, "archiving a thread reply copied to the DM");
+    }
+    Ok(Copied { id: message.id })
+}
+
 /// How many of a person's sessions with one agent are looked through for
 /// the Desk conversations that changed.
 const ACTIVE_SEARCHED: usize = 1_000;
@@ -778,6 +916,40 @@ impl Conversations for HubConversations {
         )
     }
 
+    async fn threads(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+    ) -> Result<Threads, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        let speaker = Speaker::agent(
+            agent,
+            &service.display_name().unwrap_or_else(|| agent.to_string()),
+        );
+        threads_of(service.sessions.as_ref(), &speaker, &owner, |session| {
+            service.live_turns.running(session)
+        })
+    }
+
+    async fn copy_to_chat(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        copy: CopyToChat,
+    ) -> Result<Copied, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        copy_to_dm(
+            service.sessions.as_ref(),
+            service.agent_id.as_str(),
+            &owner,
+            copy,
+        )
+    }
+
     /// The point is the caller's own, so no one moves another's; every
     /// other Desk of theirs is told it moved.
     async fn put_read(
@@ -925,6 +1097,89 @@ mod tests {
     use super::*;
 
     use workforce_common::session::{InMemorySessionStore, JsonlSessionStore, SessionMessage};
+
+    #[test]
+    fn a_dms_threads_are_listed_with_their_replies_and_a_reply_is_copied_to_the_dm() {
+        let store = InMemorySessionStore::new();
+        let mut dm = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+        dm.add_user_message("what shall we ship?", None);
+        let parent = dm.messages[0].id.clone();
+        store.save(&dm).unwrap();
+        store.append_to_archive(&dm.id, &dm.messages[0]).unwrap();
+        let channel = workforce_core::desk::dm_thread_channel(&parent);
+        let mut thread = store.get_or_create(&channel, ME, "scout").unwrap();
+        thread.add_user_message("the first one", None);
+        thread.add_assistant_message("done", 1);
+        store.save(&thread).unwrap();
+        for m in &thread.messages {
+            store.append_to_archive(&thread.id, m).unwrap();
+        }
+        // A thread on no message of the DM is none; nor are another person's,
+        // or a room.
+        let stray = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+        let mut stray = store.get_or_create(&stray, ME, "scout").unwrap();
+        stray.add_user_message("on nothing", None);
+        store.save(&stray).unwrap();
+        store
+            .append_to_archive(&stray.id, &stray.messages[0])
+            .unwrap();
+        let mut theirs = store
+            .get_or_create(&channel, "identity-2", "scout")
+            .unwrap();
+        theirs.add_user_message("mine", None);
+        store.save(&theirs).unwrap();
+        store.get_or_create("desk:planning", ME, "scout").unwrap();
+
+        let running = |id: &str| id == thread.id;
+        let listed = threads_of(&store, &scout(), ME, running).unwrap();
+        assert_eq!(listed.threads.len(), 1);
+        let one = &listed.threads[0];
+        assert_eq!(
+            (one.parent.as_str(), one.replies, one.working),
+            (parent.as_str(), 2, true)
+        );
+        assert_eq!(one.authors, [Author::User, Author::Agent]);
+        assert!(!threads_of(&store, &scout(), ME, |_| false).unwrap().threads[0].working);
+
+        let copied = copy_to_dm(
+            &store,
+            "scout",
+            ME,
+            CopyToChat {
+                text: " the first one ".into(),
+                thread_of: parent.clone(),
+            },
+        )
+        .unwrap();
+        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 10).unwrap();
+        let copy = read.messages.iter().find(|m| m.id == copied.id).unwrap();
+        assert_eq!(
+            (copy.text.as_str(), copy.from),
+            ("the first one", Author::User)
+        );
+        let mark = copy.mark.clone().unwrap();
+        assert_eq!(mark.thread_of.as_deref(), Some(parent.as_str()));
+        assert!(mark.thread_copy);
+        // It's in the DM's context too, and started no turn.
+        let head = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        assert!(head.messages.iter().any(|m| m.id == copied.id));
+        // The thread's own conversation is untouched.
+        let own = page(&store, &scout(), ME, &channel, Cursor::Newest, 10).unwrap();
+        assert_eq!(own.messages.len(), 2);
+
+        for thread_of in ["not-an-id", "7a8b4c1e-0000-4000-8000-000000000000"] {
+            let refused = copy_to_dm(
+                &store,
+                "scout",
+                ME,
+                CopyToChat {
+                    text: "x".into(),
+                    thread_of: thread_of.into(),
+                },
+            );
+            assert!(refused.is_err(), "{thread_of}");
+        }
+    }
 
     const ME: &str = "identity-1";
 

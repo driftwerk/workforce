@@ -1116,7 +1116,7 @@ mod tests {
     fn in_desk<T>(f: impl FnOnce() -> T) -> T {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended: true,
             relayed: false,
             owner: "sarah".into(),

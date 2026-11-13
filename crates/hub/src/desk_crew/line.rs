@@ -188,7 +188,8 @@ impl CrewHub {
             crew::one_line(q.headline(), 400),
             e.why
         );
-        let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         let delivered = crate::desk_surface::deliver(
             &service,
             &owner,
@@ -245,7 +246,8 @@ impl CrewHub {
                 |q| crew::one_line(q.headline(), 120)
             )
         );
-        let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         if let Err(e) = crate::desk_surface::deliver(
             &service,
             &owner,

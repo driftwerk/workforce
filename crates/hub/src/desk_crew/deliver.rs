@@ -96,7 +96,7 @@ impl CrewHub {
         let _wake = crate::desk_browser::CrewWake::begin(&sid);
         let _ = tx.send(BroadcastMessage::new(sid.clone(), "typing", String::new()));
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
             owner: owner.to_string(),
             attended: in_dm,
             relayed: true,

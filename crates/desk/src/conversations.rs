@@ -239,6 +239,38 @@ pub struct Deleted {
     pub forgot: Vec<String>,
 }
 
+/// One thread on a message of the DM: its parent's id, how many replies it
+/// holds, when the last came, who has replied, and whether the agent is
+/// answering in it now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Thread {
+    pub parent: String,
+    pub replies: usize,
+    pub last_at: DateTime<Utc>,
+    pub authors: Vec<Author>,
+    pub working: bool,
+}
+
+/// The threads of the DM, the one with the newest reply first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Threads {
+    pub threads: Vec<Thread>,
+}
+
+/// A reply in a thread, also sent to the DM: its text, and the id of the DM
+/// message the thread is on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CopyToChat {
+    pub text: String,
+    pub thread_of: String,
+}
+
+/// The copy of a reply in the DM: the id it has there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Copied {
+    pub id: String,
+}
+
 /// A page of the conversation, oldest first; `more` when messages remain
 /// beyond it in the direction it was read. A page around a message reads
 /// both ways: `more` when older ones remain, `more_after` when newer ones do.
@@ -383,6 +415,32 @@ pub trait Conversations: Send + Sync {
     ) -> Result<Deleted, ConversationError> {
         Err(ConversationError::Unavailable(
             "messages can't be deleted here yet".into(),
+        ))
+    }
+
+    /// The threads on messages of the caller's DM with `agent`.
+    async fn threads(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+    ) -> Result<Threads, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "this hub does not keep threads in a DM".into(),
+        ))
+    }
+
+    /// Appends the caller's reply in a thread of their DM with `agent` to the
+    /// DM itself, marked as the thread's, and starts no turn there.
+    async fn copy_to_chat(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+        _copy: CopyToChat,
+    ) -> Result<Copied, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "this hub does not keep threads in a DM".into(),
         ))
     }
 
@@ -568,12 +626,52 @@ async fn delete_message(
         .into_response()
 }
 
+async fn threads(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path(agent): Path<String>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    c.threads(&headers, q.token.as_deref(), &agent)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn copy_to_chat(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path(agent): Path<String>,
+    Query(q): Query<TokenQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let copy = match serde_json::from_slice::<CopyToChat>(&body) {
+        Ok(copy) => copy,
+        Err(e) => {
+            return ConversationError::Invalid(format!("the body is not a reply to copy: {e}"))
+                .into_response()
+        }
+    };
+    if copy.text.trim().is_empty() {
+        return ConversationError::Invalid("a reply needs words to copy".into()).into_response();
+    }
+    c.copy_to_chat(&headers, q.token.as_deref(), &agent, copy)
+        .await
+        .map(Json)
+        .into_response()
+}
+
 /// The Desk conversation routes on `conversations`.
 pub fn router(conversations: Arc<dyn Conversations>) -> Router {
     Router::new()
         .route("/api/desk/conversations", get(active))
         .route("/api/desk/conversations/{agent}", get(conversation))
         .route("/api/desk/conversations/{agent}/search", get(search))
+        .route("/api/desk/conversations/{agent}/threads", get(threads))
+        .route(
+            "/api/desk/conversations/{agent}/messages",
+            post(copy_to_chat),
+        )
         .route("/api/desk/conversations/{agent}/close", post(close))
         .route(
             "/api/desk/conversations/{agent}/read",
@@ -610,6 +708,8 @@ mod tests {
         Search(String, String, Option<String>, usize),
         Memories(String, String),
         Delete(String, String, Delete),
+        Threads(String),
+        Copy(String, String, String),
     }
 
     /// Answers fixed values, and remembers what it was asked.
@@ -718,6 +818,40 @@ mod tests {
                 id: "mem-1".into(),
                 text: "Likes pineapple".into(),
             }])
+        }
+
+        async fn threads(
+            &self,
+            headers: &HeaderMap,
+            token: Option<&str>,
+            agent: &str,
+        ) -> Result<Threads, ConversationError> {
+            self.check(headers, token)?;
+            self.0.lock().unwrap().push(Ask::Threads(agent.into()));
+            Ok(Threads {
+                threads: vec![Thread {
+                    parent: "m1".into(),
+                    replies: 3,
+                    last_at: "2026-10-28T09:00:00Z".parse().unwrap(),
+                    authors: vec![Author::User, Author::Agent],
+                    working: true,
+                }],
+            })
+        }
+
+        async fn copy_to_chat(
+            &self,
+            headers: &HeaderMap,
+            token: Option<&str>,
+            agent: &str,
+            copy: CopyToChat,
+        ) -> Result<Copied, ConversationError> {
+            self.check(headers, token)?;
+            self.0
+                .lock()
+                .unwrap()
+                .push(Ask::Copy(agent.into(), copy.text, copy.thread_of));
+            Ok(Copied { id: "c1".into() })
         }
 
         async fn delete_message(
@@ -954,6 +1088,53 @@ mod tests {
         }
         let (status, _) = get(asked, "/api/desk/conversations/scout/search?q=x", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn threads_are_listed_and_a_reply_is_copied_to_the_chat() {
+        let asked = Arc::new(Asked::default());
+        let (status, body) = get(
+            Arc::clone(&asked),
+            "/api/desk/conversations/scout/threads",
+            Some("Bearer device-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"threads": [{
+                "parent": "m1", "replies": 3, "last_at": "2026-10-28T09:00:00Z",
+                "authors": ["user", "agent"], "working": true,
+            }]})
+        );
+        assert_eq!(asked.last(), Ask::Threads("scout".into()));
+        let (status, _) = get(
+            Arc::clone(&asked),
+            "/api/desk/conversations/scout/threads",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let post = |body: &'static str| {
+            let request = Request::post("/api/desk/conversations/scout/messages".to_string())
+                .header("authorization", "Bearer device-token")
+                .header("content-type", "application/json");
+            call(Arc::clone(&asked), request, Body::from(body))
+        };
+        let (status, body) = post(r#"{"text": "yes, that one", "thread_of": "m1"}"#).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"id": "c1"})));
+        assert_eq!(
+            asked.last(),
+            Ask::Copy("scout".into(), "yes, that one".into(), "m1".into())
+        );
+        for bad in [
+            "{nope",
+            r#"{"text": "  ", "thread_of": "m1"}"#,
+            r#"{"text": "x"}"#,
+        ] {
+            let (status, _) = post(bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]

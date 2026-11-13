@@ -218,7 +218,7 @@ mod tests {
             session_id: "s1".into(),
             message_id: "m1".into(),
             kind: DeliveryKind::Job,
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             spoken: false,
         }
     }

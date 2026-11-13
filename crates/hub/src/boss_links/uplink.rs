@@ -216,6 +216,21 @@ impl From<Rechecked> for String {
 /// are dropped before any check, and nothing is counted against it.
 pub const EVENTS_PER_MINUTE: u32 = 30;
 
+/// The most `ask` frames one link is taken a minute; the rest are dropped
+/// before any check (the engine sends an open ask again on its next socket).
+pub const ASKS_PER_MINUTE: u32 = 30;
+
+/// Whether `link` is past `most` this minute in `seen`, counting this one.
+fn past_share(seen: &mut HashMap<Uuid, (Instant, u32)>, link: Uuid, most: u32) -> bool {
+    let now = Instant::now();
+    let (since, n) = seen.entry(link).or_insert((now, 0));
+    if now.duration_since(*since) >= Duration::from_secs(60) {
+        (*since, *n) = (now, 0);
+    }
+    *n += 1;
+    *n > most
+}
+
 /// The most wakes of one link waiting to be gathered at once: one link's
 /// flood never takes another's place.
 pub const WAKES_WAITING_PER_LINK: usize = 8;
@@ -241,6 +256,13 @@ impl Drop for Unproved {
 }
 
 impl Uplinks {
+    /// Sends `frame` down whichever socket carries `link` now; false when
+    /// none does or its queue is full.
+    pub(crate) fn notify_link(&self, link: Uuid, frame: Value) -> bool {
+        let socket = self.links.lock().get(&link).cloned();
+        socket.is_some_and(|s| s.links.lock().contains_key(&link) && s.notify(frame))
+    }
+
     /// A place for one more socket of token `token_id` from `address` to
     /// prove itself, unless either has as many open as it may.
     fn unproved(
@@ -839,6 +861,7 @@ async fn run(
     let mut unanswered = 0u32;
     // Each link's events this minute: (since, how many).
     let mut events: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let mut asks: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut bad = 0u32;
     loop {
         if bad > MAX_BAD_FRAMES {
@@ -892,13 +915,7 @@ async fn run(
                             continue;
                         }
                         // Past its minute's share: dropped before any check.
-                        let now = Instant::now();
-                        let (since, n) = events.entry(link).or_insert((now, 0));
-                        if now.duration_since(*since) >= Duration::from_secs(60) {
-                            (*since, *n) = (now, 0);
-                        }
-                        *n += 1;
-                        if *n > EVENTS_PER_MINUTE {
+                        if past_share(&mut events, link, EVENTS_PER_MINUTE) {
                             continue;
                         }
                         let live = match uplinks.recheck(&state, &socket, link).await {
@@ -915,9 +932,49 @@ async fn run(
                             None => bad += 1,
                         }
                     }
-                    // Frames of later versions (asks_open, catch_up, …) are
-                    // RB7's: not counted against it.
-                    Some("asks_open" | "catch_up" | "ask" | "ask_closed") => {}
+                    // What a link's sessions ask its person, and what came
+                    // of it: bound to the link this socket proved and still
+                    // holds, checked again, and kept for the link's person
+                    // and agent whatever the frame says.
+                    Some(kind @ ("ask" | "ask_closed" | "decision_refused")) => {
+                        let Some(link) = frame["linkId"].as_str().and_then(|l| l.parse::<Uuid>().ok()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        if !socket.links.lock().contains_key(&link) {
+                            bad += 1;
+                            continue;
+                        }
+                        if past_share(&mut asks, link, ASKS_PER_MINUTE) {
+                            continue;
+                        }
+                        let live = match uplinks.recheck(&state, &socket, link).await {
+                            Ok(live) => live,
+                            Err(r) if r.unavailable => continue,
+                            Err(_) => {
+                                bad += 1;
+                                continue;
+                            }
+                        };
+                        if kind == "ask" {
+                            if super::asks::Asked::of(&frame, chrono::Utc::now()).is_none() {
+                                bad += 1;
+                                continue;
+                            }
+                            let (state, hub) = (Arc::clone(&state), hub.clone());
+                            tokio::spawn(async move {
+                                let _ = super::asks::asked(&state, &live, &frame, &hub).await;
+                            });
+                        } else {
+                            let state = Arc::clone(&state);
+                            tokio::spawn(async move {
+                                super::asks::closed(&state, &live, &frame).await;
+                            });
+                        }
+                    }
+                    // Frames of later versions (asks_open, catch_up, …):
+                    // not counted against it.
+                    Some("asks_open" | "catch_up") => {}
                     _ => bad += 1,
                 }
             }
@@ -1037,7 +1094,7 @@ fn handshake(
         })
         .collect();
     let ready = json!({"type": "ready", "links": links, "refused": refused,
-                       "engine": hello.engine.name});
+                       "engine": hello.engine.name, "features": ["asks"]});
     let _ = socket.tx.try_send(Message::Text(ready.to_string().into()));
     Ok(accepted)
 }

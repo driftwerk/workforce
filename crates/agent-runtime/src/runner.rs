@@ -7749,7 +7749,7 @@ mod tests {
     async fn a_run_scoped_to_no_desk_conversation_answers_to_none_its_caller_does() {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             owner: "person-1".into(),
             attended: true,
             relayed: false,
@@ -8524,7 +8524,7 @@ mod tests {
             // Desk conversation the turn answers to.
             desk: Some(workforce_common::channels::desk::DeskScope {
                 target: workforce_common::channels::desk::DeskTarget {
-                    place: workforce_common::channels::desk::DeskPlace::Dm,
+                    place: workforce_common::channels::desk::DeskPlace::Dm { thread: None },
                     channel: "desk".into(),
                     device: None,
                     spoken: false,
