@@ -650,7 +650,8 @@ impl Desk {
     /// Whether `id`'s open request `approval` would read or change an
     /// agent's own settings (its config, where its budget and limits are),
     /// as far as Desk can tell: a file it names, or a command that names
-    /// one of those files' folders. What Desk can't read counts as not.
+    /// one of those files' folders. What Desk can't read counts as not;
+    /// not knowing where home is yet, everything counts.
     fn touches_agent_settings(&self, id: Uuid, approval: Uuid) -> bool {
         let settings = self.0.state.lock().charges.agent_settings.clone();
         if settings.is_empty() {
@@ -659,8 +660,10 @@ impl Desk {
         let Some(pending) = self.pending_of(id, approval) else {
             return false;
         };
+        // Not knowing where home is, what it reads can't be told: held, as
+        // Desk allows everything else at once (`allow`).
         let Some(home) = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone()) else {
-            return false;
+            return true;
         };
         let Ok(view) = self.view(id) else {
             return false;
@@ -688,7 +691,9 @@ impl Desk {
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
     /// boss runs is acted on only by that boss, and only while it has the
-    /// wheel. Anyone else, and a session no boss runs, is the hub's rule.
+    /// wheel, unless that boss is unbound (Act fully), whom the person
+    /// driving doesn't hold. Anyone else, and a session no boss runs, is
+    /// the hub's rule.
     pub(crate) fn boss_holds(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
         let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
             return Ok(());
@@ -705,12 +710,18 @@ impl Desk {
                 "another boss runs {name}; it's theirs or the person's to act on"
             )));
         }
-        if self.wheel_of(id).is_some_and(Wheel::person) {
+        if self.wheel_of(id).is_some_and(Wheel::person) && !self.full_of(&boss.party.id).unbound {
             return Err(DeskError::Conflict(format!(
                 "the person is driving {name}, so it's theirs to act on now"
             )));
         }
         Ok(())
+    }
+
+    /// Whether `boss` is unbound now, as the hub last said: at Act fully,
+    /// in force. Desk allows what the sessions it oversees ask at once.
+    pub fn boss_unbound(&self, boss: &str) -> bool {
+        self.full_of(boss).unbound
     }
 
     /// `id`'s open request `approval`: the one it waits on, or another of

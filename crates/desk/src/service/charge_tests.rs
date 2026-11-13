@@ -192,6 +192,15 @@ async fn the_persons_hold_lasts_two_minutes_after_their_last_input_unless_the_bo
         typed(chrono::Duration::seconds(30));
         assert_eq!(d.wheel_of(s.id), Some(Wheel::Person), "still typing");
         assert!(d.boss_holds(s.id, Some(&by)).is_err());
+        // Unbound (Act fully), the person typing holds it back from nothing.
+        let unbound = crate::charge::FullGrant {
+            unbound: true,
+            ..Default::default()
+        };
+        d.set_full([("sarah".to_string(), unbound)].into());
+        assert!(d.boss_holds(s.id, Some(&by)).is_ok(), "unbound");
+        d.set_full(std::collections::HashMap::new());
+        assert!(d.boss_holds(s.id, Some(&by)).is_err());
         typed(chrono::Duration::minutes(3));
         assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss), "stopped typing");
         assert!(d.boss_holds(s.id, Some(&by)).is_ok());

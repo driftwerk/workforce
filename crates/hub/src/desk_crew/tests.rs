@@ -1801,6 +1801,8 @@ mod act_fully;
 
 mod act_fully_budget;
 
+mod allow_at_once;
+
 mod decisions;
 mod items;
 mod promises;

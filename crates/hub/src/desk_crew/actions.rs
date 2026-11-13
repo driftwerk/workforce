@@ -527,9 +527,9 @@ impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer of `o`'s scope
     /// do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
-        // Unbound, every crew action runs: Desk answers what it asks for
-        // itself (`boss_decides`), and only the hold while the person types
-        // into a session it runs waits, as a courtesy.
+        // Unbound, every crew action runs: Desk allows what its sessions
+        // ask the moment they ask (`allow`), and answers the rest as the
+        // boss says (`boss_decides`).
         // Its own limits are the person's at every level, unbound too: only
         // ever a card they approve.
         if let Action::ChangeOversight { .. } = action {
@@ -542,7 +542,10 @@ impl CrewHub {
             if let Some(held) = self.mode_hold(action, o, boss.as_deref()) {
                 return held;
             }
-            return self.unbound_gate(action, o);
+            // The person driving a session it runs holds nothing: a plain
+            // message still waits on its line while they type, as Desk
+            // delivers it.
+            return Gate::Run;
         }
         self.gate_as(action, o, boss.as_deref(), false)
     }
@@ -763,34 +766,12 @@ impl CrewHub {
         }
     }
 
-    /// [`Self::gate`] for an unbound overseer: everything runs, but what
-    /// it does to a session it runs waits while the person is driving it
-    /// (a plain message waits on its line as before).
-    fn unbound_gate(&self, action: &Action, o: &Oversight) -> Gate {
-        let boss = self.boss_id(o);
-        let charged =
-            Self::session_of(action).filter(|s| boss.as_deref().is_some_and(|b| self.runs(*s, b)));
-        if let Some(session) = charged {
-            let driving = self.desk.wheel_of(session).is_some_and(|w| w.person());
-            if driving && !matches!(action, Action::Nudge { reply_to: None, .. }) {
-                let name = self.session_name(session);
-                return Gate::Suggest(
-                    format!(
-                        "the person is driving {name}, so I've held this for them as a suggestion"
-                    )
-                    .into(),
-                );
-            }
-        }
-        Gate::Run
-    }
-
     /// Whether `by` is an overseer that is unbound now.
     pub(crate) fn by_unbound(&self, by: &By) -> bool {
         by.party.kind == crew::PartyKind::Manager
             && self
                 .overseer_named(&by.party.id)
-                .is_some_and(|(s, o)| self.unbound_given(&s, &o))
+                .is_some_and(|(s, o)| self.unbound_given(s.agent_id.as_str(), &o))
     }
 
     /// The hard limit what `action` says, or the question it answers,

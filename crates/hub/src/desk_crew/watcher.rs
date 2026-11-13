@@ -192,7 +192,7 @@ fn question_key(subject: &str, kind: &str, mark: &str) -> String {
     format!("{kind}:{subject}:{}", crew::one_line(mark, 200))
 }
 
-fn tracked(o: &Oversight, subject: &Party) -> bool {
+pub(super) fn tracked(o: &Oversight, subject: &Party) -> bool {
     match subject.kind {
         PartyKind::Agent => o.track.crew,
         PartyKind::Session => match subject.origin {
@@ -387,8 +387,17 @@ impl CrewHub {
         let wanted = match event.kind {
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
-            // Unbound, what waits on an answer wakes it at once.
-            Kind::NeedsYou => unbound,
+            // Unbound, what waits on an answer wakes it at once, unless it
+            // is a request Desk allows at once itself (`allow`).
+            Kind::NeedsYou => {
+                unbound
+                    && !subject
+                        .id
+                        .parse()
+                        .ok()
+                        .and_then(|s| self.desk.view(s).ok())
+                        .is_some_and(|v| self.answers_at_once(&v))
+            }
             _ => false,
         };
         let about = match event.kind {
@@ -638,7 +647,7 @@ impl CrewHub {
         };
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
-        let hint = match self.unbound_given(&service, &o) {
+        let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
             true => Self::boss_hint(&o),
             false => Self::level_hint(level, &o),
         };

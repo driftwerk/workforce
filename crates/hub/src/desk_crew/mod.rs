@@ -28,6 +28,7 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 mod actions;
+mod allow;
 mod board;
 pub(crate) mod context;
 mod decisions;
@@ -214,7 +215,7 @@ pub(crate) fn dm_oversight_hint(service: &AgentService) -> Option<String> {
     let crew = for_service(service)?;
     let (service, o) = crew.overseer_named(service.agent_id.as_str())?;
     let (level, _) = crew.level_now(service.agent_id.as_str(), &o);
-    let unbound = o.level != Level::Watch && crew.unbound_given(&service, &o);
+    let unbound = o.level != Level::Watch && crew.unbound_given(service.agent_id.as_str(), &o);
     Some(CrewHub::dm_hint(level, &o, unbound))
 }
 
@@ -564,6 +565,7 @@ impl CrewHub {
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(allow::allow_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
@@ -688,8 +690,8 @@ impl CrewHub {
                         workforce_desk::charge::FullGrant {
                             repos: full.repos.clone(),
                             workflows: full.workflows.clone(),
-                            anywhere: full.anywhere && self.boss_is_local(s),
-                            unbound: self.unbound_given(s, o),
+                            anywhere: full.anywhere,
+                            unbound: self.unbound_given(s.agent_id.as_str(), o),
                         },
                     ))
                 })
@@ -762,7 +764,7 @@ impl CrewHub {
     pub(crate) fn by_at_level(&self, mut by: By, o: &Oversight) -> By {
         let unbound = self
             .overseer_named(&by.party.id)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o));
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o));
         if unbound {
             by.reason = Some(match by.reason.take() {
                 Some(r) => format!("{} (unbound: no limits)", r.trim_end()),
@@ -779,27 +781,19 @@ impl CrewHub {
         by
     }
 
-    /// Whether `service`, an overseer, is an agent this hub runs. A boss
-    /// served from a grant (a remote boss) never is, and is never unbound
-    /// nor anywhere: what it does is the remote hub's to judge, not this
-    /// one's to wave through.
-    pub(crate) fn boss_is_local(&self, service: &AgentService) -> bool {
-        let id = service.agent_id.as_str();
-        !workforce_desk::grant::is_served(id)
-            && self.services().iter().any(|s| s.agent_id.as_str() == id)
-    }
-
-    /// Whether `service`, overseeing with `o`, is unbound now: it chose
-    /// it ([`Oversight::unbound`]), it is local, and Act fully is in force
-    /// (its budget, when set, isn't spent).
-    pub(crate) fn unbound_given(&self, service: &AgentService, o: &Oversight) -> bool {
-        o.unbound(self.boss_is_local(service)) && self.fully(service.agent_id.as_str(), o).is_ok()
+    /// Whether the boss `agent`, overseeing with `o`, is unbound now: it
+    /// is at Act fully ([`Oversight::unbound`]) and Act fully is in force
+    /// (its budget, when set, isn't spent; a boss served from a grant needs
+    /// one, [`fully_for`]). One check for every boss, this hub's own and
+    /// one served from a grant.
+    pub(crate) fn unbound_given(&self, agent: &str, o: &Oversight) -> bool {
+        o.unbound() && self.fully(agent, o).is_ok()
     }
 
     /// Whether the overseer of `o`'s scope is unbound now.
     pub(crate) fn unbound(&self, o: &Oversight) -> bool {
         self.overseer_for(&o.scope)
-            .is_some_and(|(s, _)| self.unbound_given(&s, o))
+            .is_some_and(|(s, _)| self.unbound_given(s.agent_id.as_str(), o))
     }
 
     /// Whether the overseer of `o`'s scope acts fully in the repository
