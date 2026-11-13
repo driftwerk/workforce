@@ -62,9 +62,9 @@ mod grants;
 mod grants_tests;
 mod groups;
 mod handoff;
-mod knows;
 #[cfg(test)]
 mod handoff_tests;
+mod knows;
 pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
 mod lifecycle;
 mod line;
