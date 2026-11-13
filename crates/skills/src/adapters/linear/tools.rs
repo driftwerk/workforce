@@ -1358,8 +1358,13 @@ impl Tool for LinearCommentListTool {
                                 name
                                 email
                             }
+                            botActor {
+                                name
+                                type
+                            }
                             createdAt
                             updatedAt
+                            editedAt
                         }
                     }
                 }

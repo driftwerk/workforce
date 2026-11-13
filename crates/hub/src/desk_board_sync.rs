@@ -55,7 +55,7 @@ use workforce_desk::board_sync::{self as sync, Remote, RemoteError, RemoteState}
 use workforce_desk::{Desk, DeskError, LinkBoard};
 use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
 
-use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
+use crate::gateway::{resolve_caller_context, AuthFailure, CallerContext, GatewayState};
 use crate::vault::Vault;
 
 /// The longest the link dialog waits on one hub when asking which offers a
@@ -875,8 +875,46 @@ pub(crate) async fn person_of(
     headers: &HeaderMap,
     token: Option<&str>,
 ) -> Result<String, Response> {
+    let caller = resolve_caller_context(&sync.state, headers, token).await;
+    holder_of(sync, &caller)
+}
+
+/// The person themselves at their own Desk, for what goes out in their own
+/// words, unprefixed: [`person_of`], asking with their own sign-in or with
+/// the Desk app on a computer paired to them
+/// ([`crate::device_link::is_desktop_device`]), never with a phone's, a
+/// voice box's or any other device's token. A token made for an agent, a
+/// session or a tool (a remote MCP or boss link token) is no sign-in here
+/// at all.
+pub(crate) async fn person_at_desk(
+    sync: &BoardSync,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<String, Response> {
+    let caller = resolve_caller_context(&sync.state, headers, token).await;
+    let person = holder_of(sync, &caller)?;
+    if let Some(device) = caller.device_id.as_deref() {
+        let store = sync.state.identity_store.as_ref();
+        let at_desk = store.is_some_and(|store| {
+            crate::device_link::is_desktop_device(store.as_ref(), device)
+                && crate::device_link::identity_for_device(store.as_ref(), device).as_deref()
+                    == Some(person.as_str())
+        });
+        if !at_desk {
+            return Err(refusal(
+                StatusCode::FORBIDDEN,
+                "Only you, at Desk on your computer, post in your own words: not a paired phone or other device",
+            ));
+        }
+    }
+    Ok(person)
+}
+
+/// The person `caller` is, holding `sync`'s hub. The refusal is the
+/// answer, as [`person_of`]'s is.
+#[allow(clippy::result_large_err)]
+fn holder_of(sync: &BoardSync, caller: &CallerContext) -> Result<String, Response> {
     let state = &sync.state;
-    let caller = resolve_caller_context(state, headers, token).await;
     match caller.auth_failure {
         Some(AuthFailure::InvalidCredentials) => {
             return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
@@ -889,7 +927,7 @@ pub(crate) async fn person_of(
         }
         None => {}
     }
-    let Some(person) = caller.identity_id else {
+    let Some(person) = caller.identity_id.clone() else {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "A board's sync is a person's: ask as yourself, not as the hub",

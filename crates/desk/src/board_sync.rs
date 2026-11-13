@@ -1237,6 +1237,7 @@ pub fn details_of(
         project: issue.project.clone(),
         due: issue.due,
         read_at: was.and_then(|d| d.read_at),
+        comments_at: was.and_then(|d| d.comments_at),
         facts,
     }
 }
