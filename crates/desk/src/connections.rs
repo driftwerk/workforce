@@ -192,7 +192,8 @@ impl DeskStore {
 
     /// Moves a connection's checks to another instance: a flat connection
     /// becoming a named one keeps what its last check found. A check
-    /// already kept there stays.
+    /// already kept there stays, and the one moved from goes either way, so
+    /// a later connection at `from` never inherits it.
     pub async fn move_connection(
         &self,
         connector: &str,
@@ -218,6 +219,14 @@ impl DeskStore {
                     &from,
                     &to,
                 ],
+            )
+            .await?;
+        client
+            .execute(
+                "DELETE FROM connections
+                 WHERE connector = $1 AND level = $2 AND agent = $3 AND person = $4
+                   AND instance = $5",
+                &[&connector, &level.as_str(), &level.agent(), &person, &from],
             )
             .await?;
         Ok(())
@@ -323,7 +332,8 @@ mod tests {
             assert_eq!(rows[1].status, Status::Failing);
 
             // A flat connection's check moves with it to its instance, and
-            // never over one kept there.
+            // never over one kept there: then it goes, and the one there
+            // stays.
             let flat = check(
                 "linear",
                 Level::All,
@@ -344,16 +354,13 @@ mod tests {
                 .iter()
                 .map(|r| (r.connector.as_str(), r.instance.as_str()))
                 .collect();
-            assert_eq!(
-                names,
-                [("jira", "acme"), ("jira", "globex"), ("linear", "acme")]
-            );
+            assert_eq!(names, [("jira", "globex"), ("linear", "acme")]);
 
             store
                 .drop_connection("jira", &Level::All, "globex", "sarah")
                 .await
                 .unwrap();
-            assert_eq!(store.connections("sarah").await.unwrap().len(), 2);
+            assert_eq!(store.connections("sarah").await.unwrap().len(), 1);
         })
         .await;
     }
