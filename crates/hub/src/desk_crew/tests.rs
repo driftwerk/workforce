@@ -3546,6 +3546,107 @@ async fn a_status_question_waits_for_the_turn_and_for_the_person_at_the_wheel() 
     .await;
 }
 
+/// The boss is given the same block of its crew's accounts and its own
+/// recent posts in its DM and on a session's line (where its line and work
+/// turns run); the posts are read from the DM's archive, so a rollover
+/// loses none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_turn_of_the_boss_is_given_the_same_block_and_its_posts_survive_a_rollover() {
+    use super::context;
+    const PURPOSE: &str = "Fix the login page so people can sign in again.";
+    const POST: &str = "The login fix is in review; I'll say when CI is green.";
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let mut account = workforce_desk::account::Account::new(s.id, "", chrono::Utc::now());
+        account.purpose = PURPOSE.into();
+        account.now = "Waiting for CI on the fix.".into();
+        d.store().session_account_put(&account).await.unwrap();
+        // The boss told the person something, then its DM rolled over.
+        let mut dm = overseer
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "desk")
+            .unwrap();
+        dm.add_user_message("How is the login fix going?", None);
+        dm.add_assistant_message(POST, 9);
+        overseer.sessions.save(&dm).unwrap();
+        for m in &dm.messages {
+            overseer.sessions.append_to_archive(&dm.id, m).unwrap();
+        }
+        workforce_agent::rollover::seal_and_mint(overseer.sessions.as_ref(), &mut dm, 0).unwrap();
+        let in_dm = context::block(&overseer, DESK_CHANNEL, PERSON)
+            .await
+            .expect("a block in the DM");
+        let on_line = context::block(&overseer, &super::line::line_channel(s.id), PERSON)
+            .await
+            .expect("a block on the line");
+        for (turn, block) in [("dm", &in_dm), ("line", &on_line)] {
+            assert!(block.contains(PURPOSE), "{turn}: {block}");
+            assert!(
+                block.contains(POST),
+                "{turn}: the post survives the rollover: {block}"
+            );
+            assert!(
+                block.contains("<<<EXTERNAL_UNTRUSTED_CONTENT_"),
+                "{turn}: fenced as data"
+            );
+        }
+        assert!(
+            on_line.contains("The session this turn is about, acme-web"),
+            "{on_line}"
+        );
+        assert!(!in_dm.contains("The session this turn is about"));
+        // And the model is given it: a DM turn, and a turn on the line as
+        // line and work turns run.
+        crew.run_dm_turn(
+            &overseer,
+            PERSON,
+            "desk asks: how is it going?",
+            1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        crew.run_turn(
+            &overseer,
+            PERSON,
+            &super::line::line_channel(s.id),
+            "acme-web finished its turn.",
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let asked: Vec<String> = llm
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let with = asked
+            .iter()
+            .filter(|b| b.contains("Fix the login page so people can sign in again"))
+            .count();
+        assert!(
+            with >= 2,
+            "both turns are given the block ({with} of {})",
+            asked.len()
+        );
+    })
+    .await;
+}
+
 /// Set to take on every session, at `act`, the overseer takes one on as
 /// it appears, and never one the person took back.
 #[tokio::test(flavor = "multi_thread")]

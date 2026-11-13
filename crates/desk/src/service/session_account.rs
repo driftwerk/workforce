@@ -184,6 +184,11 @@ impl Desk {
         Ok(self.0.store.session_account(id).await?)
     }
 
+    /// The accounts kept of sessions `ids`.
+    pub async fn session_accounts_of(&self, ids: &[Uuid]) -> Result<Vec<Account>, DeskError> {
+        Ok(self.0.store.session_accounts(ids).await?)
+    }
+
     /// Session `id`'s account for a reader (the boss, before it says
     /// anything of it): refreshed first when it is stale (older than
     /// [`account::FRESH_FOR`] while it works, or a turn ended since it was
