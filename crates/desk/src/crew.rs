@@ -481,6 +481,9 @@ pub struct ManagerView {
     /// Groups closed to everyone but the person: named for a boss that
     /// oversees nothing now, so neither it nor the main overseer sees them.
     pub sealed: Vec<String>,
+    /// What the main overseer handled today: the Floor's "handled N of M".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// A sidebar group's boss, as Desk shows it on the group and its row.
@@ -492,6 +495,9 @@ pub struct GroupBoss {
     pub group: String,
     /// `watch`, `suggest` or `act`.
     pub level: String,
+    /// What it handled today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// The overseer as the desk needs it.

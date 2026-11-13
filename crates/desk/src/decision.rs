@@ -248,6 +248,7 @@ pub struct DecisionLine {
 /// got to first, of `decisions`: what "handled 23 of 25 myself" is
 /// counted from. Choices and the turns it let wait are not needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Handled {
     pub own: usize,
     pub preference: usize,

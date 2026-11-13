@@ -111,24 +111,38 @@ async fn manager(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Resp
         return r;
     }
     let o = s.crew.overseer();
-    let bosses = s
-        .desk
-        .bosses()
-        .into_iter()
-        .filter_map(|b| {
-            Some(GroupBoss {
-                group: b.scope.group()?.to_string(),
-                agent_id: b.agent,
-                name: b.name,
-                level: b.level,
-            })
-        })
-        .collect();
+    let today = s.crew.midnight();
+    // Today's counts: a boss whose log can't be read shows none.
+    let handled = async |boss: &str| match s.desk.store().decisions_handled(boss, today).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::info!(error = %format!("{e:#}"), "a boss's handled counts couldn't be read");
+            None
+        }
+    };
+    let mut bosses = Vec::new();
+    for b in s.desk.bosses() {
+        let Some(group) = b.scope.group().map(str::to_string) else {
+            continue;
+        };
+        bosses.push(GroupBoss {
+            handled: handled(&b.agent).await,
+            group,
+            agent_id: b.agent,
+            name: b.name,
+            level: b.level,
+        });
+    }
+    let main = match &o {
+        Some(o) => handled(&o.id).await,
+        None => None,
+    };
     Json(ManagerView {
         agent_id: o.as_ref().map(|o| o.id.clone()),
         level: o.map(|o| o.level),
         bosses,
         sealed: s.desk.sealed(),
+        handled: main,
     })
     .into_response()
 }
@@ -1180,13 +1194,33 @@ mod tests {
             .unwrap();
             d.bound_groups(["g-acme".to_string(), "g-globex".to_string()])
                 .await;
+            use crate::decision::{BossDecision, How, Need};
+            for (boss, need, how) in [
+                ("desk", Need::Approval, How::Own),
+                ("desk", Need::Question, How::Preference),
+                ("desk", Need::Choice, How::Own),
+                ("sarah", Need::Stall, How::Escalated),
+            ] {
+                d.store()
+                    .decision_put(&BossDecision::new(boss, need, "did it", "because", how))
+                    .await
+                    .unwrap();
+            }
             let (status, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(m["agentId"], "desk");
             assert_eq!(m["sealed"], json!(["g-globex"]));
+            // Today's counts on each boss's row: needs only, not choices.
+            assert_eq!(
+                m["handled"],
+                json!({"own": 1, "preference": 1, "escalated": 0, "personFirst": 0})
+            );
             assert_eq!(
                 m["bosses"],
-                json!([{"agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act"}])
+                json!([{
+                    "agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act",
+                    "handled": {"own": 0, "preference": 0, "escalated": 1, "personFirst": 0},
+                }])
             );
         })
         .await;
