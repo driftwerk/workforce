@@ -503,7 +503,9 @@ const LOCK_STALE: Duration = Duration::from_secs(20);
 /// How many times a change is made again when the file changed under it.
 const TRIES: usize = 5;
 /// One per config Desk changes, held while it changes it: its changes to
-/// one file, from any thread, are made one after another.
+/// one file, from any thread, are made one after another. A queue has no
+/// limit of its own: each in it still waits at most [`LOCK_WAIT`] for the
+/// CLI, so N at once behind a CLI's lock wait up to N times that.
 static UPDATING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -555,7 +557,8 @@ fn update(
     }
     // Desk's own changes queue here, one at a time, so the lock's wait is
     // only ever for the CLI: never one of Desk's timing out behind its own.
-    let queue = updating(&target);
+    // By the file's real path, however it is named.
+    let queue = updating(&fs::canonicalize(&target).unwrap_or_else(|_| target.clone()));
     let _ours = queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
