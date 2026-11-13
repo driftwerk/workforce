@@ -1090,7 +1090,31 @@ async fn a_persons_and_a_shared_flat_connection_both_show() {
     let h = hub().await;
     h.global.set(&mine("skills/linear/api_key"), GOOD).unwrap();
     h.global.set("skills/linear/api_key", GOOD2).unwrap();
+    // The level's one check was of the person's own, which stays `default`.
+    h.kept
+        .put(
+            &Checked {
+                connector: "linear".into(),
+                level: Level::All,
+                instance: DEFAULT_INSTANCE.into(),
+                person: SARAH.into(),
+                account: Some("sarah".into()),
+                status: Status::Connected,
+                detail: None,
+                connected_at: Utc::now(),
+                checked_at: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
     let list = h.c.list(SARAH).await;
+    let linear = connector(&list, "linear");
+    assert_eq!(linear.connections[0].account.as_deref(), Some("sarah"));
+    assert_eq!(
+        linear.connections[1].account, None,
+        "the shared one beside it never takes the person's check"
+    );
     let ids: Vec<(String, VaultSource)> = connector(&list, "linear")
         .connections
         .iter()
@@ -1133,18 +1157,37 @@ async fn a_new_connection_moves_a_flat_one_first_so_neither_is_hidden() {
 }
 
 #[tokio::test]
-async fn a_flat_github_moves_to_the_owner_it_reached() {
-    let mut h = hub().await;
-    Arc::get_mut(&mut h.c).unwrap().github_owner = Some("Acme".into());
+async fn a_flat_github_moves_to_default_and_still_reaches_every_owner() {
+    use workforce_agent::runner::CURRENT_USER_ID;
+    let h = hub().await;
     h.global.set(&mine("skills/github/token"), GH_GOOD).unwrap();
     h.c.migrate(SARAH).await;
     assert_eq!(
         h.global
-            .get(&mine("skills/github/workspaces/acme/token"))
+            .get(&mine("skills/github/workspaces/default/token"))
             .as_deref(),
         Some(GH_GOOD)
     );
-    // Without one, its account's login.
+    // git, Claude Code and an open bench still find it, for any owner.
+    let (a, g) = (Arc::clone(&h.allan), Arc::clone(&h.global));
+    CURRENT_USER_ID
+        .scope(SARAH.to_string(), async move {
+            for owner in ["acme", "globex"] {
+                assert_eq!(
+                    workforce_hub_core::user_config::resolve_github_pat(Some(&a), Some(&g), owner)
+                        .as_deref(),
+                    Some(GH_GOOD),
+                    "{owner}"
+                );
+            }
+            assert_eq!(
+                workforce_hub_core::user_config::resolve_bench_github_pat(Some(&a), Some(&g))
+                    .as_deref(),
+                Some(GH_GOOD)
+            );
+        })
+        .await;
+    // An agent's own flat token stays its `default` too.
     let h = hub().await;
     h.allan.set(&mine("skills/github/token"), GH_GOOD).unwrap();
     h.kept
@@ -1166,7 +1209,7 @@ async fn a_flat_github_moves_to_the_owner_it_reached() {
         .unwrap();
     let list = h.c.list(SARAH).await;
     let github = &connector(&list, "github").connections[0];
-    assert_eq!(github.id, "agent~allan~sarah");
+    assert_eq!(github.id, "agent~allan~default");
     assert_eq!(
         github.account.as_deref(),
         Some("sarah"),
@@ -1387,10 +1430,10 @@ async fn githubs_device_sign_in_keeps_the_token_at_the_tier_it_was_for() {
     assert_eq!(
         keys(&h.allan),
         [
-            mine("skills/github/workspaces/sarah/label"),
-            mine("skills/github/workspaces/sarah/token")
+            mine("skills/github/workspaces/default/label"),
+            mine("skills/github/workspaces/default/token")
         ],
-        "a GitHub connection is its owner's"
+        "a first GitHub connection is the default, which git uses for any owner"
     );
     assert!(keys(&h.global).is_empty());
     assert!(h.c.flow("someone-else", &started.flow).is_none());

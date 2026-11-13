@@ -766,12 +766,20 @@ pub fn resolve_github_pat(
     let workspace = format!("skills/github/workspaces/{owner}/token");
     user_override_layered(agent_vault, global_vault, &workspace)
         .or_else(|| user_override_layered(agent_vault, global_vault, GITHUB_FLAT_TOKEN))
+        .or_else(|| user_override_layered(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
         .or_else(|| get_layered(agent_vault, global_vault, &workspace))
         .or_else(|| get_layered(agent_vault, global_vault, GITHUB_FLAT_TOKEN))
+        .or_else(|| get_layered(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
 }
 
 /// Vault path of the GitHub PAT that isn't scoped to one org.
 const GITHUB_FLAT_TOKEN: &str = "skills/github/token";
+
+/// The `default` instance's PAT: the flat token once Desk's named
+/// connections moved it there, and a person's first GitHub connection. It
+/// is the adapter's own name for the flat token, so it is unscoped like it,
+/// and read right after it. An org's own instance never stands in for it.
+const GITHUB_DEFAULT_TOKEN: &str = "skills/github/workspaces/default/token";
 
 /// The GitHub PAT for a session with no repo to key an owner off — an open
 /// bench, where Claude Code clones whatever it is asked for. Same precedence
@@ -782,6 +790,7 @@ pub fn resolve_bench_github_pat(
     global_vault: Option<&Vault>,
 ) -> Option<String> {
     resolve_flat(agent_vault, global_vault, GITHUB_FLAT_TOKEN)
+        .or_else(|| resolve_flat(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
 }
 
 impl workforce_common::settings::VaultResolver for UserAwareVault {
@@ -1866,6 +1875,37 @@ mod layered_tests {
         assert_eq!(
             resolve_github_pat(None, Some(&global), "acme").as_deref(),
             Some("global-bare")
+        );
+    }
+
+    #[test]
+    fn the_default_instance_is_unscoped_like_the_flat_token_and_an_org_instance_is_not() {
+        let agent = new_vault();
+        agent
+            .set("skills/github/workspaces/contoso/token", "org-only")
+            .unwrap();
+        assert!(resolve_github_pat(Some(&agent), None, "acme").is_none());
+        assert!(resolve_bench_github_pat(Some(&agent), None).is_none());
+        agent
+            .set("skills/github/workspaces/default/token", "default-pat")
+            .unwrap();
+        assert_eq!(
+            resolve_github_pat(Some(&agent), None, "acme").as_deref(),
+            Some("default-pat")
+        );
+        assert_eq!(
+            resolve_github_pat(Some(&agent), None, "contoso").as_deref(),
+            Some("org-only")
+        );
+        assert_eq!(
+            resolve_bench_github_pat(Some(&agent), None).as_deref(),
+            Some("default-pat")
+        );
+        // The flat token still comes first.
+        agent.set("skills/github/token", "flat").unwrap();
+        assert_eq!(
+            resolve_bench_github_pat(Some(&agent), None).as_deref(),
+            Some("flat")
         );
     }
 
