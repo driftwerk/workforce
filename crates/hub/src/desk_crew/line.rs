@@ -210,6 +210,29 @@ impl CrewHub {
                 tracing::warn!(error = %format!("{e:#}"), "keeping a session's question as an open item failed");
             }
         }
+        // While the person types to the boss, the card waits for a pause,
+        // at most three minutes, without holding up the caller.
+        let boss = service.agent_id.as_str().to_string();
+        if self.typing_release(&boss).is_some() {
+            let crew = self.me();
+            let q = q.clone();
+            tokio::spawn(async move {
+                crew.after_typing(&boss).await;
+                crew.question_card(&service, &owner, &q, e).await;
+            });
+            return;
+        }
+        self.question_card(&service, &owner, q, e).await;
+    }
+
+    /// Puts `q`'s card in `service`'s DM with `owner`, asked with `e`.
+    async fn question_card(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        q: &LineMessage,
+        e: Escalation,
+    ) {
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
@@ -219,8 +242,8 @@ impl CrewHub {
         let target =
             DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         let delivered = crate::desk_surface::deliver(
-            &service,
-            &owner,
+            service,
+            owner,
             &target,
             crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
         )

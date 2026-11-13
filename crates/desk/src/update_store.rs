@@ -25,7 +25,8 @@ impl DeskStore {
             .await?;
         let r = client
             .query_one(
-                "SELECT boss, since, gather_since, result, last_update_at, unread, told, pending \
+                "SELECT boss, since, gather_since, result, last_update_at, unread, told, pending, \
+                   away_since \
                  FROM boss_update_state WHERE boss = $1",
                 &[&boss],
             )
@@ -47,6 +48,7 @@ impl DeskStore {
                     None
                 }
             }),
+            away_since: r.try_get(8)?,
         })
     }
 
@@ -127,5 +129,34 @@ impl DeskStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// The person is away from `boss`'s DM since `since`, unless they
+    /// already were: the first time it is noticed is kept.
+    pub async fn update_away(&self, boss: &str, since: DateTime<Utc>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_update_state SET away_since = COALESCE(away_since, $2) \
+                 WHERE boss = $1",
+                &[&boss, &since],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The person is back from the absence that began at `since`: whether
+    /// this call ended it (a second caller, or one after a restart, finds
+    /// it ended).
+    pub async fn update_back(&self, boss: &str, since: DateTime<Utc>) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_update_state SET away_since = NULL \
+                 WHERE boss = $1 AND away_since = $2",
+                &[&boss, &since],
+            )
+            .await?;
+        Ok(n == 1)
     }
 }

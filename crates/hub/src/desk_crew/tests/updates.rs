@@ -291,6 +291,7 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             cutoff: None,
             handed: false,
             sent: None,
+            away: None,
         };
         // Kept before it went: sent once.
         d.store()

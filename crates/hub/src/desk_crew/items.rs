@@ -594,8 +594,32 @@ impl CrewHub {
 
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
-    /// for a check-in. Whether it went out.
+    /// for a check-in. While the person types to the boss it goes once they
+    /// pause, at most three minutes on, without holding up the caller.
+    /// Whether it went out, or will.
     pub(crate) async fn post_item(
+        &self,
+        boss: &str,
+        i: &OpenItem,
+        text: String,
+        approvals: Vec<MentionedApproval>,
+    ) -> bool {
+        if self.typing_release(boss).is_none() {
+            return self.post_item_now(boss, i, text, approvals).await;
+        }
+        if self.overseer_named(boss).is_none() {
+            return false;
+        }
+        let crew = self.me();
+        let (boss, i) = (boss.to_string(), i.clone());
+        tokio::spawn(async move {
+            crew.after_typing(&boss).await;
+            crew.post_item_now(&boss, &i, text, approvals).await;
+        });
+        true
+    }
+
+    async fn post_item_now(
         &self,
         boss: &str,
         i: &OpenItem,

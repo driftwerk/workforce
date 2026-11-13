@@ -592,6 +592,10 @@ pub struct Extras {
     /// A boss's update, as the chat renders it in place of its text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<crate::update::MentionedUpdate>,
+    /// A catch-up on the person's return: the absence it covers, its
+    /// headline, and what it says beyond its `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away: Option<crate::away::MentionedAway>,
 }
 
 impl Extras {
@@ -603,6 +607,7 @@ impl Extras {
             && self.decisions.is_empty()
             && self.item.is_none()
             && self.update.is_none()
+            && self.away.is_none()
     }
 }
 
@@ -714,6 +719,14 @@ pub trait Crew: Send + Sync {
     async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
     }
+    /// The person is typing in the boss `agent`'s DM: what it would post
+    /// waits for a pause. False when `agent` is no boss here.
+    fn dm_typing(&self, _agent: &str) -> bool {
+        false
+    }
+    /// What Desk says of the person: whether its window is attended, and
+    /// which boss's DM (by its agent) is on screen.
+    fn presence(&self, _attending: bool, _dm_on_screen: Option<&str>) {}
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {
