@@ -36,21 +36,21 @@ use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::Action;
 use super::watcher::tracked;
-use super::{name_of, CrewHub, FULL_SPEND_UNREAD};
+use super::{CrewHub, FULL_SPEND_UNREAD};
 
 /// How often every waiting request is looked at again, whatever events
 /// were missed.
 const SWEEP: Duration = Duration::from_secs(2);
 
 /// How long one decision call may take before it is tried again.
-pub(super) const WITHIN: Duration = Duration::from_secs(30);
+pub(crate) const WITHIN: Duration = Duration::from_secs(30);
 
 /// How long a request may be in its decision call (two tries, and a
 /// margin): past it, it is decided or left to the person.
 pub(super) const DECIDING: chrono::TimeDelta = chrono::TimeDelta::seconds(70);
 
 /// What starts every decision call: how a reader (or a test) knows one.
-pub(super) const MARK: &str = "[Desk decision]";
+pub(crate) const MARK: &str = "[Desk decision]";
 
 /// How many decision calls a boss makes at once.
 const AT_ONCE: usize = 3;
@@ -61,7 +61,7 @@ const SHOWN: usize = 200;
 /// How much of a session's last reply the call is given.
 const LAST_REPLY: usize = 3000;
 
-const SYSTEM: &str = "You are the boss of coding sessions you oversee for the person, at Act fully: \
+pub(crate) const SYSTEM: &str = "You are the boss of coding sessions you oversee for the person, at Act fully: \
 you decide yourself, now, whether a session may do what it asks. You are given the whole request, \
 never cut short, with what the session is for and where it stands. Judge it as the person would want: \
 allow what serves the session's work; deny what is wrong, risky or not what the work needs, and say \
@@ -224,6 +224,7 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 };
                 if !crew.still_decides(view, &by.party.id) {
                     taken.push(*approval);
+                    crew.left_by_served(&by.party.id, view.id, *approval);
                     crew.tell_dm(
                         &by.party.id,
                         &format!(
@@ -301,7 +302,9 @@ impl CrewHub {
     /// Whether `boss` still decides `view`'s request: it is over the
     /// session, and at Act fully in force.
     pub(super) fn still_decides(&self, view: &SessionView, boss: &str) -> bool {
-        self.desk.boss_unbound(boss) && self.boss_over(view).as_deref() == Some(boss)
+        self.desk.boss_unbound(boss)
+            && self.boss_over(view).as_deref() == Some(boss)
+            && self.served_still_holds(boss, view.id)
     }
 
     /// Whether `view`'s waiting request is its Act fully boss's to decide
@@ -421,6 +424,8 @@ impl CrewHub {
     /// Says `s` in its boss's DM, unless that reason was said already for
     /// a request still open, or for this one.
     async fn say_waits(&self, s: Said, told: &mut Told) {
+        // A boss on another hub: the person hears it there, as an ask.
+        self.served_waits(&s.boss, s.approval);
         if told.get(&s.approval).is_some_and(|(_, w)| *w == s.why) {
             return;
         }
@@ -433,16 +438,17 @@ impl CrewHub {
 
     /// The boss's decision on `view`'s request `p`, done.
     async fn decide_request(&self, view: &SessionView, p: &PendingApproval, boss: &str) -> Outcome {
-        let Some((service, o)) = self.overseer_named(boss) else {
+        // This hub's own boss, or one on another hub served from a grant
+        // here, whose call is made on its own hub ([`super::remote_decide`]).
+        let Some(decider) = self.decider_of(boss, view) else {
             return Outcome::NotOurs;
         };
-        let name = name_of(&service);
-        let prompt = self.decision_prompt(view, p, &o).await;
+        let name = decider.name.clone();
+        let prompt = self.decision_prompt(view, p, &decider.oversight).await;
         let mut failed = String::new();
         let mut decided = None;
         for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decision_call(&service, SYSTEM, &prompt)).await
-            {
+            match tokio::time::timeout(WITHIN, self.decide_by(&decider, &prompt)).await {
                 Ok(Ok(text)) => match verdict(&text) {
                     Some(v) => {
                         decided = Some(v);
@@ -626,44 +632,17 @@ impl CrewHub {
     ) -> Result<String, String> {
         // The hub's own work for the person whose Desk this is: it may run
         // on their accounts when the install's login is at its limit.
-        let (response, served) = crate::hub_core::logins::install_pool::hub_own_work(
-            with_served_log(service.llm.create_message(
-                Some(system),
-                &[LlmMessage::user(prompt.to_string())],
-                &[],
-                None,
-                Some(400),
-                true,
-            )),
-        )
-        .await;
-        let response = response.map_err(|e| e.to_string())?;
-        let model = response.model.clone();
-        service.cost_tracker.record(CostEntry {
-            task_type: Some("desk_decision"),
-            description: Some("desk:decision"),
-            served,
-            ..CostEntry::new(
-                service.agent_id.as_str(),
-                &model,
-                TokenCounts::from(&response.usage),
-                Origin::DeskReading,
-            )
-        });
-        Ok(response
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect())
+        crate::hub_core::logins::install_pool::hub_own_work(decision_call(service, system, prompt))
+            .await
     }
 
     /// Records that `boss` left `view`'s request `p` to the person, saying
     /// `why`.
     async fn record_left(&self, boss: &str, view: &SessionView, p: &PendingApproval, why: &str) {
-        let what = format!("left {} to you: {}", view.label(), shown(p));
+        let what = super::remote_decide::named(
+            boss,
+            format!("left {} to you: {}", view.label(), shown(p)),
+        );
         let mut d = BossDecision::new(boss, Need::Approval, &what, why, How::Escalated);
         d.need_ref = Some(p.id.to_string());
         d.session = Some(view.id);
@@ -672,6 +651,12 @@ impl CrewHub {
 
     /// Says `text` in `boss`'s DM, as a notice.
     pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
+        // A boss on another hub: its conversation is there, where what it
+        // leaves to the person goes up as an ask ([`Self::left_by_served`]).
+        if workforce_desk::grant::is_served(boss) {
+            tracing::info!(%boss, text, "a remote boss's request waits on the person");
+            return;
+        }
         let Some((service, _)) = self.overseer_named(boss) else {
             tracing::warn!(%boss, text, "no DM to say a waiting request in");
             return;
@@ -692,6 +677,46 @@ impl CrewHub {
             tracing::warn!(%boss, error = %e, "saying a waiting request in the DM failed");
         }
     }
+}
+
+/// One call to `service`'s own model for a decision, on whichever hub holds
+/// `service` (the person's own, or a remote boss's): its text. It runs on
+/// `service`'s own model alone, never another's.
+pub(crate) async fn decision_call(
+    service: &crate::serve::AgentService,
+    system: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let (response, served) = with_served_log(service.llm.create_message(
+        Some(system),
+        &[LlmMessage::user(prompt.to_string())],
+        &[],
+        None,
+        Some(400),
+        true,
+    ))
+    .await;
+    let response = response.map_err(|e| e.to_string())?;
+    let model = response.model.clone();
+    service.cost_tracker.record(CostEntry {
+        task_type: Some("desk_decision"),
+        description: Some("desk:decision"),
+        served,
+        ..CostEntry::new(
+            service.agent_id.as_str(),
+            &model,
+            TokenCounts::from(&response.usage),
+            Origin::DeskReading,
+        )
+    });
+    Ok(response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect())
 }
 
 #[cfg(test)]

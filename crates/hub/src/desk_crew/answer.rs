@@ -203,10 +203,12 @@ impl CrewHub {
     /// (now, or once the person has been quiet): then nothing else wakes the
     /// boss for it.
     pub(crate) fn answers_question_itself(&self, view: &SessionView) -> bool {
+        // A boss on another hub answers questions in its own turns there,
+        // woken as before: none is swallowed here.
         question_of(view).is_some()
-            && self
-                .boss_over(view)
-                .is_some_and(|b| self.desk.boss_unbound(&b))
+            && self.boss_over(view).is_some_and(|b| {
+                !workforce_desk::grant::is_served(&b) && self.desk.boss_unbound(&b)
+            })
     }
 
     /// Looks at session `id`'s question: hands it to its boss (once,

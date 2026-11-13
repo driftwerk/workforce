@@ -657,6 +657,10 @@ impl Uplink {
         let asks_taken = ready["features"]
             .as_array()
             .is_some_and(|f| f.iter().any(|x| x == "asks"));
+        // A hub that decides its boss's requests on its own model says so.
+        let decide_taken = ready["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|x| x == "decide"));
         // What it asks open goes up again with the first look, and what
         // happened in each group while it was away now.
         let _ = sink
@@ -702,6 +706,16 @@ impl Uplink {
                 .collect(),
             tx.clone(),
         ));
+        // Where each accepted link's boss's decisions go up, while this
+        // socket is up, when the hub takes them.
+        let decide_up = self.crew.decide_up(
+            accepted
+                .values()
+                .filter(|_| decide_taken)
+                .map(|l| (l.link_id, l.boss().party_id(), l.group.clone()))
+                .collect(),
+            tx.clone(),
+        );
         // At most a few answers are worked on at once; the rest are refused
         // to be sent again.
         let deciding = Arc::new(tokio::sync::Semaphore::new(DECIDING_AT_ONCE));
@@ -847,6 +861,9 @@ impl Uplink {
                         let _ = tx.send(back).await;
                     });
                 }
+                // What its boss's model answered of a decision sent up:
+                // taken only for one sent on this socket, on its link.
+                Some("decided") => self.crew.decided(&decide_up, &frame),
                 Some("state") => {
                     tracing::info!(state = ?frame["state"], "a boss hub said a link's state");
                 }
@@ -855,6 +872,7 @@ impl Uplink {
         };
         events.abort();
         asks.abort();
+        drop(decide_up);
         drop(tx);
         let _ = writer.await;
         ended
