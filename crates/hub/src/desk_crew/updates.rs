@@ -107,6 +107,8 @@ pub(super) struct Batch {
     pub decisions: Vec<BossDecision>,
     pub kept: Vec<String>,
     waiting: Vec<OpenItem>,
+    /// What only the person can do, still open: the brief's "for you".
+    pub for_you: Vec<OpenItem>,
     restated: Vec<(Uuid, bool)>,
     pub told: HashMap<Uuid, Told>,
 }
@@ -224,10 +226,17 @@ impl CrewHub {
                 .collect(),
             false => Vec::new(),
         };
+        let for_you: Vec<OpenItem> = open
+            .iter()
+            .filter(|i| i.kind == OpenKind::Todo && i.state == OpenState::Open && i.said())
+            .cloned()
+            .collect();
         let waiting: Vec<OpenItem> = open
             .into_iter()
             .filter(|i| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
             .filter(|i| i.said() && i.state == OpenState::Open)
+            // The person in that session now: theirs, nothing said of it.
+            .filter(|i| i.session.is_none_or(|s| !self.person_in(s, i.opened_at)))
             .collect();
         let quiet = self
             .quiet_made
@@ -246,6 +255,7 @@ impl CrewHub {
             decisions,
             kept,
             waiting,
+            for_you,
             restated,
             told,
         }
@@ -261,7 +271,7 @@ impl CrewHub {
         owner: &str,
         o: &Oversight,
         b: &Batch,
-    ) -> (Vec<UpdateSession>, Vec<DecisionLine>) {
+    ) -> (Vec<UpdateSession>, Vec<DecisionLine>, Option<String>) {
         let mut written = update::Composed::default();
         let writer = self.update_writer.lock().clone();
         // Only what it did is worth the model's words, the newest first: the
@@ -299,6 +309,25 @@ impl CrewHub {
                         tracing::info!(error = %format!("{e:#}"), "the update's writer failed; written plainly")
                     }
                 }
+                // Over its bounds: asked once more for those fields alone,
+                // then whatever is still long is clipped.
+                let long = update::too_long(&written);
+                if !long.is_empty() && self.desk.update_take().await.unwrap_or(false) {
+                    user.push_str(&update::reask(&long));
+                    match writer
+                        .write(boss, owner, update::COMPOSER_SYSTEM, &user)
+                        .await
+                        .map(|a| update::parse_composed(&a))
+                    {
+                        Ok(Some(again)) => {
+                            written = update::merge_composed(std::mem::take(&mut written), again)
+                        }
+                        Ok(None) => tracing::info!("the update's writer answered a re-ask out of form; clipped"),
+                        Err(e) => {
+                            tracing::info!(error = %format!("{e:#}"), "the update's writer failed a re-ask; clipped")
+                        }
+                    }
+                }
             }
         }
         let sessions = b
@@ -313,13 +342,15 @@ impl CrewHub {
                     text: written
                         .sessions
                         .remove(&s.id)
+                        .map(|t| workforce_desk::crew::words(&t, update::SESSION_WORDS))
                         .unwrap_or_else(|| update::plain_session(&new, &s.account)),
                     refs: update::refs_of(&new),
                 }
             })
             .collect();
         let decisions = update::decision_lines(&b.decisions, &written.decisions);
-        (sessions, decisions)
+        let headline = written.headline.as_deref().and_then(update::headline_line);
+        (sessions, decisions, headline)
     }
 
     /// `b` written as an update for `owner`: its extras and its text.
@@ -331,19 +362,31 @@ impl CrewHub {
         b: &Batch,
         now: DateTime<Utc>,
     ) -> (MentionedUpdate, String) {
-        let (sessions, decisions) = self.composed(boss, owner, o, b).await;
+        let (sessions, decisions, headline) = self.composed(boss, owner, o, b).await;
+        let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let footer = match self.desk.cheap_today().await {
             Ok((spent, cap)) => update::footer(spent, cap),
             Err(_) => None,
         };
-        let u = MentionedUpdate {
+        let names: HashMap<Uuid, String> = self
+            .desk
+            .list()
+            .into_iter()
+            .map(|v| (v.id, v.label().to_string()))
+            .collect();
+        let (brief, more_items) = update::brief(&b.decisions, &decisions, &b.for_you, &names);
+        let mut u = MentionedUpdate {
             sessions,
             decisions,
             kept: b.kept.clone(),
-            waiting: b.waiting.iter().map(|i| WaitingItem::of(i, now)).collect(),
-            needs_you: b.waiting.iter().map(|i| NeedsYou::of(i, now)).collect(),
+            waiting: b.waiting.iter().map(|i| WaitingItem::of(i, now, full)).collect(),
+            needs_you: b.waiting.iter().map(|i| NeedsYou::of(i, now, full)).collect(),
             footer,
+            headline: String::new(),
+            brief,
+            more_items,
         };
+        u.headline = headline.unwrap_or_else(|| update::plain_headline(&u));
         let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();
         let text = update::render(&u, &decided);
         (u, text)
@@ -359,6 +402,9 @@ impl CrewHub {
             let Some(_one) = Updating::begin(&self.updating, &boss) else {
                 continue;
             };
+            // What the person settled in a session themselves is no longer
+            // theirs to answer here.
+            self.settle_in_sessions(&boss).await;
             if let Err(e) = self.update_of(&service, &o).await {
                 tracing::warn!(agent = %service.agent_id, error = %format!("{e:#}"), "a boss's update failed");
             }

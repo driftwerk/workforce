@@ -447,6 +447,7 @@ impl CrewHub {
             .iter()
             .filter(asks)
             .filter(|i| i.state == OpenState::Open)
+            .filter(|i| i.session.is_none_or(|s| !self.person_in(s, i.opened_at)))
             .collect();
         let parked: Vec<ParkedItem> = open
             .iter()
@@ -469,7 +470,8 @@ impl CrewHub {
             }
             return Ok(());
         }
-        let (sessions, decisions) = self.composed(boss, owner, o, &b).await;
+        let (sessions, decisions, _) = self.composed(boss, owner, o, &b).await;
+        let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let finished: Vec<(String, String)> = b
             .sessions
             .iter()
@@ -491,9 +493,10 @@ impl CrewHub {
             sessions,
             decisions,
             kept: b.kept.clone(),
-            waiting: waiting.iter().map(|i| WaitingItem::of(i, now)).collect(),
-            needs_you: waiting.iter().map(|i| NeedsYou::of(i, now)).collect(),
+            waiting: waiting.iter().map(|i| WaitingItem::of(i, now, full)).collect(),
+            needs_you: waiting.iter().map(|i| NeedsYou::of(i, now, full)).collect(),
             footer,
+            ..Default::default()
         };
         let a = MentionedAway {
             since,
@@ -525,8 +528,5 @@ impl CrewHub {
 /// words.
 fn timed(d: &BossDecision, tz: chrono_tz::Tz) -> String {
     let at = d.at.with_timezone(&tz).format("%H:%M");
-    match d.why.trim() {
-        "" => format!("{at} · {}.", d.what.trim_end_matches('.')),
-        why => format!("{at} · {} — {why}", d.what.trim_end_matches('.')),
-    }
+    format!("{at} {}", d.said())
 }

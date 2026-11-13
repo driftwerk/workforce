@@ -17,6 +17,9 @@ text_enum!(OpenKind {
     Confirm => "confirm",
     Promise => "promise",
     Order => "order",
+    // What only the person can do (rotate their own credentials): one
+    // line, no answers, Done when it's done.
+    Todo => "todo",
 });
 
 text_enum!(OpenState {
@@ -33,6 +36,23 @@ text_enum!(ClosedBy {
     Superseded => "superseded",
     Lapsed => "lapsed",
 });
+
+/// Why an ask closed when the person settled it in its session
+/// themselves: what tells it apart from one answered with Desk's buttons.
+pub const SETTLED_WHY: &str = "You settled it in the session.";
+/// How `i` was settled in its session, if it was: the person there
+/// ([`SETTLED_WHY`]), or the session itself.
+pub fn settled_by(i: &OpenItem) -> Option<crate::update::SettledBy> {
+    use crate::update::SettledBy;
+    match (i.state, i.closed_by, i.closed_why.as_deref()) {
+        (OpenState::Closed, _, Some(SETTLED_WHY)) => Some(SettledBy::You),
+        (OpenState::Closed, Some(ClosedBy::Session), _) => Some(SettledBy::Session),
+        _ => None,
+    }
+}
+
+/// Why a "for you" item closed when the person said they did it.
+pub const DONE_WHY: &str = "You did it.";
 
 /// How old an ask is before it is first restated.
 pub const FIRST_RESTATE: Duration = Duration::minutes(30);
@@ -63,6 +83,20 @@ pub struct AskLayout {
 /// The most points an ask's layout keeps, and the most characters each.
 pub const POINTS: usize = 6;
 pub const POINT_CHARS: usize = 120;
+/// The most points the person is shown, and the most words in each.
+pub const SHOWN_POINTS: usize = 2;
+pub const POINT_WORDS: usize = 12;
+/// The most words an ask's one line has, as the person reads it.
+pub const QUESTION_WORDS: usize = 15;
+/// The most characters it has.
+pub const QUESTION_CHARS: usize = 160;
+
+/// What an ask offers the person to answer with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Offer {
+    pub recommendation: Option<String>,
+    pub options: Vec<String>,
+}
 
 /// The one of `options` that `answer` names, ignoring case and spaces at
 /// either end.
@@ -111,6 +145,10 @@ pub struct OpenItem {
     pub closed_why: Option<String>,
     #[serde(default)]
     pub layout: AskLayout,
+    /// Why the boss couldn't decide it: at Act fully, the one thing that
+    /// lets an ask carry answers.
+    #[serde(default)]
+    pub cant_decide: Option<String>,
 }
 
 /// An item to open (or, when one with its key is open, to update).
@@ -133,6 +171,7 @@ pub struct NewItem {
     /// The sessions a promise or order is linked to.
     pub sessions: Vec<Uuid>,
     pub layout: AskLayout,
+    pub cant_decide: Option<String>,
 }
 
 impl NewItem {
@@ -153,6 +192,7 @@ impl NewItem {
             said: true,
             sessions: Vec::new(),
             layout: AskLayout::default(),
+            cant_decide: None,
         }
     }
 
@@ -174,6 +214,7 @@ impl NewItem {
             said: false,
             sessions: Vec::new(),
             layout: AskLayout::default(),
+            cant_decide: None,
         }
     }
 
@@ -431,28 +472,94 @@ impl OpenItem {
         }
     }
 
-    /// "Still waiting on you: {text} · {age} · {holding up}".
+    /// "Still waiting on you: {its one line} · {age} · {holding up}", short:
+    /// the rest is behind "more", and any recommendation in its buttons.
     pub fn still_waiting(&self, now: DateTime<Utc>) -> String {
-        let mut s = format!("Still waiting on you: {} · {}", self.text, self.age(now));
+        let mut s = format!("Still waiting on you: {} · {}", self.headline(), self.age(now));
         if let Some(h) = self.holding_up.as_deref().filter(|h| !h.trim().is_empty()) {
-            s.push_str(&format!(" · {}", h.trim()));
-        }
-        if let Some(r) = self
-            .recommendation
-            .as_deref()
-            .filter(|r| !r.trim().is_empty())
-        {
-            s.push_str(&format!("\n\nI'd say: {}", r.trim()));
+            s.push_str(&format!(" · {}", crate::crew::words(h, POINT_WORDS)));
         }
         s
     }
 
+    /// Its one line, as the person reads it: the question given, else
+    /// its text's first sentence, at most [`QUESTION_WORDS`].
+    pub fn headline(&self) -> String {
+        let q = self
+            .layout
+            .question
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .unwrap_or(&self.text);
+        let first = crate::crew::one_line(q, usize::MAX);
+        crate::crew::clip(&crate::crew::words(&first, QUESTION_WORDS), QUESTION_CHARS)
+    }
+
+    /// What it says beyond its one line, behind "more": its full text
+    /// when longer, and what it holds up. None when there is nothing more.
+    pub fn detail(&self) -> Option<String> {
+        let head = self.headline();
+        let mut parts: Vec<String> = Vec::new();
+        let text = self.text.trim();
+        if crate::open_item::normalised(text) != crate::open_item::normalised(&head) {
+            parts.push(text.to_string());
+        }
+        if let Some(h) = self.holding_up.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            parts.push(format!("Holding up: {h}"));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// Its points as the person is shown them: at most
+    /// [`SHOWN_POINTS`], each at most [`POINT_WORDS`].
+    pub fn shown_points(&self) -> Vec<String> {
+        self.layout
+            .points
+            .iter()
+            .map(|p| crate::crew::words(p, POINT_WORDS))
+            .filter(|p| !p.is_empty())
+            .take(SHOWN_POINTS)
+            .collect()
+    }
+
+    /// What it offers to answer with, at `full` (Act fully) or not: at Act
+    /// fully the boss recommends nothing, and an ask carries answers only
+    /// when it said why it couldn't decide.
+    pub fn offer(&self, full: bool) -> Offer {
+        if self.kind == OpenKind::Todo {
+            return Offer::default();
+        }
+        match full {
+            false => Offer {
+                recommendation: self.recommendation.clone(),
+                options: self.options.clone(),
+            },
+            true => Offer {
+                recommendation: None,
+                options: match self.cant_decide.as_deref().map(str::trim) {
+                    Some(w) if !w.is_empty() => self.options.clone(),
+                    _ => Vec::new(),
+                },
+            },
+        }
+    }
+
     /// As the chat's extras carry it.
     pub fn mention(&self) -> MentionedItem {
+        self.mention_at(false)
+    }
+
+    /// As the chat's extras carry it at `full` (Act fully) or not: what it
+    /// offers to answer with as [`Self::offer`] says.
+    pub fn mention_at(&self, full: bool) -> MentionedItem {
+        let offer = self.offer(full);
         MentionedItem {
             item_id: self.id.to_string(),
-            recommendation: self.recommendation.clone(),
-            options: self.options.clone(),
+            recommendation: offer.recommendation,
+            options: offer.options,
+            detail: self.detail(),
+            for_you: self.kind == OpenKind::Todo,
             generalizes: self.generalizes.clone(),
             prefer_scope: self
                 .generalizes
@@ -469,6 +576,12 @@ impl OpenItem {
 #[serde(rename_all = "camelCase")]
 pub struct MentionedItem {
     pub item_id: String,
+    /// What it says beyond its one line, behind "more".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Only the person can do it: Done, never answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub for_you: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -523,6 +636,7 @@ pub fn listed(items: &[OpenItem], now: DateTime<Utc>, tz: chrono_tz::Tz) -> Stri
         OpenKind::Confirm,
         OpenKind::Promise,
         OpenKind::Order,
+        OpenKind::Todo,
     ] {
         let of: Vec<&OpenItem> = items
             .iter()
@@ -538,6 +652,7 @@ pub fn listed(items: &[OpenItem], now: DateTime<Utc>, tz: chrono_tz::Tz) -> Stri
                 OpenKind::Confirm => "Decisions you want confirmed",
                 OpenKind::Promise => "Promises you made",
                 OpenKind::Order => "The person's orders",
+                OpenKind::Todo => "What only the person can do",
             }
         ));
         of.into_iter().for_each(|i| out.push_str(&line(i)));
@@ -585,6 +700,7 @@ mod tests {
             closed_by: None,
             closed_why: None,
             layout: AskLayout::default(),
+            cant_decide: None,
         }
     }
 

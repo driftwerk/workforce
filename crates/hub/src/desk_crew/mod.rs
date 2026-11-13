@@ -1244,6 +1244,10 @@ impl Crew for CrewHub {
         self.me().drop_item(id).await
     }
 
+    async fn done_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().done_item(id).await
+    }
+
     async fn always_item(
         &self,
         id: uuid::Uuid,

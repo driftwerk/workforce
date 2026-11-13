@@ -232,20 +232,44 @@ pub struct WaitingItem {
     pub recommendation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// What it says beyond its one line, behind "more".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl WaitingItem {
-    /// `i` as an update lists it at `now`.
-    pub fn of(i: &OpenItem, now: DateTime<Utc>) -> Self {
+    /// `i` as an update lists it at `now`, at `full` (Act fully) or not:
+    /// its one line, what it holds up in a few words, what it offers as
+    /// [`OpenItem::offer`] says, and the rest behind "more".
+    pub fn of(i: &OpenItem, now: DateTime<Utc>, full: bool) -> Self {
+        let offer = i.offer(full);
         Self {
             item_id: i.id.to_string(),
-            text: i.text.clone(),
+            text: i.headline(),
             age: age(i.opened_at, now),
-            holding_up: i.holding_up.clone(),
-            recommendation: i.recommendation.clone(),
-            options: i.options.clone(),
+            holding_up: i
+                .holding_up
+                .as_deref()
+                .map(|h| crate::crew::words(h, crate::open_item::POINT_WORDS))
+                .filter(|h| !h.is_empty()),
+            recommendation: offer
+                .recommendation
+                .map(|r| crate::crew::words(&r, crate::open_item::QUESTION_WORDS)),
+            options: offer.options,
+            detail: i.detail(),
         }
     }
+}
+
+/// How an item was settled in the session, apart from the update that
+/// still lists it: the chat folds it to "✓ Settled in the session".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettledBy {
+    /// The person answered or acted in the session themselves.
+    You,
+    /// The session settled it (its account shows it done).
+    Session,
 }
 
 /// An answer the person can give, as a button: the recommended one filled.
@@ -258,7 +282,7 @@ pub struct AnswerOption {
 }
 
 /// The most characters a needs-you question has.
-pub const QUESTION_CHARS: usize = 160;
+pub const QUESTION_CHARS: usize = crate::open_item::QUESTION_CHARS;
 
 /// What waits on the person, laid out (`extras.update.needsYou`): one
 /// question, its points, the boss's recommendation, the answers with the
@@ -290,13 +314,23 @@ pub struct NeedsYou {
     /// `generalizes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_scope: Option<String>,
+    /// The session it is about, if one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// What it says beyond its one line, behind "more".
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Settled in the session since: folded, never answered here.
+    #[serde(default)]
+    pub settled_by: Option<SettledBy>,
 }
 
 impl NeedsYou {
-    /// `i` laid out at `now`: what the boss gave, else its text's first
-    /// sentence as the question, with no points, no answer recommended and
-    /// nothing said to carry on.
-    pub fn of(i: &OpenItem, now: DateTime<Utc>) -> Self {
+    /// `i` laid out at `now`, at `full` (Act fully) or not: its one line
+    /// ([`OpenItem::headline`]), at most two short points, what it offers
+    /// as [`OpenItem::offer`] says (at Act fully no recommendation), what
+    /// carries on in a few words, and the rest behind "more".
+    pub fn of(i: &OpenItem, now: DateTime<Utc>, full: bool) -> Self {
         let l = &i.layout;
         let given = |t: &Option<String>| {
             t.as_deref()
@@ -304,24 +338,21 @@ impl NeedsYou {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
         };
-        let question = match given(&l.question) {
-            Some(q) => crate::crew::one_line(&q, QUESTION_CHARS),
-            None => crate::crew::one_line(&i.text, QUESTION_CHARS),
+        let offer = i.offer(full);
+        let recommended = match full {
+            true => None,
+            false => given(&l.recommended).and_then(|r| {
+                crate::open_item::matching_option(&offer.options, &r).map(str::to_string)
+            }),
         };
-        let recommended = given(&l.recommended)
-            .and_then(|r| crate::open_item::matching_option(&i.options, &r).map(str::to_string));
         Self {
             item_id: i.id.to_string(),
-            question,
-            items: l
-                .points
-                .iter()
-                .map(|p| p.trim())
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect(),
-            recommendation: given(&i.recommendation),
-            options: i
+            question: i.headline(),
+            items: i.shown_points(),
+            recommendation: offer
+                .recommendation
+                .map(|r| crate::crew::words(&r, crate::open_item::QUESTION_WORDS)),
+            options: offer
                 .options
                 .iter()
                 .map(|o| AnswerOption {
@@ -329,11 +360,15 @@ impl NeedsYou {
                     recommended: recommended.as_deref() == Some(o.as_str()),
                 })
                 .collect(),
-            not_blocking: given(&l.not_blocking),
+            not_blocking: given(&l.not_blocking)
+                .map(|n| crate::crew::words(&n, crate::open_item::POINT_WORDS)),
             age: age(i.opened_at, now),
             generalizes: given(&i.generalizes),
             prefer_scope: given(&i.generalizes)
                 .map(|_| i.prefer_scope.clone().unwrap_or_else(|| "all".into())),
+            session_id: i.session.map(|s| s.to_string()),
+            detail: i.detail(),
+            settled_by: None,
         }
     }
 }
@@ -359,6 +394,233 @@ pub struct MentionedUpdate {
     /// The day's cheap calls, near the ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<String>,
+    /// The update in one line (at most [`HEADLINE_WORDS`] words): what the
+    /// chat shows first.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub headline: String,
+    /// What it did and what only the person can do, by session: at most
+    /// [`BRIEF_ITEMS`] lines in all, what it left alone as a count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brief: Vec<BriefGroup>,
+    /// The lines past [`BRIEF_ITEMS`] the brief leaves out.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more_items: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The most lines an update's brief shows, across its groups.
+pub const BRIEF_ITEMS: usize = 3;
+/// The most words in an update's headline.
+pub const HEADLINE_WORDS: usize = 12;
+
+/// What a brief line is: something the boss did, or something only the
+/// person can do (answered with "Done" alone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BriefKind {
+    Done,
+    ForYou,
+}
+
+/// One line of an update's brief (`extras.update.brief[].items[]`): every
+/// field always on the wire, null when it has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefItem {
+    /// The decision's id (done) or the item's (for you).
+    pub id: String,
+    pub kind: BriefKind,
+    /// What, at most [`crate::decision::BRIEF_WORDS`] words.
+    pub action: String,
+    /// Why in a few words, no full stop.
+    #[serde(default)]
+    pub why: Option<String>,
+    /// The rest, behind a disclosure.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// A done line's undo button, as [`DecisionLine::undo`].
+    #[serde(default)]
+    pub undo: Option<String>,
+    /// A for-you line settled since, filled when the page is read.
+    #[serde(default)]
+    pub settled_by: Option<SettledBy>,
+    pub at: DateTime<Utc>,
+}
+
+/// One session's lines in an update's brief; `sessionId` null for what
+/// isn't about one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefGroup {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub label: String,
+    #[serde(default)]
+    pub items: Vec<BriefItem>,
+    /// How many times it looked and left it alone: a count, never lines.
+    #[serde(default)]
+    pub left_alone: u32,
+}
+
+/// The label of a group not about one session.
+pub const CREW_LABEL: &str = "Crew";
+
+/// An update's brief from its decisions (`lines`, laid out from `rows`)
+/// and the open items only the person can do (`for_you`), each group
+/// named from `names`: what only the person can do first, then what the
+/// boss did, newest first, [`BRIEF_ITEMS`] in all; what it left alone
+/// counted; the lines left out counted apart.
+pub fn brief(
+    rows: &[BossDecision],
+    lines: &[DecisionLine],
+    for_you: &[OpenItem],
+    names: &HashMap<Uuid, String>,
+) -> (Vec<BriefGroup>, u32) {
+    use crate::decision::DecisionKind;
+    let mut groups: Vec<BriefGroup> = Vec::new();
+    let group = |groups: &mut Vec<BriefGroup>, s: Option<Uuid>| -> usize {
+        let id = s.map(|s| s.to_string());
+        match groups.iter().position(|g| g.session_id == id) {
+            Some(i) => i,
+            None => {
+                let label = s
+                    .and_then(|s| names.get(&s).cloned())
+                    .unwrap_or_else(|| CREW_LABEL.to_string());
+                groups.push(BriefGroup {
+                    session_id: id,
+                    label,
+                    items: Vec::new(),
+                    left_alone: 0,
+                });
+                groups.len() - 1
+            }
+        }
+    };
+    let mut all: Vec<(Option<Uuid>, BriefItem)> = Vec::new();
+    let mut todo: Vec<&OpenItem> = for_you.iter().collect();
+    todo.sort_by_key(|i| std::cmp::Reverse(i.opened_at));
+    for i in todo {
+        all.push((
+            i.session,
+            BriefItem {
+                id: i.id.to_string(),
+                kind: BriefKind::ForYou,
+                action: crate::crew::clip(
+                    &crate::crew::words(&i.headline(), crate::decision::BRIEF_WORDS),
+                    crate::decision::BRIEF_CHARS,
+                ),
+                why: i
+                    .holding_up
+                    .as_deref()
+                    .and_then(crate::decision::clause)
+                    .map(|h| crate::crew::words(&h, crate::decision::WHY_WORDS)),
+                detail: i.detail(),
+                undo: None,
+                settled_by: None,
+                at: i.opened_at,
+            },
+        ));
+    }
+    let mut done: Vec<(&BossDecision, &DecisionLine)> = Vec::new();
+    let mut alone: Vec<Option<Uuid>> = Vec::new();
+    for d in rows {
+        match d.kind {
+            DecisionKind::LeftAlone => alone.push(d.session),
+            DecisionKind::Acted => {
+                if let Some(l) = lines.iter().find(|l| l.id == d.id.to_string()) {
+                    done.push((d, l));
+                }
+            }
+            // Asked of the person (its own card) or taken back: no line.
+            DecisionKind::Escalated | DecisionKind::Undone => {}
+        }
+    }
+    done.sort_by_key(|(d, _)| std::cmp::Reverse(d.at));
+    for (d, l) in done {
+        let why = crate::decision::clause(&l.why);
+        let full = d.why.trim();
+        let detail = (!full.is_empty()
+            && crate::open_item::normalised(full)
+                != crate::open_item::normalised(l.why.trim()))
+        .then(|| full.to_string());
+        all.push((
+            d.session,
+            BriefItem {
+                id: l.id.clone(),
+                kind: BriefKind::Done,
+                action: l.action.trim().trim_end_matches('.').to_string(),
+                why,
+                detail,
+                undo: l.undo.clone(),
+                settled_by: None,
+                at: d.at,
+            },
+        ));
+    }
+    let more = all.len().saturating_sub(BRIEF_ITEMS) as u32;
+    for (s, item) in all.into_iter().take(BRIEF_ITEMS) {
+        let g = group(&mut groups, s);
+        groups[g].items.push(item);
+    }
+    // Counted where its lines are, after them.
+    for s in alone {
+        let g = group(&mut groups, s);
+        groups[g].left_alone += 1;
+    }
+    (groups, more)
+}
+
+/// The update's headline written plainly: what it did, what is the
+/// person's and what it left alone, in counts.
+pub fn plain_headline(u: &MentionedUpdate) -> String {
+    let count = |k: BriefKind| {
+        u.brief
+            .iter()
+            .flat_map(|g| &g.items)
+            .filter(|i| i.kind == k)
+            .count()
+    };
+    let more = u.more_items as usize;
+    let for_you = count(BriefKind::ForYou);
+    // What only the person can do comes first: the lines left out are
+    // what it did.
+    let done = count(BriefKind::Done) + more;
+    let waiting = u.needs_you.len();
+    let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
+    let mut parts: Vec<String> = Vec::new();
+    if done > 0 {
+        parts.push(format!("{done} done"));
+    }
+    if for_you > 0 {
+        parts.push(format!("{for_you} for you"));
+    }
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting on you"));
+    }
+    if alone > 0 {
+        parts.push(format!("{alone} left alone"));
+    }
+    if parts.is_empty() {
+        return match u.sessions.len() {
+            0 => "Nothing new.".into(),
+            1 => format!("{} moved on.", u.sessions[0].name),
+            n => format!("{n} sessions moved on."),
+        };
+    }
+    let mut out = parts.join(", ");
+    if let Some(c) = out.get(..1) {
+        out = c.to_uppercase() + &out[1..];
+    }
+    format!("{out}.")
+}
+
+/// `headline` within [`HEADLINE_WORDS`] words, one line; none when empty.
+pub fn headline_line(headline: &str) -> Option<String> {
+    let line = crate::crew::words(&crate::crew::one_line(headline, usize::MAX), HEADLINE_WORDS);
+    (!line.trim().is_empty()).then_some(line)
 }
 
 impl MentionedUpdate {
@@ -425,6 +687,9 @@ pub fn age(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// session's paragraph (`**name** (purpose) — text`), then the decisions'
 /// lines, what it kept, and what still waits, each verbatim.
 pub fn render(u: &MentionedUpdate, decided: &[String]) -> String {
+    if !u.headline.trim().is_empty() {
+        return render_brief(u);
+    }
     let mut out: Vec<String> = Vec::new();
     for s in &u.sessions {
         let purpose = match s.purpose.trim() {
@@ -452,6 +717,56 @@ pub fn render(u: &MentionedUpdate, decided: &[String]) -> String {
     out.join("\n\n")
 }
 
+/// A briefed update's text: its headline, each line ("✓ did — why",
+/// "● For you: … — why"), what it left alone as a count, what it left
+/// out, what waits on the person in one line each, and what it kept.
+pub fn render_brief(u: &MentionedUpdate) -> String {
+    let mut out: Vec<String> = vec![u.headline.trim().to_string()];
+    let mut lines: Vec<String> = Vec::new();
+    for i in u.brief.iter().flat_map(|g| &g.items) {
+        let mark = match i.kind {
+            BriefKind::Done => "✓",
+            BriefKind::ForYou => "● For you:",
+        };
+        lines.push(match i.why.as_deref().filter(|w| !w.trim().is_empty()) {
+            Some(why) => format!("{mark} {} — {why}", i.action),
+            None => format!("{mark} {}", i.action),
+        });
+    }
+    // Where the brief leaves room, what the sessions did, one sentence
+    // each; the rest counted with what it left out.
+    let room = BRIEF_ITEMS.saturating_sub(lines.len());
+    for s in u.sessions.iter().take(room) {
+        lines.push(format!(
+            "**{}** — {}",
+            s.name,
+            crate::crew::words(s.text.trim(), SESSION_WORDS)
+        ));
+    }
+    let more = u.more_items as usize + u.sessions.len().saturating_sub(room);
+    if more > 0 {
+        lines.push(format!("+{more} more"));
+    }
+    let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
+    if alone > 0 {
+        lines.push(format!(
+            "Left alone: {alone} {}.",
+            if alone == 1 { "time" } else { "times" }
+        ));
+    }
+    for n in &u.needs_you {
+        lines.push(format!("● Needs you: {}", n.question));
+    }
+    if !lines.is_empty() {
+        out.push(lines.join("\n"));
+    }
+    out.extend(u.kept.iter().cloned());
+    if let Some(f) = &u.footer {
+        out.push(format!("_{f}_"));
+    }
+    out.join("\n\n")
+}
+
 /// The footer near the day's ceiling (80% of it spent), or none.
 pub fn footer(spent: i64, cap: u32) -> Option<String> {
     (cap > 0 && spent * 5 >= i64::from(cap) * 4)
@@ -462,10 +777,14 @@ pub fn footer(spent: i64, cap: u32) -> Option<String> {
 /// is, what's next and roughly when; per decision, what it did in a short
 /// line and why in one sentence, never quoting the message it sent (shown
 /// apart). Asks and what it kept are added verbatim.
-pub const COMPOSER_SYSTEM: &str = "You write parts of an overseer's short update to the person it works for, in its voice (\"I\", plain words, no lists, no headings).\n\
-For each session given, write one or two sentences: where it is, what's next and roughly when, from what it did since the person was last told. Don't mention decisions, questions or anything waiting on the person in these: those are added separately.\n\
-For each decision given, write its action: what you did, in at most 70 characters, as one short sentence (\"Lifted my hold on tonight's release.\", \"Let web wait for CI.\"); and its why: one sentence, the reason. Never quote or repeat the message you sent: the person reads it separately.\n\
-Leave out anything not given; never invent PR numbers, names or times. Answer with JSON only: {\"sessions\": [{\"id\": \"<session id>\", \"text\": \"<paragraph>\"}], \"decisions\": [{\"id\": \"<decision id>\", \"action\": \"<short line>\", \"why\": \"<one sentence>\"}]}.";
+pub const COMPOSER_SYSTEM: &str = "You write parts of an overseer's short update to the person it works for, in its voice (\"I\", plain words, no lists, no headings). Critical facts only: never retell a plan, never quote a message.\n\
+headline: the whole update in at most 12 words (\"Unblocked web's release; one thing needs you.\").\n\
+For each session given, write one sentence of at most 25 words: where it is and what's next, from what it did since the person was last told. Don't mention decisions, questions or anything waiting on the person in these: those are added separately.\n\
+For each decision given, write its action: what you did, in at most 12 words (\"Lifted my hold on tonight's release.\", \"Let web wait for CI.\"); and its why: the reason in at most 8 words (\"CI is green again\"). Never quote or repeat the message you sent: the person reads it separately.\n\
+Leave out anything not given; never invent PR numbers, names or times. Answer with JSON only: {\"headline\": \"<line>\", \"sessions\": [{\"id\": \"<session id>\", \"text\": \"<sentence>\"}], \"decisions\": [{\"id\": \"<decision id>\", \"action\": \"<short line>\", \"why\": \"<few words>\"}]}.";
+
+/// The most words of a session's sentence in an update.
+pub const SESSION_WORDS: usize = 25;
 
 /// What the composer is given of each session: its id, name, purpose,
 /// what it did since it was last told, now, next and what it waits on.
@@ -522,6 +841,7 @@ pub fn composer_decisions(decisions: &[BossDecision]) -> String {
 /// What the composer wrote, by session and by decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Composed {
+    pub headline: Option<String>,
     pub sessions: HashMap<Uuid, String>,
     /// Each decision's short line and why, as written.
     pub decisions: HashMap<Uuid, (String, String)>,
@@ -542,10 +862,17 @@ pub fn parse_composed(answer: &str) -> Option<Composed> {
             .filter(|t| !t.is_empty())
             .map(str::to_string)
     };
-    let mut out = Composed::default();
+    let mut out = Composed {
+        headline: v["headline"]
+            .as_str()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string),
+        ..Default::default()
+    };
     let sessions = v["sessions"].as_array();
     let decisions = v["decisions"].as_array();
-    if sessions.is_none() && decisions.is_none() {
+    if sessions.is_none() && decisions.is_none() && out.headline.is_none() {
         return None;
     }
     for s in sessions.into_iter().flatten() {
@@ -554,11 +881,75 @@ pub fn parse_composed(answer: &str) -> Option<Composed> {
         }
     }
     for d in decisions.into_iter().flatten() {
-        if let (Some(id), Some(action), why) = (id_of(d), text_of(d, "action"), text_of(d, "why")) {
-            out.decisions.insert(id, (action, why.unwrap_or_default()));
+        let (action, why) = (text_of(d, "action"), text_of(d, "why"));
+        if let (Some(id), true) = (id_of(d), action.is_some() || why.is_some()) {
+            out.decisions
+                .insert(id, (action.unwrap_or_default(), why.unwrap_or_default()));
         }
     }
     Some(out)
+}
+
+/// What of `c` is over its bounds, said for the composer to write again:
+/// the headline past [`HEADLINE_WORDS`], a session's sentence past
+/// [`SESSION_WORDS`], a decision's action past
+/// [`crate::decision::BRIEF_WORDS`] words or [`crate::decision::BRIEF_CHARS`]
+/// characters, its why past [`crate::decision::WHY_WORDS`] words.
+pub fn too_long(c: &Composed) -> Vec<String> {
+    use crate::crew::word_count;
+    use crate::decision::{BRIEF_CHARS, BRIEF_WORDS, WHY_WORDS};
+    let mut out = Vec::new();
+    if c.headline.as_deref().is_some_and(|h| word_count(h) > HEADLINE_WORDS) {
+        out.push(format!("headline (at most {HEADLINE_WORDS} words)"));
+    }
+    let mut sessions: Vec<_> = c.sessions.iter().collect();
+    sessions.sort_by_key(|(id, _)| **id);
+    for (id, text) in sessions {
+        if word_count(text) > SESSION_WORDS {
+            out.push(format!("session {id} text (at most {SESSION_WORDS} words)"));
+        }
+    }
+    let mut decisions: Vec<_> = c.decisions.iter().collect();
+    decisions.sort_by_key(|(id, _)| **id);
+    for (id, (action, why)) in decisions {
+        if word_count(action) > BRIEF_WORDS || action.chars().count() > BRIEF_CHARS {
+            out.push(format!(
+                "decision {id} action (at most {BRIEF_WORDS} words, {BRIEF_CHARS} characters)"
+            ));
+        }
+        if word_count(why) > WHY_WORDS {
+            out.push(format!("decision {id} why (at most {WHY_WORDS} words)"));
+        }
+    }
+    out
+}
+
+/// What the composer is asked the second time, when `fields` of its first
+/// answer were too long: those alone, shorter, in the same JSON.
+pub fn reask(fields: &[String]) -> String {
+    format!(
+        "\n\nYour last answer was too long in: {}. Write only those again, within the limits, \
+         in the same JSON shape (leave out every other field).",
+        fields.join("; ")
+    )
+}
+
+/// `again`'s fields over `first`'s: the second answer's shorter words win.
+pub fn merge_composed(mut first: Composed, again: Composed) -> Composed {
+    if again.headline.is_some() {
+        first.headline = again.headline;
+    }
+    first.sessions.extend(again.sessions);
+    for (id, (action, why)) in again.decisions {
+        let e = first.decisions.entry(id).or_default();
+        if !action.is_empty() {
+            e.0 = action;
+        }
+        if !why.is_empty() {
+            e.1 = why;
+        }
+    }
+    first
 }
 
 /// Each of `decisions` as the update carries it: the composer's short line
@@ -710,6 +1101,7 @@ mod tests {
                 holding_up: None,
                 recommendation: None,
                 options: vec![],
+                detail: None,
             }],
             footer: footer(410, 500),
             ..Default::default()
@@ -742,6 +1134,7 @@ mod tests {
                     holding_up: None,
                     recommendation: None,
                     options: vec![],
+                    detail: None,
                 }],
                 ..Default::default()
             },
@@ -824,8 +1217,158 @@ mod tests {
         let plain = decision_lines(std::slice::from_ref(&d), &HashMap::new()).remove(0);
         assert_eq!(plain.action, "Sent web a message.");
         assert!(plain.action.chars().count() <= crate::decision::BRIEF_CHARS);
-        assert!(COMPOSER_SYSTEM.contains("at most 70 characters"));
+        assert!(COMPOSER_SYSTEM.contains("at most 12 words"));
         assert!(composer_decisions(&[d]).contains("message sent (don't quote it)"));
+    }
+
+    fn item_of(new: &crate::open_item::NewItem) -> OpenItem {
+        let now = Utc::now();
+        OpenItem {
+            id: Uuid::new_v4(),
+            boss: new.boss.clone(),
+            owner: "you".into(),
+            kind: new.kind,
+            session: new.session,
+            line_message: None,
+            text: new.text.clone(),
+            holding_up: new.holding_up.clone(),
+            recommendation: new.recommendation.clone(),
+            options: new.options.clone(),
+            generalizes: None,
+            done_when: None,
+            dedupe_key: new.dedupe_key.clone(),
+            opened_at: now,
+            last_said_at: None,
+            said_count: 1,
+            raised_at: None,
+            sessions: vec![],
+            changed_at: now,
+            state: crate::open_item::OpenState::Open,
+            closed_at: None,
+            closed_by: None,
+            closed_why: None,
+            layout: Default::default(),
+            prefer_scope: None,
+            cant_decide: None,
+        }
+    }
+
+    #[test]
+    fn the_brief_is_three_lines_at_most_what_was_left_alone_a_count() {
+        let web = Uuid::new_v4();
+        let at = |d: BossDecision, mins: i64| BossDecision {
+            session: Some(web),
+            at: Utc::now() - Duration::minutes(mins),
+            ..d
+        };
+        let acted: Vec<BossDecision> = (0..4)
+            .map(|n| at(nudge(&format!("Message number {n} for web, sent in full.")), n))
+            .collect();
+        let alone = |n| {
+            at(
+                BossDecision::new(
+                    "desk",
+                    crate::decision::Need::TurnEnd,
+                    "nothing",
+                    "Still running its tests.",
+                    crate::decision::How::Own,
+                ),
+                n,
+            )
+        };
+        let mut left = alone(9);
+        left.kind = crate::decision::DecisionKind::LeftAlone;
+        let mut left2 = alone(10);
+        left2.kind = crate::decision::DecisionKind::LeftAlone;
+        let mut rows = acted.clone();
+        rows.push(left);
+        rows.push(left2);
+        let lines = decision_lines(&rows, &HashMap::new());
+        let mut todo = crate::open_item::NewItem::ask(
+            "desk",
+            crate::open_item::OpenKind::Todo,
+            None,
+            "Rotate the staging deploy key: it is in your own vault account, which I can't reach.",
+        );
+        todo.holding_up = Some("The staging deploy waits on it.".into());
+        let item = item_of(&todo);
+        let names = HashMap::from([(web, "acme-web".to_string())]);
+        let (groups, more) = brief(&rows, &lines, std::slice::from_ref(&item), &names);
+        // What only the person can do first, then the newest it did.
+        assert_eq!(groups[0].session_id, None);
+        assert_eq!(groups[0].label, CREW_LABEL);
+        assert_eq!(groups[0].items[0].kind, BriefKind::ForYou);
+        assert_eq!(
+            groups[0].items[0].action,
+            "Rotate the staging deploy key: it is in your own vault account…"
+        );
+        assert_eq!(
+            groups[0].items[0].why.as_deref(),
+            Some("the staging deploy waits on it")
+        );
+        let web_group = &groups[1];
+        assert_eq!(web_group.label, "acme-web");
+        assert_eq!(web_group.items.len(), 2);
+        assert_eq!(web_group.items[0].id, acted[0].id.to_string());
+        assert_eq!(web_group.items[0].action, "Sent web a message");
+        assert_eq!(web_group.items[0].why.as_deref(), Some("you confirmed it yourself at 15:33"));
+        assert_eq!(web_group.left_alone, 2);
+        assert_eq!(more, 2);
+        let mut u = MentionedUpdate {
+            brief: groups,
+            more_items: more,
+            ..Default::default()
+        };
+        u.headline = plain_headline(&u);
+        assert_eq!(u.headline, "4 done, 1 for you, 2 left alone.");
+        let text = render(&u, &[]);
+        assert_eq!(
+            text,
+            "4 done, 1 for you, 2 left alone.\n\n\
+             ● For you: Rotate the staging deploy key: it is in your own vault account… — the staging deploy waits on it\n\
+             ✓ Sent web a message — you confirmed it yourself at 15:33\n\
+             ✓ Sent web a message — you confirmed it yourself at 15:33\n\
+             +2 more\n\
+             Left alone: 2 times."
+        );
+        assert!(!text.contains("Message number"));
+        // The wire: every brief field there, null when none.
+        let v = serde_json::to_value(&u).unwrap();
+        let first = &v["brief"][1]["items"][0];
+        for k in ["id", "kind", "action", "why", "detail", "undo", "settledBy", "at"] {
+            assert!(first.get(k).is_some(), "{k} in {first}");
+        }
+        assert_eq!(v["brief"][0]["items"][0]["kind"], "forYou");
+        assert_eq!(v["moreItems"], 2);
+        assert_eq!(v["brief"][1]["leftAlone"], 2);
+    }
+
+    #[test]
+    fn what_is_past_its_bounds_is_named_for_the_reask() {
+        let id = Uuid::new_v4();
+        let c = Composed {
+            headline: Some("one two three four five six seven eight nine ten eleven twelve thirteen".into()),
+            sessions: HashMap::new(),
+            decisions: HashMap::from([(id, ("Held it.".to_string(), "one two three four five six seven eight nine".to_string()))]),
+        };
+        let long = too_long(&c);
+        assert_eq!(
+            long,
+            vec![
+                "headline (at most 12 words)".to_string(),
+                format!("decision {id} why (at most 8 words)"),
+            ]
+        );
+        assert!(reask(&long).contains("too long in: headline (at most 12 words);"));
+        let again = Composed {
+            headline: Some("Held the release.".into()),
+            sessions: HashMap::new(),
+            decisions: HashMap::from([(id, (String::new(), "CI failed".to_string()))]),
+        };
+        let merged = merge_composed(c, again);
+        assert_eq!(merged.headline.as_deref(), Some("Held the release."));
+        assert_eq!(merged.decisions[&id], ("Held it.".to_string(), "CI failed".to_string()));
+        assert!(too_long(&merged).is_empty());
     }
 
     #[test]
@@ -868,9 +1411,10 @@ mod tests {
             closed_why: None,
             layout: Default::default(),
             prefer_scope: None,
+            cant_decide: None,
         };
         // Plainly: its first sentence, no points, nothing recommended.
-        let plain = NeedsYou::of(&i, now);
+        let plain = NeedsYou::of(&i, now, false);
         assert_eq!(
             plain.question,
             "Two staging records need a decision before PR 3 can go."
@@ -886,7 +1430,7 @@ mod tests {
             recommended: Some("deactivate · leave it empty".into()),
             not_blocking: Some("The docs PR doesn't depend on it.".into()),
         };
-        let laid = NeedsYou::of(&i, now);
+        let laid = NeedsYou::of(&i, now, false);
         assert_eq!(laid.question, "Two records need a decision.");
         assert_eq!(laid.items, vec!["A user with no organisation.".to_string()]);
         assert_eq!(

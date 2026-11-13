@@ -170,7 +170,7 @@ async fn an_action_by_a_preference_cites_it_and_only_the_citation_is_checked() {
             by_pref.why
         );
         assert!(
-            by_pref.said().contains("make it wait for green"),
+            by_pref.said().contains("per your preference"),
             "{}",
             by_pref.said()
         );

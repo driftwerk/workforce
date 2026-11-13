@@ -38,7 +38,7 @@ use workforce_desk::crew::{self, Extras, ItemRefused, MentionedApproval};
 use workforce_desk::line::{Asked, LineKind};
 use workforce_desk::model::{DeskEvent, SessionState};
 use workforce_desk::open_item::{
-    self, ClosedBy, NewItem, OpenItem, OpenKind, OpenState, FIRST_RESTATE, LAPSE_AFTER,
+    self, ClosedBy, NewItem, OpenItem, OpenKind, OpenState, DONE_WHY, FIRST_RESTATE, LAPSE_AFTER,
     RESTATED_AT_ONCE, SWEEP_AFTER,
 };
 
@@ -56,7 +56,11 @@ pub const OPEN: &str = "crew.open_items";
 pub const PROMISE: &str = "crew.promise";
 pub const ORDER: &str = "crew.order";
 
-pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). For the update's layout, also give it in one line (question), its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
+pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message, one line (question, at most 15 words), with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Never retell a session's plan: the full text (text) and what it holds up (holding_up) sit behind \"more\". Give your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"); also its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). For what only the person can physically do (rotate their credentials), use kind todo: one line, no answers. At Act fully, decide and act instead of asking; ask with answers only when you truly can't decide, saying why (cant_decide). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
+/// What `crew.ask` says at Act fully to an ask that gave no reason it
+/// couldn't decide.
+const ACT_FULLY_ASK: &str = "At Act fully you decide and act yourself: do it, and the person reads what you did in your update. For what only the person can physically do (rotate their own credentials, sign in), use kind todo: one line, no answers. Ask with answers only when you truly can't decide, and say why (cant_decide).";
+
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself.";
 pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
@@ -79,14 +83,15 @@ pub fn schema(name: &str) -> Value {
     match name {
         ASK => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "What you ask, in full, readable cold" },
-            "kind": { "type": "string", "enum": ["ask", "confirm"], "description": "ask (default), or confirm a decision you took" },
+            "kind": { "type": "string", "enum": ["ask", "confirm", "todo"], "description": "ask (default), confirm a decision you took, or todo: what only the person can physically do (one line, no answers; they mark it Done)" },
+            "cant_decide": { "type": "string", "description": "At Act fully: why you can't decide this yourself. Without it, at Act fully you decide and act instead of asking" },
             "session_id": { "type": "string", "description": "The session it is about, if one (from crew.overview)" },
             "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
             "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
-            "question": { "type": "string", "description": "The ask in one line, shown bold above the rest, e.g. \"Two staging records need a decision before the next PR.\"" },
-            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers, each one short line, at most 6, when there are several" },
+            "question": { "type": "string", "description": "The ask in one line of at most 15 words, shown alone; the rest goes in text, behind \"more\". E.g. \"Two staging records need a decision before the next PR.\"" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers when there are several: the person is shown at most 2, each at most 12 words" },
             "recommended": { "type": "string", "description": "The one of options you recommend, word for word" },
             "not_blocking": { "type": "string", "description": "What carries on meanwhile, e.g. \"The docs PR doesn't depend on it\"" },
             "scope": { "type": "string", "description": "With generalizes: what the person's \"always\" would cover: all (default), group:<id>, or repo:<owner/name> when the case is about a repository's work (merging, deploying)" }
@@ -110,16 +115,13 @@ pub fn schema(name: &str) -> Value {
     }
 }
 
-/// An item's text as a needs-you post.
+/// An item as a needs-you post: one line, the rest behind "more" in its
+/// extras ([`OpenItem::detail`]); what only the person can do is "For you".
 pub(super) fn needs_you(i: &OpenItem) -> String {
-    let mut s = format!("**Needs you.** {}", i.text);
-    if let Some(h) = i.holding_up.as_deref().filter(|h| !h.trim().is_empty()) {
-        s.push_str(&format!("\n\nHolding up: {}", h.trim()));
+    match i.kind {
+        OpenKind::Todo => format!("**For you.** {}", i.headline()),
+        _ => format!("**Needs you.** {}", i.headline()),
     }
-    if let Some(r) = i.recommendation.as_deref().filter(|r| !r.trim().is_empty()) {
-        s.push_str(&format!("\n\nI'd say: {}", r.trim()));
-    }
-    s
 }
 
 /// The session a watcher key (`{kind}:{session}:…`) is about.
@@ -241,8 +243,36 @@ impl CrewHub {
         let kind = match input["kind"].as_str() {
             None | Some("ask") => OpenKind::Ask,
             Some("confirm") => OpenKind::Confirm,
-            Some(_) => return Err("kind is ask or confirm.".into()),
+            Some("todo") => OpenKind::Todo,
+            Some(_) => return Err("kind is ask, confirm or todo.".into()),
         };
+        let some_of = |k: &str| {
+            input[k]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let cant_decide = some_of("cant_decide");
+        // At Act fully the boss decides and acts; it asks only what it
+        // truly can't decide, and says why.
+        if kind != OpenKind::Todo && cant_decide.is_none() {
+            let full = self
+                .overseer_named(boss)
+                .is_some_and(|(_, o)| self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full);
+            if full {
+                return Err(ACT_FULLY_ASK.into());
+            }
+        }
+        // Its one line is one line: a long one is asked again, shorter.
+        if let Some(q) = some_of("question") {
+            if crew::word_count(&q) > open_item::QUESTION_WORDS || q.contains('\n') {
+                return Err(format!(
+                    "question is one line of at most {} words; put the rest in text.",
+                    open_item::QUESTION_WORDS
+                ));
+            }
+        }
         let session = match input["session_id"].as_str() {
             Some(s) => {
                 let id: Uuid = s
@@ -266,6 +296,14 @@ impl CrewHub {
             Some(s) => Some(workforce_desk::preference::PrefScope::parse(&s)?.text()),
             None => None,
         };
+        // The person is in that session themselves: it's theirs.
+        if let Some(s) = session {
+            if self.person_in(s, crew::now() - self.desk.hold_for(boss)) {
+                return Ok(json!(
+                    "Not asked: the person is in that session themselves right now, so it's theirs. Don't ask about it; carry on with the rest."
+                ));
+            }
+        }
         let mut new = NewItem::ask(boss, kind, session, text).generalizing(some("generalizes"));
         new.holding_up = some("holding_up");
         new.recommendation = some("recommendation");
@@ -327,6 +365,7 @@ impl CrewHub {
             .take(open_item::POINTS)
             .map(|p| crew::one_line(p, open_item::POINT_CHARS))
             .collect();
+        new.cant_decide = cant_decide;
         new.layout = open_item::AskLayout {
             question: some("question")
                 .map(|q| crew::one_line(&q, workforce_desk::update::QUESTION_CHARS)),
@@ -671,6 +710,74 @@ impl CrewHub {
         }
     }
 
+    /// Whether the person has taken part in `session` themselves since
+    /// `since` (typed, prompted, wrote or answered there), or has its wheel
+    /// now: then the boss says nothing about its questions.
+    pub(crate) fn person_in(&self, session: Uuid, since: DateTime<Utc>) -> bool {
+        // Since then, or within the wheel's hold of now: they are at it.
+        let since = since.min(crew::now() - workforce_desk::charge::HOLD);
+        self.desk
+            .person_input_at(session)
+            .is_some_and(|at| at > since)
+            || self
+                .desk
+                .wheel_of(session)
+                .is_some_and(workforce_desk::charge::Wheel::person)
+    }
+
+    /// Settles `boss`'s open asks about a session the person has taken
+    /// part in since each was opened: closed as theirs, its question on
+    /// the line set aside, and said as `settled` so Desk folds what still
+    /// lists it. What only the person can do stays theirs to mark Done.
+    pub(crate) async fn settle_in_sessions(&self, boss: &str) {
+        let store = self.desk.store();
+        let open = match store.items_not_closed(Some(boss)).await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::info!(error = %e, "a boss's open items couldn't be read to settle");
+                return;
+            }
+        };
+        for i in open {
+            let Some(s) = i.session else { continue };
+            if !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm) || !i.said() {
+                continue;
+            }
+            if self
+                .desk
+                .person_input_at(s)
+                .is_none_or(|at| at <= i.opened_at)
+            {
+                continue;
+            }
+            match store
+                .item_close(i.id, ClosedBy::Person, open_item::SETTLED_WHY)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::info!(error = %e, "an item settled in its session wasn't closed");
+                    continue;
+                }
+            }
+            if let Some(ask) = i.line_message {
+                if let Err(e) = self.desk.line_dismiss(ask).await {
+                    tracing::info!(error = ?e, "a settled item's question wasn't set aside");
+                }
+            }
+            self.desk.note(
+                workforce_desk::crew::Event::new(
+                    workforce_desk::crew::Kind::Settled,
+                    crew::Party::you(),
+                    self.desk.view(s).ok().map(|v| crew::Party::session(&v)),
+                    format!("settled in {}: {}", self.name_of_session(s), i.headline()),
+                )
+                .detail(json!({ "itemId": i.id.to_string(), "by": "you" })),
+            );
+        }
+    }
+
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
     /// for a check-in. While the person types to the boss it goes once they
@@ -684,8 +791,13 @@ impl CrewHub {
         text: String,
         approvals: Vec<MentionedApproval>,
     ) -> bool {
+        // At Act fully the boss recommends nothing, and offers answers only
+        // where it said why it couldn't decide.
+        let full = self
+            .overseer_named(boss)
+            .is_some_and(|(_, o)| self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full);
         let extras = Extras {
-            item: Some(i.mention()),
+            item: Some(i.mention_at(full)),
             approvals,
             ..Default::default()
         };
@@ -872,6 +984,30 @@ impl CrewHub {
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?;
         Ok("Dropped.".into())
+    }
+
+    /// The person did what item `id` left to them only (a "for you"
+    /// line's Done): it closes as theirs. Only what only they can do.
+    pub(crate) async fn done_item(&self, id: Uuid) -> Result<String, ItemRefused> {
+        let store = self.desk.store();
+        let item = store
+            .open_item(id)
+            .await
+            .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
+            .ok_or(ItemRefused::NotFound)?;
+        if item.state == OpenState::Closed {
+            return Err(ItemRefused::Closed);
+        }
+        if item.kind != OpenKind::Todo {
+            return Err(ItemRefused::Cant(
+                "That asks for an answer, not Done.".into(),
+            ));
+        }
+        store
+            .item_close(id, ClosedBy::Person, DONE_WHY)
+            .await
+            .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?;
+        Ok("Done.".into())
     }
 
     /// What `boss` owes the person, as its turns are given it.
@@ -1378,6 +1514,7 @@ mod tests {
                     closed_by: None,
                     closed_why: None,
                     layout: Default::default(),
+                    cant_decide: None,
                 }
             })
             .collect();

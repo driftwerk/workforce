@@ -87,9 +87,15 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
             post.desk.as_ref().and_then(|m| m.delivery),
             Some(workforce_common::channels::desk::DeliveryKind::Question)
         );
-        assert!(post.content.contains("Holding up: The billing migration"), "{}", post.content);
+        // What it holds up is behind "more", never in the line.
+        assert!(!post.content.contains("Holding up"), "{}", post.content);
         let extras = d.store().extras(std::slice::from_ref(&post.id)).await.unwrap();
         let item = extras[&post.id].item.clone().expect("its buttons");
+        assert!(
+            item.detail.as_deref().unwrap_or_default().contains("Holding up: The billing migration"),
+            "{:?}",
+            item.detail
+        );
         assert_eq!(item.options, vec!["Merge", "Wait for green"]);
         assert_eq!(item.recommendation.as_deref(), Some("Wait for green"));
 
@@ -125,7 +131,12 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
         let mut laid = again.clone();
         laid.as_object_mut().unwrap().remove("options");
         laid["recommended"] = json!("wait FOR green ");
-        laid["question"] = json!("Merge with CI red?\nThe e2e job is flaky.");
+        // A question of two lines is asked again, as one.
+        let mut two = laid.clone();
+        two["question"] = json!("Merge with CI red?\nThe e2e job is flaky.");
+        let r = call(&crew, super::super::items::ASK, two).await;
+        assert!(!r.success, "two lines");
+        laid["question"] = json!("Merge with CI red?");
         laid["items"] = json!((0..9).map(|n| format!("Point {n} {}", "x".repeat(200))).collect::<Vec<_>>());
         laid["not_blocking"] = json!("The docs PR carries on.\nSo does the export.");
         let r = call(&crew, super::super::items::ASK, laid).await;
@@ -141,7 +152,7 @@ async fn an_ask_is_one_item_posted_at_once_and_survives_a_rollover() {
         assert_eq!(i.layout.points.len(), 6);
         assert!(i.layout.points.iter().all(|p| p.chars().count() <= 120));
         assert_eq!(i.layout.not_blocking.as_deref(), Some("The docs PR carries on."));
-        let n = workforce_desk::update::NeedsYou::of(&i, chrono::Utc::now());
+        let n = workforce_desk::update::NeedsYou::of(&i, chrono::Utc::now(), false);
         assert_eq!(
             n.options.iter().map(|o| o.recommended).collect::<Vec<_>>(),
             vec![false, true]
@@ -807,6 +818,161 @@ async fn an_answer_that_doesnt_reach_the_boss_opens_its_item_again() {
             .await
             .unwrap();
         assert!(!d.store().item_reopen(closed.id).await.unwrap());
+    })
+    .await;
+}
+
+const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
+                    [oversight.full]\nrepos = [\"acme/acme-web\"]\n";
+
+/// The first screenshot's case: at Act fully, what only the person can do
+/// (rotate their own key) is never asked with answers or a recommendation.
+/// Asked so, it is refused; as a todo it is one "For you." line with no
+/// buttons, closed by its Done.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_what_only_the_person_can_do_is_one_line_with_done() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", FULL, &[]).await;
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        let text = "acme-api's CI log printed the staging deploy key. The key is in your own vault account, which I can't reach, so I can't rotate it myself. My plan once it's rotated: re-run the deploy, then check the bucket's access log for the last day.";
+        let ask = json!({
+            "text": text,
+            "session_id": s.id.to_string(),
+            "options": ["Rotate now", "After the release", "Leave it"],
+            "recommendation": "Rotate now: the log is readable across the org.",
+            "holding_up": "The staging deploy waits on a fresh key",
+        });
+        let r = call(&crew, super::super::items::ASK, ask.clone()).await;
+        assert!(!r.success, "asked with answers at Act fully");
+        assert!(
+            r.error.as_deref().unwrap_or_default().contains("kind todo"),
+            "{:?}",
+            r.error
+        );
+        assert!(dm_posts(&overseer, "**Needs you.**").is_empty());
+
+        let mut todo = ask.clone();
+        todo["kind"] = json!("todo");
+        todo["question"] = json!("Rotate the staging deploy key in your vault.");
+        let r = call(&crew, super::super::items::ASK, todo).await;
+        assert!(r.success, "{:?}", r.error);
+        let post = eventually("the for-you post", async || {
+            dm_posts(&overseer, "**For you.**").into_iter().next()
+        })
+        .await;
+        assert_eq!(
+            post.content.lines().next().unwrap_or_default(),
+            "**For you.** Rotate the staging deploy key in your vault."
+        );
+        assert!(!post.content.contains("My plan"), "{}", post.content);
+        assert!(!post.content.contains("Rotate now"), "{}", post.content);
+        let extras = d.store().extras(std::slice::from_ref(&post.id)).await.unwrap();
+        let item = extras[&post.id].item.clone().expect("its card");
+        assert!(item.options.is_empty(), "{:?}", item.options);
+        assert_eq!(item.recommendation, None);
+        assert!(item.for_you);
+        let id: uuid::Uuid = item.item_id.parse().unwrap();
+
+        assert_eq!(crew.done_item(id).await.unwrap(), "Done.");
+        let closed = d.store().open_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            (closed.state, closed.closed_by, closed.closed_why.as_deref()),
+            (OpenState::Closed, Some(ClosedBy::Person), Some("You did it."))
+        );
+        assert_eq!(crew.done_item(id).await, Err(ItemRefused::Closed));
+    })
+    .await;
+}
+
+/// The second screenshot's case: a session's question while the person is
+/// typing in that session is theirs, and nothing is posted; one posted
+/// before they stepped in is settled at the next look, said as `settled`,
+/// and the update that listed it reads as settled by them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        d.person_typing(s.id).unwrap();
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Should I drop the staging orders table and re-seed it from the fixtures, or migrate the rows in place? The fixtures are a week old.", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        let q = d.store().line_message(ask).await.unwrap().unwrap();
+        crew.post_question(&q).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(dm_posts(&overseer, "acme-web asks:").is_empty(), "nothing posted");
+        assert!(d.store().item_of_line(ask).await.unwrap().is_none());
+
+        // Asked of the person before they stepped in: posted, then settled.
+        let other = new_session(&d, dir.path(), "acme-api").await;
+        let asked = d
+            .line_call(
+                other.id,
+                "ask",
+                &json!({"to": "desk", "text": "May I bump the API's rate limit to 200 a minute for the load test?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        let q = d.store().line_message(ask).await.unwrap().unwrap();
+        crew.post_question(&q).await;
+        let card = eventually("the card", async || {
+            dm_posts(&overseer, "acme-api asks:").into_iter().next()
+        })
+        .await;
+        let item = d.store().item_of_line(ask).await.unwrap().expect("its item");
+        let (_, mut events) = d.subscribe();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        d.person_typing(other.id).unwrap();
+        crew.look_at_updates().await;
+        let closed = eventually("settled", async || {
+            d.store()
+                .open_item(item.id)
+                .await
+                .unwrap()
+                .filter(|i| i.state == OpenState::Closed)
+        })
+        .await;
+        assert_eq!(
+            closed.closed_why.as_deref(),
+            Some(workforce_desk::open_item::SETTLED_WHY)
+        );
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(workforce_desk::model::DeskEvent::Activity { event }) = events.recv().await {
+                    if event.kind == Kind::Settled {
+                        return event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the settled event");
+        let detail = settled.detail.clone().unwrap_or_default();
+        assert_eq!(detail["itemId"], json!(item.id.to_string()));
+        assert_eq!(detail["by"], json!("you"));
+        assert_eq!(
+            workforce_desk::open_item::settled_by(&closed),
+            Some(workforce_desk::update::SettledBy::You)
+        );
+        assert!(!card.content.is_empty());
     })
     .await;
 }

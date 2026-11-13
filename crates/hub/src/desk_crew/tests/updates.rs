@@ -42,7 +42,7 @@ struct Deciding {
 #[async_trait::async_trait]
 impl UpdateWriter for Deciding {
     async fn write(&self, _: &str, _: &str, system: &str, user: &str) -> eyre::Result<String> {
-        assert!(system.contains("at most 70 characters"));
+        assert!(system.contains("at most 12 words"));
         let ids = |prefix: &str| -> Vec<String> {
             user.lines()
                 .filter_map(|l| l.strip_prefix(prefix))
@@ -63,6 +63,41 @@ impl UpdateWriter for Deciding {
             sessions.join(", "),
             serde_json::Value::from(decisions)
         ))
+    }
+}
+
+/// A writer whose first answer is too long and whose second is `again`
+/// (too long too, or within bounds), counting its calls.
+struct Reasking {
+    again: (String, String, String),
+    calls: std::sync::atomic::AtomicUsize,
+    asked: parking_lot::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl UpdateWriter for Reasking {
+    async fn write(&self, _: &str, _: &str, _: &str, user: &str) -> eyre::Result<String> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.asked.lock().push(user.to_string());
+        let ids: Vec<String> = user
+            .lines()
+            .filter_map(|l| l.strip_prefix("Decision "))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
+        let (headline, action, why) = match n {
+            0 => (
+                "Today I put a hold on tonight's release of acme-web and told the person all about it",
+                "Put a hold on tonight's release of acme-web until the migration check passes on staging",
+                "Because the migration check failed twice on staging this afternoon and it might again",
+            ),
+            _ => (self.again.0.as_str(), self.again.1.as_str(), self.again.2.as_str()),
+        };
+        let decisions: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "action": action, "why": why}))
+            .collect();
+        Ok(serde_json::json!({"headline": headline, "decisions": decisions}).to_string())
     }
 }
 
@@ -174,7 +209,7 @@ async fn nothing_changed_is_no_post_and_a_result_goes_out_within_the_gather() {
         assert!(
             posted
                 .content
-                .starts_with("**acme-web** — PR #622 is up; I'll merge it once CI is green."),
+                .contains("**acme-web** — PR #622 is up; I'll merge it once CI is green."),
             "{}",
             posted.content
         );
@@ -239,7 +274,7 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             assert!(
                 posted
                     .content
-                    .starts_with("**acme-web** — Done: Merged PR #622. Next: Deploy it."),
+                    .contains("**acme-web** — Done: Merged PR #622. Next: Deploy it."),
                 "written plainly: {}",
                 posted.content
             );
@@ -345,8 +380,23 @@ async fn decisions_and_needs_you_are_laid_out() {
             );
             assert!(l.action.chars().count() <= 70);
             assert_eq!(l.message.as_deref(), Some(message));
-            // The text the chat falls back on still says it in full.
-            assert!(posted.content.contains(message), "{}", posted.content);
+            // The text is the brief: its headline and short lines, never
+            // the message it sent.
+            assert!(!posted.content.contains(message), "{}", posted.content);
+            assert_eq!(u.headline, "1 done, 1 waiting on you.");
+            assert!(posted.content.starts_with(&u.headline), "{}", posted.content);
+            let b = &u.brief[0];
+            assert_eq!(b.session_id.as_deref(), Some(s.id.to_string().as_str()));
+            assert_eq!(b.label, "acme-web");
+            assert_eq!(b.items[0].kind, workforce_desk::update::BriefKind::Done);
+            assert_eq!(b.items[0].action, expect_action.trim_end_matches('.'));
+            assert_eq!(
+                b.items[0].why.as_deref(),
+                workforce_desk::decision::clause(expect_why).as_deref()
+            );
+            assert!(posted
+                .content
+                .contains(&format!("✓ {}", b.items[0].action)), "{}", posted.content);
             let n = &u.needs_you[0];
             assert_eq!(n.question, "Two staging records need a decision.");
             assert_eq!(n.items, vec!["A user with no organisation.".to_string()]);
@@ -523,4 +573,78 @@ async fn left_alone_only_asks_the_composer_nothing() {
         assert_eq!(writer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     })
     .await;
+}
+
+/// What the composer writes past its bounds is asked again once, listing
+/// only those fields; still too long, it is clipped: never over the limits.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_long_update_is_asked_again_once_then_clipped() {
+    let long = (
+        "Today I put a hold on tonight's release of acme-web and told the person all about it",
+        "Put a hold on tonight's release of acme-web until the migration check passes on staging",
+        "Because the migration check failed twice on staging this afternoon and it might again",
+    );
+    for (again, expect) in [
+        (
+            ("Held acme-web's release.", "Put a hold on tonight's release.", "The migration check failed."),
+            ("Held acme-web's release.", "Put a hold on tonight's release", "the migration check failed"),
+        ),
+        (
+            long,
+            (
+                "Today I put a hold on tonight's release of acme-web and told…",
+                // Still past its bounds: the row's own line.
+                "Sent acme-web a message",
+                "Because the migration check failed twice on staging…",
+            ),
+        ),
+    ] {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+            let writer = Arc::new(Reasking {
+                again: (again.0.into(), again.1.into(), again.2.into()),
+                calls: Default::default(),
+                asked: Default::default(),
+            });
+            crew.set_update_writer(writer.clone());
+            begun(&crew).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            crew.perform(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: "Hold the release until the migration check passes on staging.".into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("The migration check failed on staging.").unwrap(),
+            )
+            .await
+            .unwrap();
+            let posted =
+                eventually("the update", async || updates(&overseer).into_iter().next()).await;
+            let u = eventually("its extras", async || {
+                d.store()
+                    .extras(std::slice::from_ref(&posted.id))
+                    .await
+                    .unwrap()
+                    .remove(&posted.id)
+                    .and_then(|e| e.update)
+            })
+            .await;
+            assert_eq!(writer.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "asked once more");
+            let second = writer.asked.lock()[1].clone();
+            assert!(second.contains("too long in: headline"), "{second}");
+            assert!(second.contains("action (at most 12 words"), "{second}");
+            assert!(second.contains("why (at most 8 words)"), "{second}");
+            assert_eq!(u.headline, expect.0);
+            let item = &u.brief[0].items[0];
+            assert_eq!(item.action, expect.1);
+            assert_eq!(item.why.as_deref(), Some(expect.2));
+            assert!(workforce_desk::crew::word_count(&u.headline) <= 12);
+            assert!(workforce_desk::crew::word_count(&item.action) <= 12);
+            assert!(item.action.chars().count() <= 70);
+            assert!(workforce_desk::crew::word_count(item.why.as_deref().unwrap()) <= 8);
+        })
+        .await;
+    }
 }
