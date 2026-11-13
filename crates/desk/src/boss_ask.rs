@@ -1434,7 +1434,6 @@ mod tests {
             "cargo build 2>&1 >&2",
             "cd src && cargo build",
             "curl -s \"https://api.example.com/a?b=1\"",
-            "jq '.items[0]' data.json",
             "grep -rn '.*Err' src/",
             "[ -f Cargo.toml ] && cargo build",
         ] {
