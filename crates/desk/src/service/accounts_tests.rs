@@ -2407,6 +2407,7 @@ async fn a_session_in_a_terminal_of_its_own_on_a_full_plan_has_its_own_need() {
             crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
                 window: Some("five_hour".into()),
                 resets_at: Some(now + chrono::Duration::hours(2)),
+                at: None,
             }),
         );
         d.change(id, |r, _| {
@@ -3033,7 +3034,7 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
         let offered = d.pool_accounts();
         assert_eq!(
             offered,
-            vec![(work, None), (personal, None)],
+            vec![(work, None, None), (personal, None, None)],
             "the default first, no token"
         );
         assert_eq!(
@@ -3044,7 +3045,7 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
         // A call of the hub's own refused on Work: full for Desk too, and
         // offered as such from then on.
         let until = chrono::Utc::now() + chrono::Duration::days(2);
-        d.hub_cooling(work, until);
+        d.hub_cooling(work, until, chrono::Utc::now());
         let need = until_need(&d).await;
         assert!(
             matches!(&need, AccountNeed::Limit { from, .. } if from.id == Some(work)),
@@ -3052,11 +3053,125 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
         );
         assert_eq!(d.pool_accounts()[0].1, Some(until));
         // Told again, nothing new.
-        d.hub_cooling(work, until - chrono::Duration::hours(1));
+        d.hub_cooling(work, until - chrono::Duration::hours(1), chrono::Utc::now());
         assert_eq!(
             d.0.state.lock().standing[&Some(work)].hit_until,
             Some(until)
         );
+    })
+    .await;
+}
+
+/// A refusal Claude Code wrote at `at`, on the weekly window resetting at
+/// `resets`.
+fn weekly_refusal(
+    at: chrono::DateTime<chrono::Utc>,
+    resets: chrono::DateTime<chrono::Utc>,
+) -> crate::limit::LimitHit {
+    crate::limit::LimitHit {
+        window: Some("seven_day".into()),
+        resets_at: Some(resets),
+        at: Some(at),
+    }
+}
+
+#[tokio::test]
+async fn signing_in_again_ends_an_accounts_stop_here_and_in_the_hubs_pool() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, key_options(dir.path(), keys.clone())).await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let week = now + chrono::Duration::days(3);
+        // Refused this morning, by a session and by the hub's own call.
+        let morning = now - chrono::Duration::hours(3);
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&weekly_refusal(morning, week)));
+        }
+        d.hub_cooling(work, week, morning + chrono::Duration::minutes(1));
+        assert_eq!(work_standing(&d, work).full(now), Some(Some(week)));
+        assert_eq!(d.pool_accounts()[0], (work, Some(week), None));
+        // Signed in again: the stop is over, and the hub's pool is told
+        // since when, so its own cooldown from before ends too.
+        let token = crate::engine_accounts::AccountToken::new(GOOD).unwrap();
+        d.renew_account(keys.clone(), work, &token).await.unwrap();
+        let after = chrono::Utc::now();
+        assert_eq!(work_standing(&d, work).full(after), None);
+        let (id, full, cleared) = d.pool_accounts()[0];
+        assert_eq!((id, full), (work, None));
+        assert!(
+            cleared.is_some_and(|c| c >= now && c <= after),
+            "{cleared:?}"
+        );
+        // What was heard before it, told again (the hub still cooling, the
+        // transcript's line read again), locks nothing.
+        d.hub_cooling(work, week, morning + chrono::Duration::minutes(1));
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&weekly_refusal(morning, week)));
+        }
+        assert_eq!(work_standing(&d, work).full(chrono::Utc::now()), None);
+        // A refusal since does.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        d.hub_cooling(work, week, chrono::Utc::now());
+        assert_eq!(
+            work_standing(&d, work).full(chrono::Utc::now()),
+            Some(Some(week))
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_that_succeeds_on_an_account_ends_its_stop() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let week = now + chrono::Duration::days(3);
+        d.hub_cooling(work, week, now - chrono::Duration::minutes(5));
+        assert!(work_standing(&d, work).full(now).is_some());
+        // The hub's own call on it succeeded.
+        d.hub_served(work, chrono::Utc::now());
+        assert_eq!(work_standing(&d, work).full(chrono::Utc::now()), None);
+        assert!(d.pool_accounts()[0].2.is_some(), "the pool is told");
+        // Refused again, then a session's turn on it ends well.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let refused = chrono::Utc::now();
+        d.hub_cooling(work, week, refused);
+        assert!(work_standing(&d, work).full(chrono::Utc::now()).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            // A reply written before that refusal, read late, ends nothing:
+            // the refusal is newer.
+            let earlier = refused - chrono::Duration::milliseconds(1);
+            assert_eq!(Desk::mark_ok(&mut st, &raw, earlier), Some(false));
+            assert_eq!(
+                Desk::mark_ok(&mut st, &raw, chrono::Utc::now()),
+                Some(true),
+                "it ended a stop"
+            );
+        }
+        assert_eq!(work_standing(&d, work).full(chrono::Utc::now()), None);
+        // A transcript's refusal from before that success, read late, is over.
+        {
+            let mut st = d.0.state.lock();
+            let raw = Desk::raw_running(&st, a);
+            let before = now - chrono::Duration::minutes(1);
+            Desk::mark_session_hit(&mut st, a, &raw, Some(&weekly_refusal(before, week)));
+        }
+        assert_eq!(work_standing(&d, work).full(chrono::Utc::now()), None);
     })
     .await;
 }
@@ -3102,6 +3217,7 @@ fn login_at(
                 crate::limit::LimitHit {
                     window: Some("seven_day".into()),
                     resets_at: Some(r),
+                    at: None,
                 },
             )
         }),
@@ -3219,7 +3335,7 @@ async fn only_what_the_session_itself_wrote_of_its_account_is_taken_back() {
         d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
         d.report_usage(weekly(55.0, in_secs(2 * 86_400)), Some(b));
         let pool_until = in_secs(3600);
-        d.hub_cooling(work, pool_until);
+        d.hub_cooling(work, pool_until, chrono::Utc::now());
         d.login_scan_done(a, Some(login_at(login, None))).await;
         assert!(d.0.state.lock().relogged.contains(&a));
         let s = work_standing(&d, work);
@@ -3329,6 +3445,7 @@ async fn a_login_seen_in_the_tail_keeps_the_stop_its_account_had_before_as_its_r
                 Some(&crate::limit::LimitHit {
                     window: Some("seven_day".into()),
                     resets_at: Some(resets),
+                    at: None,
                 }),
                 hit_at,
             );
@@ -3714,7 +3831,17 @@ async fn an_account_whose_sign_in_is_gone_is_signed_in_again_and_keeps_everythin
         {
             let st = d.0.state.lock();
             assert!(!st.links.contains_key(&work), "its link is forgotten");
-            assert!(!st.standing.contains_key(&Some(work)));
+            // What it knew of its plan goes; only when it was signed in
+            // again stays, so a stop from before is over.
+            let standing = &st.standing[&Some(work)];
+            assert!(standing.signed_in_at.is_some());
+            assert_eq!(
+                standing,
+                &crate::engine_accounts::Standing {
+                    signed_in_at: standing.signed_in_at,
+                    ..Default::default()
+                }
+            );
             assert!(!st
                 .prints
                 .contains_key(&super::identities::Raw::Account(work)));
@@ -3753,6 +3880,7 @@ async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_sta
             let hit = |window: &str, resets| crate::limit::LimitHit {
                 window: Some(window.into()),
                 resets_at: Some(resets),
+                at: None,
             };
             // Extra usage spent until 1 Dec; Opus's weekly window spent.
             Desk::mark_session_hit(&mut st, a, &raw, Some(&hit("overage", december)));
@@ -3778,6 +3906,7 @@ async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_sta
             let hit = crate::limit::LimitHit {
                 window: Some("overage".into()),
                 resets_at: Some(december),
+                at: None,
             };
             Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
         }
@@ -3799,6 +3928,7 @@ async fn extra_usage_or_one_models_limit_spent_never_fills_the_account_and_a_sta
             let hit = crate::limit::LimitHit {
                 window: Some("seven_day".into()),
                 resets_at: Some(week),
+                at: None,
             };
             Desk::mark_session_hit(&mut st, a, &raw, Some(&hit));
         }

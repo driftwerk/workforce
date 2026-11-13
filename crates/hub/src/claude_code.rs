@@ -526,6 +526,9 @@ impl ClaudeCodeResult {
             limit: self.limit.clone(),
             usage: self.plan_usage.clone(),
             failed: self.completion == Completion::Failed,
+            succeeded: self.completion == Completion::Success,
+            started_at: chrono::Utc::now()
+                - chrono::Duration::from_std(self.duration).unwrap_or_default(),
             notice: &self.notice,
             stderr_tail: &self.stderr_tail,
             failure_line: self.failure_line(),
