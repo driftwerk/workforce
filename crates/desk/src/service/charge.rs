@@ -309,6 +309,21 @@ impl Desk {
         repo_of_own(&own).is_some_and(|r| r.named(&named, &home))
     }
 
+    /// The repository session `id` works in, as its `origin` names it
+    /// (`owner/name`, lowercased): what a preference scoped to a
+    /// repository covers. `None` when it works in none (or it isn't here).
+    pub fn repo_of_session(&self, id: Uuid) -> Option<String> {
+        let view = self.view(id).ok()?;
+        let own = charge::own_folder(std::path::Path::new(&view.cwd));
+        git_line_within(
+            &own,
+            &["remote", "get-url", "origin"],
+            Duration::from_secs(2),
+        )
+        .and_then(|o| charge::repo_name(&o))
+        .map(|r| r.path)
+    }
+
     /// How long the person's input holds a session `boss` runs, as the hub
     /// last said.
     pub fn hold_for(&self, boss: &str) -> chrono::Duration {
@@ -647,10 +662,11 @@ impl Desk {
         )
     }
 
-    /// Whether `id`'s open request `approval` would read or change an
-    /// agent's own settings (its config, where its budget and limits are),
-    /// as far as Desk can tell: a file it names, or a command that names
-    /// one of those files' folders. What Desk can't read counts as not.
+    /// Whether `id`'s open request `approval` would change an agent's own
+    /// settings (its config, where its oversight, budget and limits are),
+    /// as far as Desk can tell: a file it writes, or a command that may
+    /// write one ([`command_may_touch_settings`]). Reading them is
+    /// allowed. Not knowing where home is yet, everything counts.
     fn touches_agent_settings(&self, id: Uuid, approval: Uuid) -> bool {
         let settings = self.0.state.lock().charges.agent_settings.clone();
         if settings.is_empty() {
@@ -659,8 +675,10 @@ impl Desk {
         let Some(pending) = self.pending_of(id, approval) else {
             return false;
         };
+        // Not knowing where home is, what it reads can't be told: held, as
+        // Desk allows everything else at once (`allow`).
         let Some(home) = self.0.boss_bounds.lock().as_ref().map(|b| b.home.clone()) else {
-            return false;
+            return true;
         };
         let Ok(view) = self.view(id) else {
             return false;
@@ -671,24 +689,34 @@ impl Desk {
             settings.iter().any(|s| p.starts_with(s))
         };
         match &facts.what {
-            charge::What::Change(paths) | charge::What::Read(paths) => {
-                paths.iter().any(|p| named(p))
-            }
-            charge::What::Command(command) => settings.iter().any(|s| {
-                let shown = s.display().to_string();
-                let tilde = s
-                    .strip_prefix(&home)
-                    .map(|rest| format!("~/{}", rest.display()))
-                    .unwrap_or_default();
-                command.contains(&shown) || (!tilde.is_empty() && command.contains(&tilde))
+            // Reading them changes nothing: only a write is the person's.
+            charge::What::Change(paths) => paths.iter().any(|p| named(p)),
+            charge::What::Read(_) | charge::What::Web { .. } | charge::What::Inside => false,
+            charge::What::Command(command) => command_may_touch_settings(
+                command,
+                std::path::Path::new(&view.cwd),
+                &settings,
+                &home,
+            ),
+            // What Desk doesn't read (an MCP server's tool): held when its
+            // input names a workspace, as it may write there. Its input, as
+            // text, is no program Desk knows, so it counts as a write.
+            _ => pending.request.as_ref().is_some_and(|r| {
+                command_may_touch_settings(
+                    &r.input.to_string(),
+                    std::path::Path::new(&view.cwd),
+                    &settings,
+                    &home,
+                )
             }),
-            _ => false,
         }
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
     /// boss runs is acted on only by that boss, and only while it has the
-    /// wheel. Anyone else, and a session no boss runs, is the hub's rule.
+    /// wheel, unless that boss is unbound (Act fully), whom the person
+    /// driving doesn't hold. Anyone else, and a session no boss runs, is
+    /// the hub's rule.
     pub(crate) fn boss_holds(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
         let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
             return Ok(());
@@ -705,12 +733,30 @@ impl Desk {
                 "another boss runs {name}; it's theirs or the person's to act on"
             )));
         }
-        if self.wheel_of(id).is_some_and(Wheel::person) {
+        if self.wheel_of(id).is_some_and(Wheel::person) && !self.full_of(&boss.party.id).unbound {
             return Err(DeskError::Conflict(format!(
                 "the person is driving {name}, so it's theirs to act on now"
             )));
         }
         Ok(())
+    }
+
+    /// Whether `boss` is unbound now, as the hub last said: at Act fully,
+    /// in force. Desk allows what the sessions it oversees ask at once.
+    pub fn boss_unbound(&self, boss: &str) -> bool {
+        self.full_of(boss).unbound
+    }
+
+    /// Whether Desk knows where home is yet: until it does, an unbound
+    /// boss allows nothing, as what a request reaches can't be told.
+    pub fn boss_home_known(&self) -> bool {
+        self.0.boss_bounds.lock().is_some()
+    }
+
+    /// Whether any boss is unbound now: else no request is Desk's to allow
+    /// at once, and nothing need be looked at.
+    pub fn any_boss_unbound(&self) -> bool {
+        self.0.state.lock().charges.full.values().any(|g| g.unbound)
     }
 
     /// `id`'s open request `approval`: the one it waits on, or another of
@@ -749,18 +795,35 @@ impl Desk {
         // what reads or changes an agent's own settings: its budget and
         // limits stay the person's.
         let unbound = self.full_of(&boss.party.id).unbound;
-        if unbound && decision == Decision::Allow && self.touches_agent_settings(id, approval) {
-            return Err(DeskError::Conflict(
-                "it reads or changes an agent's own settings, where its budget and limits are: \
-                 it's the person's to allow"
-                    .into(),
-            ));
+        if unbound && decision == Decision::Allow {
+            // Held by its Desk budget or a breaker of its own, it takes no
+            // turn, and allows nothing either.
+            if let Some(why) = self.agent_held_why(&boss.party.id) {
+                return Err(DeskError::Conflict(format!(
+                    "{} is {why}: it's the person's to allow until they let it go on",
+                    boss.party.name
+                )));
+            }
+            if self.0.boss_bounds.lock().is_none() {
+                return Err(DeskError::Conflict(
+                    "Desk doesn't know yet where home is, so it can't tell what it reaches".into(),
+                ));
+            }
+            if self.touches_agent_settings(id, approval) {
+                return Err(DeskError::Conflict(
+                    "it may read or change an agent's own settings, where its budget and limits \
+                     are: it's the person's to allow"
+                        .into(),
+                ));
+            }
         }
+        // A session Desk's breaker paused goes on only at the person's
+        // word, whoever runs it.
+        self.breaker_refuses_prompt(id, Some(boss))?;
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
         }
         self.boss_holds(id, Some(boss))?;
-        self.breaker_refuses_prompt(id, Some(boss))?;
         // Allowing what it asks drives it; denying makes nothing happen.
         if decision == Decision::Allow {
             self.mode_lets(id, Some(boss))?;
@@ -1435,6 +1498,275 @@ fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
         .filter(|o| o.status.success())?;
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Whether `command`, run in `cwd`, may change one of `settings`
+/// (agents' own config files and folders, each inside its workspace), as
+/// far as its words can tell. It errs towards yes, as Act fully allows
+/// whatever it says no to. A word of it is held when, as a path (`~` and
+/// `$HOME` read as home; a relative one read from `cwd`, from home, and
+/// from every absolute path the command names, as a `cd` may have gone
+/// there):
+/// - it is inside a workspace, or names one of a workspace's own
+///   folders above it short of home (`~/.workforce`, its `agents`);
+/// - it can't be read (a variable, a substitution, a glob) and ends in,
+///   or passes through, a settings file or folder's name.
+///
+/// Words can't catch everything a program might build at run time: the
+/// budget is the person's because Desk's card is how it changes.
+pub(crate) fn command_may_touch_settings(
+    command: &str,
+    cwd: &std::path::Path,
+    settings: &[std::path::PathBuf],
+    home: &std::path::Path,
+) -> bool {
+    use std::path::{Component, Path, PathBuf};
+    // Only what may write is held: a command made only of reads, with no
+    // output sent to a file, changes nothing.
+    if !may_write(command) {
+        return false;
+    }
+    // `p` as its links and `.`/`..` resolve, as far as it exists.
+    fn real(p: &Path) -> PathBuf {
+        let mut lexical = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    lexical.pop();
+                }
+                c => lexical.push(c),
+            }
+        }
+        let mut head = lexical.clone();
+        let mut tail = Vec::new();
+        loop {
+            if let Some(r) = crate::computer::boss::resolve_real(&head) {
+                return tail
+                    .iter()
+                    .rev()
+                    .fold(r, |acc, t: &std::ffi::OsString| acc.join(t));
+            }
+            match (head.file_name().map(|n| n.to_os_string()), head.parent()) {
+                (Some(name), Some(up)) => {
+                    tail.push(name);
+                    head = up.to_path_buf();
+                }
+                _ => return lexical,
+            }
+        }
+    }
+    let home_real = real(home);
+    let roots: Vec<PathBuf> = {
+        let mut r: Vec<PathBuf> = settings
+            .iter()
+            .filter_map(|s| s.parent().map(real))
+            .collect();
+        r.sort();
+        r.dedup();
+        r
+    };
+    // A workspace, or a folder of its above it and short of home.
+    let guarded: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|r| {
+            r.ancestors()
+                .take_while(|a| a.starts_with(&home_real) && *a != home_real)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .chain(roots.iter().cloned())
+        .collect();
+    let names: Vec<String> = settings
+        .iter()
+        .filter_map(|s| s.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let home_s = home.display().to_string();
+    // Quotes and escapes only join what they touch: `.work"force"` is
+    // `.workforce` to the shell.
+    let text = command
+        .replace(['\'', '"', '\\'], "")
+        .replace("${HOME}", &home_s)
+        .replace("$HOME", &home_s);
+    let words: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || ";|&()<>=:,".contains(c))
+        .filter(|w| !w.is_empty())
+        .map(|w| match w {
+            "~" => home_s.clone(),
+            w => match w.strip_prefix("~/") {
+                Some(rest) => format!("{home_s}/{rest}"),
+                None => w.to_string(),
+            },
+        })
+        .collect();
+    let mut bases = vec![real(cwd), home_real.clone()];
+    bases.extend(
+        words
+            .iter()
+            .filter(|w| w.starts_with('/'))
+            .map(|w| real(Path::new(w))),
+    );
+    if bases.iter().any(|b| roots.iter().any(|r| b.starts_with(r))) {
+        return true;
+    }
+    let held = |p: &Path| {
+        let p = real(p);
+        roots.iter().any(|r| p.starts_with(r)) || guarded.contains(&p)
+    };
+    // A word that can't be read (a variable, a substitution, a glob) may
+    // be a path into a workspace, wherever the settings name is said.
+    let unread = |w: &str| w.contains(['$', '`', '*', '?', '[']);
+    // It ends in a settings file or folder's name (`config.toml`,
+    // `$W/heartbeats`), not merely passes one (`~/.local/bin`).
+    let through = |w: &str| {
+        let last = w.trim_end_matches('/').rsplit('/').next().unwrap_or(w);
+        names.iter().any(|n| n == last)
+    };
+    if words.iter().any(|w| unread(w)) && words.iter().any(|w| through(w)) {
+        return true;
+    }
+    words.iter().any(|w| {
+        if unread(w) {
+            return false;
+        }
+        match w.starts_with('/') {
+            true => held(Path::new(w)),
+            false => bases.iter().any(|b| held(&b.join(w))),
+        }
+    })
+}
+
+/// Whether `command` may write anything: anything but a chain of plain
+/// reads (`cat`, `grep`, `ls`, `sed` without `-i`, `find` without
+/// `-exec` or `-delete`, …) with no output redirected to a file. What it
+/// doesn't know counts as a write.
+pub(crate) fn may_write(command: &str) -> bool {
+    // Only programs that can't write a file, whatever they are given.
+    const READS: &[&str] = &[
+        "cat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ls",
+        "wc",
+        "stat",
+        "file",
+        "du",
+        "df",
+        "pwd",
+        "echo",
+        "printf",
+        "true",
+        "test",
+        "[",
+        "diff",
+        "cmp",
+        "jq",
+        "cut",
+        "tr",
+        "column",
+        "nl",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        "which",
+        "type",
+        "date",
+        "id",
+        "whoami",
+        "uname",
+        "hostname",
+        "sed",
+        "find",
+        "od",
+        "md5sum",
+        "sha256sum",
+        "cd",
+    ];
+    // What runs the program after it: judged by that program.
+    const WRAPS: &[&str] = &["env", "command", "nice", "time", "nohup"];
+    // Output into a file: `>` and `>>`, but not `2>&1` or `>/dev/null`.
+    let cleaned = command
+        .replace("2>&1", "")
+        .replace(">&2", "")
+        .replace(">/dev/null", "")
+        .replace("> /dev/null", "")
+        .replace("2>/dev/null", "");
+    if cleaned.contains('>') || cleaned.contains("tee ") {
+        return true;
+    }
+    cleaned
+        .split(['|', ';', '&', '\n', '(', ')', '`'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            let all: Vec<&str> = segment.split_whitespace().collect();
+            let mut words = all.as_slice();
+            // A variable set first (`M=/x; …`, `LC_ALL=C sort`) and a
+            // wrapper with its flags write nothing themselves.
+            loop {
+                match words.first() {
+                    Some(w) if w.contains('=') && !w.starts_with('-') => words = &words[1..],
+                    Some(w) if WRAPS.contains(&w.rsplit('/').next().unwrap_or(w)) => {
+                        words = &words[1..];
+                        while words.first().is_some_and(|w| w.starts_with('-')) {
+                            words = &words[1..];
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            let Some(program) = words.first() else {
+                return false;
+            };
+            let program = program.rsplit('/').next().unwrap_or(program);
+            if !READS.contains(&program) {
+                return true;
+            }
+            let bare = |w: &&str| w.trim_matches(['\'', '"']).to_string();
+            match program {
+                // `-i` in any spelling (`-Ei`, `-ni`, `--in-place=.bak`), or a
+                // script that writes or runs a command: `w`, `W` or `e`
+                // after an address or alone (`1,$w f`, `/re/!w f`, `e cmd`),
+                // or as an `s` flag (`s/a/b/w f`, `s/a/b/e`).
+                "sed" => words.iter().skip(1).any(|w| {
+                    let w = bare(w);
+                    if w.starts_with("--in-place") {
+                        return true;
+                    }
+                    // A script given as `--expression=…` is read as one.
+                    let w = match w.strip_prefix("--expression=") {
+                        Some(script) => script.to_string(),
+                        None if w.starts_with("--") => return false,
+                        None if w.starts_with('-') => return w.contains('i'),
+                        None => w,
+                    };
+                    let chars: Vec<char> = w.chars().collect();
+                    chars.iter().enumerate().any(|(i, c)| {
+                        let next = chars.get(i + 1);
+                        "wWe".contains(*c)
+                            && (i == 0 || "0123456789$/~,!;{} ".contains(chars[i - 1]))
+                            && (next.is_none_or(|n| n.is_whitespace())
+                                // `w` straight before its file: `1,$w/path`.
+                                || (*c != 'e' && next.is_some_and(|n| "/~$.".contains(*n))))
+                    })
+                }),
+                "find" => words.iter().any(|w| {
+                    matches!(
+                        *w,
+                        "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
+                    ) || w.starts_with("-fprint")
+                }),
+                "rg" => words.iter().any(|w| w.starts_with("--pre")),
+                _ => false,
+            }
+        })
 }
 
 #[cfg(test)]

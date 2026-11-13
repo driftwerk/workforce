@@ -811,6 +811,24 @@ async fn overseeing(
     (overseer, crew, d, llm)
 }
 
+/// The boss's decision calls (`decide`) all allow what they're asked.
+async fn boss_allows(llm: &wiremock::MockServer) {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(super::decide::MARK))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "d1", "object": "chat.completion", "model": "mock",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                "content": "ALLOW: it serves the session's work"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .with_priority(1)
+        .mount(llm)
+        .await;
+}
+
 fn session_party(name: &str) -> workforce_desk::crew::Party {
     workforce_desk::crew::Party {
         kind: PartyKind::Session,
@@ -1478,10 +1496,10 @@ async fn a_crew_turn_answers_to_its_dm_and_does_not_post_elsewhere_unasked() {
         assert_eq!(
             seen.lock().clone(),
             Some((
-                Some(format!("Dm for {PERSON}, relayed")),
+                Some(format!("Dm {{ thread: None }} for {PERSON}, relayed")),
                 "desk".to_string()
             )),
-            "the turn answers to the DM, as one relayed to it"
+            "the turn answers to the DM itself, not a thread of it, as one relayed to it"
         );
         crew.run_dm_turn(
             &scout,
@@ -1565,7 +1583,7 @@ async fn a_crew_turn_answers_to_its_dm_and_does_not_post_elsewhere_unasked() {
         assert_eq!(
             where_,
             (
-                Some(format!("Dm for {PERSON}, relayed")),
+                Some(format!("Dm {{ thread: None }} for {PERSON}, relayed")),
                 "desk".to_string()
             )
         );
@@ -1801,10 +1819,16 @@ mod act_fully;
 
 mod act_fully_budget;
 
+mod decides_at_once;
+
 mod decisions;
 mod items;
+mod learning;
+mod preferences;
 mod promises;
 mod updates;
+
+mod away;
 
 mod remote_asks;
 mod served;
@@ -2464,8 +2488,13 @@ mod floor {
                 let registry = DeskStore::with_pool(pool.clone()).await.unwrap();
                 registry.put(&alive).await.unwrap();
                 registry.put(&gone).await.unwrap();
-                // What the hub logged before it went down.
-                let at = chrono::Utc::now() - chrono::Duration::minutes(10);
+                // What the hub logged before it went down, to the
+                // microsecond Postgres keeps: the turn is read back from
+                // the log, so a nanosecond `at` would never come back.
+                let at = chrono::SubsecRound::trunc_subsecs(
+                    chrono::Utc::now() - chrono::Duration::minutes(10),
+                    6,
+                );
                 let (kept, lost) = (open_turn(&alive, at), open_turn(&gone, at));
                 for t in [&kept, &lost] {
                     installed.log.send(TurnOp::Begin {

@@ -6,14 +6,49 @@
 use std::sync::Arc;
 
 use chrono::Duration;
+use workforce_common::channels::desk::{DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_desk::crew::{self, Extras, MentionedApproval, MentionedSuggestion};
 
 use super::CrewHub;
+use crate::desk_surface::{Delivered, Delivery};
 use crate::gateway::Mentions;
 use crate::serve::AgentService;
 
 impl CrewHub {
+    /// Delivers `delivery` to `owner`'s DM with `service`, its `extras`
+    /// kept first, by the id it is saved under: the person's Desk reads the
+    /// message the moment it is announced, and reads its card with it. A
+    /// failed keep is logged and the message goes plain, as before. A
+    /// failed delivery leaves its extras with no message: harmless, as
+    /// extras are only read by the ids of messages that exist.
+    pub(crate) async fn deliver_with_extras(
+        &self,
+        service: &AgentService,
+        owner: &str,
+        delivery: Delivery,
+        extras: &Extras,
+    ) -> eyre::Result<Delivered> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.keep_extras_of(&id, service.agent_id.as_str(), extras)
+            .await;
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+        crate::desk_surface::deliver_as(service, owner, &target, delivery, id).await
+    }
+
+    /// Keeps `extras` by `message`, logging a failure.
+    pub(super) async fn keep_extras_of(&self, message: &str, agent_id: &str, extras: &Extras) {
+        if let Err(e) = self
+            .desk
+            .store()
+            .put_extras(message, agent_id, extras)
+            .await
+        {
+            tracing::warn!(error = %e, "keeping a message's extras failed");
+        }
+    }
+
     /// The extras of an answer `text` the overseer `agent_id` is giving in
     /// its DM session `sid`.
     pub(crate) async fn extras_for(&self, agent_id: &str, sid: &str, text: &str) -> Extras {

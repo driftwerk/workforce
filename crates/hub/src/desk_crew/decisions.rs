@@ -9,8 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
-use workforce_common::channels::DESK_CHANNEL;
+use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::crew::{self, By, Extras, Kind, PartyKind, UndoRefused};
 use workforce_desk::decision::{BossDecision, Handled, How, Need, Undo, UndoPlan};
 use workforce_desk::line::{Delivery, LineMessage};
@@ -263,14 +262,83 @@ impl CrewHub {
             }
             _ => crew::clip(said, 240),
         };
-        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), How::Own);
+        // One made by a preference says so (its why already cites it).
+        let how = match by.preference {
+            Some(_) => How::Preference,
+            None => How::Own,
+        };
+        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), how);
         d.need_ref = need_ref;
         d.session = session_of(action, done);
+        d.preference = by.preference;
         let (undo, plan) = undo_of(action, done, before);
         d.undo = undo;
         d.action = plan.map(|p| p.value()).unwrap_or(Value::Null);
         self.record(&d).await;
+        if let Some(p) = d.preference {
+            self.preference_used(p).await;
+        }
         Some(d)
+    }
+
+    /// Records that `action`, which a boss acting at Act or Act fully
+    /// wanted to do, became a suggestion for the person because of a
+    /// setting or rule (`why`, which names it), said as `said`: the
+    /// decision line tells the person what to allow if they want it done.
+    /// An answer to a session's question is recorded where it is given to
+    /// the person ([`Self::record_escalated`]); at Suggest, suggesting is
+    /// the work and nothing is recorded.
+    pub(crate) async fn record_drafted(
+        &self,
+        action: &Action,
+        by: &By,
+        said: &str,
+        why: &str,
+        level: workforce_common::oversight::Level,
+    ) {
+        if !level.acts()
+            || matches!(
+                action,
+                Action::Nudge {
+                    reply_to: Some(_),
+                    ..
+                } | Action::Escalate { .. }
+                    | Action::ChangeOversight { .. }
+            )
+        {
+            return;
+        }
+        let Some(boss) = self.deciding_boss(by) else {
+            return;
+        };
+        // Unbound, what it holds (the person driving, a mode kept) is no
+        // setting of theirs to allow.
+        if self.by_unbound(by) {
+            return;
+        }
+        let (need, need_ref) = need_of(action);
+        // Suggested again, the same need is one escalation.
+        if let Some(r) = need_ref.as_deref() {
+            let since = crew::now() - chrono::Duration::days(1);
+            if self
+                .desk
+                .store()
+                .decision_escalated_since(&boss, r, since)
+                .await
+                .unwrap_or(false)
+            {
+                return;
+            }
+        }
+        let what = format!("left it to you: {}", crew::clip(said, 240));
+        let why = format!(
+            "I couldn't do it myself: {}. It's yours to do, or to allow.",
+            why.trim().trim_end_matches('.')
+        );
+        let mut d = BossDecision::new(&boss, need, &what, &why, How::Escalated);
+        d.need_ref = need_ref;
+        d.session = session_of(action, &Done::default());
+        self.record(&d).await;
     }
 
     /// Records a session's question `ask` given to the person by `by`,
@@ -328,33 +396,16 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, d.said()),
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting a decision in the DM failed");
-                return;
-            }
-        };
         let extras = Extras {
             decisions: vec![d.line()],
             ..Default::default()
         };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Notice, d.said());
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, service.agent_id.as_str(), &extras)
+            .deliver_with_extras(&service, &owner, delivery, &extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping a decision's line failed");
+            tracing::warn!(error = %e, "putting a decision in the DM failed");
         }
     }
 
@@ -403,6 +454,11 @@ impl CrewHub {
                 mine.need_ref = Some(claimed.id.to_string());
                 if let Err(e) = store.decision_put(&mine).await {
                     tracing::warn!(error = %e, "an undo wasn't kept as a decision");
+                }
+                // Undoing what a preference decided overrules it: counted,
+                // and the person is asked whether to change it.
+                if let (How::Preference, Some(pref)) = (claimed.how, claimed.preference) {
+                    self.overruled(&claimed.boss, pref, &claimed.what).await;
                 }
                 Ok(done)
             }

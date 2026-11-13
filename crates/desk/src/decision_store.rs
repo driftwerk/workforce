@@ -128,6 +128,63 @@ impl DeskStore {
         Ok(h)
     }
 
+    /// [`Self::decisions_handled`] per day at the person's `tz`, oldest
+    /// first: only the days with a need.
+    pub async fn decisions_handled_by_day(
+        &self,
+        boss: &str,
+        since: DateTime<Utc>,
+        tz: chrono_tz::Tz,
+    ) -> Result<Vec<(chrono::NaiveDate, Handled)>> {
+        let client = self.pool().get().await?;
+        let mut days: Vec<(chrono::NaiveDate, Handled)> = Vec::new();
+        for r in client
+            .query(
+                "SELECT (at AT TIME ZONE $3)::date AS day, need, how, count(*) AS n \
+                 FROM boss_decisions WHERE boss = $1 AND at >= $2 \
+                 GROUP BY day, need, how ORDER BY day",
+                &[&boss, &since, &tz.name()],
+            )
+            .await?
+        {
+            let day: chrono::NaiveDate = r.try_get("day")?;
+            let n: i64 = r.try_get("n")?;
+            let (Ok(need), Ok(how)) = (
+                Need::parse(r.try_get("need")?),
+                How::parse(r.try_get("how")?),
+            ) else {
+                continue;
+            };
+            if days.last().is_none_or(|(d, _)| *d != day) {
+                days.push((day, Handled::default()));
+            }
+            if let Some((_, h)) = days.last_mut() {
+                h.add(need, how, n as usize);
+            }
+        }
+        days.retain(|(_, h)| h.needs() > 0);
+        Ok(days)
+    }
+
+    /// Whether `boss` already gave the person the need `need_ref` since
+    /// `since`: a suggestion made again is one escalation, not two.
+    pub async fn decision_escalated_since(
+        &self,
+        boss: &str,
+        need_ref: &str,
+        since: DateTime<Utc>,
+    ) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM boss_decisions WHERE boss = $1 AND need_ref = $2 \
+                 AND how = 'escalated' AND at >= $3 LIMIT 1",
+                &[&boss, &need_ref, &since],
+            )
+            .await?
+            .is_some())
+    }
+
     /// The decisions `ids` (as the chat's extras name them), by id.
     pub async fn decisions_of(&self, ids: &[Uuid]) -> Result<Vec<BossDecision>> {
         if ids.is_empty() {

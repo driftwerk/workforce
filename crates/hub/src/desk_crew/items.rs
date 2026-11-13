@@ -84,7 +84,8 @@ pub fn schema(name: &str) -> Value {
             "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
-            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" }
+            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
+            "scope": { "type": "string", "description": "With generalizes: what the person's \"always\" would cover: all (default), group:<id>, or repo:<owner/name> when the case is about a repository's work (merging, deploying)" }
         }, "required": ["text"] }),
         PROMISE => json!({ "type": "object", "properties": {
             "session_id": { "type": "string" },
@@ -106,7 +107,7 @@ pub fn schema(name: &str) -> Value {
 }
 
 /// An item's text as a needs-you post.
-fn needs_you(i: &OpenItem) -> String {
+pub(super) fn needs_you(i: &OpenItem) -> String {
     let mut s = format!("**Needs you.** {}", i.text);
     if let Some(h) = i.holding_up.as_deref().filter(|h| !h.trim().is_empty()) {
         s.push_str(&format!("\n\nHolding up: {}", h.trim()));
@@ -255,6 +256,12 @@ impl CrewHub {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
+        // What an "always" would cover, checked now so a bad one is said
+        // to the boss, not found when the person presses it.
+        let prefer_scope = match some("scope") {
+            Some(s) => Some(workforce_desk::preference::PrefScope::parse(&s)?.text()),
+            None => None,
+        };
         let mut new = NewItem::ask(boss, kind, session, text).generalizing(some("generalizes"));
         new.holding_up = some("holding_up");
         new.recommendation = some("recommendation");
@@ -273,12 +280,26 @@ impl CrewHub {
         self.asked_person
             .lock()
             .insert(boss.to_string(), crew::now());
-        let opened = self
+        let mut opened = self
             .desk
             .store()
             .item_open(&new)
             .await
             .map_err(Self::item_err)?;
+        if let (Some(scope), true) = (&prefer_scope, opened.item().generalizes.is_some()) {
+            match self
+                .desk
+                .store()
+                .item_set_prefer_scope(opened.item().id, scope)
+                .await
+            {
+                // Its card says what an "always" would cover.
+                Ok(()) => match &mut opened {
+                    Opened::New(i) | Opened::Again(i) => i.prefer_scope = Some(scope.clone()),
+                },
+                Err(e) => tracing::warn!(error = %e, "an ask's preference scope wasn't kept"),
+            }
+        }
         let tz = self.desk.timezone();
         match opened {
             Opened::New(i) => {
@@ -594,7 +615,10 @@ impl CrewHub {
 
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
-    /// for a check-in. Whether it went out.
+    /// for a check-in. While the person types to the boss it goes once they
+    /// pause or send, at most three minutes on, without holding up the
+    /// caller, and only while `i` is still open. Whether it went out, or
+    /// will.
     pub(crate) async fn post_item(
         &self,
         boss: &str,
@@ -602,42 +626,12 @@ impl CrewHub {
         text: String,
         approvals: Vec<MentionedApproval>,
     ) -> bool {
-        let Some((service, _)) = self.overseer_named(boss) else {
-            return false;
-        };
-        let Some(owner) = self.person(Some(&service)) else {
-            return false;
-        };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Question, text),
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting what the boss asks of the person in its DM failed");
-                return false;
-            }
-        };
         let extras = Extras {
             item: Some(i.mention()),
             approvals,
             ..Default::default()
         };
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, boss, &extras)
-            .await
-        {
-            tracing::warn!(error = %e, "keeping an open item's buttons failed");
-        }
-        true
+        self.card(boss, Some(i.id), text, extras).await
     }
 
     /// A DM reply of `boss`'s, in a turn that started at `started`, that
@@ -732,6 +726,11 @@ impl CrewHub {
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
             .ok_or(ItemRefused::Closed)?;
+        // "You undid … Should I change that preference?": keeping or
+        // forgetting it is done here; changing it goes to the boss.
+        if let Some(done) = self.overrule_answered(&closed, answer).await {
+            return Ok(done);
+        }
         let Some((service, _)) = self.overseer_named(&closed.boss) else {
             return Ok("Answered.".into());
         };
@@ -1314,6 +1313,7 @@ mod tests {
                     said_count: if n == 0 { 3 } else { 1 },
                     raised_at: None,
                     sessions: vec![],
+                    prefer_scope: None,
                     changed_at: now,
                     state: OpenState::Open,
                     closed_at: None,

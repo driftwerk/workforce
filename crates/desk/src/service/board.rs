@@ -1300,6 +1300,7 @@ impl Desk {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let why = format!("pull request #{} {}", pr.number, pr.state.as_str());
         match board::follows_pr(t.state, pr.state) {
@@ -1504,6 +1505,7 @@ impl Desk {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         let say = |e: DeskError| match e {
             DeskError::NotFound => "That ticket is gone.".to_string(),

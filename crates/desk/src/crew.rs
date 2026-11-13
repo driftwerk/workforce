@@ -292,6 +292,9 @@ pub struct By {
     pub reason: Option<String>,
     pub suggestion_id: Option<String>,
     pub hop: i16,
+    /// The person's preference a boss applied in doing it (H9), checked
+    /// to be there and active: its decision cites it.
+    pub preference: Option<uuid::Uuid>,
 }
 
 impl By {
@@ -302,6 +305,7 @@ impl By {
             reason: Some(reason.to_string()).filter(|r| !r.trim().is_empty()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -311,6 +315,7 @@ impl By {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -320,6 +325,7 @@ impl By {
             reason: Some(reason.to_string()).filter(|r| !r.trim().is_empty()),
             suggestion_id: None,
             hop: 0,
+            preference: None,
         }
     }
 
@@ -475,6 +481,9 @@ pub struct ManagerView {
     /// Groups closed to everyone but the person: named for a boss that
     /// oversees nothing now, so neither it nor the main overseer sees them.
     pub sealed: Vec<String>,
+    /// What the main overseer handled today: the Floor's "handled N of M".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// A sidebar group's boss, as Desk shows it on the group and its row.
@@ -486,6 +495,9 @@ pub struct GroupBoss {
     pub group: String,
     /// `watch`, `suggest` or `act`.
     pub level: String,
+    /// What it handled today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// The overseer as the desk needs it.
@@ -592,6 +604,10 @@ pub struct Extras {
     /// A boss's update, as the chat renders it in place of its text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<crate::update::MentionedUpdate>,
+    /// A catch-up on the person's return: the absence it covers, its
+    /// headline, and what it says beyond its `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away: Option<crate::away::MentionedAway>,
 }
 
 impl Extras {
@@ -603,6 +619,7 @@ impl Extras {
             && self.decisions.is_empty()
             && self.item.is_none()
             && self.update.is_none()
+            && self.away.is_none()
     }
 }
 
@@ -714,6 +731,50 @@ pub trait Crew: Send + Sync {
     async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
     }
+    /// "Always": the person's answer to the boss's open item `id` becomes
+    /// one of their preferences, for the kind of case the item said it
+    /// settles; `then` in place of their answer's words when given.
+    async fn always_item(
+        &self,
+        _id: uuid::Uuid,
+        _then: Option<&str>,
+    ) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// The person keeps a preference themselves: `when`, `then`, what it
+    /// covers (`scope`), for the boss of the ask `from_item` when given,
+    /// else of `boss_scope` (the main boss when none). The same case and
+    /// scope, or the one kept from the same ask, gives way to it.
+    async fn keep_preference(
+        &self,
+        _when: &str,
+        _then: &str,
+        _scope: &str,
+        _from_item: Option<uuid::Uuid>,
+        _boss_scope: Option<&str>,
+    ) -> Result<crate::preference::Preference, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// How many needs the boss `agent` (the main boss when none is named)
+    /// handled itself, by the person's preferences, gave the person, or the
+    /// person got to first, since `since` (the start of today when none),
+    /// in all and per day: what "handled 23 of 25 myself" says. `None`
+    /// where there is no such boss.
+    async fn handled(
+        &self,
+        _agent: Option<&str>,
+        _since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+    /// The person is typing in the boss `agent`'s DM: what it would post
+    /// waits for a pause. False when `agent` is no boss here.
+    fn dm_typing(&self, _agent: &str) -> bool {
+        false
+    }
+    /// What Desk says of the person: whether its window is attended, and
+    /// which boss's DM (by its agent) is on screen.
+    fn presence(&self, _attending: bool, _dm_on_screen: Option<&str>) {}
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {

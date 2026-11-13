@@ -195,6 +195,20 @@ impl DeskStore {
         Ok(back)
     }
 
+    /// Whether any exchange of `session` was kept: a turn it ran.
+    pub async fn kept_a_turn(&self, session: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM memory_exchanges WHERE session = $1)",
+                &[&session],
+            )
+            .await
+            .context("reading whether a session kept a turn")?
+            .try_get(0)
+            .map_err(Into::into)
+    }
+
     /// The brief `session` was given (none once forgotten), and the group
     /// it was given in; none when it was handed no work.
     pub async fn lineage_brief(

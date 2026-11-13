@@ -171,7 +171,7 @@ fn unbound_now(state: &Arc<GatewayState>, agent: &str) -> bool {
     let Some(crew) = crate::desk_crew::for_service(&service) else {
         return false;
     };
-    crew.unbound_given(&service, &o) && attended_by_holder(state)
+    crew.unbound_given(service.agent_id.as_str(), &o) && attended_by_holder(state)
 }
 
 /// Whether this turn may be unbound in the browser: the Desk holder's

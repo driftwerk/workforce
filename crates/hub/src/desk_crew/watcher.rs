@@ -192,7 +192,7 @@ fn question_key(subject: &str, kind: &str, mark: &str) -> String {
     format!("{kind}:{subject}:{}", crew::one_line(mark, 200))
 }
 
-fn tracked(o: &Oversight, subject: &Party) -> bool {
+pub(super) fn tracked(o: &Oversight, subject: &Party) -> bool {
     match subject.kind {
         PartyKind::Agent => o.track.crew,
         PartyKind::Session => match subject.origin {
@@ -387,8 +387,26 @@ impl CrewHub {
         let wanted = match event.kind {
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
-            // Unbound, what waits on an answer wakes it at once.
-            Kind::NeedsYou => unbound,
+            // Unbound, what waits on an answer wakes it at once, unless it
+            // is a request its decision call has (`decide`).
+            Kind::NeedsYou => {
+                unbound
+                    && match event.approval_id.as_deref() {
+                        // A request: only while it still waits and isn't
+                        // one its decision call has (`decide`), which has
+                        // often answered it by now.
+                        Some(a) => subject
+                            .id
+                            .parse()
+                            .ok()
+                            .and_then(|s| self.desk.view(s).ok())
+                            .is_some_and(|v| {
+                                v.pending.as_ref().is_some_and(|p| p.id.to_string() == a)
+                                    && !self.answers_at_once(&v)
+                            }),
+                        None => true,
+                    }
+            }
             _ => false,
         };
         let about = match event.kind {
@@ -556,7 +574,10 @@ impl CrewHub {
              while the plan's next tickets are free and fewer than {} sessions are working, start \
              sessions for them (crew.start_session or crew.assign_ticket). Between turns, set a \
              session's mode with crew.set_mode: auto before routine work, default before work that \
-             will need your judgement. Nothing should sit idle. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change.",
+             will need your judgement. Nothing should sit idle. Check the person's preferences first and apply \
+             the one that fits (a close match too: apply it and say so). With none, decide yourself; give the \
+             person a question only when you truly can't, with crew.ask_person and generalizes, so their \
+             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change.",
             o.work.parallel, o.work.parallel
         )
     }
@@ -638,7 +659,7 @@ impl CrewHub {
         };
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
-        let hint = match self.unbound_given(&service, &o) {
+        let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
             true => Self::boss_hint(&o),
             false => Self::level_hint(level, &o),
         };
@@ -1077,6 +1098,21 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 w.pending.clear();
                 continue;
             };
+            // A check-in that speaks in the DM waits while the person types
+            // to the boss (at most the typing cap); a quiet one acts now.
+            let (level, _) = crew.level_now(&id, &o);
+            // Requests beside its message, and what needs the person.
+            let asks = w.pending.iter().any(|t| !t.approvals.is_empty());
+            let needs = asks || w.pending.iter().any(|t| t.about.is_some());
+            let speaks = !(level.acts() && o.updates.enabled) || asks;
+            if speaks && crew.typing_release(&id).is_some() {
+                continue;
+            }
+            // Away, a check-in that would only tell the person gathers for
+            // their return; one with what needs them still goes.
+            if speaks && !needs && crew.away_now(&id).await {
+                continue;
+            }
             // Held by Desk's breaker, it takes no turns: what it would have
             // checked in on is on the Floor for the person.
             if crew.desk.agent_held(&id).is_some() {
