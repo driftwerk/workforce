@@ -50,6 +50,8 @@ fn synced(state: TicketState) -> Ticket {
         },
         assignee: None,
         clipped: false,
+        html_read: 0,
+        details: Default::default(),
     });
     t
 }
@@ -269,6 +271,10 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         assignee: None,
         closed: None,
         clipped: false,
+        priority: None,
+        project: None,
+        due: None,
+        files: None,
     };
     let p = pulled(&t, &issue, &states);
     assert_eq!(p.title.as_deref(), Some("Fix the login page"));
@@ -853,4 +859,187 @@ fn a_shared_jira_key_s_assigned_to_me_is_the_matched_account() {
     );
     // An account id that isn't one is never put in the query.
     assert!(jql("ACME", &Filter::AssignedToMe, None, Some("x\" OR \"1")).contains("currentUser()"));
+}
+
+/// PLT-2692's rendered description, as Jira sent it: an issue macro is an
+/// indented span, which made a code block of its key and status.
+const ISSUE_MACRO: &str = "<p>Following the completion of Unified Login (<a href=\"https://acme.atlassian.net/browse/PLT-875\" class=\"external-link\" rel=\"nofollow noreferrer\">PLT-875</a>), this epic covers:</p>\n\n<ol>\n\t<li>Ongoing small fixes.</li>\n\t<li>The next phase, building on the foundation established in \n    <span class=\"jira-issue-macro\" data-jira-key=\"PLT-875\" >\n                <a href=\"https://acme.atlassian.net/browse/PLT-875\" class=\"jira-issue-macro-key issue-link\"  title=\"Unified login\" >\n            <img class=\"icon\" src=\"https://acme.atlassian.net/images/icons/issuetypes/epic.svg\" />\n            PLT-875\n        </a>\n                                                    <span class=\"aui-lozenge aui-lozenge-subtle aui-lozenge-success\">Done</span>\n            </span>\n. This needs scoping out.</li>\n</ol>\n";
+
+#[test]
+fn an_issue_macro_reads_as_a_link_in_its_sentence_not_a_code_block() {
+    let md = html_text(ISSUE_MACRO);
+    assert_eq!(
+        md,
+        "Following the completion of Unified Login ([PLT-875](https://acme.atlassian.net/browse/PLT-875)), this epic covers:\n\
+         * Ongoing small fixes.\n\
+         * The next phase, building on the foundation established in [PLT-875](https://acme.atlassian.net/browse/PLT-875) Done . This needs scoping out."
+    );
+    assert!(!has_html_indent(&md));
+}
+
+#[test]
+fn a_link_keeps_only_a_web_address() {
+    assert_eq!(
+        html_text("<p>See <a href=\"https://x.test/a?b=1&amp;c=2\">the doc</a>.</p>"),
+        "See [the doc](https://x.test/a?b=1&c=2)."
+    );
+    assert_eq!(
+        html_text("<p><a href=\"javascript:alert(1)\">click</a></p>"),
+        "click"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/\"> </a>gone</p>"),
+        "gone"
+    );
+}
+
+#[test]
+fn preformatted_text_keeps_its_lines_in_a_fence() {
+    assert_eq!(
+        html_text("<p>Run:</p><pre><code>a  b\n  c</code></pre><p>then</p>"),
+        "Run:\n```\na  b\n  c\n```\nthen"
+    );
+}
+
+#[test]
+fn an_old_indented_description_is_told_from_a_fenced_one() {
+    assert!(has_html_indent("text\n    PLT-875\n\n    Done\n. more"));
+    assert!(!has_html_indent("text\n```\n    indented code\n```\nend"));
+    assert!(!has_html_indent("plain\n* list"));
+    assert!(!has_html_indent("text\n~~~\n    indented code\n~~~\nend"));
+}
+
+#[test]
+fn a_held_body_with_a_macro_code_block_is_read_again_unless_edited_here() {
+    let old = "The foundation established in\n    PLT-875\n\n    Done\n. This needs scoping out.";
+    let mut t = synced(TicketState::Todo);
+    t.body = old.into();
+    let e = t.external.as_mut().unwrap();
+    e.seen.body = old.into();
+    let fixed = html_text(ISSUE_MACRO);
+    let issue = Issue {
+        updated_at: e.remote_updated_at,
+        body: Some(fixed.clone()),
+        ..linear_issue(&json!({
+            "identifier": "ACME-1", "title": "Fix the login", "description": "x",
+            "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" }
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        pulled(&t, &issue, &BTreeMap::new()).body.as_deref(),
+        Some(fixed.as_str())
+    );
+    // Edited here since: the person's words stay.
+    t.body = format!("{old}\nmine");
+    assert!(pulled(&t, &issue, &BTreeMap::new()).body.is_none());
+}
+
+#[test]
+fn a_held_body_is_read_again_only_once_and_only_from_jira() {
+    let old = "The foundation established in\n    PLT-875\n\n    Done\n. This needs scoping out.";
+    let mut t = synced(TicketState::Todo);
+    t.body = old.into();
+    let e = t.external.as_mut().unwrap();
+    e.seen.body = old.into();
+    assert!(rereads_html(e, old));
+    // Read with today's reader, even when what came back is still indented:
+    // never again.
+    e.html_read = HTML_READ;
+    assert!(!rereads_html(e, old));
+    // Edited here and sent: a nested list the person wrote is theirs.
+    e.html_read = 0;
+    let mine = "Steps\n* one\n    * nested";
+    let sent = Seen {
+        title: "Fix the login".into(),
+        body: mine.into(),
+        state: Some(TicketState::Todo),
+        needs: vec![],
+    };
+    pushed(e, &sent, None, true);
+    assert!(!rereads_html(e, mine));
+    // A push that sent no words leaves an old body to be read again.
+    e.html_read = 0;
+    e.seen.body = old.into();
+    pushed(
+        e,
+        &Seen {
+            body: old.into(),
+            ..sent
+        },
+        None,
+        false,
+    );
+    assert!(rereads_html(e, old));
+    // Linear's markdown is its own: an indented line there is meant.
+    e.html_read = 0;
+    e.system = System::Linear;
+    assert!(!rereads_html(e, old));
+}
+
+#[test]
+fn a_no_break_space_never_indents_a_line() {
+    assert_eq!(
+        html_text("<p>&nbsp;&nbsp;&nbsp;&nbsp;indented</p><p>&#160;&#xa0; two</p>"),
+        "indented\ntwo"
+    );
+    assert!(!has_html_indent(&html_text(
+        "<p>&nbsp;&nbsp;&nbsp;&nbsp;indented</p>"
+    )));
+}
+
+#[test]
+fn an_address_that_would_break_its_link_is_dropped() {
+    // An entity is read before the address is checked: a quote it hides
+    // never reaches the link.
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a&quot;b\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a&amp;quot;b\">x</a></p>"),
+        "[x](https://x.test/a&quot;b)"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a\nb\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/a)b\">x</a></p>"),
+        "x"
+    );
+    // Only `href` itself, in any case and spacing.
+    assert_eq!(
+        html_text("<p><a data-href=\"https://x.test/\">x</a></p>"),
+        "x"
+    );
+    assert_eq!(
+        html_text("<p><a HREF = 'https://x.test/'>x</a></p>"),
+        "[x](https://x.test/)"
+    );
+    // Words that would end the link text early are kept without the marks.
+    assert_eq!(
+        html_text("<p><a href=\"https://x.test/\">a] b\\ `c</a></p>"),
+        "[a b c](https://x.test/)"
+    );
+}
+
+#[test]
+fn preformatted_text_keeps_no_marks_and_its_own_fence() {
+    assert_eq!(
+        html_text("<pre><b>bold</b> <a href=\"https://x.test/\">x</a></pre>"),
+        "```\nbold x\n```"
+    );
+    assert_eq!(
+        html_text("<pre>```\nnested\n```</pre>"),
+        "````\n```\nnested\n```\n````"
+    );
+    assert_eq!(html_text("<p>a</p><pre>open"), "a\n```\nopen\n```");
+    assert_eq!(html_text("<pre>````\nx</pre>"), "`````\n````\nx\n`````");
+    // A link whose address goes keeps its words as written.
+    assert_eq!(html_text("<p><a>C:\\path</a></p>"), "C:\\path");
+    assert_eq!(
+        html_text("<pre>&lt;tag&gt; &amp; x</pre>"),
+        "```\n<tag> & x\n```"
+    );
 }

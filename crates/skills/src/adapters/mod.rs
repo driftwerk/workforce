@@ -109,6 +109,9 @@ pub mod messaging_routing;
 
 pub mod utils;
 
+#[cfg(any(feature = "jira", feature = "linear"))]
+pub mod file_read;
+
 pub mod auth;
 
 /// The `[[vault:<key>]]` resolver, which lives in `workforce_agent` so the
