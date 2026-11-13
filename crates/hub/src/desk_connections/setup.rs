@@ -204,10 +204,11 @@ fn browser_page(connector: &str, origin: &str) -> Option<browser_keys::KeyPage> 
     })
 }
 
-/// Registers every key page whose origin is known before a setup starts
-/// (Jira's, Linear's, GitHub's, and each Datadog region's), so their text
-/// is hidden and they are never pictured, whoever opens them. A person's
-/// own Metabase is registered once its site is kept.
+/// Registers every key page, so their text is hidden and they are never
+/// pictured, whoever opens them and whether or not a setup is running:
+/// Jira's, Linear's, GitHub's and each Datadog region's at their origins,
+/// and Metabase's, whose address is each person's own, on any `https`
+/// origin. Nothing is registered later, so the registry never grows.
 pub fn register_key_pages() {
     for service in ["jira", "linear", "github"] {
         if let Some(r) = recipe(service) {
@@ -223,6 +224,9 @@ pub fn register_key_pages() {
         if let Some(page) = browser_page("datadog", &datadog_web(&fields)) {
             browser_keys::register(page);
         }
+    }
+    if let Some(page) = browser_page("metabase", "") {
+        browser_keys::register_anywhere(page);
     }
 }
 
@@ -816,13 +820,6 @@ impl Setups {
             };
             let value = value.as_str();
             s.fields.insert(field.to_string(), value.to_string());
-            if (s.service, field) == ("metabase", "site_url") {
-                if let Some(page) =
-                    metabase_origin(&s.fields).and_then(|o| browser_page("metabase", &o))
-                {
-                    browser_keys::register(page);
-                }
-            }
             if Some(field) == c.site {
                 s.relabel("where", format!("Found your site: {value}"));
                 s.mark("where", StepState::Done, None);
@@ -868,8 +865,13 @@ impl Setups {
     pub fn key_page(&self, caller: &Caller, connector: &str) -> Option<KeyPage> {
         self.check_caller(caller).ok()?;
         let id = self.running(caller, connector)?;
+        self.page_of(caller, &id, connector)
+    }
+
+    /// The key page of the setup `id`, for `connector`.
+    fn page_of(&self, caller: &Caller, id: &str, connector: &str) -> Option<KeyPage> {
         let recipe = recipe(connector)?;
-        self.with(caller, &id, |s| {
+        self.with(caller, id, |s| {
             let origin = (recipe.origins)(&s.fields)
                 .into_iter()
                 .next()
@@ -893,12 +895,16 @@ impl Setups {
     /// The caller of the turn running now, as the browser names it: `user`'s
     /// `agent` in the conversation whose session key is `conversation`.
     /// `None` outside a conversation, or when the turn's own person isn't
-    /// `user`, so the browser's word alone never makes a caller.
+    /// `user` or its agent isn't `agent`, so the browser's word alone never
+    /// makes a caller.
     pub fn turn_caller(&self, user: &str, agent: &str, conversation: &str) -> Option<Caller> {
-        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
+        use workforce_agent::runner::{
+            CURRENT_AGENT_ID, CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID,
+        };
         let person = CURRENT_USER_ID.try_with(|u| u.clone()).ok()?;
         let key = CURRENT_SESSION_KEY.try_with(|k| k.clone()).ok()?;
-        if person != user || key != conversation || conversation.is_empty() {
+        let turn_agent = CURRENT_AGENT_ID.try_with(|a| a.clone()).ok()?;
+        if person != user || turn_agent != agent || key != conversation || conversation.is_empty() {
             return None;
         }
         let session = CURRENT_SESSION_ID
@@ -915,13 +921,12 @@ impl Setups {
     }
 
     /// [`Self::key_page`] as the browser takes it: what `browser.capture_key`
-    /// checks the tab against and sends the extension's read. It is also
-    /// registered, so its text is hidden and it is never pictured.
+    /// checks the tab against and sends the extension's read. Every key page
+    /// is registered at install ([`register_key_pages`]), so its text is
+    /// hidden and it is never pictured.
     pub fn browser_page(&self, caller: &Caller, connector: &str) -> Option<browser_keys::KeyPage> {
         let page = self.key_page(caller, connector)?;
-        let shaped = browser_page(connector, &page.origin)?;
-        browser_keys::register(shaped.clone());
-        Some(shaped)
+        browser_page(connector, &page.origin)
     }
 
     /// Keeps `value`, a key the browser read off `read_origin` and
@@ -947,7 +952,7 @@ impl Setups {
         })?;
         let recipe = recipe(connector).ok_or_else(|| by_hand(connector).to_string())?;
         let page = self
-            .key_page(caller, connector)
+            .page_of(caller, &id, connector)
             .ok_or("That setup has ended.")?;
         if read_origin != page.origin || !page.holds(read_path) {
             return Err("That wasn't the service's own key page, so nothing was kept.".into());

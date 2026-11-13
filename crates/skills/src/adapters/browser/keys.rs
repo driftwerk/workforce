@@ -32,6 +32,12 @@ pub struct KeyPage {
 
 static PAGES: LazyLock<RwLock<Vec<KeyPage>>> = LazyLock::new(Default::default);
 
+/// Key pages whose service runs at an address of each person's own (a
+/// Metabase): their paths on any `https` origin. Their text is hidden and a
+/// picture of one is thrown away wherever they are, before a setup has
+/// kept the address and after; one entry per connector, so nothing grows.
+static ANYWHERE: LazyLock<RwLock<Vec<KeyPage>>> = LazyLock::new(Default::default);
+
 /// Registers (or replaces) `page` for its connector at its origin. A
 /// connector may have key pages at several origins (Datadog's regions, each
 /// person's own Metabase): every one is hidden, and none replaces another's.
@@ -41,6 +47,30 @@ pub fn register(page: KeyPage) {
     let mut pages = PAGES.write().unwrap();
     pages.retain(|p| p.connector != page.connector || p.origin != page.origin);
     pages.push(page);
+}
+
+/// Registers (or replaces) `page`'s paths as key pages on every `https`
+/// origin: its `origin` is not looked at. They are never sent the extension
+/// as a picture to refuse (its refusals are exact origins); the hub's own
+/// check of what was pictured throws such a picture away.
+pub fn register_anywhere(page: KeyPage) {
+    let mut pages = ANYWHERE.write().unwrap();
+    pages.retain(|p| p.connector != page.connector);
+    pages.push(page);
+}
+
+/// Whether `url` is, on any `https` origin, under one of `page`'s paths.
+fn matches_anywhere(page: &KeyPage, url: &str) -> bool {
+    match super::address::origin_of(url) {
+        Some(origin) if origin.starts_with("https://") => matches(
+            &KeyPage {
+                origin,
+                ..page.clone()
+            },
+            url,
+        ),
+        _ => false,
+    }
 }
 
 /// Whether `url` is on one of `page`'s key pages.
@@ -118,6 +148,11 @@ pub const PROBES_VALUE: &str = "On a key page Desk doesn't take a selector that 
 /// Whether `url` is any connector's key page.
 pub fn is_key_page(url: &str) -> bool {
     PAGES.read().unwrap().iter().any(|p| matches(p, url))
+        || ANYWHERE
+            .read()
+            .unwrap()
+            .iter()
+            .any(|p| matches_anywhere(p, url))
 }
 
 /// Whether `value` is, whole, a key of `page`'s connector.
@@ -150,12 +185,13 @@ pub const HIDDEN: &str = "[key hidden: use browser.capture_key]";
 /// `text` read from the page at `url`, with key-shaped text hidden when it
 /// is a key page; any other page's text as it is.
 pub fn hide_keys(url: &str, text: &str) -> String {
-    let pages = PAGES.read().unwrap();
-    if !pages.iter().any(|p| matches(p, url)) {
+    if !is_key_page(url) {
         return text.to_string();
     }
+    let pages = PAGES.read().unwrap();
+    let anywhere = ANYWHERE.read().unwrap();
     let mut out = text.to_string();
-    for p in pages.iter() {
+    for p in pages.iter().chain(anywhere.iter()) {
         out = p.shape.replace_all(&out, HIDDEN).into_owned();
     }
     let out = workforce_common::redact::redact_secrets(&out);
@@ -266,6 +302,43 @@ mod tests {
             .filter(|p| p.connector == "fixture-many")
             .count();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn a_page_registered_anywhere_is_hidden_on_every_https_origin_and_never_sent_to_refuse() {
+        let page = KeyPage {
+            connector: "fixture-anywhere".into(),
+            origin: String::new(),
+            paths: vec!["/admin/api-keys".into()],
+            workspace_segment: false,
+            shape: Regex::new(r"aw_[a-z]{8}").unwrap(),
+        };
+        register_anywhere(page.clone());
+        register_anywhere(page);
+        for at in [
+            "https://bi.acme.example/admin/api-keys",
+            "https://10.0.0.5:3000/admin/api-keys/new",
+        ] {
+            assert!(is_key_page(at), "{at}");
+            assert_eq!(hide_keys(at, "aw_abcdefgh"), HIDDEN);
+        }
+        for not in [
+            "http://bi.acme.example/admin/api-keys",
+            "https://bi.acme.example/admin/api-keysx",
+            "https://bi.acme.example/admin",
+        ] {
+            assert!(!is_key_page(not), "{not}");
+        }
+        assert_eq!(
+            ANYWHERE
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|p| p.connector == "fixture-anywhere")
+                .count(),
+            1
+        );
+        assert!(!refusals().to_string().contains("/admin/api-keys"));
     }
 
     #[test]

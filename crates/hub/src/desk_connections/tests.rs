@@ -1928,15 +1928,20 @@ mod setups {
     /// key kept from where the extension says it read it.
     #[tokio::test]
     async fn the_browser_reaches_a_setup_only_from_its_own_turn() {
-        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
+        use workforce_agent::runner::{
+            CURRENT_AGENT_ID, CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID,
+        };
         use workforce_skills::adapters::browser::keys;
+        setup::register_key_pages();
         let (_h, s) = setups().await;
         let allan = caller("allan");
         s.start(&allan, "linear", Some("Acme"), None).await.unwrap();
         let in_turn = |person: &'static str, key: &'static str, f: Box<dyn FnOnce() + Send>| {
             CURRENT_USER_ID.sync_scope(person.to_string(), || {
-                CURRENT_SESSION_ID.sync_scope("s-allan".to_string(), || {
-                    CURRENT_SESSION_KEY.sync_scope(key.to_string(), f)
+                CURRENT_AGENT_ID.sync_scope("allan".to_string(), || {
+                    CURRENT_SESSION_ID.sync_scope("s-allan".to_string(), || {
+                        CURRENT_SESSION_KEY.sync_scope(key.to_string(), f)
+                    })
                 })
             })
         };
@@ -1953,9 +1958,10 @@ mod setups {
                 assert!(s2.turn_caller(SARAH, "allan", "desk:other").is_none());
                 let who = s2.turn_caller(SARAH, "allan", "desk:allan").unwrap();
                 assert_eq!(who.session.as_deref(), Some("s-allan"));
-                // Ben runs no setup in this conversation: nothing to read.
-                let ben = s2.turn_caller(SARAH, "ben", "desk:allan").unwrap();
-                assert!(s2.browser_page(&ben, "linear").is_none());
+                // Allan's turn is never Ben's, and Ben runs no setup here:
+                // nothing to read.
+                assert!(s2.turn_caller(SARAH, "ben", "desk:allan").is_none());
+                assert!(s2.browser_page(&caller("ben"), "linear").is_none());
                 // Linear's page, with its workspace's segment, and registered so
                 // the browser hides it and takes no picture of it.
                 let page = s2.browser_page(&who, "linear").unwrap();
@@ -2006,10 +2012,17 @@ mod setups {
             "https://github.com/settings/personal-access-tokens/new",
             "https://app.datadoghq.eu/organization-settings/api-keys",
             "https://app.ddog-gov.com/personal-settings/application-keys",
+            // A Metabase's address is each person's own: its key page is
+            // hidden wherever it is, before any setup has kept one.
+            "https://bi.globex.example/admin/settings/authentication/api-keys",
+            "https://10.1.2.3:3000/admin/settings/authentication/api-keys",
         ] {
             assert!(keys::is_key_page(at), "{at}");
         }
         assert!(!keys::is_key_page("https://linear.app/acme/issue/ACM-1"));
+        assert!(!keys::is_key_page(
+            "https://bi.globex.example/admin/settings/authentication"
+        ));
     }
 
     #[tokio::test]
@@ -2375,7 +2388,6 @@ mod setups {
             Secret::new(token.into()),
         )
         .unwrap();
-        // A key the service refused is dropped: nothing is held for it.
 
         let mb = s.start(&allan, "metabase", None, None).await.unwrap();
         assert!(s
