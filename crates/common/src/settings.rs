@@ -11087,6 +11087,13 @@ pub trait SecretStore: Send + Sync {
     /// List secret paths, optionally filtered by prefix. Never returns values.
     fn list(&self, prefix: Option<&str>) -> Vec<String>;
 
+    /// Whether this store's reads are pinned to an agent's connections (a
+    /// hub running Desk): where a credential is sent is then read only from
+    /// the tier the credential came from, or the hub's shared tier.
+    fn is_pinned(&self) -> bool {
+        false
+    }
+
     /// Read a secret only from user-scoped layers, ignoring shared/agent
     /// fallbacks. Returns `None` when no user identity is active or no
     /// user-specific override exists for this path.
