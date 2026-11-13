@@ -2285,7 +2285,9 @@ mod tests {
 
     /// At Full access, deleting outside the folder asks once per folder: the
     /// "always" kept is a delete grant on the folder the card showed, and
-    /// then `rm -rf node_modules` there runs.
+    /// then `rm -rf node_modules` there runs. Unix only: its scratch is
+    /// named through a symlink.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn an_always_for_a_delete_is_kept_for_the_folder_the_card_showed() {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {

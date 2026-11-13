@@ -19,7 +19,9 @@ impl CrewHub {
     /// Delivers `delivery` to `owner`'s DM with `service`, its `extras`
     /// kept first, by the id it is saved under: the person's Desk reads the
     /// message the moment it is announced, and reads its card with it. A
-    /// failed keep is logged and the message goes plain, as before.
+    /// failed keep is logged and the message goes plain, as before. A
+    /// failed delivery leaves its extras with no message: harmless, as
+    /// extras are only read by the ids of messages that exist.
     pub(crate) async fn deliver_with_extras(
         &self,
         service: &AgentService,
