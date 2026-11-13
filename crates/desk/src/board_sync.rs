@@ -873,14 +873,22 @@ pub fn unescape_newlines(text: &str) -> String {
 }
 
 /// HTML (Jira's rendered description) as markdown the board shows safely:
-/// headings, bullets, bold, italics and code keep their marks, every other
-/// tag goes, and what a script or style held goes with it.
+/// headings, bullets, bold, italics, code and links keep their marks, every
+/// other tag goes, and what a script or style held goes with it. Text reads
+/// as HTML reads it: a run of spaces and newlines is one space, outside a
+/// `<pre>`, so Jira's indented markup (an issue macro's key and status) never
+/// becomes a markdown code block. A link keeps its address when it is
+/// `http(s)`; its words are kept either way.
 pub fn html_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut tag = String::new();
     let mut in_tag = false;
     // Inside a `script` or `style`: nothing is kept until it closes.
     let mut skipping: Option<String> = None;
+    // Inside a `pre`: its text is kept as it is, fenced.
+    let mut in_pre = false;
+    // The open links: each one's address, and where its words start.
+    let mut links: Vec<(Option<String>, usize)> = Vec::new();
     for c in html.chars() {
         match (in_tag, c) {
             (false, '<') => {
@@ -907,6 +915,9 @@ pub fn html_text(html: &str) -> String {
                     continue;
                 }
                 let line = |out: &mut String| {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
@@ -921,18 +932,52 @@ pub fn html_text(html: &str) -> String {
                         line(&mut out);
                         out.push_str("* ");
                     }
+                    (false, "pre") => {
+                        line(&mut out);
+                        out.push_str("```\n");
+                        in_pre = true;
+                    }
+                    (true, "pre") => {
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str("```\n");
+                        in_pre = false;
+                    }
+                    (false, "a") => links.push((link_href(&tag), out.len())),
+                    (true, "a") => {
+                        if let Some((href, at)) = links.pop() {
+                            let words = out[at..].trim().to_string();
+                            out.truncate(at);
+                            match (href, words.is_empty()) {
+                                (_, true) => {}
+                                (Some(href), false) => out.push_str(&format!(
+                                    "[{}]({href})",
+                                    words.replace(['[', ']'], "")
+                                )),
+                                (None, false) => out.push_str(&words),
+                            }
+                        }
+                    }
                     (_, "strong" | "b") => out.push_str("**"),
                     (_, "em" | "i") => out.push('*'),
-                    (_, "code") => out.push('`'),
-                    (_, "br" | "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "pre" | "li") => {
-                        line(&mut out)
-                    }
+                    (_, "code" | "tt") if !in_pre => out.push('`'),
+                    (
+                        _,
+                        "br" | "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "li" | "ul" | "ol",
+                    ) => line(&mut out),
                     _ => {}
                 }
             }
             (true, c) => tag.push(c),
-            (false, c) if skipping.is_none() => out.push(c),
-            (false, _) => {}
+            (false, _) if skipping.is_some() => {}
+            (false, c) if in_pre => out.push(c),
+            (false, c) if c.is_whitespace() => {
+                if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                    out.push(' ');
+                }
+            }
+            (false, c) => out.push(c),
         }
     }
     let out = out
@@ -948,6 +993,41 @@ pub fn html_text(html: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+/// An `<a>` tag's address, when it is `http` or `https`; never one that
+/// could run (`javascript:`) or reach a local file.
+fn link_href(tag: &str) -> Option<String> {
+    let at = tag.find("href=")? + 5;
+    let rest = &tag[at..];
+    let (quote, rest) = match rest.chars().next()? {
+        q @ ('"' | '\'') => (Some(q), &rest[1..]),
+        _ => (None, rest),
+    };
+    let end = match quote {
+        Some(q) => rest.find(q)?,
+        None => rest.find(char::is_whitespace).unwrap_or(rest.len()),
+    };
+    let href = rest[..end].replace("&amp;", "&");
+    let lower = href.to_ascii_lowercase();
+    let ok = (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !href.contains(['(', ')', ' ', '<', '>', '"']);
+    ok.then_some(href)
+}
+
+/// Whether `text` still has a line Jira's indented markup made into a
+/// markdown code block (four spaces or a tab in front, outside a fence):
+/// what [`html_text`] made of a description before it read spaces as HTML
+/// does. Such a description is read again, once.
+pub fn has_html_indent(text: &str) -> bool {
+    let mut fenced = false;
+    text.lines().any(|l| {
+        if l.trim_start().starts_with("```") {
+            fenced = !fenced;
+            return false;
+        }
+        !fenced && !l.trim().is_empty() && (l.starts_with("    ") || l.starts_with('\t'))
+    })
 }
 
 fn text_field(v: &Value) -> (String, bool) {
@@ -1193,10 +1273,11 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
         // Unchanged there, but the description held here still has its
         // newlines written out: it is read again, once.
         return Pulled {
-            body: issue
-                .body
-                .clone()
-                .filter(|b| has_escaped_newlines(&t.body) && e.seen.body == t.body && *b != t.body),
+            body: issue.body.clone().filter(|b| {
+                (has_escaped_newlines(&t.body) || (has_html_indent(&t.body) && !has_html_indent(b)))
+                    && e.seen.body == t.body
+                    && *b != t.body
+            }),
             ..Pulled::default()
         };
     }

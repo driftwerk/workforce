@@ -956,6 +956,7 @@ impl Desk {
             if issue.updated_at <= e.remote_updated_at
                 && e.synced
                 && !crate::board_sync::has_escaped_newlines(&t.body)
+                && !crate::board_sync::has_html_indent(&t.body)
             {
                 return self.refresh_assignee(t.clone(), issue).await.map_err(fail);
             }
