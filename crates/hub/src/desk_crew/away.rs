@@ -493,7 +493,10 @@ impl CrewHub {
             sessions,
             decisions,
             kept: b.kept.clone(),
-            waiting: waiting.iter().map(|i| WaitingItem::of(i, now, full)).collect(),
+            waiting: waiting
+                .iter()
+                .map(|i| WaitingItem::of(i, now, full))
+                .collect(),
             needs_you: waiting.iter().map(|i| NeedsYou::of(i, now, full)).collect(),
             footer,
             ..Default::default()

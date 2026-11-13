@@ -384,7 +384,11 @@ async fn decisions_and_needs_you_are_laid_out() {
             // the message it sent.
             assert!(!posted.content.contains(message), "{}", posted.content);
             assert_eq!(u.headline, "1 done, 1 waiting on you.");
-            assert!(posted.content.starts_with(&u.headline), "{}", posted.content);
+            assert!(
+                posted.content.starts_with(&u.headline),
+                "{}",
+                posted.content
+            );
             let b = &u.brief[0];
             assert_eq!(b.session_id.as_deref(), Some(s.id.to_string().as_str()));
             assert_eq!(b.label, "acme-web");
@@ -394,9 +398,11 @@ async fn decisions_and_needs_you_are_laid_out() {
                 b.items[0].why.as_deref(),
                 workforce_desk::decision::clause(expect_why).as_deref()
             );
-            assert!(posted
-                .content
-                .contains(&format!("✓ {}", b.items[0].action)), "{}", posted.content);
+            assert!(
+                posted.content.contains(&format!("✓ {}", b.items[0].action)),
+                "{}",
+                posted.content
+            );
             let n = &u.needs_you[0];
             assert_eq!(n.question, "Two staging records need a decision.");
             assert_eq!(n.items, vec!["A user with no organisation.".to_string()]);
@@ -586,8 +592,16 @@ async fn an_over_long_update_is_asked_again_once_then_clipped() {
     );
     for (again, expect) in [
         (
-            ("Held acme-web's release.", "Put a hold on tonight's release.", "The migration check failed."),
-            ("Held acme-web's release.", "Put a hold on tonight's release", "the migration check failed"),
+            (
+                "Held acme-web's release.",
+                "Put a hold on tonight's release.",
+                "The migration check failed.",
+            ),
+            (
+                "Held acme-web's release.",
+                "Put a hold on tonight's release",
+                "the migration check failed",
+            ),
         ),
         (
             long,
@@ -616,7 +630,8 @@ async fn an_over_long_update_is_asked_again_once_then_clipped() {
                     message: "Hold the release until the migration check passes on staging.".into(),
                     reply_to: None,
                 },
-                crew.by_overseer("The migration check failed on staging.").unwrap(),
+                crew.by_overseer("The migration check failed on staging.")
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -631,7 +646,11 @@ async fn an_over_long_update_is_asked_again_once_then_clipped() {
                     .and_then(|e| e.update)
             })
             .await;
-            assert_eq!(writer.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "asked once more");
+            assert_eq!(
+                writer.calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "asked once more"
+            );
             let second = writer.asked.lock()[1].clone();
             assert!(second.contains("too long in: headline"), "{second}");
             assert!(second.contains("action (at most 12 words"), "{second}");

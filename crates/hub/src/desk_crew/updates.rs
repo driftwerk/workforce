@@ -331,7 +331,9 @@ impl CrewHub {
                         Ok(Some(again)) => {
                             written = update::merge_composed(std::mem::take(&mut written), again)
                         }
-                        Ok(None) => tracing::info!("the update's writer answered a re-ask out of form; clipped"),
+                        Ok(None) => tracing::info!(
+                            "the update's writer answered a re-ask out of form; clipped"
+                        ),
                         Err(e) => {
                             tracing::info!(error = %format!("{e:#}"), "the update's writer failed a re-ask; clipped")
                         }
@@ -388,8 +390,16 @@ impl CrewHub {
             sessions,
             decisions,
             kept: b.kept.clone(),
-            waiting: b.waiting.iter().map(|i| WaitingItem::of(i, now, full)).collect(),
-            needs_you: b.waiting.iter().map(|i| NeedsYou::of(i, now, full)).collect(),
+            waiting: b
+                .waiting
+                .iter()
+                .map(|i| WaitingItem::of(i, now, full))
+                .collect(),
+            needs_you: b
+                .waiting
+                .iter()
+                .map(|i| NeedsYou::of(i, now, full))
+                .collect(),
             footer,
             headline: String::new(),
             brief,

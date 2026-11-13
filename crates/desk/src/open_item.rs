@@ -476,7 +476,11 @@ impl OpenItem {
     /// "Still waiting on you: {its one line} · {age} · {holding up}", short:
     /// the rest is behind "more", and any recommendation in its buttons.
     pub fn still_waiting(&self, now: DateTime<Utc>) -> String {
-        let mut s = format!("Still waiting on you: {} · {}", self.headline(), self.age(now));
+        let mut s = format!(
+            "Still waiting on you: {} · {}",
+            self.headline(),
+            self.age(now)
+        );
         if let Some(h) = self.holding_up.as_deref().filter(|h| !h.trim().is_empty()) {
             s.push_str(&format!(" · {}", crate::crew::words(h, POINT_WORDS)));
         }
@@ -506,7 +510,12 @@ impl OpenItem {
         if crate::open_item::normalised(text) != crate::open_item::normalised(&head) {
             parts.push(text.to_string());
         }
-        if let Some(h) = self.holding_up.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        if let Some(h) = self
+            .holding_up
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
             parts.push(format!("Holding up: {h}"));
         }
         (!parts.is_empty()).then(|| parts.join("\n\n"))

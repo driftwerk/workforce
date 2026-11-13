@@ -543,8 +543,7 @@ pub fn brief(
         let why = crate::decision::clause(&l.why);
         let full = d.why.trim();
         let detail = (!full.is_empty()
-            && crate::open_item::normalised(full)
-                != crate::open_item::normalised(l.why.trim()))
+            && crate::open_item::normalised(full) != crate::open_item::normalised(l.why.trim()))
         .then(|| full.to_string());
         all.push((
             d.session,
@@ -586,7 +585,8 @@ pub fn plain_headline(u: &MentionedUpdate, for_you: usize) -> String {
     // Lines left out are what only the person can do past those shown,
     // then what it did.
     let shown = count(BriefKind::ForYou);
-    let done = count(BriefKind::Done) + (u.more_items as usize).saturating_sub(for_you - shown.min(for_you));
+    let done = count(BriefKind::Done)
+        + (u.more_items as usize).saturating_sub(for_you - shown.min(for_you));
     let waiting = u.needs_you.len();
     let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
     let mut parts: Vec<String> = Vec::new();
@@ -898,7 +898,10 @@ pub fn too_long(c: &Composed) -> Vec<String> {
     use crate::crew::word_count;
     use crate::decision::{BRIEF_CHARS, BRIEF_WORDS, WHY_WORDS};
     let mut out = Vec::new();
-    if c.headline.as_deref().is_some_and(|h| word_count(h) > HEADLINE_WORDS) {
+    if c.headline
+        .as_deref()
+        .is_some_and(|h| word_count(h) > HEADLINE_WORDS)
+    {
         out.push(format!("headline (at most {HEADLINE_WORDS} words)"));
     }
     let mut sessions: Vec<_> = c.sessions.iter().collect();
@@ -1261,7 +1264,12 @@ mod tests {
             ..d
         };
         let acted: Vec<BossDecision> = (0..4)
-            .map(|n| at(nudge(&format!("Message number {n} for web, sent in full.")), n))
+            .map(|n| {
+                at(
+                    nudge(&format!("Message number {n} for web, sent in full.")),
+                    n,
+                )
+            })
             .collect();
         let alone = |n| {
             at(
@@ -1310,7 +1318,10 @@ mod tests {
         assert_eq!(web_group.items.len(), 2);
         assert_eq!(web_group.items[0].id, acted[0].id.to_string());
         assert_eq!(web_group.items[0].action, "Sent web a message");
-        assert_eq!(web_group.items[0].why.as_deref(), Some("you confirmed it yourself at 15:33"));
+        assert_eq!(
+            web_group.items[0].why.as_deref(),
+            Some("you confirmed it yourself at 15:33")
+        );
         assert_eq!(web_group.left_alone, 2);
         assert_eq!(more, 2);
         let mut u = MentionedUpdate {
@@ -1334,7 +1345,16 @@ mod tests {
         // The wire: every brief field there, null when none.
         let v = serde_json::to_value(&u).unwrap();
         let first = &v["brief"][1]["items"][0];
-        for k in ["id", "kind", "action", "why", "detail", "undo", "settledBy", "at"] {
+        for k in [
+            "id",
+            "kind",
+            "action",
+            "why",
+            "detail",
+            "undo",
+            "settledBy",
+            "at",
+        ] {
             assert!(first.get(k).is_some(), "{k} in {first}");
         }
         assert_eq!(v["brief"][0]["items"][0]["kind"], "forYou");
@@ -1346,9 +1366,17 @@ mod tests {
     fn what_is_past_its_bounds_is_named_for_the_reask() {
         let id = Uuid::new_v4();
         let c = Composed {
-            headline: Some("one two three four five six seven eight nine ten eleven twelve thirteen".into()),
+            headline: Some(
+                "one two three four five six seven eight nine ten eleven twelve thirteen".into(),
+            ),
             sessions: HashMap::new(),
-            decisions: HashMap::from([(id, ("Held it.".to_string(), "one two three four five six seven eight nine".to_string()))]),
+            decisions: HashMap::from([(
+                id,
+                (
+                    "Held it.".to_string(),
+                    "one two three four five six seven eight nine".to_string(),
+                ),
+            )]),
         };
         let long = too_long(&c);
         assert_eq!(
@@ -1366,7 +1394,10 @@ mod tests {
         };
         let merged = merge_composed(c, again);
         assert_eq!(merged.headline.as_deref(), Some("Held the release."));
-        assert_eq!(merged.decisions[&id], ("Held it.".to_string(), "CI failed".to_string()));
+        assert_eq!(
+            merged.decisions[&id],
+            ("Held it.".to_string(), "CI failed".to_string())
+        );
         assert!(too_long(&merged).is_empty());
     }
 
