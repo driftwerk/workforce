@@ -8,7 +8,8 @@
 //!
 //! What it gives the person shows three ways, from the one row: a Floor
 //! need, a question card in its DM, and the session's thread. Its routine
-//! answers show in its DM as one compact notice each.
+//! answers are decisions in its log, each said in its DM as one line with
+//! its Undo ([`super::decisions`]).
 //!
 //! A session it runs ([`super::work`]) wakes it here at each turn's end
 //! too, gathered with the session's messages into one `[Desk work]` turn.
@@ -152,6 +153,7 @@ impl CrewHub {
                     "Something went wrong on this Mac.".to_string()
                 }
             })?;
+        self.record_escalated(&q, by, why).await;
         self.post_question(&q).await;
         Ok(())
     }
@@ -223,40 +225,6 @@ impl CrewHub {
             .await
         {
             tracing::warn!(error = %e, "keeping a question card failed");
-        }
-    }
-
-    /// Says in the overseer's DM, compactly, that it answered a session.
-    pub(crate) async fn answered_notice(&self, answer: &LineMessage) {
-        if answer.from.kind != PartyKind::Manager {
-            return;
-        }
-        let Some((service, owner)) = self.dm(&answer.from.id) else {
-            return;
-        };
-        let question = match answer.in_reply_to {
-            Some(ask) => self.desk.store().line_message(ask).await.ok().flatten(),
-            None => None,
-        };
-        let text = format!(
-            "Answered {} · {}",
-            answer.to.name,
-            question.map_or_else(
-                || crew::one_line(&answer.text, 120),
-                |q| crew::one_line(q.headline(), 120)
-            )
-        );
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        if let Err(e) = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-        )
-        .await
-        {
-            tracing::warn!(error = %e, "noting an answer in the DM failed");
         }
     }
 
@@ -376,6 +344,8 @@ impl CrewHub {
             }
         }
         let prompt = self.line_prompt(session, &messages, &ended, &o);
+        let boss = service.agent_id.as_str().to_string();
+        let mark = self.acted_mark(&boss, session);
         let ran = self
             .run_turn(
                 &service,
@@ -399,14 +369,22 @@ impl CrewHub {
             }
         }
         let reply = ran.as_ref().map(|(_, r)| r.as_str()).map_err(|_| ());
-        let reason = "Your reply to the session's question.";
-        let by = By::manager(service.agent_id.as_str(), &name_of(&service), reason);
         for (ask, settled) in still_open.iter().zip(settle(reply, still_open.len())) {
             match settled {
                 Settle::Escalate(why) => {
+                    let by = By::manager(service.agent_id.as_str(), &name_of(&service), why);
                     let _ = self.escalate(ask.id, &by, why, Vec::new(), None).await;
                 }
                 Settle::Answer(text) => {
+                    // The reply's own first sentence is why, as the person
+                    // reads it.
+                    let reason = match crew::one_line(&text, 200) {
+                        r if r.is_empty() => {
+                            "Its reply answered the session's question.".to_string()
+                        }
+                        r => r,
+                    };
+                    let by = By::manager(service.agent_id.as_str(), &name_of(&service), &reason);
                     let action = Action::Nudge {
                         to: Target::Session(session),
                         message: text,
@@ -443,6 +421,14 @@ impl CrewHub {
                         }
                     }
                 }
+            }
+        }
+        // A turn that did nothing, and suggested nothing, is a decision
+        // too: recorded here, never read from what it said.
+        if let Ok((_, reply)) = &ran {
+            if self.acted_mark(&boss, session) == mark {
+                self.record_nothing(&boss, session, !ended.is_empty(), reply)
+                    .await;
             }
         }
     }

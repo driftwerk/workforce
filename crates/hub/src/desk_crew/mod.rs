@@ -30,6 +30,7 @@ use crate::serve::AgentService;
 mod actions;
 mod board;
 pub(crate) mod context;
+mod decisions;
 mod deliver;
 mod extras;
 mod handover;
@@ -142,6 +143,9 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
+    /// How many decisions (and suggestions) each boss made, by the session
+    /// they were about: a line or work turn that moved none let it wait.
+    acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -507,6 +511,7 @@ impl CrewHub {
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
+            acted: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
@@ -1163,6 +1168,13 @@ impl Crew for CrewHub {
                 tracing::warn!(target: "floor", error = %format!("{e:#}"), "the floor's needs are unavailable")
             })
             .ok()
+    }
+
+    async fn undo_decision(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<String, workforce_desk::crew::UndoRefused> {
+        self.me().undo(id).await
     }
 
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {

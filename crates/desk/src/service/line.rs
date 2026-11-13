@@ -1644,6 +1644,26 @@ impl Desk {
         .await
     }
 
+    /// Takes back the one message `id` a boss sent a session, while it is
+    /// queued or held (an Undo of its decision): it never goes in. An
+    /// answer taken back puts its question back with the person. The
+    /// message as it now is, or `None` when it has already gone in.
+    pub async fn line_withdraw(&self, id: Uuid) -> Result<Option<LineMessage>, DeskError> {
+        let back = line::Escalation {
+            why: "You took back Desk's answer, so this is yours to answer.".into(),
+            options: Vec::new(),
+            draft: None,
+        };
+        let Some((withdrawn, reopened)) = self.0.store.line_withdraw_one(id, &back).await? else {
+            return Ok(None);
+        };
+        self.line_announce(&withdrawn);
+        if let Some(q) = reopened {
+            self.line_announce(&q);
+        }
+        Ok(Some(withdrawn))
+    }
+
     /// The person changes (`Some`) or takes back (`None`) a message of
     /// theirs that hasn't gone out.
     pub async fn line_edit(&self, id: Uuid, text: Option<String>) -> Result<(), DeskError> {

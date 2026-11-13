@@ -1,6 +1,7 @@
 //! `/api/desk/activity`, `/overview`, `/manager` and `/suggestions`: the
 //! crew as Floor and the overseer's DM read it, and the person's answers to
-//! the overseer's suggestions. `/unread` and `/reads`: what is unread on this
+//! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
+//! one of its decisions. `/unread` and `/reads`: what is unread on this
 //! Desk, and how far the person has read each place.
 
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::Authorize;
-use crate::crew::{By, Crew, Filter, GroupBoss, Kind, ManagerView, SuggestionState};
+use crate::crew::{By, Crew, Filter, GroupBoss, Kind, ManagerView, SuggestionState, UndoRefused};
 use crate::reads::{AllScope, Read, ReadPut};
 use crate::rooms::YOU;
 use crate::service::{Desk, DeskError};
@@ -206,6 +207,29 @@ async fn answer(
     Json(suggestion).into_response()
 }
 
+/// Undoes one of the boss's decisions, as the person.
+async fn undo(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<uuid::Uuid>() else {
+        return error(StatusCode::NOT_FOUND, "That decision isn’t there.");
+    };
+    match s.crew.undo_decision(id).await {
+        Ok(done) => Json(json!({ "done": done })).into_response(),
+        Err(UndoRefused::NotFound) => error(StatusCode::NOT_FOUND, "That decision isn’t there."),
+        Err(UndoRefused::Already) => {
+            error(StatusCode::CONFLICT, "That decision was already undone.")
+        }
+        Err(UndoRefused::Cant(why)) => error(StatusCode::BAD_REQUEST, why),
+    }
+}
+
 #[derive(Deserialize)]
 struct Puts {
     puts: Vec<ReadPut>,
@@ -268,6 +292,7 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/manager", get(manager))
         .route("/api/desk/suggestions", get(suggestions))
         .route("/api/desk/suggestions/{id}/{answer}", post(answer))
+        .route("/api/desk/decisions/{id}/undo", post(undo))
         .route("/api/desk/unread", get(unread))
         .route("/api/desk/reads", get(read_points).put(put_reads))
         .route("/api/desk/reads/all", post(all_read))
@@ -323,6 +348,39 @@ mod tests {
             self.0.lock().push(s.id.clone());
             Ok(())
         }
+        async fn undo_decision(&self, id: uuid::Uuid) -> Result<String, UndoRefused> {
+            match id.as_u128() {
+                1 => Ok("let acme-web go".into()),
+                2 => Err(UndoRefused::Already),
+                3 => Err(UndoRefused::Cant("What ran is fixed forward.".into())),
+                _ => Err(UndoRefused::NotFound),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_undo_route_says_each_outcome_by_its_status() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let app = crew_router(d, Arc::new(Bearer), Arc::new(Hub::default()));
+            let uri = |n: u128| format!("/api/desk/decisions/{}/undo", uuid::Uuid::from_u128(n));
+            let (status, body) = call(&app, "POST", &uri(1)).await;
+            assert_eq!(
+                (status, body["done"].as_str()),
+                (StatusCode::OK, Some("let acme-web go"))
+            );
+            assert_eq!(call(&app, "POST", &uri(2)).await.0, StatusCode::CONFLICT);
+            let (status, body) = call(&app, "POST", &uri(3)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "What ran is fixed forward.");
+            assert_eq!(call(&app, "POST", &uri(4)).await.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                call(&app, "POST", "/api/desk/decisions/nope/undo").await.0,
+                StatusCode::NOT_FOUND
+            );
+        })
+        .await;
     }
 
     async fn desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> Desk {
