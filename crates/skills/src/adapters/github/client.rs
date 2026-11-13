@@ -13,7 +13,7 @@ use super::app_auth::{
     app_jwt, installation_id_of, installation_token_of, AppCredentials, AppError,
     InstallationToken, InstallationTokens,
 };
-use crate::adapters::auth::{field_paths, resolve_credential, resolve_host};
+use crate::adapters::auth::{field_paths, host_for, resolve_credential};
 use crate::adapters::utils::retry_after_secs;
 
 /// Thin wrapper around `reqwest::Client` with GitHub API authentication.
@@ -205,7 +205,7 @@ impl GithubClient {
                     || eyre!("GitHub token not configured at {token_ws} or {token_flat}"),
                 )?;
                 let (url_ws, url_flat) = self.paths("base_url");
-                let base_url = resolve_host(store.as_ref(), token.per_user, &url_ws, &url_flat)
+                let base_url = host_for(store.as_ref(), &token, &url_ws, &url_flat)
                     .unwrap_or_else(|| self.base_url.clone());
                 (Self::bearer(&token.value)?, base_url)
             }

@@ -26,13 +26,15 @@
 //! paired with a host one user wrote. Configuration baked into a client that
 //! every user shares must be read with [`shared_get`].
 
-use workforce_common::settings::SecretStore;
+use workforce_common::settings::{SecretStore, VaultSource};
 
 /// A credential value and whether one of the caller's own tiers supplied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub value: String,
     pub per_user: bool,
+    /// The tier it came from, where the store says.
+    pub tier: Option<VaultSource>,
 }
 
 /// The workspace and flat forms of a skill field.
@@ -56,14 +58,24 @@ pub fn resolve_credential(
     workspace_path: &str,
     flat_path: &str,
 ) -> Option<Resolved> {
+    // The tier `value` was read from at `path`, by the store's own account.
+    let tier = |path: &str, value: &str, per_user: bool| {
+        store
+            .inspect(path)
+            .into_iter()
+            .find(|(t, v)| t.is_per_user() == per_user && v == value)
+            .map(|(t, _)| t)
+    };
     let user = |path: &str| {
         store.get_user_override(path).map(|value| Resolved {
+            tier: tier(path, &value, true),
             value,
             per_user: true,
         })
     };
     let shared = |path: &str| {
         store.get(path).map(|value| Resolved {
+            tier: tier(path, &value, false),
             value,
             per_user: false,
         })
@@ -72,6 +84,61 @@ pub fn resolve_credential(
         .or_else(|| user(flat_path))
         .or_else(|| shared(workspace_path))
         .or_else(|| shared(flat_path))
+}
+
+/// Where a credential is sent (a site, a host, a port), for the credential
+/// `cred`: [`resolve_companion`]'s rule, except on a pinned store (a hub
+/// running Desk), where an agent can write vault paths beside the person's
+/// connection. There it is read only from the tier `cred` came from, or the
+/// hub's shared `Global` tier, which only an administrator writes: never
+/// from a tier an agent wrote without the credential.
+pub fn companion_for(
+    store: &dyn SecretStore,
+    cred: &Resolved,
+    workspace_path: &str,
+    flat_path: &str,
+) -> Option<String> {
+    if !store.is_pinned() {
+        return resolve_companion(store, cred.per_user, workspace_path, flat_path);
+    }
+    let at = |path: &str, tier: VaultSource| {
+        store
+            .inspect(path)
+            .into_iter()
+            .find(|(t, _)| *t == tier)
+            .map(|(_, v)| v)
+    };
+    let own = cred.tier?;
+    at(workspace_path, own)
+        .or_else(|| at(flat_path, own))
+        .or_else(|| at(workspace_path, VaultSource::Global))
+        .or_else(|| at(flat_path, VaultSource::Global))
+}
+
+/// [`companion_for`] of a host, normalised to no trailing slash.
+pub fn host_for(
+    store: &dyn SecretStore,
+    cred: &Resolved,
+    workspace_path: &str,
+    flat_path: &str,
+) -> Option<String> {
+    companion_for(store, cred, workspace_path, flat_path)
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+/// The address a loader builds a client with, for the credential at
+/// `credential_path`: [`shared_get`] as before, except on a pinned store,
+/// where it is read as [`companion_for`] reads it.
+pub fn address_for(
+    store: &dyn SecretStore,
+    credential_path: &str,
+    address_path: &str,
+) -> Option<String> {
+    if !store.is_pinned() {
+        return shared_get(store, address_path);
+    }
+    let cred = resolve_at(store, credential_path)?;
+    companion_for(store, &cred, address_path, address_path)
 }
 
 /// [`resolve_credential`] for a field that has a single form.
@@ -136,6 +203,26 @@ pub fn resolve_host(
         .map(|url| url.trim_end_matches('/').to_string())
 }
 
+/// The redirect policy for a client that sends its key in a header of its
+/// own (Metabase's `x-api-key`, Datadog's `DD-API-KEY`), which reqwest keeps
+/// on every hop: a redirect within the origin first asked is followed, one
+/// to any other origin is not, so the key never reaches a host it wasn't
+/// set up for. (`Authorization` is dropped by reqwest on a cross-host hop,
+/// so the clients that send only that keep its default.)
+#[cfg(any(feature = "metabase", feature = "datadog"))]
+pub fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let asked = attempt.previous().first().map(|u| u.origin());
+        if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else if asked.as_ref() == Some(&attempt.url().origin()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,8 +233,14 @@ mod tests {
     const WS_SITE: &str = "skills/jira/workspaces/default/site";
     const FLAT_SITE: &str = "skills/jira/site";
 
+    /// What LayeredInMem's tiers are: the user's is AgentPerUser, the
+    /// agent's AgentSpecific.
     fn resolved(value: &str, per_user: bool) -> Resolved {
         Resolved {
+            tier: Some(match per_user {
+                true => VaultSource::AgentPerUser,
+                false => VaultSource::AgentSpecific,
+            }),
             value: value.into(),
             per_user,
         }
@@ -292,5 +385,128 @@ mod tests {
             resolve_companion(&*store, true, WS_SITE, FLAT_SITE).as_deref(),
             Some("https://ws.atlassian.net")
         );
+    }
+
+    /// LayeredInMem as a hub running Desk reads it.
+    struct Pinned(std::sync::Arc<LayeredInMem>);
+
+    impl SecretStore for Pinned {
+        fn get(&self, p: &str) -> Option<String> {
+            self.0.get(p)
+        }
+        fn set(&self, p: &str, v: &str) -> eyre::Result<()> {
+            self.0.set(p, v)
+        }
+        fn delete(&self, p: &str) -> eyre::Result<bool> {
+            self.0.delete(p)
+        }
+        fn list(&self, p: Option<&str>) -> Vec<String> {
+            self.0.list(p)
+        }
+        fn get_user_override(&self, p: &str) -> Option<String> {
+            self.0.get_user_override(p)
+        }
+        fn inspect(&self, p: &str) -> Vec<(VaultSource, String)> {
+            self.0.inspect(p)
+        }
+        fn is_pinned(&self) -> bool {
+            true
+        }
+    }
+
+    /// On a hub running Desk, a site an agent wrote at another tier than
+    /// the person's key is never where the key is sent; the site kept with
+    /// the key is.
+    #[test]
+    fn a_pinned_store_sends_a_key_only_where_its_own_tier_says() {
+        // The person's key and site for this agent; the agent's own site
+        // beside them at the agent's shared tier.
+        let store = Pinned(LayeredInMem::new(
+            &[(WS_SITE, "https://evil.example")],
+            &[(WS, "user_token"), (WS_SITE, "https://acme.atlassian.net")],
+        ));
+        let cred = resolve_credential(&store, WS, FLAT).unwrap();
+        assert_eq!(
+            companion_for(&store, &cred, WS_SITE, FLAT_SITE).as_deref(),
+            Some("https://acme.atlassian.net")
+        );
+        // A key at the shared tier, a site only at the person's: none.
+        let store = Pinned(LayeredInMem::new(
+            &[(WS, "shared_token")],
+            &[(WS_SITE, "https://evil.example")],
+        ));
+        let cred = resolve_credential(&store, WS, FLAT).unwrap();
+        assert_eq!(companion_for(&store, &cred, WS_SITE, FLAT_SITE), None);
+        assert_eq!(address_for(&store, WS, WS_SITE), None);
+        // The person's key, a site only the agent wrote: none, where before
+        // it would have been read.
+        let store = Pinned(LayeredInMem::new(
+            &[(WS_SITE, "https://evil.example")],
+            &[(WS, "user_token")],
+        ));
+        let cred = resolve_credential(&store, WS, FLAT).unwrap();
+        assert_eq!(companion_for(&store, &cred, WS_SITE, FLAT_SITE), None);
+        assert_eq!(
+            resolve_companion(&*store.0, true, WS_SITE, FLAT_SITE).as_deref(),
+            Some("https://evil.example"),
+            "an unpinned store keeps its rule"
+        );
+    }
+
+    #[cfg(any(feature = "metabase", feature = "datadog"))]
+    #[tokio::test]
+    async fn a_key_in_its_own_header_never_follows_a_redirect_to_another_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let asked = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(path("/away"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/steal", elsewhere.uri())),
+            )
+            .mount(&asked)
+            .await;
+        Mock::given(path("/moved"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/here"))
+            .mount(&asked)
+            .await;
+        Mock::given(path("/here"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&asked)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirects())
+            .build()
+            .unwrap();
+        let away = client
+            .get(format!("{}/away", asked.uri()))
+            .header("x-api-key", "mb_key")
+            .header("DD-API-KEY", "dd_key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            away.status(),
+            302,
+            "the hop away is handed back, not followed"
+        );
+        let moved = client
+            .get(format!("{}/moved", asked.uri()))
+            .header("x-api-key", "mb_key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            moved.text().await.unwrap(),
+            "ok",
+            "a hop within the origin is followed"
+        );
+        elsewhere.verify().await;
     }
 }
