@@ -200,16 +200,23 @@ async fn post(
         Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
         // On the issue: never answered as a failure, which would have it
         // posted again.
-        Err(CommentPost::NotKept(c)) => {
-            let mut answer = serde_json::to_value(&*c).unwrap_or_else(|_| json!({}));
-            answer["message"] = json!(
-                "Posted. Desk couldn't keep its copy just now: it shows when the comments are read again."
-            );
-            (StatusCode::CREATED, Json(answer)).into_response()
-        }
+        Err(CommentPost::NotKept(c)) => (StatusCode::CREATED, Json(not_kept(&c))).into_response(),
         Err(CommentPost::Desk(e)) => e.into_response(),
         Err(e) => refusal(StatusCode::BAD_GATEWAY, &e.to_string()),
     }
+}
+
+/// The answer for a comment posted on its issue that Desk couldn't keep:
+/// as posted, `kept: false`, and no id, since there is no copy here for one
+/// to name.
+fn not_kept(c: &workforce_desk::ticket_comments::Comment) -> serde_json::Value {
+    let mut answer = serde_json::to_value(c).unwrap_or_else(|_| json!({}));
+    answer["id"] = serde_json::Value::Null;
+    answer["kept"] = json!(false);
+    answer["message"] = json!(
+        "Posted. Desk couldn't keep its copy just now: it shows when the comments are read again."
+    );
+    answer
 }
 
 #[cfg(test)]

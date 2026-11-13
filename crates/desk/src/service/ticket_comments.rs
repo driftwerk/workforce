@@ -26,7 +26,8 @@ pub enum CommentPost {
     Remote(RemoteError),
     /// It is on the issue, but Desk couldn't keep its copy: it comes back
     /// when the issue's comments are next read. Posting again would post it
-    /// twice.
+    /// twice. The comment as posted, with no id here ([`Uuid::nil`]): there
+    /// is no copy to name.
     #[error("posted, but not kept here")]
     NotKept(Box<Comment>),
 }
@@ -71,6 +72,9 @@ impl Desk {
             return self.ticket_comments(id).await.map_err(fail);
         };
         let (tool, args) = comments::list_call(e.system, &e.key);
+        // Before the call: a comment Desk posts from here on may postdate
+        // its answer, so this read never takes it as deleted.
+        let asked_at = crate::crew::now();
         let answer = crate::board_sync::call(remote, e.system, tool, args).await?;
         let read = match e.system {
             crate::board::System::Jira => comments::jira_comments(&answer),
@@ -84,7 +88,7 @@ impl Desk {
         })?;
         self.0
             .store
-            .put_remote_comments(id, &read.comments, read.complete)
+            .put_remote_comments(id, &read, asked_at)
             .await
             .map_err(|e| fail(internal(e)))?;
         // When they were read: a version race only means they're read again.
@@ -122,7 +126,6 @@ impl Desk {
         }
         let t = self.ticket_of(id).await?;
         let key = self.key_of(&t).await?;
-        let at = crate::crew::now();
         let remote_id = match (&t.external, via) {
             (Some(e), Some(via)) => {
                 if by.party.kind != PartyKind::You {
@@ -162,6 +165,9 @@ impl Desk {
             }
             (None, _) => None,
         };
+        // Once it's on the issue: a read asked for before now may not list
+        // it, and never takes it as deleted (`put_remote_comments`).
+        let at = crate::crew::now();
         let author = comments::author_from(&by.party);
         let kept = self
             .0
@@ -174,7 +180,7 @@ impl Desk {
             // On the issue already: said as posted, never as failed.
             (Err(e), Some(_)) => {
                 tracing::warn!(ticket = %id, error = %e, "a posted comment wasn't kept here");
-                (Uuid::new_v4(), false)
+                (Uuid::nil(), false)
             }
         };
         let group = self.board_of(t.board).await.ok().and_then(|b| b.group);

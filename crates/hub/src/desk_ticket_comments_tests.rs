@@ -411,12 +411,39 @@ async fn a_malformed_read_keeps_every_comment() {
         desk.read_ticket_comments(t.ticket.id, &*via).await.unwrap();
         let all = desk.ticket_comments(t.ticket.id).await.unwrap();
         assert_eq!(all.len(), 2);
-        // A whole read listing none: the issue's go, the person's stays.
+        // A whole read listing none, asked for after the person posted: the
+        // issue's go, and so does theirs, deleted there too.
         remote.jira.lock().unwrap().comments_answer = Some(json!({ "total": 0, "comments": [] }));
         desk.read_ticket_comments(t.ticket.id, &*via).await.unwrap();
-        let all = desk.ticket_comments(t.ticket.id).await.unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].body, "On it");
+        assert!(desk.ticket_comments(t.ticket.id).await.unwrap().is_empty());
     })
     .await;
+}
+
+/// A comment posted but not kept here is answered as posted, with no id:
+/// one would name nothing Desk could find again.
+#[test]
+fn a_comment_not_kept_is_answered_with_no_id() {
+    use workforce_desk::ticket_comments::{Author, AuthorKind, Comment};
+    let c = Comment {
+        id: uuid::Uuid::nil(),
+        remote_id: Some("10042".into()),
+        author: Author {
+            kind: AuthorKind::Person,
+            name: "You".into(),
+            on: "Desk".into(),
+        },
+        posted_by: None,
+        body: "On it".into(),
+        flagged: false,
+        at: chrono::Utc::now(),
+        edited_at: None,
+        only_here: false,
+    };
+    let answer = super::not_kept(&c);
+    assert!(answer["id"].is_null(), "{answer}");
+    assert_eq!(answer["kept"], false);
+    assert_eq!(answer["body"], "On it");
+    assert!(answer.get("remoteId").is_none(), "{answer}");
+    assert!(answer["message"].as_str().unwrap().starts_with("Posted."));
 }

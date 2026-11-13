@@ -134,10 +134,14 @@ fn author_of(system: System, name: Option<String>, app: bool) -> Author {
 }
 
 /// An issue's comments as one answer listed them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemoteRead {
     pub comments: Vec<RemoteComment>,
-    /// The answer listed every comment the issue has, and each was read: only
+    /// The ids of comments it listed whose rest couldn't be read (a time
+    /// that doesn't parse): there still, so what is kept of each stays as
+    /// it was, and none stops a whole read pruning the others.
+    pub unread: Vec<String>,
+    /// The answer listed every comment the issue has, each by its id: only
     /// then is one it doesn't list taken as deleted there.
     pub complete: bool,
 }
@@ -149,79 +153,94 @@ fn listed(answer: &Value) -> Result<&Vec<Value>, String> {
         .ok_or_else(|| "its answer listed no comments".to_string())
 }
 
-/// `comments` as read from `listed` entries: complete when none was left
-/// out, none was cut off at [`READ_MAX`], and `total` (when the answer
-/// counts them) is no more than it listed.
-fn read_of(listed: usize, comments: Vec<RemoteComment>, total: Option<Option<u64>>) -> RemoteRead {
-    let counted = match total {
-        None => true,
-        Some(total) => total.is_some_and(|t| t <= listed as u64),
-    };
-    RemoteRead {
-        complete: comments.len() == listed && listed < READ_MAX && counted,
-        comments,
-    }
+/// One entry of an answer: read, there but unreadable past its id, or not
+/// even that.
+enum Entry {
+    Read(RemoteComment),
+    Unread(String),
+    Unknown,
 }
 
-/// The comments of a `jira.list_comments` answer; Jira's `total` says
-/// whether that was all of them (an answer without it never is).
+/// What `entries` (an answer's first [`READ_MAX`]) read as. Whole when each
+/// of `listed` was read or at least named, and the issue has no more: as
+/// `total` counts them, or, where the answer doesn't count, fewer came back
+/// than the page asked for ([`READ_MAX`]).
+fn read_of(listed: usize, entries: impl Iterator<Item = Entry>, total: Option<u64>) -> RemoteRead {
+    let mut read = RemoteRead::default();
+    let mut named = 0;
+    for entry in entries.take(READ_MAX) {
+        match entry {
+            Entry::Read(c) => read.comments.push(c),
+            Entry::Unread(id) => read.unread.push(id),
+            Entry::Unknown => continue,
+        }
+        named += 1;
+    }
+    let all_there = match total {
+        Some(total) => total <= listed as u64,
+        None => listed < READ_MAX,
+    };
+    read.complete = named == listed && all_there;
+    read
+}
+
+/// The comments of a `jira.list_comments` answer, asked for [`READ_MAX`]
+/// at a time; Jira's `total` says whether that was all of them.
 pub fn jira_comments(answer: &Value) -> Result<RemoteRead, String> {
     let all = listed(answer)?;
-    let comments = all
-        .iter()
-        .filter_map(|c| {
-            let id = match &c["id"] {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                _ => return None,
-            };
-            let (html, flagged) = unfence(c["body_html"].as_str().unwrap_or_default());
-            let body = held(&crate::board_sync::html_text(&html));
-            let app = c["author_account_type"].as_str() == Some("app");
-            Some(RemoteComment {
-                author: author_of(System::Jira, name_of(&c["author"]), app),
-                remote_id: id,
-                flagged,
-                at: crate::board_sync::remote_time(&c["created"])?,
-                edited_at: crate::board_sync::remote_time(&c["updated"])
-                    .filter(|u| Some(*u) != crate::board_sync::remote_time(&c["created"])),
-                body,
-            })
+    let entries = all.iter().map(|c| {
+        let id = match &c["id"] {
+            Value::String(s) if !s.is_empty() => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return Entry::Unknown,
+        };
+        let Some(at) = crate::board_sync::remote_time(&c["created"]) else {
+            return Entry::Unread(id);
+        };
+        let (html, flagged) = unfence(c["body_html"].as_str().unwrap_or_default());
+        let body = held(&crate::board_sync::html_text(&html));
+        let app = c["author_account_type"].as_str() == Some("app");
+        Entry::Read(RemoteComment {
+            author: author_of(System::Jira, name_of(&c["author"]), app),
+            remote_id: id,
+            flagged,
+            at,
+            edited_at: crate::board_sync::remote_time(&c["updated"]).filter(|u| *u != at),
+            body,
         })
-        .take(READ_MAX)
-        .collect();
-    Ok(read_of(all.len(), comments, Some(answer["total"].as_u64())))
+    });
+    Ok(read_of(all.len(), entries, answer["total"].as_u64()))
 }
 
 /// The comments of a `linear.comment_list` answer, asked for at most
 /// [`READ_MAX`].
 pub fn linear_comments(answer: &Value) -> Result<RemoteRead, String> {
     let all = listed(answer)?;
-    let comments = all
-        .iter()
-        .filter_map(|c| {
-            let id = c["id"].as_str()?.to_string();
-            let (body, flagged) = unfence(c["body"].as_str().unwrap_or_default());
-            let body = held(&body);
-            let bot = c.get("botActor").filter(|b| b.is_object());
-            let (name, app) = match (c["user"]["name"].as_str(), bot) {
-                (Some(_), _) => (name_of(&c["user"]["name"]), false),
-                (None, Some(b)) => (name_of(&b["name"]), true),
-                (None, None) => (None, false),
-            };
-            let at = crate::board_sync::remote_time(&c["createdAt"])?;
-            Some(RemoteComment {
-                author: author_of(System::Linear, name, app),
-                remote_id: id,
-                flagged,
-                at,
-                edited_at: crate::board_sync::remote_time(&c["editedAt"]),
-                body,
-            })
+    let entries = all.iter().map(|c| {
+        let Some(id) = c["id"].as_str().filter(|id| !id.is_empty()) else {
+            return Entry::Unknown;
+        };
+        let Some(at) = crate::board_sync::remote_time(&c["createdAt"]) else {
+            return Entry::Unread(id.to_string());
+        };
+        let (body, flagged) = unfence(c["body"].as_str().unwrap_or_default());
+        let body = held(&body);
+        let bot = c.get("botActor").filter(|b| b.is_object());
+        let (name, app) = match (c["user"]["name"].as_str(), bot) {
+            (Some(_), _) => (name_of(&c["user"]["name"]), false),
+            (None, Some(b)) => (name_of(&b["name"]), true),
+            (None, None) => (None, false),
+        };
+        Entry::Read(RemoteComment {
+            author: author_of(System::Linear, name, app),
+            remote_id: id.to_string(),
+            flagged,
+            at,
+            edited_at: crate::board_sync::remote_time(&c["editedAt"]),
+            body,
         })
-        .take(READ_MAX)
-        .collect();
-    Ok(read_of(all.len(), comments, None))
+    });
+    Ok(read_of(all.len(), entries, None))
 }
 
 /// The id of the comment a `jira.add_comment` or `linear.comment_add`
@@ -241,9 +260,11 @@ pub fn posted_id(system: System, answer: &Value) -> Option<String> {
 /// The call that lists `key`'s comments.
 pub fn list_call(system: System, key: &str) -> (&'static str, Value) {
     match system {
+        // A page as large as is read, so `total` says whether it was all
+        // (Jira's own page is smaller).
         System::Jira => (
             "jira.list_comments",
-            serde_json::json!({ "issue_key": key }),
+            serde_json::json!({ "issue_key": key, "max_results": READ_MAX }),
         ),
         System::Linear => (
             "linear.comment_list",
@@ -338,20 +359,22 @@ impl DeskStore {
             .collect()
     }
 
-    /// Keeps `ticket`'s issue's comments as it now lists them: new ones
-    /// added, edited ones rewritten, and, only when `complete` (the issue
-    /// listed them all), ones it no longer lists deleted. Who in Desk posted
-    /// one stays, and so does every one Desk posted; Desk-only comments are
-    /// never touched.
+    /// Keeps `ticket`'s issue's comments as `read` (asked for at `asked_at`)
+    /// lists them: new ones added, edited ones rewritten, and, only when the
+    /// read is whole, ones it no longer lists deleted, Desk's posts among
+    /// them. Who in Desk posted one stays while it's there. One Desk posted
+    /// after the read was asked for stays (the answer may predate it), and
+    /// so does one listed but unreadable ([`RemoteRead::unread`]); Desk-only
+    /// comments are never touched.
     pub async fn put_remote_comments(
         &self,
         ticket: Uuid,
-        comments: &[RemoteComment],
-        complete: bool,
+        read: &RemoteRead,
+        asked_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
-        for c in comments {
+        for c in &read.comments {
             tx.execute(
                 "INSERT INTO ticket_comments (id, ticket, remote_id, author, body, flagged, at, edited_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
@@ -371,12 +394,17 @@ impl DeskStore {
             )
             .await?;
         }
-        if complete {
-            let ids: Vec<&str> = comments.iter().map(|c| c.remote_id.as_str()).collect();
+        if read.complete {
+            let there: Vec<&str> = read
+                .comments
+                .iter()
+                .map(|c| c.remote_id.as_str())
+                .chain(read.unread.iter().map(String::as_str))
+                .collect();
             tx.execute(
                 "DELETE FROM ticket_comments WHERE ticket = $1 AND remote_id IS NOT NULL \
-                 AND posted_by IS NULL AND NOT (remote_id = ANY($2))",
-                &[&ticket, &ids],
+                 AND NOT (remote_id = ANY($2)) AND (posted_by IS NULL OR at < $3)",
+                &[&ticket, &there, &asked_at],
             )
             .await?;
         }

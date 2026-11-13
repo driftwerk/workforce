@@ -24,9 +24,13 @@ fn a_linear_comment_s_writer_is_a_person_or_an_app_whatever_it_says() {
         { "id": "c5", "body": "no time" },
     ]});
     let read = linear_comments(&answer).unwrap();
-    assert!(!read.complete, "one was left out: the read isn't whole");
+    assert!(
+        read.complete,
+        "one without a time is there all the same: the read is whole"
+    );
+    assert_eq!(read.unread, ["c5"]);
     let c = read.comments;
-    assert_eq!(c.len(), 4, "one without a time is left out");
+    assert_eq!(c.len(), 4, "one without a time isn't read");
     assert_eq!(
         (c[0].author.kind, c[0].author.name.as_str()),
         (AuthorKind::Person, "Dana Kim")
@@ -57,8 +61,8 @@ fn a_jira_comment_s_rendered_body_is_its_words_and_an_app_is_an_agent() {
     ]});
     let read = jira_comments(&answer).unwrap();
     assert!(
-        !read.complete,
-        "an answer that doesn't count them isn't whole"
+        read.complete,
+        "an answer that doesn't count them, short of a page, is whole"
     );
     let c = read.comments;
     assert_eq!(
@@ -123,6 +127,15 @@ async fn a_ticket(store: &DeskStore) -> Uuid {
     ticket
 }
 
+/// A read listing `comments`, whole or not.
+fn read(comments: Vec<RemoteComment>, complete: bool) -> RemoteRead {
+    RemoteRead {
+        comments,
+        unread: vec![],
+        complete,
+    }
+}
+
 fn remote(id: &str, body: &str) -> RemoteComment {
     RemoteComment {
         remote_id: id.into(),
@@ -171,8 +184,11 @@ async fn a_read_keeps_who_in_desk_posted_a_comment_and_leaves_desk_s_own() {
         store
             .put_remote_comments(
                 t,
-                &[remote("c1", "On it (edited)"), remote("c2", "Thanks")],
-                true,
+                &read(
+                    vec![remote("c1", "On it (edited)"), remote("c2", "Thanks")],
+                    true,
+                ),
+                Utc::now(),
             )
             .await
             .unwrap();
@@ -192,7 +208,7 @@ async fn a_read_keeps_who_in_desk_posted_a_comment_and_leaves_desk_s_own() {
         assert_eq!(note.author.kind, AuthorKind::Agent);
         // c2 deleted there: gone here; the session's note stays.
         store
-            .put_remote_comments(t, &[remote("c1", "On it")], true)
+            .put_remote_comments(t, &read(vec![remote("c1", "On it")], true), Utc::now())
             .await
             .unwrap();
         let c = store.comments_of(t, true).await.unwrap();
@@ -270,13 +286,81 @@ fn a_malformed_or_partial_answer_is_no_whole_read() {
         !jira_comments(&jira(json!(2))).unwrap().complete,
         "a page of more"
     );
-    assert!(!jira_comments(&jira(Value::Null)).unwrap().complete);
+    assert!(
+        jira_comments(&jira(Value::Null)).unwrap().complete,
+        "uncounted, but fewer than a page"
+    );
+    // Uncounted and a whole page: maybe more there.
+    let page: Vec<Value> = (0..READ_MAX)
+        .map(|n| {
+            json!({ "id": n.to_string(), "author": "Dana", "body_html": "<p>a</p>",
+                "created": "2026-11-10T09:00:00.000+0000" })
+        })
+        .collect();
+    assert!(
+        !jira_comments(&json!({ "comments": page }))
+            .unwrap()
+            .complete
+    );
+    // Counted: a page of all of them is whole, even a full one.
+    assert!(
+        jira_comments(&json!({ "total": READ_MAX, "comments": page }))
+            .unwrap()
+            .complete
+    );
+    // One with no id can't be told apart: never whole.
+    let anon = json!({ "total": 1, "comments": [ { "author": "Dana", "body_html": "<p>a</p>",
+        "created": "2026-11-10T09:00:00.000+0000" } ] });
+    assert!(!jira_comments(&anon).unwrap().complete);
 }
 
-/// Only a whole read deletes what the issue no longer lists, and never one
-/// Desk posted.
+/// The read asks Jira for a page as large as it reads, so its `total`
+/// says whether that was all.
+#[test]
+fn jira_s_comments_are_asked_for_a_page_as_large_as_is_read() {
+    let (tool, args) = list_call(System::Jira, "ACME-1");
+    assert_eq!(tool, "jira.list_comments");
+    assert_eq!(args["max_results"], READ_MAX);
+}
+
+/// One comment whose time doesn't parse is still there: its row stays as
+/// it was, and the others a whole read no longer lists go.
 #[tokio::test]
-async fn only_a_whole_read_prunes_and_never_what_desk_posted() {
+async fn an_unreadable_comment_stays_and_never_stops_pruning() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let t = a_ticket(&store).await;
+        store
+            .put_remote_comments(
+                t,
+                &read(vec![remote("c1", "a"), remote("c2", "b"), remote("c3", "c")], true),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        // c2's time no longer parses; c3 was deleted there.
+        let answer = json!({ "comments": [
+            { "id": "c1", "body": "a", "user": { "name": "Sam" }, "createdAt": "2026-11-10T09:00:00Z" },
+            { "id": "c2", "body": "b (edited)", "user": { "name": "Sam" }, "createdAt": "yesterday" },
+        ]});
+        let r = linear_comments(&answer).unwrap();
+        assert!(r.complete);
+        store.put_remote_comments(t, &r, Utc::now()).await.unwrap();
+        let c = store.comments_of(t, true).await.unwrap();
+        let bodies: Vec<_> = c.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(bodies.contains(&"b"), "kept as it was: {bodies:?}");
+        assert!(c.iter().all(|c| c.remote_id.as_deref() != Some("c3")));
+    })
+    .await;
+}
+
+/// Only a whole read deletes what the issue no longer lists: one Desk
+/// posted among them, unless it was posted after the read was asked for
+/// (the answer may predate it).
+#[tokio::test]
+async fn only_a_whole_read_prunes_and_desk_s_posts_only_once_read_after() {
     with_test_pool(build_pool, |pool| async move {
         DeskStore::migrate(&pool).await.unwrap();
         let store = DeskStore::from_pool(pool);
@@ -293,13 +377,23 @@ async fn only_a_whole_read_prunes_and_never_what_desk_posted() {
             )
             .await
             .unwrap();
+        let posted = Utc::now();
+        let before = posted - chrono::Duration::seconds(5);
         store
-            .put_remote_comments(t, &[remote("c1", "a"), remote("c2", "b")], true)
+            .put_remote_comments(
+                t,
+                &read(vec![remote("c1", "a"), remote("c2", "b")], true),
+                before,
+            )
             .await
             .unwrap();
         // A partial read: nothing it doesn't list goes.
         store
-            .put_remote_comments(t, &[remote("c1", "a (edited)")], false)
+            .put_remote_comments(
+                t,
+                &read(vec![remote("c1", "a (edited)")], false),
+                Utc::now(),
+            )
             .await
             .unwrap();
         let c = store.comments_of(t, true).await.unwrap();
@@ -308,12 +402,22 @@ async fn only_a_whole_read_prunes_and_never_what_desk_posted() {
             c.iter().any(|c| c.body == "a (edited)"),
             "still kept in step"
         );
-        // A whole read that lists none: the issue's own go, Desk's stays.
-        store.put_remote_comments(t, &[], true).await.unwrap();
+        // A whole read asked for before Desk posted, listing none: the
+        // issue's own go; Desk's, maybe newer than the answer, stays.
+        store
+            .put_remote_comments(t, &read(vec![], true), before)
+            .await
+            .unwrap();
         let c = store.comments_of(t, true).await.unwrap();
         assert_eq!(c.len(), 1, "{c:?}");
         assert_eq!(c[0].remote_id.as_deref(), Some("mine"));
         assert_eq!(c[0].author.name, "You");
+        // One asked for after: Desk's post was deleted there, and goes.
+        store
+            .put_remote_comments(t, &read(vec![], true), Utc::now())
+            .await
+            .unwrap();
+        assert!(store.comments_of(t, true).await.unwrap().is_empty());
     })
     .await;
 }

@@ -1049,7 +1049,7 @@ pub const BOARD_SYNC_VIEW_TOOLS: &[&str] = &[
 pub const BOARD_SYNC_FILE_TOOLS: &[&str] = &["jira.attachment_read", "linear.upload_read"];
 
 /// The query a hub's board sync puts on every call to a linked hub's remote
-/// MCP: it is a program, so that hub offers it the [`BOARD_SYNC_VIEW_TOOLS`]
+/// MCP: it is a program, so that hub offers it the [`BOARD_SYNC_FILE_TOOLS`]
 /// a model's client is never offered. A mark, not a credential.
 pub const BOARD_SYNC_CALLER: &str = "caller=desk-board-sync";
 
