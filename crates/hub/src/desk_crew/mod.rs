@@ -169,6 +169,10 @@ pub struct CrewHub {
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses whose update is being looked at now.
     updating: Mutex<std::collections::HashSet<String>>,
+    /// Session questions given to the person while they were at that
+    /// session a moment before: said once they have left it a hold's
+    /// time, unless they answer there first.
+    pub(super) held_questions: Mutex<std::collections::HashSet<uuid::Uuid>>,
     /// The suggestions each boss's quiet check-ins made, and when, for its
     /// next update to show.
     quiet_made:
@@ -565,6 +569,7 @@ impl CrewHub {
             relayed_turns: Mutex::default(),
             update_writer: Mutex::default(),
             updating: Mutex::default(),
+            held_questions: Mutex::default(),
             quiet_made: Mutex::default(),
             dm_typing: Mutex::default(),
             presence: Mutex::default(),
@@ -1244,6 +1249,10 @@ impl Crew for CrewHub {
 
     async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
         self.me().drop_item(id).await
+    }
+
+    async fn done_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().done_item(id).await
     }
 
     async fn always_item(
