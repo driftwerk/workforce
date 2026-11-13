@@ -202,11 +202,19 @@ jobs:
       - name: Give the build room to swap
         run: |
           free -h
+          # Only a mitigation: without room on the scratch disk, build as
+          # before.
+          if [ ! -d /mnt ] || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 24 ]; then
+            echo "No room on /mnt for swap: building with the runner's own."
+            exit 0
+          fi
           sudo swapoff -a
           sudo fallocate -l 16G /mnt/test-build.swap
           sudo chmod 600 /mnt/test-build.swap
           sudo mkswap /mnt/test-build.swap >/dev/null
           sudo swapon /mnt/test-build.swap
+          # Swap only under real pressure, so the runner itself isn't starved.
+          sudo sysctl -q vm.swappiness=10
           free -h
       - name: Build every test binary
         run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
