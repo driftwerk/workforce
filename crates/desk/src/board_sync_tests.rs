@@ -129,17 +129,17 @@ fn a_linear_filter_is_the_tool_s_own_arguments_for_the_team() {
     let me = "11111111-2222-4333-8444-555555555555";
     assert_eq!(
         linear_args(team, &Filter::AssignedToMe, Some(me), None, None),
-        json!({ "team_id": team, "limit": 100, "assignee_id": me })
+        json!({ "team_id": team, "limit": 50, "rich": true, "assignee_id": me })
     );
     assert_eq!(
         linear_args(team, &Filter::Label("web".into()), None, None, None),
-        json!({ "team_id": team, "limit": 100 })
+        json!({ "team_id": team, "limit": 50, "rich": true })
     );
     let q = Filter::Query(r#"{"state": "Todo", "priority": 2}"#.into());
     assert!(check_filter(System::Linear, &q, None).is_ok());
     assert_eq!(
         linear_args(team, &q, None, None, None),
-        json!({ "team_id": team, "limit": 100, "state": "Todo", "priority": 2 })
+        json!({ "team_id": team, "limit": 50, "rich": true, "state": "Todo", "priority": 2 })
     );
     // The team is the link's: a filter can't name another, nor break out of
     // the tool's own query.
@@ -270,6 +270,7 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         assignee: None,
         closed: None,
         clipped: false,
+        facts: Default::default(),
         priority: None,
         project: None,
         due: None,
@@ -491,11 +492,11 @@ fn a_whole_board_lists_what_is_open_and_follows_every_change() {
     let team = "8a7b6c5d-0000-4000-8000-000000000001";
     assert_eq!(
         linear_args(team, &all, None, None, Some("cur1")),
-        json!({ "team_id": team, "limit": 100, "open_only": true, "after": "cur1" })
+        json!({ "team_id": team, "limit": 50, "rich": true, "open_only": true, "after": "cur1" })
     );
     assert_eq!(
         linear_args(team, &all, None, Some(since), None),
-        json!({ "team_id": team, "limit": 100, "updated_since": since })
+        json!({ "team_id": team, "limit": 50, "rich": true, "updated_since": since })
     );
     assert!(linear_args(team, &with_done, None, None, None)["completed_since"].is_string());
     // It takes no member id, and no done issue that isn't on the board yet.
@@ -858,4 +859,159 @@ fn a_shared_jira_key_s_assigned_to_me_is_the_matched_account() {
     );
     // An account id that isn't one is never put in the query.
     assert!(jql("ACME", &Filter::AssignedToMe, None, Some("x\" OR \"1")).contains("currentUser()"));
+}
+
+/// Linear keeps "A blocks B" once: in A's relations (B the related issue)
+/// and in B's inverse relations (A the issue). What blocks an issue is in
+/// its inverse relations, as the issue; what it blocks, its relations.
+#[test]
+fn a_linear_issue_is_blocked_by_its_inverse_relations_issue() {
+    let i = linear_issue(&json!({
+        "id": "u1", "identifier": "MAN-543", "title": "Voice box drops the wake word",
+        "description": "", "updatedAt": "2026-11-09T10:00:00.000Z", "createdAt": "2026-09-27T08:00:00.000Z",
+        "url": "https://linear.app/x/issue/MAN-543",
+        "priority": 2, "priorityLabel": "High", "estimate": 2,
+        "state": { "name": "In Progress", "type": "started" },
+        "creator": { "name": "Ana Ruiz" },
+        "cycle": { "number": 14, "name": null, "startsAt": "2026-11-03T00:00:00.000Z", "endsAt": "2026-11-17T00:00:00.000Z" },
+        "parent": { "identifier": "MAN-500", "title": "Firmware 2.4", "state": { "name": "Todo", "type": "unstarted" } },
+        "project": { "name": "Voice box" },
+        "labels": { "nodes": [{ "name": "Bug" }, { "name": "Firmware" }] },
+        "relations": { "nodes": [
+            { "type": "blocks", "relatedIssue": { "identifier": "MAN-560", "title": "Ship 2.4", "state": { "name": "Todo", "type": "unstarted" } } },
+            { "type": "related", "relatedIssue": { "identifier": "MAN-401", "title": "Mic gain", "state": { "name": "Done", "type": "completed" } } }
+        ] },
+        "inverseRelations": { "nodes": [
+            { "type": "blocks", "issue": { "identifier": "MAN-611", "title": "Wi-Fi reconnect", "state": { "name": "In Review", "type": "started" } } }
+        ] },
+        "children": { "nodes": [
+            { "identifier": "MAN-544", "state": { "type": "completed" } },
+            { "identifier": "MAN-545", "state": { "type": "started" } },
+            { "identifier": "MAN-546", "state": { "type": "canceled" } }
+        ] },
+        "attachments": { "nodes": [
+            { "url": "https://github.com/acme/voice/pull/248", "sourceType": "github", "title": "Fix wake word",
+              "metadata": { "status": "open" } },
+            { "url": "https://docs.example/spec", "sourceType": "api", "title": "Spec" }
+        ] }
+    }))
+    .unwrap();
+    assert_eq!(i.blocked_by, Some(vec!["MAN-611".to_string()]));
+    let f = &i.facts;
+    let rels: Vec<(LinkRel, &str, Option<&str>)> = f
+        .links
+        .iter()
+        .map(|l| (l.rel, l.issue.key.as_str(), l.words.as_deref()))
+        .collect();
+    assert_eq!(
+        rels,
+        vec![
+            (LinkRel::BlockedBy, "MAN-611", None),
+            (LinkRel::Blocks, "MAN-560", None),
+            (LinkRel::Other, "MAN-401", Some("relates to")),
+        ]
+    );
+    assert_eq!(f.priority_rank, Some(2));
+    assert_eq!(f.points, Some(2.0));
+    assert_eq!(f.state_kind.as_deref(), Some("started"));
+    assert_eq!(f.parent.as_ref().map(|p| p.key.as_str()), Some("MAN-500"));
+    assert_eq!(f.sprint.as_ref().and_then(|s| s.number), Some(14));
+    assert_eq!(
+        f.sub_items,
+        Some(Progress { done: 1, total: 2 }),
+        "a cancelled one doesn't count"
+    );
+    assert_eq!(f.reporter.as_deref(), Some("Ana Ruiz"));
+    let prs = f.prs.as_ref().unwrap();
+    assert_eq!(
+        (prs.count, prs.state.as_str(), prs.number),
+        (1, "open", Some(248))
+    );
+    // An older hub's answer, with no relations asked for: blockers unknown.
+    let old = linear_issue(&json!({
+        "identifier": "MAN-1", "title": "x", "description": "",
+        "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" }
+    }))
+    .unwrap();
+    assert_eq!(old.blocked_by, None);
+}
+
+/// A `jira.search` row with what the hub passes through: the parent epic,
+/// links read from the issue's side, sub-tasks, the Development summary.
+#[test]
+fn a_jira_row_says_its_type_epic_links_and_prs() {
+    let i = jira_issue(
+        &json!({
+            "key": "PLT-2549", "summary": "Build architecture for scheduled summary emails",
+            "status": "In Progress", "status_category": "indeterminate",
+            "updated": "2026-11-09T10:00:00.000+0000", "issuetype": "Story", "issuetype_level": 0,
+            "priority": "Not Prioritised ",
+            "parent": { "key": "PLT-2282", "summary": "Q3 ad hoc support", "issuetype": "Epic",
+                "hierarchy_level": 1, "status": "Product Review", "status_category": "new" },
+            "issuelinks": [
+                { "key": "PLT-2979", "summary": "Rotate test credentials", "issuetype": "Task",
+                  "status": "Backlog", "status_category": "new", "direction": "inward",
+                  "link_type": "Blocks", "relation": "is blocked by" },
+                { "key": "PLT-2983", "summary": "Mute synthetics", "issuetype": "Task",
+                  "status": "Backlog", "status_category": "new", "direction": "outward",
+                  "link_type": "Relates", "relation": "relates to" },
+                { "key": "PLT-3001", "summary": "Later work", "direction": "outward",
+                  "link_type": "Blocks", "relation": "blocks" }
+            ],
+            "subtasks": [], "components": [], "fix_versions": ["4.2"], "comment_total": 1,
+            "created": "2026-08-24T15:41:35.694+0100", "reporter": "Richard Lucas",
+            "development": { "count": 2, "state": "MERGED", "open": false }
+        }),
+        "https://acme.atlassian.net",
+    )
+    .unwrap();
+    assert_eq!(i.priority, None, "not prioritised is no priority");
+    assert_eq!(i.blocked_by, Some(vec!["PLT-2979".to_string()]));
+    let f = &i.facts;
+    assert_eq!(f.kind.as_deref(), Some("Story"));
+    assert_eq!(
+        f.epic.as_ref().map(|e| e.title.as_str()),
+        Some("Q3 ad hoc support")
+    );
+    assert_eq!(f.links[1].words.as_deref(), Some("relates to"));
+    assert_eq!(f.links[2].rel, LinkRel::Blocks);
+    assert_eq!(f.sub_items, None, "no sub-tasks, no count");
+    assert_eq!(f.fix_versions, vec!["4.2".to_string()]);
+    assert_eq!(
+        f.created.map(|t| t.to_rfc3339()),
+        Some("2026-08-24T14:41:35.694+00:00".to_string())
+    );
+    assert_eq!(
+        f.prs.as_ref().map(|p| (p.count, p.state.as_str())),
+        Some((2, "merged"))
+    );
+    // A search that didn't ask for links says nothing of blockers.
+    let bare = jira_issue(
+        &json!({ "key": "PLT-1", "summary": "x", "status": "To Do", "updated": "2026-11-09T10:00:00.000+0000" }),
+        "",
+    )
+    .unwrap();
+    assert_eq!(bare.blocked_by, None);
+    assert_eq!(
+        bare.facts,
+        Facts {
+            remote_state: Some("To Do".into()),
+            ..Default::default()
+        },
+        "a bare row says only its state"
+    );
+}
+
+#[test]
+fn a_jira_priority_shows_bars_by_its_place_in_the_site_s_order() {
+    let four: Vec<String> = ["Now", "Soon", "Next", "Later"].map(String::from).to_vec();
+    let ranks: Vec<_> = four.iter().map(|p| priority_rank(p, &four)).collect();
+    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(4)]);
+    let five: Vec<String> = ["Highest", "High", "Medium", "Low", "Lowest"]
+        .map(String::from)
+        .to_vec();
+    let ranks: Vec<_> = five.iter().map(|p| priority_rank(p, &five)).collect();
+    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(3), Some(4)]);
+    assert_eq!(priority_rank("Unknown", &four), None);
+    assert_eq!(priority_rank("Now", &[]), None);
 }

@@ -1266,13 +1266,12 @@ async fn count_matches(
             }
             System::Linear => {
                 let team = target_id.unwrap_or_default();
-                let a = sync::call(
-                    remote,
-                    system,
-                    "linear.issue_list",
-                    sync::linear_args(team, filter, me, None, page.as_deref()),
-                )
-                .await?;
+                // Counting needs only each issue's key, state and labels:
+                // plain pages of 100, not the sync's rich ones.
+                let mut args = sync::linear_args(team, filter, me, None, page.as_deref());
+                args["rich"] = json!(false);
+                args["limit"] = json!(sync::PAGE);
+                let a = sync::call(remote, system, "linear.issue_list", args).await?;
                 let issues = sync::linear_issues(&a);
                 let paged = sync::linear_pages(&a);
                 // A hub whose tool doesn't page answers one page: past a

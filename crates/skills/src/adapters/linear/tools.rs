@@ -15,6 +15,27 @@ use super::client::LinearClient;
 
 use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
 
+/// The largest page a `rich` listing reads: its relations and sub-issues
+/// raise each issue's share of Linear's per-query complexity.
+const RICH_PAGE: u64 = 50;
+
+/// What a `rich` listing and `issue_get` select besides an issue's own
+/// fields: its estimate, cycle, creator, what it blocks and is blocked by
+/// (Linear keeps "A blocks B" once: in A's `relations`, with B as
+/// `relatedIssue`, and in B's `inverseRelations`, with A as `issue`), and
+/// its sub-issues' states, for "n of m done".
+const RICH_ISSUE_FIELDS: &str = r#"
+                        estimate
+                        cycle { number name startsAt endsAt }
+                        creator { name }
+                        relations(first: 10) {
+                            nodes { type relatedIssue { identifier title state { name type } } }
+                        }
+                        inverseRelations(first: 10) {
+                            nodes { type issue { identifier title state { name type } } }
+                        }
+                        children(first: 25) { nodes { identifier state { type } } }"#;
+
 /// A description that arrives as one line with its newlines written out
 /// (`\n` as two characters, as a model sometimes sends them) is turned
 /// into real line breaks; text with real ones is left alone.
@@ -222,6 +243,10 @@ impl Tool for LinearIssueListTool {
                     "type": "string",
                     "description": "With open_only: also issues completed at or after this ISO 8601 time"
                 },
+                "rich": {
+                    "type": "boolean",
+                    "description": "Also each issue's estimate, cycle, creator, relations, sub-issues' states and attachment metadata (pages of at most 50)"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -249,7 +274,14 @@ impl Tool for LinearIssueListTool {
             }
         };
 
-        let limit = coerce_to_u64(&input["limit"]).unwrap_or(50).min(100);
+        // A board's sync asks for more of each issue (`rich`): its relations,
+        // sub-issues' states, estimate, cycle and creator. That costs more of
+        // Linear's per-query complexity, so its pages are smaller.
+        let rich = input["rich"].as_bool() == Some(true);
+        let limit =
+            coerce_to_u64(&input["limit"])
+                .unwrap_or(50)
+                .min(if rich { RICH_PAGE } else { 100 });
 
         // Build filter conditions
         let mut filters = Vec::new();
@@ -375,17 +407,26 @@ impl Tool for LinearIssueListTool {
                                 subtitle
                                 url
                                 sourceType
-                                createdAt
+                                createdAt{}
                             }}
                         }}
                         createdAt
                         updatedAt
-                        url
+                        url{}
                     }}
                 }}
             }}
             "#,
-            params, limit, page, filter_clause
+            params,
+            limit,
+            page,
+            filter_clause,
+            if rich {
+                "\n                                metadata"
+            } else {
+                ""
+            },
+            if rich { RICH_ISSUE_FIELDS } else { "" },
         );
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -539,9 +580,19 @@ impl Tool for LinearIssueGetTool {
                             title
                             state {
                                 name
+                                type
                             }
                             priority
                         }
+                    }
+                    estimate
+                    cycle { number name startsAt endsAt }
+                    creator { name }
+                    relations(first: 20) {
+                        nodes { type relatedIssue { identifier title state { name type } } }
+                    }
+                    inverseRelations(first: 20) {
+                        nodes { type issue { identifier title state { name type } } }
                     }
                     labels {
                         nodes {
@@ -559,6 +610,7 @@ impl Tool for LinearIssueGetTool {
                             url
                             sourceType
                             createdAt
+                            metadata
                         }
                     }
                     createdAt

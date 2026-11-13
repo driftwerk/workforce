@@ -1658,3 +1658,151 @@ async fn a_board_s_remote_files_go_when_its_link_reads_as_someone_else() {
     })
     .await;
 }
+
+/// A Jira whose search carries what an issue says of itself: ACME-1 is a
+/// story in the epic ACME-9, blocked by ACME-2 while `blocked` holds.
+struct RichJira {
+    blocked: Mutex<bool>,
+    updated: Mutex<String>,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+#[async_trait]
+impl Remote for RichJira {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::callable(System::Jira)
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
+        let updated = self.updated.lock().unwrap().clone();
+        let blocked = *self.blocked.lock().unwrap();
+        match tool {
+            "jira.list_fields" => Ok(json!({
+                "fields": { "points": "customfield_10016", "sprint": "customfield_10020",
+                    "start_date": null, "development": "customfield_10000" },
+                "priorities": [{ "id": "1", "name": "Now" }, { "id": "2", "name": "Soon" },
+                    { "id": "3", "name": "Next" }, { "id": "4", "name": "Later" }],
+            })),
+            "jira.search" => {
+                let links = match blocked {
+                    true => json!([{ "key": "ACME-2", "summary": "Shared role model",
+                        "issuetype": "Story", "status": "In Progress",
+                        "status_category": "indeterminate", "direction": "inward",
+                        "link_type": "Blocks", "relation": "is blocked by" }]),
+                    false => json!([]),
+                };
+                Ok(json!({ "is_last": true, "issues": [
+                    { "key": "ACME-1", "summary": "Map hub roles", "status": "To Do",
+                      "status_category": "new", "updated": updated, "labels": ["web"],
+                      "description_html": "<p>Roles.</p>", "issuetype": "Story",
+                      "issuetype_level": 0, "priority": "Next",
+                      "parent": { "key": "ACME-9", "summary": "Permissions", "issuetype": "Epic",
+                        "hierarchy_level": 1, "status": "In Progress",
+                        "status_category": "indeterminate" },
+                      "subtasks": [{ "key": "ACME-3", "status_category": "done" },
+                        { "key": "ACME-4", "status_category": "new" }],
+                      "issuelinks": links, "components": ["API"], "fix_versions": [],
+                      "comment_total": 4, "created": "2026-11-01T09:00:00.000+0000",
+                      "reporter": "Tom Reed", "points": 5.0,
+                      "sprint": [{ "name": "Sprint 41", "state": "closed",
+                          "start": "2026-10-20T09:00:00.000Z", "end": "2026-11-02T17:00:00.000Z" },
+                        { "name": "Sprint 42", "state": "active",
+                          "start": "2026-11-03T09:00:00.000Z", "end": "2026-11-16T17:00:00.000Z" }],
+                      "development": { "count": 2, "state": "MERGED", "open": false } },
+                    { "key": "ACME-2", "summary": "Shared role model", "status": "To Do",
+                      "updated": "2026-11-09T09:00:00.000+0000", "labels": ["web"],
+                      "description_html": "<p>One model.</p>", "issuelinks": [] },
+                ]}))
+            }
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+/// What an issue says of itself comes in with the listing, and what blocks
+/// it there becomes its need, seen as sent, and goes when it no longer does.
+#[tokio::test]
+async fn an_issue_s_facts_and_blockers_come_in_with_the_pull() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let remote = RichJira {
+            blocked: Mutex::new(true),
+            updated: Mutex::new("2026-11-09T10:00:00.000+0000".into()),
+            calls: Mutex::new(vec![]),
+        };
+        d.pull_board(b.id, &remote).await.unwrap();
+        // The site's fields were read once, and asked for by role.
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        let fields = s.fields.clone().unwrap();
+        assert_eq!(fields.points.as_deref(), Some("customfield_10016"));
+        assert_eq!(fields.priorities.len(), 4);
+        let calls = remote.calls.lock().unwrap().clone();
+        let search = calls.iter().find(|(t, _)| t == "jira.search").unwrap();
+        assert_eq!(search.1["custom_fields"]["sprint"], "customfield_10020");
+        assert!(search.1["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "issuelinks"));
+        let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
+        let of = |key: &str| {
+            tickets
+                .iter()
+                .find(|t| t.key.as_deref() == Some(key))
+                .unwrap()
+                .clone()
+        };
+        let one = of("ACME-1");
+        let two = of("ACME-2");
+        let e = one.ticket.external.clone().unwrap();
+        let f = &e.details.facts;
+        assert_eq!(f.kind.as_deref(), Some("Story"));
+        assert_eq!(f.epic.as_ref().map(|r| r.key.as_str()), Some("ACME-9"));
+        assert_eq!(f.points, Some(5.0));
+        assert_eq!(
+            f.sprint.as_ref().and_then(|s| s.name.as_deref()),
+            Some("Sprint 42")
+        );
+        assert_eq!(
+            f.sub_items,
+            Some(crate::board::Progress { done: 1, total: 2 })
+        );
+        assert_eq!(f.comments, Some(4));
+        assert_eq!(f.priority_rank, Some(3), "Next is third of four");
+        assert_eq!(
+            f.prs.as_ref().map(|p| (p.count, p.state.as_str())),
+            Some((2, "merged"))
+        );
+        assert_eq!(f.reporter.as_deref(), Some("Tom Reed"));
+        // ACME-2 blocks it there: a need, seen as sent.
+        assert_eq!(one.ticket.needs, vec![two.ticket.id]);
+        assert_eq!(e.seen.needs, vec!["ACME-2".to_string()]);
+        assert!(crate::board_sync::push_of(&one.ticket, &["ACME-2".into()]).is_empty());
+        // Unblocked there: the need a pull made goes.
+        *remote.blocked.lock().unwrap() = false;
+        *remote.updated.lock().unwrap() = "2026-11-09T11:00:00.000+0000".into();
+        d.pull_board(b.id, &remote).await.unwrap();
+        let one = d.ticket(one.ticket.id).await.unwrap();
+        assert!(one.ticket.needs.is_empty(), "{:?}", one.ticket.needs);
+        assert!(one.ticket.external.unwrap().seen.needs.is_empty());
+        // The fields aren't read again within the day.
+        let reads = remote
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == "jira.list_fields")
+            .count();
+        assert_eq!(reads, 1);
+    })
+    .await;
+}

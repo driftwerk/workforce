@@ -31,6 +31,7 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.get_issue",
     "jira.get_attachment",
     "jira.attachment_read",
+    "jira.list_fields",
     "jira.list_comments",
     "jira.list_transitions",
     "jira.list_projects",
@@ -140,6 +141,7 @@ impl JiraSkill {
             Arc::new(tools::JiraGetProjectTool::new(c(), w(), p())),
             Arc::new(tools::JiraSearchUsersTool::new(c(), w(), p())),
             Arc::new(tools::JiraMyselfTool::new(c(), w(), p())),
+            Arc::new(tools::JiraListFieldsTool::new(c(), w(), p())),
             Arc::new(tools::JiraListBoardsTool::new(c(), w(), p())),
             Arc::new(tools::JiraListSprintsTool::new(c(), w(), p())),
             Arc::new(tools::JiraAddWorklogTool::new(c(), w(), p())),
@@ -167,6 +169,7 @@ impl JiraSkill {
             "jira.get_project",
             "jira.search_users",
             "jira.myself",
+            "jira.list_fields",
             "jira.list_boards",
             "jira.list_sprints",
             "jira.add_worklog",
@@ -422,6 +425,16 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.list_fields",
+                    "This Jira site's custom fields by role (story points, sprint, start date, Development) and its priorities, highest first",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" }
+                        }
+                    }),
+                ),
+                mk_tool(
                     "jira.list_boards",
                     "List Jira Software (Agile) boards",
                     serde_json::json!({
@@ -499,6 +512,7 @@ impl JiraSkill {
                 allow("jira.get_project"),
                 allow("jira.search_users"),
                 allow("jira.myself"),
+                allow("jira.list_fields"),
                 allow("jira.list_boards"),
                 allow("jira.list_sprints"),
                 allow("jira.add_worklog"),
@@ -547,7 +561,7 @@ mod tests {
         };
         let skill = JiraSkill::new(cfg).unwrap();
         let tools = skill.tools();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
         // Sanity check: all tool names start with "jira."
         for t in &tools {
             assert!(t.name().starts_with("jira."));
@@ -617,10 +631,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_lists_all_21_tools() {
+    fn definition_lists_all_22_tools() {
         let def = JiraSkill::definition();
-        assert_eq!(def.tools.len(), 21);
-        assert_eq!(def.default_policies.len(), 21);
+        assert_eq!(def.tools.len(), 22);
+        assert_eq!(def.default_policies.len(), 22);
         assert_eq!(def.requirements.credentials.len(), 3);
         assert!(def.validate().is_ok());
     }
