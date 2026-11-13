@@ -245,10 +245,9 @@ pub fn cite(applied: &Preference, close: bool, over: &[Preference], tz: chrono_t
             applied.rule()
         ),
         true => format!(
-            "applied your preference from {} about {} (“{}”) as a close match: I read this case as covered; shout if wrong",
+            "per your preference from {} ({}), as a close match: I read this case as covered; shout if wrong",
             applied.date(tz),
-            applied.when_text,
-            applied.then_text
+            applied.rule()
         ),
     };
     for o in over.iter().filter(|o| o.id != applied.id) {
@@ -273,11 +272,13 @@ pub fn cite(applied: &Preference, close: bool, over: &[Preference], tz: chrono_t
 pub fn listed(prefs: &[Preference], tz: chrono_tz::Tz, max: usize) -> String {
     let mut out = String::new();
     let mut left = 0usize;
-    for p in prefs {
+    for (i, p) in prefs.iter().enumerate() {
         let l = p.line(tz);
+        // Cut in the order they win: a later one never shows in place of
+        // one that outranks it.
         if out.len() + l.len() + 1 > max {
-            left += 1;
-            continue;
+            left = prefs.len() - i;
+            break;
         }
         out.push_str(&l);
         out.push('\n');
@@ -385,6 +386,10 @@ mod tests {
         older.created_at = any.created_at - chrono::Duration::days(3);
         assert!(cite(&any, false, &[older], tz).contains("over the older one"));
         let close = cite(&staging, true, &[], tz);
+        assert!(
+            close.starts_with(&format!("per your preference from {}", staging.date(tz))),
+            "{close}"
+        );
         assert!(close.contains("as a close match"), "{close}");
         assert!(close.contains("shout if wrong"), "{close}");
     }

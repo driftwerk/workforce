@@ -149,13 +149,28 @@ impl CrewHub {
             .map_err(refuse)?
             .unwrap_or_default();
         let scope = preference::boss_scope_of(b.oversight.scope.group());
-        let mut ids = vec![id];
-        ids.extend(over.iter().filter(|o| **o != id));
-        let named = self.preferences_named(&scope, &ids).await.map_err(refuse)?;
+        // Only the one applied must be there and active: one it set aside
+        // that has since gone is left out of the line, never a refusal.
+        let applied = self
+            .preferences_named(&scope, &[id])
+            .await
+            .map_err(refuse)?
+            .remove(0);
+        let over: Vec<Uuid> = over.into_iter().filter(|o| *o != id).collect();
+        let set_aside: Vec<Preference> = self
+            .desk
+            .store()
+            .preferences_by_id(&over)
+            .await
+            .map_err(Self::pref_err)
+            .map_err(refuse)?
+            .into_iter()
+            .filter(|p| p.owner == YOU && p.boss_scope == scope && p.state == PrefState::Active)
+            .collect();
         let tz = self.desk.timezone();
         Ok(Some(Applied {
             id,
-            cite: preference::cite(&named[0], close, &named[1..], tz),
+            cite: preference::cite(&applied, close, &set_aside, tz),
         }))
     }
 
@@ -222,16 +237,18 @@ impl CrewHub {
             .into_iter()
             .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
             .collect();
-        store.preference_put(&p).await.map_err(Self::pref_err)?;
+        // The older one goes first, so a failure never leaves two that
+        // both apply.
         let tz = self.desk.timezone();
         let mut replaced = Vec::new();
         for o in &same {
-            if let Err(e) = store.preference_set_state(o.id, PrefState::Retired).await {
-                tracing::warn!(error = %e, "a replaced preference wasn't retired");
-                continue;
-            }
+            store
+                .preference_set_state(o.id, PrefState::Retired)
+                .await
+                .map_err(Self::pref_err)?;
             replaced.push(format!("{} (from {})", o.rule(), o.date(tz)));
         }
+        store.preference_put(&p).await.map_err(Self::pref_err)?;
         let mut said = format!(
             "Kept as preference {}: when {}, {} (for {}).",
             p.id,
@@ -351,7 +368,12 @@ impl CrewHub {
             None => prefs,
             Some(id) => {
                 let group = self.desk.view(id).ok().and_then(|v| v.group.map(|g| g.id));
-                let repo = self.desk.repo_of_session(id);
+                // Git is asked off the async workers.
+                let desk = self.desk.clone();
+                let repo = tokio::task::spawn_blocking(move || desk.repo_of_session(id))
+                    .await
+                    .ok()
+                    .flatten();
                 prefs
                     .into_iter()
                     .filter(|p| p.scope.covers(group.as_deref(), repo.as_deref()))

@@ -285,18 +285,32 @@ async fn an_action_by_a_preference_cites_it_and_only_the_citation_is_checked() {
         let r = call(
             &crew,
             "crew.nudge",
-            nudge(json!({ "preference": red.id.to_string(), "over": [staging.id.to_string()] })),
-        )
-        .await;
-        assert!(!r.success, "one set aside must be active too");
-        let r = call(
-            &crew,
-            "crew.nudge",
             nudge(json!({ "preference": red.id.to_string(), "match": "maybe" })),
         )
         .await;
         assert!(!r.success);
         assert_eq!(count(d.clone()).await, before, "nothing was done");
+        // One set aside that has since gone is left out of the line, never
+        // a reason to refuse.
+        let r = call(
+            &crew,
+            "crew.nudge",
+            nudge(json!({ "preference": red.id.to_string(), "over": [staging.id.to_string()] })),
+        )
+        .await;
+        assert!(r.success, "{:?}", r.error);
+        let left_out = d
+            .store()
+            .decisions_since("desk", epoch(), 50)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            left_out.why.contains("per your preference") && !left_out.why.contains("one from"),
+            "{}",
+            left_out.why
+        );
         // The same nudge with none runs unbound as it always did.
         let r = call(&crew, "crew.nudge", nudge(json!({}))).await;
         assert!(r.success, "{:?}", r.error);
