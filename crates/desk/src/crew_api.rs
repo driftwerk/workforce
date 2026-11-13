@@ -299,7 +299,7 @@ async fn item_answer(
         return Json(json!({ "done": done })).into_response();
     }
     // Answered either way: what keeping it said, or why it couldn't.
-    match s.crew.always_item(id, None).await {
+    match s.crew.always_item(id, Some(body.answer.trim())).await {
         Ok(kept) => Json(json!({ "done": done, "kept": kept })).into_response(),
         Err(e) => Json(json!({ "done": done, "notKept": refused_why(&e) })).into_response(),
     }
@@ -863,7 +863,7 @@ mod tests {
             let (status, said) = call_json(&app, &answer(1), &with_always).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(said["done"], "Sent: Wait for green");
-            assert_eq!(said["kept"], "From now on: your answer");
+            assert_eq!(said["kept"], "From now on: Wait for green");
             let (status, said) = call_json(&app, &answer(5), &with_always).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(said["done"], "Sent: Wait for green");

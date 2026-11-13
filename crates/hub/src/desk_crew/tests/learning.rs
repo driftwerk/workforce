@@ -155,6 +155,36 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
                 .unwrap();
         }
 
+        // A session's question closes only when its session takes the
+        // answer: "Always" with the answer just sent keeps it at once.
+        let mut line = workforce_desk::open_item::NewItem::ask(
+            "desk",
+            workforce_desk::open_item::OpenKind::Ask,
+            None,
+            "acme-web asks: deploy to staging now?",
+        )
+        .generalizing(Some("When a session asks to deploy to staging".into()));
+        line.line_message = Some(uuid::Uuid::new_v4());
+        line.said = true;
+        let line = d.store().item_open(&line).await.unwrap().item().clone();
+        assert!(
+            crew.always_item(line.id, None).await.is_err(),
+            "with no answer in hand, it waits for the answer"
+        );
+        let said = crew.always_item(line.id, Some("Deploy")).await.unwrap();
+        assert!(said.starts_with("From now on"), "{said}");
+        let kept = d
+            .store()
+            .preference_from_item(line.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.then_text, "Deploy");
+        d.store()
+            .preference_set_state(kept.id, PrefState::Retired)
+            .await
+            .unwrap();
+
         // An ask that settles no case keeps nothing.
         call(&crew, super::super::items::ASK, json!({ "text": "Lunch?" })).await;
         let plain = d

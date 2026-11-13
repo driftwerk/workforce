@@ -511,7 +511,10 @@ impl CrewHub {
                         .into(),
                 )
             })?;
-        if item.state != OpenState::Closed {
+        // A session's question closes when its session takes the answer,
+        // after the answer went: with the answer in hand it is kept now.
+        let sent_to_its_session = item.line_message.is_some() && then.is_some();
+        if item.state != OpenState::Closed && !sent_to_its_session {
             return Err(ItemRefused::Cant("Answer it first.".into()));
         }
         let then = then
