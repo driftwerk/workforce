@@ -41,6 +41,10 @@ pub struct AgentRegistry {
     /// learning or scheduler runs for it; it only lends its model, sign-ins
     /// and price table to what the hub does itself ([`Self::host`]).
     host: std::sync::OnceLock<Arc<AgentService>>,
+    /// The hub's base config, beside which its overlay sits: what a change
+    /// an agent makes through its own tools is written beside, since an
+    /// agent built at runtime has no config path of its own.
+    config_path: std::sync::OnceLock<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -487,7 +491,13 @@ impl AgentRegistry {
             gates: std::sync::OnceLock::new(),
             routed: std::sync::OnceLock::new(),
             host: std::sync::OnceLock::new(),
+            config_path: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Sets the hub's base config path, once.
+    pub fn set_config_path(&self, path: PathBuf) {
+        let _ = self.config_path.set(path);
     }
 
     /// Install the process-wide gates: every current service is attached to
@@ -642,6 +652,10 @@ impl crate::hosts::RegistryView for AgentRegistry {
 
     fn unloaded(&self) -> Vec<Unloaded> {
         AgentRegistry::unloaded(self)
+    }
+
+    fn config_path(&self) -> Option<PathBuf> {
+        self.config_path.get().cloned()
     }
 
     fn login_vaults(

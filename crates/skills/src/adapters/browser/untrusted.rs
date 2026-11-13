@@ -91,24 +91,6 @@ impl Seen {
         scan.wrapped_content
     }
 
-    /// `value` as the model reads it: a string or a structure fenced as text;
-    /// a number, a flag or nothing as it is, since none can carry words.
-    pub(super) fn value(&mut self, value: Value) -> Value {
-        match value {
-            Value::String(s) => Value::String(self.text(&s)),
-            Value::Array(_) | Value::Object(_) => {
-                Value::String(self.text(&serde_json::to_string(&value).unwrap_or_default()))
-            }
-            other => other,
-        }
-    }
-
-    /// Keeps what the scans found for `session`: a hostile one holds it
-    /// back, as [`Self::into_output`] does.
-    pub(super) fn keep(self, session: &str) {
-        self.into_output(session, Value::Null);
-    }
-
     /// `output` with the scan's findings added, kept for `session` too.
     pub(super) fn into_output(self, session: &str, mut output: Value) -> Value {
         if self.hostile {
@@ -149,19 +131,6 @@ mod tests {
         assert!(out.contains("EXTERNAL_UNTRUSTED_CONTENT_"), "{out}");
         assert!(out.contains("browser:example.com"), "{out}");
         assert!(out.contains("hello"));
-    }
-
-    #[test]
-    fn numbers_and_flags_pass_as_they_are_and_structures_are_fenced() {
-        let mut seen = Seen::at("https://example.com/");
-        assert_eq!(seen.value(json!(3)), json!(3));
-        assert_eq!(seen.value(json!(true)), json!(true));
-        assert_eq!(seen.value(Value::Null), Value::Null);
-        let fenced = seen.value(json!({"a": "b"}));
-        assert!(fenced
-            .as_str()
-            .unwrap()
-            .contains("EXTERNAL_UNTRUSTED_CONTENT_"));
     }
 
     #[test]

@@ -29,9 +29,12 @@ use crate::serve::AgentService;
 
 mod actions;
 mod board;
+pub(crate) mod context;
+mod decisions;
 mod deliver;
 mod extras;
 mod handover;
+mod items;
 mod line;
 mod observe;
 mod own_settings;
@@ -39,17 +42,20 @@ mod plan;
 mod read_only;
 mod reading;
 pub(crate) mod relay;
+pub(crate) mod remote_asks;
 mod scope;
 pub(crate) mod served;
 mod spend;
 mod tools;
+mod updates;
+pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use tools::{describe as crew_describe, schema as crew_schema};
+pub(crate) use tools::schema as crew_schema;
 pub(crate) use watcher::reported;
 
 pub(crate) use extras::mentions_for;
@@ -59,7 +65,7 @@ pub use plan::{plan_channel, PLAN};
 
 /// What a check-in's prompt starts with: the person never typed it, so the
 /// DM's history leaves it out.
-pub const CHECK_IN: &str = "[Desk check-in]";
+pub const CHECK_IN: &str = crate::desk_surface::CHECK_IN;
 
 /// Hand-offs between agents allowed from one thing that happened, as in
 /// rooms.
@@ -115,6 +121,9 @@ pub struct CrewHub {
     /// let go only once that has lasted ([`work::LET_GO_AFTER_LOOKS`]), never
     /// on a config that failed to read once.
     unbossed: Mutex<HashMap<uuid::Uuid, (u32, std::time::Instant)>>,
+    /// How many uplinks carry each remote boss's links now, by its
+    /// `<hub>/<agent>`.
+    remote_up: Mutex<HashMap<String, usize>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -137,6 +146,29 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
+    /// How many decisions (and suggestions) each boss made, by the session
+    /// they were about: a line or work turn that moved none let it wait.
+    acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
+    /// When each boss last asked the person with `crew.ask_person`: its
+    /// turn's reply then isn't also kept as a question of its own.
+    asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The sessions boss turns acted on lately (started, told, handed
+    /// work), by the turn's session id, and when: what a DM turn did for
+    /// the person's order. Another turn's acts are never its own.
+    turn_acts: Mutex<Vec<(String, DateTime<Utc>, uuid::Uuid)>>,
+    /// The person's messages each boss DM turn is answering, by session.
+    person_turns: Mutex<HashMap<String, String>>,
+    /// The DM sessions running a message another overseer sent on: not
+    /// the person's, so never their order.
+    relayed_turns: Mutex<std::collections::HashSet<String>>,
+    /// Who writes the updates' paragraphs; none: plainly.
+    update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
+    /// The bosses whose update is being looked at now.
+    updating: Mutex<std::collections::HashSet<String>>,
+    /// The suggestions each boss's quiet check-ins made, and when, for its
+    /// next update to show.
+    quiet_made:
+        Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -148,6 +180,9 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Sessions a start's work was given to, held from other starts until
+    /// [`actions::REUSE_CLAIM`] has passed.
+    reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     /// Calls for the person's machines, waiting for Desk's native side
     /// ([`relay`]), and who waits for each answer.
     relays: Mutex<relay::Relays>,
@@ -490,6 +525,7 @@ impl CrewHub {
             hops: Mutex::default(),
             wake_hop: Mutex::default(),
             unbossed: Mutex::default(),
+            remote_up: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
@@ -498,10 +534,19 @@ impl CrewHub {
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
+            acted: Mutex::default(),
+            asked_person: Mutex::default(),
+            turn_acts: Mutex::default(),
+            person_turns: Mutex::default(),
+            relayed_turns: Mutex::default(),
+            update_writer: Mutex::default(),
+            updating: Mutex::default(),
+            quiet_made: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
@@ -520,6 +565,8 @@ impl CrewHub {
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }
@@ -612,6 +659,18 @@ impl CrewHub {
                 })
                 .collect(),
         );
+        // The cheap model's day for every session's account: the main
+        // boss's, the accounts being shared (else the first boss's).
+        self.desk.set_account_limits(
+            list.iter()
+                .find(|(_, o)| o.scope == Scope::Ungrouped)
+                .or(list.first())
+                .map(|(_, o)| workforce_desk::account::Limits {
+                    cheap_calls_per_day: o.updates.cheap_calls_per_day,
+                    account_questions_per_day: o.updates.account_questions_per_day,
+                })
+                .unwrap_or_default(),
+        );
         // No boss allows a change to any agent's own settings, its own
         // limits among them.
         self.desk.withhold_agent_settings(
@@ -634,6 +693,32 @@ impl CrewHub {
                         },
                     ))
                 })
+                .collect(),
+        );
+        // Who won't answer what the sessions it runs ask, and why: the
+        // badge of such a session says it waits on the person.
+        self.desk.set_unanswering(
+            list.iter()
+                .filter_map(|(s, o)| {
+                    let name = name_of(s);
+                    let why = match o.level {
+                        Level::Watch => format!("{name} only watches."),
+                        Level::Suggest => format!("{name} only suggests: you decide."),
+                        Level::Act | Level::Full => {
+                            let held = self.desk.agent_held_why(s.agent_id.as_str())?;
+                            format!("{name} is {held}.")
+                        }
+                    };
+                    Some((s.agent_id.as_str().to_string(), why))
+                })
+                .chain(
+                    self.remote_unanswering(
+                        &list
+                            .iter()
+                            .map(|(_, o)| o.scope.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                )
                 .collect(),
         );
         self.desk.set_holds(
@@ -1115,6 +1200,25 @@ impl Crew for CrewHub {
                 tracing::warn!(target: "floor", error = %format!("{e:#}"), "the floor's needs are unavailable")
             })
             .ok()
+    }
+
+    async fn undo_decision(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<String, workforce_desk::crew::UndoRefused> {
+        self.me().undo(id).await
+    }
+
+    async fn answer_item(
+        &self,
+        id: uuid::Uuid,
+        answer: &str,
+    ) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().answer_item(id, answer).await
+    }
+
+    async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().drop_item(id).await
     }
 
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {

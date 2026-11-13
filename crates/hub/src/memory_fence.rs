@@ -163,7 +163,8 @@ pub(crate) fn turns_in_flight(workspace: &Path) -> usize {
 
 /// The fence a turn of `agent` on `channel` starting now carries.
 ///
-/// In a Desk group's boss conversation, the group's own tag, whatever turn
+/// In a Desk group's boss conversation (its Desk channel, or the Slack DM
+/// thread its link opened), the group's own tag, whatever turn
 /// it runs inside: everything remembered there is the group's, and only
 /// that is recalled, never what the agent holds from elsewhere. A channel
 /// that claims to be one but isn't (`session` says) remembers and recalls
@@ -176,13 +177,22 @@ pub(crate) fn fence_for_turn(
     channel: &str,
     session: impl FnOnce() -> Option<workforce_common::session::Session>,
 ) -> String {
-    if workforce_common::channels::is_desk_boss_channel(channel) {
-        let fence = session()
+    let boss_fence = |s: Option<&workforce_common::session::Session>| {
+        let fence = s
             .and_then(|s| {
-                crate::boss_links::conversation::BossConversation::of(&s, agent.as_str(), &s.owner)
+                crate::boss_links::conversation::BossConversation::of(s, agent.as_str(), &s.owner)
             })
             .map_or(Fence::Unknown, |c| Fence::Boss(c.memory_tag()));
-        return encode(agent, &fence);
+        encode(agent, &fence)
+    };
+    if workforce_common::channels::is_desk_boss_channel(channel) {
+        return boss_fence(session().as_ref());
+    }
+    // A Slack DM thread its link mapped to one: told by its session.
+    if crate::boss_links::slack::dm_thread(channel).is_some() {
+        if let Some(s) = session().filter(|s| s.claims_desk_boss()) {
+            return boss_fence(Some(&s));
+        }
     }
     workforce_agent::runner::CURRENT_MEMORY_FENCE
         .try_with(|s| s.clone())

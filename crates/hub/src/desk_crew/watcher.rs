@@ -16,6 +16,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
+use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
@@ -37,11 +38,12 @@ const DESK_TOOLS: [&str; 9] = crate::desk_tools::NAMES;
 const MORNING_JOB: &str = "crew-summary-morning";
 const EVENING_JOB: &str = "crew-summary-evening";
 
-/// Where the open questions the overseer raised are kept, and when each
-/// last was, so a restart doesn't raise them again.
-const RAISED: &str = "hub.crew.raised";
+/// Where the open questions the overseer raised were kept before they were
+/// the boss's open items: read once, moved, and gone
+/// ([`CrewHub::raised_marks`]).
+pub(super) const RAISED: &str = "hub.crew.raised";
 /// How long a raised question is remembered.
-const RAISED_FOR: chrono::TimeDelta = chrono::TimeDelta::days(1);
+const RAISED_FOR: chrono::TimeDelta = super::items::MARK_FOR;
 /// The most check-in lines held while check-ins are spent; older go.
 const MAX_HELD: usize = 30;
 
@@ -95,6 +97,19 @@ pub(super) struct Trigger {
     /// The sidebar group of what it is about: the overseer whose scope sees
     /// that is the one it wakes.
     pub group: Option<String>,
+}
+
+/// What an Act-level check-in is asked while the composer writes the
+/// boss's updates.
+pub(super) const QUIET_ACT: &str =
+    "Act. What you do with the crew.* tools is kept as your decisions and \
+     reaches the person in your next update; give a reason each time. \
+     Say nothing to the person unless something needs them, then use crew.ask_person.";
+
+/// The boss `agent`'s own check-in channel, off its DM: a quiet check-in's
+/// words stay there.
+pub fn check_in_channel(agent: &str) -> String {
+    format!("{DESK_CHANNEL}:checkin:{agent}")
 }
 
 /// What the overseer may spend on check-ins now.
@@ -211,6 +226,9 @@ fn who(p: &Party) -> String {
         _ => format!("{} (agent {})", p.name, p.id),
     }
 }
+
+/// What every DM turn of a boss is told before it speaks of a session.
+pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
 impl CrewHub {
     /// Keeps tools, summaries and the one-overseer-per-scope rule in step
@@ -575,7 +593,7 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return "You oversee the crew, unbound: do everything yourself with the crew.* tools.".into();
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {CHECK_FIRST}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -593,14 +611,14 @@ impl CrewHub {
             ),
             false => String::new(),
         };
-        format!("You oversee the crew {says}{off}")
+        format!("You oversee the crew {says}{off} {CHECK_FIRST}")
     }
 
     fn level_words(level: Level) -> &'static str {
         match level {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
-            Level::Act => "You act: do the work yourself with the crew.* tools (start sessions, hand them work, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
+            Level::Act => "You act: do the work yourself with the crew.* tools (hand work to a session already there before starting one, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
             Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's (asked to change them, say plainly you can't and post crew.ask_oversight_change for them to approve). Give a reason each time.",
         }
     }
@@ -624,21 +642,60 @@ impl CrewHub {
             true => Self::boss_hint(&o),
             false => Self::level_hint(level, &o),
         };
+        // Where it acts and its updates are composed, what it did reaches
+        // the person through the next update: it says nothing itself.
+        let composed = level.acts() && o.updates.enabled;
+        let ask = match composed {
+            true => QUIET_ACT,
+            false => "Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
+                      them first. Name sessions and agents as above.",
+        };
+        // At Watch and Suggest its message is also the boss's update: one
+        // post, not two.
+        let update = match !level.acts() && o.updates.enabled {
+            true => self.update_for_wake(&service, &o).await,
+            false => None,
+        };
         let prompt = format!(
             "{CHECK_IN} Here is what happened on the crew since you last looked (you oversee it at level {}):\n{}\n\n\
-             Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
-             them first. Name sessions and agents as above. {}{}",
+             {ask} {}{}{}",
             level.as_str(),
             reported(&lines.join("\n"), "the crew's sessions and agents"),
             hint,
             why.map(|w| format!(" {w} Tell the person once if it matters.")).unwrap_or_default(),
+            update
+                .as_ref()
+                .map(|(_, handing, _)| format!("\n\n{handing}"))
+                .unwrap_or_default(),
         );
         let hop = triggers.iter().map(|t| t.hop).max().unwrap_or(0);
         let approvals: Vec<MentionedApproval> =
             triggers.into_iter().flat_map(|t| t.approvals).collect();
-        self.check_in(&service, &owner, "wake", &prompt, hop, Some(approvals))
-            .await
-            .is_some()
+        // Off the DM, so its own words aren't posted, unless it names
+        // requests the person sees beside its message.
+        let quiet = composed && approvals.is_empty();
+        let started = Utc::now();
+        let reply = self
+            .check_in_on(
+                &service,
+                &owner,
+                "wake",
+                &prompt,
+                hop,
+                Some(approvals),
+                quiet,
+            )
+            .await;
+        if let (Some(reply), Some((p, _, _))) = (&reply, &update) {
+            self.update_answered(&service, p, reply).await;
+        }
+        // What it suggested where no message carries it goes with its
+        // next update.
+        if quiet && reply.is_some() {
+            self.keep_quiet_suggestions(service.agent_id.as_str(), started)
+                .await;
+        }
+        reply.is_some()
     }
 
     /// Puts what `service`'s own scheduled check-in (its heartbeat) found
@@ -671,6 +728,24 @@ impl CrewHub {
         hop: i16,
         listed: Option<Vec<MentionedApproval>>,
     ) -> Option<String> {
+        self.check_in_on(service, owner, kind, prompt, hop, listed, false)
+            .await
+    }
+
+    /// [`Self::check_in`], `quiet`: on the boss's own check-in channel off
+    /// its DM, so its reply isn't posted (what it asks with
+    /// crew.ask_person still is).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn check_in_on(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        kind: &str,
+        prompt: &str,
+        hop: i16,
+        listed: Option<Vec<MentionedApproval>>,
+        quiet: bool,
+    ) -> Option<String> {
         let mut record = CheckIn {
             id: crew::new_id(),
             at: crew::now(),
@@ -684,9 +759,24 @@ impl CrewHub {
         }
         let id = service.agent_id.as_str().to_string();
         self.wake_hop.lock().insert(id.clone(), hop);
-        let ran = self
-            .run_dm_turn(service, owner, prompt, hop, listed, None)
-            .await;
+        let ran = match quiet {
+            true => {
+                self.run_turn(
+                    service,
+                    owner,
+                    &check_in_channel(&id),
+                    prompt,
+                    hop,
+                    listed,
+                    None,
+                )
+                .await
+            }
+            false => {
+                self.run_dm_turn(service, owner, prompt, hop, listed, None)
+                    .await
+            }
+        };
         self.wake_hop.lock().remove(&id);
         match ran {
             Ok((_, reply)) => {
@@ -823,31 +913,6 @@ impl CrewHub {
         let me = Party::manager(service.agent_id.as_str(), &name_of(service));
         self.desk.note(Event::new(Kind::Quiet, me, None, text));
     }
-
-    /// The open questions raised and when, as kept.
-    pub(super) async fn raised(&self) -> HashMap<String, DateTime<Utc>> {
-        match self.desk.store().state(RAISED).await {
-            Ok(kept) => kept
-                .and_then(|e| serde_json::from_value(e.value).ok())
-                .unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!(error = %e, "reading the questions the overseer raised failed");
-                HashMap::new()
-            }
-        }
-    }
-
-    /// Keeps `raised` for the next start.
-    async fn keep_raised(&self, raised: &HashMap<String, DateTime<Utc>>) {
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_state(RAISED, &serde_json::json!(raised))
-            .await
-        {
-            tracing::warn!(error = %e, "keeping the questions the overseer raised failed");
-        }
-    }
 }
 
 /// The session whose turn `event` says ended, when it does.
@@ -893,7 +958,8 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut waking: HashMap<String, Waking> = HashMap::new();
-    let mut raised = crew.raised().await;
+    // Kept on the boss's open items, so a restart doesn't raise them again.
+    let mut raised = crew.raised_marks().await;
     // A check-in whose turn didn't run comes back here, to be tried again
     // once: none is dropped without a word.
     let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
@@ -1048,12 +1114,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             let triggers = std::mem::take(&mut w.pending);
             let now = Utc::now();
             raised.retain(|_, at| now - *at < RAISED_FOR);
-            let asked: Vec<&String> = triggers.iter().filter_map(|t| t.about.as_ref()).collect();
-            if !asked.is_empty() {
-                for key in asked {
+            for t in &triggers {
+                if let Some(key) = &t.about {
                     raised.insert(key.clone(), now);
+                    crew.mark_raised(&id, key, &t.line, now).await;
                 }
-                crew.keep_raised(&raised).await;
             }
             let crew = Arc::clone(&crew);
             let retry = retry.clone();

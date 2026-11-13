@@ -805,6 +805,9 @@ impl Desk {
             s.hit_window = None;
             hit_by = None;
         }
+        // A limit from before the account was last signed in, or before a
+        // call on it last succeeded, is over.
+        let hit_before = hit_before.filter(|(at, _)| s.counts(*at));
         if let Some((at, hit)) = &hit_before {
             if s.hit_at.is_none_or(|h| h < *at) {
                 s.hit_at = Some(*at);
@@ -823,7 +826,7 @@ impl Desk {
                 .hit_window
                 .zip(s.hit_until)
                 .zip(s.hit_at)
-                .filter(|&((_, until), at)| at < since && until > since),
+                .filter(|&((_, until), at)| at < since && until > since && s.counts(at)),
         }
         .and_then(|((minutes, resets), at)| {
             let kind = match minutes {

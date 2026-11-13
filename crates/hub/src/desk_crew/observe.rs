@@ -71,10 +71,19 @@ impl CrewHub {
             .and_then(|sid| self.hops.lock().remove(sid))
             .unwrap_or(0);
         if overseer && channel == DESK_CHANNEL {
+            let sid = session_id?.to_string();
             if !message.starts_with(CHECK_IN) {
                 self.person_spoke();
             }
-            let sid = session_id?.to_string();
+            if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
+                // Messages queued into one turn are all its asks.
+                let mut turns = self.person_turns.lock();
+                let asked = turns.entry(sid.clone()).or_default();
+                if !asked.is_empty() {
+                    asked.push('\n');
+                }
+                asked.push_str(message);
+            }
             self.manager_turns.lock().insert(sid.clone(), crew::now());
             return Some(Track {
                 crew: self.me(),
@@ -147,8 +156,22 @@ impl Track {
         if let Some(sid) = self.manager_session.take() {
             if let Ok(answer) = outcome {
                 crew.keep_extras(&self.party.id, &sid, answer).await;
+                // A reply that ends on a question to the person is what it
+                // owes them, unless the turn asked with crew.ask_person.
+                let started = crew.manager_turns.lock().get(&sid).copied();
+                if let Some(started) = started {
+                    crew.ask_from_reply(&self.party.id, started, answer).await;
+                    // What the person asked for, when the turn acted on
+                    // sessions for it, is an order kept to done.
+                    let asked = crew.person_turns.lock().get(&sid).cloned();
+                    let service = crew.state.registry.get(&self.party.id);
+                    if let (Some(asked), Some(service)) = (asked, service) {
+                        crew.order_from_turn(&service, &sid, started, &asked).await;
+                    }
+                }
             }
             crew.manager_turns.lock().remove(&sid);
+            crew.person_turns.lock().remove(&sid);
             return;
         }
         crew.running.lock().remove(&self.key);
@@ -181,6 +204,7 @@ impl Drop for Track {
         }
         if let Some(sid) = &self.manager_session {
             self.crew.manager_turns.lock().remove(sid);
+            self.crew.person_turns.lock().remove(sid);
             return;
         }
         self.crew.running.lock().remove(&self.key);

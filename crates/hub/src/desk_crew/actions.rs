@@ -14,10 +14,11 @@ use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
 use workforce_desk::mode::Mode;
-use workforce_desk::model::{Engine, NewSession, Origin};
+use workforce_desk::model::{Engine, NewSession, Origin, SessionState, SessionView};
 use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
+use super::decisions::Done;
 use super::read_only::read_only_in;
 use super::CrewHub;
 
@@ -91,6 +92,9 @@ pub(crate) enum Action {
         view: Option<View>,
         /// A new branch to work on, in a worktree of its own.
         worktree: Option<String>,
+        /// The person asked for a new session: none already there is
+        /// given the work instead.
+        fresh: bool,
     },
     Assign {
         agent: String,
@@ -165,6 +169,8 @@ struct Input {
     agent_id: Option<String>,
     approval_id: Option<String>,
     message: Option<String>,
+    /// `crew.ask_session`'s question.
+    question: Option<String>,
     prompt: Option<String>,
     /// `path` before it was `folder`: suggestions kept from then say it.
     path: Option<String>,
@@ -174,6 +180,9 @@ struct Input {
     engine: Option<Engine>,
     view: Option<View>,
     worktree: Option<String>,
+    /// `crew.start_session`'s `new`: a new session, whatever is there.
+    #[serde(rename = "new")]
+    fresh: Option<bool>,
     task: Option<String>,
     ticket: Option<String>,
     ticket_id: Option<String>,
@@ -197,6 +206,9 @@ fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
         .parse()
         .map_err(|_| format!("That isn’t a {what} id from crew.overview."))
 }
+
+/// How Desk's status question to a session begins.
+pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two, then carry on with your work as you were):";
 
 fn text(raw: Option<String>, what: &str) -> Result<String, String> {
     raw.map(|t| t.trim().to_string())
@@ -295,6 +307,15 @@ impl Action {
                     reply_to,
                 }
             }
+            // Desk's status question: a message on its line like a nudge,
+            // so it waits for a working session's turn to end and goes
+            // through the same gate, marked so the session knows it's asked
+            // to say where it is, not to change course.
+            "crew.ask_session" => Self::Nudge {
+                to: Target::Session(session()?),
+                message: format!("{STATUS_QUESTION} {}", text(i.question, "what to ask it")?),
+                reply_to: None,
+            },
             "crew.escalate" => Self::Escalate {
                 message: id(
                     i.message_id.as_deref(),
@@ -340,6 +361,7 @@ impl Action {
                 engine: i.engine,
                 view: i.view,
                 worktree: blank_none(i.worktree),
+                fresh: i.fresh.unwrap_or(false),
             },
             "crew.assign" => Self::Assign {
                 agent: text(i.agent_id, "which agent")?,
@@ -1193,8 +1215,43 @@ impl CrewHub {
     }
 
     /// Does `action` as `by`. What happened, or what went wrong in plain
-    /// words.
+    /// words. A boss's is recorded in its decision log as it is done, with
+    /// how it is undone; an answer to a session's question is said in its
+    /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        let before = self.before(action);
+        let who = by.clone();
+        let mut done = Done::default();
+        let said = self.perform_as(action, by, &mut done).await?;
+        self.after_action(action, &who, &done).await;
+        if let Some(d) = self
+            .record_action(action, &who, &said, &done, &before)
+            .await
+        {
+            // An answer it gave a session is said at once, unless the
+            // composer is on: then it is an "I decided" line of the next
+            // update.
+            let composed = self
+                .overseer_named(&d.boss)
+                .is_some_and(|(_, o)| o.updates.enabled);
+            if !composed
+                && matches!(
+                    action,
+                    Action::Nudge {
+                        reply_to: Some(_),
+                        ..
+                    }
+                )
+            {
+                self.post_decision(&d).await;
+            }
+        }
+        Ok(said)
+    }
+
+    /// [`Self::perform`]'s work: what it left behind that an undo needs
+    /// goes in `done`.
+    async fn perform_as(&self, action: &Action, by: By, done: &mut Done) -> Result<String, String> {
         let plain = |e: workforce_desk::DeskError| match e {
             workforce_desk::DeskError::NotFound => "That session isn’t there any more.".to_string(),
             workforce_desk::DeskError::Internal(e) => {
@@ -1253,7 +1310,7 @@ impl CrewHub {
                             .line_answer(*ask, sender, message.clone())
                             .await
                             .map_err(line)?;
-                        self.answered_notice(&answer).await;
+                        done.line = Some((answer.id, answer.delivery));
                         Ok(format!("answered {name}"))
                     }
                     // On its line: it gets it once its turn ends, never typed
@@ -1270,6 +1327,7 @@ impl CrewHub {
                             )
                             .await
                             .map_err(line)?;
+                        done.line = Some((told.id, told.delivery));
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
                                 "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
@@ -1359,7 +1417,7 @@ impl CrewHub {
                     .map_err(plain)?;
                 Ok(format!("restarted {}", v.label()))
             }
-            Action::StartSession { .. } => self.start_session(action, by).await,
+            Action::StartSession { .. } => self.start_session(action, by, done).await,
             Action::AssignTicket { .. } => self.assign_ticket(action, by).await,
             Action::MoveTicket {
                 ticket, id, state, ..
@@ -1484,7 +1542,12 @@ impl CrewHub {
     /// more than `[oversight.work] parallel` at once (counted with the
     /// start, so two at once can't both take the last slot); the person
     /// saying yes to its suggestion is theirs to decide, and starts it.
-    async fn start_session(&self, action: &Action, by: By) -> Result<String, String> {
+    async fn start_session(
+        &self,
+        action: &Action,
+        by: By,
+        done: &mut Done,
+    ) -> Result<String, String> {
         let Action::StartSession {
             folder,
             goal,
@@ -1492,6 +1555,7 @@ impl CrewHub {
             engine,
             view,
             worktree,
+            ..
         } = action
         else {
             return Err("That isn't a session to start.".into());
@@ -1549,11 +1613,145 @@ impl CrewHub {
                         .unwrap_or(s)
                 }
             })?;
+        done.started = Some(v.id);
         Ok(format!(
             "started {} ({}); you run it, and the person can watch it, type into it and take it over",
             v.label(),
             v.id
         ))
+    }
+
+    /// With "always work in real sessions", the session this overseer
+    /// already runs to give a start's work to instead of starting another:
+    /// `action` becomes a nudge to it with the goal, and the session is
+    /// claimed so another start doesn't pile onto it. Only when the start
+    /// itself would run (`hand_out_work`, the level) and so would the nudge;
+    /// never when the person asked for a new one or a worktree of its own.
+    /// The start as it was, and the session's name, when it does.
+    pub(crate) async fn reuse_instead(
+        &self,
+        action: &mut Action,
+        o: &Oversight,
+        boss: &str,
+    ) -> Option<(Action, String)> {
+        let Action::StartSession {
+            folder,
+            goal,
+            engine,
+            worktree: None,
+            fresh: false,
+            ..
+        } = &*action
+        else {
+            return None;
+        };
+        if !o.work.prefer_sessions || self.gate(action, o) != Gate::Run {
+            return None;
+        }
+        let engine = self.engine_or_default(*engine, o).ok()?;
+        let v = self.reusable(folder, goal, engine, o, boss).await?;
+        let nudge = Action::Nudge {
+            to: Target::Session(v.id),
+            message: goal.clone(),
+            reply_to: None,
+        };
+        if self.gate(&nudge, o) != Gate::Run || !self.claim(v.id) {
+            return None;
+        }
+        let start = std::mem::replace(action, nudge);
+        Some((start, v.label().to_string()))
+    }
+
+    /// Claims `session` for a start's work for a while, so concurrent starts
+    /// don't all go to it; false when another has it claimed.
+    fn claim(&self, session: Uuid) -> bool {
+        let mut claims = self.reuse_claims.lock();
+        let now = std::time::Instant::now();
+        claims.retain(|_, at| now.duration_since(*at) < REUSE_CLAIM);
+        if claims.contains_key(&session) {
+            return false;
+        }
+        claims.insert(session, now);
+        true
+    }
+
+    /// Lets go of a claim whose nudge didn't go.
+    pub(crate) fn unclaim(&self, session: Uuid) {
+        self.reuse_claims.lock().remove(&session);
+    }
+
+    /// Gives `session` the work `nudge` carries; if it can't take it, lets
+    /// go of it and does `start` as asked instead. What was done, and
+    /// whether the session got the work.
+    pub(crate) async fn give_or_start(
+        &self,
+        nudge: &Action,
+        start: &Action,
+        session: Uuid,
+        by: By,
+    ) -> Result<(String, bool), String> {
+        match self.perform(nudge, by.clone()).await {
+            Ok(done) => Ok((done, true)),
+            Err(why) => {
+                self.unclaim(session);
+                tracing::info!(%session, %why, "a session given a start's work couldn't take it; starting one");
+                Ok((self.perform(start, by).await?, false))
+            }
+        }
+    }
+
+    /// A session `goal` in `folder` on `engine` can go to: one `boss` runs
+    /// (never the person's own, nor another boss's), in that same folder or
+    /// worktree, on that engine, running and between turns (idle or done),
+    /// not being driven by the person, not claimed by another start, and
+    /// not on a ticket of its own unless it is on this very goal. One on
+    /// this goal first, then the one used last.
+    pub(crate) async fn reusable(
+        &self,
+        folder: &str,
+        goal: &str,
+        engine: Engine,
+        o: &Oversight,
+        boss: &str,
+    ) -> Option<SessionView> {
+        let place = same_place_key(folder);
+        let seen = self.desk.seen_by(&o.scope);
+        let goal = goal.trim().to_lowercase();
+        let claimed: std::collections::HashSet<Uuid> = {
+            let now = std::time::Instant::now();
+            self.reuse_claims
+                .lock()
+                .iter()
+                .filter(|(_, at)| now.duration_since(**at) < REUSE_CLAIM)
+                .map(|(s, _)| *s)
+                .collect()
+        };
+        let mut fits: Vec<SessionView> = self
+            .desk
+            .list()
+            .into_iter()
+            .filter(|v| {
+                v.live
+                    && v.engine == engine
+                    && matches!(v.state, SessionState::Idle | SessionState::Done)
+                    && seen.sees(v.group.as_ref().map(|g| g.id.as_str()))
+                    && same_place_key(&v.cwd) == place
+                    && self.runs(v.id, boss)
+                    && !self.desk.wheel_of(v.id).is_some_and(|w| w.person())
+                    && !claimed.contains(&v.id)
+            })
+            .collect();
+        fits.sort_by_key(|v| {
+            std::cmp::Reverse((v.goal.trim().to_lowercase() == goal, v.updated_at))
+        });
+        for v in fits {
+            let same_goal = v.goal.trim().to_lowercase() == goal;
+            // On a ticket of its own, it's that ticket's.
+            if same_goal || self.desk.doing_key(v.id).await.is_none() {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// `engine`, or the overseer's default one.
@@ -2073,6 +2271,20 @@ impl CrewHub {
             format!("suggested: {}", suggestion.text),
         ));
         Ok(suggestion)
+    }
+}
+
+/// How long a session given a start's work is held from another start.
+pub(crate) const REUSE_CLAIM: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A folder as two sessions are compared by: the same folder (or the same
+/// worktree, never a sibling worktree of its repository), without a
+/// trailing slash, `~` read as the home folder.
+pub(crate) fn same_place_key(folder: &str) -> String {
+    let f = folder.trim().trim_end_matches('/');
+    match (f.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+        _ => f.to_string(),
     }
 }
 

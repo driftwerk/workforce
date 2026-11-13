@@ -8,12 +8,13 @@
 //!
 //! What it gives the person shows three ways, from the one row: a Floor
 //! need, a question card in its DM, and the session's thread. Its routine
-//! answers show in its DM as one compact notice each.
+//! answers are decisions in its log, each said in its DM as one line with
+//! its Undo ([`super::decisions`]).
 //!
 //! A session it runs ([`super::work`]) wakes it here at each turn's end
 //! too, gathered with the session's messages into one `[Desk work]` turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Extras, MentionedQuestion, PartyKind};
 use workforce_desk::line::{Asked, Escalation, LineKind, LineMessage};
 use workforce_desk::model::DeskEvent;
+use workforce_desk::open_item::{self, NewItem, OpenKind};
+use workforce_desk::open_item_store::Opened;
 
 use super::actions::{Action, Gate, Target};
 use super::watcher::reported;
@@ -37,6 +40,10 @@ pub const LINE: &str = "[Desk line]";
 
 /// How long a session's messages are gathered into one turn.
 const GATHER: Duration = Duration::from_secs(3);
+
+/// How often the sessions a boss runs are looked at for requests it owes
+/// an answer to.
+const ASKS_EVERY: Duration = Duration::from_millis(500);
 
 /// The overseer's own conversation for `session`'s line.
 pub fn line_channel(session: Uuid) -> String {
@@ -148,6 +155,7 @@ impl CrewHub {
                     "Something went wrong on this Mac.".to_string()
                 }
             })?;
+        self.record_escalated(&q, by, why).await;
         self.post_question(&q).await;
         Ok(())
     }
@@ -163,7 +171,7 @@ impl CrewHub {
     /// Puts the question `q`, given to the person, in the DM of the
     /// overseer it was asked of (by its scope) as a question card. With no
     /// DM yet, the Floor and the session's thread still show it.
-    async fn post_question(&self, q: &LineMessage) {
+    pub(crate) async fn post_question(&self, q: &LineMessage) {
         let boss = match q.to.kind {
             PartyKind::Manager => Some(q.to.id.clone()),
             _ => self
@@ -178,13 +186,38 @@ impl CrewHub {
             options: Vec::new(),
             draft: None,
         });
+        // One item, and one card, however often it is given to the person:
+        // escalated again, it is updated and nothing new is posted.
+        let mut item = NewItem::ask(
+            service.agent_id.as_str(),
+            OpenKind::Ask,
+            q.from_session(),
+            &format!(
+                "{} asks: “{}”",
+                q.from.name,
+                crew::one_line(q.headline(), 400)
+            ),
+        );
+        item.dedupe_key = open_item::line_key(q.id);
+        item.line_message = Some(q.id);
+        item.options = e.options.clone();
+        item.recommendation = e.draft.clone();
+        match self.desk.store().item_open(&item).await {
+            Ok(Opened::New(_)) => {}
+            Ok(Opened::Again(_)) => return,
+            // Kept or not, the person still gets the question.
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "keeping a session's question as an open item failed");
+            }
+        }
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
             crew::one_line(q.headline(), 400),
             e.why
         );
-        let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+        let target =
+            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         let delivered = crate::desk_surface::deliver(
             &service,
             &owner,
@@ -218,39 +251,6 @@ impl CrewHub {
             .await
         {
             tracing::warn!(error = %e, "keeping a question card failed");
-        }
-    }
-
-    /// Says in the overseer's DM, compactly, that it answered a session.
-    pub(crate) async fn answered_notice(&self, answer: &LineMessage) {
-        if answer.from.kind != PartyKind::Manager {
-            return;
-        }
-        let Some((service, owner)) = self.dm(&answer.from.id) else {
-            return;
-        };
-        let question = match answer.in_reply_to {
-            Some(ask) => self.desk.store().line_message(ask).await.ok().flatten(),
-            None => None,
-        };
-        let text = format!(
-            "Answered {} · {}",
-            answer.to.name,
-            question.map_or_else(
-                || crew::one_line(&answer.text, 120),
-                |q| crew::one_line(q.headline(), 120)
-            )
-        );
-        let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
-        if let Err(e) = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-        )
-        .await
-        {
-            tracing::warn!(error = %e, "noting an answer in the DM failed");
         }
     }
 
@@ -370,6 +370,8 @@ impl CrewHub {
             }
         }
         let prompt = self.line_prompt(session, &messages, &ended, &o);
+        let boss = service.agent_id.as_str().to_string();
+        let mark = self.acted_mark(&boss, session);
         let ran = self
             .run_turn(
                 &service,
@@ -393,14 +395,22 @@ impl CrewHub {
             }
         }
         let reply = ran.as_ref().map(|(_, r)| r.as_str()).map_err(|_| ());
-        let reason = "Your reply to the session's question.";
-        let by = By::manager(service.agent_id.as_str(), &name_of(&service), reason);
         for (ask, settled) in still_open.iter().zip(settle(reply, still_open.len())) {
             match settled {
                 Settle::Escalate(why) => {
+                    let by = By::manager(service.agent_id.as_str(), &name_of(&service), why);
                     let _ = self.escalate(ask.id, &by, why, Vec::new(), None).await;
                 }
                 Settle::Answer(text) => {
+                    // The reply's own first sentence is why, as the person
+                    // reads it.
+                    let reason = match crew::one_line(&text, 200) {
+                        r if r.is_empty() => {
+                            "Its reply answered the session's question.".to_string()
+                        }
+                        r => r,
+                    };
+                    let by = By::manager(service.agent_id.as_str(), &name_of(&service), &reason);
                     let action = Action::Nudge {
                         to: Target::Session(session),
                         message: text,
@@ -437,6 +447,14 @@ impl CrewHub {
                         }
                     }
                 }
+            }
+        }
+        // A turn that did nothing, and suggested nothing, is a decision
+        // too: recorded here, never read from what it said.
+        if let Ok((_, reply)) = &ran {
+            if self.acted_mark(&boss, session) == mark {
+                self.record_nothing(&boss, session, !ended.is_empty(), reply)
+                    .await;
             }
         }
     }
@@ -594,6 +612,10 @@ struct Gathered {
     messages: Vec<LineMessage>,
     /// What its turn's end said, when the overseer runs it.
     ended: Vec<String>,
+    /// The requests it waits on that its boss is given, each with its line
+    /// for the work turn: read again as the turn starts, and only those
+    /// still open go in.
+    asks: Vec<(Uuid, String)>,
 }
 
 impl Gathered {
@@ -602,6 +624,7 @@ impl Gathered {
             since: Instant::now(),
             messages: Vec::new(),
             ended: Vec::new(),
+            asks: Vec::new(),
         }
     }
 }
@@ -627,6 +650,9 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
     let mut looked: Option<Instant> = None;
+    // The requests already given to a boss, by id and boss, while open.
+    let mut offered: HashSet<(Uuid, String)> = HashSet::new();
+    let mut asked_at: Option<Instant> = None;
     loop {
         let mut look = false;
         tokio::select! {
@@ -674,6 +700,19 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             },
             _ = tick.tick() => {}
         }
+        // What the sessions a boss runs ask Desk to allow, at most twice a
+        // second: each open request it can answer and hasn't been given.
+        if asked_at.is_none_or(|at| at.elapsed() >= ASKS_EVERY) {
+            asked_at = Some(Instant::now());
+            for (session, approval, line) in crew.owed_asks(&mut offered) {
+                tracing::info!(%session, %approval, "a request goes to the boss that runs its session");
+                gathering
+                    .entry(session)
+                    .or_insert_with(Gathered::new)
+                    .asks
+                    .push((approval, line));
+            }
+        }
         // New sessions as they appear, and all of them now and then.
         look |= looked.is_none_or(|at| at.elapsed() >= crew.timing.tick);
         if look && taking_on.as_ref().is_none_or(|h| h.is_finished()) {
@@ -691,25 +730,42 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             let Some(Gathered {
                 messages,
                 mut ended,
+                mut asks,
                 ..
             }) = gathering.remove(&session)
             else {
                 continue;
             };
-            // Let go, or taken over, while it waited: no work turn.
-            if !ended.is_empty() && !crew.still_works(session) {
+            // Answered while it was gathered (by the person, say): no turn
+            // for it.
+            let open = crew
+                .desk
+                .view(session)
+                .ok()
+                .and_then(|v| v.pending)
+                .map(|p| p.id);
+            asks.retain(|(approval, _)| Some(*approval) == open);
+            let work = !ended.is_empty() || !asks.is_empty();
+            // Let go, or taken over, while it waited: no work turn, and its
+            // requests are the boss's to be given again once it drives.
+            if work && !crew.still_works(session) {
                 ended.clear();
+                let boss = crew.boss_of(session);
+                for (approval, _) in asks.drain(..) {
+                    offered.retain(|(a, b)| *a != approval || Some(b) != boss.as_ref());
+                }
                 if messages.is_empty() {
                     continue;
                 }
             }
             // Out of work turns for the hour: its turn's end waits for the
             // next, and what it asked goes on.
-            if !ended.is_empty() && !crew.spend_work_turn(session) {
+            if work && !crew.spend_work_turn(session) {
                 gathering.insert(
                     session,
                     Gathered {
                         ended: std::mem::take(&mut ended),
+                        asks: std::mem::take(&mut asks),
                         ..Gathered::new()
                     },
                 );
@@ -717,10 +773,16 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     continue;
                 }
             }
+            ended.extend(asks.iter().map(|(_, line)| line.clone()));
             let crew = Arc::clone(&crew);
             running.insert(
                 session,
-                tokio::spawn(async move { crew.answer_line(session, messages, ended).await }),
+                tokio::spawn(async move {
+                    crew.answer_line(session, messages, ended).await;
+                    // What its turn was given and left open is the
+                    // person's: never given to it again by itself.
+                    crew.left_open(session, &asks).await;
+                }),
             );
         }
     }

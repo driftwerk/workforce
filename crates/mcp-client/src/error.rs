@@ -26,10 +26,18 @@ pub enum McpError {
         data: Option<serde_json::Value>,
     },
 
-    /// HTTP 401/403 or JSON-RPC code -32001 — the caller's
+    /// HTTP 401 or JSON-RPC code -32001 — the caller's
     /// `AuthProvider` should obtain a fresh credential.
     #[error("authentication failed: {0}")]
     AuthExpired(String),
+
+    /// HTTP 403: the server knows the credential but won't serve this
+    /// request with it. `said` is the server's own words (scrubbed,
+    /// clipped), so a caller can tell a refused person from a refused
+    /// credential. Counts as an auth error ([`McpError::is_auth`]), as 403
+    /// always has.
+    #[error("forbidden: {message}")]
+    Forbidden { message: String, said: String },
 
     /// HTTP 429 — the server refused the request before executing it.
     /// `retry_after_secs` carries the Retry-After header when sent.
@@ -91,7 +99,7 @@ impl McpError {
 
     /// Whether the caller should refresh credentials and retry.
     pub fn is_auth(&self) -> bool {
-        matches!(self, Self::AuthExpired(_))
+        matches!(self, Self::AuthExpired(_) | Self::Forbidden { .. })
     }
 }
 
@@ -106,6 +114,12 @@ mod tests {
         assert!(McpError::Transport("boom".into()).is_transport());
         assert!(!McpError::Transport("boom".into()).is_auth());
         assert!(!McpError::Transport("boom".into()).is_unreachable());
+        let forbidden = McpError::Forbidden {
+            message: "HTTP 403".into(),
+            said: "no".into(),
+        };
+        assert!(forbidden.is_auth());
+        assert!(!forbidden.is_transport());
     }
 
     #[test]

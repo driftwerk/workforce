@@ -31,6 +31,8 @@ const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
 const MCP_PROTOCOL_HEADER: &str = "MCP-Protocol-Version";
 const ACCEPT_VALUE: &str = "application/json, text/event-stream";
 const POST: &str = "POST";
+/// The most of a 403's body read for its reason.
+const FORBIDDEN_BODY_MAX: usize = 4096;
 
 pub(crate) struct Transport {
     endpoint: Url,
@@ -82,12 +84,27 @@ impl Transport {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
 
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        if status == StatusCode::UNAUTHORIZED {
             return Err(McpError::AuthExpired(format!(
                 "server returned HTTP {} on {POST} {}",
                 status.as_u16(),
                 self.redacted_endpoint
             )));
+        }
+        if status == StatusCode::FORBIDDEN {
+            // The server's reason, bounded: a refused person reads
+            // differently from a refused credential.
+            let said = read_capped(resp, FORBIDDEN_BODY_MAX)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).chars().take(300).collect())
+                .unwrap_or_default();
+            return Err(McpError::Forbidden {
+                message: format!(
+                    "server returned HTTP 403 on {POST} {}",
+                    self.redacted_endpoint
+                ),
+                said: scrub(said),
+            });
         }
         if status == StatusCode::NOT_FOUND {
             return Ok(PostOutcome::SessionExpired);

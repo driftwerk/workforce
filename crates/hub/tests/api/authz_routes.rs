@@ -2356,28 +2356,52 @@ async fn an_identity_edit_never_writes_its_verified_email() {
     assert!(!stored.linked_ids.contains_key("oidc_email"));
     assert!(!stored.linked_ids.contains_key("oidc_email_at"));
 
-    // One a sign-in wrote stays through an edit, and goes on suspension.
+    // Ones a sign-in and Slack wrote stay through an edit that keeps their
+    // links, whatever it says of them; Slack's goes when its link changes.
+    let now = chrono::Utc::now().to_rfc3339();
     let mut signed_in = stored.clone();
-    signed_in
-        .linked_ids
-        .insert("oidc_email".into(), "member@example.com".into());
-    signed_in
-        .linked_ids
-        .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+    for (k, v) in [
+        ("oidc", "sub-member"),
+        ("oidc_email", "member@example.com"),
+        ("oidc_email_at", now.as_str()),
+        ("slack", "U-1"),
+        ("slack_email", "member@example.com"),
+        ("slack_email_at", now.as_str()),
+    ] {
+        signed_in.linked_ids.insert(k.into(), v.into());
+    }
     let store = state.identity_store.as_ref().unwrap();
     store.update(&signed_in).unwrap();
-    let (s, _) = req_json(
-        state.clone(),
-        "PUT",
-        &path,
-        Some(&admin),
-        Some(serde_json::json!({ "linked_ids": { "slack": "U-2" } })),
-    )
+    let edit = |links: serde_json::Value| {
+        req_json(
+            state.clone(),
+            "PUT",
+            &path,
+            Some(&admin),
+            Some(serde_json::json!({ "linked_ids": links })),
+        )
+    };
+    let (s, _) = edit(serde_json::json!({
+        "oidc": "sub-member", "slack": "U-1",
+        "slack_email": "someone-else@example.com", "slack_email_at": now,
+    }))
     .await;
     assert_eq!(s, StatusCode::OK);
     let kept = store.get_by_id(fx.member.id).unwrap().unwrap();
+    for key in ["oidc_email", "slack_email"] {
+        assert_eq!(
+            kept.linked_ids.get(key).map(String::as_str),
+            Some("member@example.com"),
+            "{key}"
+        );
+    }
+    let (s, _) = edit(serde_json::json!({ "oidc": "sub-member", "slack": "U-2" })).await;
+    assert_eq!(s, StatusCode::OK);
+    let relinked = store.get_by_id(fx.member.id).unwrap().unwrap();
+    assert!(!relinked.linked_ids.contains_key("slack_email"));
+    assert!(!relinked.linked_ids.contains_key("slack_email_at"));
     assert_eq!(
-        kept.linked_ids.get("oidc_email").map(String::as_str),
+        relinked.linked_ids.get("oidc_email").map(String::as_str),
         Some("member@example.com")
     );
     let (s, _) = req_json(

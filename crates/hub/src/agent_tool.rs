@@ -6,6 +6,7 @@
 //! - `agent.create` — create a new agent (with optional role template)
 //! - `agent.update` — update an existing agent (partial merge)
 //! - `agent.delete` — delete an agent from config
+//! - `agent.rename` — the agent renames itself, once its person approves
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -109,6 +110,55 @@ impl AgentToolContext {
     }
 }
 
+impl AgentToolContext {
+    /// Renames agent `id` the one way every rename goes (see
+    /// [`crate::agent_rename`]), beside the hub's config (see
+    /// [`Self::overlay_path`]).
+    /// The base config the overlay sits beside: this agent's, else the
+    /// hub's (an agent built at runtime, Desk's for one, has none of its
+    /// own), else the default agent's.
+    fn overlay_path(&self) -> Option<PathBuf> {
+        self.config_path.clone().or_else(|| {
+            let registry = self.registry.get().and_then(Weak::upgrade)?;
+            registry
+                .config_path()
+                .or_else(|| registry.default_agent().and_then(|d| d.config_path.clone()))
+        })
+    }
+
+    async fn rename(
+        &self,
+        id: &str,
+        name: &str,
+        instructions: Option<String>,
+    ) -> Result<String, String> {
+        let Some(registry) = self.registry.get().and_then(Weak::upgrade) else {
+            return Err("The hub's agents can't be read yet; try again in a moment".to_string());
+        };
+        let default = registry.default_agent();
+        let Some(config_path) = self.overlay_path() else {
+            return Err("No config path available — cannot persist agent changes".to_string());
+        };
+        let lock_manager = default.as_ref().map_or_else(
+            || Arc::clone(&self.lock_manager),
+            |d| Arc::clone(&d.lock_manager),
+        );
+        let user = current_turn_user();
+        crate::agent_rename::Renamer {
+            registry: &*registry,
+            config_path: &config_path,
+            data_dir: std::path::Path::new(&self.data_dir),
+            lock_manager: &lock_manager,
+            def_store: self.def_store.as_deref(),
+            actor: user.as_deref(),
+            via: "agent_tool",
+        }
+        .rename(id, name, instructions)
+        .await
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// The identity the current turn runs as (empty when unbound) — recorded as
 /// the revision author for config writes made through these tools.
 fn current_turn_user() -> Option<String> {
@@ -125,6 +175,7 @@ pub fn agent_tools(ctx: AgentToolContext) -> Vec<Arc<dyn Tool>> {
         Arc::new(AgentShowTool::new(ctx.clone())),
         Arc::new(AgentCreateTool::new(ctx.clone())),
         Arc::new(AgentUpdateTool::new(ctx.clone())),
+        Arc::new(AgentRenameTool::new(ctx.clone())),
         Arc::new(AgentDeleteTool::new(ctx)),
     ]
 }
@@ -432,7 +483,7 @@ impl Tool for AgentCreateTool {
         }
 
         let user = current_turn_user();
-        if let Err(e) = crate::config_writer::overlay_upsert_agent(
+        if let Err(e) = crate::config_writer::overlay_create_agent(
             &config_path,
             std::path::Path::new(&self.ctx.data_dir),
             agent,
@@ -443,6 +494,12 @@ impl Tool for AgentCreateTool {
         )
         .await
         {
+            if crate::config_writer::AgentExists::is(&e) {
+                return Ok(ToolResult::failure(
+                    format!("Agent '{}' already exists", params.id),
+                    duration(),
+                ));
+            }
             return Ok(ToolResult::failure(
                 format!("Failed to save config: {}", e),
                 duration(),
@@ -535,35 +592,49 @@ impl Tool for AgentUpdateTool {
         }
         let duration = || start.elapsed().as_millis() as u64;
 
-        let config_path = match &self.ctx.config_path {
-            Some(p) => p.clone(),
-            None => {
-                return Ok(ToolResult::failure(
-                    "No config path available — cannot persist agent changes",
+        let AgentUpdateInput {
+            agent_id,
+            name,
+            model,
+            mut system_prompt,
+            default,
+        } = params;
+        // A new name goes the one way every rename goes: refused when it's
+        // taken, and into the agent's files and instructions too.
+        let mut renamed = None;
+        if let Some(name) = name {
+            match self
+                .ctx
+                .rename(&agent_id, &name, system_prompt.take())
+                .await
+            {
+                Ok(name) => renamed = Some(name),
+                Err(why) => return Ok(ToolResult::failure(why, duration())),
+            }
+            if model.is_none() && default.is_none() {
+                return Ok(ToolResult::success(
+                    serde_json::json!({ "updated": true, "id": agent_id, "name": renamed }),
                     duration(),
                 ));
             }
+        }
+
+        let Some(config_path) = self.ctx.overlay_path() else {
+            return Ok(ToolResult::failure(
+                "No config path available — cannot persist agent changes",
+                duration(),
+            ));
         };
 
         // Update only the provided fields on the agent's RAW entry (taken
         // from overlay/base tables, never the env-expanded struct) and write
         // it to the overlay as a per-entity replacement.
-        let AgentUpdateInput {
-            agent_id,
-            name,
-            model,
-            system_prompt,
-            default,
-        } = params;
         let user = current_turn_user();
         if let Err(e) = crate::config_writer::overlay_update_agent_fields(
             &config_path,
             std::path::Path::new(&self.ctx.data_dir),
             &agent_id,
             move |entry| {
-                if let Some(name) = name {
-                    entry.insert("name".to_string(), toml::Value::String(name));
-                }
                 if let Some(model) = model {
                     entry.insert("model".to_string(), toml::Value::String(model));
                 }
@@ -595,10 +666,92 @@ impl Tool for AgentUpdateTool {
             serde_json::json!({
                 "updated": true,
                 "id": agent_id,
+                "name": renamed,
                 "live_within_seconds": true,
             }),
             duration(),
         ))
+    }
+}
+
+// ─── agent.rename ───────────────────────────────────────────────────────────
+
+/// The agent renames itself, when its person asks it to: every agent has it,
+/// and a person approves every call.
+pub struct AgentRenameTool {
+    ctx: AgentToolContext,
+}
+
+impl AgentRenameTool {
+    pub fn new(ctx: AgentToolContext) -> Self {
+        Self { ctx }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentRenameInput {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for AgentRenameTool {
+    fn name(&self) -> &str {
+        "agent.rename"
+    }
+
+    fn description(&self) -> &str {
+        "Rename yourself, when the person you work with asks you to. Your new name goes \
+         everywhere you're shown and into your own files (IDENTITY.md and the rest), and \
+         you answer to it from your next message. Refused when another agent has the \
+         name. The person approves it first, and needs the right to manage agents."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Your new name, as the person said it"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn approval_requirement(&self) -> Option<String> {
+        Some(
+            "A new name changes how everyone sees and addresses this agent, so a person \
+             approves it"
+                .to_string(),
+        )
+    }
+
+    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
+        let name = input.get("name").and_then(serde_json::Value::as_str)?;
+        Some(format!("Rename {} to {}", self.ctx.agent_id, name.trim()))
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
+        let start = Instant::now();
+        let params: AgentRenameInput = serde_json::from_value(input)?;
+        let duration = || start.elapsed().as_millis() as u64;
+        match self
+            .ctx
+            .rename(&self.ctx.agent_id, &params.name, None)
+            .await
+        {
+            Ok(name) => Ok(ToolResult::success(
+                serde_json::json!({
+                    "renamed": true,
+                    "id": self.ctx.agent_id,
+                    "name": name,
+                    "note": "You answer to the new name from your next message.",
+                }),
+                duration(),
+            )),
+            Err(why) => Ok(ToolResult::failure(why, duration())),
+        }
     }
 }
 

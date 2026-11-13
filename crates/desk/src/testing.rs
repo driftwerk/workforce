@@ -68,6 +68,33 @@ impl Authorize for Fixed {
     }
 }
 
+/// Lets in a signed-in administrator who isn't the person holding the hub:
+/// what only the holder may do is refused.
+struct NotHolder;
+
+#[async_trait]
+impl Authorize for NotHolder {
+    async fn authorize(
+        &self,
+        _: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        Ok(Some("admin".into()))
+    }
+
+    async fn authorize_holder(
+        &self,
+        _: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+pub(crate) fn not_holder() -> std::sync::Arc<dyn Authorize> {
+    std::sync::Arc::new(NotHolder)
+}
+
 /// Lets everyone in.
 pub(crate) fn allow_all() -> std::sync::Arc<dyn Authorize> {
     std::sync::Arc::new(Fixed(Ok(None)))
