@@ -1737,17 +1737,24 @@ pub(crate) fn may_write(command: &str) -> bool {
                 // or as an `s` flag (`s/a/b/w f`, `s/a/b/e`).
                 "sed" => words.iter().skip(1).any(|w| {
                     let w = bare(w);
-                    if w.starts_with("--") {
-                        return w.starts_with("--in-place");
+                    if w.starts_with("--in-place") {
+                        return true;
                     }
-                    if w.starts_with('-') {
-                        return w.contains('i');
-                    }
+                    // A script given as `--expression=…` is read as one.
+                    let w = match w.strip_prefix("--expression=") {
+                        Some(script) => script.to_string(),
+                        None if w.starts_with("--") => return false,
+                        None if w.starts_with('-') => return w.contains('i'),
+                        None => w,
+                    };
                     let chars: Vec<char> = w.chars().collect();
                     chars.iter().enumerate().any(|(i, c)| {
+                        let next = chars.get(i + 1);
                         "wWe".contains(*c)
                             && (i == 0 || "0123456789$/~,!;{} ".contains(chars[i - 1]))
-                            && chars.get(i + 1).is_none_or(|n| n.is_whitespace())
+                            && (next.is_none_or(|n| n.is_whitespace())
+                                // `w` straight before its file: `1,$w/path`.
+                                || (*c != 'e' && next.is_some_and(|n| "/~$.".contains(*n))))
                     })
                 }),
                 "find" => words.iter().any(|w| {

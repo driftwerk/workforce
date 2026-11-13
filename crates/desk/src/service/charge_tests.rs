@@ -1136,6 +1136,8 @@ fn a_command_that_may_change_an_agents_settings_is_told_however_it_is_written() 
         "sed -n '/x/!W /h/.workforce/agents/desk/config.toml' /tmp/x",
         "sed 'e cp /tmp/x /h/.workforce/agents/desk/config.toml' /tmp/y",
         "tree -o /h/.workforce/agents/desk/config.toml",
+        "sed -n '1,$w/h/.workforce/agents/desk/config.toml' /tmp/x",
+        "sed -n --expression='1,$w /h/.workforce/agents/desk/config.toml' /tmp/x",
         "find /h/.workforce -fprintf /h/.workforce/agents/desk/config.toml x",
         "sed -i s/a/b/ /h/.work\"force\"/agents/desk/config.toml",
         "sed -i s/a/b/ /h/.work\\force/agents/desk/config.toml",
