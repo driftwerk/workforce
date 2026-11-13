@@ -168,6 +168,8 @@ struct Input {
     agent_id: Option<String>,
     approval_id: Option<String>,
     message: Option<String>,
+    /// `crew.ask_session`'s question.
+    question: Option<String>,
     prompt: Option<String>,
     /// `path` before it was `folder`: suggestions kept from then say it.
     path: Option<String>,
@@ -203,6 +205,9 @@ fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
         .parse()
         .map_err(|_| format!("That isn’t a {what} id from crew.overview."))
 }
+
+/// How Desk's status question to a session begins.
+pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two, then carry on with your work as you were):";
 
 fn text(raw: Option<String>, what: &str) -> Result<String, String> {
     raw.map(|t| t.trim().to_string())
@@ -301,6 +306,15 @@ impl Action {
                     reply_to,
                 }
             }
+            // Desk's status question: a message on its line like a nudge,
+            // so it waits for a working session's turn to end and goes
+            // through the same gate, marked so the session knows it's asked
+            // to say where it is, not to change course.
+            "crew.ask_session" => Self::Nudge {
+                to: Target::Session(session()?),
+                message: format!("{STATUS_QUESTION} {}", text(i.question, "what to ask it")?),
+                reply_to: None,
+            },
             "crew.escalate" => Self::Escalate {
                 message: id(
                     i.message_id.as_deref(),

@@ -279,6 +279,14 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             .map(|by| (json!({ "by": by }), false))
             .collect(),
         "crew.board" => vec![(json!({}), false)],
+        "crew.account" => vec![
+            (json!({ "session_id": s }), true),
+            (json!({ "session_id": s, "question": "Which key?" }), true),
+        ],
+        "crew.ask_session" => vec![(
+            json!({ "session_id": s, "question": "Where are you?", "reason": r }),
+            true,
+        )],
         "crew.nudge" => vec![
             (
                 json!({ "session_id": s, "message": "How is it going?", "reason": r }),

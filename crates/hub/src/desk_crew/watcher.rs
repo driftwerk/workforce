@@ -212,6 +212,9 @@ fn who(p: &Party) -> String {
     }
 }
 
+/// What every DM turn of a boss is told before it speaks of a session.
+pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
+
 impl CrewHub {
     /// Keeps tools, summaries and the one-overseer-per-scope rule in step
     /// with the agents' configs.
@@ -575,7 +578,7 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return "You oversee the crew, unbound: do everything yourself with the crew.* tools.".into();
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {CHECK_FIRST}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -593,7 +596,7 @@ impl CrewHub {
             ),
             false => String::new(),
         };
-        format!("You oversee the crew {says}{off}")
+        format!("You oversee the crew {says}{off} {CHECK_FIRST}")
     }
 
     fn level_words(level: Level) -> &'static str {

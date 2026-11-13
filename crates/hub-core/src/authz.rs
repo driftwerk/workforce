@@ -714,9 +714,11 @@ impl Capability {
                 "crew.overview",
                 "crew.activity",
                 "crew.history",
+                "crew.account",
                 "crew.spend",
                 "crew.board",
                 "crew.nudge",
+                "crew.ask_session",
                 "crew.escalate",
                 "crew.approve",
                 "crew.deny",
@@ -1082,7 +1084,7 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
         | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" | "desk.interrupt"
         // The crew overseer reads and drives the same terminals.
-        | "crew.overview" | "crew.activity" | "crew.history" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.escalate" | "crew.approve"
+        | "crew.overview" | "crew.activity" | "crew.history" | "crew.account" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.ask_session" | "crew.escalate" | "crew.approve"
         | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
         | "crew.assign" | "crew.assign_ticket" | "crew.move_ticket" | "crew.take_on" | "crew.release"
         | "crew.plan" | "crew.plan_update" | "crew.handover" => Some(Capability::ShellExec),
