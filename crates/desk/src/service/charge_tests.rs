@@ -1124,6 +1124,20 @@ fn a_command_that_may_change_an_agents_settings_is_told_however_it_is_written() 
         "cp -r /tmp/w/. /h/.workforce/",
         "cd /h/dev && tee ../.workforce/agents/desk/config.toml < x",
         "python3 -c 'open(\"/h/.workforce/agents/desk/config.toml\",\"w\")'",
+        "env cp /tmp/x /h/.workforce/agents/desk/config.toml",
+        "env sed -i s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed -Ei s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed --in-place=.bak s/a/b/ /h/.workforce/agents/desk/config.toml",
+        "sed -n 's/a/b/w /h/.workforce/agents/desk/config.toml' /tmp/x",
+        "awk -i inplace 1 /h/.workforce/agents/desk/config.toml",
+        "yq -i .a=1 /h/.workforce/agents/desk/config.toml",
+        "sort -o /h/.workforce/agents/desk/config.toml /tmp/x",
+        "find /h/.workforce -fprintf /h/.workforce/agents/desk/config.toml x",
+        "sed -i s/a/b/ /h/.work\"force\"/agents/desk/config.toml",
+        "sed -i s/a/b/ /h/.work\\force/agents/desk/config.toml",
+        "D=/h/.work; cd ${D}force/agents/desk && sed -i x config.toml",
+        "cd /h/.workf*/agents/desk && sed -i x config.toml",
+        "{\"path\":\"/h/.workforce/agents/desk/config.toml\",\"content\":\"x\"}",
     ] {
         assert!(may(c), "{c}");
     }

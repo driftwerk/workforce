@@ -691,13 +691,23 @@ impl Desk {
         match &facts.what {
             // Reading them changes nothing: only a write is the person's.
             charge::What::Change(paths) => paths.iter().any(|p| named(p)),
+            charge::What::Read(_) | charge::What::Web { .. } | charge::What::Inside => false,
             charge::What::Command(command) => command_may_touch_settings(
                 command,
                 std::path::Path::new(&view.cwd),
                 &settings,
                 &home,
             ),
-            _ => false,
+            // What Desk doesn't read (an MCP server's tool): held when its
+            // input names a workspace, as it may write there.
+            _ => pending.request.as_ref().is_some_and(|r| {
+                command_may_touch_settings(
+                    &r.input.to_string(),
+                    std::path::Path::new(&view.cwd),
+                    &settings,
+                    &home,
+                )
+            }),
         }
     }
 
@@ -1571,11 +1581,14 @@ pub(crate) fn command_may_touch_settings(
         .filter_map(|s| s.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
     let home_s = home.display().to_string();
+    // Quotes and escapes only join what they touch: `.work"force"` is
+    // `.workforce` to the shell.
     let text = command
+        .replace(['\'', '"', '\\'], "")
         .replace("${HOME}", &home_s)
         .replace("$HOME", &home_s);
     let words: Vec<String> = text
-        .split(|c: char| c.is_whitespace() || ";|&()<>'\"=:,".contains(c))
+        .split(|c: char| c.is_whitespace() || ";|&()<>=:,".contains(c))
         .filter(|w| !w.is_empty())
         .map(|w| match w {
             "~" => home_s.clone(),
@@ -1599,14 +1612,21 @@ pub(crate) fn command_may_touch_settings(
         let p = real(p);
         roots.iter().any(|r| p.starts_with(r)) || guarded.contains(&p)
     };
+    // A word that can't be read (a variable, a substitution, a glob) may
+    // be a path into a workspace, wherever the settings name is said.
+    let unread = |w: &str| w.contains(['$', '`', '*', '?', '[']);
+    // It ends in a settings file or folder's name (`config.toml`,
+    // `$W/heartbeats`), not merely passes one (`~/.local/bin`).
+    let through = |w: &str| {
+        let last = w.trim_end_matches('/').rsplit('/').next().unwrap_or(w);
+        names.iter().any(|n| n == last)
+    };
+    if words.iter().any(|w| unread(w)) && words.iter().any(|w| through(w)) {
+        return true;
+    }
     words.iter().any(|w| {
-        let unread = w.contains(['$', '`', '*', '?', '[']);
-        let through = || {
-            let parts: Vec<&str> = w.split('/').collect();
-            names.iter().any(|n| parts.contains(&n.as_str()))
-        };
-        if unread {
-            return through();
+        if unread(w) {
+            return false;
         }
         match w.starts_with('/') {
             true => held(Path::new(w)),
@@ -1620,6 +1640,7 @@ pub(crate) fn command_may_touch_settings(
 /// `-exec` or `-delete`, …) with no output redirected to a file. What it
 /// doesn't know counts as a write.
 pub(crate) fn may_write(command: &str) -> bool {
+    // Only programs that can't write a file, whatever they are given.
     const READS: &[&str] = &[
         "cat",
         "head",
@@ -1646,9 +1667,6 @@ pub(crate) fn may_write(command: &str) -> bool {
         "diff",
         "cmp",
         "jq",
-        "yq",
-        "sort",
-        "uniq",
         "cut",
         "tr",
         "column",
@@ -1660,20 +1678,19 @@ pub(crate) fn may_write(command: &str) -> bool {
         "which",
         "type",
         "date",
-        "env",
         "id",
         "whoami",
         "uname",
         "hostname",
         "sed",
-        "awk",
         "find",
-        "xxd",
         "od",
         "md5sum",
         "sha256sum",
         "cd",
     ];
+    // What runs the program after it: judged by that program.
+    const WRAPS: &[&str] = &["env", "command", "nice", "time", "nohup"];
     // Output into a file: `>` and `>>`, but not `2>&1` or `>/dev/null`.
     let cleaned = command
         .replace("2>&1", "")
@@ -1689,11 +1706,22 @@ pub(crate) fn may_write(command: &str) -> bool {
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .any(|segment| {
-            // A variable set first (`M=/x; …`, `LC_ALL=C sort`) writes nothing.
-            let words: Vec<&str> = segment
-                .split_whitespace()
-                .skip_while(|w| w.contains('=') && !w.starts_with('-'))
-                .collect();
+            let all: Vec<&str> = segment.split_whitespace().collect();
+            let mut words = all.as_slice();
+            // A variable set first (`M=/x; …`, `LC_ALL=C sort`) and a
+            // wrapper with its flags write nothing themselves.
+            loop {
+                match words.first() {
+                    Some(w) if w.contains('=') && !w.starts_with('-') => words = &words[1..],
+                    Some(w) if WRAPS.contains(&w.rsplit('/').next().unwrap_or(w)) => {
+                        words = &words[1..];
+                        while words.first().is_some_and(|w| w.starts_with('-')) {
+                            words = &words[1..];
+                        }
+                    }
+                    _ => break,
+                }
+            }
             let Some(program) = words.first() else {
                 return false;
             };
@@ -1701,17 +1729,26 @@ pub(crate) fn may_write(command: &str) -> bool {
             if !READS.contains(&program) {
                 return true;
             }
+            let bare = |w: &&str| w.trim_matches(['\'', '"']).to_string();
             match program {
-                "sed" => words
-                    .iter()
-                    .any(|w| w.starts_with("-i") || *w == "--in-place"),
-                "awk" => segment.contains("system(") || segment.contains("print >"),
+                // `-i` in any spelling (`-Ei`, `-ni`, `--in-place=.bak`), or
+                // a script that writes (`w file`, `s/a/b/w file`).
+                "sed" => words.iter().skip(1).any(|w| {
+                    let w = bare(w);
+                    (w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
+                        || w.starts_with("--in-place")
+                        || w == "w"
+                        || w.starts_with("w ")
+                        || w.contains("/w")
+                        || w.contains(";w")
+                }),
                 "find" => words.iter().any(|w| {
                     matches!(
                         *w,
-                        "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint"
-                    )
+                        "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
+                    ) || w.starts_with("-fprint")
                 }),
+                "rg" => words.iter().any(|w| w.starts_with("--pre")),
                 _ => false,
             }
         })

@@ -3630,7 +3630,10 @@ impl Desk {
             .as_ref()
             .filter(|b| b.party.kind == crew::PartyKind::Manager)
             .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
-            .map(|(name, r)| format!("Denied by {name}, who oversees this session: {r}"));
+            .map(|(name, r)| {
+                let r = r.trim_end_matches(" (unbound: no limits)");
+                format!("Denied by {name}, who oversees this session: {r}")
+            });
         let _ = answer.send(match decision {
             Decision::Allow => claude::allow(),
             Decision::Deny => match &because {

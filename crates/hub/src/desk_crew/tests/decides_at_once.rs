@@ -306,3 +306,74 @@ async fn act_fully_hands_each_request_whole_to_the_boss_at_once_and_does_as_it_d
     })
     .await;
 }
+
+/// What the boss decided but Desk refused for now is done only while the
+/// boss still decides it: the level lowered meanwhile, the request is the
+/// person's again, and the DM says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_desk_refused_is_dropped_once_act_fully_isnt_in_force() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        decides(&llm, "ls -la /srv/acme", "ALLOW: it lists a folder").await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let s = new_session(&d, &base, "acme-web").await;
+        let url = hook_url(&base, s.id).await;
+        d.set_breaker_rules(workforce_desk::Rules { loops: true })
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            hook(
+                &url,
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test -p acme"}}),
+            )
+            .await;
+        }
+        let subject = format!("session:{}", s.id);
+        eventually("the breaker to pause it", async || {
+            d.breaker_needs()
+                .into_iter()
+                .find(|n| n.id == format!("breaker:{subject}"))
+        })
+        .await;
+        let paused = asked(&url, "ls -la /srv/acme");
+        eventually("the DM to say the breaker holds it", async || {
+            (said(&overseer, &["`Bash(ls -la /srv/acme)`", "breaker"]) > 0).then_some(())
+        })
+        .await;
+        // The person lowers the level, then lets the session go on.
+        write_config(
+            &overseer,
+            &THEIRS.replace("level = \"full\"", "level = \"act\""),
+        );
+        eventually("Act fully to end", async || {
+            (!d.boss_unbound("desk")).then_some(())
+        })
+        .await;
+        d.breaker_continue(&subject, By::you()).unwrap();
+        eventually("the DM to say it is the person's again", async || {
+            (said(&overseer, &["yours again"]) > 0).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        let p = d.view(s.id).unwrap().pending.expect("still the person's");
+        d.decide(
+            s.id,
+            p.id,
+            workforce_desk::model::Decision::Deny,
+            Some(By::you()),
+        )
+        .unwrap();
+        assert_eq!(behavior(&paused.await.unwrap()), "deny");
+    })
+    .await;
+}
