@@ -48,9 +48,14 @@ pub const CACHE_MAX: i64 = 256 * 1024 * 1024;
 pub const LISTED_MAX: usize = 50;
 /// The largest chunk asked for at once.
 const CHUNK: u64 = 512 * 1024;
-/// The longest address or id of a remote file kept, in bytes: past it the
-/// file isn't listed (an index row holds about 2.7 KB).
+/// The longest id of a remote file kept (a Linear upload's is its address),
+/// in bytes: past it the file isn't listed, since its id is in a unique
+/// index and an index row holds about 2.7 KB.
 pub const REMOTE_MAX: usize = 2048;
+/// The longest link's address kept, in bytes. A link's address is no id
+/// (a signed S3 or Figma one runs long): past this the link is still
+/// listed, without it.
+pub const URL_MAX: usize = 64 * 1024;
 
 /// Where a file comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -206,12 +211,10 @@ pub fn linear_files(issue: &Value, body: &str) -> Vec<RemoteFile> {
         let Some(url) = a["url"].as_str().map(str::trim) else {
             continue;
         };
-        if url.len() > REMOTE_MAX {
-            continue;
-        }
         let title = name_of(&a["title"]);
         if is_linear_upload(url) {
-            if seen.insert(url.to_string()) {
+            // An upload's address is its id: too long for one, it's left out.
+            if url.len() <= REMOTE_MAX && seen.insert(url.to_string()) {
                 out.push(upload_file(title, url.to_string()));
             }
             continue;
@@ -230,7 +233,7 @@ pub fn linear_files(issue: &Value, body: &str) -> Vec<RemoteFile> {
                 .unwrap_or_else(|| "Link".into()),
             media_type: "text/uri-list".into(),
             size: None,
-            url: Some(url.to_string()),
+            url: (url.len() <= URL_MAX).then(|| url.to_string()),
             thumb: false,
         });
     }
@@ -622,9 +625,10 @@ impl DeskStore {
     /// Keeps `ticket`'s remote files as its issue now lists them: new ones
     /// added, changed ones rewritten (their kept bytes forgotten), gone ones
     /// deleted with what was kept of them. Uploads are never touched. A
-    /// file that can't be kept (listed twice, its address too long, refused
-    /// by Postgres) is logged and left out: it never fails the ticket's pull.
-    /// Whether anything changed.
+    /// file that can't be kept (listed twice, its id too long, refused by
+    /// Postgres) is logged and left out: it never fails the ticket's pull,
+    /// and one already here whose rewrite was refused goes, its kept bytes
+    /// with it, rather than stay as it was. Whether anything changed.
     pub async fn put_remote_files(
         &self,
         ticket: Uuid,
@@ -648,11 +652,11 @@ impl DeskStore {
         let now = Utc::now();
         let by = serde_json::to_value(by)?;
         let mut listed = std::collections::HashSet::new();
+        // What went in, or stands as it was: anything else here goes.
+        let mut kept = std::collections::HashSet::new();
         for (pos, f) in files.iter().enumerate() {
-            if f.remote_id.len() > REMOTE_MAX
-                || f.url.as_ref().is_some_and(|u| u.len() > REMOTE_MAX)
-            {
-                tracing::warn!(%ticket, source = f.source.as_str(), "a ticket's file has too long an address: left out");
+            if f.remote_id.len() > REMOTE_MAX {
+                tracing::warn!(%ticket, source = f.source.as_str(), "a ticket's file has too long an id: left out");
                 continue;
             }
             if !listed.insert((f.source, f.remote_id.as_str())) {
@@ -666,6 +670,7 @@ impl DeskStore {
                 Ok(c) => {
                     sp.commit().await?;
                     changed |= c;
+                    kept.insert((f.source, f.remote_id.as_str()));
                 }
                 Err(e) => {
                     sp.rollback().await?;
@@ -676,9 +681,9 @@ impl DeskStore {
         let gone: Vec<Uuid> = was
             .iter()
             .filter(|w| {
-                !files
-                    .iter()
-                    .any(|f| f.source == w.source && Some(&f.remote_id) == w.remote_id.as_ref())
+                !w.remote_id
+                    .as_deref()
+                    .is_some_and(|id| kept.contains(&(w.source, id)))
             })
             .map(|w| w.id)
             .collect();

@@ -65,8 +65,16 @@ impl ToolAccessSnapshot {
 pub const PROGRAM_ONLY_TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_VIEW_TOOLS;
 
 /// Why a turn can't call a [`PROGRAM_ONLY_TOOLS`] tool.
-const PROGRAM_ONLY: &str =
+pub const PROGRAM_ONLY: &str =
     "This tool is for Desk's board sync, not for agents. To look at an attachment, use the integration's own attachment tool (like jira.get_attachment).";
+
+/// The refusal a [`PROGRAM_ONLY_TOOLS`] tool gets anywhere a model, a
+/// monitor, a workflow step or a job would call it; `None` for any other.
+pub fn program_only_refusal(tool_name: &str) -> Option<String> {
+    PROGRAM_ONLY_TOOLS
+        .contains(&tool_name)
+        .then(|| PROGRAM_ONLY.to_string())
+}
 
 /// Computes a fresh [`ToolAccessSnapshot`] for the active user.
 /// Implementations should be cheap — called once per LLM round.

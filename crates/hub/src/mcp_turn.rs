@@ -149,7 +149,9 @@ impl RoundTools {
             gates: service.tool_gates(crate::desk_surface::allows()),
             policy: Arc::clone(&service.policy),
             surface,
-            access: service.tool_access_snapshot(),
+            // A model's round: a program's tools are off its surface and
+            // its snapshot alike.
+            access: service.tool_access_snapshot().for_a_turn(),
             spill: service.current_spill_config(),
             audit: CallAudit {
                 origin: CallOrigin::Round,

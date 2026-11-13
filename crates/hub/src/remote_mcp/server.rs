@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -187,24 +187,49 @@ async fn session_closed() -> StatusCode {
 
 async fn serve_default(
     State(remote): State<Arc<RemoteMcpState>>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    serve(&remote, None, &headers, &body).await
+    serve(&remote, None, query.as_deref(), &headers, &body).await
 }
 
 async fn serve_agent(
     State(remote): State<Arc<RemoteMcpState>>,
     Path(agent_id): Path<String>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    serve(&remote, Some(&agent_id), &headers, &body).await
+    serve(&remote, Some(&agent_id), query.as_deref(), &headers, &body).await
+}
+
+/// Whether a request's query carries the board sync's mark
+/// (`workforce_core::desk::BOARD_SYNC_CALLER`), which a hub's sync of a
+/// linked hub puts on every call. Any client could add it: it is no
+/// credential, and grants nothing the person can't already read (an
+/// attachment opens through `jira.get_attachment` too). It only keeps a
+/// program's chunked byte readers off a model's client that doesn't ask.
+fn marked_as_board_sync(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
+        q.split('&')
+            .any(|p| p == workforce_core::desk::BOARD_SYNC_CALLER)
+    })
+}
+
+/// `surface` without a program's tools
+/// ([`workforce_agent::tools::access::PROGRAM_ONLY_TOOLS`]): what a caller
+/// that is neither a paired device nor the board sync is offered.
+fn without_program_tools(surface: &ToolRegistry) {
+    for name in workforce_agent::tools::access::PROGRAM_ONLY_TOOLS {
+        surface.unregister(name);
+    }
 }
 
 async fn serve(
     remote: &RemoteMcpState,
     agent_id: Option<&str>,
+    query: Option<&str>,
     headers: &HeaderMap,
     body: &str,
 ) -> Response {
@@ -248,9 +273,18 @@ async fn serve(
             return (StatusCode::INTERNAL_SERVER_ERROR, "session unavailable").into_response();
         }
     };
+    // A program, not a model: Desk's board sync, by a paired device's token
+    // or a hub's sync of its linked hub. Only a program is offered the
+    // file-byte readers, or has a file's chunk left whole.
+    let program = caller.as_member || marked_as_board_sync(query);
     let mut surface = remote.surface_for(&service);
     if caller.as_member {
         surface = Arc::new(device_surface(&surface));
+    }
+    let mut access = service.tool_access_snapshot();
+    if !program {
+        without_program_tools(&surface);
+        access = access.for_a_turn();
     }
     let mut gates = service.tool_gates(crate::desk_surface::allows());
     if caller.as_member {
@@ -261,14 +295,14 @@ async fn serve(
             gates,
             policy: Arc::clone(&service.policy),
             surface: Surface::Fixed(Arc::clone(&surface)),
-            access: service.tool_access_snapshot(),
+            access,
             spill: remote_spill_config(service.current_spill_config()),
             audit: CallAudit {
                 origin: CallOrigin::RemoteToken(caller.token.id),
                 identity_id,
                 agent_id: service.agent_id.to_string(),
             },
-            program: caller.as_member,
+            program,
         },
         ctx,
         router: service.approval_router.read().clone(),
@@ -1524,6 +1558,93 @@ mod tests {
         assert!(is_error);
         assert_eq!(text, UNREACHABLE_APPROVER);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Only the board sync's mark, as a whole query pair, marks a call.
+    #[test]
+    fn the_board_sync_s_mark_is_read_whole() {
+        let mark = workforce_core::desk::BOARD_SYNC_CALLER;
+        assert!(marked_as_board_sync(Some(mark)));
+        assert!(marked_as_board_sync(Some(&format!("x=1&{mark}"))));
+        for q in [
+            None,
+            Some(""),
+            Some("caller=desk"),
+            Some("caller=desk-board-sync-x"),
+        ] {
+            assert!(!marked_as_board_sync(q), "{q:?}");
+        }
+    }
+
+    /// The file-byte readers are a program's: a plain token's client (a
+    /// model's, as like as not) is neither offered them nor runs one; the
+    /// board sync's marked calls are, as a paired device's are.
+    #[tokio::test]
+    async fn only_a_program_is_offered_the_file_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = fixture(true);
+        let service = crate::serve::testing::plain_service(tmp.path()).await;
+        for name in ["jira.attachment_read", "linear.upload_read", "jira.search"] {
+            service.tools.register(Arc::new(Named(name)));
+        }
+        fx.state.registry.insert("default", Arc::clone(&service));
+        let who = Identity::new("Member", IdentityRole::Member);
+        fx.identities.create(&who).unwrap();
+        let token = issue(&fx, &who, TokenShape::default());
+        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let post = |uri: String, body: &'static str| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jira_attachment_read","arguments":{"attachment_id":"1"}}}"#;
+        let names = |v: serde_json::Value| -> Vec<String> {
+            v["result"]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let mark = workforce_core::desk::BOARD_SYNC_CALLER;
+        for plain in ["/mcp".to_string(), "/mcp/agents/default".to_string()] {
+            let offered = names(post(plain.clone(), list).await);
+            assert!(offered.contains(&"jira_search".to_string()), "{offered:?}");
+            assert!(
+                !offered
+                    .iter()
+                    .any(|n| n == "jira_attachment_read" || n == "linear_upload_read"),
+                "{plain}: {offered:?}"
+            );
+            let refused = post(plain.clone(), read).await;
+            assert!(
+                refused["error"].is_object() || refused["result"]["isError"] == true,
+                "{plain}: {refused}"
+            );
+            let offered = names(post(format!("{plain}?{mark}"), list).await);
+            for n in ["jira_attachment_read", "linear_upload_read"] {
+                assert!(offered.contains(&n.to_string()), "{plain}: {offered:?}");
+            }
+        }
     }
 
     #[tokio::test]
