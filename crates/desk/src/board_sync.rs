@@ -43,6 +43,17 @@ pub fn by_email_tool(system: System) -> &'static str {
     }
 }
 
+/// The tools a ticket's view of `system`'s issue calls when the hub offers
+/// them ([`workforce_core::desk::BOARD_SYNC_VIEW_TOOLS`]).
+pub fn view_tools(system: System) -> Vec<&'static str> {
+    let prefix = format!("{}.", system.as_str());
+    workforce_core::desk::BOARD_SYNC_VIEW_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| t.starts_with(&prefix))
+        .collect()
+}
+
 /// The hub's tool that lists the members there whose name contains what
 /// the person typed (`{name}`): id, name and avatar, never an email.
 pub fn members_tool(system: System) -> &'static str {
@@ -61,8 +72,9 @@ pub fn choose_tool(system: System) -> &'static str {
     }
 }
 
-/// Every tool `system`'s sync may call: the ones it needs, and the ones
-/// that say (or let the person say) who they are there.
+/// Every tool `system`'s sync may call: the ones it needs, the ones that
+/// say (or let the person say) who they are there, and the ones a ticket's
+/// view reads with.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
     all.extend([
@@ -74,6 +86,7 @@ pub fn callable(system: System) -> Vec<&'static str> {
     if system == System::Jira {
         all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
     }
+    all.extend(view_tools(system));
     all
 }
 
@@ -437,7 +450,22 @@ pub const JIRA_FIELDS: &[&str] = &[
     "updated",
     "labels",
     "description",
+    "priority",
+    "duedate",
+    "attachment",
 ];
+
+/// A priority as an issue names it: none when it says it has none.
+fn priority_of(v: &Value) -> Option<String> {
+    let p = name_of(v)?;
+    let lower = p.to_ascii_lowercase();
+    (!matches!(lower.as_str(), "no priority" | "none" | "")).then_some(p)
+}
+
+/// A due date as Jira or Linear writes it (`2026-11-14`).
+fn due_of(v: &Value) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(v.as_str()?.get(..10)?, "%Y-%m-%d").ok()
+}
 
 /// The `linear.issue_list` arguments a filter means for the team
 /// `team_id`, from `since` (the cursor) and at the page `after`; a label is
@@ -729,6 +757,13 @@ pub struct Issue {
     pub closed: Option<bool>,
     /// Its description was cut to [`BODY_MAX`](crate::board::BODY_MAX).
     pub clipped: bool,
+    /// Its priority, project and due date there; its labels are above.
+    pub priority: Option<String>,
+    pub project: Option<String>,
+    pub due: Option<chrono::NaiveDate>,
+    /// The files it holds, when the answer says (`None`: an older hub's,
+    /// which leaves what is known).
+    pub files: Option<Vec<crate::ticket_files::RemoteFile>>,
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
@@ -872,18 +907,126 @@ pub fn unescape_newlines(text: &str) -> String {
     }
 }
 
+/// The version of [`html_text`] a Jira ticket's body was last read with
+/// ([`External::html_read`](crate::board::External::html_read)): a body held
+/// from before it read spaces as HTML does is read again, once.
+pub const HTML_READ: u8 = 1;
+
+/// The character an HTML entity (`amp`, `#39`, `#x27`) stands for, when it
+/// is one Desk knows. A no-break space reads as a space, so it folds into
+/// the spaces around it.
+fn entity(name: &str) -> Option<char> {
+    Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        _ => {
+            let n = name.strip_prefix('#')?;
+            let code = match n.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => n.parse().ok()?,
+            };
+            match char::from_u32(code)? {
+                '\u{a0}' => ' ',
+                c if c.is_control() && !c.is_whitespace() => return None,
+                c => c,
+            }
+        }
+    })
+}
+
+/// `text` with its entities read; one it doesn't know stays as written.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest[1..]
+            .find(';')
+            .filter(|end| *end <= 10)
+            .and_then(|end| Some((entity(&rest[1..=end])?, end + 2)));
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// HTML (Jira's rendered description) as markdown the board shows safely:
-/// headings, bullets, bold, italics and code keep their marks, every other
-/// tag goes, and what a script or style held goes with it.
+/// headings, bullets, bold, italics, code and links keep their marks, every
+/// other tag goes, and what a script or style held goes with it. Text reads
+/// as HTML reads it: a run of spaces and newlines is one space, outside a
+/// `<pre>`, so Jira's indented markup (an issue macro's key and status) never
+/// becomes a markdown code block. A link keeps its address when it is
+/// `http(s)`; its words are kept either way. Entities are read as the text
+/// is, so an address is checked as it will be written.
 pub fn html_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut tag = String::new();
     let mut in_tag = false;
     // Inside a `script` or `style`: nothing is kept until it closes.
     let mut skipping: Option<String> = None;
+    // Inside a `pre`: where its fence starts, its text kept as it is.
+    let mut pre: Option<usize> = None;
+    // The open links: each one's address, and where its words start.
+    let mut links: Vec<(Option<String>, usize)> = Vec::new();
+    // The text since the last tag, its entities not yet read.
+    let mut text = String::new();
+    let flush = |text: &mut String, out: &mut String, in_pre: bool| {
+        for c in decode_entities(text).chars() {
+            match c {
+                c if in_pre => out.push(c),
+                c if c.is_whitespace() => {
+                    if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                        out.push(' ');
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        text.clear();
+    };
+    let line = |out: &mut String| {
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    };
+    let close_pre = |out: &mut String, at: usize| {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        // Text holding a run of backticks is fenced with a longer one.
+        let longest = out[at + 4..]
+            .split(|c| c != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let fence = "`".repeat(3.max(longest + 1));
+        out.replace_range(at..at + 3, &fence);
+        out.push_str(&fence);
+        out.push('\n');
+    };
     for c in html.chars() {
         match (in_tag, c) {
             (false, '<') => {
+                if skipping.is_none() {
+                    flush(&mut text, &mut out, pre.is_some());
+                }
                 in_tag = true;
                 tag.clear();
             }
@@ -906,11 +1049,18 @@ pub fn html_text(html: &str) -> String {
                     skipping = Some(name);
                     continue;
                 }
-                let line = |out: &mut String| {
-                    if !out.is_empty() && !out.ends_with('\n') {
-                        out.push('\n');
+                // Inside a `pre` only its own end and line breaks count.
+                if let Some(at) = pre {
+                    match (closing, name.as_str()) {
+                        (true, "pre") => {
+                            close_pre(&mut out, at);
+                            pre = None;
+                        }
+                        (false, "br") => out.push('\n'),
+                        _ => {}
                     }
-                };
+                    continue;
+                }
                 match (closing, name.as_str()) {
                     (false, "h1" | "h2" | "h3" | "h4") => {
                         line(&mut out);
@@ -921,33 +1071,167 @@ pub fn html_text(html: &str) -> String {
                         line(&mut out);
                         out.push_str("* ");
                     }
+                    (false, "pre") => {
+                        line(&mut out);
+                        pre = Some(out.len());
+                        out.push_str("```\n");
+                    }
+                    (false, "a") => links.push((link_href(&tag), out.len())),
+                    (true, "a") => {
+                        if let Some((href, at)) = links.pop() {
+                            // `line` only ever pops spaces after `at`, and
+                            // pushes one newline: `at` stays in bounds.
+                            let at = at.min(out.len());
+                            let text = out[at..].trim().to_string();
+                            out.truncate(at);
+                            match href {
+                                _ if text.is_empty() => {}
+                                Some(href) => {
+                                    out.push_str(&format!("[{}]({href})", link_words(&text)))
+                                }
+                                // No address to keep: its words stand as they are.
+                                None => out.push_str(&text),
+                            }
+                        }
+                    }
                     (_, "strong" | "b") => out.push_str("**"),
                     (_, "em" | "i") => out.push('*'),
-                    (_, "code") => out.push('`'),
-                    (_, "br" | "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "pre" | "li") => {
-                        line(&mut out)
-                    }
+                    (_, "code" | "tt") => out.push('`'),
+                    (
+                        _,
+                        "br" | "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "li" | "ul" | "ol",
+                    ) => line(&mut out),
                     _ => {}
                 }
             }
             (true, c) => tag.push(c),
-            (false, c) if skipping.is_none() => out.push(c),
-            (false, _) => {}
+            (false, _) if skipping.is_some() => {}
+            (false, c) => text.push(c),
         }
     }
-    let out = out
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&");
+    if skipping.is_none() && !in_tag {
+        flush(&mut text, &mut out, pre.is_some());
+    }
+    if let Some(at) = pre {
+        close_pre(&mut out, at);
+    }
+    // No line outside a fence starts with spaces: none reads as code.
+    let mut fence: Option<String> = None;
     out.lines()
-        .map(str::trim_end)
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("```") {
+                let ticks: String = t.chars().take_while(|c| *c == '`').collect();
+                match &fence {
+                    Some(f) if *f == ticks && t.len() == ticks.len() => fence = None,
+                    None => fence = Some(ticks),
+                    _ => {}
+                }
+                return l.trim_end();
+            }
+            match fence {
+                Some(_) => l.trim_end(),
+                None => l.trim(),
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
+}
+
+/// A link's words as markdown link text: on one line, with nothing that
+/// would end the text or escape its end.
+fn link_words(words: &str) -> String {
+    words
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(['[', ']', '\\', '`'], "")
+}
+
+/// An `<a>` tag's address, when it is `http` or `https`; never one that
+/// could run (`javascript:`) or reach a local file, nor one holding what
+/// would end a markdown link.
+fn link_href(tag: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    // `href` as an attribute of its own, not the end of `data-href`.
+    let at = lower
+        .match_indices("href")
+        .find(|(i, _)| {
+            lower[..*i].ends_with(char::is_whitespace)
+                && lower[i + 4..].trim_start().starts_with('=')
+        })?
+        .0;
+    let rest = tag[at + 4..].trim_start()[1..].trim_start();
+    let (quote, rest) = match rest.chars().next()? {
+        q @ ('"' | '\'') => (Some(q), &rest[1..]),
+        _ => (None, rest),
+    };
+    let end = match quote {
+        Some(q) => rest.find(q)?,
+        None => rest.find(char::is_whitespace).unwrap_or(rest.len()),
+    };
+    let href = decode_entities(&rest[..end]);
+    let lower = href.to_ascii_lowercase();
+    let ok = (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !href.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '[' | ']' | '\\'
+                )
+        });
+    ok.then_some(href)
+}
+
+/// Whether `text` still has a line Jira's indented markup made into a
+/// markdown code block (four spaces or a tab in front, outside a fence):
+/// what [`html_text`] made of a description before it read spaces as HTML
+/// does.
+pub fn has_html_indent(text: &str) -> bool {
+    let mut fence: Option<&str> = None;
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        for mark in ["```", "~~~"] {
+            if t.starts_with(mark) {
+                match fence {
+                    Some(f) if f == mark => fence = None,
+                    None => fence = Some(mark),
+                    _ => {}
+                }
+                return false;
+            }
+        }
+        fence.is_none() && !l.trim().is_empty() && (l.starts_with("    ") || l.starts_with('\t'))
+    })
+}
+
+/// `e` once a push sent what `sent` holds: what its issue now says, as
+/// far as the push knows. A description sent from here is Desk's own, so
+/// it is never read again for an old shape.
+pub fn pushed(
+    e: &mut crate::board::External,
+    sent: &crate::board::Seen,
+    noted: Option<TicketState>,
+    body_sent: bool,
+) {
+    e.seen = sent.clone();
+    e.noted = noted;
+    if body_sent {
+        e.html_read = HTML_READ;
+    }
+}
+
+/// Whether `e`'s held `body` is read again although its issue is
+/// unchanged: once, for a Jira body read before [`HTML_READ`] that still
+/// has its old code block, and never once it was edited in Desk.
+pub fn rereads_html(e: &crate::board::External, body: &str) -> bool {
+    e.system == System::Jira
+        && e.html_read < HTML_READ
+        && e.seen.body == body
+        && has_html_indent(body)
 }
 
 fn text_field(v: &Value) -> (String, bool) {
@@ -1022,6 +1306,10 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
             .get("status_category")
             .and_then(Value::as_str)
             .map(|c| c == "done"),
+        priority: priority_of(&i["priority"]),
+        project: None,
+        due: due_of(&i["duedate"]),
+        files: crate::ticket_files::jira_files(i),
         key,
     })
 }
@@ -1043,6 +1331,7 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
     let (body, clipped) = held_body(unescape_newlines(&body));
+    let files = crate::ticket_files::linear_files(i, &body);
     let blocked_by = i.get("relations").map(|r| {
         r.get("nodes")
             .and_then(Value::as_array)
@@ -1076,7 +1365,30 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         closed: i["state"]["type"]
             .as_str()
             .map(|k| matches!(k, "completed" | "canceled" | "cancelled")),
+        priority: priority_of(&i["priorityLabel"]),
+        project: name_of(&i["project"]["name"]),
+        due: due_of(&i["dueDate"]),
+        files: Some(files),
     })
+}
+
+/// What `issue` says of itself, kept on its ticket: its priority, labels,
+/// project and due date, with when its issue was last read whole carried
+/// over from `was`.
+pub fn details_of(issue: &Issue, was: Option<&crate::board::Details>) -> crate::board::Details {
+    crate::board::Details {
+        priority: issue.priority.clone(),
+        labels: issue
+            .labels
+            .iter()
+            .take(20)
+            .map(|l| crate::crew::one_line(l, 60))
+            .collect(),
+        project: issue.project.clone(),
+        due: issue.due,
+        read_at: was.and_then(|d| d.read_at),
+        comments_at: was.and_then(|d| d.comments_at),
+    }
 }
 
 // ── States ───────────────────────────────────────────────────────────────
@@ -1191,12 +1503,14 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
     };
     if issue.updated_at <= e.remote_updated_at {
         // Unchanged there, but the description held here still has its
-        // newlines written out: it is read again, once.
+        // newlines written out, or the code block an older read made of
+        // Jira's markup: it is read again, once.
         return Pulled {
-            body: issue
-                .body
-                .clone()
-                .filter(|b| has_escaped_newlines(&t.body) && e.seen.body == t.body && *b != t.body),
+            body: issue.body.clone().filter(|b| {
+                ((has_escaped_newlines(&t.body) && e.seen.body == t.body)
+                    || rereads_html(e, &t.body))
+                    && *b != t.body
+            }),
             ..Pulled::default()
         };
     }

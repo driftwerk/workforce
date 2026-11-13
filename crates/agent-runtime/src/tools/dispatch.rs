@@ -703,9 +703,14 @@ fn preview_of(input: &Value) -> &str {
 }
 
 /// The refusal a tool that requires human approval gets on a path with no
-/// human on it — a workflow tool step, a job runner. `None` leaves the call
-/// alone, so an ungated tool is unaffected.
+/// human on it — a workflow tool step, a job runner, a monitor. A program's
+/// tool ([`crate::tools::access::PROGRAM_ONLY_TOOLS`]) is refused there too:
+/// only the board sync calls those, and never by these paths. `None` leaves
+/// the call alone, so an ungated tool is unaffected.
 pub fn unattended_refusal(tools: &ToolRegistry, tool_name: &str) -> Option<String> {
+    if let Some(refusal) = crate::tools::access::program_only_refusal(tool_name) {
+        return Some(refusal);
+    }
     tools
         .get(tool_name)
         .is_some_and(|tool| tool.approval_requirement().is_some())
@@ -1629,6 +1634,18 @@ mod tests {
         assert!(refusal.contains("approve"), "{refusal}");
         assert_eq!(unattended_refusal(&tools, "echo"), None);
         assert_eq!(unattended_refusal(&tools, "not-registered"), None);
+    }
+
+    #[test]
+    fn a_program_s_tool_is_refused_on_an_unattended_path() {
+        let tools = registry();
+        for name in crate::tools::access::PROGRAM_ONLY_TOOLS {
+            assert_eq!(
+                unattended_refusal(&tools, name).as_deref(),
+                Some(crate::tools::access::PROGRAM_ONLY),
+                "{name}"
+            );
+        }
     }
 
     fn catalogue() -> (ToolRegistry, Arc<RecordingTool>) {
