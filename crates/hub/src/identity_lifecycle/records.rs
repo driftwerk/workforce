@@ -309,6 +309,9 @@ impl Holding for DecisionRecords {
         let tally = self.held(cx, who).await?;
         if apply {
             crate::decision_store::forget_person(&cx.hub()?.config, &who.names).await?;
+            // What their Desks shared with this hub's agents (Sees) goes
+            // with their decisions: both are records of their own work.
+            crate::desk_knows::forget_person(who.id).await?;
         }
         Ok(tally)
     }
