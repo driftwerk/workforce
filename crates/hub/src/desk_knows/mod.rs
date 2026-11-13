@@ -24,6 +24,7 @@
 
 pub mod routes;
 pub mod store;
+pub mod sync;
 
 use std::sync::Arc;
 use std::time::Duration;

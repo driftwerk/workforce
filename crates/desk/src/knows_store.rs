@@ -3,6 +3,8 @@
 //! kind has gone (`knows_cursors`), and the person's changes and choices
 //! (`knows_log`).
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use serde::Serialize;
@@ -38,6 +40,19 @@ pub struct LogEntry {
 pub struct Sent {
     pub held: Held,
     pub bytes: i32,
+    /// What was sent of a kind sent again when it changes (an account, a
+    /// need, a decision): its body's hash. None for one sent once.
+    pub hash: Option<String>,
+}
+
+/// What `agent` was sent of one item, as the sync reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentState {
+    pub hash: Option<String>,
+    /// It is being deleted: never sent again until that is done.
+    pub deleting: bool,
+    /// It was deleted: sent again only as new.
+    pub deleted: bool,
 }
 
 /// The longest log an agent's page reads at once.
@@ -182,11 +197,12 @@ impl DeskStore {
         let tx = client.transaction().await?;
         let stmt = tx
             .prepare(
-                "INSERT INTO knows_sent (agent, kind, ref, session, group_id, board, boss, bytes, sent_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                "INSERT INTO knows_sent (agent, kind, ref, session, group_id, board, boss, bytes, sent_at, hash) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (agent, kind, ref) DO UPDATE SET session = EXCLUDED.session, \
                    group_id = EXCLUDED.group_id, board = EXCLUDED.board, boss = EXCLUDED.boss, \
-                   bytes = EXCLUDED.bytes, sent_at = EXCLUDED.sent_at, deleted_at = NULL, kept_at = NULL",
+                   bytes = EXCLUDED.bytes, sent_at = EXCLUDED.sent_at, hash = EXCLUDED.hash, \
+                   deleted_at = NULL, kept_at = NULL",
             )
             .await?;
         for s in sent {
@@ -203,12 +219,42 @@ impl DeskStore {
                     &h.boss,
                     &s.bytes,
                     &now,
+                    &s.hash,
                 ],
             )
             .await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// What `agent` was sent of `kinds`, by (kind, ref): for the sync to
+    /// send a changed item again, and nothing being deleted.
+    pub async fn knows_sent_states(
+        &self,
+        agent: &str,
+        kinds: &[&str],
+    ) -> Result<HashMap<(String, String), SentState>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT kind, ref, hash, deleting IS NOT NULL, deleted_at IS NOT NULL FROM knows_sent \
+                 WHERE agent = $1 AND kind = ANY($2)",
+                &[&agent, &kinds],
+            )
+            .await?
+            .iter()
+            .map(|r| {
+                Ok((
+                    (r.try_get(0)?, r.try_get(1)?),
+                    SentState {
+                        hash: r.try_get(2)?,
+                        deleting: r.try_get(3)?,
+                        deleted: r.try_get(4)?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Logs the person's choice for `items` (kind, ref) that `agent` holds
@@ -375,6 +421,33 @@ impl DeskStore {
     }
 }
 
+/// In `tx`, which forgets `ids`: each agent's copies of those sessions,
+/// kept by the person's choice or not, marked for deleting under one
+/// `delete` log row per agent (`why: "forgotten"`), for the delete worker
+/// to take back from the agent's hub as any other delete.
+pub(crate) async fn knows_forget_sessions_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    ids: &[Uuid],
+) -> Result<()> {
+    tx.execute(
+        "WITH hit AS ( \
+           SELECT agent, kind, ref, session FROM knows_sent \
+           WHERE session = ANY($1) AND deleted_at IS NULL AND deleting IS NULL FOR UPDATE), \
+         logs AS ( \
+           INSERT INTO knows_log (id, at, agent, what, detail) \
+           SELECT gen_random_uuid(), now(), agent, 'delete', jsonb_build_object( \
+             'why', 'forgotten', 'items', count(*), \
+             'transcripts', count(*) FILTER (WHERE kind = 'transcript'), \
+             'sessions', count(DISTINCT session)) \
+           FROM hit GROUP BY agent RETURNING id, agent) \
+         UPDATE knows_sent k SET deleting = logs.id FROM hit JOIN logs ON logs.agent = hit.agent \
+         WHERE k.agent = hit.agent AND k.kind = hit.kind AND k.ref = hit.ref",
+        &[&ids],
+    )
+    .await?;
+    Ok(())
+}
+
 fn log_entry(r: &Row, at: usize) -> Result<LogEntry> {
     Ok(LogEntry {
         id: r.try_get(at)?,
@@ -403,6 +476,7 @@ mod tests {
                 boss: None,
             },
             bytes: 100,
+            hash: None,
         }
     }
 

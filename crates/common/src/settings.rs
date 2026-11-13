@@ -779,6 +779,50 @@ pub struct DeskConfig {
     /// engine is given last.
     #[serde(default)]
     pub bosses: DeskBossesConfig,
+    /// What Desk shares of the person's work with agents (`[desk.knows]`,
+    /// Sees): this engine's limits for sending it.
+    #[serde(default)]
+    pub knows: DeskKnowsSyncConfig,
+}
+
+/// `[desk.knows]`: how Desk sends each agent what its rule covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskKnowsSyncConfig {
+    /// Off: nothing is sent, whatever the rules say.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// How far back a newly covered session's history is sent.
+    #[serde(default = "default_knows_backfill_days")]
+    pub backfill_days: u32,
+    /// The most items sent to one agent a minute.
+    #[serde(default = "default_knows_send_per_minute")]
+    pub send_per_minute: u32,
+    /// The most megabytes sent to one agent a day.
+    #[serde(default = "default_knows_send_mb_per_day")]
+    pub send_mb_per_day: u32,
+}
+
+impl Default for DeskKnowsSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backfill_days: default_knows_backfill_days(),
+            send_per_minute: default_knows_send_per_minute(),
+            send_mb_per_day: default_knows_send_mb_per_day(),
+        }
+    }
+}
+
+fn default_knows_backfill_days() -> u32 {
+    14
+}
+
+fn default_knows_send_per_minute() -> u32 {
+    600
+}
+
+fn default_knows_send_mb_per_day() -> u32 {
+    512
 }
 
 /// `[desk.bosses]`: this engine's limits for the grants Desk on the
@@ -1083,6 +1127,7 @@ impl Default for DeskConfig {
             forget_agents: Vec::new(),
             memory: DeskMemoryConfig::default(),
             bosses: DeskBossesConfig::default(),
+            knows: DeskKnowsSyncConfig::default(),
         }
     }
 }
