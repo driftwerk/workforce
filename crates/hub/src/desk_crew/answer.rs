@@ -83,7 +83,7 @@ pub(super) fn reply(text: &str) -> Option<Reply> {
         return None;
     }
     match w.as_str() {
-        "ASK" => Some(Reply::Ask(rest.to_string())),
+        "ASK" => Some(Reply::Ask(workforce_desk::crew::one_line(rest, SHOWN))),
         "ANSWER" => {
             let why = lines
                 .find_map(|l| {
@@ -91,6 +91,7 @@ pub(super) fn reply(text: &str) -> Option<Reply> {
                         .filter(|(w, _)| w == "WHY")
                         .map(|(_, r)| r.to_string())
                 })
+                .map(|w| workforce_desk::crew::clip(&w, SHOWN))
                 .unwrap_or_default();
             Some(Reply::Answer {
                 text: workforce_desk::crew::clip(rest, ANSWER_MAX),
@@ -177,17 +178,15 @@ enum Answered {
 
 impl CrewHub {
     /// How long the person's last input keeps `o`'s sessions' questions
-    /// theirs: `answer_after_minutes` of the crew's minute.
+    /// theirs: `answer_after_minutes` of the crew's minute, and never less
+    /// than their hold, so an answer is never queued behind their wheel.
     pub(super) fn answer_gap(
         &self,
         o: &workforce_common::oversight::Oversight,
     ) -> chrono::Duration {
-        chrono::Duration::from_std(
-            self.timing
-                .minute
-                .mul_f64(f64::from(o.wake.answer_after_minutes)),
-        )
-        .unwrap_or_default()
+        let minutes = o.wake.answer_after_minutes.max(o.wake.hold_minutes);
+        chrono::Duration::from_std(self.timing.minute.mul_f64(f64::from(minutes)))
+            .unwrap_or_default()
     }
 
     /// Whether the person is in control of `view` for its questions, as its
@@ -196,9 +195,7 @@ impl CrewHub {
         let gap = self
             .overseer_named(boss)
             .map(|(_, o)| self.answer_gap(&o))
-            .unwrap_or_else(|| {
-                chrono::Duration::minutes(workforce_common::oversight::ANSWER_AFTER_MINUTES.into())
-            });
+            .unwrap_or_else(|| self.answer_gap(&workforce_common::oversight::Oversight::default()));
         self.desk.person_in_control(view.id, gap)
     }
 
@@ -355,6 +352,13 @@ impl CrewHub {
                     }
                     Err(refused) => {
                         tracing::warn!(session = %view.id, %boss, %refused, "a boss's answer to a question was refused");
+                        self.record_question_left(
+                            boss,
+                            view,
+                            q,
+                            &format!("Desk refused its answer: {refused}"),
+                        )
+                        .await;
                         self.tell_dm(
                             boss,
                             &format!("{label} asks “{shown}”. I answered, but Desk refused it: {refused}"),

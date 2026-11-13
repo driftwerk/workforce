@@ -390,7 +390,8 @@ impl CrewHub {
         // nothing else.
         if event.kind == Kind::Question
             && view().is_some_and(|v| {
-                self.person_has_questions(&v, overseer) || self.answers_question_itself(&v)
+                super::answer::question_of(&v).is_some()
+                    && (self.person_has_questions(&v, overseer) || self.answers_question_itself(&v))
             })
         {
             return None;
@@ -501,7 +502,9 @@ impl CrewHub {
                     .ok()
                     .and_then(|s| self.desk.view(s).ok())
                     .is_some_and(|v| {
-                        self.person_has_questions(&v, overseer) || self.answers_question_itself(&v)
+                        super::answer::question_of(&v).is_some()
+                            && (self.person_has_questions(&v, overseer)
+                                || self.answers_question_itself(&v))
                     })
             {
                 continue;

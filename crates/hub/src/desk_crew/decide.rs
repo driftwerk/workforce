@@ -571,7 +571,6 @@ impl CrewHub {
             "now": account.as_ref().map(|a| &a.now),
             "next": account.as_ref().map(|a| &a.next),
             "waiting_on": account.as_ref().and_then(|a| a.waiting_on.as_ref()),
-            "last_prompt": view.last_prompt.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
             "last_reply": view.last_reply.as_deref().map(|r| workforce_desk::crew::clip(r, LAST_REPLY)),
         });
         let prefs = self
