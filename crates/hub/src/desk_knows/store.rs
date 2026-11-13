@@ -228,6 +228,8 @@ impl KnowsStore for MemoryKnows {
         if forget.all {
             self.1.lock().remove(owner);
         }
+        // The daily digest may name what goes: built again from what's left.
+        self.2.lock().remove(&(owner.person, owner.agent.clone()));
         let mut kept = self.0.lock();
         let before = kept.len();
         kept.retain(|(o, _, _), (i, _)| !(o == owner && covered(forget, i)));
@@ -488,6 +490,13 @@ pub mod postgres {
 
         async fn forget(&self, owner: &Owner, forget: &Forget) -> Result<u64> {
             let client = self.pool.get().await?;
+            // The daily digest may name what goes: built again from what's left.
+            client
+                .execute(
+                    "DELETE FROM daily WHERE person = $1 AND agent = $2",
+                    &[&owner.person, &owner.agent],
+                )
+                .await?;
             if forget.all {
                 client
                     .execute(
@@ -633,7 +642,7 @@ pub mod postgres {
                        AND ($4::text[] IS NULL OR kind = ANY($4)) \
                        AND ($5::text IS NULL OR session = $5) \
                        AND ($6::timestamptz IS NULL OR at >= $6) \
-                     ORDER BY coalesce(jsonb_array_length(body->'flagged'), 0) = 0 DESC, \
+                     ORDER BY (body->'flagged' IS NULL OR body->'flagged' = '[]'::jsonb) DESC, \
                        ts_rank(tsv, q) / (1 + extract(epoch FROM (now() - at)) / 604800.0) DESC \
                      LIMIT $7",
                     &[
@@ -923,7 +932,20 @@ pub(crate) mod tests {
             block: "[DESK WORK]".into(),
         };
         store.set_daily(&me, &built).await.unwrap();
-        assert_eq!(store.daily(&me).await.unwrap(), Some(built));
+        assert_eq!(store.daily(&me).await.unwrap(), Some(built.clone()));
+        // Any forget drops it, to be built again from what's left.
+        store
+            .forget(
+                &mac,
+                &Forget {
+                    sessions: vec!["s404".into()],
+                    ..Forget::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.daily(&me).await.unwrap(), None);
+        store.set_daily(&me, &built).await.unwrap();
         // Forgetting everything of a Desk drops what it set.
         store
             .forget(

@@ -1013,7 +1013,7 @@ async fn desk_work_digest(
             Err(e) => return Some(Err(e)),
         };
         Some(match mode.as_str() {
-            "live" => work.digest(None).await,
+            "live" => work.digest_block(None).await,
             "daily" => {
                 work.daily(chrono::Utc::now(), &service.config.desk_knows.digest_at, tz)
                     .await

@@ -172,6 +172,18 @@ impl Work {
         })
     }
 
+    /// Whether anything of session `id` is held.
+    async fn holds_session(&self, id: &str) -> Result<bool> {
+        Ok(!self
+            .read(Read {
+                session: Some(id.to_string()),
+                limit: 1,
+                ..Read::default()
+            })
+            .await?
+            .is_empty())
+    }
+
     /// The sessions, open needs and the day's decisions, newest first.
     pub async fn overview(&self, group: Option<&str>) -> Result<String> {
         let in_group = |i: &Item| group.is_none_or(|g| i.group_name.as_deref() == Some(g));
@@ -319,8 +331,8 @@ impl Work {
     ) -> Result<String> {
         let session = match session {
             Some(n) => match self.session_id(n).await? {
-                Some((id, _)) => Some(id),
-                None => return Ok(NOT_SHARED.into()),
+                Some((id, _)) if self.holds_session(&id).await? => Some(id),
+                _ => return Ok(NOT_SHARED.into()),
             },
             None => None,
         };
@@ -508,11 +520,13 @@ impl Work {
             "Needs from the person: {}. Ask desk_work.overview for more.\n",
             needs.len()
         ));
-        // The label outside the fence, so the model knows what the block is.
-        Ok(Some(format!(
-            "[DESK WORK]\n{}",
-            wrapped(&cut(&out, DIGEST_CHARS))
-        )))
+        Ok(Some(cut(&out, DIGEST_CHARS)))
+    }
+
+    /// The `[DESK WORK]` block of [`Self::digest`]'s text, as the prompt
+    /// carries it.
+    pub async fn digest_block(&self, since: Option<DateTime<Utc>>) -> Result<Option<String>> {
+        Ok(self.digest(since).await?.as_deref().map(block))
     }
 
     /// The daily digest for `now`: built once for each day's window (from
@@ -531,21 +545,31 @@ impl Work {
         };
         if let Some(kept) = self.store.daily(&self.reader).await? {
             if kept.built_for == to {
-                return Ok(Some(kept.block).filter(|b| !b.is_empty()));
+                return Ok(Some(kept.block)
+                    .filter(|b| !b.is_empty())
+                    .as_deref()
+                    .map(block));
             }
         }
-        let block = self.digest(Some(from)).await?;
+        // Kept plain, and fenced as it is served.
+        let text = self.digest(Some(from)).await?;
         self.store
             .set_daily(
                 &self.reader,
                 &Daily {
                     built_for: to,
-                    block: block.clone().unwrap_or_default(),
+                    block: text.clone().unwrap_or_default(),
                 },
             )
             .await?;
-        Ok(block)
+        Ok(text.as_deref().map(block))
     }
+}
+
+/// The digest's text as the prompt carries it: the label outside the
+/// fence, so the model knows what the block is.
+fn block(text: &str) -> String {
+    format!("[DESK WORK]\n{}", wrapped(text))
 }
 
 /// `date` at `time` in `tz`: the earlier of two in a fold, the first time
@@ -858,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn the_digest_says_whats_working_and_waiting_and_daily_only_when_something_changed() {
         let w = work().await;
-        let live = w.digest(None).await.unwrap().unwrap();
+        let live = w.digest_block(None).await.unwrap().unwrap();
         assert!(
             live.contains("[DESK WORK]") && live.contains("atlas: running tests"),
             "{live}"
@@ -900,6 +924,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.daily(Utc::now(), &at, tz).await.unwrap(), first);
+        // Forgetting the session drops it from the kept digest.
+        w.store
+            .forget(
+                &owner,
+                &crate::desk_knows::store::Forget {
+                    sessions: vec!["s1".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let after = w.daily(Utc::now(), &at, tz).await.unwrap();
+        assert!(
+            after.as_deref().is_none_or(|b| !b.contains("atlas")),
+            "{after:?}"
+        );
         // Someone else holds nothing.
         let none = Work {
             reader: Reader {
@@ -909,6 +949,12 @@ mod tests {
             ..w
         };
         assert!(none.digest(None).await.unwrap().is_none());
+        assert_eq!(
+            none.search("atlas", None, Some("atlas"), None, 5)
+                .await
+                .unwrap(),
+            NOT_SHARED
+        );
     }
 
     #[test]
