@@ -477,6 +477,9 @@ impl CrewTool {
             }
         }
         let mut action = Action::parse(self.name, &kept)?;
+        // Tried, whatever comes of it (done, suggested, refused, failed):
+        // its turn didn't let the session wait.
+        crew.acted_on(b.service.agent_id.as_str(), CrewHub::session_of(&action));
         // Nothing outside its scope is looked into, before anything is said
         // of it or the gate weighs it.
         crew.in_scope(&action, &b.seen).await?;
@@ -563,9 +566,6 @@ impl CrewTool {
                 }))
             }
             Gate::Suggest(why) => {
-                // A suggestion is something done about it: its turn didn't
-                // let it wait.
-                crew.acted_on(b.service.agent_id.as_str(), CrewHub::session_of(&action));
                 if action.starts_session() {
                     crew.start_suggestable(&by, oversight).await?;
                 }

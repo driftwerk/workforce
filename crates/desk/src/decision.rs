@@ -19,6 +19,8 @@ text_enum!(Need {
     Stall => "stall",
     TurnEnd => "turn_end",
     Order => "order",
+    // The person undoing one of its decisions: not a need of its own.
+    Undo => "undo",
 });
 
 text_enum!(How {
@@ -107,11 +109,28 @@ impl BossDecision {
 
     /// As the chat's extras carry it.
     pub fn line(&self) -> DecisionLine {
+        self.line_now(None)
+    }
+
+    /// As the chat's extras carry it now: once undone, no button; a line
+    /// message's button as its row now is (`delivery`: still waiting is
+    /// Undo, gone in is Correct, never going in is none).
+    pub fn line_now(&self, delivery: Option<crate::line::Delivery>) -> DecisionLine {
+        use crate::line::Delivery;
+        let button = match (self.undone_at, self.plan(), delivery) {
+            (Some(_), _, _) => None,
+            (None, Some(UndoPlan::Line { .. }), Some(d)) if self.undo != Undo::None => match d {
+                Delivery::Queued | Delivery::Held => Some("undo"),
+                Delivery::Handed | Delivery::Delivered | Delivery::Noted => Some("correct"),
+                Delivery::Refused | Delivery::Withdrawn => None,
+            },
+            _ => self.button(),
+        };
         DecisionLine {
             id: self.id.to_string(),
             text: self.what.clone(),
             why: self.why.clone(),
-            undo: self.button().map(str::to_string),
+            undo: button.map(str::to_string),
             undone: self.undone_at.is_some(),
             preference: self.preference.map(|p| p.to_string()),
         }
@@ -240,17 +259,22 @@ impl Handled {
     pub fn of(decisions: &[BossDecision]) -> Self {
         let mut h = Self::default();
         for d in decisions {
-            if !matches!(d.need, Need::Approval | Need::Question | Need::Stall) {
-                continue;
-            }
-            match d.how {
-                How::Own => h.own += 1,
-                How::Preference => h.preference += 1,
-                How::Escalated => h.escalated += 1,
-                How::PersonFirst => h.person_first += 1,
-            }
+            h.add(d.need, d.how, 1);
         }
         h
+    }
+
+    /// Counts `n` decisions of `need` made `how`: only needs count.
+    pub fn add(&mut self, need: Need, how: How, n: usize) {
+        if !matches!(need, Need::Approval | Need::Question | Need::Stall) {
+            return;
+        }
+        match how {
+            How::Own => self.own += n,
+            How::Preference => self.preference += n,
+            How::Escalated => self.escalated += n,
+            How::PersonFirst => self.person_first += n,
+        }
     }
 
     pub fn needs(&self) -> usize {

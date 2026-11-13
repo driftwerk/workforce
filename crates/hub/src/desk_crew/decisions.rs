@@ -394,7 +394,7 @@ impl CrewHub {
             Ok(done) => {
                 let mut mine = BossDecision::new(
                     &claimed.boss,
-                    claimed.need,
+                    Need::Undo,
                     &format!("you undid: {}", claimed.what),
                     &done,
                     How::PersonFirst,
@@ -448,7 +448,12 @@ impl CrewHub {
                 // Read again now: one still waiting is taken back; one gone
                 // in is corrected.
                 match self.desk.line_withdraw(*message).await {
-                    Ok(Some(_)) => {
+                    Ok(Some((_, reopened))) => {
+                        // An answer taken back: its question is the
+                        // person's again, carded in the DM.
+                        if let Some(q) = reopened {
+                            self.post_question(&q).await;
+                        }
                         self.desk.note(
                             by.event(
                                 Kind::Dismissed,
@@ -469,7 +474,30 @@ impl CrewHub {
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "a boss's message couldn't be taken back");
+                        return Err("Something went wrong on this Mac.".into());
                     }
+                }
+                // No longer waiting: read again. Only one that went in is
+                // corrected; one that never will (withdrawn, refused, gone)
+                // has nothing to take back.
+                let now = self
+                    .desk
+                    .store()
+                    .line_message(*message)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "a boss's message couldn't be read");
+                        "Something went wrong on this Mac.".to_string()
+                    })?;
+                if !now.as_ref().is_some_and(|m| {
+                    matches!(
+                        m.delivery,
+                        Delivery::Handed | Delivery::Delivered | Delivery::Noted
+                    )
+                }) {
+                    return Ok(format!(
+                        "Desk's message to {name} never went in, so there was nothing to take back"
+                    ));
                 }
                 let said = match ask {
                     Some(_) => format!(
@@ -537,7 +565,15 @@ impl CrewHub {
                 "Your decisions could not be read just now.".to_string()
             })?;
         let tz = workforce_desk::crew::Crew::timezone(self);
-        let h = Handled::of(&list);
+        let h = self
+            .desk
+            .store()
+            .decisions_handled(boss, since)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "a boss's handled counts couldn't be read");
+                Handled::of(&list)
+            });
         Ok(json!({
             "since": since.to_rfc3339(),
             "handled": {

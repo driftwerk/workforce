@@ -7,7 +7,7 @@ use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::decision::{BossDecision, How, Need, Undo};
+use crate::decision::{BossDecision, Handled, How, Need, Undo};
 use crate::store::DeskStore;
 
 const COLUMNS: &str =
@@ -102,6 +102,47 @@ impl DeskStore {
             .collect::<Result<Vec<_>>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    /// How many needs `boss` handled since `since`, over every decision in
+    /// that time (never a page of them).
+    pub async fn decisions_handled(&self, boss: &str, since: DateTime<Utc>) -> Result<Handled> {
+        let client = self.pool().get().await?;
+        let mut h = Handled::default();
+        for r in client
+            .query(
+                "SELECT need, how, count(*) AS n FROM boss_decisions \
+                 WHERE boss = $1 AND at >= $2 GROUP BY need, how",
+                &[&boss, &since],
+            )
+            .await?
+        {
+            let n: i64 = r.try_get("n")?;
+            if let (Ok(need), Ok(how)) = (
+                Need::parse(r.try_get("need")?),
+                How::parse(r.try_get("how")?),
+            ) {
+                h.add(need, how, n as usize);
+            }
+        }
+        Ok(h)
+    }
+
+    /// The decisions `ids` (as the chat's extras name them), by id.
+    pub async fn decisions_of(&self, ids: &[Uuid]) -> Result<Vec<BossDecision>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!("SELECT {COLUMNS} FROM boss_decisions WHERE id = ANY($1)"),
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(decision)
+            .collect()
     }
 
     /// Claims `id`'s undo: the decision as it now is, marked undone, or

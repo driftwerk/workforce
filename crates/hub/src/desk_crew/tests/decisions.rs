@@ -309,3 +309,140 @@ async fn crew_decisions_reads_the_log_with_the_handled_count() {
     })
     .await;
 }
+
+/// Only a boss's message still queued or held is withdrawn; an answer
+/// taken back puts its question back with the person, and is no longer its
+/// answer. The chat's line follows the row: Undo while it waits, Correct
+/// once it went in, none once undone.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_waiting_message_is_withdrawn_and_an_answer_taken_back_reopens_its_question() {
+    use workforce_desk::crew::Party;
+    use workforce_desk::line::{Asked, LineKind, LineMessage};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let boss = Party::manager("desk", "Desk");
+        let mut ask = LineMessage::new(
+            Party::session(&s),
+            boss.clone(),
+            LineKind::Ask,
+            "Which port?".into(),
+            0,
+        );
+        ask.asked = Some(Asked::Answered);
+        d.store().put_line(&ask).await.unwrap();
+        let mut answer = LineMessage::new(
+            boss.clone(),
+            Party::session(&s),
+            LineKind::Answer,
+            "5433".into(),
+            0,
+        );
+        answer.in_reply_to = Some(ask.id);
+        d.store().put_line(&answer).await.unwrap();
+        let (withdrawn, reopened) = d.line_withdraw(answer.id).await.unwrap().unwrap();
+        assert_eq!(withdrawn.delivery, Delivery::Withdrawn);
+        let reopened = reopened.expect("its question is put back");
+        assert_eq!(reopened.asked, Some(Asked::Escalated));
+        assert!(d.store().line_reply_to(ask.id).await.unwrap().is_none());
+        assert!(d.line_withdraw(answer.id).await.unwrap().is_none(), "once");
+        // Gone in, or the person's own: never withdrawn.
+        let mut gone = LineMessage::new(
+            boss.clone(),
+            Party::session(&s),
+            LineKind::Tell,
+            "x".into(),
+            0,
+        );
+        gone.delivery = Delivery::Delivered;
+        d.store().put_line(&gone).await.unwrap();
+        assert!(d.line_withdraw(gone.id).await.unwrap().is_none());
+        let theirs = LineMessage::new(
+            Party::you(),
+            Party::session(&s),
+            LineKind::Tell,
+            "y".into(),
+            0,
+        );
+        d.store().put_line(&theirs).await.unwrap();
+        assert!(d.line_withdraw(theirs.id).await.unwrap().is_none());
+
+        // The chat's line, as the row is now.
+        let nudge = Action::Nudge {
+            to: Target::Session(s.id),
+            message: "Hold the merge.".into(),
+            reply_to: None,
+        };
+        crew.perform(&nudge, crew.by_overseer("CI is red.").unwrap())
+            .await
+            .unwrap();
+        let made = d
+            .store()
+            .decisions_since("desk", epoch(), 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let extras = workforce_desk::crew::Extras {
+            decisions: vec![made.line()],
+            ..Default::default()
+        };
+        d.store().put_extras("m-1", "desk", &extras).await.unwrap();
+        let line = |d: Desk| async move {
+            d.store().extras(&["m-1".to_string()]).await.unwrap()["m-1"].decisions[0].clone()
+        };
+        assert_eq!(line(d.clone()).await.undo.as_deref(), Some("undo"));
+        let Some(workforce_desk::decision::UndoPlan::Line { message, .. }) = made.plan() else {
+            panic!();
+        };
+        let mut sent = d.store().line_message(message).await.unwrap().unwrap();
+        sent.delivery = Delivery::Delivered;
+        d.store().put_line(&sent).await.unwrap();
+        assert_eq!(
+            line(d.clone()).await.undo.as_deref(),
+            Some("correct"),
+            "it went in since"
+        );
+        crew.undo(made.id).await.unwrap();
+        let after = line(d.clone()).await;
+        assert!(after.undone && after.undo.is_none(), "{after:?}");
+
+        // One that never went in has nothing to take back, and no
+        // correction is sent for it.
+        crew.perform(&nudge, crew.by_overseer("CI is red still.").unwrap())
+            .await
+            .unwrap();
+        let made = d
+            .store()
+            .decisions_since("desk", epoch(), 20)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let Some(workforce_desk::decision::UndoPlan::Line { message, .. }) = made.plan() else {
+            panic!();
+        };
+        let mut never = d.store().line_message(message).await.unwrap().unwrap();
+        never.delivery = Delivery::Withdrawn;
+        d.store().put_line(&never).await.unwrap();
+        let before = d.store().line_inbox(&s.id.to_string()).await.unwrap().len();
+        let done = crew.undo(made.id).await.unwrap();
+        assert!(done.contains("never went in"), "{done}");
+        assert_eq!(
+            d.store().line_inbox(&s.id.to_string()).await.unwrap().len(),
+            before
+        );
+        // An undo is no need of its own: the counts are the boss's needs.
+        let h = d.store().decisions_handled("desk", epoch()).await.unwrap();
+        assert_eq!(h.needs(), 0, "{h:?}");
+    })
+    .await;
+}

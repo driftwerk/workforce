@@ -169,7 +169,7 @@ impl CrewHub {
     /// Puts the question `q`, given to the person, in the DM of the
     /// overseer it was asked of (by its scope) as a question card. With no
     /// DM yet, the Floor and the session's thread still show it.
-    async fn post_question(&self, q: &LineMessage) {
+    pub(crate) async fn post_question(&self, q: &LineMessage) {
         let boss = match q.to.kind {
             PartyKind::Manager => Some(q.to.id.clone()),
             _ => self

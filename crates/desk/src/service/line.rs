@@ -1647,8 +1647,12 @@ impl Desk {
     /// Takes back the one message `id` a boss sent a session, while it is
     /// queued or held (an Undo of its decision): it never goes in. An
     /// answer taken back puts its question back with the person. The
-    /// message as it now is, or `None` when it has already gone in.
-    pub async fn line_withdraw(&self, id: Uuid) -> Result<Option<LineMessage>, DeskError> {
+    /// message as it now is, and the question put back; `None` when it is
+    /// no longer waiting.
+    pub async fn line_withdraw(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(LineMessage, Option<LineMessage>)>, DeskError> {
         let back = line::Escalation {
             why: "You took back Desk's answer, so this is yours to answer.".into(),
             options: Vec::new(),
@@ -1658,10 +1662,10 @@ impl Desk {
             return Ok(None);
         };
         self.line_announce(&withdrawn);
-        if let Some(q) = reopened {
-            self.line_announce(&q);
+        if let Some(q) = &reopened {
+            self.line_announce(q);
         }
-        Ok(Some(withdrawn))
+        Ok(Some((withdrawn, reopened)))
     }
 
     /// The person changes (`Some`) or takes back (`None`) a message of
