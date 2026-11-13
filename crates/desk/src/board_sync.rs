@@ -54,11 +54,38 @@ pub fn view_tools(system: System) -> Vec<&'static str> {
         .collect()
 }
 
+/// The hub's tool that lists the members there whose name contains what
+/// the person typed (`{name}`): id, name and avatar, never an email.
+pub fn members_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "identity.jira_users_named",
+        System::Linear => "identity.linear_members_named",
+    }
+}
+
+/// The hub's tool that keeps (`{id, name}`) or clears (`{clear: true}`)
+/// whom the person chose to be there: only ever their own.
+pub fn choose_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "identity.jira_choose_me",
+        System::Linear => "identity.linear_choose_me",
+    }
+}
+
 /// Every tool `system`'s sync may call: the ones it needs, the ones that
-/// say who the person is there, and the ones a ticket's view reads with.
+/// say (or let the person say) who they are there, and the ones a ticket's
+/// view reads with.
 pub fn callable(system: System) -> Vec<&'static str> {
     let mut all = tools_of(system).to_vec();
-    all.extend([identity_tool(system), by_email_tool(system)]);
+    all.extend([
+        identity_tool(system),
+        by_email_tool(system),
+        members_tool(system),
+        choose_tool(system),
+    ]);
+    if system == System::Jira {
+        all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
+    }
     all.extend(view_tools(system));
     all
 }
@@ -129,6 +156,35 @@ pub trait Remote: Send + Sync {
     async fn tools(&self) -> Result<Vec<String>, RemoteError>;
     /// Calls `tool` (a registry name) with `args`; its answer as JSON.
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError>;
+    /// The same for a call made only to fill in a dialog: one that would
+    /// need an approval is not parked or routed to anyone, it just fails.
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.call(tool, args).await
+    }
+}
+
+/// `call`, quietly (see `Remote::call_quiet`): a call that would wait on an
+/// approval is `Waiting`, as ever, but nothing was asked of anyone.
+pub async fn call_quiet(
+    remote: &dyn Remote,
+    system: System,
+    tool: &str,
+    args: Value,
+) -> Result<Value, RemoteError> {
+    if !callable(system).contains(&tool) {
+        return Err(RemoteError::NotAllowed(tool.to_string()));
+    }
+    let answer = remote.call_quiet(tool, args).await?;
+    if answer.get("status").and_then(Value::as_str) == Some("approval_pending") {
+        return Err(RemoteError::Waiting {
+            request_id: answer
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(answer)
 }
 
 /// `remote`'s answer to `tool`, refusing any tool the sync may not call.
@@ -483,7 +539,7 @@ pub enum Who {
     Person(Assignee),
     /// The key is shared, and exactly one user there has the email the
     /// person's sign-in provider verified: this is them.
-    ByEmail(Assignee),
+    ByEmail(Assignee, crate::board::MeSource),
     /// The key is shared (an agent's, the hub's): it says who owns the key,
     /// never who the person is; and no one user there has their verified
     /// email, for this reason.
@@ -498,7 +554,7 @@ impl Who {
     pub fn why_not(&self, hub: &str, system: System) -> Option<String> {
         let title = system.title();
         match self {
-            Self::Person(_) | Self::ByEmail(_) => None,
+            Self::Person(_) | Self::ByEmail(..) => None,
             Self::Shared(NoMatch::EmailHidden) => Some(format!(
                 "{hub} uses a shared {title} key, and {title} doesn't show your email to the shared key, so it can't say who you are."
             )),
@@ -520,7 +576,7 @@ impl Who {
     /// The person, when it says who they are.
     pub fn person(&self) -> Option<&Assignee> {
         match self {
-            Self::Person(a) | Self::ByEmail(a) => Some(a),
+            Self::Person(a) | Self::ByEmail(a, _) => Some(a),
             Self::Shared(_) | Self::Unsaid => None,
         }
     }
@@ -586,10 +642,13 @@ pub fn by_email_of(system: System, answer: &Value) -> Who {
     if let Some(id) = user["id"].as_str() {
         let id = id.trim().to_string();
         if check_me(system, &id).is_ok() {
-            return Who::ByEmail(Assignee {
-                name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
-                id,
-            });
+            return Who::ByEmail(
+                Assignee {
+                    name: name_of(&user["name"]).unwrap_or_else(|| "You".into()),
+                    id,
+                },
+                crate::board::MeSource::of_source(answer["source"].as_str()),
+            );
         }
     }
     Who::Shared(match answer["why"].as_str() {

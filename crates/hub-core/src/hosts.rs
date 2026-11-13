@@ -179,6 +179,10 @@ pub trait RegistryView: Send + Sync {
     fn all_services(&self) -> Vec<Arc<AgentService>>;
     /// The configured agents that are not serving, by id.
     fn unloaded(&self) -> Vec<Unloaded>;
+    /// The hub's base config, beside which its overlay sits, once known.
+    fn config_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     /// Whether `identity` may use `agent` as a chat with it would decide.
     fn admits(&self, agent: &str, identity: &str) -> bool;
     /// Every vault a login may be stored in, across the registered agents.

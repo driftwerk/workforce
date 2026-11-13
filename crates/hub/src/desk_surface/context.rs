@@ -41,7 +41,10 @@ pub(crate) fn desk_context(
     let owner = person.map_or_else(|| "your person's".to_string(), |p| format!("{p}'s"));
     let asks = person.unwrap_or("them");
     let conversation = match &turn.place {
-        DeskPlace::Dm => format!("a direct message with {named}"),
+        DeskPlace::Dm { thread: None } => format!("a direct message with {named}"),
+        DeskPlace::Dm { thread: Some(_) } => {
+            format!("a thread in a direct message with {named}")
+        }
         DeskPlace::Room {
             name,
             thread: Some(_),
@@ -68,9 +71,10 @@ pub(crate) fn desk_context(
     let posted = match &turn.place {
         DeskPlace::Room {
             thread: Some(_), ..
-        } => "thread",
+        }
+        | DeskPlace::Dm { thread: Some(_) } => "thread",
         DeskPlace::Room { .. } | DeskPlace::LegacyRoom { .. } => "room",
-        DeskPlace::Dm | DeskPlace::Call => "conversation",
+        DeskPlace::Dm { thread: None } | DeskPlace::Call => "conversation",
     };
     let block = format!(
         "[MESSAGING CONTEXT — use these values when calling messaging tools]\n\
@@ -147,10 +151,11 @@ fn thread_lines(desk: &DeskTurnContext, session_channel: &str) -> Option<String>
     let scope = match &desk.turn.place {
         DeskPlace::Room {
             thread: Some(_), ..
-        } => SeedScope::Thread,
+        }
+        | DeskPlace::Dm { thread: Some(_) } => SeedScope::Thread,
         DeskPlace::Room { .. } | DeskPlace::LegacyRoom { .. } => SeedScope::Room,
         DeskPlace::Call => SeedScope::Call,
-        DeskPlace::Dm => SeedScope::Conversation,
+        DeskPlace::Dm { thread: None } => SeedScope::Conversation,
     };
     // What others said is theirs, fenced as untrusted, as Slack's is.
     render(
@@ -193,9 +198,10 @@ mod tests {
                 spoken: false,
                 voice: None,
                 members: Vec::new(),
+                edit: None,
             },
             target: DeskTarget {
-                place: DeskPlace::Dm,
+                place: DeskPlace::Dm { thread: None },
                 channel: "desk".into(),
                 device: None,
                 spoken: false,
@@ -319,7 +325,7 @@ mod tests {
     #[test]
     fn a_dm_a_call_and_a_hand_off_say_so() {
         let dm = desk_context(
-            &context(DeskPlace::Dm, DeskSpeaker::Person, 0, &[]),
+            &context(DeskPlace::Dm { thread: None }, DeskSpeaker::Person, 0, &[]),
             "desk",
             "s1",
             None,

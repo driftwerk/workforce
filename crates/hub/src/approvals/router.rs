@@ -184,14 +184,38 @@ fn for_unattended_desk(
     }
 }
 
+/// A Desk group's boss woken by its engines runs with nobody there: what it
+/// would ask in its conversation is asked of the conversation's person, as
+/// a routed approval only they need give, delivered into the group's Slack
+/// thread and to Desk. Only a wake turn (or one resumed from a wake's
+/// approval) runs under [`crate::boss_links::wake::ORIGIN`], and only after
+/// the conversation proved to be the person's; a rule that routes the call
+/// to someone else still stands.
+fn for_boss_wake(decision: ApprovalDecision, requester: &str, ttl: Duration) -> ApprovalDecision {
+    let waking = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+        .try_with(|o| o == crate::boss_links::wake::ORIGIN)
+        .unwrap_or(false);
+    match decision {
+        ApprovalDecision::SelfServe if waking && Uuid::from_str(requester).is_ok() => {
+            ApprovalDecision::Routed(ApprovalRoute {
+                approver_user_ids: vec![requester.to_string()],
+                allow_self_approval: true,
+                ttl,
+            })
+        }
+        decision => decision,
+    }
+}
+
 impl ApprovalRouter for HubApprovalRouter {
     fn route(&self, ctx: &ApprovalRouteCtx<'_>) -> ApprovalDecision {
-        for_unattended_desk(
+        let decision = for_unattended_desk(
             self.route_by_rules(ctx),
             ctx.user_id,
             workforce_agent::runner::current_desk().as_ref(),
             self.default_ttl,
-        )
+        );
+        for_boss_wake(decision, ctx.user_id, self.default_ttl)
     }
 
     fn defer(&self, record: &PendingApprovalCore) -> eyre::Result<()> {
@@ -284,12 +308,65 @@ mod tests {
         ident
     }
 
+    #[tokio::test]
+    async fn a_boss_wake_asks_its_own_person_and_only_a_wake_does() {
+        use workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN;
+        let person = Uuid::new_v4().to_string();
+        let ttl = Duration::from_secs(60);
+        let waking = |origin: &'static str, decision: ApprovalDecision, requester: String| {
+            CURRENT_AUTOMATED_ORIGIN.scope(origin.to_string(), async move {
+                for_boss_wake(decision, &requester, ttl)
+            })
+        };
+        match waking(
+            crate::boss_links::wake::ORIGIN,
+            ApprovalDecision::SelfServe,
+            person.clone(),
+        )
+        .await
+        {
+            ApprovalDecision::Routed(route) => {
+                assert_eq!(route.approver_user_ids, vec![person.clone()]);
+                assert!(route.allow_self_approval);
+            }
+            _ => panic!("the person is asked"),
+        }
+        // Any other origin, or none, asks in the conversation as before.
+        assert!(matches!(
+            waking("heartbeat", ApprovalDecision::SelfServe, person.clone()).await,
+            ApprovalDecision::SelfServe
+        ));
+        assert!(matches!(
+            for_boss_wake(ApprovalDecision::SelfServe, &person, ttl),
+            ApprovalDecision::SelfServe
+        ));
+        // A requester that isn't a person, or a rule's own route, stands.
+        assert!(matches!(
+            waking(
+                crate::boss_links::wake::ORIGIN,
+                ApprovalDecision::SelfServe,
+                "scheduler".into()
+            )
+            .await,
+            ApprovalDecision::SelfServe
+        ));
+        assert!(matches!(
+            waking(
+                crate::boss_links::wake::ORIGIN,
+                ApprovalDecision::DenyUnreachable,
+                person.clone()
+            )
+            .await,
+            ApprovalDecision::DenyUnreachable
+        ));
+    }
+
     #[test]
     fn an_unattended_desk_run_asks_its_own_person_and_nothing_else_changes() {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
         let person = Uuid::new_v4().to_string();
         let scope = |attended, owner: &str| DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended,
             relayed: false,
             owner: owner.into(),
@@ -401,7 +478,7 @@ mod tests {
             ApprovalDecision::SelfServe
         ));
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended: false,
             relayed: false,
             owner: uid.clone(),

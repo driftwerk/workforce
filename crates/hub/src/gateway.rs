@@ -374,6 +374,8 @@ const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 pub fn router(state: Arc<GatewayState>) -> Router {
     // The boss tools of this hub's turns call its uplinks.
     crate::boss_links::tools::serve_for(&state);
+    // And what happens in their groups wakes them.
+    crate::boss_links::wake::start(&state);
     let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
@@ -1437,7 +1439,10 @@ async fn ws_handler(
     // no channel, otherwise the conversational channel it names.
     let anchor_channel = match query.channel.as_deref() {
         None => IOS_CHANNEL.to_string(),
-        Some(channel) if workforce_common::channels::is_conversational(channel) => {
+        Some(channel)
+            if workforce_common::channels::is_conversational(channel)
+                || workforce_common::channels::is_desk_boss_channel(channel) =>
+        {
             channel.to_string()
         }
         Some(channel) => return invalid_ws_channel(channel),
@@ -1452,6 +1457,29 @@ async fn ws_handler(
         Err(refused) => return refused,
     };
     let agent_id = query.agent_id;
+    // A Desk group's boss conversation anchors only its own person's
+    // connection, with its own agent, once its link has opened it.
+    if workforce_common::channels::is_desk_boss_channel(&anchor_channel) {
+        let owner = caller
+            .identity_id
+            .as_deref()
+            .or(caller.device_id.as_deref());
+        if !crate::boss_links::conversation::anchors(
+            &state,
+            owner,
+            agent_id.as_deref(),
+            &anchor_channel,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "boss_conversation",
+                    "message": crate::boss_links::conversation::REFUSED,
+                })),
+            )
+                .into_response();
+        }
+    }
     ws.on_upgrade(move |socket| {
         handle_ws(
             socket,
@@ -1513,6 +1541,19 @@ const DESK_STREAM: &str = "desk.stream";
 /// A Desk message may be sent to queue for the running turn rather than
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
+/// A DM can be searched over its whole history on the hub
+/// (`GET /api/desk/conversations/{agent}/search`), and a page read around a
+/// match (`around=`). Served with the conversation routes.
+const DESK_SEARCH: &str = "desk.search";
+/// A DM has threads: a conversation of its own on a message, on the channel
+/// `desk:thread:<id>`, listed by `GET /api/desk/conversations/{agent}/threads`,
+/// a reply in one also sent to the DM by
+/// `POST /api/desk/conversations/{agent}/messages`.
+const DESK_DM_THREADS: &str = "desk.dm_threads";
+/// A person may delete their own message in their DM, and forget what the
+/// agent remembered from it
+/// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
+const DESK_DELETE: &str = "desk.delete";
 const DESK_DELIVERIES: &str = "desk.deliveries";
 /// A Desk conversation's read names the client's own id for each message
 /// sent under one, and every kept row's place in the archive: Desk knows its
@@ -1521,6 +1562,10 @@ const DESK_CLIENT_IDS: &str = "desk.client_ids";
 /// A room turn may name the room's members, told to the agent in the hub's
 /// words and answering its room lookups (`desk_surface::room_view`).
 const DESK_ROSTER: &str = "desk.roster";
+/// A DM turn may edit the person's latest message
+/// ([`workforce_common::channels::desk::DeskEdit`]): the reply to the old
+/// version is set aside and the agent answers the new one.
+const DESK_EDIT: &str = "desk.edit";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
@@ -1549,6 +1594,20 @@ fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
             .any(|m| m.role == workforce_common::session::MessageRole::Assistant)
 }
 
+/// Whether a chat message is first offered to the session's live turn, to
+/// join it or wait for it. Attachments never join one (an injected message
+/// is text-only), unless sent to queue. An edit never joins or waits on a
+/// live turn: it starts its own, which a live one refuses busy, so it can't
+/// set aside a reply still being written.
+fn steers(
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+    has_attachments: bool,
+    queued: bool,
+) -> bool {
+    let edits = desk.is_some_and(|d| d.turn.edit.is_some());
+    !edits && (!has_attachments || queued)
+}
+
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
@@ -1561,8 +1620,13 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     // points beside it, and what numbers every row and keeps its client id.
     let in_postgres = deliveries && crate::session_store_factory::keeps_desk_reads();
     let reads = in_postgres.then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
-    [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER]
+    [DESK_PLACE, DESK_STREAM, DESK_QUEUE, DESK_ROSTER, DESK_EDIT]
         .into_iter()
+        // Deleting is a conversation route, served where the link is.
+        .chain(deliveries.then_some(DESK_DELETE))
+        // Searching is too.
+        .chain(deliveries.then_some(DESK_SEARCH))
+        .chain(deliveries.then_some(DESK_DM_THREADS))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)
@@ -1849,10 +1913,51 @@ mod desk_frame_tests {
     }
 
     #[test]
+    fn an_edit_is_never_steered_into_a_live_turn_nor_queued_for_one() {
+        use workforce_common::channels::desk::{DeskEdit, DeskTurnContext};
+        let context = |edit: Option<DeskEdit>| {
+            DeskTurnContext::new(
+                DeskTurn {
+                    edit,
+                    ..DeskTurn::legacy("desk").unwrap()
+                },
+                "desk",
+                None,
+                false,
+                None,
+                "reply-1".into(),
+            )
+        };
+        let plain = context(None);
+        let edit = context(Some(DeskEdit {
+            replaces: "m-1".into(),
+        }));
+        assert!(steers(Some(&plain), false, false));
+        assert!(steers(None, true, true));
+        assert!(!steers(None, true, false), "files never join a live turn");
+        for (files, queued) in [(false, false), (false, true), (true, true)] {
+            assert!(!steers(Some(&edit), files, queued));
+        }
+        // Outside the DM it never gets this far.
+        assert_eq!(
+            desk_turn_of(
+                true,
+                Some(DeskTurn {
+                    edit: edit.turn.edit.clone(),
+                    ..DeskTurn::legacy("desk:planning").unwrap()
+                }),
+                "desk:planning",
+                None,
+            ),
+            Err("only your latest message in a direct message can be edited".into())
+        );
+    }
+
+    #[test]
     fn a_desk_connection_s_turn_is_checked_or_inferred() {
         let room = format!("desk:{}", uuid::Uuid::from_u128(5));
         let sent = DeskTurn {
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             ..DeskTurn::legacy("desk").unwrap()
         };
         assert_eq!(
@@ -2011,7 +2116,7 @@ mod voice_forward_tests {
                 session_id: "sess-1".into(),
                 message_id: "m1".into(),
                 kind: workforce_common::channels::desk::DeliveryKind::Job,
-                place: workforce_common::channels::desk::DeskPlace::Dm,
+                place: workforce_common::channels::desk::DeskPlace::Dm { thread: None },
                 spoken: false,
             },
         );
@@ -2698,8 +2803,10 @@ async fn handle_ws(
                             // under its own id): once its turn has answered it,
                             // or while that turn runs, it is not asked twice. Its
                             // turn just ends, and the Desk reads what was kept.
+                            // So is an edit sent again: it is sent under an
+                            // id of its own, which its first try saved.
                             if let Some(asked) = desk.as_ref().filter(|d| {
-                                matches!(d.turn.place, DeskPlace::Dm)
+                                matches!(d.turn.place, DeskPlace::Dm { .. })
                                     && d.turn.message.is_some_and(|id| {
                                         asked_already(
                                             &service,
@@ -2720,7 +2827,7 @@ async fn handle_ws(
                             }
                             let queued = client_msg.mode
                                 == Some(workforce_gateway_client::protocol::SendMode::Queue);
-                            if !has_attachments || queued {
+                            if steers(desk.as_ref(), has_attachments, queued) {
                                 let steered = steer(
                                     nats.as_ref(),
                                     &service,
@@ -6409,7 +6516,9 @@ async fn create_agent(
         agent.insert("memory".to_string(), toml::Value::Table(memory));
     }
 
-    if let Err(e) = crate::config_writer::overlay_upsert_agent(
+    // Made only where no agent of that id is: checked again under the
+    // overlay's lock, so two creates of one id can't both be made.
+    if let Err(e) = crate::config_writer::overlay_create_agent(
         &config_path,
         &data_dir,
         agent,
@@ -6420,6 +6529,12 @@ async fn create_agent(
     )
     .await
     {
+        if crate::config_writer::AgentExists::is(&e) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("agent '{}' already exists", body.id)})),
+            ));
+        }
         // F8 (2026-05-15): log paths server-side but don't echo FS layout
         // back to the client.
         warn!(agent_id = %body.id, error = %e, "Failed to write agent to config overlay");
@@ -6471,46 +6586,60 @@ async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool
     }
 }
 
-/// The longest display name an agent may be given.
-const AGENT_NAME_MAX_CHARS: usize = 100;
-
-/// A rename's name, trimmed: 1–100 characters.
-fn agent_name(name: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let name = name.trim();
-    match name.chars().count() {
-        1..=AGENT_NAME_MAX_CHARS => Ok(name.to_string()),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("an agent's name is 1 to {AGENT_NAME_MAX_CHARS} characters")
-            })),
-        )),
-    }
-}
-
-/// Writes a new display name and instructions to the agent's config overlay
-/// entry, where every later build of it reads them (a restart included), and
-/// shows the name at once. An empty `system_prompt` removes the instructions.
-async fn persist_name_and_prompt(
+/// Renames agent `id` the one way every rename goes (see
+/// [`crate::agent_rename`]): refused when another agent has the name, and
+/// written into its files and instructions as well as its config.
+async fn rename_agent(
     state: &GatewayState,
     caller: &CallerContext,
     id: &str,
-    name: Option<String>,
+    name: &str,
+    instructions: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::agent_rename::{RenameError, Renamer};
+    let (config_path, data_dir, lock_manager) = resolve_overlay_ctx(state)?;
+    let renamer = Renamer {
+        registry: &*state.registry,
+        config_path: &config_path,
+        data_dir: &data_dir,
+        lock_manager: &lock_manager,
+        def_store: state.def_store.as_deref(),
+        actor: caller.identity_id.as_deref(),
+        via: "web",
+    };
+    renamer.rename(id, name, instructions).await.map_err(|e| {
+        let status = match &e {
+            RenameError::Invalid(_) => StatusCode::BAD_REQUEST,
+            RenameError::Taken => StatusCode::CONFLICT,
+            RenameError::Missing(_) => StatusCode::NOT_FOUND,
+            RenameError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(serde_json::json!({"error": e.to_string()})))
+    })?;
+    if let Some(kick) = &state.overlay_kick {
+        kick.notify_one();
+    }
+    Ok(())
+}
+
+/// Writes new instructions to the agent's config overlay entry, where every
+/// later build of it reads them (a restart included). An empty
+/// `system_prompt` removes them.
+async fn persist_prompt(
+    state: &GatewayState,
+    caller: &CallerContext,
+    id: &str,
     system_prompt: Option<String>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if name.is_none() && system_prompt.is_none() {
+    if system_prompt.is_none() {
         return Ok(());
     }
     let (config_path, data_dir, lock_manager) = resolve_overlay_ctx(state)?;
-    let written = name.clone();
     crate::config_writer::overlay_update_agent_fields(
         &config_path,
         &data_dir,
         id,
         move |entry| {
-            if let Some(name) = written {
-                entry.insert("name".to_string(), toml::Value::String(name));
-            }
             match system_prompt {
                 Some(prompt) if prompt.trim().is_empty() => {
                     entry.remove("system_prompt");
@@ -6528,15 +6657,12 @@ async fn persist_name_and_prompt(
     )
     .await
     .map_err(|e| {
-        warn!(agent_id = %id, error = %e, "Failed to save an agent's name to the config overlay");
+        warn!(agent_id = %id, error = %e, "Failed to save an agent's instructions to the config overlay");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "saving the agent failed"})),
         )
     })?;
-    if let (Some(name), Some(service)) = (name, state.registry.get(id)) {
-        *service.name_override.write() = Some(name);
-    }
     if let Some(kick) = &state.overlay_kick {
         kick.notify_one();
     }
@@ -6614,8 +6740,10 @@ async fn apply_agent_update(
     // Verify agent exists
     let _service = resolve_agent(&state, &id)?;
 
-    let name = body.name.as_deref().map(agent_name).transpose()?;
-    persist_name_and_prompt(&state, &caller, &id, name, body.system_prompt.clone()).await?;
+    match body.name.as_deref() {
+        Some(name) => rename_agent(&state, &caller, &id, name, body.system_prompt.clone()).await?,
+        None => persist_prompt(&state, &caller, &id, body.system_prompt.clone()).await?,
+    }
 
     // Live model override (no restart required)
     if let Some(ref model) = body.model {
@@ -17426,25 +17554,31 @@ mod turn_control_tests {
             followup_injection(
                 "approved, ship it",
                 "u1",
-                Some(DeskPlace::Dm),
+                Some(DeskPlace::Dm { thread: None }),
                 false,
                 Some("c-7")
             ),
             TurnControl::FollowUp {
                 text: "approved, ship it".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: false,
                 id: Some("c-7".into()),
             },
             "a follow-up carries the client's id for it"
         );
         assert_eq!(
-            followup_injection("approve req-1", "u1", Some(DeskPlace::Dm), true, None),
+            followup_injection(
+                "approve req-1",
+                "u1",
+                Some(DeskPlace::Dm { thread: None }),
+                true,
+                None
+            ),
             TurnControl::FollowUp {
                 text: "approve req-1".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: true,
                 id: None,
             },

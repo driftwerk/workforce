@@ -18,7 +18,8 @@
 //! - `GET /api/desk/sync-hubs`: the hubs a board can sync through, and
 //!   whether each has a token. Never a token.
 //! - `PUT /api/desk/sync-hubs/{hub}` `{name, url, token}`: checks the token
-//!   with `tools/list`, then keeps it (write-only).
+//!   by asking the hub which of its agents the person may reach (on an older
+//!   hub, its default agent's `tools/list`), then keeps it (write-only).
 //! - `DELETE /api/desk/sync-hubs/{hub}`: forgets the hub and its token; its
 //!   boards pause.
 //! - `POST /api/desk/boards/link/check` `{system, via, target?, filter?, me?}`:
@@ -124,6 +125,8 @@ pub fn agent_id_ok(id: &str) -> bool {
 pub struct HubRemote {
     client: McpClient,
     ready: tokio::sync::OnceCell<()>,
+    /// It reaches the hub's default agent (`/mcp`), not a named one.
+    plain: bool,
 }
 
 impl HubRemote {
@@ -149,17 +152,58 @@ impl HubRemote {
                 McpLimits::default(),
             ),
             ready: tokio::sync::OnceCell::new(),
+            plain: agent.is_none(),
         })
     }
 
-    async fn ready(&self) -> Result<(), RemoteError> {
+    async fn ready(&self) -> Result<(), McpError> {
         self.ready
-            .get_or_try_init(|| async {
-                self.client.initialize().await.map(drop).map_err(mcp_error)
-            })
+            .get_or_try_init(|| async { self.client.initialize().await.map(drop) })
             .await
             .map(|_| ())
     }
+
+    /// Whether `e` says the agent this reaches doesn't let the person in:
+    /// the default agent's 403, or a named agent's 404 (one that is gone or
+    /// no longer admits them reads as not there). The token is fine; that
+    /// agent just offers them nothing.
+    fn not_admitted(&self, e: &McpError) -> bool {
+        match e {
+            McpError::Forbidden { said, .. } => {
+                self.plain && said.contains(crate::remote_mcp::server::DEFAULT_NOT_ADMITTED)
+            }
+            McpError::Protocol(m) => !self.plain && m.contains("404"),
+            _ => false,
+        }
+    }
+}
+
+/// Why no agent on a hub serves the person, as a pause keeps it.
+pub const NO_AGENT_LETS_YOU_IN: &str =
+    "no agent there lets you in; ask whoever runs it to let you use one";
+
+/// The same, said of a hub by name.
+fn no_agent_words(hub: &str) -> String {
+    format!("{hub} has no agent that lets you in; ask whoever runs it to let you use one.")
+}
+
+/// A hub's 403, in words for the person: the hub's own words are matched
+/// (both ends are this code); anything else is passed on, clipped. Never
+/// "make a new token": the token was good, the person or its use wasn't.
+fn forbidden(said: &str) -> RemoteError {
+    use crate::remote_mcp::{auth, server};
+    let reason = if said.contains(auth::NOT_ACTIVE) {
+        "your account there isn't active; ask whoever runs it to turn it back on".to_string()
+    } else if said.contains(auth::OUT_OF_SCOPE) {
+        "that token isn't one for Desk; make a new one there".to_string()
+    } else if said.contains(server::DEFAULT_NOT_ADMITTED) {
+        NO_AGENT_LETS_YOU_IN.to_string()
+    } else if said.trim().is_empty() {
+        "it turned the token away".to_string()
+    } else {
+        said.trim().chars().take(300).collect()
+    };
+    RemoteError::Refused(reason)
 }
 
 /// What a hub's answer means for the sync. Its words are already redacted
@@ -168,7 +212,10 @@ fn mcp_error(e: McpError) -> RemoteError {
     let said = |s: &str| s.chars().take(300).collect::<String>();
     match e {
         McpError::Unreachable(m) => RemoteError::Offline(said(&m)),
+        // 401: a token the hub doesn't know (revoked, expired).
         McpError::AuthExpired(_) => RemoteError::NoToken,
+        // 403: a token it knows, refused for why it says.
+        McpError::Forbidden { said, .. } => forbidden(&said),
         McpError::RateLimited {
             retry_after_secs, ..
         } => RemoteError::RateLimited { retry_after_secs },
@@ -187,27 +234,39 @@ fn mcp_error(e: McpError) -> RemoteError {
 #[async_trait]
 impl Remote for HubRemote {
     async fn tools(&self) -> Result<Vec<String>, RemoteError> {
-        self.ready().await?;
-        let survey = tokio::time::timeout(CALL_TIMEOUT, self.client.list_tool_names())
-            .await
-            .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
-            .map_err(mcp_error)?;
-        Ok(survey.names.into_iter().map(|t| t.name).collect())
+        let listed = match self.ready().await {
+            Ok(()) => tokio::time::timeout(CALL_TIMEOUT, self.client.list_tool_names())
+                .await
+                .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?,
+            Err(e) => Err(e),
+        };
+        match listed {
+            Ok(survey) => Ok(survey.names.into_iter().map(|t| t.name).collect()),
+            // An agent that doesn't let the person in offers them nothing:
+            // the others they may reach are asked.
+            Err(e) if self.not_admitted(&e) => Ok(vec![]),
+            Err(e) => Err(mcp_error(e)),
+        }
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
-        self.ready().await?;
         let wire = tool.replace('.', "_");
-        let result = tokio::time::timeout(
-            CALL_TIMEOUT,
-            self.client
-                .tools_call(&wire, args, CancellationToken::new()),
-        )
-        .await
-        .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?
-        .map_err(|e| match e {
+        let result = match self.ready().await {
+            Ok(()) => tokio::time::timeout(
+                CALL_TIMEOUT,
+                self.client
+                    .tools_call(&wire, args, CancellationToken::new()),
+            )
+            .await
+            .map_err(|_| RemoteError::Offline("the hub didn't answer in time".into()))?,
+            Err(e) => Err(e),
+        };
+        let result = result.map_err(|e| match e {
             // An unknown tool (JSON-RPC "method not found"): not offered.
             McpError::ServerError { code: -32601, .. } => RemoteError::Missing(tool.to_string()),
+            // An agent that stopped letting the person in: its tools read as
+            // gone, so the board's next pass asks the agents again.
+            e if self.not_admitted(&e) => RemoteError::Missing(tool.to_string()),
             e => mcp_error(e),
         })?;
         sync::mcp_answer(&result)
@@ -215,14 +274,16 @@ impl Remote for HubRemote {
 }
 
 /// The agents `token`'s person may reach on the hub at `url`
-/// (`GET /mcp/agents`), default first; none from a hub without the route.
+/// (`GET /mcp/agents`), default first; `None` from an older hub without the
+/// route. An empty list: the token is good, but no agent there lets its
+/// person in.
 pub async fn hub_agents(
     url: &str,
     token: &Secret,
     http: &reqwest::Client,
-) -> Result<Vec<String>, RemoteError> {
+) -> Result<Option<Vec<String>>, RemoteError> {
     let at = format!("{}/mcp/agents", url.trim_end_matches('/'));
-    let mut resp = tokio::time::timeout(
+    let resp = tokio::time::timeout(
         PROBE_TIMEOUT,
         http.get(&at).bearer_auth(token.expose()).send(),
     )
@@ -232,11 +293,10 @@ pub async fn hub_agents(
     match resp.status().as_u16() {
         401 => return Err(RemoteError::NoToken),
         // Not allowed, or asked too often: said as such, never as "no
-        // agent has it".
+        // agent has it", and never as a token to make again.
         403 => {
-            return Err(RemoteError::Refused(
-                "the hub doesn't let you see its agents".into(),
-            ))
+            let said = read_bounded(resp).await.unwrap_or_default();
+            return Err(forbidden(&String::from_utf8_lossy(&said)));
         }
         429 => {
             return Err(RemoteError::RateLimited {
@@ -248,12 +308,35 @@ pub async fn hub_agents(
             })
         }
         // An older hub without the route: only its default agent is asked.
-        404 | 405 => return Ok(vec![]),
+        404 | 405 => return Ok(None),
         s if s >= 500 => return Err(RemoteError::Offline(format!("the hub answered {s}"))),
         s if s >= 400 => return Err(RemoteError::Failed(format!("the hub answered {s}"))),
         _ => {}
     }
-    // A bounded read: an answer this long isn't a list of agents.
+    let body = read_bounded(resp).await?;
+    let body: Value = serde_json::from_slice(&body).unwrap_or_default();
+    let mut agents: Vec<(bool, String)> = body["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let id = a["id"].as_str().filter(|i| agent_id_ok(i))?;
+            Some((a["default"].as_bool() != Some(true), id.to_string()))
+        })
+        .collect();
+    agents.sort();
+    agents.dedup();
+    Ok(Some(
+        agents
+            .into_iter()
+            .take(MAX_AGENTS)
+            .map(|(_, id)| id)
+            .collect(),
+    ))
+}
+
+/// A bounded read: an answer this long isn't a list of agents.
+async fn read_bounded(mut resp: reqwest::Response) -> Result<Vec<u8>, RemoteError> {
     let mut body = Vec::new();
     while let Some(chunk) = tokio::time::timeout(PROBE_TIMEOUT, resp.chunk())
         .await
@@ -267,23 +350,7 @@ pub async fn hub_agents(
             ));
         }
     }
-    let body: Value = serde_json::from_slice(&body).unwrap_or_default();
-    let mut agents: Vec<(bool, String)> = body["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|a| {
-            let id = a["id"].as_str().filter(|i| agent_id_ok(i))?;
-            Some((a["default"].as_bool() != Some(true), id.to_string()))
-        })
-        .collect();
-    agents.sort();
-    agents.dedup();
-    Ok(agents
-        .into_iter()
-        .take(MAX_AGENTS)
-        .map(|(_, id)| id)
-        .collect())
+    Ok(body)
 }
 
 /// The most agents on a hub a board's probe asks.
@@ -324,11 +391,18 @@ impl LocalRemote {
             .ok_or_else(|| RemoteError::Refused("this hub runs no agent".into()))
     }
 
-    /// The registry's tools the sync may call for this system.
+    /// The registry's tools the sync may call for this system, its adapter
+    /// loaded first with the person's keys, as a turn of theirs loads it: a
+    /// key they keep for themselves otherwise reaches the registry only once
+    /// some turn of theirs has used it.
     fn surface(
         &self,
         service: &crate::serve::AgentService,
     ) -> workforce_agent::tools::registry::ToolRegistry {
+        let skill = self.system.as_str();
+        workforce_agent::runner::CURRENT_USER_ID.sync_scope(self.person.clone(), || {
+            crate::skill_loader::ensure_adapters_loaded(service, |s| s == skill)
+        });
         let patterns: Vec<String> = sync::callable(self.system)
             .iter()
             .map(|t| t.to_string())
@@ -345,6 +419,18 @@ impl Remote for LocalRemote {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.run(tool, args, false).await
+    }
+
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.run(tool, args, true).await
+    }
+}
+
+impl LocalRemote {
+    /// Runs `tool`; `quiet`: with no approver to route to and nowhere to
+    /// hand a routed approval, so a call that needs one asks no one.
+    async fn run(&self, tool: &str, args: Value, quiet: bool) -> Result<Value, RemoteError> {
         use crate::mcp::ToolCallExecutor as _;
         use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor};
         let service = self.service()?;
@@ -369,10 +455,18 @@ impl Remote for LocalRemote {
                 },
             },
             ctx,
-            router: service.approval_router.read().clone(),
+            router: if quiet {
+                None
+            } else {
+                service.approval_router.read().clone()
+            },
             mode: ApprovalMode::Park {
                 pending: Arc::new(crate::mcp_gate::PendingCalls::default()),
-                routed: self.state.registry.routed_delivery(),
+                routed: if quiet {
+                    tokio::sync::mpsc::channel(1).0
+                } else {
+                    self.state.registry.routed_delivery()
+                },
                 bridge: Arc::from(Vec::new()),
             },
         };
@@ -476,9 +570,16 @@ impl BoardSync {
         if !(due || now || queued) {
             return Ok(());
         }
-        // An agent that stopped offering the tools: the agents there are
-        // asked again, and the board goes on through one that offers them.
-        let remote = if matches!(s.paused, Some(Paused::Missing { .. })) {
+        // An agent that stopped offering the tools, or no agent there
+        // letting the person in: the agents there are asked again, and the
+        // board goes on through one that offers them. Any other refusal (a
+        // policy's no) waits out its back-off as before.
+        let reprobe = match &s.paused {
+            Some(Paused::Missing { .. }) => true,
+            Some(Paused::Refused { reason }) => reason == NO_AGENT_LETS_YOU_IN,
+            _ => false,
+        };
+        let remote = if reprobe {
             match self
                 .offered(s.system, &s.via, &s.person, s.agent.as_deref())
                 .await
@@ -569,9 +670,12 @@ impl BoardSync {
     }
 
     /// What reaches every tool `system`'s sync needs, and the agent that
-    /// offers them: on a hub, `prefer` (the board's agent) first, then its
-    /// default agent, then every other agent the person may reach there,
-    /// since a hub offers each agent's own tools. None of them: `Missing`.
+    /// offers them: on a hub, `prefer` (the board's agent) first, then the
+    /// agents the person may reach there (`GET /mcp/agents`), its default
+    /// first, since a hub offers each agent's own tools. The plain `/mcp`
+    /// (the default agent, whoever it admits) only on an older hub without
+    /// that list. None of them: `Missing`; no agent that lets the person
+    /// in: `Refused`.
     pub async fn offered(
         &self,
         system: System,
@@ -595,28 +699,27 @@ impl BoardSync {
         let Via::Hub { hub } = via else {
             return probe(None).await;
         };
-        // The board's own agent, then the default.
-        let mut tried: Vec<Option<String>> = vec![];
+        // A token refused or a hub away: no agent there will do.
+        let fatal = |p: &Paused| {
+            matches!(
+                p,
+                Paused::NoToken | Paused::HubOffline { .. } | Paused::HubUnpaired
+            )
+        };
+        // The board's own agent first. What the agents lack outranks why
+        // one of them refused.
         let mut missing = None;
-        for agent in prefer
-            .map(|a| Some(a.to_string()))
-            .into_iter()
-            .chain([None])
-        {
-            if tried.contains(&agent) {
-                continue;
-            }
-            tried.push(agent.clone());
-            match probe(agent).await {
+        let mut other = None;
+        if let Some(agent) = prefer {
+            match probe(Some(agent.to_string())).await {
                 Ok(r) => return Ok(r),
-                // A token refused or a hub away: no agent there will do.
-                Err(p @ (Paused::NoToken | Paused::HubOffline { .. } | Paused::HubUnpaired)) => {
-                    return Err(p)
-                }
-                Err(p) => missing = missing.or(Some(p)),
+                Err(p) if fatal(&p) => return Err(p),
+                Err(p @ Paused::Missing { .. }) => missing = Some(p),
+                Err(p) => other = Some(p),
             }
         }
-        // Every other agent the person may reach there, asked at once.
+        // Then every agent the person may reach there, asked at once and
+        // taken in the hub's order, its default first.
         let h = self
             .desk
             .sync_hub(hub)
@@ -626,18 +729,42 @@ impl BoardSync {
             .ok_or(Paused::HubUnpaired)?;
         let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
         let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
-        let agents = hub_agents(&h.url, &token, &self.http)
+        let rest: Vec<Option<String>> = match hub_agents(&h.url, &token, &self.http)
             .await
-            .map_err(|e| paused_by(&e))?;
-        let rest: Vec<String> = agents
-            .into_iter()
-            .filter(|a| !tried.contains(&Some(a.clone())))
-            .collect();
-        let found = futures::future::join_all(rest.into_iter().map(|a| probe(Some(a)))).await;
-        if let Some(r) = found.into_iter().flatten().next() {
-            return Ok(r);
+            .map_err(|e| paused_by(&e))?
+        {
+            // An older hub, without the list: its default agent only.
+            None => vec![None],
+            Some(agents) if agents.is_empty() => {
+                return Err(Paused::Refused {
+                    reason: NO_AGENT_LETS_YOU_IN.into(),
+                })
+            }
+            Some(agents) => agents
+                .into_iter()
+                .filter(|a| Some(a.as_str()) != prefer)
+                .map(Some)
+                .collect(),
+        };
+        // The first (the default, where it lets the person in) alone, as
+        // it most often has them; then the others at once.
+        let mut rest = rest.into_iter();
+        let mut found: Vec<Result<Reached, Paused>> = vec![];
+        if let Some(first) = rest.next() {
+            match probe(first).await {
+                Ok(r) => return Ok(r),
+                Err(p) => found.push(Err(p)),
+            }
         }
-        Err(missing.unwrap_or(Paused::Missing {
+        found.extend(futures::future::join_all(rest.map(probe)).await);
+        for found in found {
+            match found {
+                Ok(r) => return Ok(r),
+                Err(p @ Paused::Missing { .. }) => missing = missing.or(Some(p)),
+                Err(p) => other = other.or(Some(p)),
+            }
+        }
+        Err(missing.or(other).unwrap_or(Paused::Missing {
             tools: sync::tools_of(system)
                 .iter()
                 .map(|t| t.to_string())
@@ -711,6 +838,7 @@ fn missing_words(hub: &str, system: System, _tools: &[String]) -> String {
 pub(crate) fn paused_words(hub: &str, system: System, p: &Paused) -> String {
     match p {
         Paused::Missing { tools } => missing_words(hub, system, tools),
+        Paused::Refused { reason } if reason == NO_AGENT_LETS_YOU_IN => no_agent_words(hub),
         other => other.say(hub),
     }
 }
@@ -787,6 +915,8 @@ pub fn router(sync: Arc<BoardSync>) -> Router {
         .route("/api/desk/sync-hubs", get(list_hubs))
         .route("/api/desk/sync-hubs/{hub}", put(put_hub).delete(delete_hub))
         .route("/api/desk/boards/link/check", post(check_link))
+        .route("/api/desk/boards/link/members", post(members_named))
+        .route("/api/desk/boards/link/me", post(choose_me))
         .route(
             "/api/desk/boards/{id}/link",
             put(link_board).delete(unlink_board),
@@ -877,33 +1007,46 @@ async fn put_hub(
         );
     }
     // A new token is tried before it is kept: one the hub refuses is never
-    // kept.
-    let offers = match &token {
-        Some(t) => {
-            let remote = match HubRemote::new(url.as_str(), t, Arc::clone(&r.sync.http), None) {
-                Ok(remote) => remote,
-                Err(e) => return refusal(StatusCode::BAD_REQUEST, &e.to_string()),
-            };
-            match remote.tools().await {
-                Ok(tools) => Some(tools),
-                Err(RemoteError::NoToken) => {
-                    return refusal(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        &format!(
-                            "{} refused that token; make a new one there.",
-                            body.name.trim()
-                        ),
-                    )
-                }
-                Err(e) => {
-                    return refusal(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("{} couldn't be reached with it: {e}", body.name.trim()),
-                    )
+    // kept. It is tried on the list of agents its person may reach there,
+    // which answers whichever agent is the default; an older hub without
+    // that list, on its default agent.
+    let name = body.name.trim();
+    let turned_away = |e: RemoteError| match e {
+        RemoteError::NoToken => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("{name} refused that token; make a new one there."),
+        ),
+        RemoteError::Refused(why) if why == NO_AGENT_LETS_YOU_IN => {
+            refusal(StatusCode::UNPROCESSABLE_ENTITY, &no_agent_words(name))
+        }
+        RemoteError::Refused(why) => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("{name} turned that token away: {why}."),
+        ),
+        e => refusal(
+            StatusCode::BAD_GATEWAY,
+            &format!("{name} couldn't be reached with it: {e}"),
+        ),
+    };
+    let tried = match &token {
+        Some(t) => match hub_agents(url.as_str(), t, &r.sync.http).await {
+            Ok(Some(agents)) if agents.is_empty() => {
+                return refusal(StatusCode::UNPROCESSABLE_ENTITY, &no_agent_words(name))
+            }
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                let remote = match HubRemote::new(url.as_str(), t, Arc::clone(&r.sync.http), None) {
+                    Ok(remote) => remote,
+                    Err(e) => return refusal(StatusCode::BAD_REQUEST, &e.to_string()),
+                };
+                match remote.tools().await {
+                    Ok(_) => true,
+                    Err(e) => return turned_away(e),
                 }
             }
-        }
-        None => None,
+            Err(e) => return turned_away(e),
+        },
+        None => false,
     };
     let kept = match r
         .sync
@@ -926,8 +1069,8 @@ async fn put_hub(
         tracing::info!(target: "sentinel.audit", hub = %hub, person = %person, "a hub's token for board sync was kept");
     }
     // What it offers through any agent the person may reach there.
-    let offers = match offers {
-        Some(_) => {
+    let offers = match tried {
+        true => {
             let via = Via::Hub { hub: hub.clone() };
             let (jira, linear) = futures::join!(
                 r.sync.offered(System::Jira, &via, &person, None),
@@ -935,7 +1078,7 @@ async fn put_hub(
             );
             Some(json!({ "jira": jira.is_ok(), "linear": linear.is_ok() }))
         }
-        None => None,
+        false => None,
     };
     Json(json!({ "id": kept.id, "name": kept.name, "url": kept.url, "offers": offers }))
         .into_response()
@@ -981,6 +1124,111 @@ struct CheckBody {
     filter: Option<Filter>,
     #[serde(default)]
     me: Option<String>,
+}
+
+/// Who the person is on a shared key, chosen: the members there whose name
+/// contains `name`, or their choice kept (`id`, `name`) or cleared.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeBody {
+    system: System,
+    via: Via,
+    /// The board's agent there, tried first.
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// The hub's agent for `body`, and the hub's name; or the refusal.
+async fn reach_for_me(
+    r: &Routes,
+    body: &MeBody,
+    person: &str,
+) -> Result<(Arc<dyn Remote>, String), Response> {
+    let hub = r.sync.hub_name(&body.via).await;
+    match r
+        .sync
+        .offered(body.system, &body.via, person, body.agent.as_deref())
+        .await
+    {
+        Ok(reached) => Ok((reached.remote, hub)),
+        Err(p) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": paused_words(&hub, body.system, &p), "paused": p })),
+        )
+            .into_response()),
+    }
+}
+
+/// The members on the board's service whose name contains what the person
+/// typed: id, name and avatar, as the hub's agent lists them (never emails).
+async fn members_named(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<MeBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    let (remote, hub) = match reach_for_me(&r, &body, &person).await {
+        Ok(reached) => reached,
+        Err(refused) => return refused,
+    };
+    let name = body.name.as_deref().unwrap_or_default();
+    match sync::call(
+        &*remote,
+        body.system,
+        sync::members_tool(body.system),
+        json!({ "name": name }),
+    )
+    .await
+    {
+        // Only what a member is shown by: whatever else came, it stays here.
+        Ok(answer) => Json(
+            json!({ "members": answer["members"].as_array().into_iter().flatten().map(|m| json!({
+            "id": m["id"], "name": m["name"], "avatar": m["avatar"],
+        })).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(e) => refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+    }
+}
+
+/// Keeps or clears whom the person chose to be on the board's service:
+/// always their own, on the hub that holds the key.
+async fn choose_me(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<MeBody>,
+) -> Response {
+    let person = person!(r, h, q);
+    let args = if body.clear {
+        json!({ "clear": true })
+    } else {
+        let Some(id) = body.id.as_deref().map(str::trim).filter(|i| !i.is_empty()) else {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                "Choose someone, or clear your choice.",
+            );
+        };
+        if let Err(e) = sync::check_me(body.system, id) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+        json!({ "id": id, "name": body.name })
+    };
+    let (remote, hub) = match reach_for_me(&r, &body, &person).await {
+        Ok(reached) => reached,
+        Err(refused) => return refused,
+    };
+    match sync::call(&*remote, body.system, sync::choose_tool(body.system), args).await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(e) => refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
+    }
 }
 
 /// How many of `target`'s issues `filter` matches, read page by page up to
@@ -1118,6 +1366,34 @@ async fn check_link(
             Err(e) => return said(e),
         }
     }
+    // Jira's projects, for a picker: asked once, with the first check (no
+    // target yet), not again as the dialog is edited; only when the hub can
+    // list them (a token minted before the tool was offered can't, and the
+    // key is typed). Never asks anyone to approve it. Jira Cloud pages at
+    // 50, so up to two pages are read for the 100 shown.
+    if body.system == System::Jira && body.target.is_none() {
+        let mut all: Vec<Value> = Vec::new();
+        while all.len() < MAX_PROJECTS {
+            let got = sync::call_quiet(
+                &*remote,
+                body.system,
+                "jira.list_projects",
+                json!({ "max_results": 50, "start_at": all.len() }),
+            )
+            .await;
+            let Ok(page) = got else { break };
+            let list = projects_of(&page);
+            let n = list.as_array().map_or(0, Vec::len);
+            all.extend(list.as_array().cloned().unwrap_or_default());
+            if n < 50 {
+                break;
+            }
+        }
+        all.truncate(MAX_PROJECTS);
+        if !all.is_empty() {
+            out["projects"] = Value::Array(all);
+        }
+    }
     let Some(target) = body.target.as_deref() else {
         return Json(out).into_response();
     };
@@ -1139,8 +1415,12 @@ async fn check_link(
         }),
         None => match sync::identify(&*remote, body.system).await {
             Ok(sync::Who::Person(me)) => Some(me),
-            Ok(sync::Who::ByEmail(me)) => {
-                out["meBy"] = json!("email");
+            Ok(sync::Who::ByEmail(me, source)) => {
+                out["meBy"] = json!(match source {
+                    workforce_desk::board::MeSource::VouchedBySlack => "slack",
+                    workforce_desk::board::MeSource::Chosen => "chosen",
+                    _ => "email",
+                });
                 Some(me)
             }
             Ok(other) => {
@@ -1169,7 +1449,7 @@ async fn check_link(
             me.as_ref().map(|m| m.id.as_str()),
             me.as_ref()
                 .map(|m| m.id.as_str())
-                .filter(|_| out["meBy"] == "email"),
+                .filter(|_| out["meBy"].is_string()),
         )
         .await;
         match matched {
@@ -1182,6 +1462,30 @@ async fn check_link(
         }
     }
     Json(out).into_response()
+}
+
+/// The most projects the link dialog lists.
+const MAX_PROJECTS: usize = 100;
+
+/// A project list as the dialog shows it: key and name.
+fn projects_of(answer: &Value) -> Value {
+    let list = answer
+        .get("projects")
+        .or_else(|| answer.get("values"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(
+        list.into_iter()
+            .filter_map(|p| {
+                let key = p["key"].as_str()?;
+                Some(json!({
+                    "key": key,
+                    "name": sync::unfence(p["name"].as_str().unwrap_or(key)).0,
+                }))
+            })
+            .collect(),
+    )
 }
 
 /// A team list as the dialog shows it: id, key and name.
@@ -1332,10 +1636,10 @@ async fn link_board(
                 link.me_name = Some(me.name);
                 link.me_source = Some(workforce_desk::board::MeSource::Vouched);
             }
-            Ok(sync::Who::ByEmail(me)) => {
+            Ok(sync::Who::ByEmail(me, source)) => {
                 link.me = Some(me.id);
                 link.me_name = Some(me.name);
-                link.me_source = Some(workforce_desk::board::MeSource::VouchedByEmail);
+                link.me_source = Some(source);
             }
             Ok(other) => link.me_note = other.why_not(&hub, link.system),
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),

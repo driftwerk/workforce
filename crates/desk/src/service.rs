@@ -100,6 +100,10 @@ mod memory_line_tests;
 mod memory_recall;
 mod modes;
 mod moves;
+mod session_account;
+#[cfg(test)]
+mod session_account_tests;
+pub use session_account::{AccountAnswer, AccountRead, Moment as AccountMoment};
 #[cfg(test)]
 mod moves_tests;
 #[cfg(test)]
@@ -778,6 +782,10 @@ pub struct Floor {
     /// Notes decisions, facts and to-dos from sessions: the hub's cheap
     /// model. Without one, nothing is noted.
     pub deriver: Option<Arc<dyn crate::memory::derive::Deriver>>,
+    /// Keeps each overseen session's running account: the hub's cheap
+    /// model, which is handed each turn end's gist too. Without one, no
+    /// account is kept.
+    pub accountant: Option<Arc<dyn crate::account::Accountant>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -841,10 +849,28 @@ enum Persist {
     Turn(Box<TurnOp>),
     /// What a session asks the person now (nothing: it asks nothing).
     Asks(Uuid, Vec<asks::KeptAsk>),
+    /// Told once everything sent before it is written: how a test reads
+    /// what was queued without guessing how long the write takes.
+    #[cfg(test)]
+    Barrier(oneshot::Sender<()>),
+}
+
+#[cfg(test)]
+impl Desk {
+    /// Returns once everything queued to be written so far is written.
+    pub(super) async fn persisted(&self) {
+        let (done, wrote) = oneshot::channel();
+        self.0.persist.send(Persist::Barrier(done)).unwrap();
+        wrote.await.unwrap();
+    }
 }
 
 struct Inner {
     opts: Options,
+    /// What the person chose in Settings → Memory, over `opts.memory`.
+    memory_choices: Mutex<crate::memory::MemoryChoices>,
+    /// One change of those choices at a time: written, then cached.
+    memory_choose: tokio::sync::Mutex<()>,
     /// The colours Desk draws its terminals in, which their colour queries
     /// are answered from ([`crate::vt::Palette`]).
     palette: crate::vt::Palette,
@@ -880,6 +906,7 @@ struct Inner {
     index: memory_index::IndexRun,
     /// Session memory's notes and their worker.
     derive: memory_derive::DeriveRun,
+    accounts: session_account::AccountRun,
     /// Handoff's lineage, and its preview's wait.
     handoff: handoff::HandoffRun,
     /// Reads a turn's last reply where the rules can't tell whether it
@@ -1519,6 +1546,8 @@ impl Desk {
         let (ledger, ledger_jobs) =
             ledger::LedgerRun::new(floor.pricer.clone(), floor.redactor.clone());
         let desk = Self(Arc::new(Inner {
+            memory_choices: Default::default(),
+            memory_choose: Default::default(),
             palette,
             palette_save: Default::default(),
             shell: terminals::login_shell(&env, terminals::account_shell, |p| p.is_file()),
@@ -1566,6 +1595,7 @@ impl Desk {
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
             derive: memory_derive::DeriveRun::new(floor.deriver.clone()),
+            accounts: session_account::AccountRun::new(floor.accountant.clone()),
             handoff: Default::default(),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
@@ -1597,12 +1627,14 @@ impl Desk {
         desk.scopes_load().await;
         desk.grants_load().await;
         desk.lineage_load().await;
+        desk.memory_choices_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().index_loop());
         tokio::spawn(desk.clone().derive_loop());
+        tokio::spawn(desk.clone().account_loop());
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
@@ -1610,6 +1642,7 @@ impl Desk {
         desk.plans_load().await;
         desk.boards_ungrouped(&ungrouped_boards).await;
         tokio::spawn(desk.clone().watch_background());
+        desk.line_load().await;
         tokio::spawn(desk.clone().line_loop());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
@@ -1923,6 +1956,7 @@ impl Desk {
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
         view.mode = live.and(state.modes_started.get(&r.id).copied());
+        view.waits_on_you = Self::waits_on_you(state, &view);
         view
     }
 
@@ -3487,7 +3521,40 @@ impl Desk {
         }
     }
 
+    /// Answers session `id`'s request `approval` as `by` (the person when
+    /// none) says, and closes what its boss owed the person on it, if
+    /// anything, as that answer goes.
     pub fn decide(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: Decision,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        let (closer, why) = match by.as_ref() {
+            Some(b) if b.party.kind == crew::PartyKind::Manager => (
+                crate::open_item::ClosedBy::Boss,
+                format!("{} answered it.", b.party.name),
+            ),
+            _ => (
+                crate::open_item::ClosedBy::Person,
+                "You answered it.".to_string(),
+            ),
+        };
+        let view = self.decide_now(id, approval, decision, by)?;
+        let key = crate::open_item::approval_key(&id.to_string(), &approval.to_string());
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let d = self.clone();
+            rt.spawn(async move {
+                if let Err(e) = d.0.store.item_close_of_key(&key, closer, &why).await {
+                    tracing::warn!(error = %e, "closing the open item of an answered request failed");
+                }
+            });
+        }
+        Ok(view)
+    }
+
+    fn decide_now(
         &self,
         id: Uuid,
         approval: Uuid,
@@ -5315,6 +5382,12 @@ impl Desk {
             false => asked_at_end(&denials, said.as_deref()),
         };
         let said_whole = said.clone().filter(|_| unsure);
+        // It ended well: a call on its sign-in succeeded, so a stop on that
+        // sign-in from before is over.
+        let ended_well = !failed
+            && said
+                .as_deref()
+                .is_none_or(|s| !crate::limit::says_plan_limit(s));
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
         // A refusal whose words aren't the plan's, on an account whose
@@ -5393,19 +5466,51 @@ impl Desk {
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
             self.read_later(id, end, reader, reply);
         }
-        // A `/login` inside it whose `auth_success` went unheard.
+        // A `/login` inside it whose `auth_success` went unheard. Only once
+        // that is known is the success marked, on the sign-in it ran on, as
+        // of the last reply its transcript has (never later than the call
+        // that made it: another session's refusal since stands).
         if let Some(p) = path.clone() {
             let desk = self.clone();
             tokio::spawn(async move {
-                let login = tokio::task::spawn_blocking(move || {
-                    transcript::read_tail(Path::new(&p))
-                        .ok()
-                        .and_then(|t| t.last_login)
-                })
-                .await
-                .ok()
-                .flatten();
+                let read = |p: String| async move {
+                    tokio::task::spawn_blocking(move || {
+                        transcript::read_tail(Path::new(&p))
+                            .ok()
+                            .map(|t| (t.last_login, t.ok_at))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                };
+                let (login, mut ok_at) = read(p.clone()).await;
                 desk.login_in_transcript(id, login).await;
+                // The hook fires before Claude Code writes the reply: its
+                // line is waited for a little, else the last one before it
+                // stands (the safe side: it clears only older stops).
+                if ended_well {
+                    for wait in [250, 1000, 3000] {
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        let (_, later) = read(p.clone()).await;
+                        if later > ok_at {
+                            ok_at = later;
+                            break;
+                        }
+                    }
+                }
+                if let Some(ok) = ok_at.filter(|_| ended_well) {
+                    let raw = {
+                        let st = desk.0.state.lock();
+                        // Still read for a `/login` inside it: which sign-in
+                        // it ran on isn't known yet.
+                        (!st.scan_pending.contains(&id) && st.records.contains_key(&id))
+                            .then(|| Self::raw_running(&st, id))
+                    };
+                    if let Some(raw) = raw {
+                        desk.ok_seen(&raw, ok);
+                    }
+                }
             });
         }
         if let Some(on) = on {
@@ -5486,6 +5591,7 @@ impl Desk {
                 crossed = Some(crate::limit::LimitHit {
                     window: Some(kind.into()),
                     resets_at: full.until,
+                    at: hit.and_then(|h| h.at),
                 });
             }
             Some(crate::limit::Reach::Model(model)) => {
@@ -5497,14 +5603,64 @@ impl Desk {
             _ => {}
         }
         let hit = crossed.as_ref().or(hit);
+        // When it was refused: as its transcript line says when read from
+        // one (a line read again after a restart is as old as it is), else
+        // now.
+        let at = hit
+            .and_then(|h| h.at)
+            .filter(|at| *at <= now)
+            .unwrap_or(now);
+        let side = Self::side_of_raw(st, raw).map(|side| Self::standing_of(st, side));
         let standing = Self::standing_mut(st, raw);
-        standing.hit_at = Some(now);
+        // From before the account was last signed in, or before a call on
+        // it last succeeded: that limit is over, it locks nothing.
+        if !standing.counts(at) || side.is_some_and(|s| !s.counts(at)) {
+            tracing::info!(session = %id, %at, "a refusal from before the account's last sign-in or success: it is over");
+            return None;
+        }
+        // A later stop already kept stands.
+        if standing.hit_at.is_some_and(|kept| kept > at) {
+            return None;
+        }
+        standing.hit_at = Some(at);
         standing.hit_until = hit
             .and_then(|h| h.resets_at)
             .or(standing.hit_until.filter(|u| *u > now));
         standing.hit_window = hit.and_then(|h| h.minutes());
         Self::wrote_hit(st, raw, identities::Writer::Session(id));
-        Some(now)
+        Some(at)
+    }
+
+    /// A call on `raw` succeeded at `at` (a session's turn ended well): a
+    /// stop on its limit from before is over. `None` when nothing new was
+    /// learned; else whether it ended a stop, on the side `raw` counts for
+    /// (its account, when the CLI's sign-in is one).
+    fn mark_ok(st: &mut State, raw: &identities::Raw, at: DateTime<Utc>) -> Option<bool> {
+        let at = at.min(Utc::now());
+        if Self::standing_mut(st, raw).ok_at.is_some_and(|ok| ok >= at) {
+            return None;
+        }
+        let side = Self::side_of_raw(st, raw);
+        let full = |st: &State| {
+            side.is_some_and(|side| Self::standing_of(st, side).full(Utc::now()).is_some())
+        };
+        let was = full(st);
+        Self::standing_mut(st, raw).ok_at = Some(at);
+        Some(was && !full(st))
+    }
+
+    /// [`Self::mark_ok`], then kept, and the accounts told when it ended a
+    /// stop.
+    fn ok_seen(&self, raw: &identities::Raw, at: DateTime<Utc>) {
+        let Some(ended) = Self::mark_ok(&mut self.0.state.lock(), raw, at) else {
+            return;
+        };
+        self.keep_standing();
+        if ended {
+            tracing::info!(%at, "a call succeeded on an account that was stopped: it has room again");
+            let desk = self.clone();
+            tokio::spawn(async move { desk.accounts_moved().await });
+        }
     }
 
     /// Session `id`'s turn stopped `account` on its limit now; kept as the
@@ -5570,6 +5726,7 @@ impl Desk {
             Some(resets_at) => TurnFailure::Limit(LimitHit {
                 window: None,
                 resets_at: Some(resets_at),
+                at: None,
             }),
             None => failure,
         }
@@ -5638,8 +5795,10 @@ impl Desk {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
                     if hit.reach() == crate::limit::Reach::Plan {
                         let standing = Self::standing_mut(&mut st, &account);
-                        standing.hit_until = hit.resets_at.or(standing.hit_until);
-                        standing.hit_window = hit.minutes().or(standing.hit_window);
+                        if hit.at.is_none_or(|at| standing.counts(at)) {
+                            standing.hit_until = hit.resets_at.or(standing.hit_until);
+                            standing.hit_window = hit.minutes().or(standing.hit_window);
+                        }
                     } else {
                         // Words read as the plan's; the transcript names a
                         // model's or extra usage: the account isn't full.
@@ -5665,7 +5824,10 @@ impl Desk {
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
-                    if standing.hit_at.is_some() && hit.reach() == crate::limit::Reach::Plan {
+                    if standing.hit_at.is_some()
+                        && hit.reach() == crate::limit::Reach::Plan
+                        && hit.at.is_none_or(|at| standing.counts(at))
+                    {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                         standing.hit_window = hit.minutes().or(standing.hit_window);
                     }
@@ -6311,6 +6473,13 @@ impl Desk {
                                 Some(f) => st.turn_failures.insert(id, f),
                                 None => st.turn_failures.remove(&id),
                             };
+                            // A reply it wrote: the call on its sign-in
+                            // succeeded then.
+                            if let Some(ok) = t.ok_at {
+                                let raw = Self::raw_running(&st, id);
+                                drop(st);
+                                self.ok_seen(&raw, ok);
+                            }
                         }
                         self.change(id, |r, _| {
                             r.origin = Origin::External;
@@ -6330,6 +6499,7 @@ impl Desk {
                     let now = Utc::now();
                     let mut tail = tail.unwrap_or_default();
                     let failure = tail.failure.take();
+                    let ok_at = tail.ok_at;
                     let r = SessionRecord {
                         id: Uuid::new_v4(),
                         engine: Engine::Claude,
@@ -6366,7 +6536,12 @@ impl Desk {
                     if let Some(f) = failure {
                         self.0.state.lock().turn_failures.insert(r.id, f);
                     }
+                    let new_id = r.id;
                     self.save(r);
+                    if let Some(ok) = ok_at {
+                        let raw = Self::raw_running(&self.0.state.lock(), new_id);
+                        self.ok_seen(&raw, ok);
+                    }
                 }
             }
         }
@@ -6582,6 +6757,11 @@ async fn persist_loop(
                     Err(_) => unwritten.insert(session, asks),
                 };
                 put
+            }
+            #[cfg(test)]
+            Persist::Barrier(done) => {
+                let _ = done.send(());
+                Ok(())
             }
         };
         if let Err(e) = result {
@@ -7166,6 +7346,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7329,6 +7510,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7462,6 +7644,7 @@ mod tests {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -7579,6 +7762,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -7704,6 +7888,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8022,6 +8207,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8866,6 +9052,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8930,6 +9117,7 @@ mod tests {
                     redactor: None,
                     index: None,
                     deriver: None,
+                    accountant: None,
                 },
                 CancellationToken::new(),
             )
@@ -8998,6 +9186,7 @@ mod tests {
                 redactor: None,
                 index: None,
                 deriver: None,
+                accountant: None,
             },
             CancellationToken::new(),
         )

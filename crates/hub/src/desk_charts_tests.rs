@@ -130,7 +130,7 @@ async fn the_sink_delivers_a_chart_s_spec_where_the_conversation_draws_it() {
         .unwrap();
     conversation.set_rendered_rich(RichFeatures::from_names(["charts,chart_specs"]));
     scout.sessions.save(&conversation).unwrap();
-    let dm = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
+    let dm = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
     let as_run = |session: &str, attended: bool| SessionContext {
         desk: Some(DeskScope {
             target: dm.clone(),
@@ -200,7 +200,7 @@ async fn the_sink_delivers_the_picture_where_the_conversation_does_not_draw_char
     let (picture, _, marker) = chart(None);
     let ctx = SessionContext {
         desk: Some(DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
             attended: true,
             relayed: false,
             owner: "person-2".into(),

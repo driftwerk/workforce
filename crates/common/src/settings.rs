@@ -892,6 +892,10 @@ pub struct DeskMemoryConfig {
     /// The most disk session memory may use, in MB.
     #[serde(default = "default_desk_memory_max_disk_mb")]
     pub max_disk_mb: u64,
+    /// The most room the person may give session memory from Desk's
+    /// Settings, in MB; unset, any size Desk allows.
+    #[serde(default)]
+    pub max_disk_mb_ceiling: Option<u64>,
     /// The most passages written to the search index a minute.
     #[serde(default = "default_desk_memory_index_per_minute")]
     pub index_per_minute: u32,
@@ -917,6 +921,7 @@ impl Default for DeskMemoryConfig {
             backfill_days: default_desk_memory_backfill_days(),
             retain_days: default_desk_memory_retain_days(),
             max_disk_mb: default_desk_memory_max_disk_mb(),
+            max_disk_mb_ceiling: None,
             index_per_minute: default_desk_memory_index_per_minute(),
             derive_calls_per_day: default_desk_memory_derive_calls_per_day(),
             session_reach: default_desk_memory_session_reach(),
@@ -9145,8 +9150,11 @@ impl RemoteMcpConfig {
         "jira.transition_issue",
         "jira.add_comment",
         "jira.get_project",
+        "jira.list_projects",
         "jira.myself",
         "identity.jira_user_by_my_email",
+        "identity.jira_users_named",
+        "identity.jira_choose_me",
         "linear.issue_list",
         "linear.issue_get",
         "linear.issue_search",
@@ -9162,6 +9170,8 @@ impl RemoteMcpConfig {
         "linear.upload_read",
         "linear.comment_list",
         "identity.linear_member_by_my_email",
+        "identity.linear_members_named",
+        "identity.linear_choose_me",
         "help",
     ];
 
@@ -10433,40 +10443,34 @@ pub struct SkillsConfig {
     pub browser: BrowserSkillsConfig,
 }
 
-/// `[skills.browser]`: where the browser skill keeps its profiles and
-/// whether its window shows.
+/// `[skills.browser]`: the headless browser a server hub runs (a hub
+/// without Desk): where it keeps its profiles, whether its window shows,
+/// and which Chromium runs.
 ///
 /// ```toml
 /// [skills.browser]
 /// # profile_root = "/var/lib/workforce/browser"
 /// # show = true
 /// # chrome_binary = "/usr/bin/chromium"
-/// # chrome_user_data_dir = "/Users/me/Library/Application Support/Google/Chrome"
 /// ```
 ///
-/// On a hub with `[desk]`, profiles live in Desk's own folder
-/// (`…/Desk/browser`), which every agent's tools are kept from, they are
-/// never reaped (the person signs in to them once, by hand), and the window
-/// shows. Elsewhere they live in the system's temp folder and are reaped
-/// after a week, headless, as before.
+/// Profiles live in the system's temp folder and are reaped after a week,
+/// headless, unless set otherwise here. A hub with `[desk]` launches no
+/// browser: Desk browses in the person's own Chrome, through Desk's
+/// extension, and these keys change nothing there. `chrome_user_data_dir`
+/// (the old remote-debugging My Chrome) is still read, and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSkillsConfig {
     /// Where profiles live, in place of the default above. Profiles under a
     /// root named here are never reaped.
     #[serde(default)]
     pub profile_root: Option<String>,
-    /// Show the window (`true`) or run headless (`false`); unset, it shows
-    /// on Desk only.
+    /// Show the window (`true`) or run headless (`false`, the default).
     #[serde(default)]
     pub show: Option<bool>,
     /// The Chrome or Chromium to run; found on `PATH` where unset.
     #[serde(default)]
     pub chrome_binary: Option<String>,
-    /// The person's own Chrome's user data folder, where it writes
-    /// `DevToolsActivePort` while remote debugging is on; unset, Chrome's
-    /// own for this platform.
-    #[serde(default)]
-    pub chrome_user_data_dir: Option<String>,
 }
 
 impl Default for SkillsConfig {

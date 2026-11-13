@@ -59,7 +59,9 @@ pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CH
 /// platform-scoped (`slack:…`) or internal (`workflow:…`, `scheduler:…`)
 /// sessions. These are the channels where stale-resume rollover applies.
 pub fn is_conversational(channel: &str) -> bool {
-    CONVERSATIONAL_CHANNELS.contains(&channel) || is_desk_room(channel)
+    CONVERSATIONAL_CHANNELS.contains(&channel)
+        || is_desk_room(channel)
+        || workforce_core::desk::dm_thread_parent(channel).is_some()
 }
 
 // ── Channel surface trait ───────────────────────────────────────────────────
@@ -905,6 +907,20 @@ impl SurfaceRegistry {
         self.probe(platform, channel, candidates, context_workspace)
             .await
             .map(|s| (s, ResolutionPath::Probe))
+    }
+
+    /// The workspace `channel` of `platform` was last resolved in, when this
+    /// registry knows it: after [`Self::resolve_user_dm`] for a DM it opened,
+    /// say. The only workspace a single-workspace platform has, otherwise.
+    pub async fn workspace_of(&self, platform: &str, channel: &str) -> Option<String> {
+        if let Some(ws) = self.routes.lookup(platform, channel).await {
+            return Some(ws);
+        }
+        let mut only = self.candidates(platform).into_iter().map(|(ws, _)| ws);
+        match (only.next(), only.next()) {
+            (Some(ws), None) => Some(ws),
+            _ => None,
+        }
     }
 
     fn candidates(&self, platform: &str) -> Vec<(String, Arc<dyn ChannelSurface>)> {

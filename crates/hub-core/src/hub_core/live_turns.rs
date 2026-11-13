@@ -1034,7 +1034,7 @@ mod tests {
             Control::from(TurnControl::FollowUp {
                 text: "hi".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: true,
                 id: None,
             }),
@@ -1043,7 +1043,7 @@ mod tests {
                     external_id: None,
                     ..
                 },
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: true,
             }
         ));
@@ -1052,7 +1052,7 @@ mod tests {
             Control::from(TurnControl::FollowUp {
                 text: "hi".into(),
                 user: "u1".into(),
-                place: Some(DeskPlace::Dm),
+                place: Some(DeskPlace::Dm { thread: None }),
                 queue: false,
                 id: Some("c-1".into()),
             }),
@@ -1107,6 +1107,7 @@ mod tests {
             spoken: false,
             voice: None,
             members: Vec::new(),
+            edit: None,
         };
         DeskTurnContext::new(
             turn,
@@ -1177,7 +1178,7 @@ mod tests {
             .begin(
                 "s1",
                 SelfServe::Answerable,
-                Some(&asked_in(DeskPlace::Dm)),
+                Some(&asked_in(DeskPlace::Dm { thread: None })),
                 None,
             )
             .await
@@ -1264,24 +1265,28 @@ mod tests {
     async fn a_queued_message_waits_for_a_working_turn() {
         let turns = LiveTurns::new("allan");
         assert_eq!(
-            turns.apply("s1", queued_from(Some(DeskPlace::Dm))).await,
+            turns
+                .apply("s1", queued_from(Some(DeskPlace::Dm { thread: None })))
+                .await,
             Applied::NotLive
         );
         let (_turn, mut inbox) = turns
             .begin(
                 "s1",
                 SelfServe::Answerable,
-                Some(&asked_in(DeskPlace::Dm)),
+                Some(&asked_in(DeskPlace::Dm { thread: None })),
                 None,
             )
             .await
             .unwrap();
-        for place in [Some(DeskPlace::Dm), None] {
+        for place in [Some(DeskPlace::Dm { thread: None }), None] {
             assert_eq!(turns.apply("s1", queued_from(place)).await, Applied::Busy);
         }
         assert!(inbox.rx.try_recv().is_err(), "nothing reached the turn");
         assert_eq!(
-            turns.apply("s1", follow_up_from(Some(DeskPlace::Dm))).await,
+            turns
+                .apply("s1", follow_up_from(Some(DeskPlace::Dm { thread: None })))
+                .await,
             Applied::Injected,
             "sent now, it steers as before"
         );
@@ -1300,7 +1305,9 @@ mod tests {
             drop(turn);
         });
         assert_eq!(
-            turns.apply("s1", queued_from(Some(DeskPlace::Dm))).await,
+            turns
+                .apply("s1", queued_from(Some(DeskPlace::Dm { thread: None })))
+                .await,
             Applied::NotLive
         );
         settling.await.unwrap();
@@ -1311,7 +1318,9 @@ mod tests {
         let turns = LiveTurns::new("allan");
         let (_turn, _inbox) = begin(&turns, "s1").await;
         assert_eq!(
-            turns.apply("s1", follow_up_from(Some(DeskPlace::Dm))).await,
+            turns
+                .apply("s1", follow_up_from(Some(DeskPlace::Dm { thread: None })))
+                .await,
             Applied::Injected
         );
     }

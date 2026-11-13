@@ -36,6 +36,15 @@ const WARN_EVERY: Duration = Duration::from_secs(10 * 60);
 const WARN_CAUSES: usize = 256;
 /// Turns looked up to be adopted before the list is started again.
 const LOOKED: usize = 4096;
+/// How long a session's turn-end gist waits for its account to be written
+/// before the floor writes it itself.
+const HANDED_FOR: Duration = Duration::from_secs(90);
+/// How long an account's gist stands for the turn end it came before.
+const DELIVERED_FOR: Duration = Duration::from_secs(120);
+
+/// Whether a Desk session's turn-end gist is written from its account
+/// instead: the desk says, with the same rule its account writer keeps.
+pub type HandsOff = Arc<dyn Fn(Uuid) -> bool + Send + Sync>;
 
 /// What writes: the hub's cheap model, and what the hub knows of a subject
 /// beyond its turns.
@@ -163,6 +172,13 @@ struct Inner {
     tried: Mutex<HashMap<(String, bool), Instant>>,
     /// When each cause of a failure was last logged at WARN.
     warned: Mutex<HashMap<String, Instant>>,
+    /// Whose turn-end gists the account writer writes.
+    hands_off: OnceLock<HandsOff>,
+    /// Turn-end gists handed to the account writer, waiting for it.
+    handed: Mutex<HashMap<SubjectKey, Job>>,
+    /// Gists the account writer wrote before the floor saw their turn
+    /// end, each taken by that turn end.
+    delivered: Mutex<HashMap<SubjectKey, Instant>>,
 }
 
 /// What the writer knows of the turns running: each subject's, whose each
@@ -219,6 +235,9 @@ impl Gists {
             calls: Semaphore::new(CALLS),
             tried: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashMap::new()),
+            hands_off: OnceLock::new(),
+            handed: Mutex::new(HashMap::new()),
+            delivered: Mutex::new(HashMap::new()),
         }));
         tokio::spawn(gists.clone().read(rx));
         gists
@@ -227,6 +246,108 @@ impl Gists {
     /// Writes through `model` from now on; the first one served stays.
     pub fn serve(&self, model: Arc<dyn Model>) {
         let _ = self.0.model.set(model);
+    }
+
+    /// Hands the turn-end gists of the Desk sessions `hands_off` says to
+    /// their account writer, which writes each from the account's answer
+    /// ([`Self::account_gist`]); the first one given stays.
+    pub fn hand_turn_ends(&self, hands_off: HandsOff) {
+        let _ = self.0.hands_off.set(hands_off);
+    }
+
+    /// Whether `job` is a turn end whose gist the account writer writes.
+    fn handed_off(&self, job: &Job) -> bool {
+        let Subject::Session { id, .. } = &job.subject else {
+            return false;
+        };
+        job.moment == Moment::Ended && self.0.hands_off.get().is_some_and(|f| f(*id))
+    }
+
+    /// Waits for the account writer to write `job`'s gist; past
+    /// [`HANDED_FOR`] (it couldn't), the floor writes it as ever.
+    async fn handed(&self, job: Job) {
+        let key = job.whose.1.clone();
+        // Used up here, so a later turn's end is never taken as written.
+        let just = self
+            .0
+            .delivered
+            .lock()
+            .remove(&key)
+            .is_some_and(|at| at.elapsed() < DELIVERED_FOR);
+        if just {
+            // Its account came first: the gist is written already.
+            return;
+        }
+        let turn = job.turn;
+        self.0.handed.lock().insert(key.clone(), job);
+        tokio::time::sleep(HANDED_FOR).await;
+        let waiting = {
+            let mut handed = self.0.handed.lock();
+            match handed.get(&key) {
+                Some(j) if j.turn == turn => handed.remove(&key),
+                _ => None,
+            }
+        };
+        if let Some(job) = waiting {
+            debug!(target: "floor", subject = ?key, "a session's account wrote no gist in time; the floor writes it");
+            self.written(job).await;
+        }
+    }
+
+    /// Writes session `session`'s turn-end gist from its account: its
+    /// purpose and now said plainly (none: kept as they were), `by_model`
+    /// when the model wrote the account.
+    pub async fn account_gist(
+        &self,
+        session: Uuid,
+        purpose: Option<String>,
+        now: Option<String>,
+        by_model: bool,
+    ) {
+        let key = SubjectKey::session(session);
+        let handed = self.0.handed.lock().remove(&key);
+        if handed.is_none() {
+            // The account came before the floor's turn end: that end is
+            // written already once it comes.
+            self.0.delivered.lock().insert(key.clone(), Instant::now());
+        }
+        let owner = handed.as_ref().and_then(|j| j.whose.0.clone());
+        let whose: Whose = (owner.clone(), key.clone());
+        let lock = Arc::clone(self.0.writing.lock().entry(whose).or_default());
+        let _one = lock.lock().await;
+        let kept = self
+            .0
+            .kept
+            .gist(owner.as_deref(), &key)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(target: "floor", error = %format!("{e:#}"), "reading a gist failed");
+                None
+            });
+        let at = crew::now();
+        let (kept_purpose, kept_at) = kept
+            .as_ref()
+            .map_or((None, None), |k| (k.purpose.clone(), k.purpose_at));
+        let renewed = purpose.is_some() && purpose != kept_purpose;
+        let turn = handed
+            .as_ref()
+            .map(|j| j.turn)
+            .or(kept.as_ref().map(|k| k.turn))
+            .unwrap_or_default();
+        let gist = Gist {
+            purpose: if renewed { purpose } else { kept_purpose },
+            purpose_at: if renewed { Some(at) } else { kept_at },
+            now: now
+                .or_else(|| kept.as_ref().map(|k| k.now.clone()))
+                .unwrap_or_else(|| "Finished what it was asked.".into()),
+            now_at: at,
+            turn,
+            by_model,
+        };
+        match self.0.kept.put_gist(owner.as_deref(), &key, &gist).await {
+            Ok(()) => (self.0.told)(owner.as_deref()),
+            Err(e) => warn!(target: "floor", error = %format!("{e:#}"), "keeping a gist failed"),
+        }
     }
 
     /// The log applied `op`. Never waits: a full backlog drops it.
@@ -483,7 +604,10 @@ impl Gists {
             moment,
         };
         let gists = self.clone();
-        tokio::spawn(async move { gists.written(job).await });
+        match self.handed_off(&job) {
+            true => tokio::spawn(async move { gists.handed(job).await }),
+            false => tokio::spawn(async move { gists.written(job).await }),
+        };
     }
 
     async fn ended_unseen(&self, turn: Uuid, outcome: Outcome, answer: Option<String>) {
@@ -494,7 +618,7 @@ impl Gists {
                 return warn!(target: "floor", error = %format!("{e:#}"), "reading a turn for its gist failed")
             }
         };
-        self.written(Job {
+        let job = Job {
             whose: (t.owner.clone(), t.subject.key()),
             subject: t.subject.clone(),
             name: t.name.clone(),
@@ -505,8 +629,11 @@ impl Gists {
             reply: answer,
             doing: doing_at_end(outcome),
             moment: Moment::Ended,
-        })
-        .await;
+        };
+        match self.handed_off(&job) {
+            true => self.handed(job).await,
+            false => self.written(job).await,
+        }
     }
 
     /// Writes `job`'s gist on what was kept: the model's, with the purpose
@@ -1015,6 +1142,35 @@ impl Call {
         max_tokens: 400,
         task: "floor_gist",
         description: "floor:gist",
+    };
+
+    /// A session's running account, with its turn-end gist; booked apart
+    /// so it shows on its own in spend.
+    pub(crate) const ACCOUNT: Call = Call {
+        max_tokens: workforce_desk::account::ANSWER_TOKENS,
+        task: workforce_desk::account::TASK,
+        description: "desk:account",
+    };
+
+    /// A running turn's `now` in a session's account.
+    pub(crate) const ACCOUNT_NOW: Call = Call {
+        max_tokens: 200,
+        task: workforce_desk::account::TASK,
+        description: "desk:account-now",
+    };
+
+    /// A question about a session, answered from its exchanges.
+    pub(crate) const ACCOUNT_QUESTION: Call = Call {
+        max_tokens: workforce_desk::account::QUESTION_TOKENS,
+        task: workforce_desk::account::QUESTION_TASK,
+        description: "desk:account-question",
+    };
+
+    /// The session paragraphs of a boss's update.
+    pub(crate) const UPDATE: Call = Call {
+        max_tokens: 700,
+        task: "desk_update",
+        description: "desk:update",
     };
 }
 
@@ -1849,6 +2005,90 @@ mod tests {
             Some("Getting Desk ready for the team.")
         );
         assert_eq!(memory.reached.lock()[0], Reach::Job);
+    }
+
+    /// A session a boss oversees has its turn-end gist written from its
+    /// account, with no call of the floor's own; when the account brings
+    /// none in time, the floor writes it as ever.
+    #[tokio::test(start_paused = true)]
+    async fn a_handed_off_turn_end_is_written_from_the_account_or_by_the_floor_when_none_comes() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, told) = gists(Arc::clone(&model));
+        gists.hand_turn_ends(Arc::new(|_| true));
+        let id = Uuid::new_v4();
+        let session = |turn: Uuid| Turn {
+            subject: Subject::Session {
+                id,
+                engine: Engine::Claude,
+            },
+            name: "login-fix".into(),
+            ..started(turn)
+        };
+        let ends = |turn: Uuid| TurnOp::End {
+            turn,
+            at: crew::now(),
+            outcome: Outcome::Finished,
+            answer: Some("It builds.".into()),
+            question: None,
+        };
+        let first = Uuid::new_v4();
+        gists.saw(&begin_for(session(first), true));
+        settle().await;
+        let calls = model.asked.lock().len();
+        assert_eq!(
+            memory.written.lock().len(),
+            1,
+            "its beginning is the floor's"
+        );
+        gists.saw(&ends(first));
+        settle().await;
+        assert_eq!(
+            memory.written.lock().len(),
+            1,
+            "its end waits for the account"
+        );
+        gists
+            .account_gist(
+                id,
+                Some("Fixing the login page.".into()),
+                Some("Fixed the login page; the fix is in review.".into()),
+                true,
+            )
+            .await;
+        {
+            let written = memory.written.lock();
+            assert_eq!(written.len(), 2);
+            let g = written.last().unwrap();
+            assert_eq!(g.now, "Fixed the login page; the fix is in review.");
+            assert_eq!(g.purpose.as_deref(), Some("Fixing the login page."));
+            assert_eq!(g.turn, first, "the turn it ended");
+            assert!(g.by_model);
+        }
+        assert!(*told.lock() >= 2, "the floor is told");
+        assert_eq!(
+            model.asked.lock().len(),
+            calls,
+            "no call of the floor's own"
+        );
+        // Long after, the floor never writes that turn's end again.
+        tokio::time::sleep(HANDED_FOR * 2).await;
+        settle().await;
+        assert_eq!(memory.written.lock().len(), 2);
+
+        // A turn whose account never comes: the floor writes it itself.
+        let second = Uuid::new_v4();
+        gists.saw(&begin_for(session(second), true));
+        settle().await;
+        gists.saw(&ends(second));
+        settle().await;
+        let before = memory.written.lock().len();
+        tokio::time::sleep(HANDED_FOR + Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            memory.written.lock().len(),
+            before + 1,
+            "written by the floor in the end"
+        );
     }
 
     #[tokio::test(start_paused = true)]

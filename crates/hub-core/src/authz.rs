@@ -661,7 +661,12 @@ impl Capability {
                 "slack.app_configure",
                 "slack.disconnect",
             ],
-            Capability::AgentsManage => &["agent.create", "agent.update", "agent.delete"],
+            Capability::AgentsManage => &[
+                "agent.create",
+                "agent.update",
+                "agent.rename",
+                "agent.delete",
+            ],
             Capability::PersonasManage => &["role.create", "role.update", "role.delete"],
             Capability::SkillsManage => &[
                 "system.install_catalog_skill",
@@ -709,9 +714,17 @@ impl Capability {
                 "crew.overview",
                 "crew.activity",
                 "crew.history",
+                "crew.account",
+                "crew.decisions",
+                "crew.ask_person",
+                "crew.close_item",
+                "crew.open_items",
+                "crew.promise",
+                "crew.order",
                 "crew.spend",
                 "crew.board",
                 "crew.nudge",
+                "crew.ask_session",
                 "crew.escalate",
                 "crew.approve",
                 "crew.deny",
@@ -926,7 +939,9 @@ pub fn decision_for(cap: Capability, is_admin: bool) -> Decision {
 pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capability> {
     match tool {
         // Agent lifecycle (mutating only — reads stay ungated).
-        "agent.create" | "agent.update" | "agent.delete" => Some(Capability::AgentsManage),
+        "agent.create" | "agent.update" | "agent.rename" | "agent.delete" => {
+            Some(Capability::AgentsManage)
+        }
         // Persona templates (mutating only).
         "role.create" | "role.update" | "role.delete" => Some(Capability::PersonasManage),
         // Merging, transferring from and deleting identities; the tool also
@@ -1075,7 +1090,7 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
         | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" | "desk.interrupt"
         // The crew overseer reads and drives the same terminals.
-        | "crew.overview" | "crew.activity" | "crew.history" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.escalate" | "crew.approve"
+        | "crew.overview" | "crew.activity" | "crew.history" | "crew.account" | "crew.decisions" | "crew.ask_person" | "crew.close_item" | "crew.open_items" | "crew.promise" | "crew.order" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.ask_session" | "crew.escalate" | "crew.approve"
         | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
         | "crew.assign" | "crew.assign_ticket" | "crew.move_ticket" | "crew.take_on" | "crew.release"
         | "crew.plan" | "crew.plan_update" | "crew.handover" => Some(Capability::ShellExec),
@@ -1739,6 +1754,7 @@ mod tests {
         let cases: &[(&str, Capability)] = &[
             ("agent.create", Capability::AgentsManage),
             ("agent.update", Capability::AgentsManage),
+            ("agent.rename", Capability::AgentsManage),
             ("agent.delete", Capability::AgentsManage),
             ("role.create", Capability::PersonasManage),
             ("role.update", Capability::PersonasManage),

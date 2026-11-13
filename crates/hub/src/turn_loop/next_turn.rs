@@ -33,7 +33,7 @@ pub(crate) struct Unread {
 /// are kept as the turn always kept them.
 pub(crate) fn unread_plan(desk: Option<&DeskTurnContext>, unread: Vec<Heard>) -> Unread {
     match desk {
-        Some(desk) if matches!(desk.turn.place, DeskPlace::Dm) => Unread {
+        Some(desk) if matches!(desk.turn.place, DeskPlace::Dm { .. }) => Unread {
             now: Vec::new(),
             after: unread
                 .into_iter()

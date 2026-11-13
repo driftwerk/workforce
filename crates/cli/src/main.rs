@@ -4287,6 +4287,7 @@ rules:
             let registry = Arc::new(workforce_hub::agent_registry::AgentRegistry::from_parts(
                 agent_map, default_id,
             ));
+            registry.set_config_path(config_path.clone());
             if !serves_agents {
                 registry.set_host(Arc::clone(&default_service));
                 eprintln!(

@@ -52,15 +52,14 @@ pub struct HubComputerGate {
 /// changes a page.
 pub const BROWSER_READS: &[&str] = workforce_skills::adapters::browser::READS;
 
-/// Whether `connector` is what a browser call is kept under: `browser…` in
-/// Desk's own, `chrome…` in the person's.
+/// Whether `connector` is what a browser call is kept under: a site in the
+/// person's Chrome (`chrome:<origin>`, `chrome-visit:<origin>`), or
+/// `chrome` itself.
 pub fn is_browser_key(connector: &str) -> bool {
-    ["browser", "chrome"].iter().any(|k| {
-        connector == *k
-            || connector
-                .strip_prefix(k)
-                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
-    })
+    connector == "chrome"
+        || connector
+            .strip_prefix("chrome")
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
 }
 
 /// Whether `tool` is a browser tool that changes a page.
@@ -139,6 +138,42 @@ pub fn judge_unbound_with(judge: UnboundJudge) -> bool {
 /// no judge installed, it isn't: unbound is never assumed.
 fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
+}
+
+/// Whether an identity is the person whose Desk this is: the only one whose
+/// turns may use their own Chrome, signed in as them.
+pub type HolderJudge = Box<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+
+static HOLDER: std::sync::OnceLock<HolderJudge> = std::sync::OnceLock::new();
+
+/// Installs the holder check, once (with Desk's browser).
+pub fn judge_holder_with(judge: HolderJudge) -> bool {
+    HOLDER.set(judge).is_ok()
+}
+
+/// Whether the turn in scope is the person whose Desk this is. With no
+/// check installed, it isn't: their Chrome is never assumed someone's.
+/// Sarah holds the test hub: her turns use her Chrome.
+#[cfg(test)]
+pub(crate) fn sarah_holds() {
+    let _ = judge_holder_with(Box::new(|user| user == Some("sarah")));
+}
+
+/// Whether this turn is the hub holder's own: the identity in scope is
+/// the person whose Desk this is.
+pub(crate) fn the_holders_turn() -> bool {
+    let user = CURRENT_USER_ID
+        .try_with(|u| u.clone())
+        .ok()
+        .filter(|u| !u.is_empty());
+    HOLDER.get().is_some_and(|judge| judge(user.as_deref()))
+}
+
+/// Whether `tool` with `effect` uses the person's Chrome: every browser
+/// call, and anything kept under a site there.
+fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
+    tool.starts_with("browser.")
+        || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
 }
 
 /// Where the person's home is.
@@ -397,7 +432,19 @@ impl HubComputerGate {
         options.allow_session =
             (always.is_some() || site) && choices.iter().any(|c| matches!(c, Choice::AllowSession));
         options.allow_in_folder = always;
-        options.facts = Some(Box::new(facts_of(effect, home, why)));
+        let mut facts = facts_of(effect, home, why);
+        if matches!(
+            verdict,
+            Verdict::Ask {
+                why: workforce_core::computer::Why::SignIn,
+                ..
+            }
+        ) {
+            facts.effect = "sign_in".into();
+            options.allow_session = false;
+            options.allow_in_folder = None;
+        }
+        options.facts = Some(Box::new(facts));
         options
     }
 }
@@ -808,6 +855,13 @@ impl ComputerGate for HubComputerGate {
             Effect::Connector { connector, write } => *write || connector.starts_with("chrome"),
             _ => false,
         };
+        if tool == workforce_core::computer::SIGN_IN || tool == workforce_core::computer::SIGNED_IN
+        {
+            return Some(format!(
+                "{} needs you to sign in to that site yourself, and you weren't there for this job. Ask it in Desk.",
+                self.policy.name
+            ));
+        }
         (tool.starts_with("browser.") && acts).then(|| {
             format!(
                 "{} changes a page only in a turn you're in, so this job didn't. Ask it in Desk.",
@@ -827,6 +881,47 @@ impl ComputerGate for HubComputerGate {
     }
 
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict {
+        use workforce_core::computer::{SIGNED_IN, SIGN_IN};
+        // The person's Chrome is signed in as them: only their own turns
+        // use it, never another identity's (a Slack thread, someone else's
+        // conversation, a client), whoever would answer the card.
+        if uses_their_chrome(tool, effect) && !the_holders_turn() {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: format!(
+                        "{} uses the browser only in a turn of the person whose Desk this is: it is their own Chrome, signed in as them.",
+                        self.policy.name
+                    ),
+                },
+            };
+        }
+        // "Sign in for me" is for the person in Desk on this computer, who
+        // can see Desk's browser: never a turn in Slack or another client.
+        if (tool == SIGN_IN || tool == SIGNED_IN)
+            && workforce_agent::runner::current_desk().is_none()
+        {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: format!(
+                        "{} signs you in to a site only from Desk on your computer, where you can see its browser. Ask it there, or sign in to the site yourself.",
+                        self.policy.name
+                    ),
+                },
+            };
+        }
+        // The card is the wait while the person signs in, so it is put to
+        // them at every level, acting fully included.
+        if tool == SIGNED_IN {
+            return Verdict::Ask {
+                choices: vec![
+                    workforce_core::computer::Choice::AllowOnce,
+                    workforce_core::computer::Choice::Deny,
+                ],
+                why: workforce_core::computer::Why::SignIn,
+            };
+        }
         let facts = self.facts(tool, effect);
         // The dispatch gate is synchronous; the hub runs on a multi-thread
         // runtime, as the surface allow list's lookup relies on too. Anywhere
@@ -874,6 +969,14 @@ impl ComputerGate for HubComputerGate {
                 Outcome::Refused | Outcome::Declined | Outcome::NotAnswered | Outcome::Unattended
             )
         {
+            // A sign-in the person declined, or left, ends: the browser
+            // takes calls again.
+            if record.tool == workforce_core::computer::SIGNED_IN {
+                workforce_skills::adapters::browser::sign_in_ended(
+                    &self.policy.agent,
+                    &current_user(),
+                );
+            }
             workforce_skills::adapters::browser::forget_decision(
                 &self.policy.agent,
                 &current_user(),
@@ -1009,7 +1112,22 @@ mod tests {
         }
     }
 
+    /// In sarah's Desk conversation, as a turn there is.
+    fn in_desk<T>(f: impl FnOnce() -> T) -> T {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
+            attended: true,
+            relayed: false,
+            owner: "sarah".into(),
+        };
+        workforce_agent::runner::CURRENT_DESK.sync_scope(Some(scope), f)
+    }
+
+    use super::sarah_holds;
+
     fn as_sarah<T>(f: impl FnOnce() -> T) -> T {
+        sarah_holds();
         CURRENT_USER_ID.sync_scope("sarah".into(), || {
             CURRENT_SESSION_KEY.sync_scope("s1".into(), f)
         })
@@ -1249,7 +1367,8 @@ mod tests {
             assert_eq!(decide_with(bound, "github.pr_get").0, "run");
             assert_eq!(decide_with(bound, "github.pr_merge").0, "refused");
             assert_eq!(decide_with(bound, "jira.search").0, "refused");
-            assert_eq!(decide_with(bound, "browser.navigate").0, "run");
+            // The browser is the person's own Chrome: asked once a session.
+            assert_eq!(decide_with(bound, "browser.navigate").0, "asks once");
             // Asking before nothing: a send runs too.
             let never = format!("[computer]\nasks = \"never\"\n\n{bound}");
             assert_eq!(decide_with(&never, "slack.send").0, "run");
@@ -1313,6 +1432,8 @@ mod tests {
                 "browser.navigate",
                 "browser.click",
                 "browser.fill",
+                "browser.sign_in",
+                "browser.signed_in",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1332,11 +1453,17 @@ mod tests {
             };
             let suggest = UNBOUND.replace("level = \"full\"", "level = \"suggest\"");
             let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
-            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+            // Reading in the person's Chrome asks once a session below
+            // unbound ("Use my Chrome"), and one that only suggests doesn't
+            // use it at all.
+            for body in ["", act.as_str()] {
                 for read in ["browser.snapshot", "browser.navigate"] {
-                    assert_eq!(decide_with(body, read).0, "run", "{read} in {body:?}");
+                    let (asked, ran_unattended, _) = decide_with(body, read);
+                    assert!(asked.starts_with("asks"), "{read} in {body:?}: {asked}");
+                    assert!(!ran_unattended, "a job never uses the person's Chrome");
                 }
             }
+            assert_eq!(decide_with(&suggest, "browser.snapshot").0, "refused");
             for body in ["", act.as_str()] {
                 let (asked, ran_unattended, unbound) = decide_with(body, "browser.click");
                 assert!(asked.starts_with("asks"), "{asked} in {body:?}");
@@ -1358,12 +1485,127 @@ mod tests {
             }));
             assert_eq!(decide_with(UNBOUND, "browser.click"), ("run", false, true));
             assert_eq!(decide_with(UNBOUND, "browser.fill").0, "run");
+            assert_eq!(decide_with(UNBOUND, "browser.snapshot").0, "run");
+            // "Sign in for me": opening the page is opening a site in the
+            // person's Chrome (asked below unbound, run unbound, refused
+            // at Suggest); the wait for the person is put to them at every
+            // level, acting fully too, and a job is refused both.
+            for body in ["", act.as_str(), suggest.as_str(), UNBOUND] {
+                let (opened, opened_unattended, _) =
+                    in_desk(|| decide_with(body, "browser.sign_in"));
+                let expected = match body {
+                    b if b == UNBOUND => "run",
+                    b if b == suggest.as_str() => "refused",
+                    _ => "asks once",
+                };
+                assert_eq!(opened, expected, "{body:?}");
+                assert!(
+                    !opened_unattended,
+                    "nothing is opened to sign in to for a job"
+                );
+                let (asked, ran_unattended, _) = in_desk(|| decide_with(body, "browser.signed_in"));
+                assert_eq!(asked, "asks once", "{body:?}");
+                assert!(!ran_unattended, "nobody signs in for a job");
+                // Outside Desk (Slack, a client's turn) neither is done.
+                assert_eq!(
+                    decide_with(body, "browser.sign_in").0,
+                    "refused",
+                    "{body:?}"
+                );
+                assert_eq!(
+                    decide_with(body, "browser.signed_in").0,
+                    "refused",
+                    "{body:?}"
+                );
+            }
             // A judged-out turn (a job's, another person's, a spent budget)
             // is not unbound however the settings read.
             JUDGED_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
             let (asked, _, unbound) = decide_with(UNBOUND, "browser.click");
             assert!(asked.starts_with("asks"), "{asked}");
             assert!(!unbound);
+        })
+        .await;
+    }
+
+    /// The sign-in card offers "I'm signed in" and "Cancel" (Allow once and
+    /// Deny, as Desk labels them for `sign_in`), names the site, never a
+    /// session or an "always", and says Desk never sees the password; a
+    /// job is told it needs the person.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sign_in_card_waits_for_the_person_and_offers_nothing_to_keep() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let site = Effect::Connector {
+                connector: "chrome:https://shop.example".into(),
+                write: true,
+            };
+            let verdict = as_sarah(|| in_desk(|| gate.verdict("browser.signed_in", &site)));
+            let card = gate.card(&site, &verdict);
+            let facts = card.facts.as_deref().unwrap();
+            assert_eq!(facts.effect, "sign_in");
+            assert_eq!(
+                facts.connector.as_deref(),
+                Some("chrome:https://shop.example")
+            );
+            assert!(
+                facts.why.contains("never sees your password"),
+                "{}",
+                facts.why
+            );
+            assert!(card.allow_once && card.deny_once);
+            assert!(!card.allow_session && card.allow_in_folder.is_none() && !card.allow_always);
+            let refused = gate.refuses_unattended("browser.signed_in", &site).unwrap();
+            assert!(refused.contains("needs you to sign in"), "{refused}");
+        })
+        .await;
+    }
+
+    /// The person's Chrome is signed in as them: another identity's turn (a
+    /// Slack thread, someone else's conversation) is refused every browser
+    /// call, whatever its level, and the cards for the person's own turns
+    /// are theirs alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_holders_turns_use_their_chrome() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            std::fs::write(hub.subject.workspace.join("config.toml"), UNBOUND).unwrap();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let site = Effect::Connector {
+                connector: "chrome:https://shop.example".into(),
+                write: false,
+            };
+            sarah_holds();
+            for tool in ["browser.snapshot", "browser.navigate", "browser.click", "browser.capture_key"] {
+                let theirs = CURRENT_USER_ID.sync_scope("tom".into(), || {
+                    CURRENT_SESSION_KEY.sync_scope("slack:T1:C1:1.0".into(), || gate.verdict(tool, &site))
+                });
+                assert!(
+                    matches!(&theirs, Verdict::Refuse { refusal } if refusal.sentence.contains("the person whose Desk this is")),
+                    "{tool} for another identity: {theirs:?}"
+                );
+                let nobody = gate.verdict(tool, &site);
+                assert!(matches!(nobody, Verdict::Refuse { .. }), "{tool} with nobody in scope");
+            }
+            let mine = as_sarah(|| gate.verdict("browser.snapshot", &site));
+            assert!(!matches!(mine, Verdict::Refuse { .. }), "{mine:?}");
+            // A card in the person's Chrome is theirs alone.
+            let card = gate.card(&site, &mine);
+            assert!(card.person_only());
+            // And on a Desk hub no browser card is routed to an approver.
+            workforce_core::computer::browser_is_the_persons_chrome();
+            assert!(workforce_core::computer::person_only("browser.click"));
         })
         .await;
     }
@@ -1438,17 +1680,17 @@ mod tests {
     }
 
     #[test]
-    fn browser_keys_are_desks_and_the_persons_chrome() {
-        for k in [
-            "browser",
-            "browser:a.test",
-            "chrome",
-            "chrome:a.test",
-            "chrome-visit:a.test",
-        ] {
+    fn browser_keys_are_the_persons_chrome() {
+        for k in ["chrome", "chrome:a.test", "chrome-visit:a.test"] {
             assert!(is_browser_key(k), "{k}");
         }
-        for k in ["linear", "browserx", "chromecast", "chrome-x:a"] {
+        for k in [
+            "linear",
+            "browser",
+            "browser:a.test",
+            "chromecast",
+            "chrome-x:a",
+        ] {
             assert!(!is_browser_key(k), "{k}");
         }
     }

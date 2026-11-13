@@ -850,12 +850,18 @@ impl Desk {
     /// Withdraws `asks`: their session moved from the boss they asked.
     async fn withdraw_asks(&self, asks: Vec<LineMessage>) -> Result<bool, DeskError> {
         let mut withdrawn = false;
-        for mut ask in asks {
-            ask.asked = Some(Asked::Withdrawn);
-            ask.updated_at = Utc::now();
-            self.0.store.put_line(&ask).await.map_err(internal)?;
-            self.line_announce(&ask);
-            withdrawn = true;
+        for ask in asks {
+            // One statement: an answer that came first stands.
+            if let Some(ask) = self
+                .0
+                .store
+                .line_withdraw_ask(ask.id, &[Asked::Open])
+                .await
+                .map_err(internal)?
+            {
+                self.line_announce(&ask);
+                withdrawn = true;
+            }
         }
         Ok(withdrawn)
     }

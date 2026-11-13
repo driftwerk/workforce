@@ -1061,6 +1061,79 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
             400
         );
 
+        // What the install set is the holder's alone to change: another
+        // administrator may pause, but not choose.
+        let admin = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let (status, body) = call(
+            admin.clone(),
+            "PATCH",
+            "/api/desk/memory/settings",
+            Some(json!({"retainDays": 30})),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(d.memory_now().retain_days, 90);
+        assert_eq!(
+            call(
+                admin,
+                "PATCH",
+                "/api/desk/memory/settings",
+                Some(json!({"paused": true}))
+            )
+            .await
+            .0,
+            200
+        );
+
+        // Shrinking what's kept says what goes, and the preview counts it
+        // first; null sets it back to the install's.
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/api/desk/memory/retain-preview?days=30",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["days"], 30);
+        let (status, body) = call(
+            app.clone(),
+            "PATCH",
+            "/api/desk/memory/settings",
+            Some(json!({"retainDays": 30, "maxDiskMb": 2048})),
+        )
+        .await;
+        assert_eq!((status, &body["limits"]["retainDays"]), (200, &json!(30)));
+        assert_eq!(body["limits"]["maxDiskMb"], 2048);
+        let (_, body) = call(
+            app.clone(),
+            "PATCH",
+            "/api/desk/memory/settings",
+            Some(json!({"retainDays": null, "maxDiskMb": "default"})),
+        )
+        .await;
+        assert_eq!(body["limits"]["retainDays"], 90);
+        assert_eq!(
+            store
+                .setting(crate::memory::CHOSEN_RETAIN_DAYS)
+                .await
+                .unwrap(),
+            None,
+            "cleared, not kept as null"
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "PATCH",
+                "/api/desk/memory/settings",
+                Some(json!({"retainDays": "forever"}))
+            )
+            .await
+            .0,
+            400
+        );
+        let _ = settings_told();
+
         // A group's: what the change names, the rest kept.
         let (status, body) = call(
             app.clone(),
