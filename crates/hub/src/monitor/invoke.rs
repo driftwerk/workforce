@@ -115,7 +115,8 @@ impl GovernedInvoker {
             Arc::clone(&service.tools),
             Arc::clone(&service.policy),
             Arc::new(move || gates.tool_gates(crate::desk_surface::allows())),
-            Arc::new(move || service.tool_access_snapshot()),
+            // A monitor is no program: the board sync's byte readers are off it.
+            Arc::new(move || service.tool_access_snapshot().for_a_turn()),
             adapters,
         )
     }
@@ -202,7 +203,9 @@ impl GovernedInvoker {
 #[async_trait]
 impl ToolInvoke for GovernedInvoker {
     fn resolves(&self, tool: &str) -> bool {
-        denied_tool(tool).is_none() && self.resolve(tool)
+        denied_tool(tool).is_none()
+            && workforce_agent::tools::access::program_only_refusal(tool).is_none()
+            && self.resolve(tool)
     }
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError> {
@@ -403,6 +406,27 @@ mod tests {
             InvokeError::Denied("no tool named 'jira.search' is registered".into())
         );
         assert!(probe.seen.lock().unwrap().is_empty());
+    }
+
+    /// The board sync's byte readers are a program's: a monitor never calls
+    /// one, nor is offered it, though its agent's registry holds it.
+    #[tokio::test]
+    async fn a_monitor_never_calls_a_program_s_tools() {
+        for name in ["jira.attachment_read", "linear.upload_read"] {
+            let probe = probe(name, None);
+            let invoker = invoker(Arc::clone(&probe));
+            assert!(!invoker.resolves(name), "{name}");
+            let err = invoker
+                .invoke(call(Some("alice"), name, json!({ "attachment_id": "1" })))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                InvokeError::Denied(workforce_agent::tools::access::PROGRAM_ONLY.into()),
+                "{name}"
+            );
+            assert!(probe.seen.lock().unwrap().is_empty(), "{name} never ran");
+        }
     }
 
     #[tokio::test]

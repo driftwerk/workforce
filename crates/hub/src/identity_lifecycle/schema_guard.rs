@@ -326,6 +326,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "ticket_files",
+        "added_by",
+        NotPersonal("the issue's tracker, a session, or `you`, the one person of the Desk"),
+    ),
+    (
+        "desk",
+        "ticket_comments",
+        "posted_by",
+        NotPersonal("a session, an agent, or `you`, the one person of the Desk"),
+    ),
+    (
+        "desk",
         "suggestions",
         "subject",
         NotPersonal("the agent or session a suggestion is about"),
