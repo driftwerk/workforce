@@ -611,181 +611,6 @@ pub fn runs_later_command(command: &str) -> bool {
     })
 }
 
-/// The values `args` gives an option: `-o X`, `-oX`, `--output X` and
-/// `--output=X`.
-fn values(args: &[String], short: &[&str], long: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        let next = || args.get(i + 1).cloned();
-        if short.contains(&a.as_str()) || long.contains(&a.as_str()) {
-            out.extend(next());
-        } else if let Some((_, v)) = a.split_once('=').filter(|(k, _)| long.contains(k)) {
-            out.push(v.to_string());
-        } else if let Some(s) = short
-            .iter()
-            .find(|s| a.len() > s.len() && a.starts_with(**s) && !a.starts_with("--"))
-        {
-            out.push(a[s.len()..].to_string());
-        }
-    }
-    out
-}
-
-/// The files and folders `command` writes, as far as it says: what it
-/// redirects to, and what `tee`, `cp`, `mv`, `ln`, `install`, `touch`,
-/// `mkdir`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, `curl -o`,
-/// `wget -O`, `rsync`, `scp`, `tar -C`, `unzip -d` and `git clone` are
-/// given.
-fn written(command: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let words = shlex::split(command).unwrap_or_default();
-    let mut it = words.iter().peekable();
-    while let Some(w) = it.next() {
-        // `> f`, `>>f`, `2>f`, `&>f`, `>& f`, and `x>f` with no space.
-        let Some(rest) = w.find('>').map(|i| &w[i + 1..]) else {
-            continue;
-        };
-        let rest = rest.trim_start_matches(['>', '|']);
-        let (dup, rest) = match rest.strip_prefix('&') {
-            Some(r) => (true, r),
-            None => (false, rest),
-        };
-        let fd = |s: &str| s == "-" || (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
-        match rest {
-            "" => {
-                if let Some(n) = it.next() {
-                    if !(dup && fd(n)) {
-                        out.push(n.clone());
-                    }
-                }
-            }
-            r if dup && fd(r) => {}
-            r => out.push(r.to_string()),
-        }
-    }
-    for words in crate::never::commands(command) {
-        let words = crate::never::from_program(&words);
-        let Some(first) = words.first() else {
-            continue;
-        };
-        let args = &words[1..];
-        let operands: Vec<String> = args
-            .iter()
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect();
-        let short_has = |c: char| {
-            args.iter()
-                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c))
-        };
-        match crate::never::program(first) {
-            "tee" | "touch" | "mkdir" | "chmod" | "chown" | "truncate" | "ln" => {
-                out.extend(operands)
-            }
-            "cp" | "mv" | "install" | "rsync" | "scp" => {
-                out.extend(operands.last().cloned());
-                out.extend(values(args, &["-t"], &["--target-directory"]));
-            }
-            "sed" if short_has('i') || args.iter().any(|a| a.starts_with("--in-place")) => {
-                out.extend(operands)
-            }
-            "perl" | "ruby" if short_has('i') => out.extend(operands),
-            "dd" => out.extend(
-                args.iter()
-                    .filter_map(|a| a.strip_prefix("of=").map(String::from)),
-            ),
-            "curl" => {
-                out.extend(values(args, &["-o"], &["--output", "--output-dir"]));
-            }
-            "wget" => out.extend(values(
-                args,
-                &["-O", "-P"],
-                &["--output-document", "--directory-prefix"],
-            )),
-            "tar" => out.extend(values(args, &["-C"], &["--directory"])),
-            "unzip" => out.extend(values(args, &["-d"], &[])),
-            "git" => {
-                if let Some(i) = args.iter().position(|a| a == "clone") {
-                    let rest: Vec<&String> = args[i + 1..]
-                        .iter()
-                        .filter(|a| !a.starts_with('-'))
-                        .collect();
-                    out.extend(rest.get(1).map(|s| s.to_string()));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The folders `command` moves to before what follows it runs: `cd`,
-/// `pushd`, and `git -C`.
-fn moves_to(command: &str) -> (bool, Vec<String>) {
-    let mut moves = false;
-    let mut to = Vec::new();
-    for words in crate::never::commands(command) {
-        let words = crate::never::from_program(&words);
-        let Some(first) = words.first() else {
-            continue;
-        };
-        let args = &words[1..];
-        match crate::never::program(first) {
-            "cd" | "pushd" | "popd" | "chdir" => {
-                moves = true;
-                to.extend(args.iter().filter(|a| !a.starts_with('-')).cloned());
-            }
-            "git" => to.extend(values(args, &["-C"], &[])),
-            _ => {}
-        }
-    }
-    (moves, to)
-}
-
-/// Whether `command` writes outside `cwd` (scratch space aside), to a
-/// dotfile in `home`, or where it can't be told: a path with a variable, a
-/// pattern or anything substituted in (`${D}it/hooks`, `.g[i]t/hooks`,
-/// `"$(git rev-parse --git-dir)/hooks"`), or after moving to another
-/// folder.
-pub fn writes_astray(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
-    let home = real(home);
-    let cwd = cwd.map(real);
-    let scratch = [real(Path::new("/tmp")), PathBuf::from("/tmp")];
-    let written = written(command);
-    let (moves, to) = moves_to(command);
-    // Where it writes after a `cd` isn't followed.
-    if moves && !written.is_empty() {
-        return true;
-    }
-    let astray = |w: &String, writes: bool| {
-        if writes
-            && matches!(
-                w.as_str(),
-                "-" | "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
-            )
-        {
-            return false;
-        }
-        if w.is_empty() || w.contains(['$', '`', '*', '?', '[', '{']) {
-            return true;
-        }
-        let Some(cwd) = &cwd else {
-            return true;
-        };
-        let Some(at) = resolved(w, Some(cwd), &home) else {
-            return true;
-        };
-        let dotfile = at.strip_prefix(&home).ok().is_some_and(|rest| {
-            rest.components()
-                .next()
-                .is_some_and(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-        });
-        let scratch = writes && scratch.iter().any(|s| at.starts_with(s));
-        dotfile || !(at.starts_with(cwd) || scratch)
-    };
-    written.iter().any(|w| astray(w, true)) || to.iter().any(|w| astray(w, false))
-}
-
 /// `raw`, a path a tool is given, as it is on disk: `~/` the home, relative
 /// to `cwd`, `.` and `..` folded, and its nearest existing folder's links
 /// followed. None when it can't be told (`~bob/`, no cwd for a relative
@@ -819,6 +644,10 @@ pub fn resolved(raw: &str, cwd: Option<&Path>, home: &Path) -> Option<PathBuf> {
 }
 
 /// `path` with its nearest existing ancestor's links followed.
+pub(crate) fn real_path(path: &Path) -> PathBuf {
+    real(path)
+}
+
 fn real(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = path.to_path_buf();
@@ -948,11 +777,11 @@ pub fn read(r: &Request<'_>) -> Read {
             let whole = shown == command
                 && command.chars().count() <= DETAIL_CHARS
                 && !command.chars().any(unshown);
+            // Only what this engine reads the whole of is allowed from
+            // elsewhere ([`crate::boss_shell`]).
             let class = if !whole
-                || unreadable(command)
-                || opaque(command)
+                || !crate::boss_shell::readable(command, r.cwd, r.home)
                 || runs_later_command(command)
-                || writes_astray(command, r.cwd, r.home)
             {
                 Class::DeskOnly
             } else {
@@ -1443,9 +1272,18 @@ mod tests {
             assert!(unreadable(c), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
-        for c in ["cargo build", "$HOME/bin/tool --check", "echo $HOME"] {
+        for c in ["cargo build", "cargo test --all", "ls -la"] {
             assert!(!unreadable(c), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::Anywhere, "{c}");
+        }
+        // Variables, substitution and interpreters aren't read either:
+        // only what [`crate::boss_shell`] reads whole is.
+        for c in [
+            "$HOME/bin/tool --check",
+            "echo $HOME",
+            "bash scripts/test.sh",
+        ] {
+            assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
         assert_eq!(
             bash("echo $(git push)", cwd, true).class,
@@ -1550,7 +1388,6 @@ mod tests {
             "sudo -u root bash -c 'id'",
             "ssh host 'echo x > ~/.zshrc'",
         ] {
-            assert!(opaque(c), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
         // A write after moving to another folder, or a move out of its own.
@@ -1586,32 +1423,32 @@ mod tests {
             "unzip a.zip -d ../x",
             "git clone https://example.com/y.git ../y",
         ] {
-            assert!(writes_astray(c, Some(cwd), home), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
+        let _ = home;
+        // Harmless shapes stay answerable from anywhere.
         for c in [
             "cargo build > build.log 2>&1",
             "cargo test 2>/dev/null | tee out/test.txt",
-            "echo x > /tmp/notes.txt",
             "mkdir -p target/x && cp a.rs src/b.rs",
             "cargo build 2>&1 >&2",
             "cd src && cargo build",
-        ] {
-            assert!(!writes_astray(c, Some(cwd), home), "{c}");
-            assert_eq!(bash(c, cwd, false).class, Class::Anywhere, "{c}");
-        }
-        // Harmless shapes stay answerable from anywhere.
-        for c in [
-            "git commit -m \"$(cat <<'EOF'\nFix the date picker\nEOF\n)\"",
-            "echo \"built $(date)\"",
             "curl -s \"https://api.example.com/a?b=1\"",
-            "sed 's/$/;/' notes.txt",
             "jq '.items[0]' data.json",
             "grep -rn '.*Err' src/",
             "[ -f Cargo.toml ] && cargo build",
-            "bash scripts/test.sh",
         ] {
             assert_eq!(bash(c, cwd, false).class, Class::Anywhere, "{c}");
+        }
+        // What isn't read whole, though harmless, is answered in Desk:
+        // substitution, heredocs, scratch space, interpreters.
+        for c in [
+            "git commit -m \"$(cat <<'EOF'\nFix the date picker\nEOF\n)\"",
+            "echo \"built $(date)\"",
+            "echo x > /tmp/notes.txt",
+            "bash scripts/test.sh",
+        ] {
+            assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
         for c in [
             "defaults write com.acme.x y 1",
