@@ -50,6 +50,8 @@ pub(crate) struct Jira {
     pub refuse: Option<&'static str>,
     /// The hub's Jira token is a shared one, not the person's own.
     pub shared_key: bool,
+    /// Each issue's attachments: id, filename, type and bytes.
+    pub files: BTreeMap<String, Vec<(String, String, String, Vec<u8>)>>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -225,8 +227,40 @@ impl Tool for FakeJiraTool {
                 "key": input["project_key"],
                 "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
             }),
+            "jira.attachment_read" => {
+                let id = input["attachment_id"].as_str().unwrap_or_default();
+                let Some((_, _, mime, bytes)) = j.files.values().flatten().find(|f| f.0 == id)
+                else {
+                    return Ok(ToolResult::failure("Not found: no such attachment", 0));
+                };
+                let range = workforce_skills::adapters::file_read::range_of(&input).unwrap();
+                workforce_skills::adapters::file_read::chunk(bytes, mime, range)
+            }
             other => json!({ "unexpected": other }),
         };
+        let mut out = out;
+        if matches!(self.name, "jira.get_issue" | "jira.search") {
+            let attach = |v: &mut Value| {
+                let key = v["key"].as_str().unwrap_or_default().to_string();
+                if let Some(files) = j.files.get(&key) {
+                    v["attachments"] = files
+                        .iter()
+                        .map(|(id, name, mime, bytes)| {
+                            json!({ "id": id, "filename": wrapped(name, "jira.get_issue.attachment_filename"),
+                                "mime_type": mime, "size": bytes.len(), "thumbnail": false })
+                        })
+                        .collect();
+                }
+            };
+            match self.name {
+                "jira.get_issue" => attach(&mut out),
+                _ => out["issues"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                    .for_each(attach),
+            }
+        }
         Ok(ToolResult::success(out, 0))
     }
 }
@@ -242,6 +276,7 @@ pub(crate) fn register_jira(
             "jira.api",
             "jira.delete_issue",
             "jira.myself",
+            "jira.attachment_read",
             "jira.list_projects",
         ]
         .iter(),
@@ -1670,6 +1705,7 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "help",
         "identity_whoami",
         "jira_add_comment",
+        "jira_attachment_read",
         "jira_create_issue",
         "jira_get_issue",
         "jira_get_project",

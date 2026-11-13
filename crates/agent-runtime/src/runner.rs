@@ -7046,7 +7046,8 @@ impl OfferedTools {
         ctx: &PlanContext<'_>,
     ) -> bool {
         let key = (registry.generation(), ctx.context_floor);
-        let snapshot = access.snapshot();
+        // A program's tools are never a turn's.
+        let snapshot = access.snapshot().for_a_turn();
         let rebuilt = self.key != Some(key) || *self.access != snapshot;
         if rebuilt {
             let definitions = permitted_definitions(registry, &snapshot);
@@ -15311,6 +15312,42 @@ issue?"#;
         assert_eq!(
             offered_names(&offered),
             ["filesystem_read", "mcp_crm-prod_search"]
+        );
+    }
+
+    /// A program's tools (Desk's board sync reading a file) are on the
+    /// registry but never a turn's: not offered, and refused if called.
+    #[tokio::test]
+    async fn a_turn_is_never_offered_nor_runs_a_program_s_tools() {
+        let registry = registry_with(&[
+            "jira.attachment_read",
+            "linear.upload_read",
+            "jira.get_attachment",
+        ]);
+        let loading = crate::tools::loading::ToolLoading::default();
+        let session = BTreeSet::new();
+        let mut offered = OfferedTools::default();
+        offered.refresh(
+            &registry,
+            &access::NoopToolAccess,
+            &plan_context(&loading, &session),
+        );
+        assert_eq!(offered_names(&offered), ["jira_get_attachment"]);
+        let ran = crate::tools::dispatch::execute_gated(
+            &registry,
+            &offered.access,
+            "jira.attachment_read",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(!ran.success);
+        assert!(
+            ran.deny_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("board sync")),
+            "{:?}",
+            ran.deny_reason
         );
     }
 

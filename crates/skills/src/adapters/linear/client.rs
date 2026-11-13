@@ -109,6 +109,42 @@ impl LinearClient {
         Self::handle_response(response).await
     }
 
+    /// A file Linear keeps for an upload, read with the key: only from
+    /// `https://uploads.linear.app/` ([`crate::adapters::file_read::is_linear_upload`]),
+    /// and refused once it passes [`crate::adapters::file_read::FILE_MAX`].
+    /// A redirect to another host goes without the key (reqwest drops
+    /// `Authorization` on a cross-host hop).
+    pub async fn get_file(&self, url: &str) -> Result<Vec<u8>> {
+        if !crate::adapters::file_read::is_linear_upload(url) {
+            return Err(eyre!("Only Linear's own uploads are read"));
+        }
+        let response = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, self.resolve_auth()?)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            if status.as_u16() == 429 {
+                let retry = retry_after_secs(response.headers());
+                return Err(RateLimitedError::new("Rate limited by Linear", retry).into());
+            }
+            return Err(eyre!("Linear didn't send the file ({status})"));
+        }
+        crate::adapters::file_read::capped_body(response)
+            .await
+            .map_err(|e| eyre!("{e}"))
+    }
+
+    /// The key a call is made with now, as a key a file read with it is kept
+    /// by: a hash, never the key.
+    pub fn credential_key(&self) -> Result<String> {
+        Ok(crate::adapters::file_read::fingerprint(
+            self.resolve_auth()?.as_bytes(),
+        ))
+    }
+
     /// Execute a GraphQL mutation against the Linear API.
     pub async fn mutate(&self, mutation: &str, variables: Value) -> Result<Value> {
         // GraphQL mutations use the same endpoint as queries

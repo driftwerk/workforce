@@ -9165,6 +9165,8 @@ impl RemoteMcpConfig {
         "linear.states_list",
         "linear.teams_list",
         "linear.viewer",
+        "jira.attachment_read",
+        "linear.upload_read",
         "identity.linear_member_by_my_email",
         "identity.linear_members_named",
         "identity.linear_choose_me",

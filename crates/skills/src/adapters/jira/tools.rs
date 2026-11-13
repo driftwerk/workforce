@@ -69,6 +69,8 @@ fn attachment_summaries(fields: &Value) -> Vec<Value> {
                         "filename": wrap_field(&a["filename"], "jira.get_issue.attachment_filename"),
                         "mime_type": a["mimeType"],
                         "size": a["size"],
+                        "thumbnail": a.get("thumbnail").is_some_and(|t| t.is_string()),
+                        "created": a["created"],
                     })
                 })
                 .collect()
@@ -332,6 +334,8 @@ impl Tool for JiraSearchTool {
         // A description asked for comes rendered, as `jira.get_issue` gives it.
         let described = fields.iter().any(|f| f == "description");
         let labelled = fields.iter().any(|f| f == "labels");
+        let attached = fields.iter().any(|f| f == "attachment");
+        let due = fields.iter().any(|f| f == "duedate");
         let mut body = json!({
             "jql": jql,
             "maxResults": max_results,
@@ -379,6 +383,12 @@ impl Tool for JiraSearchTool {
                                 ),
                                 "jira.search.description",
                             );
+                        }
+                        if attached {
+                            out["attachments"] = Value::Array(attachment_summaries(f));
+                        }
+                        if due {
+                            out["duedate"] = f["duedate"].clone();
                         }
                         if labelled {
                             out["labels"] = Value::Array(
@@ -474,6 +484,7 @@ impl Tool for JiraGetIssueTool {
                     "created": f["created"],
                     "updated": f["updated"],
                     "comment_count": f["comment"]["total"],
+                    "duedate": f["duedate"],
                     "attachments": attachment_summaries(f),
                 });
                 Ok(ToolResult::success(out, duration_ms))
@@ -1256,6 +1267,171 @@ impl Tool for JiraGetAttachmentTool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// 11c. jira.attachment_read — a chunk of an attachment's bytes, for Desk
+// ──────────────────────────────────────────────────────────────────────
+
+jira_tool_struct!(JiraAttachmentReadTool);
+
+/// Whether `id` can be a Jira attachment's id: digits, as Jira numbers them,
+/// so nothing but an id ever goes into the path.
+fn attachment_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 20 && id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether `key` can be a Jira issue's key (`ENG-123`), so nothing but a key
+/// ever goes into the path.
+fn issue_key_ok(key: &str) -> bool {
+    let Some((project, n)) = key.rsplit_once('-') else {
+        return false;
+    };
+    let mut p = project.chars();
+    p.next().is_some_and(|c| c.is_ascii_uppercase())
+        && p.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && project.len() <= 20
+        && !n.is_empty()
+        && n.len() <= 12
+        && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Attachment `id` as issue `fields` list it: its type and size; `None`
+/// when the issue has no such attachment.
+fn listed_attachment(fields: &Value, id: &str) -> Option<(String, Option<u64>)> {
+    fields["attachment"].as_array()?.iter().find_map(|a| {
+        let aid = match &a["id"] {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        (aid == id).then(|| {
+            (
+                a["mimeType"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                coerce_to_u64(&a["size"]),
+            )
+        })
+    })
+}
+
+#[async_trait]
+impl Tool for JiraAttachmentReadTool {
+    fn name(&self) -> &str {
+        "jira.attachment_read"
+    }
+    fn description(&self) -> &str {
+        "Desk's board sync reads a Jira attachment's bytes with this, a base64 chunk at a time. \
+         To look at an attachment yourself, use jira.get_attachment instead."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "issue_key": { "type": "string", "description": "The issue the attachment is on, e.g. 'ENG-123'. Only an attachment that issue lists is read." },
+                "attachment_id": { "type": "string", "description": "Attachment id from a jira.get_issue `attachments` entry." },
+                "thumbnail": { "type": "boolean", "description": "Read Jira's small picture of it instead." },
+                "offset": { "type": "integer", "minimum": 0, "description": "Where the chunk starts, in bytes." },
+                "length": { "type": "integer", "minimum": 1, "description": "The most bytes to answer (at most 524288)." }
+            },
+            "required": ["issue_key", "attachment_id"]
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        use crate::adapters::file_read::{self, memo};
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = resolve_or_fail!(self, input, start);
+        let id = match required_str(&input, "attachment_id") {
+            Ok(s) if attachment_id_ok(s) => s.to_string(),
+            Ok(_) => {
+                return Ok(ToolResult::failure(
+                    "attachment_id is a Jira attachment's id, digits only",
+                    ms(),
+                ))
+            }
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        // Only an attachment its issue lists is read: an id alone, walked,
+        // would reach every attachment the credential can see.
+        let issue = match required_str(&input, "issue_key") {
+            Ok(k) if issue_key_ok(k) => k.to_string(),
+            Ok(_) => {
+                return Ok(ToolResult::failure(
+                    "issue_key is an issue's key, like ENG-123",
+                    ms(),
+                ))
+            }
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        let range = match file_read::range_of(&input) {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        let thumbnail = input["thumbnail"].as_bool() == Some(true);
+        let path = match thumbnail {
+            true => format!("{REST}/attachment/thumbnail/{id}"),
+            false => format!("{REST}/attachment/content/{id}"),
+        };
+        // Kept by the issue too: a kept file was checked against that
+        // issue's list when it was read.
+        let key = match client.credential_key() {
+            Ok(k) => format!("jira:{k}:{issue}:{path}"),
+            Err(e) => return Ok(ToolResult::from_report(&e, ms())),
+        };
+        // Read once for every caller missing it at once, then kept.
+        let download = async {
+            let listed = match client
+                .get(&format!("{REST}/issue/{issue}?fields=attachment"))
+                .await
+            {
+                Ok(i) => listed_attachment(&i["fields"], &id),
+                Err(e) => {
+                    return Err(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {issue}'s attachments")),
+                        ms(),
+                    ))
+                }
+            };
+            let Some((listed_type, size)) = listed else {
+                return Err(ToolResult::failure(
+                    format!("{issue} has no attachment {id}"),
+                    ms(),
+                ));
+            };
+            if !thumbnail && size.is_some_and(|n| n > file_read::FILE_MAX) {
+                return Err(ToolResult::failure(
+                    format!(
+                        "Attachment {id} is over {} MB",
+                        file_read::FILE_MAX / (1024 * 1024)
+                    ),
+                    ms(),
+                ));
+            }
+            let media_type = match thumbnail {
+                true => "image/png".to_string(),
+                false => listed_type,
+            };
+            match client.get_file(&path).await {
+                Ok(b) => Ok((b, media_type)),
+                Err(e) => Err(ToolResult::from_report(
+                    &e.wrap_err(format!("Failed to download attachment {id}")),
+                    ms(),
+                )),
+            }
+        };
+        match memo().fetch_once(&key, download).await {
+            Ok((bytes, media_type)) => Ok(ToolResult::success(
+                file_read::chunk(&bytes, &media_type, range),
+                ms(),
+            )),
+            Err(failed) => Ok(failed),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // 12. jira.list_projects
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1807,6 +1983,119 @@ mod tests {
             wrap_field(&json!("report.pdf"), "jira.get_issue.attachment_filename"),
             "filename is routed through the external-content boundary"
         );
+    }
+
+    /// Desk's read of an attachment: by its id only, a chunk at a time, the
+    /// file downloaded once and kept for the next chunk under the
+    /// credential that read it.
+    #[tokio::test]
+    async fn attachment_read_answers_chunks_and_downloads_once() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let bytes: Vec<u8> = (0..700_000u32).map(|i| (i % 250) as u8).collect();
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": "ENG-1",
+                "fields": { "attachment": [
+                    { "id": "10001", "filename": "shot.png", "mimeType": "image/png", "size": bytes.len() }
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/attachment/content/10001"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraAttachmentReadTool::new(clients, "acme".into(), Arc::default());
+        let mut got = vec![];
+        for offset in [0u64, 524_288] {
+            let r = tool
+                .execute(
+                    json!({ "issue_key": "ENG-1", "attachment_id": "10001", "offset": offset }),
+                )
+                .await
+                .unwrap();
+            assert!(r.success, "{:?}", r.error);
+            let out = r.output;
+            assert_eq!(out["kind"], "file_bytes");
+            assert_eq!(out["size"], bytes.len());
+            assert_eq!(out["offset"], offset);
+            got.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(out["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(got, bytes);
+        for bad in ["../10001", "10001/../../x", "", "abc"] {
+            let r = tool
+                .execute(json!({ "issue_key": "ENG-1", "attachment_id": bad }))
+                .await
+                .unwrap();
+            assert!(!r.success, "{bad}");
+        }
+    }
+
+    /// An id walked past what its issue lists is refused before anything
+    /// is downloaded, and an attachment is never read without its issue.
+    #[tokio::test]
+    async fn attachment_read_reads_only_what_its_issue_lists() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": "ENG-1",
+                "fields": { "attachment": [ { "id": "10001", "mimeType": "image/png", "size": 10 } ] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/rest/api/3/attachment/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraAttachmentReadTool::new(clients, "acme".into(), Arc::default());
+        let walked = tool
+            .execute(json!({ "issue_key": "ENG-1", "attachment_id": "10002" }))
+            .await
+            .unwrap();
+        assert!(!walked.success);
+        assert!(walked
+            .error
+            .unwrap_or_default()
+            .contains("has no attachment 10002"));
+        let thumb = tool
+            .execute(json!({ "issue_key": "ENG-1", "attachment_id": "10002", "thumbnail": true }))
+            .await
+            .unwrap();
+        assert!(!thumb.success, "a thumbnail is checked too");
+        for input in [
+            json!({ "attachment_id": "10001" }),
+            json!({ "issue_key": "eng-1/../x", "attachment_id": "10001" }),
+            json!({ "issue_key": "ENG-1?fields=*all", "attachment_id": "10001" }),
+        ] {
+            let r = tool.execute(input.clone()).await.unwrap();
+            assert!(!r.success, "{input}");
+        }
     }
 
     #[test]
