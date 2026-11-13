@@ -91,44 +91,13 @@ impl CrewHub {
         "Desk couldn't read or keep the person's preferences just now.".to_string()
     }
 
-    /// The person's preferences `ids`, each checked to be theirs, for the
-    /// boss of `boss_scope`, and active.
-    async fn preferences_named(
-        &self,
-        boss_scope: &str,
-        ids: &[Uuid],
-    ) -> Result<Vec<Preference>, String> {
-        let found = self
-            .desk
-            .store()
-            .preferences_by_id(ids)
-            .await
-            .map_err(Self::pref_err)?;
-        let mut out = Vec::new();
-        for id in ids {
-            let p = found
-                .iter()
-                .find(|p| p.id == *id && p.owner == YOU && p.boss_scope == boss_scope)
-                .ok_or_else(|| {
-                    format!("There is no preference {id} of the person's for you (crew.preferences lists them).")
-                })?;
-            if p.state != PrefState::Active {
-                return Err(format!(
-                    "The person's preference {id} ({}) is {}, so it can't be applied.",
-                    p.rule(),
-                    p.state.as_str()
-                ));
-            }
-            out.push(p.clone());
-        }
-        Ok(out)
-    }
-
     /// The preference an acting tool's `input` says it applies, checked,
     /// and the words its decision cites it with. `Ok(None)` when it names
-    /// none. Refused only for what would make the citation untrue (an
-    /// unknown, another's, a paused or a forgotten preference): the action
-    /// itself is never weighed.
+    /// none, or when the preferences can't be read just now (the action
+    /// then goes uncited, never held up). Refused only for what would make
+    /// the citation untrue (an unknown, another's, a paused or a forgotten
+    /// preference): the action itself is never weighed, and the same
+    /// action without a preference always runs.
     pub(super) async fn applied_preference(
         &self,
         b: &Bound,
@@ -141,33 +110,55 @@ impl CrewHub {
             format!("{why} Nothing was done: do it again without preference, or with one that is active.")
         };
         let id = pref_id(&id).map_err(refuse)?;
-        let close = match input["match"].as_str().map(str::trim) {
-            None | Some("") | Some("exact") => false,
-            Some("close") => true,
-            Some(_) => return Err(refuse("match is exact or close.".into())),
-        };
+        // Anything but "exact" is said as the hedge it is: a close match.
+        let close = !matches!(
+            input["match"].as_str().map(str::trim),
+            None | Some("") | Some("exact")
+        );
+        // One set aside that can't be read is left out of the line.
         let over: Vec<Uuid> = input["over"]
             .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).map(pref_id).collect())
-            .transpose()
-            .map_err(refuse)?
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|o| pref_id(o).ok())
+                    .filter(|o| *o != id)
+                    .collect()
+            })
             .unwrap_or_default();
         let scope = preference::boss_scope_of(b.oversight.scope.group());
+        let store = self.desk.store();
+        let found = match store.preferences_by_id(&[id]).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the cited preference couldn't be read: the action goes uncited");
+                return Ok(None);
+            }
+        };
         // Only the one applied must be there and active: one it set aside
         // that has since gone is left out of the line, never a refusal.
-        let applied = self
-            .preferences_named(&scope, &[id])
-            .await
-            .map_err(refuse)?
-            .remove(0);
-        let over: Vec<Uuid> = over.into_iter().filter(|o| *o != id).collect();
-        let set_aside: Vec<Preference> = self
-            .desk
-            .store()
+        let applied = found
+            .into_iter()
+            .find(|p| p.id == id && p.owner == YOU && p.boss_scope == scope)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "There is no preference {id} of the person's for you (crew.preferences lists them)."
+                ))
+            })?;
+        if applied.state != PrefState::Active {
+            return Err(refuse(format!(
+                "The person's preference {id} ({}) is {}, so it can't be applied.",
+                applied.rule(),
+                applied.state.as_str()
+            )));
+        }
+        let set_aside: Vec<Preference> = store
             .preferences_by_id(&over)
             .await
-            .map_err(Self::pref_err)
-            .map_err(refuse)?
+            .unwrap_or_else(|e| {
+                tracing::info!(error = %format!("{e:#}"), "the preferences set aside couldn't be read: left out of the line");
+                Vec::new()
+            })
             .into_iter()
             .filter(|p| p.owner == YOU && p.boss_scope == scope && p.state == PrefState::Active)
             .collect();
@@ -323,7 +314,7 @@ impl CrewHub {
             }
             "pause" => store.preference_set_state(id, PrefState::Paused).await,
             "resume" => store.preference_set_state(id, PrefState::Active).await,
-            "forget" => store.preference_set_state(id, PrefState::Retired).await,
+            "forget" | "retire" => store.preference_set_state(id, PrefState::Retired).await,
             _ => return Err("action is list, change, pause, resume or forget.".into()),
         }
         .map_err(Self::pref_err)?
@@ -352,7 +343,7 @@ impl CrewHub {
         boss_scope: &str,
         about: Option<Uuid>,
         unbound: bool,
-    ) -> Option<String> {
+    ) -> Option<PrefsContext> {
         let prefs = match self
             .desk
             .store()
@@ -396,14 +387,17 @@ impl CrewHub {
             true => "close when it is near but not quite its own case: apply a close match and say so, never ask",
             false => "close when it is near but not quite its own case: apply a close match when what you do can be undone, otherwise ask the person whether it covers this case (crew.ask_person, options Yes / No / Not this time)",
         };
-        Some(format!(
-            "The person's preferences (check them before you decide or ask; the first that fits wins: \
-             the most specific scope, then the newest). Apply one by passing its id as preference on the \
-             crew action, with match: exact when the case is its own, {close}; pass any others that also \
-             fit as over. With none that fits, decide yourself; ask the person only when you truly can't, \
-             with crew.ask_person and generalizes saying the kind of case, so their answer can become a \
-             preference:\n{listed}"
-        ))
+        Some(PrefsContext {
+            listed: format!("The person's preferences:\n{listed}"),
+            how: format!(
+                "Check the person's preferences (in Desk's notes above) before you decide or ask; the \
+                 first that fits wins: the most specific scope, then the newest. Apply one by passing \
+                 its id as preference on the crew action, with match: exact when the case is its own, \
+                 {close}; pass any others that also fit as over. With none that fits, decide yourself; \
+                 ask the person only when you truly can't, with crew.ask_person and generalizes saying \
+                 the kind of case, so their answer can become a preference."
+            ),
+        })
     }
 }
 
@@ -620,6 +614,14 @@ impl CrewHub {
             .collect::<Vec<_>>());
         Some(out)
     }
+}
+
+/// The person's preferences as a boss's turn is given them: the rules
+/// themselves, kept as reported data with the rest of Desk's notes, and how
+/// to apply them, which is the boss's own instruction.
+pub(crate) struct PrefsContext {
+    pub listed: String,
+    pub how: String,
 }
 
 #[cfg(test)]

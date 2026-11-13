@@ -242,8 +242,8 @@ async fn an_action_by_a_preference_cites_it_and_only_the_citation_is_checked() {
             both.why
         );
 
-        // Only the citation is checked: unknown, forgotten, or a bad match
-        // are refused before anything is sent.
+        // Only the citation is checked: unknown, another boss's, set aside
+        // or forgotten are refused before anything is sent.
         let count = |d: Desk| async move {
             d.store()
                 .decisions_since("desk", epoch(), 50)
@@ -282,14 +282,67 @@ async fn an_action_by_a_preference_cites_it_and_only_the_citation_is_checked() {
             "{:?}",
             r.error
         );
+        // Set aside: refused too.
+        let paused = kept(&d, "a session asks to deploy", "ask me", PrefScope::All, 0).await;
+        d.store()
+            .preference_set_state(paused.id, PrefState::Paused)
+            .await
+            .unwrap();
         let r = call(
             &crew,
             "crew.nudge",
-            nudge(json!({ "preference": red.id.to_string(), "match": "maybe" })),
+            nudge(json!({ "preference": paused.id.to_string() })),
         )
         .await;
-        assert!(!r.success);
+        assert!(
+            r.error.as_deref().unwrap_or_default().contains("paused"),
+            "{:?}",
+            r.error
+        );
+        // Another boss's (a group's): there is none of the person's for
+        // this one.
+        let mut theirs = Preference::new(
+            "g-acme",
+            "a session asks for a key",
+            "use the staging key",
+            PrefScope::All,
+            PrefSource::Said,
+        );
+        theirs.created_at -= chrono::Duration::days(1);
+        d.store().preference_put(&theirs).await.unwrap();
+        let r = call(
+            &crew,
+            "crew.nudge",
+            nudge(json!({ "preference": theirs.id.to_string() })),
+        )
+        .await;
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("There is no preference"),
+            "{:?}",
+            r.error
+        );
         assert_eq!(count(d.clone()).await, before, "nothing was done");
+        // An odd match or set-aside id never refuses: said as a close match,
+        // the unreadable id left out.
+        let r = call(
+            &crew,
+            "crew.nudge",
+            nudge(json!({ "preference": red.id.to_string(), "match": "maybe", "over": ["nope"] })),
+        )
+        .await;
+        assert!(r.success, "{:?}", r.error);
+        let hedged = d
+            .store()
+            .decisions_since("desk", epoch(), 50)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(hedged.why.contains("as a close match"), "{}", hedged.why);
+        assert_eq!(hedged.preference, Some(red.id));
         // One set aside that has since gone is left out of the line, never
         // a reason to refuse.
         let r = call(
@@ -373,6 +426,19 @@ async fn every_turn_is_given_the_preferences_that_cover_it() {
             block.contains("apply a close match and say so, never ask"),
             "{block}"
         );
+        // The rules are the person's, kept as data; how to apply them is
+        // the boss's own instruction, outside the fence.
+        let fence_end = block
+            .find("<<</EXTERNAL_UNTRUSTED_CONTENT_")
+            .expect("fenced");
+        assert!(
+            block.find(&staging.id.to_string()).unwrap() < fence_end,
+            "{block}"
+        );
+        assert!(
+            block.find("apply a close match and say so").unwrap() > fence_end,
+            "{block}"
+        );
         let block = super::super::context::block(&overseer, &line(docs.id), PERSON)
             .await
             .expect("a block");
@@ -405,6 +471,21 @@ async fn every_turn_is_given_the_preferences_that_cover_it() {
             !hint.contains("Never secrets"),
             "unbound: no never-list: {hint}"
         );
+        // The prompts an unbound boss is actually given carry none either:
+        // a line turn's, and its DM's.
+        let never = |t: &str| t.contains("Never secrets") || t.contains("Never anything");
+        assert!(crew.unbound(&o));
+        let ended = ["Turn ended.".to_string()];
+        let lp = crew.line_prompt(docs.id, &[], &ended, &o);
+        assert!(!never(&lp), "unbound line turn: {lp}");
+        let dm = super::super::dm_oversight_hint(&overseer).expect("a DM hint");
+        assert!(!never(&dm), "unbound DM: {dm}");
+        // Bound (a switch off), the never-list holds as before.
+        let mut bound = o.clone();
+        bound.act.interrupt = false;
+        assert!(!crew.unbound(&bound));
+        let lp = crew.line_prompt(docs.id, &[], &ended, &bound);
+        assert!(never(&lp), "bound line turn: {lp}");
     })
     .await;
 }

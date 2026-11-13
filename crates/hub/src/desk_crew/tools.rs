@@ -734,8 +734,11 @@ impl CrewTool {
         };
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());
+        let cited = input["preference"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty());
         // The person's preferences are this hub's: the machine never
-        // weighs one it doesn't keep.
+        // weighs one it doesn't keep, and its decision doesn't cite it.
         if let Some(o) = sent.as_object_mut() {
             for f in super::preferences::ACT_FIELDS {
                 o.remove(f);
@@ -752,8 +755,15 @@ impl CrewTool {
                         ),
                         &format!("{machine}'s answer"),
                     );
+                    let uncited = format!(
+                        "{machine} recorded this without your preference: if you tell the person, say \
+                         which preference you followed yourself."
+                    );
                     match a.status {
                         super::served::ServedStatus::Refused => Err(said),
+                        super::served::ServedStatus::Ok if cited => {
+                            Ok(json!({ "done": said, "note": uncited }))
+                        }
                         super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
                         super::served::ServedStatus::Suggested => Ok(json!({
                             "suggested": said,

@@ -212,6 +212,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_preferences",
+        "boss_scope",
+        NotPersonal("which boss a preference is for: `main` or a sidebar group's id"),
+    ),
+    (
+        "desk",
+        "boss_preferences",
+        "scope",
+        NotPersonal("what a preference covers: all, a group, or a repository"),
+    ),
+    (
+        "desk",
         "boss_open_items",
         "closed_by",
         NotPersonal("which side closed it (person, session, boss, superseded, lapsed), not who"),

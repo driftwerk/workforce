@@ -194,7 +194,8 @@ impl DeskStore {
     }
 
     /// Sets `id` to `state`; resuming one also starts its overrules
-    /// again. The preference as it now is, or `None` when there is none.
+    /// again. The preference as it now is, or `None` when there is none
+    /// (or it is retired: a forgotten one stays forgotten).
     pub async fn preference_set_state(
         &self,
         id: Uuid,
@@ -206,7 +207,7 @@ impl DeskStore {
                 &format!(
                     "UPDATE boss_preferences SET state = $2, changed_at = now(), \
                        overruled_count = CASE WHEN $2 = 'active' THEN 0 ELSE overruled_count END \
-                     WHERE id = $1 RETURNING {COLUMNS}"
+                     WHERE id = $1 AND state <> 'retired' RETURNING {COLUMNS}"
                 ),
                 &[&id, &state.as_str()],
             )
