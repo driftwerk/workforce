@@ -135,8 +135,43 @@ const SHIPPERS: [&str; 20] = [
 ];
 
 /// What a shipper does when it ships.
-const SHIP_VERBS: [&str; 8] = [
-    "push", "merge", "publish", "deploy", "release", "apply", "upload", "workflow",
+const SHIP_VERBS: [&str; 14] = [
+    "push",
+    "merge",
+    "publish",
+    "deploy",
+    "release",
+    "apply",
+    "upload",
+    "workflow",
+    "yank",
+    "destroy",
+    "upgrade",
+    "rollout",
+    "delete",
+    "send-pack",
+];
+
+/// Programs that run the command they are given, after their own flags
+/// and those flags' values: a program after one of them may be anywhere.
+const WRAPPERS: [&str; 17] = [
+    "sudo",
+    "doas",
+    "nice",
+    "nohup",
+    "time",
+    "command",
+    "exec",
+    "builtin",
+    "caffeinate",
+    "stdbuf",
+    "timeout",
+    "gtimeout",
+    "env",
+    "ionice",
+    "taskset",
+    "unbuffer",
+    "ssh",
 ];
 
 /// Programs that copy files to another machine, whatever they are given.
@@ -185,22 +220,76 @@ fn ships_within(command: &str, depth: u8) -> bool {
     if c.contains("publish") || c.contains("deploy") {
         return true;
     }
-    if depth > 3 || unreadable(&c) || substitutes(&c) {
+    if depth > 3 || unreadable(&c) || substitutes(&c) || opaque(&c) {
         return true;
     }
-    let commands = crate::never::commands(&c);
-    // A heredoc or herestring given to a shell or an interpreter isn't read.
-    if c.contains("<<")
-        && commands.iter().any(|w| {
-            crate::never::from_program(w).first().is_some_and(|p| {
-                let p = crate::never::program(p);
-                SHELLS.contains(&p) || INTERPRETERS.contains(&p) || p.starts_with("python")
-            })
-        })
+    crate::never::commands(&c)
+        .iter()
+        .any(|words| ships_one(words, depth))
+}
+
+/// Where in `words`, one command, a program may start: its first word,
+/// the first after its assignments and wrappers, and any word after a
+/// wrapper (whose flags may take values: `sudo -u root curl …`).
+fn starts(words: &[String]) -> Vec<usize> {
+    let mut out = vec![0, words.len() - crate::never::from_program(words).len()];
+    if let Some(j) = words
+        .iter()
+        .position(|w| WRAPPERS.contains(&crate::never::program(w)))
     {
-        return true;
+        out.extend(j + 1..words.len());
     }
-    commands.iter().any(|words| ships_one(words, depth))
+    out.retain(|i| *i < words.len());
+    out.dedup();
+    out
+}
+
+/// Whether `command` runs what this engine can't read: a shell's `-c` or
+/// its input, `eval`, an interpreter's `-c` or `-e` or its input, what
+/// `xargs`, `parallel`, `watch`, `su` or `find -exec` run, or a command on
+/// another machine (`ssh host …`), behind any wrapper. Answered in Desk.
+pub fn opaque(command: &str) -> bool {
+    let c = command.to_lowercase();
+    crate::never::commands(&c).iter().any(|words| {
+        starts(words)
+            .into_iter()
+            .any(|i| opaque_at(&words[i..], c.contains("<<")))
+    })
+}
+
+fn opaque_at(words: &[String], heredoc: bool) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let program = crate::never::program(first);
+    let args = &words[1..];
+    let flags_only = args.iter().all(|a| a.starts_with('-'));
+    match program {
+        "eval" | "xargs" | "parallel" | "watch" | "su" | "runuser" => true,
+        "ssh" | "mosh" => args.iter().filter(|a| !a.starts_with('-')).count() >= 2,
+        "find" => args
+            .iter()
+            .any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")),
+        p if SHELLS.contains(&p) => {
+            heredoc
+                || flags_only
+                || args
+                    .iter()
+                    .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
+        }
+        p if INTERPRETERS.contains(&p) || p.starts_with("python") => {
+            let evals = args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-c" | "-e" | "-p" | "-r" | "-" | "--eval" | "--print" | "--command" | "eval"
+                ) || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.contains('e') || a.contains('c')))
+            });
+            heredoc || evals || flags_only || p == "awk"
+        }
+        _ => false,
+    }
 }
 
 /// Whether `command` runs what is read only as it runs: `$(…)`, backticks
@@ -220,13 +309,6 @@ fn ships_one(words: &[String], depth: u8) -> bool {
             return true;
         }
     }
-    // What `xargs` or `parallel` runs is given on its input.
-    if words
-        .iter()
-        .any(|w| matches!(crate::never::program(w), "xargs" | "parallel"))
-    {
-        return true;
-    }
     // A shipper anywhere, its verb after it: behind a wrapper's flags and
     // their values (`sudo -u root git push`, `timeout -s KILL 5 git push`)
     // or another machine's shell (`ssh host git push`).
@@ -238,7 +320,12 @@ fn ships_one(words: &[String], depth: u8) -> bool {
     }) {
         return true;
     }
-    let words = crate::never::from_program(words);
+    starts(words).into_iter().any(|i| ships_at(&words[i..]))
+}
+
+/// Whether `words`, a program and what it is given, ship by another road
+/// than a shipper's verb.
+fn ships_at(words: &[String]) -> bool {
     let Some(first) = words.first() else {
         return false;
     };
@@ -250,61 +337,29 @@ fn ships_one(words: &[String], depth: u8) -> bool {
     }
     match program {
         // `gh api …/merge -X PUT`: anything but a read.
-        "gh" | "glab" if args.first().is_some_and(|a| a == "api") => {
-            return writes_http(&args[1..], true);
+        "gh" | "glab" if args.first().is_some_and(|a| a == "api") => writes_http(&args[1..], true),
+        // A pull request, an issue or a release made.
+        "gh" | "glab" => {
+            (has("pr") || has("issue") || has("release") || has("mr")) && has("create")
         }
-        "curl" | "wget" => return writes_http(args, false),
-        // httpie: the method is a word of its own.
+        "curl" | "wget" => writes_http(args, false),
+        // httpie: the method is a word of its own, and a field or a file
+        // given makes it a POST.
         "http" | "https" | "xh" | "xhs" => {
-            return writes_http(args, false)
-                || args
-                    .iter()
-                    .any(|a| matches!(a.as_str(), "post" | "put" | "patch" | "delete"))
+            writes_http(args, false)
+                || args.iter().any(|a| {
+                    matches!(a.as_str(), "post" | "put" | "patch" | "delete")
+                        || (!a.starts_with('-') && (a.contains('=') || a.starts_with('@')))
+                })
         }
         "aws" => {
             let s3 = has("s3") && (has("cp") || has("sync") || has("mv"));
             let s3api = has("s3api") && args.iter().any(|a| a.starts_with("put-"));
-            return s3 || s3api;
+            s3 || s3api
         }
-        "gsutil" | "gcloud" => {
-            return has("cp") || has("rsync") || has("mv");
-        }
-        "eval" => return ships_within(&args.join(" "), depth + 1),
-        "watch" => return ships_one(args, depth + 1),
-        // What `-exec` runs is a command of its own.
-        "find" => {
-            return args
-                .iter()
-                .any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
-        }
-        _ => {}
+        "gsutil" | "gcloud" => has("cp") || has("rsync") || has("mv"),
+        _ => false,
     }
-    if SHELLS.contains(&program) {
-        // `bash -c '…'`: read as its own command.
-        if let Some(i) = args
-            .iter()
-            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
-        {
-            return args
-                .get(i + 1)
-                .is_none_or(|inner| ships_within(inner, depth + 1));
-        }
-        // Its input (a pipe, a heredoc) isn't read.
-        return args.iter().all(|a| a.starts_with('-'));
-    }
-    if INTERPRETERS.contains(&program) || program.starts_with("python") {
-        // `python3 -c …`, `node -e …`, `deno eval`, or its input.
-        let evals = args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "-c" | "-e" | "-p" | "-r" | "-" | "--eval" | "--print" | "--command" | "eval"
-            ) || (a.starts_with('-')
-                && !a.starts_with("--")
-                && (a.contains('e') || a.contains('c')))
-        });
-        return evals || args.iter().all(|a| a.starts_with('-')) || program == "awk";
-    }
-    false
 }
 
 /// Whether an HTTP call with `args` writes: a method other than GET or
@@ -374,7 +429,7 @@ pub fn unreadable(command: &str) -> bool {
                 .strip_prefix("${home}/")
                 .or_else(|| p.strip_prefix("$home/"))
                 .unwrap_or(&p);
-            p.contains(['$', '*', '?', '[', '{'])
+            p != "[" && p != "[[" && p.contains(['$', '*', '?', '[', '{'])
         })
     })
 }
@@ -469,6 +524,13 @@ const RUNS_LATER_SAID: &[&str] = &[
     "systemctl",
     "core.hookspath",
     ".gitlab-ci",
+    "defaults write",
+    "npm config set",
+    "pnpm config set",
+    "yarn config set",
+    "aws configure",
+    "gh alias set",
+    "gh config set",
 ];
 
 /// Whether `path`, lowercased, names something that runs on its own later.
@@ -549,48 +611,56 @@ pub fn runs_later_command(command: &str) -> bool {
     })
 }
 
-/// Whether `command` names a path only the shell can tell: one with a
-/// variable, a pattern or a brace in it (`${D}it/hooks`, `.g[i]t/hooks`,
-/// `.g*/hooks`, `$'\x2egit'/hooks`), or anything substituted in
-/// (`"$(git rev-parse --git-dir)/hooks"`). Where it writes isn't known.
-pub fn hidden_paths(command: &str) -> bool {
-    if substitutes(command) {
-        return true;
+/// The values `args` gives an option: `-o X`, `-oX`, `--output X` and
+/// `--output=X`.
+fn values(args: &[String], short: &[&str], long: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let next = || args.get(i + 1).cloned();
+        if short.contains(&a.as_str()) || long.contains(&a.as_str()) {
+            out.extend(next());
+        } else if let Some((_, v)) = a.split_once('=').filter(|(k, _)| long.contains(k)) {
+            out.push(v.to_string());
+        } else if let Some(s) = short
+            .iter()
+            .find(|s| a.len() > s.len() && a.starts_with(**s) && !a.starts_with("--"))
+        {
+            out.push(a[s.len()..].to_string());
+        }
     }
-    let hidden =
-        |w: &str| w.contains(['$', '*', '?', '[', '{']) && (w.contains('/') || w.starts_with('.'));
-    let words: Vec<String> = crate::never::commands(command)
-        .iter()
-        .flat_map(|ws| crate::never::from_program(ws).iter().skip(1).cloned())
-        .chain(
-            shlex::split(command)
-                .unwrap_or_default()
-                .into_iter()
-                .skip(1),
-        )
-        .collect();
-    words.iter().any(|w| hidden(w))
+    out
 }
 
-/// The files `command` writes, as far as it says: what it redirects to,
-/// and what `tee`, `cp`, `mv`, `ln`, `install`, `touch`, `mkdir`, `chmod`,
-/// `chown`, `truncate`, `sed -i`, `dd of=`, `curl -o` and `wget -O` are
+/// The files and folders `command` writes, as far as it says: what it
+/// redirects to, and what `tee`, `cp`, `mv`, `ln`, `install`, `touch`,
+/// `mkdir`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, `curl -o`,
+/// `wget -O`, `rsync`, `scp`, `tar -C`, `unzip -d` and `git clone` are
 /// given.
 fn written(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let words = shlex::split(command).unwrap_or_default();
     let mut it = words.iter().peekable();
     while let Some(w) = it.next() {
-        // `> f`, `>>f`, `2>f`, `&>f`, and `x>f` with no space before it.
-        if let Some(rest) = w.find('>').map(|i| &w[i + 1..]) {
-            let rest = rest.trim_start_matches(['>', '|']);
-            if rest.starts_with('&') {
-                continue;
+        // `> f`, `>>f`, `2>f`, `&>f`, `>& f`, and `x>f` with no space.
+        let Some(rest) = w.find('>').map(|i| &w[i + 1..]) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(['>', '|']);
+        let (dup, rest) = match rest.strip_prefix('&') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let fd = |s: &str| s == "-" || (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+        match rest {
+            "" => {
+                if let Some(n) = it.next() {
+                    if !(dup && fd(n)) {
+                        out.push(n.clone());
+                    }
+                }
             }
-            match rest {
-                "" => out.extend(it.next().cloned()),
-                r => out.push(r.to_string()),
-            }
+            r if dup && fd(r) => {}
+            r => out.push(r.to_string()),
         }
     }
     for words in crate::never::commands(command) {
@@ -599,34 +669,48 @@ fn written(command: &str) -> Vec<String> {
             continue;
         };
         let args = &words[1..];
-        let operands = || args.iter().filter(|a| !a.starts_with('-')).cloned();
+        let operands: Vec<String> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+        let short_has = |c: char| {
+            args.iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c))
+        };
         match crate::never::program(first) {
-            "tee" | "touch" | "mkdir" | "chmod" | "chown" | "truncate" => out.extend(operands()),
-            "cp" | "mv" | "ln" | "install" => {
-                out.extend(operands().next_back());
-                if let Some(i) = args
-                    .iter()
-                    .position(|a| a == "-t" || a == "--target-directory")
-                {
-                    out.extend(args.get(i + 1).cloned());
-                }
+            "tee" | "touch" | "mkdir" | "chmod" | "chown" | "truncate" | "ln" => {
+                out.extend(operands)
             }
-            "sed" | "perl" | "ruby"
-                if args
-                    .iter()
-                    .any(|a| a.starts_with("-i") || a.starts_with("-pi")) =>
-            {
-                out.extend(operands())
+            "cp" | "mv" | "install" | "rsync" | "scp" => {
+                out.extend(operands.last().cloned());
+                out.extend(values(args, &["-t"], &["--target-directory"]));
             }
+            "sed" if short_has('i') || args.iter().any(|a| a.starts_with("--in-place")) => {
+                out.extend(operands)
+            }
+            "perl" | "ruby" if short_has('i') => out.extend(operands),
             "dd" => out.extend(
                 args.iter()
                     .filter_map(|a| a.strip_prefix("of=").map(String::from)),
             ),
-            "curl" | "wget" => {
-                for (i, a) in args.iter().enumerate() {
-                    if matches!(a.as_str(), "-o" | "--output" | "-O" | "--output-document") {
-                        out.extend(args.get(i + 1).cloned());
-                    }
+            "curl" => {
+                out.extend(values(args, &["-o"], &["--output", "--output-dir"]));
+            }
+            "wget" => out.extend(values(
+                args,
+                &["-O", "-P"],
+                &["--output-document", "--directory-prefix"],
+            )),
+            "tar" => out.extend(values(args, &["-C"], &["--directory"])),
+            "unzip" => out.extend(values(args, &["-d"], &[])),
+            "git" => {
+                if let Some(i) = args.iter().position(|a| a == "clone") {
+                    let rest: Vec<&String> = args[i + 1..]
+                        .iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .collect();
+                    out.extend(rest.get(1).map(|s| s.to_string()));
                 }
             }
             _ => {}
@@ -635,18 +719,55 @@ fn written(command: &str) -> Vec<String> {
     out
 }
 
+/// The folders `command` moves to before what follows it runs: `cd`,
+/// `pushd`, and `git -C`.
+fn moves_to(command: &str) -> (bool, Vec<String>) {
+    let mut moves = false;
+    let mut to = Vec::new();
+    for words in crate::never::commands(command) {
+        let words = crate::never::from_program(&words);
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let args = &words[1..];
+        match crate::never::program(first) {
+            "cd" | "pushd" | "popd" | "chdir" => {
+                moves = true;
+                to.extend(args.iter().filter(|a| !a.starts_with('-')).cloned());
+            }
+            "git" => to.extend(values(args, &["-C"], &[])),
+            _ => {}
+        }
+    }
+    (moves, to)
+}
+
 /// Whether `command` writes outside `cwd` (scratch space aside), to a
-/// dotfile in `home`, or where it can't be told.
+/// dotfile in `home`, or where it can't be told: a path with a variable, a
+/// pattern or anything substituted in (`${D}it/hooks`, `.g[i]t/hooks`,
+/// `"$(git rev-parse --git-dir)/hooks"`), or after moving to another
+/// folder.
 pub fn writes_astray(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
     let home = real(home);
     let cwd = cwd.map(real);
     let scratch = [real(Path::new("/tmp")), PathBuf::from("/tmp")];
-    written(command).iter().any(|w| {
-        if matches!(
-            w.as_str(),
-            "-" | "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
-        ) {
+    let written = written(command);
+    let (moves, to) = moves_to(command);
+    // Where it writes after a `cd` isn't followed.
+    if moves && !written.is_empty() {
+        return true;
+    }
+    let astray = |w: &String, writes: bool| {
+        if writes
+            && matches!(
+                w.as_str(),
+                "-" | "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+            )
+        {
             return false;
+        }
+        if w.is_empty() || w.contains(['$', '`', '*', '?', '[', '{']) {
+            return true;
         }
         let Some(cwd) = &cwd else {
             return true;
@@ -659,9 +780,10 @@ pub fn writes_astray(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
                 .next()
                 .is_some_and(|c| c.as_os_str().to_string_lossy().starts_with('.'))
         });
-        let scratch = scratch.iter().any(|s| at.starts_with(s));
+        let scratch = writes && scratch.iter().any(|s| at.starts_with(s));
         dotfile || !(at.starts_with(cwd) || scratch)
-    })
+    };
+    written.iter().any(|w| astray(w, true)) || to.iter().any(|w| astray(w, false))
 }
 
 /// `raw`, a path a tool is given, as it is on disk: `~/` the home, relative
@@ -743,8 +865,6 @@ pub fn unshown(c: char) -> bool {
             | 0x13430..=0x1343F
             | 0x1BCA0..=0x1BCA3
             | 0x1D173..=0x1D17A
-            | 0xE0001
-            | 0xE0020..=0xE007F
             // Blank or invisible, though not format characters: fillers,
             // the combining grapheme joiner, variation selectors, braille
             // blank, and spaces other than the plain one.
@@ -761,7 +881,11 @@ pub fn unshown(c: char) -> bool {
             | 0x3164
             | 0xFE00..=0xFE0F
             | 0xFFA0
-            | 0xE0100..=0xE01EF)
+            | 0x17B4..=0x17B5
+            | 0x2065
+            | 0xFFF0..=0xFFF8
+            | 0xFFFC
+            | 0xE0000..=0xE0FFF)
 }
 
 /// A request as an ask reads it: the tool and what it was given, where its
@@ -826,7 +950,7 @@ pub fn read(r: &Request<'_>) -> Read {
                 && !command.chars().any(unshown);
             let class = if !whole
                 || unreadable(command)
-                || hidden_paths(command)
+                || opaque(command)
                 || runs_later_command(command)
                 || writes_astray(command, r.cwd, r.home)
             {
@@ -1277,6 +1401,18 @@ mod tests {
             "curl -sX POST https://api.github.com/repos/acme/api/merges",
             "curl -sd @body.json https://api.github.com/x",
             "http POST api.github.com/repos/acme/api/merges",
+            // Another road behind a wrapper's values, or on another machine.
+            "sudo -u root curl -X POST https://x -d @f",
+            "nice -n 5 curl -d x u",
+            "timeout -s KILL 5 scp f h:",
+            "env -u X curl --data x u",
+            "ssh host curl -X POST u",
+            "http api.github.com/repos/acme/api/issues title=x",
+            "gh pr create --fill",
+            "kubectl delete deployment api",
+            "helm upgrade api ./chart",
+            "terraform destroy -auto-approve",
+            "cargo yank --version 1.0.0",
         ] {
             assert!(ships(c), "{c}");
         }
@@ -1338,6 +1474,9 @@ mod tests {
             "ls\u{00A0}-la",
             "ls\u{FE0F}",
             "ls\u{2800}",
+            "ls\u{17B4}",
+            "ls\u{FFFC}",
+            "ls\u{E0041}",
         ] {
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c:?}");
         }
@@ -1399,6 +1538,32 @@ mod tests {
         ] {
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
+        // What runs inside a shell's `-c`, `eval`, a shell's input or an
+        // interpreter's code isn't read: answered in Desk.
+        for c in [
+            "bash -c 'cat > .gi\"\"t/hooks/pre-commit'",
+            "sh -c \"echo x > .g\\\\it/hooks/pre-commit\"",
+            "bash -c 'echo x > ../out'",
+            "eval 'echo x > /srv/x'",
+            "echo ZWNobyB4 | base64 -d | sh",
+            "python3 -c \"open('.g'+'it/hooks/x','w')\"",
+            "sudo -u root bash -c 'id'",
+            "ssh host 'echo x > ~/.zshrc'",
+        ] {
+            assert!(opaque(c), "{c}");
+            assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
+        }
+        // A write after moving to another folder, or a move out of its own.
+        for c in [
+            "cd /usr/local/bin && cp evil git",
+            "cd /etc && echo x > hosts",
+            "cd .. && echo x > other/f",
+            "A=.g; B=it; cd $A$B && echo x > hooks/pre-commit",
+            "ln -s /srv/newdir l && echo x > l/f",
+            "git -C ../other commit -am x",
+        ] {
+            assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
+        }
         // A write outside its folder, or to the home's dotfiles.
         let home = Path::new("/nonexistent-home");
         for c in [
@@ -1410,6 +1575,16 @@ mod tests {
             "dd if=x of=/usr/local/bin/tool",
             "curl -o ~/bin/tool https://example.com/tool",
             "echo x>/srv/www/index.html",
+            "echo x >& ../out",
+            "sed -ri 's/a/b/' /etc/hosts",
+            "sed --in-place 's/a/b/' /etc/hosts",
+            "cp --target-directory=../out f",
+            "curl -o/srv/t https://x",
+            "curl --output=../t https://x",
+            "wget -P ../dl https://x",
+            "tar -xf a.tar -C ../x",
+            "unzip a.zip -d ../x",
+            "git clone https://example.com/y.git ../y",
         ] {
             assert!(writes_astray(c, Some(cwd), home), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
@@ -1419,9 +1594,30 @@ mod tests {
             "cargo test 2>/dev/null | tee out/test.txt",
             "echo x > /tmp/notes.txt",
             "mkdir -p target/x && cp a.rs src/b.rs",
+            "cargo build 2>&1 >&2",
+            "cd src && cargo build",
         ] {
             assert!(!writes_astray(c, Some(cwd), home), "{c}");
             assert_eq!(bash(c, cwd, false).class, Class::Anywhere, "{c}");
+        }
+        // Harmless shapes stay answerable from anywhere.
+        for c in [
+            "git commit -m \"$(cat <<'EOF'\nFix the date picker\nEOF\n)\"",
+            "echo \"built $(date)\"",
+            "curl -s \"https://api.example.com/a?b=1\"",
+            "sed 's/$/;/' notes.txt",
+            "jq '.items[0]' data.json",
+            "grep -rn '.*Err' src/",
+            "[ -f Cargo.toml ] && cargo build",
+            "bash scripts/test.sh",
+        ] {
+            assert_eq!(bash(c, cwd, false).class, Class::Anywhere, "{c}");
+        }
+        for c in [
+            "defaults write com.acme.x y 1",
+            "npm config set registry https://x",
+        ] {
+            assert_eq!(bash(c, cwd, false).class, Class::DeskOnly, "{c}");
         }
     }
 
