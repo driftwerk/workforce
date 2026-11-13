@@ -133,6 +133,19 @@ pub(crate) async fn turn_tools(
     session: &Session,
     whitelist: Option<&[String]>,
 ) -> TurnTools {
+    turn_tools_in(service, session, whitelist, false).await
+}
+
+/// [`turn_tools`], and with `private` (the turn's prompt may carry its
+/// person's own context: [`PromptPrivacy::Private`]) what their Desk shared.
+///
+/// [`PromptPrivacy::Private`]: workforce_hub_core::serve::PromptPrivacy::Private
+pub(crate) async fn turn_tools_in(
+    service: &AgentService,
+    session: &Session,
+    whitelist: Option<&[String]>,
+    private: bool,
+) -> TurnTools {
     if workforce_agent::runner::game_sandboxed() {
         return TurnTools {
             registry: Arc::new(workforce_agent::tools::registry::ToolRegistry::new()),
@@ -150,7 +163,7 @@ pub(crate) async fn turn_tools(
                 .any(|tool| whitelist.iter().any(|entry| names_tool(entry, tool)))
         });
     }
-    let base = session_registry(service, session).await;
+    let base = session_registry(service, session, private).await;
     let base = if workforce_agent::runner::delivery_tools_suppressed() {
         Arc::new(workforce_agent::runner::without_delivery_tools(&base))
     } else {
@@ -230,9 +243,15 @@ pub(crate) fn is_own_conversation(session: &Session) -> bool {
 async fn session_registry(
     service: &AgentService,
     session: &Session,
+    private: bool,
 ) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
     let base = node_registry(service, session).await;
-    match desk_work(service, session).await {
+    let work = if private {
+        desk_work(service, session).await
+    } else {
+        None
+    };
+    match work {
         Some(work) => {
             let registry = workforce_agent::tools::registry::ToolRegistry::follow(&base, |_| true);
             for tool in crate::desk_knows::tools::tools(&work) {
@@ -246,7 +265,11 @@ async fn session_registry(
 
 /// What the person's Desk shared with this agent, for the person's own
 /// conversation with it (Sees K4): only when the turn runs as them, in a
-/// conversation that is theirs alone, and they hold something.
+/// conversation that is theirs alone, and they hold something. The caller
+/// also makes sure the turn is theirs ([`PromptPrivacy::Private`]): never
+/// an automated run reporting to them, nor one run as them for others.
+///
+/// [`PromptPrivacy::Private`]: workforce_hub_core::serve::PromptPrivacy::Private
 pub(crate) async fn desk_work(
     service: &AgentService,
     session: &Session,
@@ -272,10 +295,14 @@ async fn desk_work_in(
         person,
         agent: agent.to_string(),
     };
-    match store.holds(&reader).await {
-        Ok(true) => Some(crate::desk_knows::tools::Work { store, reader }),
-        Ok(false) => None,
-        Err(e) => {
+    match tokio::time::timeout(crate::desk_knows::tools::READ_WAIT, store.holds(&reader)).await {
+        Ok(Ok(true)) => Some(crate::desk_knows::tools::Work { store, reader }),
+        Ok(Ok(false)) => None,
+        Err(_) => {
+            tracing::warn!("what Desk shared took too long to check; left out of this turn");
+            None
+        }
+        Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "what Desk shared couldn't be checked");
             None
         }

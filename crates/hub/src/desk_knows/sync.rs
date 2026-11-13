@@ -644,9 +644,11 @@ async fn put_link(
         );
     }
     tracing::info!(target: "sentinel.audit", hub = %hub, agent = %agent, person = %person, "an agent's link for Desk work was kept");
-    // A token refused before is no reason to wait now.
+    // A token refused before is no reason to wait now, and a hub linked
+    // anew is told the digest again.
     if let Some(s) = r.spent.lock().get_mut(&format!("{hub}/{agent}")) {
         s.backoff = None;
+        s.digest = None;
     }
     r.kick();
     StatusCode::NO_CONTENT.into_response()

@@ -556,7 +556,11 @@ pub async fn push(
                 &live.owner.person.to_string(),
                 "desk_knows.push",
                 &live.token,
-                &format!("{kept} items"),
+                &match (&parsed.digest, kept) {
+                    (Some(d), 0) => format!("digest {d}"),
+                    (Some(d), _) => format!("{kept} items, digest {d}"),
+                    (None, _) => format!("{kept} items"),
+                },
             );
             Json(json!({ "kept": kept })).into_response()
         }
