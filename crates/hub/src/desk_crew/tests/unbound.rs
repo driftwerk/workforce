@@ -12,7 +12,10 @@ use workforce_desk::crew::{Event, Party};
 
 /// The settings file of `agent`, which no boss allows a session to read.
 fn own_settings(agent: &AgentService) -> String {
-    format!("cat {}", agent.workspace.join("config.toml").display())
+    format!(
+        "echo 'level = \"full\"' >> {}",
+        agent.workspace.join("config.toml").display()
+    )
 }
 
 pub(super) const UNBOUND: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
@@ -51,7 +54,8 @@ async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let acme = base.join("acme-web");
         repo(&acme, "git@github.com:acme/acme-web.git");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.approve").then_some(())
         })
@@ -148,7 +152,8 @@ async fn with_switches_off_and_a_list_of_repositories_act_fully_is_unbound_all_t
             .replace("interrupt = true", "interrupt = false")
             .replace("hand_off = true", "hand_off = false")
             .replace("anywhere = true", "repos = [\"globex/globex-api\"]");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", &listed, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &listed, &[]).await;
+        super::boss_allows(&llm).await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -194,7 +199,8 @@ async fn with_switches_off_and_a_list_of_repositories_act_fully_is_unbound_all_t
 async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        let (_, crew, d, llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         let (_, o) = crew.overseer_service().unwrap();
         let web = new_session(&d, dir.path(), "acme-web").await;
         let party = Party::session(&web);
@@ -224,7 +230,7 @@ async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
 async fn at_act_what_waits_waits_its_minutes_and_nothing_sweeps() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(
+        let (_, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -232,6 +238,7 @@ async fn at_act_what_waits_waits_its_minutes_and_nothing_sweeps() {
             &[],
         )
         .await;
+        super::boss_allows(&llm).await;
         let (_, o) = crew.overseer_service().unwrap();
         let web = new_session(&d, dir.path(), "acme-web").await;
         let party = Party::session(&web);
@@ -287,7 +294,8 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -361,7 +369,7 @@ async fn unbound_puts_a_session_in_auto_and_back_and_says_so() {
 async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_asks() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, _llm) = overseeing(
+        let (_, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -369,6 +377,7 @@ async fn below_unbound_only_the_act_switch_changes_a_mode_and_only_to_one_that_a
             &[],
         )
         .await;
+        super::boss_allows(&llm).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
         let (_, mut o) = crew.overseer_service().unwrap();
         let set = |mode| Action::SetMode {
@@ -407,7 +416,8 @@ async fn a_mode_waits_for_the_turn_and_bypass_is_only_on_a_session_it_runs() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -512,7 +522,8 @@ async fn a_kept_auto_mode_ends_with_unbound_and_with_the_persons_resume() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -604,7 +615,8 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             "anywhere = true\n",
             "anywhere = true\nbudget_usd_per_day = 1\n",
         );
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })
@@ -879,7 +891,8 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
         eventually("the overseer's tools", async || {
             overseer.tools.has("crew.set_mode").then_some(())
         })

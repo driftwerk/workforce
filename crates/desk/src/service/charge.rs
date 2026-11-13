@@ -662,11 +662,11 @@ impl Desk {
         )
     }
 
-    /// Whether `id`'s open request `approval` would read or change an
-    /// agent's own settings (its config, where its budget and limits are),
-    /// as far as Desk can tell: a file it names, or a command that may
-    /// reach one ([`command_may_touch_settings`]). Not knowing where home
-    /// is yet, everything counts.
+    /// Whether `id`'s open request `approval` would change an agent's own
+    /// settings (its config, where its oversight, budget and limits are),
+    /// as far as Desk can tell: a file it writes, or a command that may
+    /// write one ([`command_may_touch_settings`]). Reading them is
+    /// allowed. Not knowing where home is yet, everything counts.
     fn touches_agent_settings(&self, id: Uuid, approval: Uuid) -> bool {
         let settings = self.0.state.lock().charges.agent_settings.clone();
         if settings.is_empty() {
@@ -689,9 +689,8 @@ impl Desk {
             settings.iter().any(|s| p.starts_with(s))
         };
         match &facts.what {
-            charge::What::Change(paths) | charge::What::Read(paths) => {
-                paths.iter().any(|p| named(p))
-            }
+            // Reading them changes nothing: only a write is the person's.
+            charge::What::Change(paths) => paths.iter().any(|p| named(p)),
             charge::What::Command(command) => command_may_touch_settings(
                 command,
                 std::path::Path::new(&view.cwd),
@@ -1490,57 +1489,232 @@ fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-/// Whether `command`, run in `cwd`, may read or change one of `settings`
+/// Whether `command`, run in `cwd`, may change one of `settings`
 /// (agents' own config files and folders, each inside its workspace), as
-/// far as its text can tell. It errs towards yes, as Act fully allows
-/// whatever it says no to:
-/// - it names a workspace, however written (`~`, `$HOME`, `//`, `/./`);
-/// - it runs inside a workspace;
-/// - it names one of those files or folders by name and the path to it
-///   can't be read from the text (a variable, a substitution, a glob, `..`).
+/// far as its words can tell. It errs towards yes, as Act fully allows
+/// whatever it says no to. A word of it is held when, as a path (`~` and
+/// `$HOME` read as home; a relative one read from `cwd`, from home, and
+/// from every absolute path the command names, as a `cd` may have gone
+/// there):
+/// - it is inside a workspace, or names one of a workspace's own
+///   folders above it short of home (`~/.workforce`, its `agents`);
+/// - it can't be read (a variable, a substitution, a glob) and ends in,
+///   or passes through, a settings file or folder's name.
+///
+/// Words can't catch everything a program might build at run time: the
+/// budget is the person's because Desk's card is how it changes.
 pub(crate) fn command_may_touch_settings(
     command: &str,
     cwd: &std::path::Path,
     settings: &[std::path::PathBuf],
     home: &std::path::Path,
 ) -> bool {
-    let home_s = home.display().to_string();
-    let mut text = command
-        .replace("${HOME}", &home_s)
-        .replace("$HOME", &home_s)
-        .replace("~/", &format!("{home_s}/"));
-    loop {
-        let next = text.replace("/./", "/").replace("//", "/");
-        if next == text {
-            break;
-        }
-        text = next;
+    use std::path::{Component, Path, PathBuf};
+    // Only what may write is held: a command made only of reads, with no
+    // output sent to a file, changes nothing.
+    if !may_write(command) {
+        return false;
     }
-    let real = |p: &std::path::Path| {
-        crate::computer::boss::resolve_real(p).unwrap_or_else(|| p.to_path_buf())
-    };
-    let cwd = real(cwd);
-    let mut roots: Vec<std::path::PathBuf> = settings
-        .iter()
-        .filter_map(|s| s.parent().map(real))
-        .collect();
-    roots.sort();
-    roots.dedup();
-    if roots.iter().any(|r| {
-        cwd.starts_with(r) || text.contains(&r.display().to_string()) || {
-            // As written, before resolving its links.
-            let shown = r.display().to_string();
-            !shown.is_empty() && command.contains(&shown)
+    // `p` as its links and `.`/`..` resolve, as far as it exists.
+    fn real(p: &Path) -> PathBuf {
+        let mut lexical = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    lexical.pop();
+                }
+                c => lexical.push(c),
+            }
         }
-    }) {
+        let mut head = lexical.clone();
+        let mut tail = Vec::new();
+        loop {
+            if let Some(r) = crate::computer::boss::resolve_real(&head) {
+                return tail
+                    .iter()
+                    .rev()
+                    .fold(r, |acc, t: &std::ffi::OsString| acc.join(t));
+            }
+            match (head.file_name().map(|n| n.to_os_string()), head.parent()) {
+                (Some(name), Some(up)) => {
+                    tail.push(name);
+                    head = up.to_path_buf();
+                }
+                _ => return lexical,
+            }
+        }
+    }
+    let home_real = real(home);
+    let roots: Vec<PathBuf> = {
+        let mut r: Vec<PathBuf> = settings
+            .iter()
+            .filter_map(|s| s.parent().map(real))
+            .collect();
+        r.sort();
+        r.dedup();
+        r
+    };
+    // A workspace, or a folder of its above it and short of home.
+    let guarded: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|r| {
+            r.ancestors()
+                .take_while(|a| a.starts_with(&home_real) && *a != home_real)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .chain(roots.iter().cloned())
+        .collect();
+    let names: Vec<String> = settings
+        .iter()
+        .filter_map(|s| s.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let home_s = home.display().to_string();
+    let text = command
+        .replace("${HOME}", &home_s)
+        .replace("$HOME", &home_s);
+    let words: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || ";|&()<>'\"=:,".contains(c))
+        .filter(|w| !w.is_empty())
+        .map(|w| match w {
+            "~" => home_s.clone(),
+            w => match w.strip_prefix("~/") {
+                Some(rest) => format!("{home_s}/{rest}"),
+                None => w.to_string(),
+            },
+        })
+        .collect();
+    let mut bases = vec![real(cwd), home_real.clone()];
+    bases.extend(
+        words
+            .iter()
+            .filter(|w| w.starts_with('/'))
+            .map(|w| real(Path::new(w))),
+    );
+    if bases.iter().any(|b| roots.iter().any(|r| b.starts_with(r))) {
         return true;
     }
-    let unread = ['$', '`', '*', '?', '['].iter().any(|c| text.contains(*c)) || text.contains("..");
-    unread
-        && settings
-            .iter()
-            .filter_map(|s| s.file_name())
-            .any(|name| text.contains(name.to_string_lossy().as_ref()))
+    let held = |p: &Path| {
+        let p = real(p);
+        roots.iter().any(|r| p.starts_with(r)) || guarded.contains(&p)
+    };
+    words.iter().any(|w| {
+        let unread = w.contains(['$', '`', '*', '?', '[']);
+        let through = || {
+            let parts: Vec<&str> = w.split('/').collect();
+            names.iter().any(|n| parts.contains(&n.as_str()))
+        };
+        if unread {
+            return through();
+        }
+        match w.starts_with('/') {
+            true => held(Path::new(w)),
+            false => bases.iter().any(|b| held(&b.join(w))),
+        }
+    })
+}
+
+/// Whether `command` may write anything: anything but a chain of plain
+/// reads (`cat`, `grep`, `ls`, `sed` without `-i`, `find` without
+/// `-exec` or `-delete`, …) with no output redirected to a file. What it
+/// doesn't know counts as a write.
+pub(crate) fn may_write(command: &str) -> bool {
+    const READS: &[&str] = &[
+        "cat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ls",
+        "tree",
+        "wc",
+        "stat",
+        "file",
+        "du",
+        "df",
+        "pwd",
+        "echo",
+        "printf",
+        "true",
+        "test",
+        "[",
+        "diff",
+        "cmp",
+        "jq",
+        "yq",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "column",
+        "nl",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        "which",
+        "type",
+        "date",
+        "env",
+        "id",
+        "whoami",
+        "uname",
+        "hostname",
+        "sed",
+        "awk",
+        "find",
+        "xxd",
+        "od",
+        "md5sum",
+        "sha256sum",
+        "cd",
+    ];
+    // Output into a file: `>` and `>>`, but not `2>&1` or `>/dev/null`.
+    let cleaned = command
+        .replace("2>&1", "")
+        .replace(">&2", "")
+        .replace(">/dev/null", "")
+        .replace("> /dev/null", "")
+        .replace("2>/dev/null", "");
+    if cleaned.contains('>') || cleaned.contains("tee ") {
+        return true;
+    }
+    cleaned
+        .split(['|', ';', '&', '\n', '(', ')', '`'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            // A variable set first (`M=/x; …`, `LC_ALL=C sort`) writes nothing.
+            let words: Vec<&str> = segment
+                .split_whitespace()
+                .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+                .collect();
+            let Some(program) = words.first() else {
+                return false;
+            };
+            let program = program.rsplit('/').next().unwrap_or(program);
+            if !READS.contains(&program) {
+                return true;
+            }
+            match program {
+                "sed" => words
+                    .iter()
+                    .any(|w| w.starts_with("-i") || *w == "--in-place"),
+                "awk" => segment.contains("system(") || segment.contains("print >"),
+                "find" => words.iter().any(|w| {
+                    matches!(
+                        *w,
+                        "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint"
+                    )
+                }),
+                _ => false,
+            }
+        })
 }
 
 #[cfg(test)]

@@ -811,6 +811,24 @@ async fn overseeing(
     (overseer, crew, d, llm)
 }
 
+/// The boss's decision calls (`decide`) all allow what they're asked.
+async fn boss_allows(llm: &wiremock::MockServer) {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(super::decide::MARK))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "d1", "object": "chat.completion", "model": "mock",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                "content": "ALLOW: it serves the session's work"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .with_priority(1)
+        .mount(llm)
+        .await;
+}
+
 fn session_party(name: &str) -> workforce_desk::crew::Party {
     workforce_desk::crew::Party {
         kind: PartyKind::Session,
@@ -1801,7 +1819,7 @@ mod act_fully;
 
 mod act_fully_budget;
 
-mod allow_at_once;
+mod decides_at_once;
 
 mod decisions;
 mod items;

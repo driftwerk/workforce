@@ -64,7 +64,8 @@ async fn act_fully_ships_in_any_repository_at_once() {
         let globex = base.join("globex-api");
         repo(&acme, "git@github.com:acme/acme-web.git");
         repo(&globex, "git@github.com:globex/globex-api.git");
-        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        super::boss_allows(&llm).await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -143,7 +144,7 @@ async fn act_fully_needs_no_repositories_and_falls_back_to_act_only_over_its_bud
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, _llm) = overseeing(
+        let (overseer, crew, d, llm) = overseeing(
             &base,
             pool,
             "ok",
@@ -151,6 +152,7 @@ async fn act_fully_needs_no_repositories_and_falls_back_to_act_only_over_its_bud
             &[],
         )
         .await;
+        super::boss_allows(&llm).await;
         crew.read_spent_today(&crew.overseers()).await;
         let id = overseer.agent_id.as_str().to_string();
         let (_, o) = crew.overseer_service().unwrap();

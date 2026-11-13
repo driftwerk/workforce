@@ -388,13 +388,13 @@ impl CrewHub {
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
             // Unbound, what waits on an answer wakes it at once, unless it
-            // is a request Desk allows at once itself (`allow`).
+            // is a request its decision call has (`decide`).
             Kind::NeedsYou => {
                 unbound
                     && match event.approval_id.as_deref() {
                         // A request: only while it still waits and isn't
-                        // one Desk allows at once itself (`allow`), which
-                        // has often answered it by now.
+                        // one its decision call has (`decide`), which has
+                        // often answered it by now.
                         Some(a) => subject
                             .id
                             .parse()

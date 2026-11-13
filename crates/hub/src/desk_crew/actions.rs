@@ -527,9 +527,9 @@ impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer of `o`'s scope
     /// do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
-        // Unbound, every crew action runs: Desk allows what its sessions
-        // ask the moment they ask (`allow`), and answers the rest as the
-        // boss says (`boss_decides`).
+        // Unbound, every crew action runs: the boss decides what its
+        // sessions ask the moment they ask (`decide`), and Desk answers as
+        // the boss says (`boss_decides`).
         // Its own limits are the person's at every level, unbound too: only
         // ever a card they approve.
         if let Action::ChangeOversight { .. } = action {

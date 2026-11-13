@@ -3625,9 +3625,18 @@ impl Desk {
             }
             (answer, seen)
         };
+        // A boss's deny says why, and what to do instead, to the session.
+        let because = by
+            .as_ref()
+            .filter(|b| b.party.kind == crew::PartyKind::Manager)
+            .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
+            .map(|(name, r)| format!("Denied by {name}, who oversees this session: {r}"));
         let _ = answer.send(match decision {
             Decision::Allow => claude::allow(),
-            Decision::Deny => claude::deny(),
+            Decision::Deny => match &because {
+                Some(m) => claude::deny_saying(m),
+                None => claude::deny(),
+            },
             Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
                 claude::ask_in_terminal()
             }

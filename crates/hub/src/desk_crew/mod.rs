@@ -28,10 +28,10 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 mod actions;
-mod allow;
 mod away;
 mod board;
 pub(crate) mod context;
+mod decide;
 mod decisions;
 mod deliver;
 mod extras;
@@ -594,7 +594,7 @@ impl CrewHub {
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(allow::allow_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
