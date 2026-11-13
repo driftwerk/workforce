@@ -384,6 +384,18 @@ impl CrewHub {
             return None;
         }
         let unbound = self.unbound(o);
+        let view = || subject.id.parse().ok().and_then(|s| self.desk.view(s).ok());
+        // A question the person is in control of is theirs: nothing is said
+        // of it (`answer`). One its Act fully boss answers itself wakes
+        // nothing else.
+        if event.kind == Kind::Question
+            && view().is_some_and(|v| {
+                super::answer::question_of(&v).is_some()
+                    && (self.person_has_questions(&v, overseer) || self.answers_question_itself(&v))
+            })
+        {
+            return None;
+        }
         let wanted = match event.kind {
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
@@ -477,6 +489,35 @@ impl CrewHub {
                 origin: item.origin,
             };
             if !tracked(o, &party) {
+                continue;
+            }
+            // A session's question the person is in control of, or its Act
+            // fully boss answers itself (`answer`), and a request its decision
+            // call has (`decide`): not raised here.
+            if item.kind == ItemKind::Session
+                && item
+                    .id
+                    .parse()
+                    .ok()
+                    .and_then(|s| self.desk.view(s).ok())
+                    .is_some_and(|v| match (&item.approval, &item.question) {
+                        // Only while its call may still be deciding it: one
+                        // it left to the person, or Desk refused, is raised.
+                        (Some(a), _) => {
+                            self.answers_at_once(&v)
+                                && v.pending.as_ref().is_some_and(|p| {
+                                    p.id.to_string() == a.id
+                                        && Utc::now() - p.since < super::decide::DECIDING
+                                })
+                        }
+                        (None, Some(_)) => {
+                            super::answer::question_of(&v).is_some()
+                                && (self.person_has_questions(&v, overseer)
+                                    || self.answers_question_itself(&v))
+                        }
+                        (None, None) => false,
+                    })
+            {
                 continue;
             }
             let (key, trigger) = match item.state {
