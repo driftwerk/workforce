@@ -647,7 +647,7 @@ mod tests {
             "CI is red on main.",
             How::Own,
         );
-        // As V060 left it: no short line, its message from its undo plan.
+        // As V059 left it: no short line, its message from its undo plan.
         d.message = Some(message.into());
         let l = d.line();
         assert_eq!(l.action, "Told web.");
