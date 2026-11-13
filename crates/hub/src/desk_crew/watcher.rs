@@ -415,6 +415,7 @@ impl CrewHub {
                             .is_some_and(|v| {
                                 v.pending.as_ref().is_some_and(|p| p.id.to_string() == a)
                                     && !self.answers_at_once(&v)
+                                    && !self.dialog_is_persons(&v, overseer)
                             }),
                         None => true,
                     }
@@ -504,11 +505,12 @@ impl CrewHub {
                         // Only while its call may still be deciding it: one
                         // it left to the person, or Desk refused, is raised.
                         (Some(a), _) => {
-                            self.answers_at_once(&v)
+                            (self.answers_at_once(&v)
                                 && v.pending.as_ref().is_some_and(|p| {
                                     p.id.to_string() == a.id
                                         && Utc::now() - p.since < super::decide::DECIDING
-                                })
+                                }))
+                                || self.dialog_is_persons(&v, overseer)
                         }
                         (None, Some(_)) => {
                             super::answer::question_of(&v).is_some()
