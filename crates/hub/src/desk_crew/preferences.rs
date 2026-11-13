@@ -225,13 +225,25 @@ impl CrewHub {
         p.from_item = item;
         let store = self.desk.store();
         // The same case and scope said again replaces the older one.
-        let same: Vec<Preference> = store
+        let mut same: Vec<Preference> = store
             .preferences_of(YOU, boss_scope, false)
             .await
             .map_err(Self::pref_err)?
             .into_iter()
             .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
             .collect();
+        // So does the one kept from the same ask (its "Always", say): one
+        // preference per ask.
+        if let Some(item) = item {
+            if let Some(kept) = store
+                .preference_from_item(item)
+                .await
+                .map_err(Self::pref_err)?
+                .filter(|k| !same.iter().any(|o| o.id == k.id))
+            {
+                same.push(kept);
+            }
+        }
         // The older one goes first, so a failure never leaves two that
         // both apply.
         let tz = self.desk.timezone();

@@ -240,7 +240,7 @@ impl DeskStore {
                 &format!(
                     "UPDATE boss_preferences SET overruled_count = overruled_count + 1, \
                        changed_at = now(), \
-                       state = CASE WHEN state = 'active' AND overruled_count + 1 >= $2 \
+                       state = CASE WHEN overruled_count + 1 >= $2 \
                                     THEN 'paused' ELSE state END \
                      WHERE id = $1 AND state = 'active' RETURNING {COLUMNS}"
                 ),

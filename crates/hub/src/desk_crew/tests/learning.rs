@@ -88,6 +88,24 @@ async fn always_turns_an_answer_into_a_scoped_preference_once() {
                 .len(),
             1
         );
+        // The boss keeping one from the same ask in other words replaces
+        // the kept one: one preference per ask.
+        let r = call(
+            &crew,
+            super::super::preferences::PREFER,
+            json!({
+                "when": "CI is red on a merge",
+                "then": "Wait for green",
+                "scope": "all",
+                "item_id": item.id.to_string(),
+            }),
+        )
+        .await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(r.output.to_string().contains("It replaces"), "{}", r.output);
+        let kept = d.store().preferences_of("you", MAIN, false).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].when_text, "CI is red on a merge");
 
         // An ask that settles no case keeps nothing.
         call(&crew, super::super::items::ASK, json!({ "text": "Lunch?" })).await;
