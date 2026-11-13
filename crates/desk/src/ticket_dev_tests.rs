@@ -106,6 +106,22 @@ fn a_pr_s_checks_are_the_latest_run_of_each_pipeline_on_its_branch() {
             state: "fail".into()
         })
     );
+    // A build on a branch of the same name in another repo isn't its.
+    let mut answer = dev_answer();
+    answer["builds"] = json!([
+        { "name": w("Build"), "pipeline": "1", "state": "failed", "branch": w("acme-1-retry"),
+          "repo": w("acme/other"), "updated": "2026-11-12T23:00:00Z" },
+        { "name": w("Build"), "pipeline": "1", "state": "successful", "branch": w("acme-1-retry"),
+          "repo": w("ACME/app"), "updated": "2026-11-12T22:00:00Z" }
+    ]);
+    assert_eq!(
+        jira_work(&answer).unwrap().prs[0].checks,
+        Some(Checks {
+            passed: 1,
+            total: 1,
+            state: "pass".into()
+        })
+    );
     // With no build on its branch, no checks: never a guess.
     let mut answer = dev_answer();
     answer["builds"] = json!([]);

@@ -64,12 +64,18 @@ pub fn remote_links_call(e: &External) -> (&'static str, Value) {
     ("jira.list_remote_links", json!({ "issue_key": e.key }))
 }
 
-/// How a build's runs on a branch went: the latest run of each pipeline
-/// that wasn't cancelled, counted. `None` when none says.
-fn checks_of(branch: &str, builds: &[Value]) -> Option<Checks> {
+/// How a PR's builds went: the builds on its branch (and its repo, when
+/// both name one), the latest run of each pipeline that wasn't cancelled,
+/// counted. `None` when none says.
+fn checks_of(branch: &str, repo: Option<&str>, builds: &[Value]) -> Option<Checks> {
+    let same_repo = |b: &&Value| match (repo, short(&b["repo"], 100)) {
+        (Some(pr), Some(build)) => pr.eq_ignore_ascii_case(&build),
+        _ => true,
+    };
     let mut runs: Vec<&Value> = builds
         .iter()
         .filter(|b| short(&b["branch"], 200).as_deref() == Some(branch))
+        .filter(same_repo)
         .filter(|b| !matches!(b["state"].as_str(), Some("cancelled" | "unknown") | None))
         .collect();
     runs.sort_by_key(|b| std::cmp::Reverse(remote_time(&b["updated"])));
@@ -119,12 +125,14 @@ pub fn jira_work(answer: &Value) -> Option<Work> {
             if state == "open" && count(&p["reviewers"]).unwrap_or(0) > 0 {
                 state = "review".into();
             }
+            let repo = short(&p["repo"], 100);
             Some(DevPr {
                 number: count(&p["number"]).or_else(|| pr_number(&url)),
                 title: short(&p["title"], 200).unwrap_or_else(|| url.clone()),
-                checks: short(&p["source_branch"], 200).and_then(|b| checks_of(&b, builds)),
+                checks: short(&p["source_branch"], 200)
+                    .and_then(|b| checks_of(&b, repo.as_deref(), builds)),
                 author: short(&p["author"], 80),
-                repo: short(&p["repo"], 100),
+                repo,
                 updated: remote_time(&p["last_update"]),
                 state,
                 url,

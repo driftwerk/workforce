@@ -511,6 +511,16 @@ async fn opening_a_ticket_reads_its_development_and_keeps_what_a_failed_read_lef
         assert_eq!(asked["issue_key"], "ACME-1");
         assert_eq!(asked["issue_id"], "11", "the id the pull kept saves a lookup");
 
+        // A pull of a changed issue leaves the development read on open.
+        crate::desk_board_sync::tests::touch(&remote.jira, "ACME-1", |i| {
+            i.summary = "Fix the login page".into();
+        });
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let pulled = desk.ticket_by_key("ACME-1").await.unwrap();
+        assert_eq!(pulled.ticket.title, "Fix the login page", "the pull ran");
+        let kept = serde_json::to_value(&pulled.ticket.external.as_ref().unwrap().dev).unwrap();
+        assert_eq!(kept, dev, "a pull keeps a ticket's development");
+
         // Its development tool fails now: the PRs stay as read, the links
         // are read again.
         {

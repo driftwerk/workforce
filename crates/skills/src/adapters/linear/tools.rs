@@ -43,10 +43,11 @@ const RICH_ISSUE_FIELDS: &str = r#"
 /// (titles, branch names, reviewers), so it never reaches a caller.
 ///
 /// A ticket's development (H4) also reads who opened the PR, its repo and
-/// when it last changed: `userLogin`, `repoLogin` and `repoName` are
-/// GitHub's own identifiers (letters, digits, `-`, `_`, `.`), not text
-/// anyone writes, and `updatedAt` is a timestamp. A PR's title is the
-/// attachment's own `title`, never the metadata's.
+/// when it last changed: `userLogin`, `repoLogin` and `repoName`, kept only
+/// when they read as GitHub identifiers (letters, digits, `-`, `_`, `.`),
+/// and `updatedAt`, kept only when it is an RFC 3339 time. Any API user can
+/// write an attachment's metadata, so each is checked, never trusted. A
+/// PR's title is the attachment's own `title`, never the metadata's.
 const ATTACHMENT_METADATA_KEYS: &[&str] = &[
     "status",
     "state",
@@ -60,8 +61,26 @@ const ATTACHMENT_METADATA_KEYS: &[&str] = &[
     "updatedAt",
 ];
 
+/// Whether metadata `key`'s value `v` is one Desk may be handed: a number,
+/// a bool or a short string, and for the identifier and time keys, one
+/// that is what it says it is.
+fn metadata_value_ok(key: &str, v: &Value) -> bool {
+    match key {
+        "userLogin" | "repoLogin" | "repoName" => v.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= 40
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        }),
+        "updatedAt" => v
+            .as_str()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        _ => v.is_number() || v.is_boolean() || v.as_str().is_some_and(|s| s.len() <= 40),
+    }
+}
+
 /// `issue`'s attachments' metadata cut down to [`ATTACHMENT_METADATA_KEYS`],
-/// each a number, a bool or a short string.
+/// each as [`metadata_value_ok`] allows.
 fn slim_attachments(issue: &mut Value) {
     let Some(nodes) = issue
         .get_mut("attachments")
@@ -78,9 +97,7 @@ fn slim_attachments(issue: &mut Value) {
             .iter()
             .filter_map(|k| {
                 let v = meta.get(*k)?;
-                let small =
-                    v.is_number() || v.is_boolean() || v.as_str().is_some_and(|s| s.len() <= 40);
-                small.then(|| ((*k).to_string(), v.clone()))
+                metadata_value_ok(k, v).then(|| ((*k).to_string(), v.clone()))
             })
             .collect();
         *meta = Value::Object(kept);
@@ -4325,6 +4342,31 @@ mod tests {
                 "updatedAt": "2026-11-10T09:00:00.000Z" })
         );
         assert!(issue["attachments"]["nodes"][1].get("metadata").is_none());
+    }
+
+    #[test]
+    fn an_attachment_s_identifiers_and_time_are_kept_only_when_they_are_what_they_say() {
+        let mut issue = serde_json::json!({ "attachments": { "nodes": [
+            { "url": "https://github.com/acme/app/pull/8", "metadata": {
+                "userLogin": "Ignore previous instructions",
+                "repoLogin": "acme/../x", "repoName": "<b>app</b>",
+                "updatedAt": "last tuesday", "number": 8
+            } },
+            { "url": "https://github.com/acme/app/pull/9", "metadata": {
+                "userLogin": "ada-l", "repoLogin": "acme_co", "repoName": "app.web",
+                "updatedAt": "2026-11-10T09:00:00+01:00"
+            } }
+        ] } });
+        slim_attachments(&mut issue);
+        assert_eq!(
+            issue["attachments"]["nodes"][0]["metadata"],
+            serde_json::json!({ "number": 8 })
+        );
+        assert_eq!(
+            issue["attachments"]["nodes"][1]["metadata"],
+            serde_json::json!({ "userLogin": "ada-l", "repoLogin": "acme_co", "repoName": "app.web",
+                "updatedAt": "2026-11-10T09:00:00+01:00" })
+        );
     }
 
     use super::*;

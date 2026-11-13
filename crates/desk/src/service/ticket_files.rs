@@ -15,6 +15,10 @@ use crate::ticket_files::{self, FileRead, FileSource, TicketFile, FILE_MAX};
 /// How long a ticket's issue, read whole for its files, is taken as read.
 pub const READ_FRESH: chrono::Duration = chrono::Duration::minutes(5);
 
+/// The longest one optional part of a ticket's development is waited for
+/// when it opens: a slow dev-status never holds the ticket up.
+const DEV_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -162,8 +166,9 @@ impl Desk {
 
     /// One optional part of ticket `id`'s development, read through
     /// `remote` by `call`: its answer, or `None` (logged) when the hub
-    /// doesn't offer the tool or it failed, so that part is left as it was
-    /// and the ticket still reads. Quiet: an approval is never asked for it.
+    /// doesn't offer the tool, it failed, or it took over [`DEV_READ_WAIT`],
+    /// so that part is left as it was and the ticket still reads. Quiet: an
+    /// approval is never asked for it.
     async fn read_dev_part(
         &self,
         id: Uuid,
@@ -171,7 +176,12 @@ impl Desk {
         e: &crate::board::External,
         (tool, args): (&'static str, serde_json::Value),
     ) -> Option<serde_json::Value> {
-        match crate::board_sync::call_quiet(remote, e.system, tool, args).await {
+        let read = crate::board_sync::call_quiet(remote, e.system, tool, args);
+        let Ok(answer) = tokio::time::timeout(DEV_READ_WAIT, read).await else {
+            tracing::warn!(ticket = %id, tool, "a ticket's development took too long to read");
+            return None;
+        };
+        match answer {
             Ok(v) => Some(v),
             Err(RemoteError::Missing(_) | RemoteError::NotAllowed(_)) => {
                 tracing::debug!(ticket = %id, tool, "the hub doesn't offer a ticket's development tool");
