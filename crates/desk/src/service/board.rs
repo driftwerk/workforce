@@ -45,6 +45,8 @@ pub struct TicketView {
     pub left_filter: bool,
     /// What stops its change going out to its issue, in plain words.
     pub push_problem: Option<String>,
+    /// Its files: its issue's, or what the person dropped on it.
+    pub files: Vec<crate::ticket_files::TicketFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -366,11 +368,13 @@ impl Desk {
             .collect();
         let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
         let mut problems = self.0.store.push_problems(&ids).await.map_err(internal)?;
+        let mut files = self.0.store.files_of(&ids).await.map_err(internal)?;
         let at = now();
         Ok(tickets
             .into_iter()
             .map(|t| TicketView {
                 push_problem: problems.remove(&t.id),
+                files: files.remove(&t.id).unwrap_or_default(),
                 key: boards.get(&t.board).and_then(|b| t.key(b)),
                 ready: board::ready(&t, &states),
                 blockers: board::blockers(&t, &states),
@@ -1572,6 +1576,20 @@ impl Desk {
                     .detail(json!({ "comment": text }))
                     .about_ticket(t.id, group.as_deref()),
                 );
+                // A session's note is its own, and stays in Desk: never
+                // posted to an issue, where it might name what is private.
+                self.0
+                    .store
+                    .add_comment(
+                        t.id,
+                        None,
+                        &crate::ticket_comments::author_from(&by.party),
+                        &by.party,
+                        &crate::ticket_comments::held(&text),
+                        now(),
+                    )
+                    .await
+                    .map_err(|e| say(internal(e)))?;
                 Ok(json!({ "key": k, "commented": true }))
             }
             TicketCall::Create {

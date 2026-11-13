@@ -600,6 +600,19 @@ async fn a_session_moves_and_comments_on_its_own_ticket_and_no_one_elses() {
             .unwrap();
         assert_eq!(comment.actor.name, "acme-web");
         assert!(comment.text.contains("the logout shares the cookie code"));
+        // It is a comment on the ticket too, the session's own.
+        let comments = d.ticket_comments(theirs.ticket.id).await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "the logout shares the cookie code");
+        assert_eq!(comments[0].author.name, "acme-web");
+        assert_eq!(
+            comments[0].author.kind,
+            crate::ticket_comments::AuthorKind::Agent
+        );
+        assert_eq!(
+            comments[0].posted_by.as_ref().map(|p| p.kind),
+            Some(crate::crew::PartyKind::Session)
+        );
         let made = call(json!({"action": "create", "text": "Add a test\nfor Safari's sign-in"}))
             .await
             .unwrap();
