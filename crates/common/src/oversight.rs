@@ -8,7 +8,7 @@
 //! group = "g-acme" # absent: everything ungrouped
 //! level = "watch" # watch | suggest | act | full
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
-//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true, hold_minutes = 2 }
+//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true, hold_minutes = 2, answer_after_minutes = 10 }
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
@@ -83,7 +83,9 @@
 //! A session in its charge is the person's while they are active in it:
 //! `hold_minutes` after their last keystroke, prompt or message there. What
 //! the session asks after that is the overseer's to answer; what it asks
-//! while they are still typing waits for them.
+//! while they are still typing waits for them. A question it ends a turn
+//! on waits longer: the boss stays silent on it, no answer and no word to
+//! the person, until `answer_after_minutes` after their last input there.
 //!
 //! Check-ins are spent from a rolling hour, `max_checkins_per_day` the
 //! ceiling over a day; what happens while they are spent waits for the next
@@ -157,6 +159,10 @@ pub struct Wake {
     /// How long the person's last input into a session it runs keeps that
     /// session theirs.
     pub hold_minutes: u32,
+    /// How long the person's last input into a session it oversees keeps
+    /// that session's questions theirs: the boss says nothing of them
+    /// until then.
+    pub answer_after_minutes: u32,
 }
 
 /// The local times of the morning and evening summaries, `None` when off.
@@ -382,6 +388,9 @@ pub const MAX_CHECKINS_PER_HOUR: i64 = 60;
 pub const HOLD_MINUTES: u32 = 2;
 /// The longest that hold may be: an hour.
 pub const MAX_HOLD_MINUTES: i64 = 60;
+/// How long, by default, the person's last input into a session keeps its
+/// questions theirs.
+pub const ANSWER_AFTER_MINUTES: u32 = 10;
 
 impl Default for Oversight {
     fn default() -> Self {
@@ -403,6 +412,7 @@ impl Default for Oversight {
                 on_failure: true,
                 on_message: true,
                 hold_minutes: HOLD_MINUTES,
+                answer_after_minutes: ANSWER_AFTER_MINUTES,
             },
             summaries: Summaries {
                 morning: Some((9, 0)),
@@ -791,6 +801,15 @@ impl Oversight {
                         "How long your typing in a session keeps it yours must be a whole number of minutes from 1 to {MAX_HOLD_MINUTES}."
                     ),
                 )?,
+                answer_after_minutes: whole(
+                    wake,
+                    "answer_after_minutes",
+                    d.wake.answer_after_minutes,
+                    1..=MAX_HOLD_MINUTES,
+                    &format!(
+                        "How long your typing in a session keeps its questions yours must be a whole number of minutes from 1 to {MAX_HOLD_MINUTES}."
+                    ),
+                )?,
             },
             summaries: Summaries {
                 morning: time(summaries, "morning", d.summaries.morning, "morning")?,
@@ -1014,6 +1033,22 @@ mod tests {
                 .hold_minutes,
             5
         );
+        assert_eq!(
+            parse("[oversight]\nenabled = true\n")
+                .unwrap()
+                .wake
+                .answer_after_minutes,
+            10,
+            "a session's questions stay the person's ten minutes"
+        );
+        assert_eq!(
+            parse("[oversight.wake]\nanswer_after_minutes = 3\n")
+                .unwrap()
+                .wake
+                .answer_after_minutes,
+            3
+        );
+        assert!(parse("[oversight.wake]\nanswer_after_minutes = 0\n").is_err());
         let wrong = "How long your typing in a session keeps it yours must be a whole number of minutes from 1 to 60.";
         for bad in ["0", "61", "\"2\"", "1.5"] {
             assert_eq!(
