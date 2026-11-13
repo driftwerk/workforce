@@ -18,6 +18,7 @@ use workforce_desk::model::{Engine, NewSession, Origin, SessionState, SessionVie
 use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
+use super::decisions::Done;
 use super::read_only::read_only_in;
 use super::CrewHub;
 
@@ -1214,8 +1215,34 @@ impl CrewHub {
     }
 
     /// Does `action` as `by`. What happened, or what went wrong in plain
-    /// words.
+    /// words. A boss's is recorded in its decision log as it is done, with
+    /// how it is undone; an answer to a session's question is said in its
+    /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        let before = self.before(action);
+        let who = by.clone();
+        let mut done = Done::default();
+        let said = self.perform_as(action, by, &mut done).await?;
+        if let Some(d) = self
+            .record_action(action, &who, &said, &done, &before)
+            .await
+        {
+            if matches!(
+                action,
+                Action::Nudge {
+                    reply_to: Some(_),
+                    ..
+                }
+            ) {
+                self.post_decision(&d).await;
+            }
+        }
+        Ok(said)
+    }
+
+    /// [`Self::perform`]'s work: what it left behind that an undo needs
+    /// goes in `done`.
+    async fn perform_as(&self, action: &Action, by: By, done: &mut Done) -> Result<String, String> {
         let plain = |e: workforce_desk::DeskError| match e {
             workforce_desk::DeskError::NotFound => "That session isn’t there any more.".to_string(),
             workforce_desk::DeskError::Internal(e) => {
@@ -1274,7 +1301,7 @@ impl CrewHub {
                             .line_answer(*ask, sender, message.clone())
                             .await
                             .map_err(line)?;
-                        self.answered_notice(&answer).await;
+                        done.line = Some((answer.id, answer.delivery));
                         Ok(format!("answered {name}"))
                     }
                     // On its line: it gets it once its turn ends, never typed
@@ -1291,6 +1318,7 @@ impl CrewHub {
                             )
                             .await
                             .map_err(line)?;
+                        done.line = Some((told.id, told.delivery));
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
                                 "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
@@ -1380,7 +1408,7 @@ impl CrewHub {
                     .map_err(plain)?;
                 Ok(format!("restarted {}", v.label()))
             }
-            Action::StartSession { .. } => self.start_session(action, by).await,
+            Action::StartSession { .. } => self.start_session(action, by, done).await,
             Action::AssignTicket { .. } => self.assign_ticket(action, by).await,
             Action::MoveTicket {
                 ticket, id, state, ..
@@ -1505,7 +1533,12 @@ impl CrewHub {
     /// more than `[oversight.work] parallel` at once (counted with the
     /// start, so two at once can't both take the last slot); the person
     /// saying yes to its suggestion is theirs to decide, and starts it.
-    async fn start_session(&self, action: &Action, by: By) -> Result<String, String> {
+    async fn start_session(
+        &self,
+        action: &Action,
+        by: By,
+        done: &mut Done,
+    ) -> Result<String, String> {
         let Action::StartSession {
             folder,
             goal,
@@ -1571,6 +1604,7 @@ impl CrewHub {
                         .unwrap_or(s)
                 }
             })?;
+        done.started = Some(v.id);
         Ok(format!(
             "started {} ({}); you run it, and the person can watch it, type into it and take it over",
             v.label(),

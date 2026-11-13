@@ -194,6 +194,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_decisions",
+        "owner",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
         "session_accounts",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

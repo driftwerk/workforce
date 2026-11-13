@@ -32,6 +32,8 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
+pub mod decision;
+pub mod decision_store;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;

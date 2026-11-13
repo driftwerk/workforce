@@ -1798,6 +1798,8 @@ mod act_fully;
 
 mod act_fully_budget;
 
+mod decisions;
+
 mod remote_asks;
 mod served;
 mod unbound;
@@ -2942,14 +2944,28 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap()?;
             dm.messages
                 .iter()
-                .find(|m| m.content.starts_with("Answered acme-web"))
+                .find(|m| m.content.starts_with("I decided: answered acme-web's question"))
                 .cloned()
         })
         .await;
         assert_eq!(
-            notice.desk.and_then(|m| m.delivery),
+            notice.desk.as_ref().and_then(|m| m.delivery),
             Some(workforce_common::channels::desk::DeliveryKind::Notice)
         );
+        // Said from its row: the decision, with the reply's own first
+        // sentence as why, in place of a stock reason.
+        let extras = d.store().extras(std::slice::from_ref(&notice.id)).await.unwrap();
+        let line = &extras[&notice.id].decisions[0];
+        let row = d
+            .store()
+            .decision(line.id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.need, workforce_desk::decision::Need::Question);
+        assert_eq!(row.why, "5433");
+        assert_eq!(line.text, row.what);
+        assert!(notice.content.contains(&row.what), "{}", notice.content);
 
         let pushing = d
             .line_call(

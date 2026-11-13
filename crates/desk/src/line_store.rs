@@ -123,7 +123,8 @@ impl DeskStore {
             .query_opt(
                 &format!(
                     "SELECT {COLUMNS} FROM line_messages \
-                     WHERE in_reply_to = $1 AND kind = 'answer' ORDER BY at LIMIT 1"
+                     WHERE in_reply_to = $1 AND kind = 'answer' AND delivery <> 'withdrawn' \
+                     ORDER BY at LIMIT 1"
                 ),
                 &[&ask],
             )
@@ -227,6 +228,52 @@ impl DeskStore {
             .as_ref()
             .map(message)
             .transpose()
+    }
+
+    /// Withdraws the one message `id` a boss sent a session (a tell, or its
+    /// answer to the session's question) while it is queued or held: it
+    /// never goes in. An answer taken back puts its question back with the
+    /// person, as `escalation` says. The message as it now is, and the
+    /// question put back; `None` when it had already gone in (or isn't a
+    /// boss's).
+    pub async fn line_withdraw_one(
+        &self,
+        id: Uuid,
+        escalation: &crate::line::Escalation,
+    ) -> Result<Option<(LineMessage, Option<LineMessage>)>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let Some(row) = tx
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'withdrawn', updated_at = now() \
+                     WHERE id = $1 AND sender ->> 'kind' = 'manager' AND kind IN ('tell', 'answer') \
+                     AND delivery IN ('queued', 'held') RETURNING {COLUMNS}"
+                ),
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let withdrawn = message(&row)?;
+        let mut reopened = None;
+        if let (LineKind::Answer, Some(ask)) = (withdrawn.kind, withdrawn.in_reply_to) {
+            reopened = tx
+                .query_opt(
+                    &format!(
+                        "UPDATE line_messages SET asked = 'escalated', escalation = $2, updated_at = now() \
+                         WHERE id = $1 AND kind = 'ask' AND asked = 'answered' RETURNING {COLUMNS}"
+                    ),
+                    &[&ask, &serde_json::to_value(escalation)?],
+                )
+                .await?
+                .as_ref()
+                .map(message)
+                .transpose()?;
+        }
+        tx.commit().await?;
+        Ok(Some((withdrawn, reopened)))
     }
 
     /// Gives what waits for the session `from` (queued, or held while it

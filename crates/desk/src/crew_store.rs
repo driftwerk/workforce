@@ -438,14 +438,53 @@ impl DeskStore {
                 &[&ids],
             )
             .await?;
-        rows.iter()
+        let mut out: HashMap<String, Extras> = rows
+            .iter()
             .map(|r| {
                 Ok((
                     r.try_get("message_id")?,
                     serde_json::from_value(r.try_get("extras")?)?,
                 ))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        self.decisions_now(&mut out).await;
+        Ok(out)
+    }
+
+    /// The decision lines in `extras` as their rows are now: undone ones
+    /// with no button, a line message's as its delivery now is. Kept as
+    /// posted when the rows can't be read.
+    async fn decisions_now(&self, extras: &mut HashMap<String, Extras>) {
+        let ids: Vec<uuid::Uuid> = extras
+            .values()
+            .flat_map(|e| e.decisions.iter())
+            .filter_map(|l| l.id.parse().ok())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let rows = match self.decisions_of(&ids).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "decisions couldn't be read for their lines");
+                return;
+            }
+        };
+        let mut delivery = HashMap::new();
+        for d in &rows {
+            if let Some(crate::decision::UndoPlan::Line { message, .. }) = d.plan() {
+                if let Ok(Some(m)) = self.line_message(message).await {
+                    delivery.insert(d.id, m.delivery);
+                }
+            }
+        }
+        for e in extras.values_mut() {
+            for l in e.decisions.iter_mut() {
+                if let Some(d) = rows.iter().find(|d| d.id.to_string() == l.id) {
+                    *l = d.line_now(delivery.get(&d.id).copied());
+                }
+            }
+        }
     }
 
     /// Keeps who said the DM message `message_id`, when its role doesn't.

@@ -26,10 +26,11 @@ use super::watcher::reported;
 use super::CrewHub;
 
 /// Every `crew.*` tool: the reading ones first.
-pub const READ: [&str; 6] = [
+pub const READ: [&str; 7] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
+    super::decisions::NAME,
     "crew.history",
     super::spend::NAME,
     super::board::NAME,
@@ -363,6 +364,11 @@ impl CrewTool {
                 self.account(crew, id, input["question"].as_str()).await
             }
             super::spend::NAME => crew.spend(input, seen).await,
+            // Its own log only: nothing of another boss's is read.
+            super::decisions::NAME => {
+                crew.decisions_tool(b.service.agent_id.as_str(), input)
+                    .await
+            }
             super::board::NAME => crew.board(seen).await,
             _ => Err("not a reading tool".into()),
         }
@@ -471,6 +477,9 @@ impl CrewTool {
             }
         }
         let mut action = Action::parse(self.name, &kept)?;
+        // Tried, whatever comes of it (done, suggested, refused, failed):
+        // its turn didn't let the session wait.
+        crew.acted_on(b.service.agent_id.as_str(), CrewHub::session_of(&action));
         // Nothing outside its scope is looked into, before anything is said
         // of it or the gate weighs it.
         crew.in_scope(&action, &b.seen).await?;
@@ -724,6 +733,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
     match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::decisions::NAME => super::decisions::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
@@ -766,6 +776,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
     match name {
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
+        super::decisions::NAME => super::decisions::schema(),
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
