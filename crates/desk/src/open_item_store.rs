@@ -16,7 +16,7 @@ use crate::store::DeskStore;
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
      said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions, \
-     prefer_scope, question, points, recommended, not_blocking";
+     prefer_scope, question, points, recommended, not_blocking, cant_decide";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -53,6 +53,7 @@ fn item(r: &Row) -> Result<OpenItem> {
             recommended: r.try_get(26)?,
             not_blocking: r.try_get(27)?,
         },
+        cant_decide: r.try_get(28)?,
     })
 }
 
@@ -130,9 +131,9 @@ impl DeskStore {
                         "INSERT INTO boss_open_items (id, boss, owner, kind, session, line_message, \
                          text, holding_up, recommendation, options, generalizes, done_when, \
                          dedupe_key, opened_at, last_said_at, said_count, changed_at, state, \
-                         sessions, question, points, recommended, not_blocking) \
+                         sessions, question, points, recommended, not_blocking, cant_decide) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                         $16, $14, 'open', $17, $18, $19, $20, $21) \
+                         $16, $14, 'open', $17, $18, $19, $20, $21, $22) \
                          ON CONFLICT (boss, dedupe_key) WHERE state <> 'closed' DO NOTHING \
                          RETURNING {COLUMNS}"
                     ),
@@ -158,6 +159,7 @@ impl DeskStore {
                         &points,
                         &new.layout.recommended,
                         &new.layout.not_blocking,
+                        &new.cant_decide,
                     ],
                 )
                 .await?;
@@ -211,7 +213,8 @@ impl DeskStore {
             || (!new.layout.points.is_empty() && new.layout.points != was.layout.points)
             || recommended != was.layout.recommended
             || (new.layout.not_blocking.is_some()
-                && new.layout.not_blocking != was.layout.not_blocking);
+                && new.layout.not_blocking != was.layout.not_blocking)
+            || (new.cant_decide.is_some() && new.cant_decide != was.cant_decide);
         let first_said = new.said && !was.said();
         let r = tx
             .query_one(
@@ -231,7 +234,8 @@ impl DeskStore {
                      question = COALESCE($14, question), \
                      points = CASE WHEN $15 = '[]'::jsonb THEN points ELSE $15 END, \
                      recommended = $16, \
-                     not_blocking = COALESCE($17, not_blocking) \
+                     not_blocking = COALESCE($17, not_blocking), \
+                     cant_decide = COALESCE($18, cant_decide) \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
                 &[
@@ -252,6 +256,7 @@ impl DeskStore {
                     &points,
                     &recommended,
                     &new.layout.not_blocking,
+                    &new.cant_decide,
                 ],
             )
             .await?;
@@ -274,6 +279,23 @@ impl DeskStore {
             .as_ref()
             .map(item)
             .transpose()
+    }
+
+    /// Whichever of `ids` are kept.
+    pub async fn open_items_of(&self, ids: &[Uuid]) -> Result<Vec<OpenItem>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!("SELECT {COLUMNS} FROM boss_open_items WHERE id = ANY($1)"),
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
     }
 
     /// `boss`'s items not closed, oldest first; every boss's with `None`.
