@@ -1352,7 +1352,6 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut events = d.0.events.subscribe();
             let v = until_calls(&d, 3).await;
             assert_eq!(v.rows.len(), 1, "the fork spent nothing of its own: {:?}", v.rows);
             assert_eq!(v.rows[0].session, Some(web.id));
@@ -1361,6 +1360,19 @@ mod tests {
             assert_eq!(v.total.tokens.output, 350 + 90 + 500_000);
             assert!((v.total.usd - (350.0 + 90.0 + 500_000.0) * 20.0 / 1e6).abs() < 1e-9);
             assert_eq!(v.total.billing, [Billing::Unknown].into(), "history from before Desk saw a sign-in");
+
+            // More of the transcript: read from where it was left, once, and
+            // said to have been spent. Listening begins here: the history's
+            // own announcement may have gone before a listener could be had
+            // (Desk is already running when it is returned).
+            let mut events = d.0.events.subscribe();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+            std::io::Write::write_all(&mut f, line("msg_03", 10).as_bytes()).unwrap();
+            d.spend_read(web.id);
+            d.spend_read(web.id);
+            d.spend_read(forked.id);
+            d.spend_read(turn.id);
+            let v = until_calls(&d, 4).await;
             let told = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Ok(DeskEvent::Spend { session }) = events.recv().await {
@@ -1371,15 +1383,6 @@ mod tests {
             .await
             .expect("new spend is announced");
             assert_eq!(told, web.id);
-
-            // More of the transcript: read from where it was left, once.
-            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
-            std::io::Write::write_all(&mut f, line("msg_03", 10).as_bytes()).unwrap();
-            d.spend_read(web.id);
-            d.spend_read(web.id);
-            d.spend_read(forked.id);
-            d.spend_read(turn.id);
-            let v = until_calls(&d, 4).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert_eq!(spent(&d, Filter::default()).await.total.calls, 4);
             assert_eq!(v.rows[0].totals.calls, 4);

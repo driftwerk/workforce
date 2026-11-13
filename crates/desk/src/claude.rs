@@ -913,7 +913,8 @@ pub(crate) mod tests {
                 reply: Some("You've hit your 5-hour limit · resets 9am (Europe/London)".into()),
                 failure: crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
                     window: None,
-                    resets_at: None
+                    resets_at: None,
+                    at: None
                 }),
                 background: None,
             }

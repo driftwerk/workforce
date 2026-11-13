@@ -675,6 +675,12 @@ pub struct Standing {
     /// When a session was last started on the account. A reading taken
     /// before it can't alone say the account is full now.
     pub started_at: Option<DateTime<Utc>>,
+    /// When the account was last signed in (again): a stop or a reading
+    /// from before it was another sign-in's, perhaps another account's.
+    pub signed_in_at: Option<DateTime<Utc>>,
+    /// When a call on the account last succeeded (a session's turn, the
+    /// hub's own call): a stop from before it is over.
+    pub ok_at: Option<DateTime<Utc>>,
 }
 
 /// The longest window that is the plan's own: the weekly one. A longer one
@@ -716,11 +722,35 @@ impl Standing {
         self
     }
 
-    /// The last start `other` knows, where later.
+    /// The last start, sign-in and success `other` knows, where later.
     fn take_holds(&mut self, other: &Standing) {
         self.started_at = self.started_at.max(other.started_at);
+        self.signed_in_at = self.signed_in_at.max(other.signed_in_at);
+        self.ok_at = self.ok_at.max(other.ok_at);
+    }
+
+    /// Since when a stop on the limit no longer counts: the last sign-in, or
+    /// the last call that succeeded, whichever is later.
+    pub fn cleared_at(&self) -> Option<DateTime<Utc>> {
+        self.signed_in_at.max(self.ok_at)
+    }
+
+    /// Whether a refusal at `at` says anything of the account now: only
+    /// one newer than its last sign-in and its last success does. An old
+    /// transcript line, or a stop told back from before, never does.
+    pub fn counts(&self, at: DateTime<Utc>) -> bool {
+        self.cleared_at().is_none_or(|cleared| at > cleared)
+    }
+
+    /// The last stop on the limit, while it still counts ([`Self::counts`]).
+    fn live_hit(&self) -> Option<DateTime<Utc>> {
+        self.hit_at.filter(|at| self.counts(*at))
     }
 }
+
+/// How near a reading's reset must be to the one a stop said to be the same
+/// window, not yet begun again.
+const SAME_RESET: chrono::Duration = chrono::Duration::minutes(10);
 
 /// How long a stop on the limit counts when no window says when it resets.
 const HIT_FOR: chrono::Duration = chrono::Duration::hours(5);
@@ -760,6 +790,11 @@ impl Standing {
         let fresh = match (self.read_at, self.started_at) {
             (Some(read), Some(started)) => read >= started,
             _ => true,
+        } && match (self.read_at, self.cleared_at()) {
+            // Read before the account was signed in again (another sign-in's)
+            // or before a call on it succeeded: it has room since.
+            (Some(read), Some(cleared)) => read > cleared,
+            _ => true,
         };
         let full_window = self
             .windows
@@ -779,19 +814,40 @@ impl Standing {
         }
         // Claude Code said when: full until then, unless a reading of this
         // account since shows that window begun again with room.
-        if let (Some(hit), Some(until)) = (self.hit_at, self.hit_until) {
-            let began_again = self.read_at.is_some_and(|r| r > hit)
-                && self.windows.iter().any(|w| {
-                    self.hit_window == Some(w.minutes)
-                        && w.used_percent < 100.0
-                        && w.resets_at.is_some_and(|r| r > until)
-                });
+        // A stop from before the last sign-in or success is over.
+        let hit_at = self.live_hit();
+        if let (Some(hit), Some(until)) = (hit_at, self.hit_until) {
+            let read_since = self.read_at.is_some_and(|r| r > hit);
+            let plan: Vec<_> = self
+                .windows
+                .iter()
+                .filter(|w| w.minutes <= PLAN_WINDOW_MAX)
+                .collect();
+            let began_again = read_since
+                && match self.hit_window {
+                    Some(minutes) => plan.iter().any(|w| {
+                        w.minutes == minutes
+                            && w.used_percent < 100.0
+                            && w.resets_at.is_some_and(|r| r > until)
+                    }),
+                    // Which window wasn't said (the hub's own call found it):
+                    // a reading since with room in every plan window, none
+                    // of them still resetting when the stop said, has begun
+                    // the one it stopped on again.
+                    None => {
+                        !plan.is_empty()
+                            && plan.iter().all(|w| {
+                                w.used_percent < 100.0
+                                    && w.resets_at.is_none_or(|r| (r - until).abs() > SAME_RESET)
+                            })
+                    }
+                };
             return (until > now && !began_again).then_some(Full {
                 until: Some(until),
                 minutes: self.hit_window,
             });
         }
-        let hit = self.hit_at.filter(|at| now - *at < HIT_FOR)?;
+        let hit = hit_at.filter(|at| now - *at < HIT_FOR)?;
         // A reading after the stop that shows room: it has reset.
         if self.read_at.is_some_and(|r| r > hit) && !self.windows.is_empty() {
             return None;
@@ -836,9 +892,15 @@ impl Standing {
         s.read_at = shift(s.read_at);
         s.hit_at = shift(s.hit_at);
         s.started_at = shift(s.started_at);
+        s.signed_in_at = shift(s.signed_in_at);
+        s.ok_at = shift(s.ok_at);
         let soon = now + chrono::Duration::minutes(2);
         // A start in the future can only be a wrong clock: not kept.
         s.started_at = s.started_at.filter(|t| *t <= soon);
+        // Never later than now here: a sign-in or success "from the future"
+        // would hide a refusal heard here since.
+        s.signed_in_at = s.signed_in_at.filter(|t| *t <= soon).map(|t| t.min(now));
+        s.ok_at = s.ok_at.filter(|t| *t <= soon).map(|t| t.min(now));
         if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
             return None;
         }
@@ -873,7 +935,7 @@ impl Standing {
         if self.full(now).is_some() {
             return false;
         }
-        match (self.hit_at, self.hit_until) {
+        match (self.live_hit(), self.hit_until) {
             // Not full by then: the time passed, or a reading of it showed
             // its window begun again.
             (Some(_), Some(_)) => true,
@@ -1338,21 +1400,111 @@ mod tests {
     #[test]
     fn a_reset_claude_code_said_holds_until_it_passes() {
         let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
-        // Stopped at minute 10, resetting at 600 by Claude Code's word: a
-        // later reading with room doesn't end it, its time does.
-        let mut s = standing(&[(20.0, Some(700))], 50, Some(10));
+        // Stopped at minute 10 on the weekly window, resetting at 600 by
+        // Claude Code's word: a later reading of that same window, not yet
+        // begun again, doesn't end it; its time does.
+        let mut s = standing(&[(99.0, Some(600))], 50, Some(10));
         s.hit_until = Some(at(600));
+        s.hit_window = Some(10_080);
         assert_eq!(s.full(at(60)), Some(Some(at(600))));
         assert_eq!(s.full(at(599)), Some(Some(at(600))));
         assert_eq!(s.full(at(601)), None);
         // A reading of it since, its window begun again with room: reset.
-        s.hit_window = Some(10_080);
         s.read_at = Some(at(70));
+        s.windows[0].used_percent = 20.0;
         s.windows[0].resets_at = Some(at(20_000));
         assert_eq!(s.full(at(80)), None);
         // The other window begun again says nothing of this one.
         s.hit_window = Some(300);
         assert_eq!(s.full(at(80)), Some(Some(at(600))));
+    }
+
+    #[test]
+    fn a_stop_on_an_unknown_window_ends_once_a_later_reading_shows_room() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        // The hub's own call found it full at minute 10, until 600, and
+        // didn't say which window.
+        let mut s = standing(&[(20.0, Some(20_000))], 5, Some(10));
+        s.hit_until = Some(at(600));
+        assert_eq!(s.full(at(60)), Some(Some(at(600))), "read before it");
+        // Read since, that window still resetting when the stop said: the
+        // same window, not yet begun again (a reading that lags).
+        s.read_at = Some(at(50));
+        s.windows = vec![
+            crate::usage::LimitWindow {
+                used_percent: 99.0,
+                resets_at: Some(at(602)),
+                minutes: 10_080,
+            },
+            crate::usage::LimitWindow {
+                used_percent: 10.0,
+                resets_at: Some(at(200)),
+                minutes: 300,
+            },
+        ];
+        assert_eq!(s.full(at(60)), Some(Some(at(600))));
+        // Read since with room in every plan window, none resetting then:
+        // begun again (the plan was reset early).
+        s.windows[0].used_percent = 3.0;
+        s.windows[0].resets_at = Some(at(10_600));
+        assert_eq!(s.full(at(60)), None);
+        assert!(s.reset_confirmed(at(60)));
+        // One plan window full in that reading: full on it.
+        s.windows[1].used_percent = 100.0;
+        assert_eq!(s.full(at(60)), Some(Some(at(200))));
+    }
+
+    #[test]
+    fn a_refusal_from_before_the_last_sign_in_or_success_locks_nothing() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let refused = || {
+            let s = Standing {
+                hit_at: Some(at(100)),
+                hit_until: Some(at(10_000)),
+                hit_window: Some(10_080),
+                ..Default::default()
+            };
+            assert_eq!(s.full(at(200)), Some(Some(at(10_000))));
+            s
+        };
+        // Signed in again since: over, and known to be.
+        let mut s = refused();
+        s.signed_in_at = Some(at(150));
+        assert_eq!(s.full(at(200)), None);
+        assert!(s.reset_confirmed(at(200)));
+        // A call on it succeeded since: over.
+        let mut s = refused();
+        s.ok_at = Some(at(150));
+        assert_eq!(s.full(at(200)), None);
+        // A success before the refusal says nothing of it.
+        s.ok_at = Some(at(50));
+        assert_eq!(s.full(at(200)), Some(Some(at(10_000))));
+        // A stop with no reset said, from before a sign-in: over too.
+        let mut s = refused();
+        s.hit_until = None;
+        s.signed_in_at = Some(at(150));
+        assert_eq!(s.full(at(200)), None);
+        // A reading at 100% taken before the sign-in was another sign-in's.
+        let mut s = standing(&[(100.0, Some(10_000))], 120, None);
+        assert!(s.full(at(200)).is_some());
+        s.signed_in_at = Some(at(150));
+        assert_eq!(s.full(at(200)), None);
+        // What another computer knew from before the sign-in brings no stop
+        // back, its sign-in and success times are kept, and shifted.
+        let mut here = Standing {
+            signed_in_at: Some(at(150)),
+            ..Default::default()
+        };
+        assert!(here.learn(&refused()));
+        assert_eq!(here.full(at(200)), None);
+        let merged = refused().merged(&here);
+        assert_eq!(merged.full(at(200)), None);
+        let mut there = refused();
+        there.ok_at = Some(at(150));
+        let seen = there
+            .as_seen(chrono::Duration::minutes(5), at(300))
+            .unwrap();
+        assert_eq!(seen.ok_at, Some(at(155)));
     }
 
     #[test]

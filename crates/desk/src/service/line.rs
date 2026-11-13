@@ -354,18 +354,18 @@ impl Desk {
                         }
                     };
                     let mut withdrawn = false;
-                    for mut ask in asks.into_iter().filter(|a| {
+                    for ask in asks.into_iter().filter(|a| {
                         a.from_session() == Some(id)
                             && a.to.kind == PartyKind::Manager
                             && a.asked == Some(Asked::Open)
                     }) {
-                        ask.asked = Some(Asked::Withdrawn);
-                        ask.updated_at = Utc::now();
-                        match self.0.store.put_line(&ask).await {
-                            Ok(()) => {
+                        // One statement: an answer that came first stands.
+                        match self.0.store.line_withdraw_ask(ask.id, &[Asked::Open]).await {
+                            Ok(Some(ask)) => {
                                 self.line_announce(&ask);
                                 withdrawn = true;
                             }
+                            Ok(None) => {}
                             Err(e) => {
                                 tracing::warn!(error = %e, "couldn't withdraw a moved session's question")
                             }
@@ -670,23 +670,14 @@ impl Desk {
     /// at the next idle instead. Each refusal names its own message, so
     /// however many were said, each comes back and only it.
     pub(super) async fn line_steer_refused(&self, id: Uuid, row: Uuid) {
-        let back =
-            async {
-                // Only one said to this session and not yet back: a message
-                // that was taken some other way stays taken.
-                let Some(mut m) =
-                    self.0.store.line_message(row).await?.filter(|m| {
-                        m.delivery == Delivery::Delivered && m.to_session() == Some(id)
-                    })
-                else {
-                    return Ok(None);
-                };
-                m.delivery = Delivery::Queued;
-                m.delivered_at = None;
-                m.updated_at = Utc::now();
-                self.0.store.put_line(&m).await?;
-                Ok::<_, eyre::Report>(Some(m))
+        let back = async {
+            // Only one said to this session and not yet back: a message
+            // that was taken some other way stays taken.
+            let Some(m) = self.0.store.line_untake(row, &id.to_string()).await? else {
+                return Ok(None);
             };
+            Ok::<_, eyre::Report>(Some(m))
+        };
         match back.await {
             Ok(None) => {}
             Ok(Some(m)) => {
@@ -1428,10 +1419,15 @@ impl Desk {
                 Delivery::Queued
             };
             if m.delivery != wanted {
-                m.delivery = wanted;
-                m.updated_at = Utc::now();
-                self.0.store.put_line(&m).await?;
-                self.line_announce(&m);
+                // One statement: a row taken, withdrawn or edited since
+                // the inbox was read is left as it is.
+                match self.0.store.line_set_waiting(m.id, wanted).await? {
+                    Some(set) => {
+                        self.line_announce(&set);
+                        m = set;
+                    }
+                    None => continue,
+                }
             }
             if now != Ok(Deliver::Paste) || typed_in || self.line_gate(&view, &m).is_some() {
                 continue;
@@ -1442,11 +1438,9 @@ impl Desk {
             let text = self.rendered(&taken).await;
             if let Err(e) = self.type_prompt(id, &text, Self::typed_by(&taken).as_ref()) {
                 // Not typed in: it waits on.
-                let mut back = taken;
-                back.delivery = Delivery::Queued;
-                back.delivered_at = None;
-                self.0.store.put_line(&back).await?;
-                self.line_announce(&back);
+                if let Some(back) = self.0.store.line_untake(taken.id, &id.to_string()).await? {
+                    self.line_announce(&back);
+                }
                 tracing::debug!(session = %id, error = %e, "a line message couldn't be typed in");
                 continue;
             }
@@ -1558,17 +1552,26 @@ impl Desk {
                 return;
             }
         };
-        for mut ask in asks {
+        for ask in asks {
             let to_it = ask.to_session() == Some(id);
             if !to_it && ask.from_session() != Some(id) {
                 continue;
             }
-            ask.asked = Some(Asked::Withdrawn);
-            ask.updated_at = Utc::now();
-            if let Err(e) = self.0.store.put_line(&ask).await {
-                tracing::warn!(error = %e, "couldn't withdraw a question");
-                continue;
-            }
+            // One statement: an answer or a dismissal that came first
+            // stands, and is not withdrawn over.
+            let ask = match self
+                .0
+                .store
+                .line_withdraw_ask(ask.id, &[Asked::Open, Asked::Escalated, Asked::Lapsed])
+                .await
+            {
+                Ok(Some(ask)) => ask,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "couldn't withdraw a question");
+                    continue;
+                }
+            };
             self.line_announce(&ask);
             let Some(asker) = ask.from_session().filter(|_| to_it) else {
                 continue;
@@ -1750,10 +1753,19 @@ impl Desk {
                 None => Err(Refusal::WentAhead.into()),
             };
         }
-        q.asked = Some(Asked::Escalated);
-        q.escalation = Some(escalation);
-        q.updated_at = Utc::now();
-        self.0.store.put_line(&q).await?;
+        // One statement: an answer, a dismissal or a lapse that came first
+        // stands.
+        let Some(given) = self.0.store.line_escalate_ask(q.id, &escalation).await? else {
+            return Err(
+                match self.0.store.line_message(ask).await?.and_then(|q| q.asked) {
+                    Some(Asked::Lapsed) => Refusal::WentAhead,
+                    Some(Asked::Dismissed) => Refusal::SetAside,
+                    _ => Refusal::Answered,
+                }
+                .into(),
+            );
+        };
+        q = given;
         let why = q.escalation.as_ref().map_or("", |e| e.why.as_str());
         self.note(
             by.event(
