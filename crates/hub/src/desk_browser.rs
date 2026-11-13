@@ -653,7 +653,12 @@ struct ShowBody {
 /// `agent`'s tab to the front of the person's Chrome, for a setup card's
 /// "Show the sign-in page": `{shown}`, false when it has none open or Chrome
 /// isn't connected. The person's only, like Stop.
-async fn show(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>, Json(b): Json<ShowBody>) -> Response {
+async fn show(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<ShowBody>,
+) -> Response {
     holder!(r, h, q);
     Json(json!({ "shown": browser::show(&b.agent).await })).into_response()
 }
