@@ -957,6 +957,7 @@ impl Desk {
             if issue.updated_at <= e.remote_updated_at
                 && e.synced
                 && !crate::board_sync::has_escaped_newlines(&t.body)
+                && !crate::board_sync::rereads_html(e, &t.body)
             {
                 return self.refresh_assignee(t.clone(), issue).await.map_err(fail);
             }
@@ -1102,6 +1103,8 @@ impl Desk {
         }
         if p.body.is_some() || issue.body.is_some() {
             e.clipped = issue.clipped;
+            // Read with today's reader: never read again for its old shape.
+            e.html_read = crate::board_sync::HTML_READ;
         }
         e.details = crate::board_sync::details_of(issue, Some(&e.details));
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
@@ -1196,6 +1199,7 @@ impl Desk {
                 },
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
+                html_read: crate::board_sync::HTML_READ,
                 details: crate::board_sync::details_of(issue, None),
             }),
             created_by: by.party.clone(),
@@ -1872,8 +1876,7 @@ impl Desk {
         let noted = crate::board_sync::noted_after(e.noted, t.state, commented);
         for _ in 0..3 {
             if let Some(ext) = t.external.as_mut() {
-                ext.seen = sent.clone();
-                ext.noted = noted;
+                crate::board_sync::pushed(ext, &sent, noted, push.body.is_some());
             }
             match self.0.store.put_ticket(&mut t).await {
                 Ok(()) => {
@@ -2127,6 +2130,8 @@ impl Desk {
             },
             assignee: None,
             clipped: false,
+            // Its body is Desk's own: never read again for an old shape.
+            html_read: crate::board_sync::HTML_READ,
             details: Default::default(),
         });
         loop {
