@@ -91,22 +91,22 @@ impl UpdateWriter for HubWriter {
 }
 
 /// A session that changed since the person was last told of it.
-struct Changed {
-    id: Uuid,
-    name: String,
+pub(super) struct Changed {
+    pub id: Uuid,
+    pub name: String,
     account: Account,
     new: Vec<Done>,
 }
 
 /// What one boss's next update would say now.
-struct Batch {
-    change: Change,
-    sessions: Vec<Changed>,
-    decisions: Vec<BossDecision>,
-    kept: Vec<String>,
+pub(super) struct Batch {
+    pub change: Change,
+    pub sessions: Vec<Changed>,
+    pub decisions: Vec<BossDecision>,
+    pub kept: Vec<String>,
     waiting: Vec<OpenItem>,
     restated: Vec<(Uuid, bool)>,
-    told: HashMap<Uuid, Told>,
+    pub told: HashMap<Uuid, Told>,
 }
 
 impl CrewHub {
@@ -121,12 +121,13 @@ impl CrewHub {
     }
 
     /// What `service`'s next update would say, from `state`, at `now`.
-    async fn batch(
+    pub(super) async fn batch(
         &self,
         service: &AgentService,
         o: &Oversight,
         state: &UpdateState,
         now: DateTime<Utc>,
+        away: Option<DateTime<Utc>>,
     ) -> Batch {
         let boss = service.agent_id.as_str();
         let seen = self.desk.seen_by(&o.scope);
@@ -156,7 +157,23 @@ impl CrewHub {
                 continue;
             };
             let was = state.told.get(&v.id);
-            let c = update::changed(was, a, state.since);
+            let mut c = update::changed(was, a, state.since);
+            let mut new: Vec<Done> = update::done_since(was, a, state.since)
+                .into_iter()
+                .cloned()
+                .collect();
+            // A catch-up says all that was done while the person was away,
+            // told in an update they didn't read or not.
+            if let Some(from) = away {
+                let all = update::done_since(None, a, from.max(state.since));
+                if !all.is_empty() {
+                    c = c.max(match all.iter().any(|d| update::is_result(d)) {
+                        true => Change::Result,
+                        false => Change::Small,
+                    });
+                    new = all.into_iter().cloned().collect();
+                }
+            }
             told.insert(v.id, Told::of(a));
             if c == Change::None {
                 continue;
@@ -165,14 +182,14 @@ impl CrewHub {
             sessions.push(Changed {
                 id: v.id,
                 name: v.label().to_string(),
-                new: update::done_since(was, a, state.since)
-                    .into_iter()
-                    .cloned()
-                    .collect(),
+                new,
                 account: a.clone(),
             });
         }
-        let last = state.last_update_at.unwrap_or(state.since);
+        let mut last = state.last_update_at.unwrap_or(state.since);
+        if let Some(from) = away {
+            last = last.min(from);
+        }
         let store = self.desk.store();
         let composed = o.updates.enabled;
         let decisions: Vec<BossDecision> = store
@@ -235,7 +252,7 @@ impl CrewHub {
     /// The session paragraphs of `b`: the cheap model's in the boss's
     /// voice when it is on and may be asked, else plainly from the rows;
     /// any it leaves out plainly too.
-    async fn paragraphs(
+    pub(super) async fn paragraphs(
         &self,
         boss: &str,
         owner: &str,
@@ -346,10 +363,43 @@ impl CrewHub {
         let now = Utc::now();
         let store = self.desk.store();
         let state = store.update_state(boss, now).await?;
+        let dm = self.dm_look(service, &owner, o);
+        // While the person types to it, or its reply is being written,
+        // nothing of this goes out: the next look sends it.
+        let held = self.update_held(boss, dm.session.as_deref());
+        let mut state = state;
         if let Some(p) = state.pending.clone() {
-            return self.resume(service, &owner, o, &state, p).await;
+            // An update that didn't go before the person went away (a
+            // failed send, a restart): the catch-up covers it, rather than
+            // a second message for one return.
+            let away = state.away_since.is_some() || dm.away.is_some();
+            if away && p.away.is_none() && p.sent.is_none() && !p.handed {
+                store.update_unpend(boss).await?;
+                state.pending = None;
+            } else if held && p.sent.is_none() {
+                self.poke_at_release(boss);
+                return Ok(());
+            } else {
+                return self.resume(service, &owner, o, &state, p).await;
+            }
         }
-        let b = self.batch(service, o, &state, now).await;
+        // Away: what changes gathers for their return. Back: one catch-up.
+        let away = match (state.away_since, dm.away) {
+            (None, Some(since)) => {
+                store.update_away(boss, since).await?;
+                true
+            }
+            (Some(_), Some(_)) => true,
+            (Some(since), None) if !held => {
+                return self.catch_up(service, &owner, o, &state, since).await;
+            }
+            (Some(_), None) => {
+                self.poke_at_release(boss);
+                return Ok(());
+            }
+            (None, None) => false,
+        };
+        let b = self.batch(service, o, &state, now, None).await;
         let gather_since = match (b.change, state.gather_since) {
             (Change::None, None) => return Ok(()),
             (Change::None, Some(_)) => {
@@ -366,6 +416,10 @@ impl CrewHub {
                 since.unwrap_or(now)
             }
         };
+        if away || held {
+            self.poke_at_release(boss);
+            return Ok(());
+        }
         let read = service
             .sessions
             .desk_read(&owner, DESK_CHANNEL)
@@ -412,6 +466,7 @@ impl CrewHub {
             cutoff: Some(now),
             handed,
             sent: None,
+            away: None,
         };
         self.desk.store().update_pend(boss, &p).await?;
         Ok(p)
@@ -481,11 +536,15 @@ impl CrewHub {
         let owner = self.person(Some(service))?;
         let now = Utc::now();
         let state = self.desk.store().update_state(boss, now).await.ok()?;
+        // Away, it gathers for their catch-up instead.
+        if state.away_since.is_some() {
+            return None;
+        }
         let p = match state.pending.clone() {
             Some(p) if p.handed && p.sent.is_none() => p,
             Some(_) => return None,
             None => {
-                let b = self.batch(service, o, &state, now).await;
+                let b = self.batch(service, o, &state, now, None).await;
                 if b.change == Change::None {
                     return None;
                 }
@@ -599,7 +658,7 @@ impl CrewHub {
     /// Sends `p` as `service`'s update, once: when a restart finds it
     /// already in the DM, it is only marked told; one that couldn't go is
     /// kept, and sent as it is on a later look.
-    async fn send(
+    pub(super) async fn send(
         &self,
         service: &Arc<AgentService>,
         owner: &str,
@@ -629,8 +688,11 @@ impl CrewHub {
             None => {
                 let target =
                     DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-                let mut delivery =
-                    crate::desk_surface::Delivery::text(DeliveryKind::Update, p.text.clone());
+                let kind = match p.away {
+                    Some(_) => DeliveryKind::Away,
+                    None => DeliveryKind::Update,
+                };
+                let mut delivery = crate::desk_surface::Delivery::text(kind, p.text.clone());
                 delivery.request_id = Some(id);
                 let message = crate::desk_surface::deliver(service, owner, &target, delivery)
                     .await?
@@ -644,6 +706,7 @@ impl CrewHub {
         };
         let extras = Extras {
             update: Some(p.update.clone()),
+            away: p.away.clone(),
             suggestions: self.quiet_suggestions(boss, &p),
             ..Default::default()
         };
@@ -716,6 +779,12 @@ impl CrewHub {
         let store = self.desk.store();
         let now = Utc::now();
         let cutoff = p.cutoff.unwrap_or(now);
+        // A catch-up ends the absence it covered, once.
+        if let Some(a) = &p.away {
+            store
+                .update_back(service.agent_id.as_str(), a.since)
+                .await?;
+        }
         for (item, park) in &p.restated {
             if let Err(e) = store.item_said(*item, now, *park).await {
                 tracing::warn!(error = %e, "counting a restated item failed");
@@ -775,7 +844,13 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = every.tick() => crew.look_at_updates().await,
+            _ = every.tick() => {
+                // Held needs-you a restart left: theirs by now.
+                crew.post_due_cards().await;
+                crew.look_at_updates().await;
+            }
+            // The person paused typing, came back, or wrote: look now.
+            () = crew.update_poke.notified() => crew.look_at_updates().await,
         }
     }
 }

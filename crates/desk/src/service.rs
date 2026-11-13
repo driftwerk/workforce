@@ -1645,6 +1645,7 @@ impl Desk {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
         }
         desk.adopt_held(held).await;
+        desk.handoffs_recover().await;
         desk.carry_asks(kept_asks, open_waits);
 
         let hooks = crate::api::hook_router(desk.clone());
@@ -6126,6 +6127,7 @@ impl Desk {
                             reason: None,
                             suggestion_id: None,
                             hop: 0,
+                            preference: None,
                         };
                         if let Err(e) = self.interrupt(id, Some(breaker)) {
                             tracing::warn!(%id, error = %e, "couldn't end a held Codex turn");

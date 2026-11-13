@@ -281,6 +281,18 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
         "crew.board" => vec![(json!({}), false)],
         "crew.decisions" => vec![(json!({}), false)],
         "crew.open_items" => vec![(json!({}), false)],
+        // Kept under its own scope, and only its own read or changed.
+        "crew.prefer" => vec![(
+            json!({ "when": "a session wants a key", "then": "ask first" }),
+            false,
+        )],
+        "crew.preferences" => vec![
+            (json!({}), false),
+            (
+                json!({ "action": "forget", "preference_id": uuid::Uuid::new_v4().to_string() }),
+                false,
+            ),
+        ],
         "crew.promise" => vec![(
             json!({ "session_id": s, "text": "Tell you when it merges", "done_when": "merged" }),
             true,

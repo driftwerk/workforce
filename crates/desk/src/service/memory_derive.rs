@@ -5,10 +5,12 @@
 //! a session is sent to the model while derivation is off for the Desk, for
 //! its group (until the person lets it), or memory is paused.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use parking_lot::Mutex;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -20,7 +22,7 @@ use crate::memory_derive_store::{model_name, Apply, Claim, ItemRow, Unread, Unre
 /// stopped mid-call finds the session due again.
 const LEASE: Duration = Duration::from_secs(5 * 60);
 /// The longest a model call is given.
-const CALL_WITHIN: Duration = Duration::from_secs(2 * 60);
+pub(super) const CALL_WITHIN: Duration = Duration::from_secs(2 * 60);
 /// How often an idle worker looks for sessions due.
 const IDLE_EVERY: Duration = Duration::from_secs(30);
 /// How often a worker at the day's limit looks again.
@@ -53,6 +55,9 @@ pub const DERIVE_FAILED: &str =
 pub(super) struct DeriveRun {
     pub(super) deriver: Option<Arc<dyn Deriver>>,
     poke: tokio::sync::Notify,
+    /// Sessions whose reading an account's refresh is making: a turn's end
+    /// meanwhile makes them due again, and the worker leaves them be.
+    sharing: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl DeriveRun {
@@ -60,7 +65,21 @@ impl DeriveRun {
         Self {
             deriver,
             poke: tokio::sync::Notify::new(),
+            sharing: Arc::default(),
         }
+    }
+}
+
+/// A session's place among those whose reading an account's refresh is
+/// making, given up as it ends however it ends.
+struct Sharing {
+    sessions: Arc<Mutex<HashSet<Uuid>>>,
+    session: Uuid,
+}
+
+impl Drop for Sharing {
+    fn drop(&mut self) {
+        self.sessions.lock().remove(&self.session);
     }
 }
 
@@ -213,6 +232,19 @@ pub enum ItemChange {
     Drop,
 }
 
+/// A reading for notes made in the same call as an account's refresh:
+/// its claim, how far its group was read and the last exchange it reads,
+/// whether more wait after them, and what the model reads.
+pub(super) struct SharedRead {
+    claim: Claim,
+    read: (i32, i32),
+    backlog: bool,
+    group: Option<String>,
+    rows: Vec<Unread>,
+    pub(super) input: Input,
+    _sharing: Sharing,
+}
+
 /// What one turn of the worker found.
 enum Did {
     Work,
@@ -318,6 +350,13 @@ impl Desk {
         let Some(claim) = self.0.store.derive_claim(LEASE.as_secs_f64()).await? else {
             return Ok(Did::Idle);
         };
+        if self.0.derive.sharing.lock().contains(&claim.session) {
+            // An account's refresh is reading it: what a turn's end added
+            // meanwhile is read after that, as its debounce says.
+            let later = Utc::now() + chrono::Duration::from_std(IDLE_EVERY).unwrap_or_default();
+            self.0.store.derive_release(&claim, Some(later)).await?;
+            return Ok(Did::Work);
+        }
         // Each group is read on its own: the first whose sessions may be
         // read, so one that may not holds only its own place.
         let mut chosen: Option<UnreadGroup> = None;
@@ -465,7 +504,35 @@ impl Desk {
                 .await?;
             return Ok(Did::Work);
         };
-        let mut applied = derive::validate(&out, &input);
+        self.derive_keep(
+            &claim,
+            (read.from, last.seq),
+            backlog,
+            group.as_deref(),
+            rows,
+            &input,
+            &out,
+            &answered.model,
+        )
+        .await?;
+        Ok(Did::Work)
+    }
+
+    /// Keeps what [`derive::validate`] allows of the notes `model` wrote
+    /// from `rows` (read as `input`), and moves the session past them.
+    #[allow(clippy::too_many_arguments)]
+    async fn derive_keep(
+        &self,
+        claim: &Claim,
+        read: (i32, i32),
+        backlog: bool,
+        group: Option<&str>,
+        rows: &[Unread],
+        input: &Input,
+        out: &derive::Out,
+        model: &str,
+    ) -> eyre::Result<()> {
+        let mut applied = derive::validate(out, input);
         // What the model wrote is kept as safely as what it read.
         if let Some(r) = &self.0.ledger.redactor {
             for a in &mut applied.add {
@@ -475,18 +542,207 @@ impl Desk {
         if applied.dropped > 0 {
             tracing::info!(session = %claim.session, dropped = applied.dropped, kept = applied.add.len(), "dropped notes the record doesn't bear out");
         }
-        let by = format!("model:{}", model_name(&answered.model));
-        self.derive_write(
-            &claim,
-            (read.from, last.seq),
-            backlog,
-            group.as_deref(),
-            &by,
-            rows,
-            &applied,
-        )
-        .await?;
-        Ok(Did::Work)
+        let by = format!("model:{}", model_name(model));
+        self.derive_write(claim, read, backlog, group, &by, rows, &applied)
+            .await
+    }
+
+    /// Session `id`'s reading for notes, to be made in the same call as its
+    /// account's refresh that reads the closed exchanges `read` (by key):
+    /// only while noting is on for it and within the day's calls, it is due
+    /// now and no worker holds it, and the exchanges it would read next
+    /// begin among those. None otherwise, and the account is refreshed
+    /// alone; the worker reads what is left as it would.
+    pub(super) async fn derive_shared(&self, id: Uuid, read: &HashSet<&str>) -> Option<SharedRead> {
+        let m = self.memory_now();
+        let deriver = self.0.derive.deriver.clone()?;
+        if !m.enabled || !m.derive || read.is_empty() {
+            return None;
+        }
+        match self.derive_shared_try(id, &*deriver, read).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(session = %id, error = format!("{e:#}"), "couldn't read a session for notes with its account; it is read on its own");
+                None
+            }
+        }
+    }
+
+    async fn derive_shared_try(
+        &self,
+        id: Uuid,
+        deriver: &dyn Deriver,
+        read: &HashSet<&str>,
+    ) -> eyre::Result<Option<SharedRead>> {
+        let cap = self.0.opts.memory.derive_calls_per_day;
+        if self.0.store.derive_calls(self.derive_day()).await? >= i64::from(cap) {
+            return Ok(None);
+        }
+        // Due now, and no worker holds it; else the account goes alone.
+        let Some(claim) = self
+            .0
+            .store
+            .derive_claim_session(id, LEASE.as_secs_f64())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.0.derive.sharing.lock().insert(id);
+        let sharing = Sharing {
+            sessions: Arc::clone(&self.0.derive.sharing),
+            session: id,
+        };
+        match self
+            .derive_shared_of(claim.clone(), deriver, read, sharing)
+            .await
+        {
+            Ok(Some(s)) => Ok(Some(s)),
+            left => {
+                // Back in its place: the worker reads it as it would have.
+                self.0.store.derive_release(&claim, claim.was).await?;
+                left
+            }
+        }
+    }
+
+    /// What `claim`'s reading shared with an account would read: one group
+    /// whose sessions may be read, from its first unread exchange, as far
+    /// as the account reads.
+    async fn derive_shared_of(
+        &self,
+        claim: Claim,
+        deriver: &dyn Deriver,
+        read: &HashSet<&str>,
+        sharing: Sharing,
+    ) -> eyre::Result<Option<SharedRead>> {
+        let groups = self.0.store.derive_unread_groups(claim.session).await?;
+        // More than one group waits (a session moved between groups): the
+        // worker reads them in turn, the one waiting longest first and none
+        // whose group isn't read yet, so the account doesn't pick for it.
+        let [g] = groups.as_slice() else {
+            return Ok(None);
+        };
+        let facts = self
+            .0
+            .store
+            .derive_facts(claim.session, g.group.as_deref())
+            .await?;
+        if facts.paused || facts.session_off || !facts.group_on {
+            return Ok(None);
+        }
+        let unread = self
+            .0
+            .store
+            .derive_unread(
+                claim.session,
+                g.group.as_deref(),
+                g.from,
+                i64::try_from(derive::BATCH).unwrap_or(12) + 1,
+            )
+            .await?;
+        let (batch, more) = batch(&unread);
+        // Behind (its first unread is before what the account reads), it
+        // reads its own; ahead, as far as the account reads, the rest next.
+        let n = batch
+            .iter()
+            .take_while(|x| read.contains(x.key.as_str()))
+            .count();
+        let rows = &batch[..n];
+        let Some(last) = rows.last() else {
+            return Ok(None);
+        };
+        let exchanges: Vec<InputExchange> = rows
+            .iter()
+            .filter(|x| !x.flagged)
+            .map(|x| InputExchange {
+                id: x.id,
+                at: x.at,
+                asker: x.asker,
+                ask: x.ask.clone(),
+                answer: x.answer.clone(),
+                steps: x.steps.clone(),
+            })
+            .collect();
+        // Only what reads as instructions: the worker passes it over
+        // without a call.
+        if exchanges.is_empty() {
+            return Ok(None);
+        }
+        let input = Input {
+            purpose: deriver.purpose(claim.session).await,
+            items: self
+                .0
+                .store
+                .held_items(claim.session, g.group.as_deref())
+                .await?,
+            exchanges,
+        };
+        Ok(Some(SharedRead {
+            read: (g.from, last.seq),
+            backlog: more || n < batch.len(),
+            group: g.group.clone(),
+            rows: rows.to_vec(),
+            input,
+            claim,
+            _sharing: sharing,
+        }))
+    }
+
+    /// Counts the shared call among the day's readings for notes; false
+    /// past `derive_calls_per_day`.
+    pub(super) async fn derive_shared_take(&self) -> eyre::Result<bool> {
+        let cap = self.0.opts.memory.derive_calls_per_day;
+        self.0.store.derive_take_call(self.derive_day(), cap).await
+    }
+
+    /// Gives back the shared call's count: no model took it.
+    pub(super) async fn derive_shared_untake(&self) {
+        if let Err(e) = self.0.store.derive_untake_call(self.derive_day()).await {
+            tracing::info!(
+                error = format!("{e:#}"),
+                "couldn't give back a reading for notes' count"
+            );
+        }
+    }
+
+    /// The shared reading wasn't made: the session goes back to its place
+    /// in the queue, and the worker reads it.
+    pub(super) async fn derive_unshare(&self, s: SharedRead) {
+        if let Err(e) = self.0.store.derive_release(&s.claim, s.claim.was).await {
+            tracing::info!(session = %s.claim.session, error = format!("{e:#}"), "couldn't let a session's reading for notes go; it is due once its lease is up");
+        }
+    }
+
+    /// Keeps the notes `model` wrote in the shared call, as the worker
+    /// keeps its own; when they can't be read, the worker reads the same
+    /// exchanges on its own.
+    pub(super) async fn derive_shared_kept(
+        &self,
+        s: SharedRead,
+        out: Option<&derive::Out>,
+        model: &str,
+    ) {
+        let Some(out) = out else {
+            tracing::info!(session = %s.claim.session, "the notes read with a session's account weren't JSON; they are read on their own");
+            self.derive_unshare(s).await;
+            return;
+        };
+        if let Err(e) = self
+            .derive_keep(
+                &s.claim,
+                s.read,
+                s.backlog,
+                s.group.as_deref(),
+                &s.rows,
+                &s.input,
+                out,
+                model,
+            )
+            .await
+        {
+            tracing::info!(session = %s.claim.session, error = format!("{e:#}"), "couldn't keep the notes read with a session's account");
+            self.derive_unshare(s).await;
+        }
     }
 
     /// Writes what was noted from `rows` and moves the session past them.
@@ -728,6 +984,7 @@ mod tests {
         Unread {
             id: Uuid::from_u128(seq as u128),
             seq,
+            key: format!("k-{seq}"),
             at: Utc::now(),
             ended: closed.then(Utc::now),
             engine: Engine::Claude,
