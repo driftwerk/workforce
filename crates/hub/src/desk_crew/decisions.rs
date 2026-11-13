@@ -9,8 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
-use workforce_common::channels::DESK_CHANNEL;
+use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::crew::{self, By, Extras, Kind, PartyKind, UndoRefused};
 use workforce_desk::decision::{BossDecision, Handled, How, Need, Undo, UndoPlan};
 use workforce_desk::line::{Delivery, LineMessage};
@@ -397,33 +396,16 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        let delivered = match crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, d.said()),
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "putting a decision in the DM failed");
-                return;
-            }
-        };
         let extras = Extras {
             decisions: vec![d.line()],
             ..Default::default()
         };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Notice, d.said());
         if let Err(e) = self
-            .desk
-            .store()
-            .put_extras(&delivered.message_id, service.agent_id.as_str(), &extras)
+            .deliver_with_extras(&service, &owner, delivery, &extras)
             .await
         {
-            tracing::warn!(error = %e, "keeping a decision's line failed");
+            tracing::warn!(error = %e, "putting a decision in the DM failed");
         }
     }
 

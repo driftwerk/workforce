@@ -201,6 +201,102 @@ impl Desk {
         ))
     }
 
+    /// Whether session `id` is open: held here and not closed. A closed
+    /// one isn't loaded at start, so it reads as gone.
+    fn is_open(&self, id: Uuid) -> bool {
+        self.0
+            .state
+            .lock()
+            .records
+            .get(&id)
+            .is_some_and(|r| r.state != SessionState::Closed)
+    }
+
+    /// Undoes the handoff that gave `id` its work when `id` took none of
+    /// it up ([`rules::took_none_up`]), or has no record at all: the
+    /// session it came from holds the work again, and can hand it on
+    /// again. Whether it was undone.
+    async fn undo_untaken(&self, id: Uuid, r: Option<&SessionRecord>, busy: bool) -> bool {
+        let l = self.lineage();
+        let Some(link) = l.links.get(&id).cloned() else {
+            return false;
+        };
+        // It handed the work on (or back) itself: part of the chain now.
+        if l.handed_off(id) {
+            return false;
+        }
+        let untaken = match r {
+            None => true,
+            Some(r) => match self.0.store.kept_a_turn(id).await {
+                Ok(kept) => {
+                    let acted = busy || kept || r.last_reply.is_some() || wrote(r).await;
+                    rules::took_none_up(&link, r.created_at, acted)
+                }
+                Err(e) => {
+                    tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't tell whether a handed-off session took up its work; its handoff stays");
+                    return false;
+                }
+            },
+        };
+        if !untaken {
+            return false;
+        }
+        tracing::info!(session = %id, from = %link.from, "a handoff whose session never took up its work was undone");
+        self.lineage_forgotten(id).await;
+        true
+    }
+
+    /// Session `id` was ended, `busy` when it was in a turn then: when it
+    /// was started for a handoff and took none of its work up, the handoff
+    /// is undone.
+    pub(super) async fn handoff_ended(&self, id: Uuid, busy: bool) {
+        let _one = self.0.handoff.write.lock().await;
+        let Ok(r) = self.record(id) else {
+            return;
+        };
+        if r.state == SessionState::Closed {
+            self.undo_untaken(id, Some(&r), busy).await;
+        }
+    }
+
+    /// At start, once the sessions the holder kept are taken back: each
+    /// handoff whose session the last hub lost before it took up its work
+    /// (or before it was even made) is undone, and that session closed, so
+    /// it is neither offered to be restored nor left holding the work.
+    pub(super) async fn handoffs_recover(&self) {
+        let _one = self.0.handoff.write.lock().await;
+        let given: Vec<Uuid> = self.lineage().links.keys().copied().collect();
+        for id in given {
+            if self.0.state.lock().live.contains_key(&id) {
+                continue;
+            }
+            let r = match self.record(id) {
+                Ok(r) => Some(r),
+                // Closed, so not loaded at start.
+                Err(_) => match self.0.store.get(id).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't read a handed-off session at start");
+                        continue;
+                    }
+                },
+            };
+            // Running still, in another terminal: never closed under it.
+            if r.as_ref().is_some_and(|r| r.state.is_running()) {
+                continue;
+            }
+            if !self.undo_untaken(id, r.as_ref(), false).await {
+                continue;
+            }
+            if self.is_open(id) {
+                self.change(id, |r, _| {
+                    r.state = SessionState::Closed;
+                    r.restore_offer = false;
+                });
+            }
+        }
+    }
+
     /// Handoff's lineage as it is now.
     pub(super) fn lineage(&self) -> Lineage {
         self.0.handoff.lineage.lock().clone()
@@ -364,7 +460,7 @@ impl Desk {
             record: matches!(r.engine, Engine::Claude | Engine::Codex),
             redactor: self.0.ledger.redactor.is_some(),
             source_group,
-            handed_to: lineage.handed_to.get(&r.id).copied(),
+            handed_to: lineage.continues_in(r.id, |s| self.is_open(s)),
             target,
             target_group,
             signed_in,
@@ -626,13 +722,13 @@ impl Desk {
             let st = self.0.state.lock();
             (
                 st.live.get(&id).is_some_and(|l| l.terminal.is_some()),
+                // One still starting is in no turn: stopped now, as an idle
+                // one is. Waiting for a turn of it to end would leave it
+                // running while no turn comes.
                 st.live.contains_key(&id)
                     && matches!(
                         r.state,
-                        SessionState::Starting
-                            | SessionState::Working
-                            | SessionState::Blocked
-                            | SessionState::Asking
+                        SessionState::Working | SessionState::Blocked | SessionState::Asking
                     ),
             )
         };
@@ -1188,6 +1284,24 @@ struct Checked {
     ask: Ask,
     /// A hand back's: when this session was handed the work.
     since: Option<DateTime<Utc>>,
+}
+
+/// Whether `r`'s engine wrote anything of its own to its transcript; so
+/// when it can't be told.
+async fn wrote(r: &SessionRecord) -> bool {
+    let Some(path) = r.transcript.clone() else {
+        return false;
+    };
+    let codex = r.engine == Engine::Codex;
+    let read = tokio::task::spawn_blocking(move || {
+        crate::transcript::engine_acted(Path::new(&path), codex)
+    })
+    .await;
+    match read {
+        Ok(Ok(acted)) => acted,
+        Ok(Err(e)) => e.kind() != std::io::ErrorKind::NotFound,
+        Err(_) => true,
+    }
 }
 
 /// What the person calls `r`.
