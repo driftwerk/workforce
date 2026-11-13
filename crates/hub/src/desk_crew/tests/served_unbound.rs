@@ -56,13 +56,22 @@ fn a_served_boss_is_unbound_only_by_everything_its_grant_turns_on() {
     ] {
         let mut act = unbound_act();
         act[off] = json!(false);
-        assert!(!served_oversight(&grant_of(act, "full")).unbound(), "{off} off");
+        assert!(
+            !served_oversight(&grant_of(act, "full")).unbound(),
+            "{off} off"
+        );
         // Said wrongly is off.
         let mut act = unbound_act();
         act[off] = json!("yes");
-        assert!(!served_oversight(&grant_of(act, "full")).unbound(), "{off} said wrongly");
+        assert!(
+            !served_oversight(&grant_of(act, "full")).unbound(),
+            "{off} said wrongly"
+        );
     }
-    assert!(!served_oversight(&grant_of(unbound_act(), "act")).unbound(), "at act");
+    assert!(
+        !served_oversight(&grant_of(unbound_act(), "act")).unbound(),
+        "at act"
+    );
     // No budget, or one that can't be: Act fully isn't in force for it.
     for budget in [Value::Null, json!(0), json!(-5), json!("50"), json!(1e9)] {
         let mut act = unbound_act();
@@ -108,6 +117,35 @@ fn put_grant(folder: &Path, revision: i64, level: &str, act: Value) -> Value {
         "boss": "remote:driftwerk/allan", "level": level, "sees": "everything",
         "members": [], "folders": [folder.to_string_lossy()], "act": act,
     })
+}
+
+/// A call of `usd` in `session`, paid by an API key: real money.
+async fn spent_on_key(d: &Desk, session: uuid::Uuid, usd: f64) {
+    use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
+    d.store()
+        .ledger_write(
+            session,
+            Engine::Claude,
+            None,
+            &[workforce_desk::ledger_store::Kept {
+                spend: Spend {
+                    key: uuid::Uuid::new_v4().to_string(),
+                    at: chrono::Utc::now(),
+                    model: Some("claude-opus-5-5".into()),
+                    tokens: Tokens {
+                        input: 100,
+                        ..Default::default()
+                    },
+                    usd: Some(usd),
+                    priced: Priced::Reported,
+                    billing: None,
+                },
+                billing: Billing::Key,
+                account: None,
+            }],
+        )
+        .await
+        .unwrap();
 }
 
 fn pre(command: &str) -> Value {
@@ -215,8 +253,7 @@ async fn a_served_boss_unbound_by_its_grant_allows_what_it_is_asked_until_the_gr
         assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
         let answered = asked.await.unwrap();
         assert_eq!(
-            answered["hookSpecificOutput"]["decision"]["behavior"],
-            "allow",
+            answered["hookSpecificOutput"]["decision"]["behavior"], "allow",
             "{answered}"
         );
         let rows = d
@@ -288,7 +325,10 @@ async fn a_served_boss_unbound_by_its_grant_allows_what_it_is_asked_until_the_gr
         assert_eq!(code, StatusCode::OK);
         assert!(crew.served_full("driftwerk/allan").is_none());
         let mut unbudgeted = unbound_act();
-        unbudgeted.as_object_mut().unwrap().remove("budget_usd_per_day");
+        unbudgeted
+            .as_object_mut()
+            .unwrap()
+            .remove("budget_usd_per_day");
         let (code, _) = native(
             &d,
             "PUT",
@@ -312,6 +352,18 @@ async fn a_served_boss_unbound_by_its_grant_allows_what_it_is_asked_until_the_gr
         assert_eq!(code, StatusCode::OK);
         let r = serve(&crew, "crew.overview", json!({})).await;
         assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        // Its budget back, Act fully waits until today's spend is read:
+        // the crew's tick reads it.
+        assert!(crew.served_full("driftwerk/allan").is_none());
+        crew.read_spent_today(&crew.overseers()).await;
+        assert!(crew.served_full("driftwerk/allan").is_some());
+        // Its budget spent in real money, it is held as soon as the crew's
+        // tick reads it, with no call of its own between.
+        spent_on_key(&d, started, 60.0).await;
+        crew.read_spent_today(&crew.overseers()).await;
+        assert!(crew.served_full("driftwerk/allan").is_none());
+        let said = hook(&url, pre("git push --force origin main")).await;
+        assert_eq!(decision(&said), "deny", "{said}");
         let (code, _) = native(
             &d,
             "POST",

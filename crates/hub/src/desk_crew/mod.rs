@@ -892,14 +892,25 @@ impl CrewHub {
                 );
             }
         }
+        // Each boss served from a grant here is read too, on the same tick
+        // as its calls are decided ([`Self::read_served_spent`]): a budget
+        // spent holds between its calls, as a local boss's does.
+        let served: std::collections::HashSet<String> = self
+            .desk
+            .grants_bossed()
+            .into_iter()
+            .filter(|(_, not_live)| not_live.is_none())
+            .filter_map(|(g, _)| g.boss.map(|b| b.party_id()))
+            .collect();
         {
-            // A boss served from a grant's spend is read as its calls are
-            // decided ([`Self::read_served_spent`]): kept here.
             let mut today = self.spent_today.lock();
-            today.retain(|agent, _| workforce_desk::grant::is_served(agent));
+            today.retain(|agent, _| served.contains(agent));
             today.extend(spent);
         }
         self.desk.set_full_budgets(shown);
+        for boss in served {
+            self.read_served_spent(&boss).await;
+        }
     }
 
     /// What the hub billed as metered to the agents `overseer`'s scope
