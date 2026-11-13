@@ -40,6 +40,7 @@ CREATE TABLE knows_sent (
 );
 CREATE INDEX knows_sent_held ON knows_sent (agent, session) WHERE deleted_at IS NULL;
 CREATE INDEX knows_sent_at ON knows_sent (agent, sent_at);
+CREATE INDEX knows_sent_deleting ON knows_sent (agent, deleting) WHERE deleting IS NOT NULL;
 
 -- How far each kind has been shared with each agent.
 CREATE TABLE knows_cursors (
