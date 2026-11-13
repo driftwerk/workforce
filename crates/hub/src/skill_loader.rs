@@ -1684,6 +1684,7 @@ pub const INSTANCE_SETTINGS: &[(&str, &str, &str)] = &[
     ("github", "app_private_key", "GitHub App private key"),
     ("jira", "default_project", "Default project key"),
     ("linear", "default_team_id", "Default team id"),
+    ("datadog", "base_url", "API address"),
     ("email", "imap_port", "IMAP port"),
     ("email", "smtp_port", "SMTP port"),
     ("email", "tls", "Use TLS"),

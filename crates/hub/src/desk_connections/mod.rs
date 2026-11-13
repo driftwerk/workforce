@@ -393,6 +393,8 @@ pub enum FlowState {
 
 struct Flow {
     person: String,
+    /// The connector it signs in to.
+    connector: &'static str,
     level: Level,
     /// The instance it keeps; GitHub's is its account's login when the
     /// person named none.
@@ -413,9 +415,6 @@ pub struct Connections {
     pub github_client_id: Option<String>,
     /// The hub's own Google callback, for a client that names none.
     pub google_redirect: String,
-    /// `[github] default_owner`: the owner a flat GitHub connection reached
-    /// by default, which its instance is named after when it moves.
-    pub github_owner: Option<String>,
     flows: Mutex<HashMap<String, Flow>>,
     /// Held while flat connections are moved, so two requests never move
     /// one twice.
@@ -512,7 +511,6 @@ impl Connections {
             services,
             github_client_id: github_client_id.filter(|id| !id.trim().is_empty()),
             google_redirect,
-            github_owner: None,
             flows: Mutex::new(HashMap::new()),
             migrating: tokio::sync::Mutex::new(()),
         }
@@ -640,12 +638,29 @@ impl Connections {
     }
 
     /// Every instance key of `c` the person holds anywhere.
+    /// The keys `person`'s connections of `c` hold, and those a sign-in of
+    /// theirs still waiting will keep: two started together never share one.
     fn keys_in_use(&self, c: &Connector, person: &str) -> BTreeSet<String> {
-        self.levels()
+        let mut keys: BTreeSet<String> = self
+            .levels()
             .iter()
             .flat_map(|level| self.instances(c, level, person))
             .map(|(key, _)| key)
-            .collect()
+            .collect();
+        let now = Instant::now();
+        let flows = self.flows.lock().expect("connection flows poisoned");
+        keys.extend(
+            flows
+                .values()
+                .filter(|f| {
+                    f.person == person
+                        && f.connector == c.id
+                        && f.until > now
+                        && matches!(f.state, FlowState::Waiting)
+                })
+                .filter_map(|f| f.key.clone()),
+        );
+        keys
     }
 
     /// A key for a new connection of `c` named `name`, unique among the
@@ -795,10 +810,15 @@ impl Connections {
                     let Ok(vault) = self.vault_at(tier, &level) else {
                         continue;
                     };
+                    // The level's one check was of the connection its first
+                    // tier held: only the first to move is named from it and
+                    // takes it; one beside it (`shared`) has none yet.
+                    let checked = checked.filter(|_| !moved);
                     match self.migrate_at(c, &level, tier, &vault, person, checked) {
                         Ok(Some(key)) => {
+                            let first = !moved;
                             moved = true;
-                            if key != DEFAULT_INSTANCE {
+                            if first && key != DEFAULT_INSTANCE {
                                 if let Err(e) = self
                                     .statuses
                                     .moved(c.id, &level, person, DEFAULT_INSTANCE, &key)
@@ -853,7 +873,7 @@ impl Connections {
     /// [`Self::migrate`] of `c` at one tier: the instance it moved to or
     /// named, if anything changed.
     ///
-    /// It becomes the adapters' `default` (GitHub's: the owner it reached),
+    /// It becomes the adapters' `default` (GitHub's too),
     /// unless another level holds that already (the person's connection for
     /// all their agents, migrated first): it then takes a key of its own,
     /// from its account, else the service, so the two stay two connections
@@ -924,16 +944,10 @@ impl Connections {
                 .and_then(|f| vault.get(&key_at(tier, person, f.path)))
         });
         let name = name_of(c, account.as_deref(), site.as_deref());
-        let mut key = match c.id {
-            "github" => self
-                .github_owner
-                .as_deref()
-                .or(account.as_deref())
-                .map(slug)
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
-            _ => DEFAULT_INSTANCE.to_string(),
-        };
+        // GitHub's too: its flat token reached every owner, and `default` is
+        // the one instance git, Claude Code and benches read for any owner
+        // (`resolve_github_pat`), as the adapter's flat mode named it.
+        let mut key = DEFAULT_INSTANCE.to_string();
         // The person's connection for all their agents keeps its key.
         let taken = *level != Level::All
             && self
@@ -952,6 +966,17 @@ impl Connections {
             key = self.new_key(c, person, "shared");
         } else if taken {
             key = self.new_key(c, person, &name);
+        }
+        // A flat GitHub token reaches every owner; under any key but
+        // `default` git, Claude Code and benches would read it for none
+        // (`resolve_github_pat`). One that can't be `default` stays flat, as
+        // it works today.
+        if c.id == "github" && key != DEFAULT_INSTANCE {
+            tracing::debug!(
+                tier = ?tier,
+                "a flat GitHub token stays flat: beside another connection it can't be the default git reads"
+            );
+            return Ok(None);
         }
         let label = key_at(tier, person, &c.label_at(&key).expect("a named connector"));
         // Email's or Google's own `default`: it only needs a name.
@@ -1265,13 +1290,11 @@ impl Connections {
         };
         let site = c.site.and_then(|s| fields.get(s)).map(String::as_str);
         let name = name.unwrap_or_else(|| name_of(c, Some(&account), site));
-        let key = match (c.id, self.keys_in_use(c, person).is_empty()) {
-            // GitHub's instance is the owner it reaches by default.
-            ("github", _) => self.new_key(c, person, &name),
+        let key = match self.keys_in_use(c, person).is_empty() {
             // A first connection is the adapters' `default`, as a flat one
-            // was.
-            (_, true) => DEFAULT_INSTANCE.to_string(),
-            _ => self.new_key(c, person, &name),
+            // was: for GitHub, the token git reaches any owner with.
+            true => DEFAULT_INSTANCE.to_string(),
+            false => self.new_key(c, person, &name),
         };
         let conn = Conn { level, key };
         self.keep(c, &conn.level, &conn.key, person, &fields, Some(&name))?;
@@ -1576,6 +1599,7 @@ impl Connections {
     fn insert_flow(
         &self,
         person: &str,
+        connector: &'static str,
         level: Level,
         key: Option<String>,
         name: Option<String>,
@@ -1588,6 +1612,7 @@ impl Connections {
             id.clone(),
             Flow {
                 person: person.to_string(),
+                connector,
                 level,
                 key,
                 name,
@@ -1658,14 +1683,14 @@ impl Connections {
         let name = Self::name(c, name)?;
         self.vault_at(Self::tiers(c, &level)[0], &level)?;
         self.migrate(person).await;
-        // GitHub's instance is its owner: the person's name for it, else
-        // its account's login once it is signed in.
+        // A first connection is the adapters' `default`, as a flat one was
+        // (for GitHub, the token git reaches any owner with). A later GitHub
+        // one is the person's name for it, else its account's login once it
+        // is signed in.
         let key = match (c.id, &name, self.keys_in_use(c, person).is_empty()) {
+            (_, _, true) => Some(DEFAULT_INSTANCE.to_string()),
             ("github", None, _) => None,
             ("github", Some(name), _) => Some(self.new_key(c, person, name)),
-            // A first connection is the adapters' `default`, as a flat one
-            // was.
-            (_, _, true) => Some(DEFAULT_INSTANCE.to_string()),
             (_, Some(name), false) => Some(self.new_key(c, person, name)),
             (_, None, false) => Some(self.new_key(c, person, c.name)),
         };
@@ -1720,23 +1745,40 @@ impl Connections {
             expires_in: Option<u64>,
             interval: Option<u64>,
         }
-        let response = self
-            .services
-            .http
-            .post(format!("{}/login/device/code", self.services.github_web))
-            .header("Accept", "application/json")
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("scope", "repo read:org"),
-            ])
-            .send()
-            .await
-            .map_err(|_| Refusal::Unavailable("GitHub couldn't be reached".into()))?;
-        let code: DeviceCode = response
-            .json()
-            .await
-            .map_err(|_| Refusal::Unavailable("GitHub didn't start the sign-in".into()))?;
-        let flow = self.insert_flow(person, level.clone(), key, name);
+        // The flow holds its key from now, before GitHub is asked: a second
+        // sign-in started meanwhile takes another.
+        let flow = self.insert_flow(person, c.id, level.clone(), key, name);
+        let asked = async {
+            let response = self
+                .services
+                .http
+                .post(format!("{}/login/device/code", self.services.github_web))
+                .header("Accept", "application/json")
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("scope", "repo read:org"),
+                ])
+                .send()
+                .await
+                .map_err(|_| Refusal::Unavailable("GitHub couldn't be reached".into()))?;
+            response
+                .json::<DeviceCode>()
+                .await
+                .map_err(|_| Refusal::Unavailable("GitHub didn't start the sign-in".into()))
+        }
+        .await;
+        let code = match asked {
+            Ok(code) => code,
+            Err(refused) => {
+                self.settle(
+                    &flow,
+                    FlowState::Failed {
+                        error: "GitHub didn't start the sign-in".into(),
+                    },
+                );
+                return Err(refused);
+            }
+        };
         let expires_in = code.expires_in.unwrap_or(900);
         let this = Arc::clone(self);
         let (flow_id, person) = (flow.clone(), person.to_string());
@@ -1892,7 +1934,7 @@ impl Connections {
             Level::All => None,
             Level::Agent(agent) => Some(agent.clone()),
         };
-        let flow = self.insert_flow(person, level, Some(key.clone()), name);
+        let flow = self.insert_flow(person, "google", level, Some(key.clone()), name);
         crate::google_oauth_callback::google_web_flow_store().insert_flow(
             web.state,
             person.to_string(),
@@ -2185,7 +2227,7 @@ pub fn install(
 ) -> Router {
     let connections = INSTALLED
         .get_or_init(|| {
-            let mut connections = Connections::new(
+            let connections = Connections::new(
                 state.vault.clone(),
                 Arc::new(Registry(Arc::clone(state))),
                 Arc::new(desk),
@@ -2193,11 +2235,6 @@ pub fn install(
                 config.desk.github_client_id.clone(),
                 google_redirect(&config.gateway.listen),
             );
-            connections.github_owner = config
-                .github
-                .default_owner
-                .clone()
-                .filter(|o| !o.trim().is_empty());
             Arc::new(connections)
         })
         .clone();

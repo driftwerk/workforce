@@ -70,8 +70,9 @@ pub fn instance_prefix(connector: &str) -> Option<&'static str> {
 pub fn instance_of<'a>(connector: &str, path: &'a str) -> Option<Option<&'a str>> {
     let rest = path.strip_prefix(instance_prefix(connector)?)?;
     Some(match rest.split_once('/') {
-        Some((key, _)) if !key.is_empty() => Some(key),
-        Some(_) => None,
+        // An empty segment (`workspaces//x`) is an instance no pick names,
+        // never the listing.
+        Some((key, _)) => Some(key),
         None if rest.is_empty() => None,
         None => Some(rest),
     })
@@ -155,6 +156,14 @@ pub fn widened(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<Strin
                 }
             }
             (Some(_), None) => said.push(format!("{c}: now uses every connection")),
+            // Naming connections where it named none narrows what it
+            // reaches, except where it used only its own: a named one may be
+            // the person's.
+            (None, Some(now)) if before.own(c) => {
+                for k in now {
+                    said.push(format!("{c}: now uses the `{k}` connection"));
+                }
+            }
             _ => {}
         }
         if before.own(c) != after.own(c) {
@@ -167,11 +176,28 @@ pub fn widened(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<Strin
         if !writes(before, None) && writes(after, None) && after.picks(c).is_none() {
             said.push(format!("{c}: may now change things"));
         }
-        if let Some(now) = after.picks(c) {
-            for k in now {
-                if !writes(before, Some(k)) && writes(after, Some(k)) {
-                    said.push(format!("{c}: may now change things through `{k}`"));
+        // Every connection that only read before and may change things
+        // now: those it names, and those `before` made read-only one by one
+        // (it may reach them still, named or not).
+        let mut keys: Vec<&str> = after
+            .picks(c)
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for r in &before.read_only {
+            if let Some((rc, k)) = r.split_once(':') {
+                if rc == *c && !keys.contains(&k) {
+                    keys.push(k);
                 }
+            }
+        }
+        for k in keys {
+            if after.picks(c).is_some_and(|p| !p.iter().any(|x| x == k)) {
+                continue;
+            }
+            if !writes(before, Some(k)) && writes(after, Some(k)) {
+                said.push(format!("{c}: may now change things through `{k}`"));
             }
         }
     }
@@ -234,9 +260,22 @@ pub fn from_value(value: &Value) -> Result<ConnectorBinding, String> {
     let Value::Table(t) = value else {
         return Err("The agent's connectors need to be a group of settings.".into());
     };
+    let read_only =
+        names(t, "read_only", "The connectors an agent only reads")?.unwrap_or_default();
+    // One connection only reads where its connector checks each write's
+    // connection; elsewhere the entry would hold nothing back.
+    if let Some(r) = read_only.iter().find(|r| {
+        r.split_once(':')
+            .is_some_and(|(c, _)| !READ_ONLY_EACH.contains(&c))
+    }) {
+        let (c, _) = r.split_once(':').unwrap_or_default();
+        return Err(format!(
+            "`{r}`: {c} only reads as a whole, not one connection at a time. Use `{c}` instead."
+        ));
+    }
     Ok(ConnectorBinding {
         enabled: names(t, "enabled", "The connectors an agent has")?,
-        read_only: names(t, "read_only", "The connectors an agent only reads")?.unwrap_or_default(),
+        read_only,
         own_credential: names(
             t,
             "own_credential",
@@ -451,6 +490,37 @@ mod tests {
         assert!(parse("[skills.connections]\njira = \"acme\"\n")
             .unwrap_err()
             .contains("list of connection names"));
+    }
+
+    #[test]
+    fn naming_connections_after_its_own_and_unmaking_one_read_only_are_widenings() {
+        let b = |src: &str| parse(src).unwrap();
+        // It read only its own; a named connection may be the person's.
+        let own = b("[skills]\nenabled = [\"jira\"]\nown_credential = [\"jira\"]\n");
+        let named = b("[skills]\nenabled = [\"jira\"]\nown_credential = [\"jira\"]\n\n[skills.connections]\njira = [\"acme\"]\n");
+        assert_eq!(
+            widened(&own, &named),
+            ["jira: now uses the `acme` connection"]
+        );
+        // Without its own, naming connections only narrows.
+        let all = b("[skills]\nenabled = [\"jira\"]\n");
+        let some = b("[skills]\nenabled = [\"jira\"]\n\n[skills.connections]\njira = [\"acme\"]\n");
+        assert!(widened(&all, &some).is_empty());
+        // One connection made read-only, with no picks: unmaking it is said.
+        let ro = b("[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n");
+        assert_eq!(
+            widened(&ro, &all),
+            ["jira: may now change things through `globex`"]
+        );
+        // A connector that can't hold one connection back refuses the entry.
+        assert!(parse("[skills]\nread_only = [\"email:work\"]\n")
+            .unwrap_err()
+            .contains("only reads as a whole"));
+        // An empty instance segment is no pick's, never the listing.
+        assert_eq!(
+            instance_of("jira", "skills/jira/workspaces//globex/x"),
+            Some(Some(""))
+        );
     }
 
     #[test]

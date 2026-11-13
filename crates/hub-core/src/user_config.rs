@@ -271,16 +271,31 @@ impl LayeredUserVault {
     /// one place.
     pub fn get_github_pat(&self, owner: &str) -> Option<String> {
         use workforce_common::credential_pin::TierPin;
-        let (agent, global) = match self.pin(GITHUB_FLAT_TOKEN) {
-            TierPin::All => (
+        let vaults = |pin: TierPin| match pin {
+            TierPin::All => Some((
                 Some(self.agent_vault.as_ref()),
                 self.global_vault.as_deref(),
-            ),
-            TierPin::Mine => (None, self.global_vault.as_deref()),
-            TierPin::Own => (Some(self.agent_vault.as_ref()), None),
-            TierPin::Nothing => return None,
+            )),
+            TierPin::Mine => Some((None, self.global_vault.as_deref())),
+            TierPin::Own => Some((Some(self.agent_vault.as_ref()), None)),
+            TierPin::Nothing => None,
         };
-        resolve_github_pat(agent, global, owner)
+        if let Some((agent, global)) = vaults(self.pin(GITHUB_FLAT_TOKEN)) {
+            return resolve_github_pat(agent, global, owner);
+        }
+        // The agent names the GitHub connections it uses, so the flat token
+        // is shut: the owner's own connection if it is one of them, else the
+        // unscoped `default` if it is. Never one it wasn't given, and never
+        // another org's.
+        [
+            format!("skills/github/workspaces/{owner}/token"),
+            GITHUB_DEFAULT_TOKEN.to_string(),
+        ]
+        .iter()
+        .find_map(|path| {
+            let (agent, global) = vaults(self.pin(path))?;
+            user_override_layered(agent, global, path).or_else(|| get_layered(agent, global, path))
+        })
     }
 
     /// `(tier, vault, physical_key)` triples in resolution order for `path`,
@@ -774,12 +789,20 @@ pub fn resolve_github_pat(
     let workspace = format!("skills/github/workspaces/{owner}/token");
     user_override_layered(agent_vault, global_vault, &workspace)
         .or_else(|| user_override_layered(agent_vault, global_vault, GITHUB_FLAT_TOKEN))
+        .or_else(|| user_override_layered(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
         .or_else(|| get_layered(agent_vault, global_vault, &workspace))
         .or_else(|| get_layered(agent_vault, global_vault, GITHUB_FLAT_TOKEN))
+        .or_else(|| get_layered(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
 }
 
 /// Vault path of the GitHub PAT that isn't scoped to one org.
 const GITHUB_FLAT_TOKEN: &str = "skills/github/token";
+
+/// The `default` instance's PAT: the flat token once Desk's named
+/// connections moved it there, and a person's first GitHub connection. It
+/// is the adapter's own name for the flat token, so it is unscoped like it,
+/// and read right after it. An org's own instance never stands in for it.
+const GITHUB_DEFAULT_TOKEN: &str = "skills/github/workspaces/default/token";
 
 /// The GitHub PAT for a session with no repo to key an owner off — an open
 /// bench, where Claude Code clones whatever it is asked for. Same precedence
@@ -790,6 +813,7 @@ pub fn resolve_bench_github_pat(
     global_vault: Option<&Vault>,
 ) -> Option<String> {
     resolve_flat(agent_vault, global_vault, GITHUB_FLAT_TOKEN)
+        .or_else(|| resolve_flat(agent_vault, global_vault, GITHUB_DEFAULT_TOKEN))
 }
 
 impl workforce_common::settings::VaultResolver for UserAwareVault {
@@ -1925,6 +1949,37 @@ mod layered_tests {
     }
 
     #[test]
+    fn the_default_instance_is_unscoped_like_the_flat_token_and_an_org_instance_is_not() {
+        let agent = new_vault();
+        agent
+            .set("skills/github/workspaces/contoso/token", "org-only")
+            .unwrap();
+        assert!(resolve_github_pat(Some(&agent), None, "acme").is_none());
+        assert!(resolve_bench_github_pat(Some(&agent), None).is_none());
+        agent
+            .set("skills/github/workspaces/default/token", "default-pat")
+            .unwrap();
+        assert_eq!(
+            resolve_github_pat(Some(&agent), None, "acme").as_deref(),
+            Some("default-pat")
+        );
+        assert_eq!(
+            resolve_github_pat(Some(&agent), None, "contoso").as_deref(),
+            Some("org-only")
+        );
+        assert_eq!(
+            resolve_bench_github_pat(Some(&agent), None).as_deref(),
+            Some("default-pat")
+        );
+        // The flat token still comes first.
+        agent.set("skills/github/token", "flat").unwrap();
+        assert_eq!(
+            resolve_bench_github_pat(Some(&agent), None).as_deref(),
+            Some("flat")
+        );
+    }
+
+    #[test]
     fn resolve_github_pat_returns_none_when_nothing_configured() {
         let agent = new_vault();
         let global = new_vault();
@@ -2052,6 +2107,43 @@ mod layered_tests {
         assert_eq!(
             store.get_github_pat("driftwerk").as_deref(),
             Some("shared-flat")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_github_pat_with_picked_connections_reads_only_those() {
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin};
+        struct Picks;
+        impl PinSource for Picks {
+            fn pin(&self, path: &str) -> TierPin {
+                match path {
+                    "skills/github/workspaces/acme/token"
+                    | "skills/github/workspaces/default/token" => TierPin::All,
+                    _ => TierPin::Nothing,
+                }
+            }
+        }
+        let agent = new_vault_layered();
+        let global = new_vault_layered();
+        agent.set("skills/github/token", "flat").unwrap();
+        agent
+            .set("skills/github/workspaces/acme/token", "acme-pat")
+            .unwrap();
+        agent
+            .set("skills/github/workspaces/globex/token", "globex-pat")
+            .unwrap();
+        let slot = std::sync::Arc::new(PinSlot::default());
+        slot.fill(std::sync::Arc::new(Picks));
+        let store = LayeredUserVault::new(agent.clone(), Some(global)).with_pins(slot);
+        assert_eq!(store.get_github_pat("acme").as_deref(), Some("acme-pat"));
+        // Globex isn't one of its connections, and the flat token is shut.
+        assert!(store.get_github_pat("globex").is_none());
+        agent
+            .set("skills/github/workspaces/default/token", "default-pat")
+            .unwrap();
+        assert_eq!(
+            store.get_github_pat("globex").as_deref(),
+            Some("default-pat")
         );
     }
 
