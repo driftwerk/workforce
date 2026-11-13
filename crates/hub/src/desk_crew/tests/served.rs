@@ -1003,7 +1003,7 @@ async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
                 &allan(),
                 Some(person),
                 &json!({"type": "decision", "askId": up[0]["askId"], "linkId": link,
-                        "nonce": up[0]["nonce"], "choice": "allow",
+                        "nonce": up[0]["nonce"], "choice": "deny",
                         "decider": {"identityId": person, "via": "slack"}}),
             )
             .await;
@@ -1017,6 +1017,7 @@ async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
                 Some(By::you())
             )
             .is_err());
+        assert!(d.view(started).unwrap().pending.is_none());
         leaves_nothing(a);
 
         // The person answers first: the boss's answer does nothing.
@@ -1045,6 +1046,10 @@ async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
                 .is_some_and(|w| w.contains("left this to you")),
             "{why:?}"
         );
+        let up = crew.asks_up(link, "acme", &allan(), false).await;
+        assert_eq!(up.len(), 1, "left to the person, it goes up: {up:?}");
+        // What the person can't see on the card isn't allowed from there.
+        assert_eq!(up[0]["class"], "desk_only", "{up:?}");
         d.decide(
             started,
             b,
@@ -1061,6 +1066,30 @@ async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
         )
         .await;
         assert_ne!(late.status, ServedStatus::Ok, "{:?}", late.body);
+        // Nor the person's late answer through the link's ask.
+        let late = crew
+            .remote_decision(
+                link,
+                "acme",
+                &allan(),
+                Some(person),
+                &json!({"type": "decision", "askId": up[0]["askId"], "linkId": link,
+                        "nonce": up[0]["nonce"], "choice": "stop",
+                        "decider": {"identityId": person, "via": "slack"}}),
+            )
+            .await;
+        assert_eq!(late["type"], "ask_closed", "{late}");
+        assert_ne!(late["how"], "decided", "{late}");
+        assert!(d.view(started).unwrap().pending.is_none());
+        let state = d.view(started).unwrap().state;
+        assert!(
+            !matches!(
+                state,
+                workforce_desk::model::SessionState::Stopped
+                    | workforce_desk::model::SessionState::Closed
+            ),
+            "the late stop didn't stop it: {state:?}"
+        );
         leaves_nothing(b);
     })
     .await;

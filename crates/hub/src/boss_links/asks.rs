@@ -45,7 +45,7 @@ const DETAIL_CHARS: usize = workforce_desk::boss_ask::DETAIL_CHARS;
 /// within Slack's 3000 a section.
 const SUMMARY_SHOWN: usize = 700;
 const NAME_SHOWN: usize = 120;
-const DETAIL_SHOWN: usize = 1_700;
+const DETAIL_SHOWN: usize = 1_600;
 const SAID_SHOWN: usize = 1_200;
 
 /// The most asks one link may have open here at once; the rest wait on
@@ -177,9 +177,10 @@ impl Asked {
             .filter(|(d, _)| !d.trim().is_empty());
         // A card that can't show the whole of what it asks about offers no
         // Allow: what was left out may be what runs.
+        // An ask without its words offers no Allow either.
         let cut = detail
             .as_ref()
-            .is_some_and(|(d, cut)| *cut || shown(d, DETAIL_SHOWN).1);
+            .is_none_or(|(d, cut)| *cut || fenced(d, DETAIL_SHOWN.saturating_sub(1)).1);
         let desk_only = desk_only || cut;
         options.retain(|o| *o != "allow" || !desk_only);
         if options.is_empty() {
@@ -302,27 +303,50 @@ fn shown(s: &str, max: usize) -> (String, bool) {
     (out, false)
 }
 
-/// [`shown`], within `max`, ending in `…` when cut.
+/// [`shown`], within `max`, ending in `…` when cut, for a card's header:
+/// no backticks, so nothing in it opens a code block.
 fn slack_text(s: &str, max: usize) -> String {
-    match shown(s, max.saturating_sub(1)) {
+    let s: String = s.chars().filter(|c| *c != '`').collect();
+    match shown(&s, max.saturating_sub(1)) {
         (s, true) => format!("{s}…"),
         (s, false) => s,
     }
 }
 
-/// `s`, escaped as [`shown`], as a code block: no run of backticks in it
-/// can close the block, a zero-width space between each two.
-fn code_block(s: &str, max: usize) -> String {
-    let (escaped, cut) = shown(s, max);
-    let mut out = String::with_capacity(escaped.len() + 8);
+/// `s`, escaped as [`shown`], for a code block: a zero-width space
+/// between each two backticks so no run of them closes the block; within
+/// `max` characters, those spaces counted, never cutting an escape.
+/// Whether it was cut.
+fn fenced(s: &str, max: usize) -> (String, bool) {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut len = 0;
     let mut tick = false;
-    for c in escaped.chars() {
+    for c in s.chars() {
+        let mut piece = String::new();
         if c == '`' && tick {
-            out.push('\u{200B}');
+            piece.push('\u{200B}');
         }
+        match c {
+            '&' => piece.push_str("&amp;"),
+            '<' => piece.push_str("&lt;"),
+            '>' => piece.push_str("&gt;"),
+            c => piece.push(c),
+        }
+        let n = piece.chars().count();
+        if len + n > max {
+            return (out, true);
+        }
+        len += n;
+        out.push_str(&piece);
         tick = c == '`';
-        out.push(c);
     }
+    (out, false)
+}
+
+/// `s` as a code block, as [`fenced`] says, within `max`: `…` where it
+/// was cut.
+fn code_block(s: &str, max: usize) -> String {
+    let (mut out, cut) = fenced(s, max.saturating_sub(1));
     if cut {
         out.push('…');
     }
@@ -902,6 +926,11 @@ mod tests {
                 .chars()
                 .any(workforce_desk::boss_ask::unshown));
         }
+        // Without its words: no Allow for what the person can't see.
+        f["detail"] = Value::Null;
+        let a = Asked::of(&f, now).unwrap();
+        assert!(a.desk_only);
+        assert_eq!(a.options, vec!["deny", "stop"]);
         // Whole: as it came.
         f["detail"] = json!("cargo build\ncargo test");
         let a = Asked::of(&f, now).unwrap();
@@ -925,6 +954,13 @@ mod tests {
         // Never an escape cut in two.
         let (s, cut) = shown("a&b", 4);
         assert_eq!((s.as_str(), cut), ("a", true));
+        // Backticks, each two of them a character more, counted too.
+        f["summary"] = json!("s".repeat(300));
+        f["detail"] = json!(format!("{}{}", "`".repeat(825), "&".repeat(175)));
+        let text = card(&f);
+        assert!(text.chars().count() <= 3_000, "{}", text.chars().count());
+        // A header opens no code block: no backticks in it.
+        assert_eq!(slack_text("acme```api", 100), "acmeapi");
         let line = plain_line("one\ntwo\tthree\u{85}four", 100);
         assert_eq!(line, "one two three four");
     }

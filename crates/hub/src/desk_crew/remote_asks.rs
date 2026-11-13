@@ -152,7 +152,12 @@ impl CrewHub {
             if bosses && view.waits_on_you.is_none() {
                 continue;
             }
-            let class = self.class_of(&g, &view).class;
+            // An ask whose words its card can't show is answered in Desk:
+            // no Allow for what the person can't see.
+            let class = match sees::shows(g.sees, Part::Question) {
+                true => self.class_of(&g, &view).class,
+                false => Class::DeskOnly,
+            };
             let options = boss_ask::options(class);
             let n = nonce();
             let hash = boss_ask::nonce_hash(&n);
