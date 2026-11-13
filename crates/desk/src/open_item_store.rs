@@ -321,6 +321,46 @@ impl DeskStore {
             .transpose()
     }
 
+    /// Closes every boss's item not closed with `key` (a request's, as it
+    /// is answered): the items as closed.
+    pub async fn item_close_of_key(
+        &self,
+        key: &str,
+        by: ClosedBy,
+        why: &str,
+    ) -> Result<Vec<OpenItem>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "UPDATE boss_open_items SET state = 'closed', closed_at = now(), changed_at = now(), \
+                     closed_by = $2, closed_why = $3 \
+                     WHERE dedupe_key = $1 AND state <> 'closed' RETURNING {COLUMNS}"
+                ),
+                &[&key, &by.as_str(), &why],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
+    /// Opens item `id` again, closed by a step that then didn't take: false
+    /// when it isn't closed, or another of its key is open by now.
+    pub async fn item_reopen(&self, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_open_items SET state = 'open', closed_at = NULL, closed_by = NULL, \
+                 closed_why = NULL, changed_at = now() WHERE id = $1 AND state = 'closed' \
+                 AND NOT EXISTS (SELECT 1 FROM boss_open_items o WHERE o.boss = boss_open_items.boss \
+                 AND o.dedupe_key = boss_open_items.dedupe_key AND o.state <> 'closed')",
+                &[&id],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
     /// Item `id` was put in a message at `at`: counted, and parked when
     /// `park` says so.
     pub async fn item_said(&self, id: Uuid, at: DateTime<Utc>, park: bool) -> Result<()> {

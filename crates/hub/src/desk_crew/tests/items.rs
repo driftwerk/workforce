@@ -531,3 +531,153 @@ async fn a_reply_ending_on_a_question_opens_one_unless_the_turn_asked() {
     })
     .await;
 }
+
+/// A parked item waits for the person: no closer and no sweep takes it,
+/// even once what it was about is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_item_is_never_closed_under_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let store = d.store();
+        let i = store
+            .item_open(&NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                Some(s.id),
+                "Merge it?",
+            ))
+            .await
+            .unwrap()
+            .item()
+            .clone();
+        store
+            .item_said(i.id, chrono::Utc::now(), true)
+            .await
+            .unwrap();
+        d.forget(s.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        crew.look_at_items().await;
+        crew.sweep_items(chrono::Duration::zero()).await;
+        let i = store.open_item(i.id).await.unwrap().unwrap();
+        assert_eq!(i.state, OpenState::Parked);
+        crew.drop_item(i.id).await.unwrap();
+        assert_eq!(
+            store.open_item(i.id).await.unwrap().unwrap().state,
+            OpenState::Closed
+        );
+    })
+    .await;
+}
+
+/// A request left to the person is an item posted with its own buttons,
+/// and answering it closes the item as that answer goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_left_to_the_person_closes_as_they_answer_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        let asked = tokio::spawn(async move {
+            hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "git push --force"}})).await
+        });
+        let pending = eventually("the request", async || d.view(s.id).unwrap().pending).await;
+        crew.approval_left_open(s.id, pending.id, "Run git push --force").await;
+        let post = eventually("its needs-you post", async || {
+            dm_posts(&overseer, "**Needs you.** acme-web waits on your answer")
+                .into_iter()
+                .next()
+        })
+        .await;
+        let extras = d.store().extras(std::slice::from_ref(&post.id)).await.unwrap();
+        assert_eq!(extras[&post.id].approvals[0].approval_id, pending.id.to_string());
+        let key = workforce_desk::open_item::approval_key(&s.id.to_string(), &pending.id.to_string());
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.dedupe_key == key)
+            .unwrap();
+        d.decide(s.id, pending.id, workforce_desk::model::Decision::Deny, Some(By::you()))
+            .unwrap();
+        asked.await.unwrap();
+        let closed = eventually("closed as answered", async || {
+            d.store()
+                .open_item(item.id)
+                .await
+                .unwrap()
+                .filter(|i| i.state == OpenState::Closed)
+        })
+        .await;
+        assert_eq!(
+            (closed.closed_by, closed.closed_why.as_deref()),
+            (Some(ClosedBy::Person), Some("You answered it."))
+        );
+    })
+    .await;
+}
+
+/// With close_from_accounts on, an ask closes once its session's account
+/// says it chose for itself since and waits on nothing; off, it stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_closes_an_ask_only_with_the_switch_on() {
+    for on in [false, true] {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (_overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                &format!(
+                    "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = {{ close_from_accounts = {on} }}\n"
+                ),
+                &[],
+            )
+            .await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let i = d
+                .store()
+                .item_open(&NewItem::ask("desk", OpenKind::Ask, Some(s.id), "Keep the export change?"))
+                .await
+                .unwrap()
+                .item()
+                .clone();
+            let mut a = workforce_desk::account::Account::new(s.id, "", chrono::Utc::now());
+            a.by_model = true;
+            a.decisions.push(workforce_desk::account::Decision {
+                what: "Went ahead without the export change".into(),
+                why: "The person didn't answer".into(),
+                at: chrono::Utc::now(),
+            });
+            d.store().session_account_put(&a).await.unwrap();
+            crew.look_at_items().await;
+            let i = d.store().open_item(i.id).await.unwrap().unwrap();
+            match on {
+                true => {
+                    assert_eq!(i.closed_by, Some(ClosedBy::Session));
+                    assert!(i.closed_why.unwrap().contains("went ahead"));
+                }
+                false => assert_eq!(i.state, OpenState::Open),
+            }
+        })
+        .await;
+    }
+}

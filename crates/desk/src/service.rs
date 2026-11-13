@@ -3502,7 +3502,40 @@ impl Desk {
         }
     }
 
+    /// Answers session `id`'s request `approval` as `by` (the person when
+    /// none) says, and closes what its boss owed the person on it, if
+    /// anything, as that answer goes.
     pub fn decide(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: Decision,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        let (closer, why) = match by.as_ref() {
+            Some(b) if b.party.kind == crew::PartyKind::Manager => (
+                crate::open_item::ClosedBy::Boss,
+                format!("{} answered it.", b.party.name),
+            ),
+            _ => (
+                crate::open_item::ClosedBy::Person,
+                "You answered it.".to_string(),
+            ),
+        };
+        let view = self.decide_now(id, approval, decision, by)?;
+        let key = crate::open_item::approval_key(&id.to_string(), &approval.to_string());
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let d = self.clone();
+            rt.spawn(async move {
+                if let Err(e) = d.0.store.item_close_of_key(&key, closer, &why).await {
+                    tracing::warn!(error = %e, "closing the open item of an answered request failed");
+                }
+            });
+        }
+        Ok(view)
+    }
+
+    fn decide_now(
         &self,
         id: Uuid,
         approval: Uuid,

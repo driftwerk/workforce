@@ -460,6 +460,37 @@ impl CrewHub {
                 .await
             {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
+                // Never lost: it is open again, and said so.
+                let reopened = crew
+                    .desk
+                    .store()
+                    .item_reopen(closed.id)
+                    .await
+                    .unwrap_or(false);
+                let text = match reopened {
+                    true => format!(
+                        "Your answer to “{}” didn't reach {} just now, so it is still open: answer it again.",
+                        crew::one_line(&closed.text, 200),
+                        super::name_of(&service)
+                    ),
+                    false => format!(
+                        "Your answer to “{}” didn't reach {} just now: say it again in this chat.",
+                        crew::one_line(&closed.text, 200),
+                        super::name_of(&service)
+                    ),
+                };
+                let target =
+                    DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+                if let Err(e) = crate::desk_surface::deliver(
+                    &service,
+                    &owner,
+                    &target,
+                    crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "saying an answer didn't reach the boss failed");
+                }
             }
         });
         Ok("Answered.".into())
@@ -590,6 +621,11 @@ impl CrewHub {
                 i.raised_at.is_none_or(|at| now - at >= MARK_FOR) && now - i.changed_at >= MARK_FOR;
             return old.then(|| (ClosedBy::Boss, "Told of over a day ago.".into()));
         }
+        // Parked, it waits for the person to answer or drop it: never
+        // closed under them.
+        if i.state == OpenState::Parked {
+            return None;
+        }
         let view = match i.session {
             Some(s) => match self.desk.view(s) {
                 Ok(v) if v.state == SessionState::Closed => {
@@ -627,12 +663,19 @@ impl CrewHub {
                     .await
                     .ok()
                     .and_then(|a| a.into_iter().next());
-                if account.is_some_and(|a| {
-                    a.by_model && a.written_at > i.changed_at && a.waiting_on.is_none()
+                // Past only when the session itself chose since it was
+                // asked, and waits on nothing now: it went ahead.
+                if let Some(chose) = account.as_ref().and_then(|a| {
+                    (a.by_model && a.waiting_on.is_none())
+                        .then(|| a.decisions.iter().rfind(|d| d.at > i.opened_at))
+                        .flatten()
                 }) {
                     return Some((
                         ClosedBy::Session,
-                        "Its account says it no longer waits on you.".into(),
+                        format!(
+                            "Its account says it went ahead: {}",
+                            crew::one_line(&chose.what, 200)
+                        ),
                     ));
                 }
             }
@@ -734,8 +777,9 @@ impl CrewHub {
     }
 
     /// The nightly sweep: of every item open or parked and unchanged for
-    /// `after`, closes what no longer applies. A parked one is never closed
-    /// for that alone: it waits for the person.
+    /// `after`, closes what no longer applies (the minute look does too; the
+    /// sweep is the backstop for what it missed). A parked one is never
+    /// closed by it: it waits for the person to answer or drop it.
     pub(crate) async fn sweep_items(&self, after: chrono::Duration) {
         let items = match self.desk.store().items_not_closed(None).await {
             Ok(i) => i,
