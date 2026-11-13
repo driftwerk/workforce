@@ -182,17 +182,17 @@ pub struct Pending {
     pub sent: Option<String>,
 }
 
-/// The lines of `p` that must reach the person word for word (decisions,
-/// what it kept, what still waits) that `said` leaves out.
+/// The lines of `p` that must reach the person word for word (its
+/// decisions and what it kept) that `said` leaves out. What still waits
+/// may be said in the boss's words: each ask has its own card.
 pub fn missing_lines(p: &Pending, decided: &[String], said: &str) -> Vec<String> {
     let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     let said = flat(said);
     decided
         .iter()
         .chain(&p.update.kept)
-        .cloned()
-        .chain(p.update.waiting.iter().map(|w| w.text.clone()))
         .filter(|l| !said.contains(&flat(l)))
+        .cloned()
         .collect()
 }
 
@@ -561,6 +561,9 @@ mod tests {
             missing_lines(&p, &decided, reply),
             vec!["What I promised at 10:00 (“Tell you”) is merged: #622".to_string()]
         );
+        // An ask said in its own words is no line missing.
+        let reworded = "I decided: told acme-api to wait — CI is red.\nWhat I promised at 10:00 (“Tell you”) is merged: #622\nI still need the staging key from you.";
+        assert!(missing_lines(&p, &decided, reworded).is_empty());
     }
 
     #[test]

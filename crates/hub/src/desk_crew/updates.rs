@@ -180,7 +180,7 @@ impl CrewHub {
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|d| d.at > last && d.undone_at.is_none())
+            .filter(|d| d.at > last && d.at <= now && d.undone_at.is_none())
             // Without the composer, an answer to a session was said at once.
             .filter(|d| composed || d.need != Need::Question)
             .collect();
@@ -191,7 +191,7 @@ impl CrewHub {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .filter(|i| i.closed_at.is_some_and(|at| at > last))
+                .filter(|i| i.closed_at.is_some_and(|at| at > last && at <= now))
                 .filter_map(|i| super::items::kept_line(i, tz))
                 .collect(),
             false => Vec::new(),
@@ -429,7 +429,11 @@ impl CrewHub {
         p: Pending,
     ) -> eyre::Result<()> {
         let boss = service.agent_id.as_str();
-        if p.handed && p.sent.is_none() {
+        // Its check-in answered it already: only what follows is left.
+        if p.handed && p.sent.is_some() {
+            return self.told(service, owner, state, &p).await;
+        }
+        if p.handed {
             // A check-in that answered it before a restart was its post.
             let answered = self
                 .desk
@@ -571,7 +575,15 @@ impl CrewHub {
             .iter()
             .map(BossDecision::said)
             .collect();
-        let missing = update::missing_lines(p, &decided, reply);
+        // Answered: kept so first, so a restart from here on neither hands
+        // it to another check-in nor posts what it left out twice.
+        let mut p = p.clone();
+        p.sent = Some(format!("check-in {}", marker(&p)));
+        self.desk
+            .store()
+            .update_pend(service.agent_id.as_str(), &p)
+            .await?;
+        let missing = update::missing_lines(&p, &decided, reply);
         if !missing.is_empty() {
             let target =
                 DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
@@ -581,7 +593,7 @@ impl CrewHub {
                 tracing::warn!(error = %e, "posting what a check-in's update left out failed");
             }
         }
-        self.told(service, owner, state, p).await
+        self.told(service, owner, state, &p).await
     }
 
     /// Sends `p` as `service`'s update, once: when a restart finds it
