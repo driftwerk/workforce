@@ -19,6 +19,9 @@ pub const READ_FRESH: chrono::Duration = chrono::Duration::minutes(5);
 /// when it opens: a slow dev-status never holds the ticket up.
 const DEV_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// The most pages of an issue's children one read of it takes.
+const CHILD_READS: usize = 3;
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -155,6 +158,38 @@ impl Desk {
             details.read_at = Some(now);
             ext.details = details;
             ext.dev = ticket_dev::merged(ext.dev.take(), work, links, now);
+        }
+        // A Jira issue's sub-tasks say nothing of who has each, and an
+        // epic's children aren't on it: one search over its children says.
+        // It never fails the read: what was known stays.
+        let facts = t.external.as_ref().map(|e| &e.details.facts);
+        let parent = facts.is_some_and(|f| {
+            e.system == System::Jira && (!f.children.is_empty() || crate::board_sync::is_epic(f))
+        });
+        if let (true, Some(s)) = (parent, sync.as_ref()) {
+            let mut budget = super::board_sync::Budget(CHILD_READS);
+            let mut pages = super::board_sync::Budget(CHILD_READS);
+            let keys = [e.key.clone()];
+            match self
+                .read_children(s, remote, &mut budget, &mut pages, &keys)
+                .await
+            {
+                Ok(Some(mut found)) => {
+                    let ext = t.external.as_mut().expect("a synced ticket");
+                    let epic = crate::board_sync::is_epic(&ext.details.facts);
+                    let children = found.of.remove(&e.key).unwrap_or_default();
+                    crate::board_sync::set_children(
+                        &mut ext.details.facts,
+                        children,
+                        &found.blocked,
+                        epic,
+                    );
+                }
+                Ok(None) | Err(RemoteError::Spent) => {}
+                Err(err) => {
+                    tracing::info!(ticket = %id, error = %err, "an issue's children weren't read");
+                }
+            }
         }
         self.save_ticket(&mut t).await.map_err(fail)?;
         let v = self.view_ticket(t).await.map_err(fail)?;
