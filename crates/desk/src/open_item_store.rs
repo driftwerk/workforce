@@ -10,12 +10,13 @@ use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::open_item::{ClosedBy, NewItem, OpenItem, OpenKind, OpenState};
+use crate::open_item::{AskLayout, ClosedBy, NewItem, OpenItem, OpenKind, OpenState};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
-     said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions";
+     said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions, \
+     question, points, recommended, not_blocking";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -45,6 +46,12 @@ fn item(r: &Row) -> Result<OpenItem> {
         closed_why: r.try_get(20)?,
         raised_at: r.try_get(21)?,
         sessions: r.try_get(22)?,
+        layout: AskLayout {
+            question: r.try_get(23)?,
+            points: serde_json::from_value(r.try_get(24)?).unwrap_or_default(),
+            recommended: r.try_get(25)?,
+            not_blocking: r.try_get(26)?,
+        },
     })
 }
 
@@ -76,6 +83,7 @@ impl DeskStore {
         let tx = client.transaction().await?;
         let now = crate::crew::now();
         let options = serde_json::to_value(&new.options)?;
+        let points = serde_json::to_value(&new.layout.points)?;
         let select = format!(
             "SELECT {COLUMNS} FROM boss_open_items \
              WHERE boss = $1 AND dedupe_key = $2 AND state <> 'closed' FOR UPDATE"
@@ -95,9 +103,9 @@ impl DeskStore {
                         "INSERT INTO boss_open_items (id, boss, owner, kind, session, line_message, \
                          text, holding_up, recommendation, options, generalizes, done_when, \
                          dedupe_key, opened_at, last_said_at, said_count, changed_at, state, \
-                         sessions) \
+                         sessions, question, points, recommended, not_blocking) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                         $16, $14, 'open', $17) \
+                         $16, $14, 'open', $17, $18, $19, $20, $21) \
                          ON CONFLICT (boss, dedupe_key) WHERE state <> 'closed' DO NOTHING \
                          RETURNING {COLUMNS}"
                     ),
@@ -119,6 +127,10 @@ impl DeskStore {
                         &said_at,
                         &said,
                         &new.sessions,
+                        &new.layout.question,
+                        &points,
+                        &new.layout.recommended,
+                        &new.layout.not_blocking,
                     ],
                 )
                 .await?;
@@ -158,7 +170,8 @@ impl DeskStore {
             || new.sessions.iter().any(|s| !was.sessions.contains(s))
             || (!new.options.is_empty() && new.options != was.options)
             || (new.holding_up.is_some() && new.holding_up != was.holding_up)
-            || (new.recommendation.is_some() && new.recommendation != was.recommendation);
+            || (new.recommendation.is_some() && new.recommendation != was.recommendation)
+            || (!new.layout.is_empty() && new.layout != was.layout);
         let first_said = new.said && !was.said();
         let r = tx
             .query_one(
@@ -174,7 +187,11 @@ impl DeskStore {
                      said_count = CASE WHEN $8 THEN 1 ELSE said_count END, \
                      last_said_at = CASE WHEN $8 THEN $11 ELSE last_said_at END, \
                      changed_at = CASE WHEN $12 OR $8 THEN $11 ELSE changed_at END, \
-                     sessions = ARRAY(SELECT DISTINCT unnest(sessions || $13::uuid[])) \
+                     sessions = ARRAY(SELECT DISTINCT unnest(sessions || $13::uuid[])), \
+                     question = COALESCE($14, question), \
+                     points = CASE WHEN $15 = '[]'::jsonb THEN points ELSE $15 END, \
+                     recommended = COALESCE($16, recommended), \
+                     not_blocking = COALESCE($17, not_blocking) \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
                 &[
@@ -191,6 +208,10 @@ impl DeskStore {
                     &now,
                     &changed,
                     &new.sessions,
+                    &new.layout.question,
+                    &points,
+                    &new.layout.recommended,
+                    &new.layout.not_blocking,
                 ],
             )
             .await?;

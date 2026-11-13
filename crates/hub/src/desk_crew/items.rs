@@ -56,7 +56,7 @@ pub const OPEN: &str = "crew.open_items";
 pub const PROMISE: &str = "crew.promise";
 pub const ORDER: &str = "crew.order";
 
-pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
+pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). For the update's layout, also give it in one line (question), its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself.";
 pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
@@ -84,7 +84,11 @@ pub fn schema(name: &str) -> Value {
             "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
-            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" }
+            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
+            "question": { "type": "string", "description": "The ask in one line, shown bold above the rest, e.g. \"Two staging records need a decision before the next PR.\"" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers, each short, when there are several" },
+            "recommended": { "type": "string", "description": "The one of options you recommend, word for word" },
+            "not_blocking": { "type": "string", "description": "What carries on meanwhile, e.g. \"The docs PR doesn't depend on it\"" }
         }, "required": ["text"] }),
         PROMISE => json!({ "type": "object", "properties": {
             "session_id": { "type": "string" },
@@ -258,17 +262,34 @@ impl CrewHub {
         let mut new = NewItem::ask(boss, kind, session, text).generalizing(some("generalizes"));
         new.holding_up = some("holding_up");
         new.recommendation = some("recommendation");
-        new.options = input["options"]
-            .as_array()
-            .map(|o| {
-                o.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let list = |k: &str| -> Vec<String> {
+            input[k]
+                .as_array()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|o| !o.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        new.options = list("options");
+        // The answer recommended is one of the options, as offered.
+        let recommended = some("recommended").and_then(|r| {
+            new.options
+                .iter()
+                .find(|o| o.trim().eq_ignore_ascii_case(r.trim()))
+                .cloned()
+        });
+        new.layout = workforce_desk::open_item::AskLayout {
+            question: some("question")
+                .map(|q| crew::one_line(&q, workforce_desk::update::QUESTION_CHARS)),
+            points: list("items"),
+            recommended,
+            not_blocking: some("not_blocking"),
+        };
         // Its turn's reply is not also kept as a question of its own.
         self.asked_person
             .lock()
@@ -1292,6 +1313,7 @@ mod tests {
                     closed_at: None,
                     closed_by: None,
                     closed_why: None,
+                    layout: Default::default(),
                 }
             })
             .collect();

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_desk::crew::{self, By, Extras, Kind, PartyKind, UndoRefused};
-use workforce_desk::decision::{BossDecision, Handled, How, Need, Undo, UndoPlan};
+use workforce_desk::decision::{BossDecision, DecisionKind, Handled, How, Need, Undo, UndoPlan};
 use workforce_desk::line::{Delivery, LineMessage};
 
 use super::actions::{Action, Target};
@@ -155,6 +155,29 @@ fn need_of(action: &Action) -> (Need, Option<String>) {
     }
 }
 
+/// The full text `action` sent a session or an agent, when it sent one.
+fn message_of(action: &Action) -> Option<&str> {
+    match action {
+        Action::Nudge { message, .. } => Some(message),
+        Action::Resume { prompt, .. } | Action::Restart { prompt, .. } => prompt.as_deref(),
+        Action::StartSession { goal, .. } => Some(goal),
+        Action::Assign { task, .. } => Some(task),
+        Action::AssignTicket { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+/// What `said` (the action's own account, "started web (…); you run it")
+/// says before its detail: the plain short line.
+fn said_short(said: &str) -> &str {
+    let cut = [";", " (", ": "]
+        .iter()
+        .filter_map(|p| said.find(p))
+        .min()
+        .unwrap_or(said.len());
+    said[..cut].trim()
+}
+
 /// The whole of `why` once the level's tag (" (at Act fully)") is said.
 fn why_of(by: &By) -> String {
     by.reason.clone().unwrap_or_default()
@@ -263,7 +286,21 @@ impl CrewHub {
             }
             _ => crew::clip(said, 240),
         };
-        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), How::Own);
+        // The short line never quotes what was sent: that is its message.
+        let brief = match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                reply_to: Some(_),
+                ..
+            } => format!("Answered {}'s question.", self.name_of_session(*s)),
+            Action::Nudge {
+                to: Target::Session(s),
+                ..
+            } => format!("Sent {} a message.", self.name_of_session(*s)),
+            _ => said_short(said).to_string(),
+        };
+        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), How::Own)
+            .briefly(&brief, message_of(action));
         d.need_ref = need_ref;
         d.session = session_of(action, done);
         let (undo, plan) = undo_of(action, done, before);
@@ -284,7 +321,9 @@ impl CrewHub {
             q.from.name,
             crew::one_line(q.headline(), 160)
         );
-        let mut d = BossDecision::new(&boss, Need::Question, &what, why, How::Escalated);
+        let mut d = BossDecision::new(&boss, Need::Question, &what, why, How::Escalated)
+            .briefly(&format!("Gave you {}'s question.", q.from.name), None);
+        d.kind = DecisionKind::Escalated;
         d.need_ref = Some(q.id.to_string());
         d.session = q.from_session();
         self.record(&d).await;
@@ -303,7 +342,8 @@ impl CrewHub {
             true => (Need::TurnEnd, format!("let {name} wait")),
             false => (Need::Choice, format!("sent {name} nothing")),
         };
-        let mut d = BossDecision::new(boss, need, &what, &why, How::Own);
+        let mut d = BossDecision::new(boss, need, &what, &why, How::Own).briefly(&what, None);
+        d.kind = DecisionKind::LeftAlone;
         d.session = Some(session);
         if work {
             d.undo = Undo::Reverse;
@@ -398,7 +438,12 @@ impl CrewHub {
                     &format!("you undid: {}", claimed.what),
                     &done,
                     How::PersonFirst,
+                )
+                .briefly(
+                    &format!("You undid: {}", claimed.brief().trim_end_matches('.')),
+                    None,
                 );
+                mine.kind = DecisionKind::Undone;
                 mine.session = claimed.session;
                 mine.need_ref = Some(claimed.id.to_string());
                 if let Err(e) = store.decision_put(&mine).await {

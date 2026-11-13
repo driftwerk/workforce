@@ -35,11 +35,11 @@ use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_desk::account::{Account, Done};
 use workforce_desk::crew::Extras;
-use workforce_desk::decision::{BossDecision, Need};
+use workforce_desk::decision::{BossDecision, DecisionLine, Need};
 use workforce_desk::model::SessionState;
 use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
 use workforce_desk::update::{
-    self, Change, MentionedUpdate, Pending, Told, UpdateSession, UpdateState, WaitingItem,
+    self, Change, MentionedUpdate, NeedsYou, Pending, Told, UpdateSession, UpdateState, WaitingItem,
 };
 
 use super::watcher::Budget;
@@ -249,26 +249,29 @@ impl CrewHub {
         }
     }
 
-    /// The session paragraphs of `b`: the cheap model's in the boss's
-    /// voice when it is on and may be asked, else plainly from the rows;
-    /// any it leaves out plainly too.
-    pub(super) async fn paragraphs(
+    /// The session paragraphs and decision lines of `b`: the cheap
+    /// model's in the boss's voice when it is on and may be asked, else
+    /// plainly from the rows; any it leaves out (or writes out of bounds)
+    /// plainly too.
+    pub(super) async fn composed(
         &self,
         boss: &str,
         owner: &str,
         o: &Oversight,
         b: &Batch,
-    ) -> Vec<UpdateSession> {
-        let mut written: HashMap<Uuid, String> = HashMap::new();
+    ) -> (Vec<UpdateSession>, Vec<DecisionLine>) {
+        let mut written = update::Composed::default();
         let writer = self.update_writer.lock().clone();
-        if let (true, Some(writer), false) = (o.updates.enabled, writer, b.sessions.is_empty()) {
+        let something = !b.sessions.is_empty() || !b.decisions.is_empty();
+        if let (true, Some(writer), true) = (o.updates.enabled, writer, something) {
             if self.desk.update_take().await.unwrap_or(false) {
                 let input: Vec<(Uuid, String, &Account, Vec<&Done>)> = b
                     .sessions
                     .iter()
                     .map(|s| (s.id, s.name.clone(), &s.account, s.new.iter().collect()))
                     .collect();
-                let user = update::composer_input(&input);
+                let mut user = update::composer_input(&input);
+                user.push_str(&update::composer_decisions(&b.decisions));
                 match writer
                     .write(boss, owner, update::COMPOSER_SYSTEM, &user)
                     .await
@@ -285,7 +288,8 @@ impl CrewHub {
                 }
             }
         }
-        b.sessions
+        let sessions = b
+            .sessions
             .iter()
             .map(|s| {
                 let new: Vec<&Done> = s.new.iter().collect();
@@ -294,12 +298,15 @@ impl CrewHub {
                     name: s.name.clone(),
                     purpose: s.account.purpose.trim().to_string(),
                     text: written
+                        .sessions
                         .remove(&s.id)
                         .unwrap_or_else(|| update::plain_session(&new, &s.account)),
                     refs: update::refs_of(&new),
                 }
             })
-            .collect()
+            .collect();
+        let decisions = update::decision_lines(&b.decisions, &written.decisions);
+        (sessions, decisions)
     }
 
     /// `b` written as an update for `owner`: its extras and its text.
@@ -311,27 +318,17 @@ impl CrewHub {
         b: &Batch,
         now: DateTime<Utc>,
     ) -> (MentionedUpdate, String) {
-        let sessions = self.paragraphs(boss, owner, o, b).await;
+        let (sessions, decisions) = self.composed(boss, owner, o, b).await;
         let footer = match self.desk.cheap_today().await {
             Ok((spent, cap)) => update::footer(spent, cap),
             Err(_) => None,
         };
         let u = MentionedUpdate {
             sessions,
-            decisions: b.decisions.iter().map(BossDecision::line).collect(),
+            decisions,
             kept: b.kept.clone(),
-            waiting: b
-                .waiting
-                .iter()
-                .map(|i| WaitingItem {
-                    item_id: i.id.to_string(),
-                    text: i.text.clone(),
-                    age: update::age(i.opened_at, now),
-                    holding_up: i.holding_up.clone(),
-                    recommendation: i.recommendation.clone(),
-                    options: i.options.clone(),
-                })
-                .collect(),
+            waiting: b.waiting.iter().map(|i| WaitingItem::of(i, now)).collect(),
+            needs_you: b.waiting.iter().map(|i| NeedsYou::of(i, now)).collect(),
             footer,
         };
         let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();

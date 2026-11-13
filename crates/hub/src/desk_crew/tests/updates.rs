@@ -8,6 +8,7 @@ use super::super::updates::UpdateWriter;
 use super::*;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_desk::account::{Account, Done, Ref, RefKind};
+use workforce_desk::open_item::{NewItem, OpenKind};
 
 /// A writer that answers `answer`, or fails.
 struct Writer(Option<String>);
@@ -28,6 +29,40 @@ impl UpdateWriter for Writer {
             }
             None => eyre::bail!("the model is down"),
         }
+    }
+}
+
+/// A writer that gives each decision `action` and `why`, and each
+/// session `said`.
+struct Deciding {
+    action: String,
+    why: String,
+}
+
+#[async_trait::async_trait]
+impl UpdateWriter for Deciding {
+    async fn write(&self, _: &str, _: &str, system: &str, user: &str) -> eyre::Result<String> {
+        assert!(system.contains("at most 70 characters"));
+        let ids = |prefix: &str| -> Vec<String> {
+            user.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.split_whitespace().next())
+                .map(str::to_string)
+                .collect()
+        };
+        let sessions: Vec<String> = ids("Session ")
+            .iter()
+            .map(|id| format!("{{\"id\": \"{id}\", \"text\": \"It merged.\"}}"))
+            .collect();
+        let decisions: Vec<serde_json::Value> = ids("Decision ")
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "action": self.action, "why": self.why}))
+            .collect();
+        Ok(format!(
+            "{{\"sessions\": [{}], \"decisions\": {}}}",
+            sessions.join(", "),
+            serde_json::Value::from(decisions)
+        ))
     }
 }
 
@@ -208,6 +243,115 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             })
             .await;
             assert_eq!(extras.decisions, vec![row.line()]);
+            // Laid out plainly: a short line that never says the message,
+            // which is kept whole beside it.
+            assert_eq!(row.brief, "Sent acme-web a message.");
+            assert_eq!(row.brief_why, "CI is red on main.");
+            assert_eq!(
+                row.message.as_deref(),
+                Some("Wait for green CI before merging.")
+            );
+            assert_eq!(row.kind, workforce_desk::decision::DecisionKind::Acted);
+            let l = &extras.decisions[0];
+            assert_eq!(l.action, "Sent acme-web a message.");
+            assert!(!l.action.contains("green CI") && !l.why.contains("green CI"));
+            assert_eq!(l.message, row.message);
+        })
+        .await;
+    }
+}
+
+/// The composer writes each decision's short line and why, never with the
+/// message in them (one that does, or runs past 70 characters, is written
+/// plainly), and what needs the person is laid out as the boss gave it.
+#[tokio::test(flavor = "multi_thread")]
+async fn decisions_and_needs_you_are_laid_out() {
+    let message = "Hold the release until the migration check passes on staging.";
+    for (action, why, expect_action, expect_why) in [
+        (
+            "Put a hold on tonight's release.",
+            "The migration check failed on staging.",
+            "Put a hold on tonight's release.",
+            "The migration check failed on staging.",
+        ),
+        (
+            "Told acme-web to hold the release until the migration check passes",
+            "It said: hold the release until the migration check passes.",
+            "Sent acme-web a message.",
+            "The migration check failed on staging.",
+        ),
+    ] {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+            crew.set_update_writer(Arc::new(Deciding {
+                action: action.into(),
+                why: why.into(),
+            }));
+            begun(&crew).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let mut ask = NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                Some(s.id),
+                "Two staging records need a decision before the next PR. Which way?",
+            );
+            ask.options = vec!["Deactivate the roles".into(), "Leave both".into()];
+            ask.recommendation = Some("Deactivate the roles; they can be put back.".into());
+            ask.layout = workforce_desk::open_item::AskLayout {
+                question: Some("Two staging records need a decision.".into()),
+                points: vec!["A user with no organisation.".into()],
+                recommended: Some("Deactivate the roles".into()),
+                not_blocking: Some("The docs PR doesn't depend on it.".into()),
+            };
+            d.store().item_open(&ask).await.unwrap();
+            crew.perform(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: message.into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("The migration check failed on staging. Twice.")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let posted =
+                eventually("the update", async || updates(&overseer).into_iter().next()).await;
+            let u = eventually("its extras", async || {
+                d.store()
+                    .extras(std::slice::from_ref(&posted.id))
+                    .await
+                    .unwrap()
+                    .remove(&posted.id)
+                    .and_then(|e| e.update)
+            })
+            .await;
+            let l = &u.decisions[0];
+            assert_eq!(
+                (l.action.as_str(), l.why.as_str()),
+                (expect_action, expect_why)
+            );
+            assert!(l.action.chars().count() <= 70);
+            assert_eq!(l.message.as_deref(), Some(message));
+            // The text the chat falls back on still says it in full.
+            assert!(posted.content.contains(message), "{}", posted.content);
+            let n = &u.needs_you[0];
+            assert_eq!(n.question, "Two staging records need a decision.");
+            assert_eq!(n.items, vec!["A user with no organisation.".to_string()]);
+            assert_eq!(
+                n.options
+                    .iter()
+                    .filter(|o| o.recommended)
+                    .map(|o| o.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Deactivate the roles"]
+            );
+            assert_eq!(
+                n.not_blocking.as_deref(),
+                Some("The docs PR doesn't depend on it.")
+            );
+            assert_eq!(u.waiting[0].options.len(), 2, "waiting stays as it was");
         })
         .await;
     }

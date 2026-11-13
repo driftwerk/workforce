@@ -45,6 +45,50 @@ text_enum!(Undo {
     None => "none",
 });
 
+/// What a decision was, as the chat lays it out: the times it left a
+/// session alone fold into one line.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    /// It did something for a session.
+    #[default]
+    Acted,
+    /// It let a session wait, or sent it nothing.
+    LeftAlone,
+    /// It gave a session's question to the person.
+    Escalated,
+    /// The person undid one of its decisions.
+    Undone,
+}
+
+impl DecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acted => "acted",
+            Self::LeftAlone => "left_alone",
+            Self::Escalated => "escalated",
+            Self::Undone => "undone",
+        }
+    }
+
+    pub fn parse(s: &str) -> eyre::Result<Self> {
+        Ok(match s {
+            "acted" => Self::Acted,
+            "left_alone" => Self::LeftAlone,
+            "escalated" => Self::Escalated,
+            "undone" => Self::Undone,
+            other => eyre::bail!("unknown DecisionKind {other:?}"),
+        })
+    }
+}
+
+/// The most characters a decision's short line has.
+pub const BRIEF_CHARS: usize = 70;
+/// The most characters its one-sentence why has.
+pub const WHY_CHARS: usize = 200;
+
 /// One decision of a boss's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BossDecision {
@@ -70,6 +114,14 @@ pub struct BossDecision {
     pub undone_at: Option<DateTime<Utc>>,
     /// The Activity event it also wrote, when known.
     pub event: Option<String>,
+    /// What was done, short ("Told web to wait for green CI."): never the
+    /// message it sent. Empty on older rows: [`Self::brief`] says it then.
+    pub brief: String,
+    /// Why, in one sentence. Empty on older rows.
+    pub brief_why: String,
+    /// The full text sent to the session; none when nothing was sent.
+    pub message: Option<String>,
+    pub kind: DecisionKind,
 }
 
 impl BossDecision {
@@ -91,6 +143,44 @@ impl BossDecision {
             undo: Undo::None,
             undone_at: None,
             event: None,
+            brief: String::new(),
+            brief_why: String::new(),
+            message: None,
+            kind: DecisionKind::Acted,
+        }
+    }
+
+    /// With its short line and one-sentence why, and the message it sent.
+    pub fn briefly(mut self, brief: &str, message: Option<&str>) -> Self {
+        self.message = message
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        self.brief = brief_line(brief, self.message.as_deref()).unwrap_or_default();
+        self.brief_why = why_line(&self.why, self.message.as_deref());
+        self
+    }
+
+    /// Its short line: as kept, else from what was decided (an older row),
+    /// never with the message it sent in it.
+    pub fn brief(&self) -> String {
+        brief_line(&self.brief, self.message.as_deref())
+            .or_else(|| brief_line(&self.what, self.message.as_deref()))
+            .unwrap_or_else(|| {
+                let what = crate::crew::one_line(&self.what, 200);
+                let cut = what.split(['“', '"']).next().unwrap_or_default().trim();
+                sentence(&crate::crew::clip(
+                    cut.trim_end_matches(':'),
+                    BRIEF_CHARS - 1,
+                ))
+            })
+    }
+
+    /// Its why in one sentence: as kept, else from the full why.
+    pub fn brief_why(&self) -> String {
+        match self.brief_why.trim() {
+            "" => why_line(&self.why, self.message.as_deref()),
+            w => w.to_string(),
         }
     }
 
@@ -129,11 +219,14 @@ impl BossDecision {
         DecisionLine {
             id: self.id.to_string(),
             text: self.what.clone(),
-            why: self.why.clone(),
+            why: self.brief_why(),
             undo: button.map(str::to_string),
             undone: self.undone_at.is_some(),
             preference: self.preference.map(|p| p.to_string()),
             at: Some(self.at),
+            action: self.brief(),
+            message: self.message.clone(),
+            kind: self.kind,
         }
     }
 
@@ -159,6 +252,58 @@ impl BossDecision {
             ) => Some("resume"),
             (Undo::Reverse, _) => Some("undo"),
         }
+    }
+}
+
+/// `text` as a sentence: a capital first, a full stop last.
+fn sentence(text: &str) -> String {
+    let t = text.trim();
+    let mut c = t.chars();
+    let Some(first) = c.next() else {
+        return String::new();
+    };
+    let mut out: String = first.to_uppercase().chain(c).collect();
+    if !out.ends_with(['.', '!', '?', '…']) {
+        out.push('.');
+    }
+    out
+}
+
+/// Whether `text` says `message`, or a good part of it: the short line
+/// and why never quote what was sent. A short message is found by its
+/// words together, a longer one by any run of six of them.
+pub fn quotes(text: &str, message: Option<&str>) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let m = words(message.unwrap_or_default());
+    let t = format!(" {} ", words(text).join(" "));
+    let run = |w: &[String]| t.contains(&format!(" {} ", w.join(" ")));
+    match m.len() {
+        0 => false,
+        n if n < 5 => run(&m),
+        _ => m.windows(5).any(run),
+    }
+}
+
+/// `text` as a decision's short line: one line, at most [`BRIEF_CHARS`],
+/// a sentence; none when empty or it quotes `message`.
+pub fn brief_line(text: &str, message: Option<&str>) -> Option<String> {
+    let line = crate::crew::one_line(text, BRIEF_CHARS - 1);
+    let line = sentence(&line);
+    (!line.is_empty() && line.chars().count() <= BRIEF_CHARS && !quotes(&line, message))
+        .then_some(line)
+}
+
+/// `why` as one sentence, never quoting `message`: empty when it would.
+pub fn why_line(why: &str, message: Option<&str>) -> String {
+    let line = sentence(&crate::crew::one_line(why, WHY_CHARS - 1));
+    match quotes(&line, message) {
+        true => String::new(),
+        false => line,
     }
 }
 
@@ -246,6 +391,16 @@ pub struct DecisionLine {
     /// When it was decided: a catch-up says each one's time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What was done, short (at most [`BRIEF_CHARS`]): never the message.
+    #[serde(default)]
+    pub action: String,
+    /// The full text sent to the session, behind the chat's Message; null
+    /// when nothing was sent.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// `acted` | `left_alone` | `escalated` | `undone`.
+    #[serde(default)]
+    pub kind: DecisionKind,
 }
 
 /// How many needs a boss settled itself, gave the person, or the person
@@ -385,5 +540,92 @@ mod tests {
         assert_eq!((h.itself(), h.needs()), (2, 4));
         assert_eq!(h.escalated, 1);
         assert_eq!(h.person_first, 1);
+    }
+
+    #[test]
+    fn the_short_line_is_bounded_and_never_quotes_the_message() {
+        let message =
+            "Please hold the release tonight until the migration check passes on staging.";
+        let d = BossDecision::new(
+            "desk",
+            Need::Choice,
+            &format!("told web “{message}”"),
+            "The migration check failed twice. It might be flaky.",
+            How::Own,
+        )
+        .briefly("Sent web a message", Some(message));
+        assert_eq!(d.brief, "Sent web a message.");
+        assert_eq!(d.brief_why, "The migration check failed twice.");
+        let l = d.line();
+        assert_eq!(l.action, "Sent web a message.");
+        assert_eq!(l.why, "The migration check failed twice.");
+        assert_eq!(l.message.as_deref(), Some(message));
+        assert_eq!(l.kind, DecisionKind::Acted);
+        // The old text is still there, as it was.
+        assert!(l.text.contains(message));
+        // A line that says the message is not a short line; nor a why.
+        assert_eq!(
+            brief_line(&format!("Told web: {message}"), Some(message)),
+            None
+        );
+        assert_eq!(why_line(message, Some(message)), "");
+        assert!(quotes("Told web “5433”.", Some("5433")));
+        assert!(!quotes("Answered web's question.", Some("5433")));
+        // At most 70 characters, counted as characters, ellipsis and all.
+        let long =
+            "Überprüfte die Läufe für jede einzelne Sitzung, die heute noch offen war, und mehr";
+        let b = brief_line(long, None).unwrap();
+        assert!(b.chars().count() <= BRIEF_CHARS, "{b}");
+        assert!(b.ends_with('…'), "{b}");
+        let back = brief_line(&b, None).unwrap();
+        assert_eq!(back, b, "a bounded line stays as it is");
+    }
+
+    #[test]
+    fn an_older_row_reads_short_from_what_it_decided() {
+        let message = "Wait for green CI before merging, then deploy to staging only.";
+        let mut d = BossDecision::new(
+            "desk",
+            Need::Choice,
+            &format!("told web “{message}”"),
+            "CI is red on main.",
+            How::Own,
+        );
+        // As V060 left it: no short line, its message from its undo plan.
+        d.message = Some(message.into());
+        let l = d.line();
+        assert_eq!(l.action, "Told web.");
+        assert!(!l.action.contains("green CI"));
+        assert_eq!(l.why, "CI is red on main.");
+        let plain = BossDecision::new("desk", Need::Approval, "allowed web", "", How::Own);
+        assert_eq!(plain.line().action, "Allowed web.");
+        assert_eq!(plain.line().message, None);
+    }
+
+    #[test]
+    fn the_kinds_and_message_are_on_the_wire() {
+        let mut d = BossDecision::new("desk", Need::TurnEnd, "let web wait", "CI runs.", How::Own)
+            .briefly("let web wait", None);
+        d.kind = DecisionKind::LeftAlone;
+        let v = serde_json::to_value(d.line()).unwrap();
+        assert_eq!(v["kind"], "left_alone");
+        assert_eq!(v["action"], "Let web wait.");
+        assert!(v.get("message").is_some_and(Value::is_null), "{v}");
+        for k in [
+            DecisionKind::Acted,
+            DecisionKind::LeftAlone,
+            DecisionKind::Escalated,
+            DecisionKind::Undone,
+        ] {
+            assert_eq!(DecisionKind::parse(k.as_str()).unwrap(), k);
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
+        }
+        // A line kept before these fields reads with their defaults.
+        let old: DecisionLine = serde_json::from_value(serde_json::json!({
+            "id": "x", "text": "told web “go”", "why": "CI is green.", "undo": "undo"
+        }))
+        .unwrap();
+        assert_eq!((old.action.as_str(), old.message), ("", None));
+        assert_eq!(old.kind, DecisionKind::Acted);
     }
 }

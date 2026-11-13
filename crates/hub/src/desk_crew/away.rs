@@ -30,7 +30,9 @@ use workforce_desk::crew::Extras;
 use workforce_desk::decision::{BossDecision, Handled};
 use workforce_desk::model::SessionState;
 use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
-use workforce_desk::update::{Change, MentionedUpdate, Pending, UpdateState, WaitingItem};
+use workforce_desk::update::{
+    Change, MentionedUpdate, NeedsYou, Pending, UpdateState, WaitingItem,
+};
 use workforce_desk::update_store::HeldCard;
 
 use super::{CrewHub, CHECK_IN};
@@ -481,7 +483,7 @@ impl CrewHub {
             }
             return Ok(());
         }
-        let sessions = self.paragraphs(boss, owner, o, &b).await;
+        let (sessions, decisions) = self.composed(boss, owner, o, &b).await;
         let finished: Vec<(String, String)> = b
             .sessions
             .iter()
@@ -501,19 +503,10 @@ impl CrewHub {
         };
         let u = MentionedUpdate {
             sessions,
-            decisions: b.decisions.iter().map(BossDecision::line).collect(),
+            decisions,
             kept: b.kept.clone(),
-            waiting: waiting
-                .iter()
-                .map(|i| WaitingItem {
-                    item_id: i.id.to_string(),
-                    text: i.text.clone(),
-                    age: workforce_desk::update::age(i.opened_at, now),
-                    holding_up: i.holding_up.clone(),
-                    recommendation: i.recommendation.clone(),
-                    options: i.options.clone(),
-                })
-                .collect(),
+            waiting: waiting.iter().map(|i| WaitingItem::of(i, now)).collect(),
+            needs_you: waiting.iter().map(|i| NeedsYou::of(i, now)).collect(),
             footer,
         };
         let a = MentionedAway {
