@@ -989,8 +989,11 @@ async fn an_unchanged_question_wakes_the_overseer_once_and_what_it_raised_is_kep
             1,
             "the same open question doesn't wake it again"
         );
-        let raised = crew.raised().await;
+        let raised = crew.raised_marks().await;
         assert_eq!(raised.len(), 1, "what it raised is kept: {raised:?}");
+        // Kept on the boss's items, never said to the person.
+        let marks = d.store().items_not_closed(Some("desk")).await.unwrap();
+        assert!(marks.iter().all(|i| !i.said()), "{marks:?}");
         d.note(ask("Ship it to everyone?"));
         eventually("a check-in about the new question", async || {
             d.store()
@@ -1799,6 +1802,7 @@ mod act_fully;
 mod act_fully_budget;
 
 mod decisions;
+mod items;
 
 mod remote_asks;
 mod served;

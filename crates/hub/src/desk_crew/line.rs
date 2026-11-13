@@ -27,6 +27,8 @@ use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Extras, MentionedQuestion, PartyKind};
 use workforce_desk::line::{Asked, Escalation, LineKind, LineMessage};
 use workforce_desk::model::DeskEvent;
+use workforce_desk::open_item::{self, NewItem, OpenKind};
+use workforce_desk::open_item_store::Opened;
 
 use super::actions::{Action, Gate, Target};
 use super::watcher::reported;
@@ -184,6 +186,30 @@ impl CrewHub {
             options: Vec::new(),
             draft: None,
         });
+        // One item, and one card, however often it is given to the person:
+        // escalated again, it is updated and nothing new is posted.
+        let mut item = NewItem::ask(
+            service.agent_id.as_str(),
+            OpenKind::Ask,
+            q.from_session(),
+            &format!(
+                "{} asks: “{}”",
+                q.from.name,
+                crew::one_line(q.headline(), 400)
+            ),
+        );
+        item.dedupe_key = open_item::line_key(q.id);
+        item.line_message = Some(q.id);
+        item.options = e.options.clone();
+        item.recommendation = e.draft.clone();
+        match self.desk.store().item_open(&item).await {
+            Ok(Opened::New(_)) => {}
+            Ok(Opened::Again(_)) => return,
+            // Kept or not, the person still gets the question.
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "keeping a session's question as an open item failed");
+            }
+        }
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
@@ -755,7 +781,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     crew.answer_line(session, messages, ended).await;
                     // What its turn was given and left open is the
                     // person's: never given to it again by itself.
-                    crew.left_open(session, &asks);
+                    crew.left_open(session, &asks).await;
                 }),
             );
         }

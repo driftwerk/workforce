@@ -25,6 +25,7 @@ use crate::line::{
 };
 use crate::line_store::NotAnswered;
 use crate::model::{DeskEvent, Origin, SessionState, SessionView};
+use crate::open_item::ClosedBy;
 
 /// What the desk keeps of its lines in memory: lost with the hub, which is
 /// the person-spoke state for the loop guard.
@@ -761,6 +762,13 @@ impl Desk {
             Err(NotAnswered::Already) => return Err(Refusal::Answered.into()),
             Err(NotAnswered::NoSuchAsk) => return Err(Refusal::NoSuchAsk(ask).into()),
         };
+        // What the boss owed the person on it is settled in this request.
+        let (closer, why) = match &by {
+            Sender::Person => (ClosedBy::Person, "You answered it.".to_string()),
+            Sender::Overseer(b) => (ClosedBy::Boss, format!("{} answered it.", b.party.name)),
+            Sender::Session(_) => (ClosedBy::Session, "The session answered it.".to_string()),
+        };
+        self.close_line_item(question.id, closer, &why).await;
         match (&by, &asker) {
             (Sender::Person, Some(v)) => self.person_spoke(v.id),
             (Sender::Session(id), _) => {
@@ -1144,6 +1152,8 @@ impl Desk {
     pub async fn line_dismiss(&self, ask: Uuid) -> Result<LineMessage, LineError> {
         match self.0.store.line_dismiss(ask).await? {
             Some(m) => {
+                self.close_line_item(ask, ClosedBy::Person, "You set it aside unanswered.")
+                    .await;
                 self.line_announce(&m);
                 Ok(m)
             }
@@ -1156,6 +1166,14 @@ impl Desk {
                 .into()),
                 _ => Err(Refusal::NoSuchAsk(ask).into()),
             },
+        }
+    }
+
+    /// Closes the boss's open item on the question `ask`, if one: a failure
+    /// is logged and never fails the answer (the hub's closers catch it).
+    pub async fn close_line_item(&self, ask: Uuid, by: ClosedBy, why: &str) {
+        if let Err(e) = self.0.store.item_close_of_line(ask, by, why).await {
+            tracing::warn!(%ask, error = %e, "closing the open item of an answered question failed");
         }
     }
 

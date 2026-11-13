@@ -15,7 +15,7 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
-//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60 }
+//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false }
 //! ```
 //!
 //! `[oversight.updates]` holds the cheap model's day: every session's
@@ -23,6 +23,9 @@
 //! (their own share), and later the boss's updates, all within
 //! `cheap_calls_per_day`. Past it accounts are written plainly. The main
 //! overseer's applies to every account, as the accounts are shared.
+//! `close_from_accounts` lets a session's account close what the boss
+//! asked the person about it, once the account shows the matter is past;
+//! off until accounts and open items have run in real use.
 //!
 //! `full` is **Act fully**: everything `act` does, and, in the repositories
 //! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
@@ -322,6 +325,9 @@ pub struct Updates {
     pub cheap_calls_per_day: u32,
     /// Questions' own share of them.
     pub account_questions_per_day: u32,
+    /// Whether a session's account may close an open item about it once
+    /// it shows the matter is past (the rule-based closers are always on).
+    pub close_from_accounts: bool,
 }
 
 /// The most cheap calls a day may allow.
@@ -421,6 +427,7 @@ impl Default for Oversight {
             updates: Updates {
                 cheap_calls_per_day: 500,
                 account_questions_per_day: 60,
+                close_from_accounts: false,
             },
         }
     }
@@ -872,6 +879,12 @@ impl Oversight {
                     &format!(
                         "The most questions a day it may answer from a session's conversation must be a whole number from 0 to {MAX_CHEAP_CALLS}."
                     ),
+                )?,
+                close_from_accounts: switch(
+                    updates,
+                    "close_from_accounts",
+                    d.updates.close_from_accounts,
+                    "closing what it asked from sessions' accounts",
                 )?,
             },
         })

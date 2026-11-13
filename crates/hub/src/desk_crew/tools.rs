@@ -25,8 +25,9 @@ use super::actions::{Action, Gate, Target};
 use super::watcher::reported;
 use super::CrewHub;
 
-/// Every `crew.*` tool: the reading ones first.
-pub const READ: [&str; 7] = [
+/// Every `crew.*` tool: the ones it has at every level first (its reads,
+/// and what it asks of the person, which is never gated).
+pub const READ: [&str; 10] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -34,6 +35,9 @@ pub const READ: [&str; 7] = [
     "crew.history",
     super::spend::NAME,
     super::board::NAME,
+    super::items::ASK,
+    super::items::CLOSE,
+    super::items::OPEN,
 ];
 pub const ACT: [&str; 21] = [
     "crew.nudge",
@@ -370,6 +374,9 @@ impl CrewTool {
                     .await
             }
             super::board::NAME => crew.board(seen).await,
+            super::items::ASK | super::items::CLOSE | super::items::OPEN => {
+                crew.items_tool(self.name, b, input).await
+            }
             _ => Err("not a reading tool".into()),
         }
     }
@@ -734,6 +741,9 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             super::decisions::NAME => super::decisions::DESCRIPTION,
+            super::items::ASK => super::items::ASK_DESCRIPTION,
+            super::items::CLOSE => super::items::CLOSE_DESCRIPTION,
+            super::items::OPEN => super::items::OPEN_DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
@@ -777,6 +787,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
         super::decisions::NAME => super::decisions::schema(),
+        super::items::ASK | super::items::CLOSE | super::items::OPEN => super::items::schema(name),
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),

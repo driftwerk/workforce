@@ -37,11 +37,12 @@ const DESK_TOOLS: [&str; 9] = crate::desk_tools::NAMES;
 const MORNING_JOB: &str = "crew-summary-morning";
 const EVENING_JOB: &str = "crew-summary-evening";
 
-/// Where the open questions the overseer raised are kept, and when each
-/// last was, so a restart doesn't raise them again.
-const RAISED: &str = "hub.crew.raised";
+/// Where the open questions the overseer raised were kept before they were
+/// the boss's open items: read once, moved, and gone
+/// ([`CrewHub::raised_marks`]).
+pub(super) const RAISED: &str = "hub.crew.raised";
 /// How long a raised question is remembered.
-const RAISED_FOR: chrono::TimeDelta = chrono::TimeDelta::days(1);
+const RAISED_FOR: chrono::TimeDelta = super::items::MARK_FOR;
 /// The most check-in lines held while check-ins are spent; older go.
 const MAX_HELD: usize = 30;
 
@@ -826,31 +827,6 @@ impl CrewHub {
         let me = Party::manager(service.agent_id.as_str(), &name_of(service));
         self.desk.note(Event::new(Kind::Quiet, me, None, text));
     }
-
-    /// The open questions raised and when, as kept.
-    pub(super) async fn raised(&self) -> HashMap<String, DateTime<Utc>> {
-        match self.desk.store().state(RAISED).await {
-            Ok(kept) => kept
-                .and_then(|e| serde_json::from_value(e.value).ok())
-                .unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!(error = %e, "reading the questions the overseer raised failed");
-                HashMap::new()
-            }
-        }
-    }
-
-    /// Keeps `raised` for the next start.
-    async fn keep_raised(&self, raised: &HashMap<String, DateTime<Utc>>) {
-        if let Err(e) = self
-            .desk
-            .store()
-            .put_state(RAISED, &serde_json::json!(raised))
-            .await
-        {
-            tracing::warn!(error = %e, "keeping the questions the overseer raised failed");
-        }
-    }
 }
 
 /// The session whose turn `event` says ended, when it does.
@@ -896,7 +872,8 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut waking: HashMap<String, Waking> = HashMap::new();
-    let mut raised = crew.raised().await;
+    // Kept on the boss's open items, so a restart doesn't raise them again.
+    let mut raised = crew.raised_marks().await;
     // A check-in whose turn didn't run comes back here, to be tried again
     // once: none is dropped without a word.
     let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
@@ -1051,12 +1028,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             let triggers = std::mem::take(&mut w.pending);
             let now = Utc::now();
             raised.retain(|_, at| now - *at < RAISED_FOR);
-            let asked: Vec<&String> = triggers.iter().filter_map(|t| t.about.as_ref()).collect();
-            if !asked.is_empty() {
-                for key in asked {
+            for t in &triggers {
+                if let Some(key) = &t.about {
                     raised.insert(key.clone(), now);
+                    crew.mark_raised(&id, key, &t.line, now).await;
                 }
-                crew.keep_raised(&raised).await;
             }
             let crew = Arc::clone(&crew);
             let retry = retry.clone();

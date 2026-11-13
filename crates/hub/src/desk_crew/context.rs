@@ -2,7 +2,8 @@
 //! session's line and in a work turn: what Desk keeps of each session in
 //! its scope (an account's line each, and the whole account of the session
 //! the turn is about) and what it told the person lately, read from the DM
-//! archive so a rollover loses none of it. Capped at about 3k tokens: past
+//! archive so a rollover loses none of it, and what it owes the person
+//! (its open items, kept in Postgres). Capped at about 3k tokens: past
 //! that, quiet sessions drop to one short line first.
 
 use chrono::{DateTime, Utc};
@@ -94,12 +95,18 @@ pub(super) fn body(
     entries: &[Entry],
     about: Option<Uuid>,
     posts: &[Post],
+    open: Option<&str>,
     tz: chrono_tz::Tz,
 ) -> Option<String> {
-    if entries.is_empty() && posts.is_empty() {
+    if entries.is_empty() && posts.is_empty() && open.is_none() {
         return None;
     }
     let mut head = String::new();
+    // What it owes the person comes first: it is never dropped for room.
+    if let Some(open) = open {
+        head.push_str(open.trim_end());
+        head.push('\n');
+    }
     let mut headed = None;
     if let Some(a) = about
         .and_then(|id| entries.iter().find(|e| e.id == id))
@@ -110,6 +117,9 @@ pub(super) fn body(
             true => format!("{}…", render.chars().take(ABOUT_CHARS).collect::<String>()),
             false => render,
         };
+        if !head.is_empty() {
+            head.push('\n');
+        }
         head.push_str(&format!(
             "The session this turn is about, {} (as of {}):\n{}\n",
             a.0.name,
@@ -207,7 +217,14 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         })
         .collect();
     let posts = recent_posts(&boss, owner);
-    let body = body(&entries, about, &posts, crew.desk.timezone())?;
+    let open = crew.items_context(boss.agent_id.as_str()).await;
+    let body = body(
+        &entries,
+        about,
+        &posts,
+        open.as_deref(),
+        crew.desk.timezone(),
+    )?;
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
          before you say anything specific of one session):\n{}",
@@ -280,7 +297,7 @@ mod tests {
             )
         }));
         let about = entries[65].id;
-        let text = body(&entries, Some(about), &[], chrono_tz::UTC).unwrap();
+        let text = body(&entries, Some(about), &[], None, chrono_tz::UTC).unwrap();
         assert!(text.len() <= CAP_CHARS + 200, "{}", text.len());
         assert!(
             text.contains("The session this turn is about, busy-5"),
@@ -314,7 +331,7 @@ mod tests {
             at: "2026-11-12T19:40:00Z".parse().unwrap(),
             text: "web is fixing the login page;\nCI next.".into(),
         }];
-        let text = body(&entries, None, &posts, chrono_tz::UTC).unwrap();
+        let text = body(&entries, None, &posts, None, chrono_tz::UTC).unwrap();
         assert!(
             text.lines().filter(|l| l.contains("Now:")).count() == 2,
             "{text}"
@@ -323,7 +340,7 @@ mod tests {
             text.contains("- 19:40 web is fixing the login page; CI next."),
             "{text}"
         );
-        assert!(body(&[], None, &[], chrono_tz::UTC).is_none());
+        assert!(body(&[], None, &[], None, chrono_tz::UTC).is_none());
     }
 
     #[test]
@@ -331,7 +348,7 @@ mod tests {
         let mut fresh = entry("new-one", SessionState::Working, "");
         fresh.account = None;
         let id = fresh.id;
-        let text = body(&[fresh], Some(id), &[], chrono_tz::UTC).unwrap();
+        let text = body(&[fresh], Some(id), &[], None, chrono_tz::UTC).unwrap();
         assert!(text.contains("- new-one (working, session_id"), "{text}");
         assert!(text.contains("no account yet"));
         let mut long = entry("busy", SessionState::Working, "Fix the login page.");
@@ -349,7 +366,7 @@ mod tests {
         entries.extend(
             (0..20).map(|i| entry(&format!("other-{i}"), SessionState::Working, "Other work.")),
         );
-        let text = body(&entries, Some(id), &[], chrono_tz::UTC).unwrap();
+        let text = body(&entries, Some(id), &[], None, chrono_tz::UTC).unwrap();
         assert!(text.len() <= CAP_CHARS + 400, "{}", text.len());
         assert!(
             text.contains("- other-0 "),

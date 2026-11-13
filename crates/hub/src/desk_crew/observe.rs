@@ -147,6 +147,12 @@ impl Track {
         if let Some(sid) = self.manager_session.take() {
             if let Ok(answer) = outcome {
                 crew.keep_extras(&self.party.id, &sid, answer).await;
+                // A reply that ends on a question to the person is what it
+                // owes them, unless the turn asked with crew.ask_person.
+                let started = crew.manager_turns.lock().get(&sid).copied();
+                if let Some(started) = started {
+                    crew.ask_from_reply(&self.party.id, started, answer).await;
+                }
             }
             crew.manager_turns.lock().remove(&sid);
             return;
