@@ -226,7 +226,7 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         .preferences_context(
             &workforce_desk::preference::boss_scope_of(o.scope.group()),
             about,
-            crew.unbound_given(&boss, &o),
+            crew.unbound_given(boss.agent_id.as_str(), &o),
         )
         .await;
     let (listed, how) = match prefs {

@@ -285,6 +285,11 @@ pub struct NeedsYou {
     /// `extras.item` says it: the chat offers "Always" with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generalizes: Option<String>,
+    /// What the person's "always" would cover (`all`, `group:<id>`,
+    /// `repo:<owner/name>`), as `extras.item` says it: only with
+    /// `generalizes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_scope: Option<String>,
 }
 
 impl NeedsYou {
@@ -327,6 +332,8 @@ impl NeedsYou {
             not_blocking: given(&l.not_blocking),
             age: age(i.opened_at, now),
             generalizes: given(&i.generalizes),
+            prefer_scope: given(&i.generalizes)
+                .map(|_| i.prefer_scope.clone().unwrap_or_else(|| "all".into())),
         }
     }
 }
@@ -860,6 +867,7 @@ mod tests {
             closed_by: None,
             closed_why: None,
             layout: Default::default(),
+            prefer_scope: None,
         };
         // Plainly: its first sentence, no points, nothing recommended.
         let plain = NeedsYou::of(&i, now);
@@ -904,6 +912,11 @@ mod tests {
         }
         assert_eq!(v["options"][0]["recommended"], true);
         assert_eq!(v["generalizes"], "When a staging record has no owner");
+        assert_eq!(v["preferScope"], "all");
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("preferScope")
+            .is_none());
         let u = MentionedUpdate {
             needs_you: vec![laid],
             ..Default::default()

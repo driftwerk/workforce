@@ -603,7 +603,7 @@ impl CrewHub {
             "{CHECK_IN} {} (You oversee the crew at level {}.) {}",
             Self::handing(&p),
             level.as_str(),
-            match self.unbound_given(service, o) {
+            match self.unbound_given(service.agent_id.as_str(), o) {
                 true => Self::boss_hint(o),
                 false => Self::level_hint(level, o),
             },

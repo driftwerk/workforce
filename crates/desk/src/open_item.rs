@@ -100,6 +100,10 @@ pub struct OpenItem {
     /// The sessions a promise or order is linked to (with `session`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<Uuid>,
+    /// What an "always" to it would cover (`all`, `group:<id>`,
+    /// `repo:<owner/name>`), as the boss proposed; all when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_scope: Option<String>,
     pub changed_at: DateTime<Utc>,
     pub state: OpenState,
     pub closed_at: Option<DateTime<Utc>>,
@@ -450,6 +454,10 @@ impl OpenItem {
             recommendation: self.recommendation.clone(),
             options: self.options.clone(),
             generalizes: self.generalizes.clone(),
+            prefer_scope: self
+                .generalizes
+                .as_ref()
+                .map(|_| self.prefer_scope.clone().unwrap_or_else(|| "all".into())),
             parked: self.state == OpenState::Parked,
         }
     }
@@ -465,8 +473,14 @@ pub struct MentionedItem {
     pub recommendation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// The kind of case an "always" to it keeps a preference for: its
+    /// `when`; the person's answer (or the recommendation) is its `then`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generalizes: Option<String>,
+    /// What that preference would cover: `all`, `group:<id>` or
+    /// `repo:<owner/name>`; set whenever `generalizes` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_scope: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parked: bool,
 }
@@ -564,6 +578,7 @@ mod tests {
             said_count: said,
             raised_at: None,
             sessions: vec![],
+            prefer_scope: None,
             changed_at: now,
             state: OpenState::Open,
             closed_at: None,

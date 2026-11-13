@@ -326,7 +326,7 @@ impl CrewHub {
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
         // Unbound, it approves its own plan, and Desk starts it.
-        if self.unbound_given(&b.service, &b.oversight) {
+        if self.unbound_given(b.service.agent_id.as_str(), &b.oversight) {
             let by = self.by_at_level(
                 self.by_boss(&b.service, "It approved its own plan."),
                 &b.oversight,

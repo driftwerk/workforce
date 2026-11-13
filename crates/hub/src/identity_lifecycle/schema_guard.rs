@@ -231,6 +231,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     (
         "desk",
         "boss_open_items",
+        "prefer_scope",
+        NotPersonal("what an \"always\" answer's preference covers: all, a group, or a repository"),
+    ),
+    (
+        "desk",
+        "boss_open_items",
         "closed_by",
         NotPersonal("which side closed it (person, session, boss, superseded, lapsed), not who"),
     ),
