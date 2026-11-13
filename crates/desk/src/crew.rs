@@ -720,6 +720,28 @@ pub trait Crew: Send + Sync {
     async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
     }
+    /// "Always": the person's answer to the boss's open item `id` becomes
+    /// one of their preferences, for the kind of case the item said it
+    /// settles; `then` in place of their answer's words when given.
+    async fn always_item(
+        &self,
+        _id: uuid::Uuid,
+        _then: Option<&str>,
+    ) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// How many needs the boss `agent` (the main boss when none is named)
+    /// handled itself, by the person's preferences, gave the person, or the
+    /// person got to first, since `since` (the start of today when none),
+    /// in all and per day: what "handled 23 of 25 myself" says. `None`
+    /// where there is no such boss.
+    async fn handled(
+        &self,
+        _agent: Option<&str>,
+        _since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        None
+    }
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {

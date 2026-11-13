@@ -1803,6 +1803,7 @@ mod act_fully_budget;
 
 mod decisions;
 mod items;
+mod learning;
 mod preferences;
 mod promises;
 mod updates;

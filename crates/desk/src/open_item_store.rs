@@ -68,6 +68,32 @@ impl Opened {
 }
 
 impl DeskStore {
+    /// The scope an "always" answer to item `id` keeps its preference
+    /// for, as the boss said when it asked (`all`, `group:<id>` or
+    /// `repo:<owner/name>`); `None` when it said none.
+    pub async fn item_prefer_scope(&self, id: Uuid) -> Result<Option<String>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT prefer_scope FROM boss_open_items WHERE id = $1",
+                &[&id],
+            )
+            .await?
+            .and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    /// Keeps `scope` as what an "always" answer to item `id` covers.
+    pub async fn item_set_prefer_scope(&self, id: Uuid, scope: &str) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET prefer_scope = $2 WHERE id = $1",
+                &[&id, &scope],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Opens `new`, or updates the item not closed with its key: in one
     /// transaction, the row locked, so two openings of one matter make one
     /// item and say it once.

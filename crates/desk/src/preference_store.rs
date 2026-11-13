@@ -105,6 +105,25 @@ impl DeskStore {
             .collect()
     }
 
+    /// The preference kept from open item `item` ("always"), if one is
+    /// and it isn't forgotten.
+    pub async fn preference_from_item(&self, item: Uuid) -> Result<Option<Preference>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_preferences \
+                     WHERE from_item = $1 AND state <> 'retired' \
+                     ORDER BY created_at DESC LIMIT 1"
+                ),
+                &[&item],
+            )
+            .await?
+            .as_ref()
+            .map(preference)
+            .transpose()
+    }
+
     /// `owner`'s preferences for the boss of `boss_scope`: the active
     /// ones, or (`all`) the paused and retired too. Oldest first.
     pub async fn preferences_of(

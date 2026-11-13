@@ -1222,6 +1222,22 @@ impl Crew for CrewHub {
         self.me().drop_item(id).await
     }
 
+    async fn always_item(
+        &self,
+        id: uuid::Uuid,
+        then: Option<&str>,
+    ) -> Result<String, workforce_desk::crew::ItemRefused> {
+        self.me().always_item(id, then).await
+    }
+
+    async fn handled(
+        &self,
+        agent: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        self.handled_counts(agent, since).await
+    }
+
     async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {
         self.read_reply(reply, group).await
     }

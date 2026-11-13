@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use chrono::{DateTime, Utc};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -284,6 +285,61 @@ async fn item_drop(
     item_result(s.crew.drop_item(id).await)
 }
 
+#[derive(Deserialize, Default)]
+struct Always {
+    #[serde(default)]
+    then: Option<String>,
+}
+
+/// "Always": the person's answer to one of the boss's asks becomes one of
+/// their preferences, for the case the ask said it settles.
+async fn item_always(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+    body: Option<Json<Always>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<uuid::Uuid>() else {
+        return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
+    };
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let then = body.then.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    item_result(s.crew.always_item(id, then).await)
+}
+
+#[derive(Deserialize)]
+struct HandledQuery {
+    token: Option<String>,
+    agent: Option<String>,
+    since: Option<String>,
+}
+
+/// How much the boss handled itself, by preference, escalated, or the
+/// person got to first: since a time (the start of today by default), in
+/// all and per day. For the catch-up's "handled 23 of 25 myself" and the
+/// Floor.
+async fn handled(State(s): S, h: HeaderMap, Query(q): Query<HandledQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let since = match q.since.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => match t.parse::<DateTime<Utc>>() {
+            Ok(t) => Some(t),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "since is an RFC 3339 time."),
+        },
+        None => None,
+    };
+    let agent = q.agent.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    match s.crew.handled(agent, since).await {
+        Some(v) => Json(v).into_response(),
+        None => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
 #[derive(Deserialize)]
 struct Puts {
     puts: Vec<ReadPut>,
@@ -349,6 +405,8 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/decisions/{id}/undo", post(undo))
         .route("/api/desk/items/{id}/answer", post(item_answer))
         .route("/api/desk/items/{id}/drop", post(item_drop))
+        .route("/api/desk/items/{id}/always", post(item_always))
+        .route("/api/desk/handled", get(handled))
         .route("/api/desk/unread", get(unread))
         .route("/api/desk/reads", get(read_points).put(put_reads))
         .route("/api/desk/reads/all", post(all_read))
@@ -361,7 +419,6 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use chrono::{DateTime, Utc};
     use parking_lot::Mutex;
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
@@ -411,6 +468,24 @@ mod tests {
                 3 => Err(UndoRefused::Cant("What ran is fixed forward.".into())),
                 _ => Err(UndoRefused::NotFound),
             }
+        }
+        async fn always_item(
+            &self,
+            id: uuid::Uuid,
+            then: Option<&str>,
+        ) -> Result<String, ItemRefused> {
+            match id.as_u128() {
+                1 => Ok(format!("From now on: {}", then.unwrap_or("your answer"))),
+                _ => Err(ItemRefused::NotFound),
+            }
+        }
+        async fn handled(
+            &self,
+            agent: Option<&str>,
+            since: Option<DateTime<Utc>>,
+        ) -> Option<Value> {
+            (agent.is_none_or(|a| a == "desk"))
+                .then(|| json!({ "needs": 25, "yourself": 23, "since": since }))
         }
         async fn answer_item(&self, id: uuid::Uuid, answer: &str) -> Result<String, ItemRefused> {
             match id.as_u128() {
@@ -482,6 +557,28 @@ mod tests {
                     .await
                     .0,
                 StatusCode::BAD_REQUEST
+            );
+            let always = |n: u128| format!("/api/desk/items/{}/always", uuid::Uuid::from_u128(n));
+            let (status, said) = call_json(&app, &always(1), &json!({ "then": " wait " })).await;
+            assert_eq!((status, said["done"].as_str()), (StatusCode::OK, Some("From now on: wait")));
+            let (status, said) = call(&app, "POST", &always(1)).await;
+            assert_eq!(
+                (status, said["done"].as_str()),
+                (StatusCode::OK, Some("From now on: your answer")),
+                "no body: their answer"
+            );
+            assert_eq!(call(&app, "POST", &always(2)).await.0, StatusCode::NOT_FOUND);
+            let (status, h) = call(&app, "GET", "/api/desk/handled").await;
+            assert_eq!((status, h["yourself"].as_u64()), (StatusCode::OK, Some(23)));
+            let (_, h) = call(&app, "GET", "/api/desk/handled?since=2026-11-12T18:00:00Z").await;
+            assert_eq!(h["since"], "2026-11-12T18:00:00Z");
+            assert_eq!(
+                call(&app, "GET", "/api/desk/handled?since=yesterday").await.0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                call(&app, "GET", "/api/desk/handled?agent=nobody").await.0,
+                StatusCode::NOT_FOUND
             );
             let drop = |n: u128| format!("/api/desk/items/{}/drop", uuid::Uuid::from_u128(n));
             assert_eq!(call(&app, "POST", &drop(1)).await.0, StatusCode::OK);

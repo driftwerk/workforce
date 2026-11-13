@@ -312,7 +312,25 @@ impl CrewHub {
         let Some(boss) = self.deciding_boss(by) else {
             return;
         };
+        // Unbound, what it holds (the person driving, a mode kept) is no
+        // setting of theirs to allow.
+        if self.by_unbound(by) {
+            return;
+        }
         let (need, need_ref) = need_of(action);
+        // Suggested again, the same need is one escalation.
+        if let Some(r) = need_ref.as_deref() {
+            let since = crew::now() - chrono::Duration::days(1);
+            if self
+                .desk
+                .store()
+                .decision_escalated_since(&boss, r, since)
+                .await
+                .unwrap_or(false)
+            {
+                return;
+            }
+        }
         let what = format!("left it to you: {}", crew::clip(said, 240));
         let why = format!(
             "I couldn't do it myself: {}. It's yours to do, or to allow.",
@@ -454,6 +472,11 @@ impl CrewHub {
                 mine.need_ref = Some(claimed.id.to_string());
                 if let Err(e) = store.decision_put(&mine).await {
                     tracing::warn!(error = %e, "an undo wasn't kept as a decision");
+                }
+                // Undoing what a preference decided overrules it: counted,
+                // and the person is asked whether to change it.
+                if let (How::Preference, Some(pref)) = (claimed.how, claimed.preference) {
+                    self.overruled(&claimed.boss, pref, &claimed.what).await;
                 }
                 Ok(done)
             }
