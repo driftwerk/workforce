@@ -214,6 +214,39 @@ async fn a_file_is_read_only_by_its_board_s_person_and_by_its_own_ticket() {
         )
         .await;
         assert_eq!(a.status, StatusCode::FORBIDDEN);
+        // Another person who holds this hub too, but didn't link the board.
+        let state = &local.sync.state;
+        let alex = workforce_identity::types::Identity::new(
+            "Alex",
+            workforce_identity::types::IdentityRole::SystemAdmin,
+        );
+        state
+            .identity_store
+            .as_ref()
+            .unwrap()
+            .create(&alex)
+            .unwrap();
+        let alex_jwt = crate::jwt::generate_token_with_identity(
+            state.jwt_config.as_ref().unwrap(),
+            &alex.display_name,
+            alex.role,
+            Some(alex.id.to_string()),
+        )
+        .unwrap();
+        let a = send(
+            &local,
+            &alex_jwt,
+            "GET",
+            &format!("/api/desk/tickets/{}/files/{file}", one.ticket.id),
+            vec![],
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            a.json()["error"],
+            "Only the person who linked this board reads its issues' files.",
+            "refused by the board's person, not by the hub"
+        );
         let a = send(
             &local,
             "nonsense",

@@ -268,6 +268,7 @@ async fn serve(
                 identity_id,
                 agent_id: service.agent_id.to_string(),
             },
+            program: caller.as_member,
         },
         ctx,
         router: service.approval_router.read().clone(),
@@ -898,6 +899,7 @@ mod tests {
                     identity_id: identity.into(),
                     agent_id: agent.into(),
                 },
+                program: false,
             },
             ctx: SessionContext {
                 key: Some(session_channel(identity)),

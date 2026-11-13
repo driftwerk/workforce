@@ -1034,6 +1034,8 @@ pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &[
 /// attachment's or an upload's bytes, a chunk at a time. Like the identity
 /// tools, called when the hub offers them and never needed: a hub without
 /// them still syncs, and its tickets' files open in Jira or Linear instead.
+/// A program's, never a model's: no agent's turn or CLI round is offered
+/// them (`workforce_agent::tools::access::PROGRAM_ONLY_TOOLS`).
 pub const BOARD_SYNC_VIEW_TOOLS: &[&str] = &["jira.attachment_read", "linear.upload_read"];
 
 #[cfg(test)]

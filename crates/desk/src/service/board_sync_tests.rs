@@ -1595,3 +1595,65 @@ async fn take_it_refuses_when_the_matched_member_changes() {
     })
     .await;
 }
+
+/// What was read of a board's issues' files as one person, through one hub,
+/// goes when the link reads as another or through another hub, and with
+/// the link: an agent changing alone keeps them.
+#[tokio::test]
+async fn a_board_s_remote_files_go_when_its_link_reads_as_someone_else() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        d.pull_board(b.id, &jira(1, &[])).await.unwrap();
+        let t = d.ticket_by_key("ACME-1").await.unwrap().ticket.id;
+        let file = crate::ticket_files::RemoteFile {
+            source: crate::ticket_files::FileSource::Jira,
+            remote_id: "10001".into(),
+            name: "a.png".into(),
+            media_type: "image/png".into(),
+            size: Some(3),
+            url: None,
+            thumb: false,
+        };
+        let party = crate::board_sync::remote_party(System::Jira, "ACME-1");
+        let put = || async {
+            d.0.store
+                .put_remote_files(t, std::slice::from_ref(&file), &party)
+                .await
+                .unwrap();
+            let id = d.0.store.files_of(&[t]).await.unwrap()[&t][0].id;
+            d.0.store
+                .keep_file_bytes(id, false, &[1, 2, 3])
+                .await
+                .unwrap();
+            id
+        };
+        let store = &d.0.store;
+        let held = |id: Uuid| async move { store.file_bytes(id, false).await.unwrap().is_some() };
+        let id = put().await;
+        d.change_sync(b.id, |s| s.agent = Some("scout".into()))
+            .await
+            .unwrap();
+        assert!(
+            held(id).await,
+            "another agent on the same hub, as the same person"
+        );
+        d.change_sync(b.id, |s| s.person = "alex".into())
+            .await
+            .unwrap();
+        assert!(
+            !d.0.store.files_of(&[t]).await.unwrap().contains_key(&t),
+            "read as someone else: forgotten"
+        );
+        let id = put().await;
+        d.change_sync(b.id, |s| s.via = Via::Hub { hub: "acme".into() })
+            .await
+            .unwrap();
+        assert!(!held(id).await, "through another hub: forgotten");
+        let id = put().await;
+        d.unlink_board(b.id).await.unwrap();
+        assert!(!held(id).await, "unlinked: forgotten");
+    })
+    .await;
+}

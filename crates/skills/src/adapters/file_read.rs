@@ -6,13 +6,18 @@
 //! The file is downloaded once, up to [`FILE_MAX`], and kept for a short
 //! while under the credential it was read with ([`Memo`]): the next chunk is
 //! served from there, and a caller with another credential never sees it.
+//! Files are kept up to [`KEPT_BYTES`] together, so several read at once
+//! each stay for their chunks; callers missing the same file at once wait
+//! for one download ([`Memo::fetch_once`]).
 //!
 //! An answer is `{kind: "file_bytes", media_type, size, offset, length,
-//! data}`, `data` the chunk's bytes in base64. Its `kind` keeps the spill
-//! from staging it (`workforce_agent::spill`): it is bytes for a program,
-//! not words for a model.
+//! data}`, `data` the chunk's bytes in base64: bytes for a program, not
+//! words for a model. No turn is offered these tools
+//! (`workforce_agent::tools::access::PROGRAM_ONLY_TOOLS`), and only the
+//! board sync's gated route leaves a chunk unstaged by its `kind`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,8 +37,8 @@ pub const CHUNK_MAX: usize = 512 * 1024;
 /// How long a downloaded file is kept for the chunks after the first.
 const KEPT_FOR: Duration = Duration::from_secs(120);
 
-/// How many downloaded files are kept at once.
-const KEPT: usize = 3;
+/// The most bytes of downloaded files kept at once, together.
+pub const KEPT_BYTES: usize = 100 * 1024 * 1024;
 
 /// The chunk a call asks for: from `offset`, at most `length` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,33 +106,99 @@ struct Kept {
 }
 
 /// Files downloaded lately, by the credential and the address they were
-/// read with.
-#[derive(Default)]
-pub struct Memo(Mutex<VecDeque<Kept>>);
+/// read with: the least lately read go first past the budget.
+pub struct Memo {
+    kept: Mutex<VecDeque<Kept>>,
+    budget: usize,
+    /// One gate per file being downloaded, while anyone waits on it.
+    fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl Default for Memo {
+    fn default() -> Self {
+        Self::within(KEPT_BYTES)
+    }
+}
 
 impl Memo {
-    /// The file kept under `key`, while it is fresh.
-    pub fn get(&self, key: &str) -> Option<(Arc<Vec<u8>>, String)> {
-        let mut kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        kept.retain(|k| k.at.elapsed() < KEPT_FOR);
-        kept.iter()
-            .find(|k| k.key == key)
-            .map(|k| (Arc::clone(&k.bytes), k.media_type.clone()))
+    /// A memo keeping at most `budget` bytes of files together.
+    pub fn within(budget: usize) -> Self {
+        Self {
+            kept: Mutex::default(),
+            budget,
+            fetching: Mutex::default(),
+        }
     }
 
-    /// Keeps `bytes` under `key`, the oldest going past [`KEPT`].
+    /// The file kept under `key`, while it is fresh; read now, it is the
+    /// last to go.
+    pub fn get(&self, key: &str) -> Option<(Arc<Vec<u8>>, String)> {
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.retain(|k| k.at.elapsed() < KEPT_FOR);
+        let i = kept.iter().position(|k| k.key == key)?;
+        let k = kept.remove(i)?;
+        let found = (Arc::clone(&k.bytes), k.media_type.clone());
+        kept.push_back(k);
+        Some(found)
+    }
+
+    /// Keeps `bytes` under `key`, the least lately read going past the
+    /// budget. A file over the whole budget isn't kept.
     pub fn put(&self, key: String, bytes: Arc<Vec<u8>>, media_type: String) {
-        let mut kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        kept.retain(|k| k.key != key);
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.retain(|k| k.key != key && k.at.elapsed() < KEPT_FOR);
+        if bytes.len() > self.budget {
+            return;
+        }
+        let mut total: usize = kept.iter().map(|k| k.bytes.len()).sum();
+        while total + bytes.len() > self.budget {
+            let Some(gone) = kept.pop_front() else { break };
+            total -= gone.bytes.len();
+        }
         kept.push_back(Kept {
             key,
             at: Instant::now(),
             media_type,
             bytes,
         });
-        while kept.len() > KEPT {
-            kept.pop_front();
+    }
+
+    /// The file under `key`: kept, or got by `fetch` and kept. Callers
+    /// asking for the same `key` at once wait on one `fetch`; the others'
+    /// are never run. A failed `fetch` keeps nothing, and the next caller
+    /// tries its own.
+    pub async fn fetch_once<E>(
+        &self,
+        key: &str,
+        fetch: impl Future<Output = Result<(Vec<u8>, String), E>>,
+    ) -> Result<(Arc<Vec<u8>>, String), E> {
+        if let Some(hit) = self.get(key) {
+            return Ok(hit);
         }
+        let gate = {
+            let mut fetching = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(fetching.entry(key.to_string()).or_default())
+        };
+        let held = gate.lock().await;
+        let got = match self.get(key) {
+            Some(hit) => Ok(hit),
+            None => fetch.await.map(|(bytes, media_type)| {
+                let bytes = Arc::new(bytes);
+                self.put(key.to_string(), Arc::clone(&bytes), media_type.clone());
+                (bytes, media_type)
+            }),
+        };
+        drop(held);
+        // The gate goes once no one else holds it: only taken under this
+        // lock, so none takes it while it goes.
+        let mut fetching = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
+        if fetching
+            .get(key)
+            .is_some_and(|g| Arc::ptr_eq(g, &gate) && Arc::strong_count(g) <= 2)
+        {
+            fetching.remove(key);
+        }
+        got
     }
 }
 
@@ -240,13 +311,64 @@ mod tests {
     }
 
     #[test]
-    fn only_so_many_files_are_kept() {
-        let memo = Memo::default();
-        for i in 0..(KEPT + 2) {
-            memo.put(format!("k{i}"), Arc::new(vec![]), "x".into());
+    fn files_are_kept_within_a_byte_budget_the_least_lately_read_going() {
+        let memo = Memo::within(1000);
+        // Many small files all stay: the budget is bytes, not files.
+        for i in 0..10 {
+            memo.put(format!("k{i}"), Arc::new(vec![0; 50]), "x".into());
         }
-        assert!(memo.get("k0").is_none());
-        assert!(memo.get(&format!("k{}", KEPT + 1)).is_some());
+        assert!((0..10).all(|i| memo.get(&format!("k{i}")).is_some()));
+        // Read again, k0 is the last of them to go.
+        memo.get("k0");
+        memo.put("big".into(), Arc::new(vec![0; 900]), "x".into());
+        assert!(memo.get("big").is_some());
+        assert!(memo.get("k0").is_some(), "lately read: kept");
+        assert!(memo.get("k1").is_none(), "least lately read: gone");
+        let kept: usize = (0..10)
+            .filter_map(|i| memo.get(&format!("k{i}")))
+            .map(|(b, _)| b.len())
+            .sum();
+        assert!(kept + 900 <= 1000, "{kept}");
+        // A file over the whole budget isn't kept, and drops nothing.
+        memo.put("huge".into(), Arc::new(vec![0; 1001]), "x".into());
+        assert!(memo.get("huge").is_none());
+        assert!(memo.get("big").is_some());
+    }
+
+    #[tokio::test]
+    async fn callers_missing_one_file_at_once_wait_for_one_download() {
+        let memo = Arc::new(Memo::within(1000));
+        let downloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let memo = Arc::clone(&memo);
+                let downloads = Arc::clone(&downloads);
+                tokio::spawn(async move {
+                    memo.fetch_once("k", async {
+                        downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok::<_, String>((vec![7; 10], "image/png".to_string()))
+                    })
+                    .await
+                    .unwrap()
+                })
+            })
+            .collect();
+        for r in reads {
+            assert_eq!(*r.await.unwrap().0, vec![7; 10]);
+        }
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(memo.fetching.lock().unwrap().is_empty(), "no gate left");
+        // A failed download keeps nothing: the next caller tries its own.
+        let failed = memo
+            .fetch_once("other", async { Err::<(Vec<u8>, String), _>("down") })
+            .await;
+        assert!(failed.is_err());
+        let again = memo
+            .fetch_once("other", async { Ok::<_, &str>((vec![1], "x".to_string())) })
+            .await
+            .unwrap();
+        assert_eq!(*again.0, vec![1]);
     }
 
     #[test]

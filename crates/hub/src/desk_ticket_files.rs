@@ -307,16 +307,11 @@ async fn read_issue(
     };
     match desk.read_ticket_issue(id, &*remote, yes(&q.force)).await {
         Ok(v) => Json(v).into_response(),
-        Err(RemoteError::Waiting { .. }) => refusal(
-            StatusCode::CONFLICT,
-            &format!("Waiting for your approval on {hub} to read it."),
-        ),
+        // The detail is logged; the page gets plain words, never the
+        // remote's own text.
         Err(e) => {
-            tracing::info!(ticket = %id, error = %e, "a ticket's issue wasn't read");
-            refusal(
-                StatusCode::BAD_GATEWAY,
-                &format!("{} didn't answer: {e}", s.system.title()),
-            )
+            tracing::warn!(ticket = %id, error = %e, "a ticket's issue wasn't read");
+            unread(&hub, s.system, FileRead::Remote(e))
         }
     }
 }
