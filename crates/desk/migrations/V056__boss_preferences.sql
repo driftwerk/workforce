@@ -28,5 +28,3 @@ CREATE TABLE boss_preferences (
     state            TEXT        NOT NULL DEFAULT 'active'
 );
 CREATE INDEX boss_preferences_scope ON boss_preferences (owner, boss_scope, state);
--- The scope an "always" answer to an ask makes its preference for.
-ALTER TABLE boss_open_items ADD COLUMN prefer_scope TEXT;

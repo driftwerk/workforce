@@ -384,6 +384,7 @@ async fn preference_patch(
     if when.as_deref() == Some("") || then.as_deref() == Some("") {
         return error(StatusCode::BAD_REQUEST, "Say the case and what to do then.");
     }
+    // A blank scope is no change, as a blank field is anywhere here.
     let scope = match body.scope.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(text) => match PrefScope::parse(text) {

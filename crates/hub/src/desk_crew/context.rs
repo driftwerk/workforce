@@ -229,9 +229,13 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
             crew.unbound_given(&boss, &o),
         )
         .await;
-    let open = match (open, prefs) {
-        (Some(open), Some(prefs)) => Some(format!("{}\n\n{prefs}", open.trim_end())),
-        (open, prefs) => open.or(prefs),
+    let (listed, how) = match prefs {
+        Some(p) => (Some(p.listed), Some(p.how)),
+        None => (None, None),
+    };
+    let open = match (open, listed) {
+        (Some(open), Some(listed)) => Some(format!("{}\n\n{listed}", open.trim_end())),
+        (open, listed) => open.or(listed),
     };
     let body = body(
         &entries,
@@ -240,9 +244,10 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         open.as_deref(),
         crew.desk.timezone(),
     )?;
+    let how = how.map(|h| format!("\n\n{h}")).unwrap_or_default();
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
-         before you say anything specific of one session):\n{}",
+         before you say anything specific of one session):\n{}{how}",
         reported(&body, "Desk's notes on your crew")
     ))
 }
