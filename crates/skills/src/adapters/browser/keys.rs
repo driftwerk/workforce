@@ -33,7 +33,7 @@ pub struct KeyPage {
 static PAGES: LazyLock<RwLock<Vec<KeyPage>>> = LazyLock::new(Default::default);
 
 /// Key pages whose service runs at an address of each person's own (a
-/// Metabase): their paths on any `https` origin. Their text is hidden and a
+/// Metabase): their paths on any `http` or `https` origin. Their text is hidden and a
 /// picture of one is thrown away wherever they are, before a setup has
 /// kept the address and after; one entry per connector, so nothing grows.
 static ANYWHERE: LazyLock<RwLock<Vec<KeyPage>>> = LazyLock::new(Default::default);
@@ -49,8 +49,8 @@ pub fn register(page: KeyPage) {
     pages.push(page);
 }
 
-/// Registers (or replaces) `page`'s paths as key pages on every `https`
-/// origin: its `origin` is not looked at. They are never sent the extension
+/// Registers (or replaces) `page`'s paths as key pages on every `http` or
+/// `https` origin: its `origin` is not looked at. They are never sent the extension
 /// as a picture to refuse (its refusals are exact origins); the hub's own
 /// check of what was pictured throws such a picture away.
 pub fn register_anywhere(page: KeyPage) {
@@ -59,10 +59,12 @@ pub fn register_anywhere(page: KeyPage) {
     pages.push(page);
 }
 
-/// Whether `url` is, on any `https` origin, under one of `page`'s paths.
+/// Whether `url` is, on any `http` or `https` origin, under one of
+/// `page`'s paths: hiding is cheap, so a page opened by hand over `http`
+/// is hidden too.
 fn matches_anywhere(page: &KeyPage, url: &str) -> bool {
     match super::address::origin_of(url) {
-        Some(origin) if origin.starts_with("https://") => matches(
+        Some(origin) => matches(
             &KeyPage {
                 origin,
                 ..page.clone()
@@ -322,8 +324,9 @@ mod tests {
             assert!(is_key_page(at), "{at}");
             assert_eq!(hide_keys(at, "aw_abcdefgh"), HIDDEN);
         }
+        assert!(is_key_page("http://bi.acme.example/admin/api-keys"));
         for not in [
-            "http://bi.acme.example/admin/api-keys",
+            "ftp://bi.acme.example/admin/api-keys",
             "https://bi.acme.example/admin/api-keysx",
             "https://bi.acme.example/admin",
         ] {

@@ -2023,6 +2023,11 @@ mod setups {
         assert!(!keys::is_key_page(
             "https://bi.globex.example/admin/settings/authentication"
         ));
+        // The extension refuses pictures by exact origin, so Metabase's
+        // page anywhere is never sent it: the hub throws the picture away.
+        assert!(!keys::refusals()
+            .to_string()
+            .contains("/admin/settings/authentication/api-keys"));
     }
 
     #[tokio::test]

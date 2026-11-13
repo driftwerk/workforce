@@ -207,7 +207,7 @@ fn browser_page(connector: &str, origin: &str) -> Option<browser_keys::KeyPage> 
 /// Registers every key page, so their text is hidden and they are never
 /// pictured, whoever opens them and whether or not a setup is running:
 /// Jira's, Linear's, GitHub's and each Datadog region's at their origins,
-/// and Metabase's, whose address is each person's own, on any `https`
+/// and Metabase's, whose address is each person's own, on any `http` or `https`
 /// origin. Nothing is registered later, so the registry never grows.
 pub fn register_key_pages() {
     for service in ["jira", "linear", "github"] {
