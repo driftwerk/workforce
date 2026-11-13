@@ -417,3 +417,93 @@ async fn opening_a_ticket_reads_its_issue_once_in_a_while() {
     })
     .await;
 }
+
+/// Opening a Jira ticket reads its description as Jira stores it, into
+/// Desk markdown with its picture by its file's id; a pull that reads the
+/// same words again leaves it, it is never sent back, and a body edited
+/// here is kept.
+#[tokio::test]
+async fn opening_a_ticket_reads_its_description_as_jira_stores_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        attach(&remote.jira, "ACME-1", "10001", "login.png", "image/png", png(10));
+        remote.jira.lock().unwrap().adf.insert(
+            "ACME-1".into(),
+            serde_json::json!({ "type": "doc", "version": 1, "content": [
+                { "type": "panel", "attrs": { "panelType": "warning" }, "content": [
+                    { "type": "paragraph", "content": [
+                        { "type": "text", "text": "Ask " },
+                        { "type": "mention", "attrs": { "id": "a", "text": "@Dana" } },
+                        { "type": "text", "text": " about " },
+                        { "type": "inlineCard", "attrs": { "url": "https://acme.example/browse/ACME-2" } }
+                    ] }
+                ] },
+                { "type": "mediaSingle", "content": [
+                    { "type": "media", "attrs": { "id": "9b1e0f2a-media", "type": "file", "alt": "login.png" } }
+                ] }
+            ] }),
+        );
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        assert_eq!(t.ticket.body, "About Fix the login.", "the pull reads its HTML");
+        let uri = format!("/api/desk/tickets/{}/read", t.ticket.id);
+        let a = send(&local, &local.jwt, "POST", &uri, vec![]).await;
+        assert_eq!(a.status, StatusCode::OK, "{:?}", a.json());
+        let asked = remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .rev()
+            .find(|(t, _)| t == "jira.get_issue")
+            .map(|(_, a)| a.clone())
+            .unwrap();
+        assert_eq!(asked["description_adf"], true);
+        let file = a.json()["files"][0]["id"].as_str().unwrap().to_string();
+        let want = format!(
+            ":::panel{{tone=warning}}\nAsk :mention[Dana] about [ACME-2](https://acme.example/browse/ACME-2)\n:::\n\n![login.png](desk-file:{file})"
+        );
+        assert_eq!(a.json()["body"], want.as_str(), "{:?}", a.json());
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        assert_eq!(t.ticket.body, want);
+
+        // Changed there, not its words: the pull leaves it, quietly.
+        let at = t.ticket.updated_at;
+        crate::desk_board_sync::tests::touch(&remote.jira, "ACME-1", |_| {});
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        assert_eq!(t.ticket.body, want);
+        assert_eq!(t.ticket.updated_at, at, "no edit is said");
+        let updates = |j: &Shared| {
+            j.lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|(t, a)| t == "jira.update_issue" && a.get("description").is_some())
+                .count()
+        };
+        assert_eq!(updates(&remote.jira), 0, "never sent back");
+
+        // Edited here: kept on the next read, and not sent over Jira's own.
+        desk.edit_ticket(
+            t.ticket.id,
+            workforce_desk::TicketPatch {
+                body: Some("Mine now.".into()),
+                ..Default::default()
+            },
+            &workforce_desk::crew::By::you(),
+        )
+        .await
+        .unwrap();
+        local.sync.pass_board(b.id, false).await.unwrap();
+        assert_eq!(updates(&remote.jira), 0);
+        let a = send(&local, &local.jwt, "POST", &format!("{uri}?force=1"), vec![]).await;
+        assert_eq!(a.status, StatusCode::OK);
+        assert_eq!(a.json()["body"], "Mine now.");
+    })
+    .await;
+}

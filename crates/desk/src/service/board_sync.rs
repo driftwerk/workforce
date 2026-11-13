@@ -1261,10 +1261,17 @@ impl Desk {
         if let Some(a) = p.assignee.clone() {
             e.assignee = Some(a);
         }
-        if p.body.is_some() || issue.body.is_some() {
+        // A body read as ADF stays while the pull reads the HTML it took
+        // the place of: the description is the same there.
+        let kept_adf = issue
+            .body
+            .as_deref()
+            .is_some_and(|b| crate::board_sync::stands_for(e, b));
+        if p.body.is_some() || (issue.body.is_some() && !kept_adf) {
             e.clipped = issue.clipped;
             // Read with today's reader: never read again for its old shape.
             e.html_read = crate::board_sync::HTML_READ;
+            e.html_print = None;
         }
         let was = crate::board_sync::blockers(&e.details.facts);
         e.details = crate::board_sync::details_of(
@@ -1366,6 +1373,7 @@ impl Desk {
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
                 html_read: crate::board_sync::HTML_READ,
+                html_print: None,
                 details: crate::board_sync::details_of(
                     issue,
                     None,
@@ -1980,7 +1988,7 @@ impl Desk {
                         a["title"] = json!(title);
                     }
                     if let Some(body) = &push.body {
-                        a["description"] = json!(body);
+                        a["description"] = json!(crate::ticket_markdown::linear_out(body));
                     }
                     a
                 }
@@ -2226,7 +2234,10 @@ impl Desk {
                         )
                     }
                     System::Linear => {
-                        let body = format!("{}\n\n(Desk ref: {reference})", t.body.trim());
+                        let body = format!(
+                            "{}\n\n(Desk ref: {reference})",
+                            crate::ticket_markdown::linear_out(t.body.trim())
+                        );
                         (
                             "linear.issue_create",
                             json!({
@@ -2303,6 +2314,7 @@ impl Desk {
             clipped: false,
             // Its body is Desk's own: never read again for an old shape.
             html_read: crate::board_sync::HTML_READ,
+            html_print: None,
             details: Default::default(),
         });
         loop {

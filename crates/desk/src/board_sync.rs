@@ -859,7 +859,7 @@ pub struct Issue {
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
-fn held_body(body: String) -> (String, bool) {
+pub fn held_body(body: String) -> (String, bool) {
     let max = crate::board::BODY_MAX;
     match body.chars().count() > max {
         true => (
@@ -1003,6 +1003,28 @@ pub fn unescape_newlines(text: &str) -> String {
 /// ([`External::html_read`](crate::board::External::html_read)): a body held
 /// from before it read spaces as HTML does is read again, once.
 pub const HTML_READ: u8 = 1;
+
+/// What [`External::html_read`](crate::board::External::html_read) says of
+/// a Jira body read as ADF on open: never read again for an old shape, and
+/// never sent back, since Jira's own document says more than it does.
+pub const ADF_READ: u8 = 2;
+
+/// A body's fingerprint (FNV-1a), the same on every build.
+pub fn body_print(body: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in body.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Whether `body`, as a pull read it from HTML, is the one `e`'s body read
+/// as ADF took the place of: the description is unchanged there, and the
+/// richer read stays.
+pub fn stands_for(e: &crate::board::External, body: &str) -> bool {
+    e.html_read == ADF_READ && e.html_print.as_deref() == Some(body_print(body).as_str())
+}
 
 /// The character an HTML entity (`amp`, `#39`, `#x27`) stands for, when it
 /// is one Desk knows. A no-break space reads as a space, so it folds into
@@ -1265,8 +1287,16 @@ fn link_href(tag: &str) -> Option<String> {
         None => rest.find(char::is_whitespace).unwrap_or(rest.len()),
     };
     let href = decode_entities(&rest[..end]);
+    safe_href(&href, false).then_some(href)
+}
+
+/// Whether `href` is an address a markdown link keeps: `https` (or `http`,
+/// unless `https_only`), never one that could run (`javascript:`) or reach
+/// a local file, nor one holding what would end the link or its text.
+pub fn safe_href(href: &str, https_only: bool) -> bool {
     let lower = href.to_ascii_lowercase();
-    let ok = (lower.starts_with("https://") || lower.starts_with("http://"))
+    let scheme = lower.starts_with("https://") || (!https_only && lower.starts_with("http://"));
+    scheme
         && !href.chars().any(|c| {
             c.is_whitespace()
                 || c.is_control()
@@ -1274,8 +1304,7 @@ fn link_href(tag: &str) -> Option<String> {
                     c,
                     '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '[' | ']' | '\\'
                 )
-        });
-    ok.then_some(href)
+        })
 }
 
 /// Whether `text` still has a line Jira's indented markup made into a
@@ -1432,7 +1461,12 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let key = parse_issue_key(i.get("identifier")?.as_str()?)?;
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
-    let (body, clipped) = held_body(unescape_newlines(&body));
+    let body = crate::ticket_markdown::linear_markdown(
+        &unescape_newlines(&body),
+        &key,
+        i["url"].as_str().unwrap_or_default(),
+    );
+    let (body, clipped) = held_body(body);
     let files = crate::ticket_files::linear_files(i, &body);
     let facts = linear_facts(i);
     // What blocks it is in its inverse relations, when the answer has them.
@@ -1967,6 +2001,7 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
                 ((has_escaped_newlines(&t.body) && e.seen.body == t.body)
                     || rereads_html(e, &t.body))
                     && *b != t.body
+                    && !stands_for(e, b)
             }),
             ..Pulled::default()
         };
@@ -1975,7 +2010,10 @@ pub fn pulled(t: &Ticket, issue: &Issue, states: &BTreeMap<TicketState, String>)
     Pulled {
         title: (issue.title != t.title && !issue.title.trim().is_empty())
             .then(|| issue.title.clone()),
-        body: issue.body.clone().filter(|b| *b != t.body),
+        body: issue
+            .body
+            .clone()
+            .filter(|b| *b != t.body && !stands_for(e, b)),
         state: state.filter(|s| *s != t.state),
         assignee: assignee_changed(t, issue),
     }
@@ -2008,8 +2046,10 @@ pub fn push_of(t: &Ticket, needs: &[String]) -> Push {
     let seen = &e.seen;
     Push {
         title: (t.title != seen.title).then(|| t.title.clone()),
-        // A description Desk holds only part of is never sent back.
-        body: (t.body != seen.body && !e.clipped).then(|| t.body.clone()),
+        // A description Desk holds only part of, or read from Jira's own
+        // document, is never sent back.
+        body: (t.body != seen.body && !e.clipped && e.html_read != ADF_READ)
+            .then(|| t.body.clone()),
         state: (Some(t.state) != seen.state).then_some(t.state),
         needs: needs
             .iter()

@@ -447,9 +447,14 @@ pub struct External {
     pub clipped: bool,
     /// The version of the HTML reader its body was last read with (Jira):
     /// one held from before [`HTML_READ`](crate::board_sync::HTML_READ) is
-    /// read again, once.
+    /// read again, once; [`ADF_READ`](crate::board_sync::ADF_READ) when it
+    /// was read as Jira stores it, on open, and is never sent back.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub html_read: u8,
+    /// A body read as ADF: the fingerprint of the HTML-read body it took
+    /// the place of, so a pull that reads the same HTML again leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_print: Option<String>,
     /// What its issue says of itself besides its words, as last pulled:
     /// shown beside it, never pushed.
     #[serde(default)]

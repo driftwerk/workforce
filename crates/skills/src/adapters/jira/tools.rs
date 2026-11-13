@@ -637,7 +637,8 @@ impl Tool for JiraGetIssueTool {
             "properties": {
                 "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
-                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." }
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." },
+                "description_adf": { "type": "boolean", "description": "Also answer the description as Jira stores it (Atlassian Document Format), as JSON text under `description_adf`." }
             },
             "required": ["issue_key"]
         })
@@ -682,6 +683,15 @@ impl Tool for JiraGetIssueTool {
                     "attachments": attachment_summaries(f),
                 });
                 let mut out = out;
+                // The description as Jira stores it, when asked: JSON text,
+                // wrapped as the rendered one is.
+                if input["description_adf"].as_bool() == Some(true) && f["description"].is_object()
+                {
+                    out["description_adf"] = wrap_field(
+                        &Value::String(f["description"].to_string()),
+                        "jira.get_issue.description",
+                    );
+                }
                 if let Value::Object(o) = &mut out {
                     // Its labels and reporter are said above, as before.
                     let mut extras = issue_extras(f, None, &custom, "jira.get_issue");
@@ -2384,6 +2394,44 @@ mod tests {
             wrap_field(&json!("report.pdf"), "jira.get_issue.attachment_filename"),
             "filename is routed through the external-content boundary"
         );
+    }
+
+    /// The description as Jira stores it comes only when asked for, as
+    /// wrapped JSON text beside the rendered one.
+    #[tokio::test]
+    async fn get_issue_answers_the_stored_description_when_asked() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let doc = json!({ "type": "doc", "version": 1, "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "It fails." }] } ] });
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": "ENG-1", "id": "1",
+                "fields": { "summary": "x", "description": doc },
+                "renderedFields": { "description": "<p>It fails.</p>" }
+            })))
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraGetIssueTool::new(clients, "acme".into(), Arc::default());
+        let r = tool.execute(json!({ "issue_key": "ENG-1" })).await.unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert!(r.output.get("description_adf").is_none(), "not asked for");
+        assert!(r.output["description_html"].is_string());
+        let r = tool
+            .execute(json!({ "issue_key": "ENG-1", "description_adf": true }))
+            .await
+            .unwrap();
+        let text = r.output["description_adf"].as_str().unwrap();
+        assert!(text.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{text}");
+        let inner = text.lines().nth(2).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(inner).unwrap(), doc);
     }
 
     /// A page of an issue's comments as asked for, with how many it has.
