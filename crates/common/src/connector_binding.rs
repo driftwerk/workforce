@@ -108,9 +108,16 @@ impl ConnectorBinding {
             && self.picks(connector).is_none_or(|p| !p.is_empty())
     }
 
-    /// Whether `connector` only reads for the agent.
+    /// Whether `connector` only reads for the agent. One connection of a
+    /// connector that can't hold a single connection back (`email:work`)
+    /// makes the whole connector read-only, so the entry never holds
+    /// nothing back.
     pub fn reads_only(&self, connector: &str) -> bool {
-        self.read_only.iter().any(|c| c == connector)
+        self.read_only.iter().any(|r| {
+            r == connector
+                || (!READ_ONLY_EACH.contains(&connector)
+                    && r.split_once(':').is_some_and(|(c, _)| c == connector))
+        })
     }
 
     /// The instances of `connector` it uses, the first its default, where
@@ -262,17 +269,6 @@ pub fn from_value(value: &Value) -> Result<ConnectorBinding, String> {
     };
     let read_only =
         names(t, "read_only", "The connectors an agent only reads")?.unwrap_or_default();
-    // One connection only reads where its connector checks each write's
-    // connection; elsewhere the entry would hold nothing back.
-    if let Some(r) = read_only.iter().find(|r| {
-        r.split_once(':')
-            .is_some_and(|(c, _)| !READ_ONLY_EACH.contains(&c))
-    }) {
-        let (c, _) = r.split_once(':').unwrap_or_default();
-        return Err(format!(
-            "`{r}`: {c} only reads as a whole, not one connection at a time. Use `{c}` instead."
-        ));
-    }
     Ok(ConnectorBinding {
         enabled: names(t, "enabled", "The connectors an agent has")?,
         read_only,
@@ -512,10 +508,10 @@ mod tests {
             widened(&ro, &all),
             ["jira: may now change things through `globex`"]
         );
-        // A connector that can't hold one connection back refuses the entry.
-        assert!(parse("[skills]\nread_only = [\"email:work\"]\n")
-            .unwrap_err()
-            .contains("only reads as a whole"));
+        // A connector that can't hold one connection back only reads, whole.
+        let email = parse("[skills]\nread_only = [\"email:work\"]\n").unwrap();
+        assert!(email.reads_only("email"));
+        assert!(!email.reads_only("jira"));
         // An empty instance segment is no pick's, never the listing.
         assert_eq!(
             instance_of("jira", "skills/jira/workspaces//globex/x"),
