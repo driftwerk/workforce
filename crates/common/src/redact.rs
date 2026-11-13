@@ -125,6 +125,7 @@ static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
         ("WORKFORCE_PAIRING_TOKEN", r"wfp_[a-zA-Z0-9_-]{20,}"),
         ("WORKFORCE_REMOTE_MCP_TOKEN", r"wfr_[a-zA-Z0-9_-]{20,}"),
         ("WORKFORCE_DESK_BOSS_TOKEN", r"wfb_[a-zA-Z0-9_-]{20,}"),
+        ("WORKFORCE_DESK_KNOWS_TOKEN", r"wfk_[a-zA-Z0-9_-]{20,}"),
         // ── Payments ──
         ("STRIPE_SECRET", r"(?:sk|rk)_(?:live|test)_[a-zA-Z0-9]{24,}"),
         ("STRIPE_WEBHOOK_SECRET", r"whsec_[a-zA-Z0-9]{32,}"),

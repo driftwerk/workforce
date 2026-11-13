@@ -18,7 +18,7 @@ use workforce_desk::charge::How;
 use workforce_desk::crew::Party;
 
 /// The person's own `[oversight]` that day, as their config had it.
-const THEIRS: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
+pub(super) const THEIRS: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
     max_checkins_per_day = 150\nmax_checkins_per_hour = 6\n\
     [oversight.wake]\nwaiting_minutes = 5\nquiet_minutes = 30\n\
     [oversight.act]\nnudge = true\nresume_restart = true\nread_only_approvals = true\n\
@@ -42,7 +42,7 @@ fn behavior(v: &Value) -> Value {
 }
 
 /// The boss's model answers a decision call naming `about` with `answer`.
-async fn decides(llm: &wiremock::MockServer, about: &str, answer: &str) {
+pub(super) async fn decides(llm: &wiremock::MockServer, about: &str, answer: &str) {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, ResponseTemplate};
     Mock::given(method("POST"))
@@ -61,7 +61,7 @@ async fn decides(llm: &wiremock::MockServer, about: &str, answer: &str) {
 }
 
 /// The decision calls made about `about`.
-async fn calls_about(llm: &wiremock::MockServer, about: &str) -> Vec<String> {
+pub(super) async fn calls_about(llm: &wiremock::MockServer, about: &str) -> Vec<String> {
     llm.received_requests()
         .await
         .unwrap_or_default()
@@ -72,7 +72,7 @@ async fn calls_about(llm: &wiremock::MockServer, about: &str) -> Vec<String> {
 }
 
 /// How many notices in the boss's DM say all of `parts`.
-fn said(overseer: &AgentService, parts: &[&str]) -> usize {
+pub(super) fn said(overseer: &AgentService, parts: &[&str]) -> usize {
     overseer
         .sessions
         .find(DESK_CHANNEL, PERSON)

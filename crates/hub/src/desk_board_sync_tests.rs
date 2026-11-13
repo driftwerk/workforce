@@ -50,6 +50,12 @@ pub(crate) struct Jira {
     pub refuse: Option<&'static str>,
     /// The hub's Jira token is a shared one, not the person's own.
     pub shared_key: bool,
+    /// Each issue's attachments: id, filename, type and bytes.
+    pub files: BTreeMap<String, Vec<(String, String, String, Vec<u8>)>>,
+    /// Each issue's comments: id, author, body, and whether an app wrote it.
+    pub comments: BTreeMap<String, Vec<(String, String, String, bool)>>,
+    /// What `jira.list_comments` answers instead of the comments, when set.
+    pub comments_answer: Option<Value>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
@@ -206,7 +212,38 @@ impl Tool for FakeJiraTool {
                 }
                 json!({ "key": key, "transitioned": true })
             }
-            "jira.add_comment" => json!({ "key": key, "comment_id": "c1" }),
+            "jira.add_comment" => {
+                let n = j.comments.values().map(Vec::len).sum::<usize>() + 1;
+                let id = format!("{}", 20_000 + n);
+                let body = input["body"].as_str().unwrap_or_default().to_string();
+                j.comments.entry(key.clone()).or_default().push((
+                    id.clone(),
+                    "Sam".into(),
+                    body,
+                    false,
+                ));
+                json!({ "key": key, "comment_id": id })
+            }
+            "jira.list_comments" if j.comments_answer.is_some() => {
+                j.comments_answer.clone().unwrap_or_default()
+            }
+            "jira.list_comments" => {
+                let comments: Vec<Value> = j
+                    .comments
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(n, (id, author, body, app))| {
+                        let at = format!("2026-11-10T09:{n:02}:00.000+0000");
+                        json!({ "id": id, "author": author, "author_account_id": "acc",
+                            "author_account_type": if *app { "app" } else { "atlassian" },
+                            "body_html": wrapped(&format!("<p>{body}</p>"), "jira.list_comments.body"),
+                            "created": at, "updated": at })
+                    })
+                    .collect();
+                json!({ "issue_key": key, "count": comments.len(), "total": comments.len(), "comments": comments })
+            }
             "jira.myself" => {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
                     "personal": !j.shared_key })
@@ -225,8 +262,40 @@ impl Tool for FakeJiraTool {
                 "key": input["project_key"],
                 "issue_types": [{ "id": "1", "name": "Bug" }, { "id": "2", "name": "Task" }],
             }),
+            "jira.attachment_read" => {
+                let id = input["attachment_id"].as_str().unwrap_or_default();
+                let Some((_, _, mime, bytes)) = j.files.values().flatten().find(|f| f.0 == id)
+                else {
+                    return Ok(ToolResult::failure("Not found: no such attachment", 0));
+                };
+                let range = workforce_skills::adapters::file_read::range_of(&input).unwrap();
+                workforce_skills::adapters::file_read::chunk(bytes, mime, range)
+            }
             other => json!({ "unexpected": other }),
         };
+        let mut out = out;
+        if matches!(self.name, "jira.get_issue" | "jira.search") {
+            let attach = |v: &mut Value| {
+                let key = v["key"].as_str().unwrap_or_default().to_string();
+                if let Some(files) = j.files.get(&key) {
+                    v["attachments"] = files
+                        .iter()
+                        .map(|(id, name, mime, bytes)| {
+                            json!({ "id": id, "filename": wrapped(name, "jira.get_issue.attachment_filename"),
+                                "mime_type": mime, "size": bytes.len(), "thumbnail": false })
+                        })
+                        .collect();
+                }
+            };
+            match self.name {
+                "jira.get_issue" => attach(&mut out),
+                _ => out["issues"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                    .for_each(attach),
+            }
+        }
         Ok(ToolResult::success(out, 0))
     }
 }
@@ -242,6 +311,8 @@ pub(crate) fn register_jira(
             "jira.api",
             "jira.delete_issue",
             "jira.myself",
+            "jira.attachment_read",
+            "jira.list_comments",
             "jira.list_projects",
         ]
         .iter(),
@@ -468,6 +539,9 @@ pub(crate) struct LocalHub {
     pub person: Identity,
     pub jwt: String,
     pub vault: Arc<Vault>,
+    /// Its identities and tokens, for pairing a device or minting a token.
+    pub fx: crate::remote_mcp::testing::Fixture,
+    pub devices: Arc<workforce_pairing::SqlitePairingStore>,
 }
 
 pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
@@ -487,9 +561,17 @@ pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
     let state = Arc::try_unwrap(fx.state)
         .ok()
         .expect("the fixture's only handle");
+    let devices = Arc::new(
+        workforce_pairing::SqlitePairingStore::in_memory().expect("in-memory pairing store"),
+    );
+    let pairing = Arc::new(workforce_pairing::DevicePairingService::new(
+        Arc::clone(&devices) as Arc<dyn workforce_pairing::PairingStore>,
+        workforce_pairing::types::PairingConfig::default(),
+    ));
     let state = Arc::new(GatewayState {
         jwt_config: Some(jwt_config),
         vault: Some(Arc::clone(&vault)),
+        device_pairing: Some(pairing),
         ..state
     });
     let (sync, app) = install(&state, desk);
@@ -499,6 +581,12 @@ pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
         person,
         jwt,
         vault,
+        fx: crate::remote_mcp::testing::Fixture {
+            state,
+            identities: fx.identities,
+            tokens: fx.tokens,
+        },
+        devices,
     }
 }
 
@@ -1670,9 +1758,11 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "help",
         "identity_whoami",
         "jira_add_comment",
+        "jira_attachment_read",
         "jira_create_issue",
         "jira_get_issue",
         "jira_get_project",
+        "jira_list_comments",
         "jira_list_projects",
         "jira_list_transitions",
         "jira_myself",

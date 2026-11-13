@@ -35,7 +35,10 @@ use crate::vault_copy::{
     copied_count, copy_credential, copy_outcome_json, dedup_destinations, logical_path_error,
     CopyRequest,
 };
-use crate::vault_policy::{agent_can_read, agent_can_read_value, AgentReadDenial};
+use crate::vault_policy::{
+    agent_can_read, agent_can_read_value, agent_can_relocate, agent_can_write, desk_running,
+    AgentReadDenial,
+};
 
 pub use crate::authz::{always_admin, never_admin, IsAdminFn};
 
@@ -343,7 +346,7 @@ impl Tool for VaultSetTool {
         let params: VaultSetInput = serde_json::from_value(input)?;
 
         let uid = current_uid();
-        if let Err(denial) = agent_can_read(&params.path, uid.as_deref()) {
+        if let Err(denial) = agent_can_write(&params.path, uid.as_deref(), desk_running()) {
             return Ok(deny_to_result(start, &params.path, denial));
         }
 
@@ -639,7 +642,7 @@ impl Tool for VaultDeleteTool {
         let params: VaultDeleteInput = serde_json::from_value(input)?;
 
         let uid = current_uid();
-        if let Err(denial) = agent_can_read(&params.path, uid.as_deref()) {
+        if let Err(denial) = agent_can_write(&params.path, uid.as_deref(), desk_running()) {
             return Ok(deny_to_result(start, &params.path, denial));
         }
 
@@ -1048,7 +1051,7 @@ impl Tool for VaultMoveTool {
                 start.elapsed().as_millis() as u64,
             ));
         }
-        if let Err(denial) = agent_can_read(&params.path, uid.as_deref()) {
+        if let Err(denial) = agent_can_relocate(&params.path, uid.as_deref(), desk_running()) {
             return Ok(deny_to_result(start, &params.path, denial));
         }
         if let Err(msg) = authorize_move(from, to, params.confirm_share, &self.is_admin) {
@@ -1311,7 +1314,7 @@ impl Tool for VaultRenameTool {
             // `http/`) and so pair an operator's credential with an
             // agent-chosen target — defeating a boundary the rest of the vault
             // surface enforces.
-            if let Err(denial) = agent_can_read(p, current_uid().as_deref()) {
+            if let Err(denial) = agent_can_relocate(p, current_uid().as_deref(), desk_running()) {
                 return Ok(ToolResult::failure(
                     format!("cannot rename '{p}': {denial}"),
                     elapsed(),
@@ -1516,7 +1519,9 @@ impl Tool for VaultCopyTool {
         }
         // Same namespace gate as the read/write tools: a server-resolved
         // credential (`databases/`, `http/`) is not copyable from an agent tool.
-        if let Err(denial) = agent_can_read(&params.path, current_uid().as_deref()) {
+        if let Err(denial) =
+            agent_can_relocate(&params.path, current_uid().as_deref(), desk_running())
+        {
             return Ok(ToolResult::failure(
                 format!("cannot copy '{}': {denial}", params.path),
                 elapsed(),

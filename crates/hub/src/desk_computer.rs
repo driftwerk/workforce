@@ -260,17 +260,22 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
         }),
         _ => return None,
     };
-    if binding.enabled.is_none() && binding.read_only.is_empty() {
+    if binding.enabled.is_none() && binding.read_only.is_empty() && binding.connections.is_empty() {
         return None;
     }
+    // A connector it uses no connection of is off; one connection that only
+    // reads is refused where the adapter resolves it, not here.
     Some(workforce_desk::computer::Connectors {
-        enabled: binding.enabled.unwrap_or_else(|| {
-            workforce_common::connector_binding::CONNECTORS
-                .iter()
-                .map(|c| c.to_string())
-                .collect()
-        }),
-        read_only: binding.read_only,
+        enabled: workforce_common::connector_binding::CONNECTORS
+            .iter()
+            .filter(|c| binding.is_on(c))
+            .map(|c| c.to_string())
+            .collect(),
+        read_only: workforce_common::connector_binding::CONNECTORS
+            .iter()
+            .filter(|c| binding.reads_only(c))
+            .map(|c| c.to_string())
+            .collect(),
     })
 }
 
@@ -655,7 +660,8 @@ impl ComputerGate for HubComputerGate {
                 tool.starts_with("browser.")
                     || workforce_common::connector_binding::connector_of(tool).is_some()
             }
-            None => false,
+            // Its own `[skills]`: a change that widens what it reaches.
+            None => tool == "system.config",
         }
     }
 
@@ -935,7 +941,7 @@ impl ComputerGate for HubComputerGate {
         // A browser call reads what its page scanned as, now, and is
         // unbound only as the crew judges this turn.
         let mut policy = std::borrow::Cow::Borrowed(&self.policy);
-        if tool.starts_with("browser.") {
+        if tool.starts_with("browser.") || widens_connections(effect) {
             let agent = &self.policy.agent;
             let mine = policy.to_mut();
             mine.browser.hostile = page_now(agent).1;
@@ -995,6 +1001,13 @@ impl ComputerGate for HubComputerGate {
             }
         });
     }
+}
+
+/// Whether `effect` widens what an agent's connections reach: decided as
+/// the crew judges this turn unbound, as a browser change is.
+fn widens_connections(effect: &Effect) -> bool {
+    matches!(effect, Effect::Connector { connector, .. }
+        if connector == "connections" || connector.starts_with("connections:"))
 }
 
 /// Makes every agent's turns on this hub go through the gate. Called once,

@@ -73,6 +73,7 @@ pub mod decide_tool;
 pub use hub_core::decision_records;
 pub mod decision_store;
 pub mod def_cmd;
+pub mod desk_knows;
 pub use workforce_hub_core::def_write_auth;
 #[cfg(feature = "postgres")]
 pub mod desk_floor;
@@ -132,6 +133,10 @@ pub mod desk_memory_index;
 pub(crate) mod desk_pool;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
+#[cfg(feature = "postgres")]
+pub mod desk_ticket_comments;
+#[cfg(feature = "postgres")]
+pub mod desk_ticket_files;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
 #[cfg(feature = "postgres")]

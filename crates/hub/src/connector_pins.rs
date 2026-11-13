@@ -13,6 +13,12 @@
 //!   before, except one it names in `own_credential`, which reads only its
 //!   own connection.
 //!
+//! - One whose connections the agent names (`[skills.connections]`) reads
+//!   only those instances (`skills/jira/workspaces/<instance>/…`), each at
+//!   whichever tier it is kept; its other instances and its flat keys
+//!   resolve nothing. Its instances' listing stays open, so an adapter
+//!   finds the ones it may read.
+//!
 //! A connector's OAuth app (`skills/<id>/oauth_client/…`) is the hub's, not
 //! a connection's, and is never pinned. Every hub without `[desk]` fills no
 //! slot, so nothing here runs there.
@@ -47,6 +53,19 @@ pub fn pin_of(binding: &ConnectorBinding, path: &str) -> TierPin {
     let Some(connector) = connector_of_path(path) else {
         return TierPin::All;
     };
+    if let Some(picks) = binding.picks(connector) {
+        if !binding.is_on(connector) {
+            return TierPin::Nothing;
+        }
+        return match workforce_common::connector_binding::instance_of(connector, path) {
+            Some(Some(instance)) if picks.iter().any(|p| p == instance) => TierPin::All,
+            Some(Some(_)) => TierPin::Nothing,
+            // The listing: each instance's own read decides.
+            Some(None) => TierPin::All,
+            // Its flat keys and selectors: the instances it names decide.
+            None => TierPin::Nothing,
+        };
+    }
     // No `enabled`: every connector is on, and one named in
     // `own_credential` still reads only its own connection.
     if binding.enabled.is_none() && !binding.own(connector) {
@@ -110,6 +129,16 @@ impl PinSource for AgentPins {
     fn pin(&self, path: &str) -> TierPin {
         pin_of(&self.binding(), path)
     }
+
+    fn default_instance(&self, connector: &str) -> Option<String> {
+        self.binding()
+            .picks(connector)
+            .and_then(|p| p.first().cloned())
+    }
+
+    fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+        self.binding().reads_only_instance(connector, instance)
+    }
 }
 
 /// The binding the `config.toml` in `workspace` has now.
@@ -125,7 +154,19 @@ pub fn changed(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<&'sta
         .copied()
         .filter(|c| {
             let path = primary(c).unwrap_or_default();
-            pin_of(before, path) != pin_of(after, path) || before.is_on(c) != after.is_on(c)
+            // The connections it names, and which only read, are in what
+            // its adapter loads with: its clients, its default, its words.
+            let read_only = |b: &ConnectorBinding| -> Vec<String> {
+                b.read_only
+                    .iter()
+                    .filter(|r| r.as_str() == *c || r.starts_with(&format!("{c}:")))
+                    .cloned()
+                    .collect()
+            };
+            pin_of(before, path) != pin_of(after, path)
+                || before.is_on(c) != after.is_on(c)
+                || before.picks(c) != after.picks(c)
+                || read_only(before) != read_only(after)
         })
         .collect()
 }
@@ -220,9 +261,24 @@ pub fn binding_of(agent: &str) -> Option<ConnectorBinding> {
 /// The tier `agent`'s key for `connector` resolves from now, for the person
 /// in scope, as its pin allows.
 pub fn source_of(agent: &str, connector: &str) -> Option<VaultSource> {
-    let path = primary(connector)?;
+    let flat = primary(connector)?;
     let pinned = PINNED.read().unwrap_or_else(|e| e.into_inner());
     let p = pinned.iter().find(|p| p.agent == agent)?;
+    // Its default connection's key, else the adapters' `default`'s, else
+    // a flat one.
+    let paths: Vec<String> = match workforce_common::connector_binding::instance_prefix(connector) {
+        Some(prefix) => {
+            let sub = flat.rsplit(['/', '.']).next().unwrap_or(flat);
+            p.pins
+                .default_instance(connector)
+                .into_iter()
+                .chain(["default".to_string()])
+                .map(|key| format!("{prefix}{key}/{sub}"))
+                .chain([flat.to_string()])
+                .collect()
+        }
+        None => vec![flat.to_string()],
+    };
     let store =
         crate::user_config::LayeredUserVault::new(Arc::clone(p.vault.as_ref()?), p.global.clone())
             .with_pins({
@@ -230,7 +286,10 @@ pub fn source_of(agent: &str, connector: &str) -> Option<VaultSource> {
                 slot.fill(Arc::clone(&p.pins) as Arc<dyn PinSource>);
                 slot
             });
-    store.get_with_source(path).map(|(_, source)| source)
+    paths
+        .iter()
+        .find_map(|path| store.get_with_source(path))
+        .map(|(_, source)| source)
 }
 
 #[cfg(test)]
@@ -242,6 +301,7 @@ mod tests {
             enabled: enabled.map(|e| e.iter().map(|s| s.to_string()).collect()),
             read_only: vec![],
             own_credential: own.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -261,6 +321,56 @@ mod tests {
         assert_eq!(connector_of_path("skills/xero/client_id"), None);
         assert_eq!(connector_of_path("embeddings/key"), None);
         assert_eq!(connector_of_path("skills/linearx/api_key"), None);
+    }
+
+    #[test]
+    fn the_connections_an_agent_names_are_the_only_instances_it_reads() {
+        let mut b = binding(Some(&["jira"]), &["jira"]);
+        b.connections
+            .insert("jira".into(), vec!["acme".into(), "globex".into()]);
+        b.read_only.push("jira:globex".into());
+        let ws = |key: &str| format!("skills/jira/workspaces/{key}/api_token");
+        // Whichever level each is kept at: its own connection doesn't narrow
+        // the ones it names.
+        assert_eq!(pin_of(&b, &ws("acme")), TierPin::All);
+        assert_eq!(pin_of(&b, &ws("globex")), TierPin::All);
+        assert_eq!(pin_of(&b, &ws("initech")), TierPin::Nothing);
+        assert_eq!(pin_of(&b, "skills/jira/workspaces/"), TierPin::All);
+        assert_eq!(pin_of(&b, "skills/jira/api_token"), TierPin::Nothing);
+        assert_eq!(
+            pin_of(&b, "skills/jira/default_workspace"),
+            TierPin::Nothing
+        );
+        // Another connector keeps its own rule.
+        assert_eq!(pin_of(&b, "skills/linear/api_key"), TierPin::Nothing);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(workforce_common::config_files::WORKSPACE_CONFIG),
+            "[skills]\nenabled = [\"jira\"]\nread_only = [\"jira:globex\"]\n\n[skills.connections]\njira = [\"globex\", \"acme\"]\n",
+        )
+        .unwrap();
+        let pins = AgentPins::new(dir.path().to_path_buf());
+        assert_eq!(pins.default_instance("jira").as_deref(), Some("globex"));
+        assert_eq!(pins.default_instance("linear"), None);
+        assert!(pins.read_only_instance("jira", "globex"));
+        assert!(!pins.read_only_instance("jira", "acme"));
+
+        // Naming none of a connector's is it off.
+        b.connections.insert("jira".into(), vec![]);
+        assert_eq!(pin_of(&b, &ws("acme")), TierPin::Nothing);
+    }
+
+    #[test]
+    fn a_change_of_the_connections_named_loads_the_connector_again() {
+        let before = binding(Some(&["jira", "linear"]), &[]);
+        let mut after = before.clone();
+        after.connections.insert("jira".into(), vec!["acme".into()]);
+        assert_eq!(changed(&before, &after), ["jira"]);
+        let mut read_only = after.clone();
+        read_only.read_only.push("jira:acme".into());
+        assert_eq!(changed(&after, &read_only), ["jira"]);
     }
 
     #[test]
