@@ -534,14 +534,9 @@ pub(crate) mod tests {
                 None,
                 "approved",
             ));
-            let mut summary = d.unread(&NoCrew, YOU).await.unwrap();
-            for _ in 0..100 {
-                if summary.activity.count >= 2 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                summary = d.unread(&NoCrew, YOU).await.unwrap();
-            }
+            // The notes are queued to be written: read once the queue is.
+            d.persisted().await;
+            let summary = d.unread(&NoCrew, YOU).await.unwrap();
             assert_eq!(summary.floor, floor);
             let main = &summary.rooms[0];
             assert_eq!(
