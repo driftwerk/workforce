@@ -1682,7 +1682,9 @@ async fn a_delete_erases_desks_activity_and_its_screenshots_at_once() {
 /// from; suspending someone forgets theirs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension() {
-    use crate::oidc::{OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY, OIDC_VERIFIED_EMAIL_KEY};
+    use crate::verified_email::{
+        OIDC_LINKED_ID_KEY, OIDC_VERIFIED_AT_KEY, OIDC_VERIFIED_EMAIL_KEY,
+    };
     let hub = hub().await;
     let admin = hub.admin();
     let at = chrono::Utc::now().to_rfc3339();
@@ -1709,7 +1711,7 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
         Some("sub-ada")
     );
     assert_eq!(
-        crate::oidc::verified_email(&bo).as_deref(),
+        crate::verified_email::verified_email(&bo).as_deref(),
         Some("ada@example.com")
     );
     // Into someone with their own sign-in: theirs stands, and the source's
@@ -1723,15 +1725,68 @@ async fn a_verified_email_moves_only_with_its_sign_in_and_dies_with_suspension()
         .unwrap();
     let ed = hub.identities.get_by_id(ed.id).unwrap().unwrap();
     assert_eq!(
-        crate::oidc::verified_email(&ed),
+        crate::verified_email::verified_email(&ed),
         None,
         "no sign-in moved, so no email"
     );
-    // Suspending forgets it.
+    // Slack's goes with the Slack link, and only with it.
+    let slack_vouched = |name: &str, slack: &str, email: &str| {
+        let who = Identity::new(name, IdentityRole::Member)
+            .with_linked_id("slack", slack)
+            .with_linked_id("slack_email", email)
+            .with_linked_id("slack_email_at", &at);
+        hub.identities.create(&who).unwrap();
+        who
+    };
+    let fay = slack_vouched("Fay", "U-FAY", "fay@example.com");
+    let gus = hub.person("Gus", "U-GUS");
+    hub.lifecycle
+        .merge(fay.id, gus.id, &admin, false)
+        .await
+        .unwrap();
+    let gus = hub.identities.get_by_id(gus.id).unwrap().unwrap();
+    assert!(
+        !gus.linked_ids.contains_key("slack_email"),
+        "Gus keeps his own Slack"
+    );
+    let hal = slack_vouched("Hal", "U-HAL", "hal@example.com");
+    let ivy = Identity::new("Ivy", IdentityRole::Member);
+    hub.identities.create(&ivy).unwrap();
+    hub.lifecycle
+        .merge(hal.id, ivy.id, &admin, false)
+        .await
+        .unwrap();
+    let ivy = hub.identities.get_by_id(ivy.id).unwrap().unwrap();
+    assert_eq!(
+        crate::verified_email::verified(&ivy),
+        Some((
+            "hal@example.com".to_string(),
+            crate::verified_email::Source::Slack
+        ))
+    );
+    // Whom someone chose to be on a shared key never moves: the target
+    // chooses for itself.
+    let chose = "chosen.jira:acme.atlassian.net";
+    let jo = Identity::new("Jo", IdentityRole::Member)
+        .with_linked_id(chose, r#"{"id":"557058:jo","name":"Jo"}"#);
+    hub.identities.create(&jo).unwrap();
+    let kit = Identity::new("Kit", IdentityRole::Member);
+    hub.identities.create(&kit).unwrap();
+    hub.lifecycle
+        .merge(jo.id, kit.id, &admin, false)
+        .await
+        .unwrap();
+    let kit = hub.identities.get_by_id(kit.id).unwrap().unwrap();
+    assert!(!kit.linked_ids.contains_key(chose), "Kit didn't choose");
+    // Suspending forgets it, and the choice too.
+    let mut cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();
+    cy.linked_ids
+        .insert(chose.into(), r#"{"id":"557058:cy","name":"Cy"}"#.into());
+    hub.identities.update(&cy).unwrap();
     hub.lifecycle.suspend(cy.id, &admin).await.unwrap();
     let cy = hub.identities.get_by_id(cy.id).unwrap().unwrap();
     assert!(!cy
         .linked_ids
         .keys()
-        .any(|k| crate::oidc::is_verified_key(k)));
+        .any(|k| crate::verified_email::is_verified_key(k) || crate::chosen_me::is_chosen_key(k)));
 }

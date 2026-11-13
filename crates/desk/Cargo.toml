@@ -10,6 +10,7 @@ description = "Desk sessions: real Claude Code and Codex terminals the hub owns,
 [dependencies]
 unicode-normalization = { workspace = true }
 async-trait = { workspace = true }
+shlex = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

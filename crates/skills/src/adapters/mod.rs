@@ -31,6 +31,13 @@ pub mod teams;
 #[cfg(feature = "browser")]
 pub mod browser;
 
+/// The headless browser a server hub runs (Chromium over the DevTools
+/// Protocol, one profile per agent and person): what `browser.*` is on a hub
+/// without Desk. A Desk hub uses the person's own Chrome instead
+/// ([`browser`]).
+#[cfg(feature = "browser")]
+pub mod browser_headless;
+
 #[cfg(feature = "obscura")]
 pub mod obscura;
 

@@ -835,6 +835,29 @@ pub const DESK_CLOSED_KEY: &str = "desk_closed";
 pub const SHARED_OWNER_PREFIX: &str = "shared:";
 
 impl SessionMessage {
+    /// A person's message, new now, under the client's own id when it has
+    /// one.
+    pub fn user(
+        content: &str,
+        external_id: Option<&str>,
+        attachments: Option<Vec<SessionAttachment>>,
+        trust_level: Option<crate::trust::TrustLevel>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: MessageRole::User,
+            content: content.to_string(),
+            tool_data: None,
+            timestamp: Utc::now(),
+            tokens: estimate_tokens(content),
+            external_id: external_id.map(String::from),
+            attachments,
+            trust_level,
+            actor: None,
+            desk: None,
+        }
+    }
+
     /// The row recording one tool call: its input shrunk to the storage cap,
     /// its output, and how it went.
     pub fn tool(
@@ -936,7 +959,8 @@ impl Session {
         }
     }
 
-    fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+    /// The metadata as an object, made one when it isn't yet.
+    pub fn metadata_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
         if !self.metadata.is_object() {
             self.metadata = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1013,12 +1037,20 @@ impl Session {
     }
 
     /// The thread's next position: same conversation identity and label,
-    /// `seq + 1`, nothing carried. A rollover additionally records the
+    /// `seq + 1`, nothing carried but a Desk boss conversation's link
+    /// ([`DESK_BOSS_KEY`]). A rollover additionally records the
     /// carry-over with [`Self::set_prev_session_id`].
     pub fn successor(&self) -> Session {
         let mut next = Session::new(&self.channel, &self.owner, &self.agent_id);
         next.label = self.label.clone();
         next.set_seq(self.seq().saturating_add(1));
+        // A Desk group's boss conversation stays its group's when started
+        // afresh: its place (a Desk channel, a Slack thread) is the link's.
+        if let Some(boss) = self.metadata.get(DESK_BOSS_KEY) {
+            next.metadata_object_mut()
+                .insert(DESK_BOSS_KEY.into(), boss.clone());
+            next.context_type = self.context_type.clone();
+        }
         next
     }
 
@@ -1643,19 +1675,7 @@ impl Session {
         attachments: Option<Vec<SessionAttachment>>,
         trust_level: Option<crate::trust::TrustLevel>,
     ) -> String {
-        let msg = SessionMessage {
-            id: Uuid::new_v4().to_string(),
-            role: MessageRole::User,
-            content: content.to_string(),
-            tool_data: None,
-            timestamp: Utc::now(),
-            tokens: estimate_tokens(content),
-            external_id: external_id.map(String::from),
-            attachments,
-            trust_level,
-            actor: None,
-            desk: None,
-        };
+        let msg = SessionMessage::user(content, external_id, attachments, trust_level);
         let id = msg.id.clone();
         self.total_tokens += msg.tokens as u64;
         self.messages.push(msg);
@@ -3133,6 +3153,41 @@ pub trait SessionStore: Send + Sync {
     /// re-processing. Returns an error if the session or message is not found.
     fn truncate_from_message(&self, session_id: &str, message_id: &str) -> eyre::Result<()>;
 
+    /// Delete the person's message `message_id` from the session: its
+    /// archive row goes, so no one reads or searches it again; its live copy
+    /// reads as [`DELETED_MESSAGE_NOTE`], without its files, so the turns
+    /// around it stay paired and its words don't come back to the model; and
+    /// the agent's replies to it ([`replies_to`]) are marked
+    /// `answered_deleted`, in the archive and live. A copy compaction already
+    /// dropped from the live context is skipped, and so is an archive this
+    /// session doesn't keep: a session without the message changes nothing.
+    /// An unknown session is an error.
+    fn delete_person_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> eyre::Result<DeletedMessage>;
+
+    /// Set aside `aside.from` and everything archived after it in the
+    /// session, up to `aside.newest`: gone from the archive, so no one reads
+    /// them again, and from the live context, so the agent doesn't either.
+    /// `aside.replacement`, when given, is saved in their place, in the
+    /// archive and the live context, in the same step: no reader ever finds
+    /// the old version gone and the new one missing. A Desk edit of the
+    /// person's latest message uses this for the reply to the old version.
+    ///
+    /// Refused with [`SetAsideStale`] when the newest archived message is no
+    /// longer `aside.newest`: something was said since the caller looked.
+    /// The live context loses the stretch from the first set-aside message
+    /// it still holds to the last; whatever it holds after that (a delivery
+    /// saved meanwhile) stays. Compaction may have folded `aside.from` into
+    /// a summary: its archive rows go all the same, the live context loses
+    /// only what it still holds of them, and the result says so
+    /// ([`SetAsideRows::compacted`]). A store with no separate archive sets
+    /// aside from the live messages. An unknown session or message is an
+    /// error.
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows>;
+
     /// Redact secrets at rest in a session's stored messages (and, for
     /// stores that keep one, its archive), reusing the ingress pattern
     /// catalogue. Idempotent. With `dry_run`, computes the stats without
@@ -3243,6 +3298,73 @@ pub trait SessionStore: Send + Sync {
         Ok(ArchivePage { messages, has_more })
     }
 
+    /// The messages of `session_ids` that match `query`, newest first, at
+    /// most `limit`: what a person or the agent said, never a tool row or a
+    /// turn's failure. `session_ids` is one thread's chain, newest session
+    /// first, and the order runs back through it: a session's messages,
+    /// newest first, then its predecessor's. A turn a rollover carried into a
+    /// successor under its own id is matched once, where it was first said:
+    /// in the oldest session that holds it. With `before`, a message of one
+    /// of them, only those older than it; a `before` none of them holds is
+    /// an [`UnknownCursor`]. Reads what
+    /// [`read_archive_page`](Self::read_archive_page) reads, so every match
+    /// is a message a page of the thread holds.
+    ///
+    /// This one matches every whitespace-separated word of `query` as a
+    /// case-insensitive substring, so part of a word finds the whole one; a
+    /// store with an index overrides it.
+    fn search_archive(
+        &self,
+        session_ids: &[String],
+        query: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> eyre::Result<Vec<TranscriptEntry>> {
+        let terms = search_terms(query);
+        let mut sessions: Vec<Vec<TranscriptEntry>> = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            sessions.push(match self.get(session_id)? {
+                Some(_) => {
+                    self.read_archive_page(session_id, None, usize::MAX)?
+                        .messages
+                }
+                None => Vec::new(),
+            });
+        }
+        // Where each message was first said: the oldest session holding it.
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (pos, entries) in sessions.iter().enumerate() {
+            for entry in entries {
+                first.insert(entry.id.as_str(), pos);
+            }
+        }
+        let originals = sessions.iter().enumerate().flat_map(|(pos, entries)| {
+            let first = &first;
+            entries
+                .iter()
+                .rev()
+                .filter(move |e| first.get(e.id.as_str()) == Some(&pos))
+        });
+        let mut passed = before.is_none();
+        let mut found = Vec::new();
+        for entry in originals {
+            if !passed {
+                passed = Some(entry.id.as_str()) == before;
+                continue;
+            }
+            if found.len() >= limit {
+                break;
+            }
+            if is_searched(entry) && matches_every_term(&entry.content, &terms) {
+                found.push(entry.clone());
+            }
+        }
+        match (passed, before) {
+            (false, Some(before)) => Err(UnknownCursor(before.to_string()).into()),
+            _ => Ok(found),
+        }
+    }
+
     /// The files the messages of `session_id` hold by reference, by message
     /// id ([`files_by_message`]). What a store's archive doesn't keep is read
     /// from its live messages, so a message compacted out of them may be
@@ -3294,6 +3416,128 @@ pub trait SessionStore: Send + Sync {
     /// Gives `from`'s read points to `into`, the later of two kept.
     fn move_desk_reads(&self, _from: &str, _into: &str) -> eyre::Result<u64> {
         Ok(0)
+    }
+}
+
+/// What a person's deleted message reads as in the live context: a note
+/// the hub left, so the turn it asked still alternates and its words are
+/// gone. A Desk read leaves it out like any other `[System note:`.
+pub const DELETED_MESSAGE_NOTE: &str = "[System note: the person deleted this message.]";
+
+/// What [`SessionStore::delete_person_message`] changed in one session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeletedMessage {
+    /// Its archive row was removed.
+    pub archived: bool,
+    /// Its live copy now reads as [`DELETED_MESSAGE_NOTE`].
+    pub live: bool,
+    /// The ids of the agent's replies to it, now marked `answered_deleted`.
+    pub replies: Vec<String>,
+}
+
+impl DeletedMessage {
+    /// Whether the session held the message at all.
+    pub fn found(&self) -> bool {
+        self.archived || self.live
+    }
+}
+
+/// The ids of the agent's replies to `asked` among `later`, the messages said
+/// after it in its session, oldest first. A Desk reply's mark names the
+/// message it answers (`in_reply_to`, the client's id it was asked under, or
+/// its own id): those that do are its replies. Without any, its replies are
+/// the agent's messages of the turn it asked: those straight after it, up to
+/// the next message of the person's or a note the hub left (a user row
+/// either way), or the first of the agent's that is no reply to it — one
+/// delivered outside a turn (a reminder, a job's, a monitor's), or one whose
+/// mark answers another message.
+pub fn replies_to(asked: &SessionMessage, later: &[SessionMessage]) -> Vec<String> {
+    let names: Vec<Uuid> = [asked.external_id.as_deref(), Some(asked.id.as_str())]
+        .into_iter()
+        .flatten()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    let marked: Vec<String> = later
+        .iter()
+        .filter(|m| m.role == MessageRole::Assistant)
+        .filter(|m| {
+            m.desk
+                .as_ref()
+                .and_then(|mark| mark.in_reply_to)
+                .is_some_and(|to| names.contains(&to))
+        })
+        .map(|m| m.id.clone())
+        .collect();
+    if !marked.is_empty() {
+        return marked;
+    }
+    let of_another_turn = |m: &SessionMessage| {
+        m.role == MessageRole::User
+            || m.desk
+                .as_ref()
+                .is_some_and(|mark| mark.delivery.is_some() || mark.in_reply_to.is_some())
+    };
+    later
+        .iter()
+        .take_while(|m| !of_another_turn(m))
+        .filter(|m| m.role == MessageRole::Assistant)
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+/// Makes the live copy of `message_id` in `messages` read as
+/// [`DELETED_MESSAGE_NOTE`], without its files. Returns the tokens it no
+/// longer takes, or `None` when the live context doesn't hold it.
+fn note_deleted(messages: &mut [SessionMessage], message_id: &str) -> Option<u64> {
+    let message = messages.iter_mut().find(|m| m.id == message_id)?;
+    let was = u64::from(message.tokens);
+    message.content = DELETED_MESSAGE_NOTE.to_string();
+    message.tokens = estimate_tokens(DELETED_MESSAGE_NOTE);
+    message.attachments = None;
+    if let Some(mark) = message.desk.as_mut() {
+        mark.files.clear();
+    }
+    Some(was.saturating_sub(u64::from(message.tokens)))
+}
+
+/// Marks the messages `replies` names as answering a deleted message.
+fn mark_answered_deleted(messages: &mut [SessionMessage], replies: &[String]) {
+    for message in messages.iter_mut().filter(|m| replies.contains(&m.id)) {
+        message
+            .desk
+            .get_or_insert_with(Default::default)
+            .answered_deleted = true;
+    }
+}
+
+/// [`SessionStore::delete_person_message`] on a session whose live messages
+/// are its archive too (or stand in for one it doesn't keep yet), or on the
+/// live context of one whose archive `replies` were already found in.
+pub(crate) fn delete_live_message(
+    session: &mut Session,
+    message_id: &str,
+    replies: Option<Vec<String>>,
+) -> DeletedMessage {
+    let replies = replies.unwrap_or_else(|| {
+        session
+            .messages
+            .iter()
+            .position(|m| m.id == message_id)
+            .map(|at| replies_to(&session.messages[at], &session.messages[at + 1..]))
+            .unwrap_or_default()
+    });
+    let saved = note_deleted(&mut session.messages, message_id);
+    mark_answered_deleted(&mut session.messages, &replies);
+    if let Some(saved) = saved {
+        session.total_tokens = session.total_tokens.saturating_sub(saved);
+    }
+    if saved.is_some() || !replies.is_empty() {
+        session.updated_at = Utc::now();
+    }
+    DeletedMessage {
+        archived: false,
+        live: saved.is_some(),
+        replies,
     }
 }
 
@@ -3764,6 +4008,49 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
+    fn delete_person_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> eyre::Result<DeletedMessage> {
+        // No archive of its own: the live messages are what is read.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        Ok(delete_live_message(session, message_id, None))
+    }
+
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
+        // No archive of its own: the live messages are what is read.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        let from = set_aside_start(&session.messages, aside)?;
+        let removed: Vec<SessionMessage> = session.messages.drain(from..).collect();
+        let removed_tokens: u64 = removed.iter().map(|m| u64::from(m.tokens)).sum();
+        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
+        if let Some(replacement) = aside.replacement {
+            session.total_tokens += u64::from(replacement.tokens);
+            session.messages.push(replacement.clone());
+        }
+        session.updated_at = chrono::Utc::now();
+        Ok(SetAsideRows {
+            entries: removed
+                .iter()
+                .map(|m| message_to_transcript_entry(session_id, m))
+                .collect(),
+            compacted: false,
+        })
+    }
+
     fn append_to_archive(&self, _session_id: &str, _message: &SessionMessage) -> eyre::Result<()> {
         Ok(())
     }
@@ -3805,6 +4092,69 @@ impl SessionStore for InMemorySessionStore {
             .and_then(|session| session.messages.iter().find(|m| m.id == message_id))
             .map(|msg| message_to_transcript_entry(session_id, msg)))
     }
+}
+
+/// What [`SessionStore::set_aside_from`] sets aside, and in its place.
+#[derive(Debug, Clone, Copy)]
+pub struct SetAside<'a> {
+    /// The first message set aside.
+    pub from: &'a str,
+    /// The newest message the caller saw archived: the last set aside.
+    pub newest: &'a str,
+    /// Saved in their place, in the same step.
+    pub replacement: Option<&'a SessionMessage>,
+}
+
+/// What [`SessionStore::set_aside_from`] set aside.
+#[derive(Debug, Clone)]
+pub struct SetAsideRows {
+    /// The archive rows set aside, oldest first, each with its Desk mark.
+    pub entries: Vec<TranscriptEntry>,
+    /// The live context no longer held the first of them: compaction had
+    /// folded it into a summary, which may still speak of it.
+    pub compacted: bool,
+}
+
+/// Something was archived after the newest message a set-aside named.
+#[derive(Debug)]
+pub struct SetAsideStale;
+
+impl std::fmt::Display for SetAsideStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the conversation changed since it was read")
+    }
+}
+
+impl std::error::Error for SetAsideStale {}
+
+/// Cut from the live `messages` the stretch from the first one in
+/// `set_aside` to the last, returning the tokens it took and whether the
+/// first set-aside message was among them (else compaction folded it away).
+fn cut_set_aside(messages: &mut Vec<SessionMessage>, set_aside: &[String]) -> (u64, bool) {
+    let held = |m: &SessionMessage| set_aside.contains(&m.id);
+    let compacted = !messages.iter().any(|m| set_aside.first() == Some(&m.id));
+    let (Some(first), Some(last)) = (
+        messages.iter().position(held),
+        messages.iter().rposition(held),
+    ) else {
+        return (0, compacted);
+    };
+    let tokens = messages
+        .drain(first..=last)
+        .map(|m| u64::from(m.tokens))
+        .sum();
+    (tokens, compacted)
+}
+
+/// Where `from` is among `messages`, the newest of which must be `newest`.
+fn set_aside_start(messages: &[SessionMessage], aside: &SetAside<'_>) -> eyre::Result<usize> {
+    if messages.last().map(|m| m.id.as_str()) != Some(aside.newest) {
+        return Err(SetAsideStale.into());
+    }
+    messages
+        .iter()
+        .position(|m| m.id == aside.from)
+        .ok_or_else(|| eyre::eyre!("Message not found: {}", aside.from))
 }
 
 // ─── Transcript Operations for InMemorySessionStore ───
@@ -4896,6 +5246,101 @@ impl SessionStore for JsonlSessionStore {
         self.write_to_disk(&session_clone)
     }
 
+    fn delete_person_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> eyre::Result<DeletedMessage> {
+        self.hydrate_in_cache(session_id)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
+        let session = cache
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        // A session from before its archive was seeded reads its live
+        // messages instead, so those alone change.
+        let path = self.archive_path(session_id);
+        let mut archived = None;
+        if path.exists() {
+            let mut rows = self.read_archive_messages(session_id)?;
+            if let Some(at) = rows.iter().position(|m| m.id == message_id) {
+                let replies = replies_to(&rows[at], &rows[at + 1..]);
+                rows.remove(at);
+                mark_answered_deleted(&mut rows, &replies);
+                let mut kept = String::new();
+                for row in &rows {
+                    kept.push_str(
+                        &serde_json::to_string(row)
+                            .map_err(|e| eyre::eyre!("Failed to serialize archive message: {e}"))?,
+                    );
+                    kept.push('\n');
+                }
+                atomic_write(&path, kept.as_bytes())?;
+                archived = Some(replies);
+            }
+        }
+        let was_archived = archived.is_some();
+        let mut deleted = delete_live_message(session, message_id, archived);
+        deleted.archived = was_archived;
+        if deleted.live || !deleted.replies.is_empty() {
+            let session_clone = session.clone();
+            drop(cache);
+            self.write_to_disk(&session_clone)?;
+        }
+        Ok(deleted)
+    }
+
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
+        self.hydrate_in_cache(session_id)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
+        let session = cache
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        let path = self.archive_path(session_id);
+        // A session from before its archive was seeded reads its live
+        // messages instead, so those are what is set aside.
+        let set_aside: Vec<SessionMessage> = if path.exists() {
+            let archived = self.read_archive_messages(session_id)?;
+            let from = set_aside_start(&archived, aside)?;
+            let mut kept = String::new();
+            for message in archived[..from].iter().chain(aside.replacement) {
+                kept.push_str(
+                    &serde_json::to_string(message)
+                        .map_err(|e| eyre::eyre!("Failed to serialize archive message: {e}"))?,
+                );
+                kept.push('\n');
+            }
+            atomic_write(&path, kept.as_bytes())?;
+            archived[from..].to_vec()
+        } else {
+            let from = set_aside_start(&session.messages, aside)?;
+            session.messages[from..].to_vec()
+        };
+        let ids: Vec<String> = set_aside.iter().map(|m| m.id.clone()).collect();
+        let (removed_tokens, compacted) = cut_set_aside(&mut session.messages, &ids);
+        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
+        if let Some(replacement) = aside.replacement {
+            session.total_tokens += u64::from(replacement.tokens);
+            session.messages.push(replacement.clone());
+        }
+        session.updated_at = chrono::Utc::now();
+        let session_clone = session.clone();
+        drop(cache);
+        self.write_to_disk(&session_clone)?;
+        Ok(SetAsideRows {
+            entries: set_aside
+                .iter()
+                .map(|m| message_to_transcript_entry(session_id, m))
+                .collect(),
+            compacted,
+        })
+    }
+
     fn append_to_archive(&self, session_id: &str, message: &SessionMessage) -> eyre::Result<()> {
         let path = self.archive_path(session_id);
         let mut file = crate::private_fs::private_file_options()
@@ -5248,6 +5693,32 @@ pub(crate) fn search_terms(query: &str) -> Vec<String> {
         })
 }
 
+/// A search's `before` names no message of the sessions it searched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCursor(pub String);
+
+impl std::fmt::Display for UnknownCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no message of these sessions is {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownCursor {}
+
+/// Whether `content` holds every one of `terms` (lowercased), case aside.
+/// No terms is no match.
+pub(crate) fn matches_every_term(content: &str, terms: &[String]) -> bool {
+    !terms.is_empty() && coordination_score(&content.to_lowercase(), terms) == terms.len()
+}
+
+/// Whether [`SessionStore::search_archive`] looks at `entry`: something a
+/// person or the agent said, not a tool row or a turn's failure.
+pub(crate) fn is_searched(entry: &TranscriptEntry) -> bool {
+    matches!(entry.role, MessageRole::User | MessageRole::Assistant)
+        && entry.tool_metadata.is_none()
+        && !entry.is_failure()
+}
+
 /// Count of distinct `terms` occurring as substrings of `content_lower` (already
 /// lowercased). A message covering more query terms ranks above one covering
 /// fewer, so a multi-word query surfaces its best matches first instead of
@@ -5409,6 +5880,151 @@ pub(crate) fn assert_reassign_owner_contract(store: &dyn SessionStore) {
 }
 
 /// Every owner is counted once per session it holds, sealed ones included.
+/// Deleting a person's message takes it out of what is read and searched,
+/// leaves the note in its live place, and marks the agent's replies: those
+/// whose mark names it, else those straight after it. With `archived`, the
+/// store keeps an archive apart from the live context: a message compaction
+/// dropped from the live context still leaves the archive, and a copy only
+/// the live context holds still reads as the note.
+#[cfg(test)]
+pub(crate) fn assert_delete_person_message_contract(store: &dyn SessionStore, archived: bool) {
+    use crate::channels::desk::DeskMark;
+    let say = |role: MessageRole, text: &str| SessionMessage {
+        id: Uuid::new_v4().to_string(),
+        role,
+        content: text.to_string(),
+        tool_data: None,
+        timestamp: Utc::now(),
+        tokens: 30,
+        external_id: None,
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: None,
+    };
+    let asked = Uuid::new_v4();
+    let mut first = say(MessageRole::User, "pineapple plans");
+    first.external_id = Some(asked.to_string());
+    first.attachments = Some(vec![SessionAttachment::from_artifact(
+        "plan.png",
+        "image/png",
+        "artifact-1",
+    )]);
+    let answer = |text: &str| SessionMessage {
+        desk: Some(DeskMark {
+            in_reply_to: Some(asked),
+            ..DeskMark::default()
+        }),
+        ..say(MessageRole::Assistant, text)
+    };
+    let (hello, more) = (answer("hello"), answer("and more"));
+    let second = say(MessageRole::User, "second");
+    let unmarked = say(MessageRole::Assistant, "unmarked");
+    let third = say(MessageRole::User, "third");
+    let later = say(MessageRole::Assistant, "later");
+    let mut session = store.get_or_create("desk", "alice", "agent-a").unwrap();
+    for message in [&first, &hello, &more, &second, &unmarked, &third, &later] {
+        store.append_to_archive(&session.id, message).unwrap();
+        session.messages.push(message.clone());
+    }
+    session.total_tokens = 7 * 30;
+    store.save(&session).unwrap();
+    let read = |id: &str| {
+        store
+            .read_archive_page(id, None, 50)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|e| (e.content, e.desk.is_some_and(|d| d.answered_deleted)))
+            .collect::<Vec<_>>()
+    };
+
+    let deleted = store.delete_person_message(&session.id, &first.id).unwrap();
+    assert_eq!(
+        deleted,
+        DeletedMessage {
+            archived,
+            live: true,
+            replies: vec![hello.id.clone(), more.id.clone()],
+        },
+        "its replies are those its mark names"
+    );
+    let live = store.get(&session.id).unwrap().unwrap();
+    let noted = &live.messages[0];
+    assert_eq!(noted.content, DELETED_MESSAGE_NOTE);
+    assert!(noted.attachments.is_none(), "its files go with it");
+    assert_eq!(
+        noted.external_id, first.external_id,
+        "a resend is still known"
+    );
+    assert!(live.messages[1..3]
+        .iter()
+        .all(|m| m.desk.as_ref().unwrap().answered_deleted));
+    assert!(
+        live.total_tokens < 7 * 30,
+        "the note takes less than it did"
+    );
+    let shown = read(&session.id);
+    let first_shown = match archived {
+        true => None,
+        false => Some((DELETED_MESSAGE_NOTE.to_string(), false)),
+    };
+    assert_eq!(
+        shown.first().cloned(),
+        first_shown.or(Some(("hello".into(), true)))
+    );
+    assert!(shown.contains(&("and more".into(), true)));
+    assert!(shown.contains(&("unmarked".into(), false)));
+    if archived {
+        assert!(
+            store
+                .search_sessions("pineapple", 10)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.message_id != first.id),
+            "searching no longer finds it"
+        );
+    }
+
+    let deleted = store
+        .delete_person_message(&session.id, &second.id)
+        .unwrap();
+    assert_eq!(
+        deleted.replies,
+        vec![unmarked.id.clone()],
+        "unmarked, its replies run up to the person's next message"
+    );
+    assert!(!read(&session.id).contains(&("later".into(), true)));
+
+    let nothing = store.delete_person_message(&session.id, "nobody").unwrap();
+    assert!(!nothing.found());
+    assert!(store
+        .delete_person_message("no-session", &first.id)
+        .is_err());
+
+    if !archived {
+        return;
+    }
+    // Compaction dropped the question from the live context; a successor
+    // holds a copy of another only live.
+    let mut session = store.get(&session.id).unwrap().unwrap();
+    let gone = say(MessageRole::User, "compacted away");
+    let kept = say(MessageRole::User, "kept verbatim");
+    store.append_to_archive(&session.id, &gone).unwrap();
+    session.messages = vec![
+        say(MessageRole::User, "[Compaction Summary] all of it"),
+        kept.clone(),
+    ];
+    store.save(&session).unwrap();
+    let deleted = store.delete_person_message(&session.id, &gone.id).unwrap();
+    assert_eq!((deleted.archived, deleted.live), (true, false));
+    assert!(!read(&session.id).iter().any(|(c, _)| c == "compacted away"));
+    let deleted = store.delete_person_message(&session.id, &kept.id).unwrap();
+    assert_eq!((deleted.archived, deleted.live), (false, true));
+    let live = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(live.messages[1].content, DELETED_MESSAGE_NOTE);
+}
+
 #[cfg(test)]
 pub(crate) fn assert_owners_contract(store: &dyn SessionStore) {
     let agent = "agent-a";
@@ -5421,6 +6037,154 @@ pub(crate) fn assert_owners_contract(store: &dyn SessionStore) {
     assert_eq!(
         store.owners().unwrap(),
         BTreeMap::from([("alice".to_string(), 3), ("shared:1700.1".to_string(), 1)])
+    );
+}
+
+/// Setting aside from a message takes it and every later row out of the
+/// archive and the live context, keeps the earlier ones, saves the
+/// replacement in their place, and returns those set aside with their
+/// marks; refused, changing nothing, when the newest archived row is no
+/// longer the one named. With `archived`, the store keeps an archive apart
+/// from the live context: the message's live copy may have been compacted
+/// away (its archive rows go, the live context loses only what it holds of
+/// them, and says so), and a row the live context gained after them stays.
+#[cfg(test)]
+pub(crate) fn assert_set_aside_contract(store: &dyn SessionStore, archived: bool) {
+    use crate::channels::desk::{DeskMark, DeskStep};
+    let say = |role: MessageRole, text: &str| SessionMessage {
+        id: Uuid::new_v4().to_string(),
+        role,
+        content: text.to_string(),
+        tool_data: None,
+        timestamp: Utc::now(),
+        tokens: 3,
+        external_id: None,
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: None,
+    };
+    let contents = |store: &dyn SessionStore, id: &str| {
+        let archive: Vec<String> = store
+            .read_archive_page(id, None, 50)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|e| e.content)
+            .collect();
+        let live: Vec<String> = store
+            .get(id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        (archive, live)
+    };
+    let strings = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let mut session = store.get_or_create("desk", "alice", "agent-a").unwrap();
+    let second = say(MessageRole::User, "second");
+    let mut reply = say(MessageRole::Assistant, "sent");
+    reply.desk = Some(DeskMark {
+        steps: vec![DeskStep::of("email.send", true, 4)],
+        ..DeskMark::default()
+    });
+    for message in [
+        say(MessageRole::User, "first"),
+        say(MessageRole::Assistant, "hello"),
+        second.clone(),
+        reply.clone(),
+    ] {
+        store.append_to_archive(&session.id, &message).unwrap();
+        session.messages.push(message);
+    }
+    session.total_tokens = 12;
+    store.save(&session).unwrap();
+    let before = contents(store, &session.id);
+
+    // Something was said after the newest the caller saw: nothing changes.
+    let stale = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &second.id,
+                newest: &second.id,
+                replacement: None,
+            },
+        )
+        .unwrap_err();
+    assert!(stale.is::<SetAsideStale>(), "{stale}");
+    assert_eq!(contents(store, &session.id), before);
+
+    let edited = SessionMessage::user("second, edited", Some("client-3"), None, None);
+    let set_aside = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &second.id,
+                newest: &reply.id,
+                replacement: Some(&edited),
+            },
+        )
+        .unwrap();
+    let ids: Vec<&str> = set_aside.entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, [second.id.as_str(), reply.id.as_str()]);
+    assert_eq!(
+        set_aside.entries[1].desk, reply.desk,
+        "each comes with its mark"
+    );
+    assert!(!set_aside.compacted);
+    let now = strings(&["first", "hello", "second, edited"]);
+    assert_eq!(contents(store, &session.id), (now.clone(), now));
+    let live = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(
+        live.total_tokens,
+        6 + u64::from(edited.tokens),
+        "what was set aside no longer counts, its replacement does"
+    );
+    let gone = SetAside {
+        from: &second.id,
+        newest: &edited.id,
+        replacement: None,
+    };
+    assert!(store.set_aside_from(&session.id, &gone).is_err());
+
+    if !archived {
+        return;
+    }
+    // The question was compacted out of the live context, its answer was
+    // not, and a delivery reached the live context after the caller looked.
+    let mut session = live;
+    let third = say(MessageRole::User, "third");
+    let again = say(MessageRole::Assistant, "again");
+    for message in [&third, &again] {
+        store.append_to_archive(&session.id, message).unwrap();
+    }
+    session.messages = vec![
+        say(MessageRole::User, "[Compaction Summary] all of it"),
+        again.clone(),
+        say(MessageRole::Assistant, "a reminder"),
+    ];
+    store.save(&session).unwrap();
+    let set_aside = store
+        .set_aside_from(
+            &session.id,
+            &SetAside {
+                from: &third.id,
+                newest: &again.id,
+                replacement: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(set_aside.entries.len(), 2);
+    assert!(set_aside.compacted, "the live context no longer held it");
+    assert_eq!(
+        contents(store, &session.id),
+        (
+            strings(&["first", "hello", "second, edited"]),
+            strings(&["[Compaction Summary] all of it", "a reminder"])
+        )
     );
 }
 
@@ -5511,9 +6275,139 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
     store.journal_clear(session_id).unwrap();
 }
 
+/// [`SessionStore::search_archive`] on a chain of two sessions: what was
+/// said, newest first back across the seam, a word's start finding it, every
+/// word needed, paged by `before`; never a tool row, a turn's failure or a
+/// session outside the chain. With `archive`, every message is archived too.
+/// Returns the chain, newest first.
+#[cfg(test)]
+pub(crate) fn assert_search_archive_contract(
+    store: &dyn SessionStore,
+    archive: bool,
+) -> Vec<String> {
+    let mut old = Session::new("desk", "u", "scout");
+    old.add_user_message("deploy the release", None);
+    let mut tool_call = SessionMessage::tool(
+        "x",
+        &serde_json::json!({}),
+        &serde_json::json!(""),
+        true,
+        1,
+        None,
+    );
+    tool_call.role = MessageRole::Assistant;
+    tool_call.content = "deploy it with a tool".into();
+    old.messages.push(tool_call);
+    old.add_assistant_message("Deployed the release", 1);
+    old.seal();
+    store.save(&old).unwrap();
+    let mut new = Session::new("desk", "u", "scout");
+    new.set_prev_session_id(&old.id);
+    new.add_user_message(
+        "ping foo.example.com, mail ops@example.org, read /var/log/app.log",
+        None,
+    );
+    new.add_user_message("what about the deployment?", None);
+    new.add_assistant_message("Agent error: deploy failed", 0);
+    new.messages.last_mut().unwrap().desk = Some(crate::channels::desk::DeskMark {
+        failed: true,
+        ..Default::default()
+    });
+    new.add_assistant_message("Nothing else to deploy", 1);
+    store.save(&new).unwrap();
+    let mut elsewhere = Session::new("desk", "v", "scout");
+    elsewhere.add_user_message("deploy elsewhere", None);
+    store.save(&elsewhere).unwrap();
+    if archive {
+        for session in [&old, &new, &elsewhere] {
+            for message in &session.messages {
+                store.append_to_archive(&session.id, message).unwrap();
+            }
+        }
+    }
+    let chain = vec![new.id.clone(), old.id.clone()];
+    let search = |query: &str, limit: usize, before: Option<&str>| -> Vec<(String, String)> {
+        store
+            .search_archive(&chain, query, limit, before)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.content, e.id))
+            .collect()
+    };
+    let texts = |found: &[(String, String)]| -> Vec<String> {
+        found.iter().map(|(text, _)| text.clone()).collect()
+    };
+    let all = [
+        "Nothing else to deploy",
+        "what about the deployment?",
+        "Deployed the release",
+        "deploy the release",
+    ];
+    assert_eq!(texts(&search("deploy", 10, None)), all);
+    assert_eq!(
+        texts(&search("DEPLO", 10, None)),
+        all,
+        "part of a word, any case"
+    );
+    assert_eq!(
+        texts(&search("release deploy", 10, None)),
+        ["Deployed the release", "deploy the release"],
+        "every word"
+    );
+    assert!(search("nowhere", 10, None).is_empty());
+    // Hosts, addresses, paths, stop words and parts of words, as typed.
+    let ping = "ping foo.example.com, mail ops@example.org, read /var/log/app.log";
+    for query in ["example", "OPS@example", "log/app.lo", "foo.example.com,"] {
+        assert_eq!(texts(&search(query, 10, None)), [ping], "{query}");
+    }
+    assert_eq!(
+        texts(&search("deploym", 10, None)),
+        ["what about the deployment?"]
+    );
+    assert_eq!(
+        texts(&search("the", 10, None)),
+        [
+            "what about the deployment?",
+            "Deployed the release",
+            "deploy the release"
+        ],
+        "a stop word"
+    );
+    assert!(
+        search("100%", 10, None).is_empty(),
+        "a wildcard is a character"
+    );
+    let first = search("deploy", 2, None);
+    assert_eq!(texts(&first), all[..2]);
+    let second = search("deploy", 2, Some(&first[1].1));
+    assert_eq!(texts(&second), all[2..], "the cursor crosses the seam");
+    assert!(search("deploy", 2, Some(&second[1].1)).is_empty());
+    let refused = store
+        .search_archive(&chain, "deploy", 2, Some("no-such-message"))
+        .unwrap_err();
+    assert!(
+        refused.downcast_ref::<UnknownCursor>().is_some(),
+        "a cursor outside the chain: {refused}"
+    );
+    chain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_in_memory_store_searches_a_chain_newest_first() {
+        assert_search_archive_contract(&InMemorySessionStore::new(), false);
+    }
+
+    #[test]
+    fn the_file_store_searches_a_chain_newest_first_live_or_archived() {
+        for archive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            assert_search_archive_contract(&JsonlSessionStore::new(dir.path()).unwrap(), archive);
+        }
+    }
 
     #[test]
     fn the_in_memory_store_reassigns_owners_keeping_both_on_a_shared_channel() {
@@ -5524,6 +6418,83 @@ mod tests {
     fn the_file_store_reassigns_owners_keeping_both_on_a_shared_channel() {
         let dir = tempfile::tempdir().unwrap();
         assert_reassign_owner_contract(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn the_in_memory_store_deletes_a_person_s_message() {
+        assert_delete_person_message_contract(&InMemorySessionStore::new(), false);
+    }
+
+    #[test]
+    fn the_file_store_deletes_a_person_s_message_from_its_archive_too() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_delete_person_message_contract(&JsonlSessionStore::new(dir.path()).unwrap(), true);
+    }
+
+    #[test]
+    fn replies_are_those_marked_for_the_message_else_those_straight_after_it() {
+        let say = |role: MessageRole, text: &str| SessionMessage {
+            id: Uuid::new_v4().to_string(),
+            role,
+            content: text.to_string(),
+            tool_data: None,
+            timestamp: Utc::now(),
+            tokens: 1,
+            external_id: None,
+            attachments: None,
+            trust_level: None,
+            actor: None,
+            desk: None,
+        };
+        let asked = say(MessageRole::User, "q");
+        let (tool, a, next, b) = (
+            say(MessageRole::Tool, "ran"),
+            say(MessageRole::Assistant, "a"),
+            say(MessageRole::User, "next"),
+            say(MessageRole::Assistant, "b"),
+        );
+        let later = [tool, a.clone(), next, b.clone()];
+        assert_eq!(replies_to(&asked, &later), vec![a.id.clone()]);
+        // A delivery outside the turn, or an answer to another message,
+        // ends the turn's replies.
+        for mark in [
+            crate::channels::desk::DeskMark {
+                delivery: Some(crate::channels::desk::DeliveryKind::Reminder),
+                ..Default::default()
+            },
+            crate::channels::desk::DeskMark {
+                in_reply_to: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        ] {
+            let other = SessionMessage {
+                desk: Some(mark),
+                ..say(MessageRole::Assistant, "elsewhere")
+            };
+            let later = [a.clone(), other, b.clone()];
+            assert_eq!(replies_to(&asked, &later), vec![a.id.clone()]);
+        }
+        // A mark naming the message by its own id wins, wherever it is.
+        let named = SessionMessage {
+            desk: Some(crate::channels::desk::DeskMark {
+                in_reply_to: Some(Uuid::parse_str(&asked.id).unwrap()),
+                ..Default::default()
+            }),
+            ..b
+        };
+        let later = [a, named.clone()];
+        assert_eq!(replies_to(&asked, &later), vec![named.id]);
+    }
+
+    #[test]
+    fn the_in_memory_store_sets_aside_from_a_message() {
+        assert_set_aside_contract(&InMemorySessionStore::new(), false);
+    }
+
+    #[test]
+    fn the_file_store_sets_aside_from_a_message_in_its_archive_too() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_set_aside_contract(&JsonlSessionStore::new(dir.path()).unwrap(), true);
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# The Chrome extension protocol fixture's sample public key
+# (crates/hub/src/desk_chrome/protocol-v1.json), made up and public by
+# nature; later commits name no key at all.
+feac6f68038b4c68dadc336426fbd2a0b09eea21:crates/hub/src/desk_chrome/protocol-v1.json:generic-api-key:8

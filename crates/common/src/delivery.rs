@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn a_desk_target_round_trips_and_names_its_conversation() {
         let target = DeskTarget {
-            place: DeskPlace::Dm,
+            place: DeskPlace::Dm { thread: None },
             channel: "desk".into(),
             device: None,
             spoken: true,

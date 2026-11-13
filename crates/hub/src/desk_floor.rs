@@ -66,7 +66,7 @@ impl Origin<'_> {
 /// knows only by its slug has no id to open, and its answers go to the DM.
 pub(crate) fn place_in_desk(place: &DeskPlace) -> Place {
     match place {
-        DeskPlace::Dm | DeskPlace::LegacyRoom { .. } => Place::Dm,
+        DeskPlace::Dm { .. } | DeskPlace::LegacyRoom { .. } => Place::Dm,
         DeskPlace::Room { room, thread, .. } => Place::Room {
             room: *room,
             thread: *thread,
@@ -815,6 +815,7 @@ pub(crate) async fn answer(
                 Ok(Decided::Resolved(_)) => Ok(Ok(())),
                 Ok(Decided::AlreadyResolved(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
                 Err(DecideError::NotAnApprover) => Ok(Err(Unanswered::NotYours)),
+                Err(DecideError::NotOffered(_)) => Ok(Err(Unanswered::NotOffered)),
                 Err(DecideError::Unknown) => Ok(Err(Unanswered::Unknown)),
                 Err(DecideError::Failed(e)) => Err(e),
             }
@@ -1226,6 +1227,7 @@ mod tests {
                 spoken: false,
                 voice: None,
                 members: Vec::new(),
+                edit: None,
             },
             channel,
             None,

@@ -613,6 +613,26 @@ async fn http_401_maps_to_auth_expired() {
     assert!(matches!(err, McpError::AuthExpired(_)), "got {err:?}");
 }
 
+/// A 403 keeps the server's reason, so a refused person can be told from a
+/// refused credential; it still counts as an auth error.
+#[tokio::test]
+async fn http_403_keeps_the_server_s_reason() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(BodyRpc("initialize"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("identity is not active"))
+        .mount(&server)
+        .await;
+
+    let client = client(&server, McpLimits::default());
+    let err = client.initialize().await.unwrap_err();
+    assert!(err.is_auth(), "got {err:?}");
+    match err {
+        McpError::Forbidden { said, .. } => assert_eq!(said, "identity is not active"),
+        other => panic!("expected Forbidden, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn server_jsonrpc_error_maps_to_server_error() {
     let server = MockServer::start().await;
@@ -674,8 +694,9 @@ fn assert_no_secrets(err: &McpError) {
 
 #[tokio::test]
 async fn http_status_errors_name_the_host_but_no_endpoint_secret() {
-    let cases: [(u16, fn(&McpError) -> bool); 3] = [
+    let cases: [(u16, fn(&McpError) -> bool); 4] = [
         (401, |e| matches!(e, McpError::AuthExpired(_))),
+        (403, |e| matches!(e, McpError::Forbidden { .. })),
         (429, |e| matches!(e, McpError::RateLimited { .. })),
         (500, |e| matches!(e, McpError::Transport(_))),
     ];

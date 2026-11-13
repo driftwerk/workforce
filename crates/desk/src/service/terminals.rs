@@ -940,13 +940,24 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(d.terminal_programs(t.id).await.unwrap(), ["sh"]);
+            // A login shell runs its profile scripts first, and what they
+            // start (a subshell, `xargs`) is listed while it does: the
+            // shell is idle when it is the only one listed, and `sleep`
+            // runs after the profile is done.
+            let mut programs = Vec::new();
+            for _ in 0..400 {
+                programs = d.terminal_programs(t.id).await.unwrap();
+                if programs == ["sh"] {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(programs, ["sh"], "the shell alone, once it is idle");
             let pty = d.attach_terminal(t.id).unwrap();
             pty.write(b"sleep 30\n").unwrap();
-            let mut programs = Vec::new();
-            for _ in 0..200 {
+            for _ in 0..400 {
                 programs = d.terminal_programs(t.id).await.unwrap();
-                if programs.len() > 1 {
+                if programs.iter().any(|p| p == "sleep") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;

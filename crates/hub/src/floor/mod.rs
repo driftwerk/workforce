@@ -34,6 +34,7 @@ pub fn desk_floor() -> workforce_desk::Floor {
         redactor: None,
         index: None,
         deriver: None,
+        accountant: None,
     }
 }
 

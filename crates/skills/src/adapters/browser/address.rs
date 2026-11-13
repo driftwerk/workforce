@@ -7,16 +7,6 @@ use std::path::PathBuf;
 
 use url::Url;
 
-/// Which browser an address is opened in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum In {
-    /// Desk's own: the web, a blank page, an inline page, or a file.
-    Desk,
-    /// The person's Chrome: the web and a blank page only.
-    #[allow(dead_code)] // opened in by My Chrome
-    Chrome,
-}
-
 /// What an address is, for what may be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -60,12 +50,11 @@ pub fn kind(url: &str) -> Kind {
     }
 }
 
-/// Whether `kind` may be opened in `place`.
-pub fn openable(kind: &Kind, place: In) -> bool {
-    matches!(
-        (kind, place),
-        (Kind::Web | Kind::Blank, _) | (Kind::Inline | Kind::File(_), In::Desk)
-    )
+/// Whether Desk may open an address of `kind` in the person's Chrome: the
+/// web and a blank page, never a file, an inline page, a script or
+/// Chrome's own pages.
+pub fn opens_in_chrome(kind: &Kind) -> bool {
+    matches!(kind, Kind::Web | Kind::Blank)
 }
 
 /// The host of `url`, as Chrome reads it: lower case, IDNA, no trailing dot.
@@ -73,52 +62,6 @@ pub fn host_of(url: &str) -> Option<String> {
     let u = parse(url)?;
     let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
-}
-
-/// Whether `url` is a page where a service shows its keys: the ones an
-/// agent setting a connection up makes a key on. Desk takes no picture of
-/// one, and hides what looks like a key in what it reads of one, so a key
-/// made there reaches no transcript or record; `connections.capture` reads
-/// it for the vault instead.
-pub fn shows_keys(url: &str) -> bool {
-    let Some(u) = parse(url) else {
-        return false;
-    };
-    let host = host_of(url).unwrap_or_default();
-    let path = u.path().trim_end_matches('/').to_ascii_lowercase();
-    let datadog = ["datadoghq.com", "datadoghq.eu", "ddog-gov.com"]
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")));
-    (host == "id.atlassian.com" && path.contains("/api-tokens"))
-        || (host == "linear.app"
-            && (path.ends_with("/settings/account/security") || path.ends_with("/settings/api")))
-        || (host == "github.com"
-            && (path.starts_with("/settings/tokens")
-                || path.starts_with("/settings/personal-access-tokens")))
-        || (datadog && (path.contains("/api-keys") || path.contains("/application-keys")))
-        || path.ends_with("/admin/settings/authentication/api-keys")
-}
-
-/// What looks like a key in text read off a page that shows them.
-static KEY_LIKE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    // A run of key characters, or Metabase's base64 (slashes and all); a
-    // path's slashes break an address into short runs, which stay.
-    regex::Regex::new(r"mb_[A-Za-z0-9+/=_\-]{16,}|[A-Za-z0-9_\-+=]{24,}")
-        .expect("key-like pattern compiles")
-});
-
-/// `value` with every run that looks like a key hidden, in every string it
-/// holds.
-pub fn without_keys(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::String(s) => Value::String(KEY_LIKE.replace_all(&s, "[a key, hidden]").into_owned()),
-        Value::Array(a) => Value::Array(a.into_iter().map(without_keys).collect()),
-        Value::Object(o) => {
-            Value::Object(o.into_iter().map(|(k, v)| (k, without_keys(v))).collect())
-        }
-        other => other,
-    }
 }
 
 /// The origin of `url` (`https://shop.example`, `http://127.0.0.1:8080`),
@@ -140,45 +83,69 @@ pub fn origin_of(url: &str) -> Option<String> {
     })
 }
 
+static OWN_PORTS: std::sync::RwLock<Vec<u16>> = std::sync::RwLock::new(Vec::new());
+
+/// Keeps the person's Chrome off the hub's own ports on this computer: the
+/// local hub is never a page Desk opens.
+pub fn keep_off_ports(ports: Vec<u16>) {
+    *OWN_PORTS.write().unwrap() = ports;
+}
+
+/// Whether `url` is this computer (a loopback or unspecified address, or
+/// `localhost`) on one of the hub's own ports.
+pub fn on_own_port(url: &str) -> bool {
+    on_ports(url, &OWN_PORTS.read().unwrap())
+}
+
+fn on_ports(url: &str, ports: &[u16]) -> bool {
+    let Some(u) = parse(url) else {
+        return false;
+    };
+    let local = match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        None => false,
+    };
+    local
+        && u.port_or_known_default()
+            .is_some_and(|p| ports.contains(&p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_pages_services_show_their_keys_on_are_known() {
-        for url in [
-            "https://id.atlassian.com/manage-profile/security/api-tokens",
-            "https://linear.app/settings/account/security",
-            "https://linear.app/acme/settings/api",
-            "https://github.com/settings/personal-access-tokens/new",
-            "https://github.com/settings/tokens",
-            "https://app.datadoghq.eu/organization-settings/api-keys",
-            "https://us5.datadoghq.com/personal-settings/application-keys",
-            "https://metabase.acme.example/admin/settings/authentication/api-keys",
+    fn the_hubs_own_ports_here_are_known() {
+        let ports = [50148, 8080];
+        for own in [
+            "http://127.0.0.1:50148/api",
+            "http://localhost:8080/",
+            "http://LOCALHOST.:50148",
+            "http://app.localhost:50148",
+            "http://0.0.0.0:8080",
+            "http://[::1]:50148/",
+            "http://[::ffff:127.0.0.1]:8080/",
+            "http://127.1.2.3:8080/",
         ] {
-            assert!(shows_keys(url), "{url}");
+            assert!(on_ports(own, &ports), "{own}");
         }
-        for url in [
-            "https://id.atlassian.com/login",
-            "https://linear.app/acme/issue/ACM-1",
-            "https://github.com/acme/web/settings",
-            "https://datadoghq.com.evil.example/api-keys",
+        for not in [
+            "http://127.0.0.1:3000/",
+            "https://example.com:8080/",
+            "http://localhost/",
             "about:blank",
         ] {
-            assert!(!shows_keys(url), "{url}");
+            assert!(!on_ports(not, &ports), "{not}");
         }
-        let shown = without_keys(serde_json::json!({
-            "body_text": "Your new token lin_api_0123456789abcdefghij0123 and a word",
-            "items": ["0123456789abcdef0123456789abcdef", "mb_AbC/dEf+GhIjKlMnOp=="],
-            "url": "https://id.atlassian.com/manage-profile/security/api-tokens"
-        }));
-        let text = shown.to_string();
-        assert!(
-            !text.contains("lin_api_0123") && !text.contains("0123456789abcdef0123"),
-            "{text}"
-        );
-        assert!(text.contains("and a word") && !text.contains("mb_AbC"));
-        assert!(text.contains("https://id.atlassian.com/manage-profile/security/api-tokens"));
     }
 
     #[test]
@@ -198,8 +165,8 @@ mod tests {
     }
 
     #[test]
-    fn only_the_web_blank_inline_and_files_open_and_only_the_web_in_chrome() {
-        for (url, desk, chrome) in [
+    fn only_the_web_and_a_blank_page_open_in_chrome() {
+        for (url, _was_desks, chrome) in [
             ("https://a.test/", true, true),
             ("HTTP://a.test", true, true),
             ("about:blank", true, true),
@@ -215,9 +182,7 @@ mod tests {
             ("blob:https://a.test/x", false, false),
             ("not a url", false, false),
         ] {
-            let k = kind(url);
-            assert_eq!(openable(&k, In::Desk), desk, "{url} in Desk's");
-            assert_eq!(openable(&k, In::Chrome), chrome, "{url} in Chrome");
+            assert_eq!(opens_in_chrome(&kind(url)), chrome, "{url}");
         }
     }
 

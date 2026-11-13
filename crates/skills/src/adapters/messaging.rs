@@ -2773,7 +2773,7 @@ mod tests {
         assert!(outside.to_string().contains("Missing 'channel' parameter"));
 
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended: true,
             relayed: false,
             owner: "person-1".into(),
@@ -2810,7 +2810,7 @@ mod tests {
         assert!(outside.to_string().contains("Missing 'channel' parameter"));
 
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             attended: true,
             relayed: false,
             owner: "person-1".into(),

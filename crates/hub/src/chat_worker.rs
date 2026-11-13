@@ -268,6 +268,16 @@ async fn run_chat_turn(
     let progress = match started {
         Ok(progress) => progress,
         Err(_) if live.is_cancelled() => return (requested, Vec::new(), Some(live)),
+        // A refused edit reads as the gateway's own refusal of it does.
+        Err(e)
+            if e.chain()
+                .any(|cause| cause.is::<crate::desk_surface::edit::EditRefused>()) =>
+        {
+            let refused = ChatProgress::Error {
+                message: crate::desk_surface::edit::ONLY_THE_LATEST.to_string(),
+            };
+            return (requested, vec![refused], Some(live));
+        }
         Err(e) => {
             let failed = ChatProgress::Error {
                 message: format!("Failed to process message: {e}"),

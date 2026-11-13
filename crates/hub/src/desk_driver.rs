@@ -414,7 +414,7 @@ fn is_own(url: &str, ports: &[u16]) -> bool {
 }
 
 /// The ports in listen addresses like `0.0.0.0:8080`.
-fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
+pub(crate) fn ports_of<'a>(listens: impl IntoIterator<Item = &'a str>) -> Vec<u16> {
     listens
         .into_iter()
         .filter_map(|l| l.rsplit(':').next()?.parse().ok())
@@ -886,6 +886,7 @@ fn options(config: &WorkforceConfig) -> Options {
             derive_calls_per_day: desk.memory.derive_calls_per_day,
             machine: may_be_machine(desk),
             brief_max_tokens: desk.memory.brief_max_tokens,
+            max_disk_mb_ceiling: desk.memory.max_disk_mb_ceiling,
         },
         bosses: workforce_desk::grant::BossOptions {
             machine: is_machine(desk),
@@ -1062,6 +1063,12 @@ pub async fn mount(
                 fallback: config.floor.fallback_providers,
             },
         })),
+        accountant: Some(Arc::new(crate::desk_memory::HubAccountant {
+            model: crate::floor::gists::HubModel {
+                state: Arc::clone(state),
+                fallback: config.floor.fallback_providers,
+            },
+        })),
         ..crate::floor::desk_floor()
     };
     let desk = Desk::start(store, options(config), floor, cancel)
@@ -1071,6 +1078,13 @@ pub async fn mount(
     desk.count_budgets_in(config.user_timezone());
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
+    }
+    // A session a boss oversees has its turn-end gist written from its
+    // account, by the same rule the account writer keeps.
+    if let Some(floor) = crate::floor::installed() {
+        floor.gists.hand_turn_ends(Arc::new(|id| {
+            self::desk().is_some_and(|d| d.account_kept_for(id))
+        }));
     }
     // The hub's own Claude calls fail over across the person's accounts.
     if let Some(vault) = state.vault.as_ref() {
@@ -1117,6 +1131,12 @@ pub async fn mount(
         crate::desk_crew::Timing::default(),
         cancel_crew,
     );
+    crew.set_update_writer(Arc::new(crate::desk_crew::HubWriter {
+        model: crate::floor::gists::HubModel {
+            state: Arc::clone(state),
+            fallback: config.floor.fallback_providers,
+        },
+    }));
     // The boss links this engine holds, its key, and its uplinks to their
     // boss hubs.
     let app = app.merge(crate::gateway::hardened(crate::desk_uplink::routes(

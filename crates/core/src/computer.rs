@@ -313,6 +313,39 @@ pub struct ComputerFacts {
     pub why: String,
 }
 
+/// "Sign in for me": the call that opens a site for the person to sign in
+/// to, and the call that waits on their card while they do.
+pub const SIGN_IN: &str = "browser.sign_in";
+pub const SIGNED_IN: &str = "browser.signed_in";
+
+/// Opening a page for the person: it goes to an address, then is theirs.
+pub const OPEN_FOR_ME: &str = "browser.open_for_me";
+
+/// Whether a browser call goes to an address: a navigation, opening a page
+/// for the person, or opening a site to sign in to. After a hostile page,
+/// going anywhere asks.
+pub fn navigates(tool: &str) -> bool {
+    matches!(tool, "browser.navigate" | OPEN_FOR_ME | SIGN_IN)
+}
+
+static PERSONS_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says this hub's browser is the person's own Chrome (a Desk hub), not a
+/// server's headless one.
+pub fn browser_is_the_persons_chrome() {
+    PERSONS_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether only the person in Desk may answer this call's card: never an
+/// approver it is routed to, nor a client answering for them. "I'm signed
+/// in", and on a Desk hub every browser call's: it is their own Chrome,
+/// signed in as them. A server's headless browser routes as any tool.
+pub fn person_only(tool: &str) -> bool {
+    tool == SIGNED_IN
+        || (tool.starts_with("browser.")
+            && PERSONS_CHROME.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Why a card asks, as its one "why" line says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -341,6 +374,8 @@ pub enum Why {
     TheirChrome,
     /// It would open a site in the person's Chrome it hasn't this session.
     NewSite,
+    /// It waits while the person signs in to a site themselves.
+    SignIn,
 }
 
 impl Why {
@@ -358,6 +393,7 @@ impl Why {
             Self::HostilePage => "The page it read tried to give it instructions",
             Self::TheirChrome => "Uses your own Chrome, signed in as you",
             Self::NewSite => "Opens a new site in your Chrome",
+            Self::SignIn => "Waits while you sign in. Desk never sees your password",
         }
     }
 }
