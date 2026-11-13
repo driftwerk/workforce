@@ -197,7 +197,7 @@ impl CrewHub {
     /// look has it, it already went, or its item was settled while it
     /// waited. A kept card is forgotten only once it went out (or never
     /// will), so a failed post or a restart midway posts it later, once.
-    async fn post_held(&self, card: HeldCard, kept: bool) -> bool {
+    pub(super) async fn post_held(&self, card: HeldCard, kept: bool) -> bool {
         let store = self.desk.store();
         if kept {
             match store.card_take(card.id).await {
@@ -226,6 +226,13 @@ impl CrewHub {
                     tracing::info!(error = %format!("{e:#}"), "a held needs-you's item couldn't be read: it goes");
                 }
             }
+        }
+        // Its boss gone, or no person to post to: it never will.
+        let reachable = self
+            .overseer_named(&card.boss)
+            .is_some_and(|(service, _)| self.person(Some(&service)).is_some());
+        if !reachable {
+            return done(false).await;
         }
         let request = card.id.to_string();
         if self.in_dm(&card.boss, &request) {
@@ -444,8 +451,7 @@ impl CrewHub {
             // No earlier post (a new DM, or one that rolled over): from
             // when the boss began, but never more than a day before the
             // absence.
-            .unwrap_or(state.since)
-            .max(since - Duration::hours(24));
+            .unwrap_or_else(|| state.since.max(since - Duration::hours(24)));
         let b = self.batch(service, o, state, now, Some(read_post)).await;
         let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
         let asks = |i: &&OpenItem| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm);

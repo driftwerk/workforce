@@ -211,10 +211,17 @@ impl DeskStore {
     /// to end, as after a restart.
     pub async fn cards_due(&self, now: DateTime<Utc>) -> Result<Vec<HeldCard>> {
         let client = self.pool().get().await?;
+        // A card a day past its time is no longer news: forgotten.
+        client
+            .execute(
+                "DELETE FROM boss_held_cards WHERE post_by < $1::timestamptz - interval '1 day'",
+                &[&now],
+            )
+            .await?;
         let rows = client
             .query(
                 "SELECT id, boss, item_id, text, extras, post_by FROM boss_held_cards \
-                 WHERE post_by <= $1 AND (claimed_until IS NULL OR claimed_until < $1) \
+                 WHERE post_by <= $1 AND (claimed_until IS NULL OR claimed_until < now()) \
                  ORDER BY post_by LIMIT 100",
                 &[&now],
             )

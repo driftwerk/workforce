@@ -123,6 +123,10 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
         // test saw it.
         let at = second.timestamp - started;
         assert!(
+            at >= chrono::Duration::milliseconds(60),
+            "held while typing: {at:?}"
+        );
+        assert!(
             at < chrono::Duration::milliseconds(280),
             "a pause lets it go before the cap: {at:?}"
         );
@@ -259,6 +263,33 @@ async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
             2,
             "posted once after the restart"
         );
+
+        // Taken by a post still under way: left to it.
+        let mut taken = held.clone();
+        taken.id = uuid::Uuid::new_v4();
+        store.card_hold(&taken).await.unwrap();
+        assert!(store.card_take(taken.id).await.unwrap());
+        crew.post_due_cards().await;
+        assert_eq!(needs_you(&overseer).len(), 2, "left to the post under way");
+        // A post that went out before the hub died, its row not yet
+        // forgotten: found in the DM by its request, forgotten, not posted
+        // again.
+        let mut went = held.clone();
+        went.id = uuid::Uuid::new_v4();
+        store.card_hold(&went).await.unwrap();
+        assert!(crew.post_held(went.clone(), false).await);
+        assert_eq!(needs_you(&overseer).len(), 3);
+        crew.post_due_cards().await;
+        assert_eq!(needs_you(&overseer).len(), 3, "not posted twice");
+        assert!(!store.card_take(went.id).await.unwrap(), "forgotten");
+
+        // A card whose boss is gone is forgotten, not retried.
+        let mut lost = held.clone();
+        lost.id = uuid::Uuid::new_v4();
+        lost.boss = "nobody".into();
+        store.card_hold(&lost).await.unwrap();
+        crew.post_due_cards().await;
+        assert!(!store.card_take(lost.id).await.unwrap(), "forgotten");
         assert!(store
             .cards_due(chrono::Utc::now())
             .await
@@ -516,7 +547,8 @@ async fn away_without_pings_from_the_read_point_alone() {
 }
 
 /// At Watch and Suggest a check-in is the update: while the person is away
-/// it gathers for their return, rather than posting into the DM.
+/// it gathers for their return, rather than posting into the DM; what
+/// needs them still goes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_in_that_only_tells_gathers_while_away() {
     use workforce_desk::crew::{Event, Kind};
@@ -572,9 +604,15 @@ async fn a_check_in_that_only_tells_gathers_while_away() {
             Some(first.clone()),
             "gathered while away"
         );
-        // Back: it goes.
-        crew.present(true, Some("desk"));
-        let next = eventually("the gathered check-in", async || {
+        // What needs them still goes while they are away, with what gathered.
+        let s = session_party("dw-676");
+        d.note(Event::new(
+            Kind::Question,
+            s.clone(),
+            Some(s),
+            "asks which key staging should use",
+        ));
+        let next = eventually("the needs-you check-in", async || {
             store
                 .latest_check_in("desk")
                 .await
@@ -582,7 +620,17 @@ async fn a_check_in_that_only_tells_gathers_while_away() {
                 .filter(|c| c.id != first)
         })
         .await;
+        assert!(next.prompt.contains("dw-676"), "{}", next.prompt);
         assert!(next.prompt.contains("workforce-e7"), "{}", next.prompt);
+        assert!(
+            store
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap()
+                .away_since
+                .is_some(),
+            "still away"
+        );
     })
     .await;
 }
