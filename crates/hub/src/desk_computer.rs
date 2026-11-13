@@ -271,11 +271,10 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
             .filter(|c| binding.is_on(c))
             .map(|c| c.to_string())
             .collect(),
-        read_only: binding
-            .read_only
+        read_only: workforce_common::connector_binding::CONNECTORS
             .iter()
-            .filter(|r| !r.contains(':'))
-            .cloned()
+            .filter(|c| binding.reads_only(c))
+            .map(|c| c.to_string())
             .collect(),
     })
 }
