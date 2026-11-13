@@ -52,6 +52,7 @@ fn synced(state: TicketState) -> Ticket {
         clipped: false,
         html_read: 0,
         details: Default::default(),
+        dev: None,
     });
     t
 }

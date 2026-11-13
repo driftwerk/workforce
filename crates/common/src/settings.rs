@@ -9168,6 +9168,8 @@ impl RemoteMcpConfig {
         "linear.viewer",
         "jira.attachment_read",
         "jira.list_comments",
+        "jira.dev_status",
+        "jira.list_remote_links",
         "linear.upload_read",
         "linear.comment_list",
         "identity.linear_member_by_my_email",
