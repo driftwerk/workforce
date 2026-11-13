@@ -75,6 +75,12 @@ impl CrewHub {
         if let Some(listed) = listed {
             self.listed.lock().insert(sid.clone(), listed);
         }
+        // What another overseer sent on is never the person's word.
+        let _relayed = (in_dm
+            && author
+                .as_ref()
+                .is_some_and(|a| a.kind != workforce_desk::conversations::SpeakerKind::You))
+        .then(|| Relayed::mark(&self.relayed_turns, &sid));
         // A message of the DM is found again by a mark of its own.
         let relay = author
             .is_some()
@@ -96,9 +102,11 @@ impl CrewHub {
         let _wake = crate::desk_browser::CrewWake::begin(&sid);
         let _ = tx.send(BroadcastMessage::new(sid.clone(), "typing", String::new()));
         let scope = DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
             owner: owner.to_string(),
-            attended: in_dm,
+            // A quiet check-in is the DM's own turn, off it only so its
+            // words aren't posted: it acts as the DM's would.
+            attended: in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:")),
             relayed: true,
         };
         let progress = workforce_agent::runner::with_desk(
@@ -164,6 +172,26 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+/// A DM session marked as running a relayed message, unmarked when the
+/// turn is done.
+struct Relayed<'a>(
+    &'a parking_lot::Mutex<std::collections::HashSet<String>>,
+    String,
+);
+
+impl<'a> Relayed<'a> {
+    fn mark(set: &'a parking_lot::Mutex<std::collections::HashSet<String>>, sid: &str) -> Self {
+        set.lock().insert(sid.to_string());
+        Self(set, sid.to_string())
+    }
+}
+
+impl Drop for Relayed<'_> {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
     }
 }
 

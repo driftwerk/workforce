@@ -53,6 +53,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { workspace = true }
 toml_edit = { workspace = true }
+unicode-normalization = { workspace = true }
 # The overseer reads what it says past look-alike and hidden letters.
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }

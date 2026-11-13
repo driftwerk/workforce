@@ -584,7 +584,7 @@ impl Desk {
             set_aside: self.0.store.index_set_aside().await?,
             purges_set_aside: self.0.index.state.lock().purges_set_aside.0,
             disk_mb: self.0.index.disk.lock().bytes.map(|b| b / (1024 * 1024)),
-            max_disk_mb: self.0.opts.memory.max_disk_mb,
+            max_disk_mb: self.memory_now().max_disk_mb,
         })
     }
 
@@ -648,7 +648,7 @@ impl Desk {
     }
 
     pub(super) fn disk_measured(&self, bytes: u64) {
-        let limit = self.0.opts.memory.max_disk_mb.saturating_mul(1024 * 1024);
+        let limit = self.memory_now().max_disk_mb.saturating_mul(1024 * 1024);
         let was_full = self.memory_full();
         if was_full && bytes < limit {
             // The hold lifts: every record is read again from where its
@@ -672,7 +672,7 @@ impl Desk {
 
     /// Whether session memory has used all the disk it may.
     pub(super) fn memory_full(&self) -> bool {
-        let limit = self.0.opts.memory.max_disk_mb.saturating_mul(1024 * 1024);
+        let limit = self.memory_now().max_disk_mb.saturating_mul(1024 * 1024);
         self.0.index.disk.lock().bytes.is_some_and(|b| b >= limit)
     }
 

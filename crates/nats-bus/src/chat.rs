@@ -227,7 +227,7 @@ mod tests {
             TurnControl::FollowUp {
                 text: "and the thread".into(),
                 user: "u1".into(),
-                place: Some(workforce_core::desk::DeskPlace::Dm),
+                place: Some(workforce_core::desk::DeskPlace::Dm { thread: None }),
                 queue: true,
                 id: Some("7a1c3e52-0b44-4d1e-9a51-2f7f5d0c1b9e".into()),
             },

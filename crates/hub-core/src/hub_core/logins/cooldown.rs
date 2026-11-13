@@ -37,7 +37,9 @@ pub struct LimitSignal {
 
 #[derive(Default)]
 pub struct CooldownStore {
-    cooling: RwLock<HashMap<LoginKey, DateTime<Utc>>>,
+    /// Each cooling login: until when, and when the refusal that cooled it
+    /// was last heard.
+    cooling: RwLock<HashMap<LoginKey, (DateTime<Utc>, DateTime<Utc>)>>,
     /// The value each slot held when it was refused for good.
     dead: RwLock<HashMap<String, String>>,
 }
@@ -76,8 +78,8 @@ impl CooldownStore {
                 .unwrap_or(now + UNKNOWN_RESET_COOLDOWN),
         };
         let mut cooling = self.cooling.write();
-        let entry = cooling.entry(key.clone()).or_insert(until);
-        *entry = (*entry).max(until);
+        let entry = cooling.entry(key.clone()).or_insert((until, now));
+        *entry = (entry.0.max(until), entry.1.max(now));
         tracing::warn!(
             kind = key.kind.label(),
             fingerprint = %key.fingerprint,
@@ -89,12 +91,40 @@ impl CooldownStore {
 
     /// When `key` stops cooling, if it is cooling at `now`.
     pub fn until(&self, key: &LoginKey, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let until = self.cooling.read().get(key).copied()?;
+        self.cooling_at(key, now).map(|(until, _)| until)
+    }
+
+    /// When `key` stops cooling, and when the refusal that cooled it was
+    /// heard, if it is cooling at `now`.
+    pub fn cooling_at(
+        &self,
+        key: &LoginKey,
+        now: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let (until, noted) = self.cooling.read().get(key).copied()?;
         if until > now {
-            return Some(until);
+            return Some((until, noted));
         }
-        self.cooling.write().retain(|_, until| *until > now);
+        self.cooling.write().retain(|_, (until, _)| *until > now);
         None
+    }
+
+    /// `key` was signed in again, or a call on it succeeded, at `since`: a
+    /// refusal heard by then is over, so it no longer cools.
+    pub fn clear_since(&self, key: &LoginKey, since: DateTime<Utc>) {
+        let stale = self
+            .cooling
+            .read()
+            .get(key)
+            .is_some_and(|(_, noted)| *noted <= since);
+        if stale {
+            self.cooling.write().remove(key);
+            tracing::info!(
+                kind = key.kind.label(),
+                fingerprint = %key.fingerprint,
+                "subscription login has room again: signed in again, or a call succeeded since its limit"
+            );
+        }
     }
 
     /// Skip `slot` while it holds the value fingerprinted `value`: the
@@ -180,6 +210,26 @@ mod tests {
         };
         store.note(&key("plan"), &weekly, now);
         assert_eq!(store.until(&key("plan"), now), weekly.resets_at);
+    }
+
+    #[test]
+    fn a_refusal_heard_before_a_sign_in_or_a_success_no_longer_cools() {
+        let store = CooldownStore::default();
+        let now = Utc::now();
+        let week = now + TimeDelta::days(3);
+        store.note(&key("a"), &rejected(Some(week)), now);
+        assert_eq!(store.cooling_at(&key("a"), now), Some((week, now)));
+        // Signed in again (or a call succeeded) before it: it stands.
+        store.clear_since(&key("a"), now - TimeDelta::minutes(1));
+        assert_eq!(store.until(&key("a"), now), Some(week));
+        // Since it: over.
+        store.clear_since(&key("a"), now + TimeDelta::seconds(1));
+        assert_eq!(store.until(&key("a"), now), None);
+        // A refusal heard again later cools again, from then.
+        let later = now + TimeDelta::minutes(5);
+        store.note(&key("a"), &rejected(Some(week)), later);
+        store.clear_since(&key("a"), now + TimeDelta::seconds(1));
+        assert_eq!(store.cooling_at(&key("a"), later), Some((week, later)));
     }
 
     #[test]

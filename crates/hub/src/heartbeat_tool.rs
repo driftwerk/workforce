@@ -766,8 +766,12 @@ mod tests {
             uuid::Uuid::new_v4().to_string(),
             uuid::Uuid::new_v4().to_string(),
         );
-        let reports =
-            DeliveryTarget::desk(DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false));
+        let reports = DeliveryTarget::desk(DeskTarget::of_turn(
+            &DeskPlace::Dm { thread: None },
+            "desk",
+            None,
+            false,
+        ));
         let check = HeartbeatCheck {
             id: "inbox".into(),
             meta: HeartbeatCheckMeta {

@@ -369,6 +369,40 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
         }
         let after = after.unwrap();
         assert!(after["body"]["error"].as_str().unwrap().contains("a minute"), "{after}");
+
+        // What happens in the group goes up as a wake for its boss: never
+        // what the boss itself did.
+        let note = |actor: workforce_desk::crew::Party, text: &str| {
+            let mut e = workforce_desk::crew::Event::new(
+                Kind::Finished,
+                actor,
+                Some(workforce_desk::crew::Party::session(&mine)),
+                text,
+            );
+            e.group = Some("acme".into());
+            e.detail = Some(json!({ "inGroup": "acme" }));
+            d.note(e);
+        };
+        note(
+            workforce_desk::crew::Party::manager("driftwerk/allan", "Allan"),
+            "the boss's own doing",
+        );
+        note(workforce_desk::crew::Party::session(&mine), "shipped the fix");
+        let mut woke = None;
+        while woke.is_none() {
+            let v = tokio::time::timeout(std::time::Duration::from_secs(10), said.recv())
+                .await
+                .expect("the engine's wake")
+                .unwrap();
+            if v["type"] == "event" {
+                assert!(!v.to_string().contains("the boss's own doing"), "{v}");
+                woke = Some(v);
+            }
+        }
+        let woke = woke.unwrap();
+        assert_eq!(woke["linkId"], json!(link_id));
+        assert_eq!(woke["kind"], "finished");
+        assert!(woke["line"].as_str().unwrap().contains("shipped the fix"), "{woke}");
         running.abort();
 
         // Starts are counted from what this engine recorded: a fresh socket,

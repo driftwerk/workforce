@@ -56,7 +56,7 @@ pub(crate) fn resolve_place(
     let target = match channel.trim() {
         "" | "here" => here()?,
         "dm" | DESK_CHANNEL => DeskTarget::of_turn(
-            &DeskPlace::Dm,
+            &DeskPlace::Dm { thread: None },
             DESK_CHANNEL,
             None,
             scope.is_some_and(|s| s.target.spoken),
@@ -366,7 +366,7 @@ mod tests {
         );
         assert_eq!(
             resolve_place(Some(&here), "dm", None, &rooms).map(|t| t.place),
-            Ok(DeskPlace::Dm)
+            Ok(DeskPlace::Dm { thread: None })
         );
         assert_eq!(
             resolve_place(Some(&here), "#release", None, &rooms),

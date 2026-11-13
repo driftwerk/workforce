@@ -215,6 +215,21 @@ impl Desk {
         Ok(g)
     }
 
+    /// Every grant here that names a boss, with why it doesn't serve its
+    /// boss now, in plain words, when it doesn't.
+    pub fn grants_bossed(&self) -> Vec<(Grant, Option<String>)> {
+        let run = self.0.grants.lock();
+        let now = Utc::now();
+        run.grants
+            .values()
+            .filter(|g| g.boss.is_some())
+            .map(|g| {
+                let v = Self::grant_view_of(&run, g, now);
+                (v.grant, v.why)
+            })
+            .collect()
+    }
+
     /// The groups grants name a boss for: bossed, whatever state each
     /// grant is in, until it is deleted.
     fn granted_groups(grants: &BTreeMap<String, Grant>) -> std::collections::HashSet<String> {

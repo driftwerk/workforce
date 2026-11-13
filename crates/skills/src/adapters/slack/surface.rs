@@ -1665,6 +1665,14 @@ impl SlackSurface {
         })
     }
 
+    /// Slack's own `users.info` answer for `user`, `ok` or not, as it came:
+    /// for a caller that must read flags the summary drops (a guest, an app
+    /// user, the workspace) or tell "no such user" from a failure.
+    pub async fn user_info_answer(&self, user: &str) -> Result<serde_json::Value> {
+        self.slack_api_get(&self.url("users.info"), &[("user", user)])
+            .await
+    }
+
     pub async fn get_user_info(&self, user: &str) -> Result<SlackUserSummary> {
         let resp = self
             .slack_api_get(&self.url("users.info"), &[("user", user)])

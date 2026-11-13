@@ -2207,6 +2207,19 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     turn_context.push_str("\n\n");
     turn_context.push_str(&meta_lines.join("\n"));
 
+    // Every turn of a boss, in its DM and on a session's line (where its
+    // line and work turns run), is given the same block of what Desk keeps
+    // of its crew and what it told the person lately.
+    #[cfg(feature = "postgres")]
+    if let Some(turn) = session_id.and_then(|sid| service.sessions.get(sid).ok().flatten()) {
+        if let Some(block) =
+            crate::desk_crew::context::block(service, &turn.channel, &turn.owner).await
+        {
+            turn_context.push_str("\n\n");
+            turn_context.push_str(&block);
+        }
+    }
+
     // ── Voice Mode Directive ──────────────────────────────────────────
     // When this turn arrived over voice, inject formatting rules so the
     // agent responds conversationally for TTS playback.
@@ -2872,7 +2885,7 @@ pub(crate) fn spawn_turn_extraction(
     let turn_tokens = estimate_tokens(effective_message) + estimate_tokens(response);
     // What a boss conversation says of people isn't fenced to its group.
     let is_dm = session.context_type == Some(workforce_common::session::SessionContextType::Dm)
-        && !workforce_common::channels::is_desk_boss_channel(&session.channel);
+        && !session.claims_desk_boss();
     let (want_passive, want_relationship) = plan_turn_extraction(
         &mem,
         turn_tokens,
@@ -3743,7 +3756,7 @@ pub(crate) async fn process_admitted(
                 service,
                 &answer,
                 &result.tool_invocations,
-                Origin::of_turn(user, channel, session.is_voice_turn()),
+                Origin::of_session_turn(user, &session, session.is_voice_turn()),
             ),
         );
         let labelled = [
@@ -3792,7 +3805,7 @@ pub(crate) async fn process_admitted(
             service.agent_id.as_str(),
             &cost_model,
             TokenCounts::from(&result.total_usage),
-            Origin::of_turn(user, channel, session.is_voice_turn()),
+            Origin::of_session_turn(user, &session, session.is_voice_turn()),
         )
     });
     record_telemetry(
@@ -4698,6 +4711,53 @@ pub(crate) async fn stream_admitted(
         &service.sessions,
         &current_session_id,
     )?;
+    // A Desk edit of the person's latest message: under the claim, so no
+    // turn adds to the conversation meanwhile, the reply to the old version
+    // is set aside and the new version saved in its place in one step, and
+    // the agent is told what that reply did that stands. Saved, the new
+    // version is the question the conversation holds below, answered where
+    // it is: so is the same edit sent again, which finds it saved already.
+    let edit_note = match desk.and_then(|d| d.turn.edit.as_ref().map(|edit| (d, edit))) {
+        Some((desk, edit)) => {
+            let files = crate::desk_attachments::carried(
+                Arc::clone(&service.sessions),
+                service.agent_id.as_str(),
+                &session.owner,
+                attachments.as_deref(),
+            )
+            .await;
+            let asked_id = desk.turn.message.map(|id| id.to_string());
+            let mut asked = workforce_common::session::SessionMessage::user(
+                display_content.unwrap_or(message),
+                external_id.or(asked_id.as_deref()),
+                attachments.clone(),
+                trust_level,
+            );
+            asked.desk = Some(workforce_common::channels::desk::DeskMark {
+                files,
+                ..desk.turn.mark()
+            });
+            let edited = crate::desk_surface::edit::set_aside(
+                service.sessions.as_ref(),
+                &current_session_id,
+                edit,
+                &asked,
+            )?;
+            session = service
+                .sessions
+                .get(&current_session_id)?
+                .ok_or_else(|| eyre::eyre!("Session not found: {current_session_id}"))?;
+            match edited {
+                crate::desk_surface::edit::Edited::Note(note) => Some(note),
+                // What the first try set aside is gone, and with it what
+                // that reply did: the agent is told only of the edit.
+                crate::desk_surface::edit::Edited::Already => {
+                    Some(crate::desk_surface::edit::edit_note(&[], false))
+                }
+            }
+        }
+        None => None,
+    };
     // A question the conversation holds already, unanswered, under the id
     // this turn names (one the hub runs as the next turn, after the turn it
     // was sent into never read it): the turn answers it where it is. A turn
@@ -4724,6 +4784,10 @@ pub(crate) async fn stream_admitted(
     // Build augmented message with channel context and welcome directive.
     let is_new_session = session.messages.is_empty();
     let mut effective_message = message.to_string();
+    // An edit is told just ahead of what the person said, after where.
+    if let Some(note) = edit_note {
+        effective_message = format!("{note}\n\n{effective_message}");
+    }
 
     // Inject messaging context so the agent knows where it is for tool calls:
     // the Slack channel and thread, or the Desk conversation and speaker.
@@ -5310,7 +5374,7 @@ pub(crate) async fn stream_admitted(
             relayed: false,
         })
         .or_else(workforce_agent::runner::current_desk);
-    let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());
+    let origin_for_task = Origin::of_session_turn(user, &session, session.is_voice_turn());
     let precurated_for_task = turn_tools.exclusive;
     let principal_for_task = principal.to_string();
     let continuity_for_task = crate::agent_turn::Continuity::of(&session);

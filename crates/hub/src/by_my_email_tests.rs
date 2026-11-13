@@ -127,11 +127,15 @@ async fn it_asks_only_by_the_caller_s_own_fresh_verified_email() {
     sam.email = Some("typed@example.com".into());
     let fresh = chrono::Utc::now().to_rfc3339();
     sam.linked_ids.insert(
-        crate::oidc::OIDC_VERIFIED_EMAIL_KEY.into(),
+        crate::verified_email::OIDC_LINKED_ID_KEY.into(),
+        "sub-sam".into(),
+    );
+    sam.linked_ids.insert(
+        crate::verified_email::OIDC_VERIFIED_EMAIL_KEY.into(),
         "sam@example.com".into(),
     );
     sam.linked_ids
-        .insert(crate::oidc::OIDC_VERIFIED_AT_KEY.into(), fresh);
+        .insert(crate::verified_email::OIDC_VERIFIED_AT_KEY.into(), fresh);
     let tool = ByMyEmail::new(On::Linear, &tools, store_with(&sam));
     assert_eq!(ask(&tool, &sam).await["user"]["id"], "m-1");
     assert_eq!(
@@ -141,7 +145,7 @@ async fn it_asks_only_by_the_caller_s_own_fresh_verified_email() {
     // Verified long ago: renewed only by signing in.
     let mut old = sam.clone();
     old.linked_ids.insert(
-        crate::oidc::OIDC_VERIFIED_AT_KEY.into(),
+        crate::verified_email::OIDC_VERIFIED_AT_KEY.into(),
         (chrono::Utc::now() - chrono::Duration::days(91)).to_rfc3339(),
     );
     let tool = ByMyEmail::new(On::Linear, &tools, store_with(&old));
@@ -160,4 +164,75 @@ async fn it_asks_only_by_the_caller_s_own_fresh_verified_email() {
     let tool = ByMyEmail::new(On::Linear, &tools, store_with(&gone));
     assert_eq!(ask(&tool, &gone).await["why"], "no_verified_email");
     assert_eq!(lookup.asked.lock().len(), 1, "looked up once only");
+}
+
+/// End to end through Slack: a message's Slack account, a full member of
+/// the bot's workspace, vouches for its email; the tool matches by it and
+/// says it's Slack's word. An OIDC sign-in's email, when there's one too,
+/// comes first.
+#[tokio::test]
+async fn slack_s_word_on_a_full_member_s_email_finds_them() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users.info"))
+        .and(query_param("user", "U-SAM"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "user": {
+            "id": "U-SAM", "team_id": "T_HOME", "deleted": false, "is_bot": false,
+            "is_restricted": false, "is_ultra_restricted": false,
+            "profile": { "email": "Sam@Example.com" },
+        } })),
+        )
+        .mount(&server)
+        .await;
+    let surface = workforce_skills::adapters::slack::surface::SlackSurface::with_base_url(
+        "xoxb-test",
+        server.uri(),
+    );
+    surface.set_home_team_id("T_HOME".into());
+
+    let store = Arc::new(SqliteIdentityStore::in_memory().unwrap());
+    let sam = Identity::new("Sam", IdentityRole::Member).with_linked_id("slack", "U-SAM");
+    store.create(&sam).unwrap();
+    assert!(crate::slack_email::refresh(store.as_ref(), &surface, sam.id).await);
+    assert!(
+        !crate::slack_email::refresh(store.as_ref(), &surface, sam.id).await,
+        "asked once a day at most"
+    );
+
+    let tools = Arc::new(ToolRegistry::new());
+    let lookup = Arc::new(Lookup {
+        name: "linear.members_list",
+        answer: json!({ "members": [member("m-1", "Sam", Some("sam@example.com"), Some(true))] }),
+        asked: Default::default(),
+    });
+    tools.register(Arc::clone(&lookup) as Arc<dyn Tool>);
+    let handle: Arc<RwLock<Option<Arc<dyn IdentityStore>>>> = Arc::new(RwLock::new(Some(
+        Arc::clone(&store) as Arc<dyn IdentityStore>,
+    )));
+    let tool = ByMyEmail::new(On::Linear, &tools, Arc::clone(&handle));
+    let found = ask(&tool, &sam).await;
+    assert_eq!(found["user"]["id"], "m-1", "{found}");
+    assert_eq!(found["source"], "slack");
+    assert_eq!(
+        *lookup.asked.lock(),
+        vec![json!({ "email": "sam@example.com", "limit": 10 })]
+    );
+
+    // A sign-in's email is preferred over Slack's.
+    let mut both = store.get_by_id(sam.id).unwrap().unwrap();
+    both.linked_ids.insert("oidc".into(), "sub-sam".into());
+    both.linked_ids
+        .insert("oidc_email".into(), "sam@corp.example".into());
+    both.linked_ids
+        .insert("oidc_email_at".into(), chrono::Utc::now().to_rfc3339());
+    store.update(&both).unwrap();
+    let found = ask(&tool, &sam).await;
+    assert_eq!(found["source"], "sign_in");
+    assert_eq!(
+        lookup.asked.lock().last().unwrap()["email"],
+        "sam@corp.example"
+    );
 }

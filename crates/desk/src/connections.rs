@@ -1,5 +1,5 @@
 //! What each connection to a service last said when it was checked
-//! (`desk` schema, V024; one per adapter instance since V052). The keys are in the hub's vault only: a row here
+//! (`desk` schema, V024; one per adapter instance since V056). The keys are in the hub's vault only: a row here
 //! holds the account a check named, its status and when, never a secret.
 //! `detail` reaches here already tokenised by the hub.
 

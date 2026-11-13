@@ -12,9 +12,15 @@
 //!   it is, and the hub's own background work for them marked so
 //!   ([`hub_own_work`]); never another person, a team's agent, or an
 //!   outside caller, and never where the policy refused the payer.
-//! - **One standing.** An account Desk knows is full is skipped and cools
-//!   here until its reset. An account that cools here (a call refused at
-//!   its limit) is told back to Desk, which then counts it full too.
+//! - **One standing.** An account Desk knows is full is skipped. An account
+//!   that cools here (a call refused at its limit) is told back to Desk,
+//!   with when it was refused, which then counts it full too. Desk's word
+//!   is never cooled here in turn, so a stop can't keep itself alive by
+//!   going round: it ends at its reset, when the account is signed in
+//!   again, or when a call on it succeeds.
+//! - **Signed in again, or served since.** A refusal heard before the
+//!   account's last sign-in or last success ([`PoolAccount::cleared_at`])
+//!   no longer cools it here.
 //! - **Only where Desk keeps accounts.** No pool is registered on a hub
 //!   without them, so the install tier is its vault login alone, as before.
 
@@ -33,6 +39,9 @@ pub struct PoolAccount {
     pub id: String,
     /// When Desk knows it is full: until then.
     pub full_until: Option<DateTime<Utc>>,
+    /// When it was last signed in, or a call on it last succeeded: a
+    /// refusal heard before then is over.
+    pub cleared_at: Option<DateTime<Utc>>,
 }
 
 /// Where the person's Claude accounts are kept: Desk, on their own hub.
@@ -49,8 +58,13 @@ pub trait InstallPool: Send + Sync {
     /// hub and Desk this is, never anyone else on it.
     fn serves(&self, person: uuid::Uuid) -> bool;
 
-    /// Account `id` is at its limit until `until`, as a call here found.
-    fn cooling(&self, id: &str, until: DateTime<Utc>);
+    /// Account `id` is at its limit until `until`, as a call here found
+    /// at `at`.
+    fn cooling(&self, id: &str, until: DateTime<Utc>, at: DateTime<Utc>);
+
+    /// A call here on account `id`, begun at `at`, succeeded: a stop it had
+    /// from before then is over.
+    fn served(&self, _id: &str, _at: DateTime<Utc>) {}
 
     /// The key account `id`'s plan readings are kept under, as the Floor
     /// names its card: a call's reading on it is the account's.

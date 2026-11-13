@@ -108,7 +108,7 @@ const HEAD_ATTEMPTS: usize = 3;
 /// Save `message` in the conversation whose head `head` reads. One saved as
 /// a rollover sealed that session is saved again in its successor, where the
 /// conversation goes on and is read from. Returns the session it landed in.
-fn save_on_head(
+pub(crate) fn save_on_head(
     sessions: &dyn SessionStore,
     head: impl Fn() -> eyre::Result<Session>,
     message: &SessionMessage,

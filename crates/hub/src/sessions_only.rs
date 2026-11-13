@@ -347,6 +347,10 @@ impl Tool for SessionsOnly {
         self.inner.approval_requirement()
     }
 
+    fn approval_notice(&self) -> Option<String> {
+        self.inner.approval_notice()
+    }
+
     fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
         self.inner.surface_effect(input)
     }

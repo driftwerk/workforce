@@ -338,9 +338,9 @@ pub async fn stop_session_turn(
     // allowed for it in this conversation.
     #[cfg(feature = "postgres")]
     crate::desk_browser::stopped(&session_id).await;
-    #[cfg(not(feature = "postgres"))]
-    workforce_skills::adapters::browser::close(
-        workforce_skills::adapters::browser::Which::Session(&session_id),
+    // A server hub's headless browser closes too.
+    workforce_skills::adapters::browser_headless::close(
+        workforce_skills::adapters::browser_headless::Which::Session(&session_id),
     )
     .await;
     info!(session_id = %session_id, stopped, "Turn stop requested via API");
