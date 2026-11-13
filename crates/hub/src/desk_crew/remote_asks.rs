@@ -34,9 +34,6 @@ use super::CrewHub;
 /// How long an ask may be answered from elsewhere.
 pub const ASK_MINUTES: i64 = 30;
 
-/// The most of a request's words an ask carries.
-const DETAIL_CHARS: usize = 1_000;
-
 /// A fresh nonce: 32 random bytes, as hex.
 fn nonce() -> String {
     use rand::RngCore as _;
@@ -155,7 +152,7 @@ impl CrewHub {
             if bosses && view.waits_on_you.is_none() {
                 continue;
             }
-            let (class, _) = self.class_of(&g, &view);
+            let class = self.class_of(&g, &view).class;
             let options = boss_ask::options(class);
             let n = nonce();
             let hash = boss_ask::nonce_hash(&n);
@@ -190,22 +187,25 @@ impl CrewHub {
         out
     }
 
-    /// Whether the request `view` waits on is answered in Desk only, and
-    /// the hard limit it runs into. Fails closed: a request this engine
-    /// can't read the whole of (Codex's, a tool it doesn't know) is
+    /// How the request `view` waits on is read for an ask: whether it is
+    /// answered in Desk only, the hard limit it runs into, and the words
+    /// it may carry ([`boss_ask::read`]). Fails closed: a request this
+    /// engine can't read the whole of (Codex's, a tool it doesn't know) is
     /// answered in Desk.
-    fn class_of(
-        &self,
-        g: &Grant,
-        view: &workforce_desk::model::SessionView,
-    ) -> (Class, Option<workforce_desk::never::Never>) {
-        let Some(p) = view.pending.as_ref() else {
-            return (Class::DeskOnly, None);
+    fn class_of(&self, g: &Grant, view: &workforce_desk::model::SessionView) -> boss_ask::Read {
+        let unread = boss_ask::Read {
+            class: Class::DeskOnly,
+            never: None,
+            detail: None,
         };
-        // What Codex says it will do isn't what runs.
-        if !p.choices.is_empty() {
-            return (Class::DeskOnly, None);
-        }
+        let Some(p) = view.pending.as_ref() else {
+            return unread;
+        };
+        // The tool and what it was given, as the engine's hook said them;
+        // the request's label is for people.
+        let Some(r) = p.request.as_ref() else {
+            return unread;
+        };
         let shipping_needs_desk = g
             .act
             .get("shipping_needs_desk")
@@ -213,61 +213,15 @@ impl CrewHub {
             .unwrap_or(false);
         let home = dirs_home();
         let cwd = std::path::PathBuf::from(&view.cwd);
-        let scratch = [std::path::PathBuf::from("/tmp")];
-        let at = workforce_desk::never::Where {
-            cwd: Some(&cwd),
-            own: Some(&cwd),
+        boss_ask::read(&boss_ask::Request {
+            tool: &r.tool,
+            input: &r.input,
+            // What Codex says it will do isn't what runs.
+            engine_choices: !p.choices.is_empty(),
+            cwd: (!view.cwd.is_empty()).then_some(cwd.as_path()),
             home: &home,
-            scratch: &scratch,
-        };
-        // The tool and what it was given, as the engine's hook said them;
-        // the request's label is for people.
-        let Some(r) = p.request.as_ref() else {
-            return (Class::DeskOnly, None);
-        };
-        let input = |k: &str| r.input[k].as_str().unwrap_or_default().to_string();
-        let (never, ships) = match r.tool.as_str() {
-            "Bash" | "shell" | "exec_command" => {
-                let command = match input("command") {
-                    c if c.is_empty() => p.detail.clone(),
-                    c => c,
-                };
-                (
-                    workforce_desk::never::command(&command, &at),
-                    boss_ask::ships(&command),
-                )
-            }
-            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "Read" => {
-                let path = match input("file_path") {
-                    f if f.is_empty() => input("notebook_path"),
-                    f => f,
-                };
-                if path.is_empty() {
-                    return (Class::DeskOnly, None);
-                }
-                // What runs on its own later: CI, hooks, an agent's settings.
-                if [
-                    ".github/",
-                    ".git/",
-                    ".claude/",
-                    ".codex/",
-                    ".husky/",
-                    ".gitlab-ci",
-                ]
-                .iter()
-                .any(|w| path.contains(w))
-                {
-                    return (Class::DeskOnly, None);
-                }
-                (
-                    workforce_desk::never::path(std::path::Path::new(&path))
-                        .or_else(|| workforce_desk::never::said(&p.detail)),
-                    false,
-                )
-            }
-            _ => return (Class::DeskOnly, None),
-        };
-        (boss_ask::class_of(never, ships, shipping_needs_desk), never)
+            shipping_needs_desk,
+        })
     }
 
     /// The `ask` frame for the request `session` waits on, of `class` with
@@ -288,13 +242,9 @@ impl CrewHub {
         let view = self.desk.view(session).ok()?;
         let p = view.pending.as_ref()?;
         let shows = sees::shows(g.sees, Part::Question);
-        let secret = self.class_of(g, &view).1 == Some(workforce_desk::never::Never::Secrets);
-        let detail = (shows && !secret).then(|| {
-            sees::capped(
-                &workforce_common::redact::redact_secrets(&p.detail),
-                DETAIL_CHARS,
-            )
-        });
+        // The whole of what runs, or the file written; never the words of
+        // what speaks of secrets, nor of what this engine can't read.
+        let detail = self.class_of(g, &view).detail.filter(|_| shows);
         let summary = if shows {
             format!(
                 "{} asks to use {}",
