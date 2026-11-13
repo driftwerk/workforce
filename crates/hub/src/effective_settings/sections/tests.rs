@@ -70,6 +70,8 @@ const NOT_REPORTED: &[(&str, &[&str])] = &[
             "curator",
             "desk",
             "desk_boss",
+            // Each Desk reads what it shared through /api/desk-knows/status.
+            "desk_knows",
             "environments",
             "exec",
             // The Floor's own page says what it shows.
