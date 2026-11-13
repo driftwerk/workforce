@@ -356,11 +356,13 @@ impl CrewHub {
                 }
                 Vec::new()
             }
+            // A question isn't work done for the person: only what tells
+            // a session to do something is.
             Action::Nudge {
                 to: Target::Session(s),
                 reply_to: None,
-                ..
-            } => vec![*s],
+                message,
+            } if !message.trim_end().ends_with('?') => vec![*s],
             Action::StartSession { .. } => done.started.into_iter().collect(),
             Action::AssignTicket { to, .. } => match to {
                 Handout::Session(s) => vec![*s],
@@ -369,12 +371,16 @@ impl CrewHub {
             },
             _ => Vec::new(),
         };
-        if acted.is_empty() {
+        // Only what a turn did is that turn's: outside one, nothing is.
+        let turn = workforce_agent::runner::CURRENT_SESSION_ID
+            .try_with(Clone::clone)
+            .ok();
+        let (Some(turn), false) = (turn, acted.is_empty()) else {
             return;
-        }
+        };
         let mut list = self.turn_acts.lock();
         list.retain(|(_, at, _)| now - *at < chrono::Duration::hours(1));
-        list.extend(acted.into_iter().map(|s| (boss.clone(), now, s)));
+        list.extend(acted.into_iter().map(|s| (turn.clone(), now, s)));
     }
 
     /// The person's message `text`, in `boss`'s DM turn that started at
@@ -388,14 +394,15 @@ impl CrewHub {
         text: &str,
     ) {
         let boss = service.agent_id.as_str();
-        let mut sessions: Vec<Uuid> = self
-            .turn_acts
-            .lock()
-            .iter()
-            .filter(|(b, at, _)| b == boss && *at >= started)
-            .map(|(_, _, s)| *s)
-            .collect();
-        sessions.dedup();
+        // This turn's acts, taken: its session, since it started.
+        let mut sessions: Vec<Uuid> = Vec::new();
+        self.turn_acts.lock().retain(|(turn, at, s)| {
+            let ours = turn == sid && *at >= started;
+            if ours && !sessions.contains(s) {
+                sessions.push(*s);
+            }
+            !ours
+        });
         if sessions.is_empty() || text.trim().is_empty() {
             return;
         }
@@ -422,7 +429,7 @@ impl CrewHub {
 
     /// A session's message on its line to its boss keeps the boss's promise
     /// to report what it says: closed, and its reply said once.
-    async fn replied(&self, m: &workforce_desk::line::LineMessage) {
+    pub(super) async fn replied(&self, m: &workforce_desk::line::LineMessage) {
         let (Some(session), true) = (m.from_session(), m.to.kind == crew::PartyKind::Manager)
         else {
             return;
@@ -435,10 +442,17 @@ impl CrewHub {
                 return;
             }
         };
-        let Some(p) = items
-            .into_iter()
-            .find(|i| i.dedupe_key == key && i.opened_at <= m.at)
-        else {
+        // The answer to the question it was asked, or, as a session's
+        // reply to a plain message isn't threaded, its next word that
+        // answers nothing else.
+        let Some(p) = items.into_iter().find(|i| {
+            i.dedupe_key == key
+                && i.opened_at <= m.at
+                && match m.in_reply_to {
+                    Some(asked) => i.line_message == Some(asked),
+                    None => true,
+                }
+        }) else {
             return;
         };
         let reply = crew::one_line(&m.text, 600);
@@ -891,10 +905,11 @@ impl CrewHub {
             }
             let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
             let after = minute * LAPSE_AFTER.num_minutes() as i32;
-            let ended = |s: Uuid| {
-                self.desk
-                    .view(s)
-                    .map_or(true, |v| v.state == SessionState::Closed)
+            // Gone or closed ended it; a view that failed says nothing.
+            let ended = |s: Uuid| match self.desk.view(s) {
+                Ok(v) => v.state == SessionState::Closed,
+                Err(workforce_desk::DeskError::NotFound) => true,
+                Err(_) => false,
             };
             return open_item::lapsed(i, now, after, ended).map(|why| (ClosedBy::Lapsed, why));
         }

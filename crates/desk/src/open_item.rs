@@ -199,9 +199,11 @@ pub fn promise_key(session: Uuid, done_when: &str) -> String {
 }
 
 /// What `done` (a session's account's done list) says kept `done_when`
-/// since `since`, if anything: "merged" by a merge, "in production" or
-/// "deployed" by a deploy, "PR open" by a PR, and anything else by its
-/// words.
+/// since `since`, if anything: "merged" by a PR it merged, "in production"
+/// or "deployed" by a deploy, "PR open" by a PR it opened, and anything
+/// else by its words, whole. Words said as not done ("not merged yet",
+/// "couldn't deploy") and other merges ("merged main into the branch")
+/// keep nothing.
 pub fn kept_by<'a>(
     done_when: &str,
     done: &'a [crate::account::Done],
@@ -211,22 +213,80 @@ pub fn kept_by<'a>(
     let want = normalised(done_when);
     let has = |d: &crate::account::Done, k: RefKind| d.refs.iter().any(|r| r.kind == k);
     done.iter().filter(|d| d.at >= since).find(|d| {
-        let text = normalised(&d.text);
+        let words: Vec<&str> = d
+            .text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        let says = |phrases: &[&str]| phrases.iter().any(|p| said(&words, p));
         match want.as_str() {
-            "merged" | "merge" => text.contains("merged") || text.contains("merge "),
-            "in production" | "deployed" | "deploy" | "released" | "live" => {
-                has(d, RefKind::Deploy)
-                    || ["deployed", "production", "released", "shipped"]
-                        .iter()
-                        .any(|w| text.contains(w))
+            "merged" | "merge" | "the pr merged" | "pr merged" => {
+                has(d, RefKind::Pr)
+                    && says(&["merged", "merge"])
+                    && !says(&[
+                        "merged main",
+                        "merged master",
+                        "merged origin",
+                        "merged upstream",
+                        "merge main",
+                        "merge master",
+                        "merge conflict",
+                        "merge conflicts",
+                    ])
             }
-            "pr open" | "pr opened" | "the pr open" => {
-                has(d, RefKind::Pr) && (text.contains("open") || text.contains("pr"))
+            "in production" | "live" | "in prod" => {
+                (has(d, RefKind::Deploy) && !negated_anywhere(&words) && !says(&["staging"]))
+                    || says(&[
+                        "in production",
+                        "to production",
+                        "to prod",
+                        "in prod",
+                        "went live",
+                        "is live",
+                    ])
+            }
+            "deployed" | "deploy" | "released" | "shipped" => {
+                (has(d, RefKind::Deploy) && !negated_anywhere(&words))
+                    || says(&["deployed", "released", "shipped"])
+            }
+            "pr open" | "pr opened" | "the pr open" | "a pr open" => {
+                has(d, RefKind::Pr) && says(&["opened", "open", "raised", "created"])
             }
             "" => false,
-            w => text.contains(w),
+            w => said(&words, w),
         }
     })
+}
+
+/// Whether `words` say `phrase` (normalised words) as done: whole words,
+/// and not just after a "not" or "couldn't".
+fn said(words: &[String], phrase: &str) -> bool {
+    let want: Vec<&str> = phrase.split(' ').filter(|w| !w.is_empty()).collect();
+    if want.is_empty() || want.len() > words.len() {
+        return false;
+    }
+    (0..=words.len() - want.len()).any(|at| {
+        words[at..at + want.len()]
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a == b)
+            && !words[at.saturating_sub(3)..at].iter().any(|w| negation(w))
+    })
+}
+
+/// Whether `w` turns what follows it down: "not", "never", "couldn't"
+/// (split as "couldn" "t").
+fn negation(w: &str) -> bool {
+    matches!(
+        w,
+        "not" | "never" | "no" | "cannot" | "t" | "failed" | "unable" | "without"
+    )
+}
+
+/// Whether `words` say no anywhere, so a deploy ref isn't enough.
+fn negated_anywhere(words: &[String]) -> bool {
+    words.iter().any(|w| negation(w))
 }
 
 /// How long a promise or order is kept with nothing changing.
@@ -531,6 +591,34 @@ mod tests {
         assert!(kept_by("merged", &list, now).is_none());
         let deployed = vec![done("Promoted to prod", Some(RefKind::Deploy), 1)];
         assert!(kept_by("in production", &deployed, since).is_some());
+        // What only reads like it keeps the promise doesn't.
+        for (text, kind, want) in [
+            ("Merged main into the branch", Some(RefKind::Pr), "merged"),
+            ("PR #622 is not merged yet", Some(RefKind::Pr), "merged"),
+            (
+                "Resolved a merge conflict in #622",
+                Some(RefKind::Pr),
+                "merged",
+            ),
+            ("Merged the two config files", None, "merged"),
+            ("Wrote a reproduction of the bug", None, "in production"),
+            (
+                "Couldn't deploy: the pipeline is red",
+                Some(RefKind::Deploy),
+                "deployed",
+            ),
+            ("Ran the query against production", None, "in production"),
+            ("Reviewed the pricing page", Some(RefKind::Pr), "PR open"),
+            ("The tests didn't pass", None, "tests pass"),
+        ] {
+            let list = vec![done(text, kind, 1)];
+            assert!(kept_by(want, &list, since).is_none(), "{text} keeps {want}");
+        }
+        let list = vec![done("All the tests pass now", None, 1)];
+        assert!(kept_by("tests pass", &list, since).is_some());
+        let list = vec![done("Deployed #622 to staging", None, 1)];
+        assert!(kept_by("deployed", &list, since).is_some());
+        assert!(kept_by("in production", &list, since).is_none());
 
         let mut p = item(10, 1, None);
         p.kind = OpenKind::Promise;

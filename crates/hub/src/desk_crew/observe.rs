@@ -74,9 +74,15 @@ impl CrewHub {
             let sid = session_id?.to_string();
             if !message.starts_with(CHECK_IN) {
                 self.person_spoke();
-                self.person_turns
-                    .lock()
-                    .insert(sid.clone(), message.to_string());
+            }
+            if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
+                // Messages queued into one turn are all its asks.
+                let mut turns = self.person_turns.lock();
+                let asked = turns.entry(sid.clone()).or_default();
+                if !asked.is_empty() {
+                    asked.push('\n');
+                }
+                asked.push_str(message);
             }
             self.manager_turns.lock().insert(sid.clone(), crew::now());
             return Some(Track {

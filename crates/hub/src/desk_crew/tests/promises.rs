@@ -43,18 +43,31 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
+        let other = new_session(&d, dir.path(), "acme-api").await;
+        let asked = new_session(&d, dir.path(), "acme-docs").await;
         let started = chrono::Utc::now();
-        crew.perform(
-            &Action::Nudge {
-                to: Target::Session(s.id),
-                message: "Add the lead picker endpoint.".into(),
-                reply_to: None,
-            },
-            crew.by_overseer("The person asked for it.").unwrap(),
-        )
-        .await
-        .unwrap();
-        crew.order_from_turn(&overseer, "no-such-session", started, "Add the lead picker endpoint")
+        let nudge = |to: uuid::Uuid, message: &str| Action::Nudge {
+            to: Target::Session(to),
+            message: message.into(),
+            reply_to: None,
+        };
+        let in_turn = |turn: &'static str, action: Action| {
+            let crew = crew.clone();
+            workforce_agent::runner::CURRENT_SESSION_ID.scope(turn.to_string(), async move {
+                crew.perform(&action, crew.by_overseer("The person asked for it.").unwrap())
+                    .await
+                    .unwrap();
+            })
+        };
+        // What this turn did for the person; a question it asked, and
+        // another turn's work at the same time, aren't.
+        in_turn("dm-turn", nudge(s.id, "Add the lead picker endpoint.")).await;
+        in_turn("dm-turn", nudge(asked.id, "Where are the docs up to?")).await;
+        in_turn("work-turn", nudge(other.id, "Rebase onto main.")).await;
+        // Nothing done in a turn is an order of nobody's.
+        crew.order_from_turn(&overseer, "quiet-turn", started, "what's up?")
+            .await;
+        crew.order_from_turn(&overseer, "dm-turn", started, "Add the lead picker endpoint")
             .await;
         let order = d
             .store()
@@ -66,6 +79,17 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
             .expect("the order");
         assert_eq!(order.sessions, vec![s.id]);
         assert_eq!(order.text, "Add the lead picker endpoint");
+        assert_eq!(
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .iter()
+                .filter(|i| i.kind == OpenKind::Order)
+                .count(),
+            1,
+            "only the turn that acted keeps an order"
+        );
         let block = crew.items_context("desk").await.unwrap();
         assert!(block.contains("The person's orders"), "{block}");
 
@@ -78,9 +102,35 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
         .await;
         assert!(r.success, "{:?}", r.error);
         let mut a = workforce_desk::account::Account::new(s.id, "", chrono::Utc::now());
+        let pr = workforce_desk::account::Ref {
+            kind: workforce_desk::account::RefKind::Pr,
+            id: "#622".into(),
+            url: None,
+        };
+        // Another merge isn't the change merged.
+        a.done.push(workforce_desk::account::Done {
+            text: "Merged main into the branch".into(),
+            refs: vec![pr.clone()],
+            at: chrono::Utc::now(),
+        });
+        let workforce_desk::account_store::Put::Kept(v) = d.store().session_account_put(&a).await.unwrap()
+        else {
+            panic!("the account kept");
+        };
+        a.version = v;
+        crew.look_at_items().await;
+        assert!(
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.text == "Ship the picker fix"),
+            "merging main in keeps nothing"
+        );
         a.done.push(workforce_desk::account::Done {
             text: "Merged #622 after CI went green".into(),
-            refs: vec![],
+            refs: vec![pr],
             at: chrono::Utc::now(),
         });
         d.store().session_account_put(&a).await.unwrap();
@@ -141,6 +191,32 @@ async fn a_status_question_is_a_promise_kept_by_the_sessions_reply() {
             promise.text
         );
         assert!(promise.line_message.is_some());
+        // An answer to something else it was asked doesn't keep it.
+        let mut elsewhere = workforce_desk::line::LineMessage::new(
+            workforce_desk::crew::Party::session(&d.view(s.id).unwrap()),
+            workforce_desk::crew::Party {
+                kind: PartyKind::Manager,
+                id: "desk".into(),
+                name: "Scout".into(),
+                engine: None,
+                origin: None,
+            },
+            workforce_desk::line::LineKind::Answer,
+            "Yes, go ahead.".into(),
+            0,
+        );
+        elsewhere.in_reply_to = Some(uuid::Uuid::new_v4());
+        crew.replied(&elsewhere).await;
+        assert_eq!(
+            d.store()
+                .open_item(promise.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OpenState::Open,
+            "an answer to another question"
+        );
         d.line_call(
             s.id,
             "tell",
