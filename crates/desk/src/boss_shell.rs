@@ -240,7 +240,9 @@ const fn letters(letters: &'static str) -> Spec {
 /// build --bin --config …`); a negative number is a value.
 fn value(w: &Word) -> Option<String> {
     let t = w.text.as_str();
-    let number = t.len() > 1 && t[1..].chars().all(|c| c.is_ascii_digit());
+    let number = t
+        .strip_prefix('-')
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
     (!t.starts_with('-') || number).then(|| w.text.clone())
 }
 
@@ -525,7 +527,14 @@ pub fn readable(command: &str, cwd: Option<&Path>, home: &Path) -> bool {
             "node" => args
                 .first()
                 .is_some_and(|s| !s.text.starts_with('-') && plain_inside(s)),
-            "git" => git(args, cwd),
+            // A remote is looked for in the folder, not where `cd` went.
+            "git" => {
+                !(moves
+                    && args
+                        .iter()
+                        .any(|w| matches!(w.text.as_str(), "fetch" | "pull" | "push")))
+                    && git(args, cwd)
+            }
             "gh" => gh(args),
             "curl" => curl(args),
             _ => {
@@ -1103,6 +1112,10 @@ mod tests {
             "git log HEAD~1",
             "head -n -5 a.rs",
             "echo 'A=x:~/b'",
+            "grep -e über a.rs",
+            "git log --author Ünal",
+            // Harmless, and read without a panic.
+            "head -n é a.rs",
         ] {
             assert!(ok(c), "{c}");
         }
@@ -1272,6 +1285,7 @@ mod tests {
             // A remote that is a folder beside it.
             "git push peer",
             "git fetch peer",
+            "cd a && git push link",
         ] {
             assert!(!ok(c), "{c}");
         }
