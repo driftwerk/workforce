@@ -975,13 +975,16 @@ pub fn html_text(html: &str) -> String {
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        // Text holding a fence of its own is fenced longer.
-        if out[at + 4..].contains("```") {
-            out.insert(at, '`');
-            out.push_str("````\n");
-        } else {
-            out.push_str("```\n");
-        }
+        // Text holding a run of backticks is fenced with a longer one.
+        let longest = out[at + 4..]
+            .split(|c| c != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let fence = "`".repeat(3.max(longest + 1));
+        out.replace_range(at..at + 3, &fence);
+        out.push_str(&fence);
+        out.push('\n');
     };
     for c in html.chars() {
         match (in_tag, c) {
@@ -1044,12 +1047,15 @@ pub fn html_text(html: &str) -> String {
                             // `line` only ever pops spaces after `at`, and
                             // pushes one newline: `at` stays in bounds.
                             let at = at.min(out.len());
-                            let words = link_words(&out[at..]);
+                            let text = out[at..].trim().to_string();
                             out.truncate(at);
-                            match (href, words.is_empty()) {
-                                (_, true) => {}
-                                (Some(href), false) => out.push_str(&format!("[{words}]({href})")),
-                                (None, false) => out.push_str(&words),
+                            match href {
+                                _ if text.is_empty() => {}
+                                Some(href) => {
+                                    out.push_str(&format!("[{}]({href})", link_words(&text)))
+                                }
+                                // No address to keep: its words stand as they are.
+                                None => out.push_str(&text),
                             }
                         }
                     }

@@ -901,6 +901,7 @@ fn an_old_indented_description_is_told_from_a_fenced_one() {
     assert!(has_html_indent("text\n    PLT-875\n\n    Done\n. more"));
     assert!(!has_html_indent("text\n```\n    indented code\n```\nend"));
     assert!(!has_html_indent("plain\n* list"));
+    assert!(!has_html_indent("text\n~~~\n    indented code\n~~~\nend"));
 }
 
 #[test]
@@ -1029,6 +1030,9 @@ fn preformatted_text_keeps_no_marks_and_its_own_fence() {
         "````\n```\nnested\n```\n````"
     );
     assert_eq!(html_text("<p>a</p><pre>open"), "a\n```\nopen\n```");
+    assert_eq!(html_text("<pre>````\nx</pre>"), "`````\n````\nx\n`````");
+    // A link whose address goes keeps its words as written.
+    assert_eq!(html_text("<p><a>C:\\path</a></p>"), "C:\\path");
     assert_eq!(
         html_text("<pre>&lt;tag&gt; &amp; x</pre>"),
         "```\n<tag> & x\n```"
