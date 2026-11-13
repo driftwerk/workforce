@@ -43,6 +43,37 @@ pub const RESTATED_AT_ONCE: usize = 3;
 /// How long an item must be unchanged before the nightly sweep looks at it.
 pub const SWEEP_AFTER: Duration = Duration::hours(24);
 
+/// How an ask is laid out for the person, beside its full text: a
+/// one-line question, its points, the option it recommends and what carries
+/// on meanwhile. Each is what the boss gave; none is made up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskLayout {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<String>,
+    /// One of its options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_blocking: Option<String>,
+}
+
+/// The most points an ask's layout keeps, and the most characters each.
+pub const POINTS: usize = 6;
+pub const POINT_CHARS: usize = 120;
+
+/// The one of `options` that `answer` names, ignoring case and spaces at
+/// either end.
+pub fn matching_option<'a>(options: &'a [String], answer: &str) -> Option<&'a str> {
+    let want = answer.trim().to_lowercase();
+    options
+        .iter()
+        .find(|o| o.trim().to_lowercase() == want)
+        .map(String::as_str)
+}
+
 /// One thing the boss owes the person.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +109,8 @@ pub struct OpenItem {
     pub closed_at: Option<DateTime<Utc>>,
     pub closed_by: Option<ClosedBy>,
     pub closed_why: Option<String>,
+    #[serde(default)]
+    pub layout: AskLayout,
 }
 
 /// An item to open (or, when one with its key is open, to update).
@@ -99,6 +132,7 @@ pub struct NewItem {
     pub said: bool,
     /// The sessions a promise or order is linked to.
     pub sessions: Vec<Uuid>,
+    pub layout: AskLayout,
 }
 
 impl NewItem {
@@ -118,6 +152,7 @@ impl NewItem {
             dedupe_key: ask_key(session, None, text),
             said: true,
             sessions: Vec::new(),
+            layout: AskLayout::default(),
         }
     }
 
@@ -138,6 +173,7 @@ impl NewItem {
             dedupe_key: key.to_string(),
             said: false,
             sessions: Vec::new(),
+            layout: AskLayout::default(),
         }
     }
 
@@ -548,6 +584,7 @@ mod tests {
             closed_at: None,
             closed_by: None,
             closed_why: None,
+            layout: AskLayout::default(),
         }
     }
 
