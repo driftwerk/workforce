@@ -40,6 +40,7 @@ mod line;
 mod observe;
 mod own_settings;
 mod plan;
+mod preferences;
 mod read_only;
 mod reading;
 pub(crate) mod relay;

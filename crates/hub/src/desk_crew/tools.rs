@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 12] = [
+pub const READ: [&str; 14] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -40,6 +40,8 @@ pub const READ: [&str; 12] = [
     super::items::OPEN,
     super::items::PROMISE,
     super::items::ORDER,
+    super::preferences::PREFER,
+    super::preferences::PREFERENCES,
 ];
 pub const ACT: [&str; 21] = [
     "crew.nudge",
@@ -381,6 +383,9 @@ impl CrewTool {
             | super::items::OPEN
             | super::items::PROMISE
             | super::items::ORDER => crew.items_tool(self.name, b, input).await,
+            super::preferences::PREFER | super::preferences::PREFERENCES => {
+                crew.preferences_tool(self.name, b, input).await
+            }
             _ => Err("not a reading tool".into()),
         }
     }
@@ -482,6 +487,11 @@ impl CrewTool {
         let mut kept = input.clone();
         if let Some(o) = kept.as_object_mut() {
             o.remove("ticket_id");
+            // What it applies is checked below and cited, never read as
+            // part of the action or kept with a suggestion.
+            for f in super::preferences::ACT_FIELDS {
+                o.remove(f);
+            }
             // Whose settings are its own, never another's it names.
             if self.name == super::own_settings::NAME {
                 o.insert("agent_id".into(), json!(b.service.agent_id.as_str()));
@@ -499,6 +509,10 @@ impl CrewTool {
         if matches!(action, Action::Handoff { .. }) && !b.oversight.act.hand_off {
             return Err("The person hasn't let you suggest continuing sessions in another engine; tell them what you would suggest instead.".into());
         }
+        // A preference it says it applies is checked before anything is
+        // done, so its decision's citation is true. Only the citation is
+        // weighed, never the action.
+        let applied = crew.applied_preference(b, input).await?;
         // A ticket is read before the gate looks at what is said of it, and
         // a suggestion keeps its id and its key, so it is that ticket that
         // is shown and acted on. One on another scope's board is refused
@@ -530,8 +544,13 @@ impl CrewTool {
             ),
             None => reason.to_string(),
         };
+        let reason = match &applied {
+            Some(a) => format!("{}; {}", reason.trim_end().trim_end_matches('.'), a.cite),
+            None => reason,
+        };
         let input = &kept;
-        let by = crew.by_boss(&b.service, &reason);
+        let mut by = crew.by_boss(&b.service, &reason);
+        by.preference = applied.as_ref().map(|a| a.id);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
             Gate::Refuse => match &action {
@@ -583,6 +602,9 @@ impl CrewTool {
                 let s = crew.suggest(self.name, input, &action, &by).await?;
                 // An answer it may not send is a draft the person sends.
                 crew.answer_drafted(&action, &by, &why).await;
+                // Its decision says which setting left it to the person.
+                crew.record_drafted(&action, &by, &s.text, &why, oversight.level)
+                    .await;
                 Ok(json!({
                     "suggested": s.text,
                     "suggestion_id": s.id,
@@ -712,6 +734,16 @@ impl CrewTool {
         };
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());
+        let cited = input["preference"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty());
+        // The person's preferences are this hub's: the machine never
+        // weighs one it doesn't keep, and its decision doesn't cite it.
+        if let Some(o) = sent.as_object_mut() {
+            for f in super::preferences::ACT_FIELDS {
+                o.remove(f);
+            }
+        }
         let agent = b.service.agent_id.as_str();
         Some(
             match crew.relay(machine, g, name, sent, agent, &ceiling).await {
@@ -723,8 +755,15 @@ impl CrewTool {
                         ),
                         &format!("{machine}'s answer"),
                     );
+                    let uncited = format!(
+                        "{machine} recorded this without your preference: if you tell the person, say \
+                         which preference you followed yourself."
+                    );
                     match a.status {
                         super::served::ServedStatus::Refused => Err(said),
+                        super::served::ServedStatus::Ok if cited => {
+                            Ok(json!({ "done": said, "note": uncited }))
+                        }
                         super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
                         super::served::ServedStatus::Suggested => Ok(json!({
                             "suggested": said,
@@ -750,6 +789,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::items::OPEN => super::items::OPEN_DESCRIPTION,
             super::items::PROMISE => super::items::PROMISE_DESCRIPTION,
             super::items::ORDER => super::items::ORDER_DESCRIPTION,
+            super::preferences::PREFER => super::preferences::PREFER_DESCRIPTION,
+            super::preferences::PREFERENCES => super::preferences::PREFERENCES_DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
@@ -784,6 +825,9 @@ pub(crate) fn describe(name: &str) -> &'static str {
 pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Value {
     let act = |mut props: serde_json::Map<String, Value>, required: &[&str]| {
         props.insert("reason".into(), reason_schema());
+        if let Some(p) = super::preferences::act_properties().as_object() {
+            props.extend(p.clone());
+        }
         let mut req: Vec<&str> = required.to_vec();
         req.push("reason");
         json!({ "type": "object", "properties": props, "required": req })
@@ -793,7 +837,14 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
         super::decisions::NAME => super::decisions::schema(),
-        super::items::ASK | super::items::CLOSE | super::items::OPEN => super::items::schema(name),
+        super::items::ASK
+        | super::items::CLOSE
+        | super::items::OPEN
+        | super::items::PROMISE
+        | super::items::ORDER => super::items::schema(name),
+        super::preferences::PREFER | super::preferences::PREFERENCES => {
+            super::preferences::schema(name)
+        }
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),

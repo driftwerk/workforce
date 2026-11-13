@@ -556,7 +556,10 @@ impl CrewHub {
              while the plan's next tickets are free and fewer than {} sessions are working, start \
              sessions for them (crew.start_session or crew.assign_ticket). Between turns, set a \
              session's mode with crew.set_mode: auto before routine work, default before work that \
-             will need your judgement. Nothing should sit idle. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change.",
+             will need your judgement. Nothing should sit idle. Check the person's preferences first and apply \
+             the one that fits (a close match too: apply it and say so). With none, decide yourself; give the \
+             person a question only when you truly can't, with crew.ask_person and generalizes, so their \
+             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change.",
             o.work.parallel, o.work.parallel
         )
     }

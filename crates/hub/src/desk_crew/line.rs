@@ -441,7 +441,7 @@ impl CrewHub {
 
     /// What the overseer reads for a session's messages to it, and its
     /// turn's end (`ended`) when it runs it.
-    fn line_prompt(
+    pub(super) fn line_prompt(
         &self,
         session: Uuid,
         messages: &[LineMessage],

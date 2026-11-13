@@ -299,15 +299,68 @@ impl CrewHub {
             } => format!("Sent {} a message.", self.name_of_session(*s)),
             _ => said_short(said).to_string(),
         };
-        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), How::Own)
+        // One made by a preference says so (its why already cites it).
+        let how = match by.preference {
+            Some(_) => How::Preference,
+            None => How::Own,
+        };
+        let mut d = BossDecision::new(&boss, need, &what, &why_of(by), how)
             .briefly(&brief, message_of(action));
         d.need_ref = need_ref;
         d.session = session_of(action, done);
+        d.preference = by.preference;
         let (undo, plan) = undo_of(action, done, before);
         d.undo = undo;
         d.action = plan.map(|p| p.value()).unwrap_or(Value::Null);
         self.record(&d).await;
+        if let Some(p) = d.preference {
+            self.preference_used(p).await;
+        }
         Some(d)
+    }
+
+    /// Records that `action`, which a boss acting at Act or Act fully
+    /// wanted to do, became a suggestion for the person because of a
+    /// setting or rule (`why`, which names it), said as `said`: the
+    /// decision line tells the person what to allow if they want it done.
+    /// An answer to a session's question is recorded where it is given to
+    /// the person ([`Self::record_escalated`]); at Suggest, suggesting is
+    /// the work and nothing is recorded.
+    pub(crate) async fn record_drafted(
+        &self,
+        action: &Action,
+        by: &By,
+        said: &str,
+        why: &str,
+        level: workforce_common::oversight::Level,
+    ) {
+        if !level.acts()
+            || matches!(
+                action,
+                Action::Nudge {
+                    reply_to: Some(_),
+                    ..
+                } | Action::Escalate { .. }
+                    | Action::ChangeOversight { .. }
+            )
+        {
+            return;
+        }
+        let Some(boss) = self.deciding_boss(by) else {
+            return;
+        };
+        let (need, need_ref) = need_of(action);
+        let what = format!("left it to you: {}", crew::clip(said, 240));
+        let why = format!(
+            "I couldn't do it myself: {}. It's yours to do, or to allow.",
+            why.trim().trim_end_matches('.')
+        );
+        let mut d = BossDecision::new(&boss, need, &what, &why, How::Escalated)
+            .briefly("Left it to you.", message_of(action));
+        d.kind = DecisionKind::Escalated;
+        d.need_ref = need_ref;
+        d.session = session_of(action, &Done::default());
+        self.record(&d).await;
     }
 
     /// Records a session's question `ask` given to the person by `by`,
