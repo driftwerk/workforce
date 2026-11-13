@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::account::{Account, Done, Ref, RefKind};
-use crate::decision::DecisionLine;
+use crate::decision::{BossDecision, DecisionLine};
+use crate::open_item::OpenItem;
 
 /// What a session's account said when the person was last told of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +234,110 @@ pub struct WaitingItem {
     pub options: Vec<String>,
 }
 
+impl WaitingItem {
+    /// `i` as an update lists it at `now`.
+    pub fn of(i: &OpenItem, now: DateTime<Utc>) -> Self {
+        Self {
+            item_id: i.id.to_string(),
+            text: i.text.clone(),
+            age: age(i.opened_at, now),
+            holding_up: i.holding_up.clone(),
+            recommendation: i.recommendation.clone(),
+            options: i.options.clone(),
+        }
+    }
+}
+
+/// An answer the person can give, as a button: the recommended one filled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerOption {
+    pub label: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// The most characters a needs-you question has.
+pub const QUESTION_CHARS: usize = 160;
+
+/// What waits on the person, laid out (`extras.update.needsYou`): one
+/// question, its points, the boss's recommendation, the answers with the
+/// recommended one marked, and what carries on meanwhile. Beside `waiting`,
+/// which says the same item as before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeedsYou {
+    pub item_id: String,
+    /// One line.
+    pub question: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub recommendation: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AnswerOption>,
+    #[serde(default)]
+    pub not_blocking: Option<String>,
+    /// How long it has waited, in words ("1 h").
+    #[serde(default)]
+    pub age: String,
+    /// The kind of case an answer would settle from then on, as
+    /// `extras.item` says it: the chat offers "Always" with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generalizes: Option<String>,
+    /// What the person's "always" would cover (`all`, `group:<id>`,
+    /// `repo:<owner/name>`), as `extras.item` says it: only with
+    /// `generalizes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_scope: Option<String>,
+}
+
+impl NeedsYou {
+    /// `i` laid out at `now`: what the boss gave, else its text's first
+    /// sentence as the question, with no points, no answer recommended and
+    /// nothing said to carry on.
+    pub fn of(i: &OpenItem, now: DateTime<Utc>) -> Self {
+        let l = &i.layout;
+        let given = |t: &Option<String>| {
+            t.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        let question = match given(&l.question) {
+            Some(q) => crate::crew::one_line(&q, QUESTION_CHARS),
+            None => crate::crew::one_line(&i.text, QUESTION_CHARS),
+        };
+        let recommended = given(&l.recommended)
+            .and_then(|r| crate::open_item::matching_option(&i.options, &r).map(str::to_string));
+        Self {
+            item_id: i.id.to_string(),
+            question,
+            items: l
+                .points
+                .iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+            recommendation: given(&i.recommendation),
+            options: i
+                .options
+                .iter()
+                .map(|o| AnswerOption {
+                    label: o.clone(),
+                    recommended: recommended.as_deref() == Some(o.as_str()),
+                })
+                .collect(),
+            not_blocking: given(&l.not_blocking),
+            age: age(i.opened_at, now),
+            generalizes: given(&i.generalizes),
+            prefer_scope: given(&i.generalizes)
+                .map(|_| i.prefer_scope.clone().unwrap_or_else(|| "all".into())),
+        }
+    }
+}
+
 /// An update, as the chat's extras carry it (`extras.update`): every field
 /// optional on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +353,9 @@ pub struct MentionedUpdate {
     pub kept: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<WaitingItem>,
+    /// What waits on the person, laid out: the same items as `waiting`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_you: Vec<NeedsYou>,
     /// The day's cheap calls, near the ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<String>,
@@ -351,9 +459,13 @@ pub fn footer(spent: i64, cap: u32) -> Option<String> {
 }
 
 /// The composer's instructions: per session, in the boss's voice, where it
-/// is, what's next and roughly when; nothing of decisions or asks (those
-/// are added verbatim).
-pub const COMPOSER_SYSTEM: &str = "You write the session paragraphs of an overseer's short update to the person it works for, in its voice (\"I\", plain words, no lists, no headings). For each session given, write one or two sentences: where it is, what's next and roughly when, from what it did since the person was last told. Leave out anything not given; never invent PR numbers, names or times. Don't mention decisions, questions or anything waiting on the person: those are added separately. Answer with JSON only: {\"sessions\": [{\"id\": \"<session id>\", \"text\": \"<paragraph>\"}]}.";
+/// is, what's next and roughly when; per decision, what it did in a short
+/// line and why in one sentence, never quoting the message it sent (shown
+/// apart). Asks and what it kept are added verbatim.
+pub const COMPOSER_SYSTEM: &str = "You write parts of an overseer's short update to the person it works for, in its voice (\"I\", plain words, no lists, no headings).\n\
+For each session given, write one or two sentences: where it is, what's next and roughly when, from what it did since the person was last told. Don't mention decisions, questions or anything waiting on the person in these: those are added separately.\n\
+For each decision given, write its action: what you did, in at most 70 characters, as one short sentence (\"Lifted my hold on tonight's release.\", \"Let web wait for CI.\"); and its why: one sentence, the reason. Never quote or repeat the message you sent: the person reads it separately.\n\
+Leave out anything not given; never invent PR numbers, names or times. Answer with JSON only: {\"sessions\": [{\"id\": \"<session id>\", \"text\": \"<paragraph>\"}], \"decisions\": [{\"id\": \"<decision id>\", \"action\": \"<short line>\", \"why\": \"<one sentence>\"}]}.";
 
 /// What the composer is given of each session: its id, name, purpose,
 /// what it did since it was last told, now, next and what it waits on.
@@ -381,24 +493,101 @@ pub fn composer_input(sessions: &[(Uuid, String, &Account, Vec<&Done>)]) -> Stri
     out
 }
 
-/// The composer's paragraphs by session, from its answer; none when it
-/// isn't the JSON asked for. A paragraph it didn't write is written
-/// plainly by the caller.
-pub fn parse_composed(answer: &str) -> Option<HashMap<Uuid, String>> {
+/// The most decisions the composer is given: the newest it acted on.
+pub const COMPOSED_DECISIONS: usize = 30;
+/// The most of a decision's message the composer is given, in characters.
+pub const COMPOSED_MESSAGE_CHARS: usize = 300;
+
+/// What the composer is given of each decision: its id, kind, what was
+/// decided and why, and the message it sent (to say what it did, never to
+/// quote).
+pub fn composer_decisions(decisions: &[BossDecision]) -> String {
+    let mut out = String::new();
+    for d in decisions {
+        out.push_str(&format!("Decision {} ({})\n", d.id, d.kind.as_str()));
+        out.push_str(&format!("  decided: {}\n", d.what.trim()));
+        if !d.why.trim().is_empty() {
+            out.push_str(&format!("  why: {}\n", d.why.trim()));
+        }
+        if let Some(m) = &d.message {
+            out.push_str(&format!(
+                "  message sent (don't quote it): {}\n",
+                crate::crew::clip(m, COMPOSED_MESSAGE_CHARS)
+            ));
+        }
+    }
+    out
+}
+
+/// What the composer wrote, by session and by decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Composed {
+    pub sessions: HashMap<Uuid, String>,
+    /// Each decision's short line and why, as written.
+    pub decisions: HashMap<Uuid, (String, String)>,
+}
+
+/// The composer's paragraphs by session and lines by decision, from its
+/// answer; none when it isn't the JSON asked for. What it didn't write is
+/// written plainly by the caller.
+pub fn parse_composed(answer: &str) -> Option<Composed> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
     let v: serde_json::Value = serde_json::from_str(answer.get(start..=end)?).ok()?;
-    let mut out = HashMap::new();
-    for s in v["sessions"].as_array()? {
-        let (Some(id), Some(text)) = (
-            s["id"].as_str().and_then(|i| i.trim().parse::<Uuid>().ok()),
-            s["text"].as_str().map(str::trim).filter(|t| !t.is_empty()),
-        ) else {
-            continue;
-        };
-        out.insert(id, crate::crew::one_line(text, 800));
+    let id_of =
+        |e: &serde_json::Value| e["id"].as_str().and_then(|i| i.trim().parse::<Uuid>().ok());
+    let text_of = |e: &serde_json::Value, k: &str| {
+        e[k].as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    let mut out = Composed::default();
+    let sessions = v["sessions"].as_array();
+    let decisions = v["decisions"].as_array();
+    if sessions.is_none() && decisions.is_none() {
+        return None;
+    }
+    for s in sessions.into_iter().flatten() {
+        if let (Some(id), Some(text)) = (id_of(s), text_of(s, "text")) {
+            out.sessions.insert(id, crate::crew::one_line(&text, 800));
+        }
+    }
+    for d in decisions.into_iter().flatten() {
+        if let (Some(id), Some(action), why) = (id_of(d), text_of(d, "action"), text_of(d, "why")) {
+            out.decisions.insert(id, (action, why.unwrap_or_default()));
+        }
     }
     Some(out)
+}
+
+/// Each of `decisions` as the update carries it: the composer's short line
+/// and why where it wrote ones that fit (at most
+/// [`crate::decision::BRIEF_CHARS`], one sentence, never quoting the
+/// message), else the row's own.
+pub fn decision_lines(
+    decisions: &[BossDecision],
+    composed: &HashMap<Uuid, (String, String)>,
+) -> Vec<DecisionLine> {
+    use crate::decision::{brief_line, why_line, BRIEF_CHARS};
+    decisions
+        .iter()
+        .map(|d| {
+            let mut line = d.line();
+            if let Some((action, why)) = composed.get(&d.id) {
+                let message = d.message.as_deref();
+                let fits = action.chars().count() <= BRIEF_CHARS && !action.contains('\n');
+                if let (true, Some(action)) = (fits, brief_line(action, message)) {
+                    line.action = action;
+                }
+                let why = why_line(why, message);
+                if !why.is_empty() {
+                    line.why = why;
+                }
+            }
+            line
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -581,8 +770,181 @@ mod tests {
             "Here: {{\"sessions\": [{{\"id\": \"{id}\", \"text\": \"PR #622 is up; I'll merge it once CI is green.\"}}, {{\"id\": \"nope\", \"text\": \"x\"}}]}}"
         ))
         .unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(got[&id].starts_with("PR #622 is up"));
+        assert_eq!(got.sessions.len(), 1);
+        assert!(got.sessions[&id].starts_with("PR #622 is up"));
+        assert!(got.decisions.is_empty());
         assert!(parse_composed("I couldn't.").is_none());
+    }
+
+    fn nudge(message: &str) -> BossDecision {
+        BossDecision::new(
+            "desk",
+            crate::decision::Need::Choice,
+            &format!("told web “{message}”"),
+            "You confirmed it yourself at 15:33. So it can go.",
+            crate::decision::How::Own,
+        )
+        .briefly("Sent web a message", Some(message))
+    }
+
+    #[test]
+    fn the_composers_decision_lines_are_taken_only_when_they_fit() {
+        let message = "You can release tonight: the person confirmed the change themselves.";
+        let d = nudge(message);
+        let answer = format!(
+            "{{\"sessions\": [], \"decisions\": [{{\"id\": \"{}\", \"action\": \"Lifted my hold on tonight's release.\", \"why\": \"You confirmed it yourself at 15:33.\"}}]}}",
+            d.id
+        );
+        let got = parse_composed(&answer).unwrap();
+        let lines = decision_lines(std::slice::from_ref(&d), &got.decisions);
+        assert_eq!(lines[0].action, "Lifted my hold on tonight's release.");
+        assert_eq!(lines[0].why, "You confirmed it yourself at 15:33.");
+        assert_eq!(lines[0].message.as_deref(), Some(message));
+        // The old text is kept as it was.
+        assert_eq!(lines[0].text, d.what);
+        let with = |action: &str, why: &str| {
+            let c = HashMap::from([(d.id, (action.to_string(), why.to_string()))]);
+            decision_lines(std::slice::from_ref(&d), &c).remove(0)
+        };
+        // Past 70 characters: the plain line.
+        let long = with(
+            "Lifted my hold on tonight's release after reading every check again carefully",
+            "",
+        );
+        assert_eq!(long.action, "Sent web a message.");
+        assert_eq!(long.why, "You confirmed it yourself at 15:33.");
+        // Quoting the message: the plain line and why.
+        let quoting = with(
+            "Told web: you can release tonight, the person confirmed.",
+            "Because the person confirmed the change themselves, it can go.",
+        );
+        assert_eq!(quoting.action, "Sent web a message.");
+        assert_eq!(quoting.why, "You confirmed it yourself at 15:33.");
+        // Not written: the plain line.
+        let plain = decision_lines(std::slice::from_ref(&d), &HashMap::new()).remove(0);
+        assert_eq!(plain.action, "Sent web a message.");
+        assert!(plain.action.chars().count() <= crate::decision::BRIEF_CHARS);
+        assert!(COMPOSER_SYSTEM.contains("at most 70 characters"));
+        assert!(composer_decisions(&[d]).contains("message sent (don't quote it)"));
+    }
+
+    #[test]
+    fn what_needs_the_person_is_laid_out_from_what_the_boss_gave() {
+        let now = Utc::now();
+        let mut new = crate::open_item::NewItem::ask(
+            "desk",
+            crate::open_item::OpenKind::Ask,
+            None,
+            "Two staging records need a decision before PR 3 can go. One has no organisation; one has roles but no user.",
+        );
+        new.recommendation = Some("Deactivate the roles; leave the user empty for now.".into());
+        new.options = vec![
+            "Deactivate · leave it empty".into(),
+            "Hold, I'll look".into(),
+        ];
+        let mut i = OpenItem {
+            id: Uuid::new_v4(),
+            boss: new.boss.clone(),
+            owner: "you".into(),
+            kind: new.kind,
+            session: None,
+            line_message: None,
+            text: new.text.clone(),
+            holding_up: None,
+            recommendation: new.recommendation.clone(),
+            options: new.options.clone(),
+            generalizes: None,
+            done_when: None,
+            dedupe_key: new.dedupe_key.clone(),
+            opened_at: now - Duration::minutes(61),
+            last_said_at: None,
+            said_count: 1,
+            raised_at: None,
+            sessions: vec![],
+            changed_at: now,
+            state: crate::open_item::OpenState::Open,
+            closed_at: None,
+            closed_by: None,
+            closed_why: None,
+            layout: Default::default(),
+            prefer_scope: None,
+        };
+        // Plainly: its first sentence, no points, nothing recommended.
+        let plain = NeedsYou::of(&i, now);
+        assert_eq!(
+            plain.question,
+            "Two staging records need a decision before PR 3 can go."
+        );
+        assert!(plain.items.is_empty() && plain.not_blocking.is_none());
+        assert!(plain.generalizes.is_none());
+        i.generalizes = Some("When a staging record has no owner".into());
+        assert!(plain.options.iter().all(|o| !o.recommended));
+        assert_eq!(plain.age, "1 h");
+        i.layout = crate::open_item::AskLayout {
+            question: Some("Two records need a decision.".into()),
+            points: vec!["A user with no organisation.".into(), " ".into()],
+            recommended: Some("deactivate · leave it empty".into()),
+            not_blocking: Some("The docs PR doesn't depend on it.".into()),
+        };
+        let laid = NeedsYou::of(&i, now);
+        assert_eq!(laid.question, "Two records need a decision.");
+        assert_eq!(laid.items, vec!["A user with no organisation.".to_string()]);
+        assert_eq!(
+            laid.options
+                .iter()
+                .map(|o| (o.label.as_str(), o.recommended))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Deactivate · leave it empty", true),
+                ("Hold, I'll look", false)
+            ]
+        );
+        let v = serde_json::to_value(&laid).unwrap();
+        for k in [
+            "itemId",
+            "question",
+            "items",
+            "recommendation",
+            "options",
+            "notBlocking",
+        ] {
+            assert!(v.get(k).is_some(), "{k} in {v}");
+        }
+        assert_eq!(v["options"][0]["recommended"], true);
+        assert_eq!(v["generalizes"], "When a staging record has no owner");
+        assert_eq!(v["preferScope"], "all");
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("preferScope")
+            .is_none());
+        let u = MentionedUpdate {
+            needs_you: vec![laid],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&u).unwrap();
+        assert!(v.get("needsYou").is_some(), "{v}");
+    }
+
+    #[test]
+    fn an_update_kept_before_the_layout_still_reads() {
+        // A pending update and its extras, as kept before these fields.
+        let p: Pending = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "text": "x",
+            "update": {
+                "decisions": [{"id": "d", "text": "told web “go”", "why": "CI is green."}],
+                "waiting": [{"itemId": "i", "text": "Which key?", "options": ["A", "B"]}]
+            },
+            "told": {}
+        }))
+        .unwrap();
+        assert_eq!(p.update.waiting[0].options, vec!["A", "B"]);
+        assert!(p.update.needs_you.is_empty());
+        assert_eq!(p.update.decisions[0].message, None);
+        let e: crate::crew::Extras = serde_json::from_value(serde_json::json!({
+            "update": {"decisions": [{"id": "d", "text": "t"}]}
+        }))
+        .unwrap();
+        assert_eq!(e.update.unwrap().decisions[0].action, "");
     }
 }
