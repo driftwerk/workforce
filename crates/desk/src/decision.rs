@@ -345,7 +345,12 @@ pub fn why_line(why: &str, message: Option<&str>) -> String {
     sentences(why)
         .into_iter()
         .filter(|s| !within(s, message))
-        .map(|s| sentence(&crate::crew::clip(&crate::crew::words(s, WHY_WORDS), WHY_CHARS - 1)))
+        .map(|s| {
+            sentence(&crate::crew::clip(
+                &crate::crew::words(s, WHY_WORDS),
+                WHY_CHARS - 1,
+            ))
+        })
         .find(|s| !s.is_empty() && !quotes(s, message))
         .unwrap_or_default()
 }
@@ -572,8 +577,17 @@ mod tests {
     #[test]
     fn a_why_is_never_a_piece_of_a_message_of_several_sentences() {
         let m = Some("Please rebase onto main now. Then rerun CI.");
-        assert_eq!(why_line("I sent: Please rebase onto main now. Then rerun CI.", m), "");
-        assert_eq!(why_line("Please rebase onto main now. Thanks.", Some("Please rebase onto main now. Thanks.")), "");
+        assert_eq!(
+            why_line("I sent: Please rebase onto main now. Then rerun CI.", m),
+            ""
+        );
+        assert_eq!(
+            why_line(
+                "Please rebase onto main now. Thanks.",
+                Some("Please rebase onto main now. Thanks.")
+            ),
+            ""
+        );
         assert_eq!(
             why_line("Then rerun CI. Its branch is a week behind main.", m),
             "Its branch is a week behind main."
