@@ -129,6 +129,24 @@ impl DeskStore {
             .collect()
     }
 
+    /// All of `owner`'s preferences, for every boss: by boss scope, oldest
+    /// first.
+    pub async fn preferences_all(&self, owner: &str) -> Result<Vec<Preference>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_preferences WHERE owner = $1 \
+                     ORDER BY boss_scope, created_at, id"
+                ),
+                &[&owner],
+            )
+            .await?
+            .iter()
+            .map(preference)
+            .collect()
+    }
+
     /// Changes `id`'s words or scope: the preference as it now is, or
     /// `None` when there is none (or it is retired).
     pub async fn preference_change(
