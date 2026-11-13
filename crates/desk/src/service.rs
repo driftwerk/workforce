@@ -5378,6 +5378,7 @@ impl Desk {
             false => asked_at_end(&denials, said.as_deref()),
         };
         let said_whole = said.clone().filter(|_| unsure);
+        let said_ok = said.clone();
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
         // A refusal whose words aren't the plan's, on an account whose
@@ -5472,6 +5473,18 @@ impl Desk {
             });
         }
         if let Some(on) = on {
+            // It ended well: the call it ran on its sign-in succeeded, so a
+            // stop on that account from before is over.
+            let ended_well = !failed
+                && said_ok
+                    .as_deref()
+                    .is_none_or(|s| !crate::limit::says_plan_limit(s));
+            if ended_well && Self::mark_ok(&mut self.0.state.lock(), &on, Utc::now()) {
+                tracing::info!(session = %id, "a turn ended well on an account that was stopped: it has room again");
+                self.keep_standing();
+                let desk = self.clone();
+                tokio::spawn(async move { desk.accounts_moved().await });
+            }
             if let Some(hit) = &limit {
                 // On its limit: the account is full now, whatever it left
                 // running (a turn waiting on background work isn't over to
@@ -5549,6 +5562,7 @@ impl Desk {
                 crossed = Some(crate::limit::LimitHit {
                     window: Some(kind.into()),
                     resets_at: full.until,
+                    at: hit.and_then(|h| h.at),
                 });
             }
             Some(crate::limit::Reach::Model(model)) => {
@@ -5560,14 +5574,45 @@ impl Desk {
             _ => {}
         }
         let hit = crossed.as_ref().or(hit);
+        // When it was refused: as its transcript line says when read from
+        // one (a line read again after a restart is as old as it is), else
+        // now.
+        let at = hit
+            .and_then(|h| h.at)
+            .filter(|at| *at <= now)
+            .unwrap_or(now);
+        let side = Self::side_of_raw(st, raw).map(|side| Self::standing_of(st, side));
         let standing = Self::standing_mut(st, raw);
-        standing.hit_at = Some(now);
+        // From before the account was last signed in, or before a call on
+        // it last succeeded: that limit is over, it locks nothing.
+        if !standing.counts(at) || side.is_some_and(|s| !s.counts(at)) {
+            tracing::info!(session = %id, %at, "a refusal from before the account's last sign-in or success: it is over");
+            return None;
+        }
+        // A later stop already kept stands.
+        if standing.hit_at.is_some_and(|kept| kept > at) {
+            return None;
+        }
+        standing.hit_at = Some(at);
         standing.hit_until = hit
             .and_then(|h| h.resets_at)
             .or(standing.hit_until.filter(|u| *u > now));
         standing.hit_window = hit.and_then(|h| h.minutes());
         Self::wrote_hit(st, raw, identities::Writer::Session(id));
-        Some(now)
+        Some(at)
+    }
+
+    /// A call on `raw` succeeded at `at` (a session's turn ended well): a
+    /// stop on its limit from before is over. Whether it ended one.
+    fn mark_ok(st: &mut State, raw: &identities::Raw, at: DateTime<Utc>) -> bool {
+        let at = at.min(Utc::now());
+        let standing = Self::standing_mut(st, raw);
+        if standing.ok_at.is_some_and(|ok| ok >= at) {
+            return false;
+        }
+        let was = standing.hit_at.is_some_and(|hit| standing.counts(hit));
+        standing.ok_at = Some(at);
+        was && standing.hit_at.is_some_and(|hit| hit <= at)
     }
 
     /// Session `id`'s turn stopped `account` on its limit now; kept as the
@@ -5633,6 +5678,7 @@ impl Desk {
             Some(resets_at) => TurnFailure::Limit(LimitHit {
                 window: None,
                 resets_at: Some(resets_at),
+                at: None,
             }),
             None => failure,
         }
@@ -5701,8 +5747,10 @@ impl Desk {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
                     if hit.reach() == crate::limit::Reach::Plan {
                         let standing = Self::standing_mut(&mut st, &account);
-                        standing.hit_until = hit.resets_at.or(standing.hit_until);
-                        standing.hit_window = hit.minutes().or(standing.hit_window);
+                        if hit.at.is_none_or(|at| standing.counts(at)) {
+                            standing.hit_until = hit.resets_at.or(standing.hit_until);
+                            standing.hit_window = hit.minutes().or(standing.hit_window);
+                        }
                     } else {
                         // Words read as the plan's; the transcript names a
                         // model's or extra usage: the account isn't full.
@@ -5728,7 +5776,10 @@ impl Desk {
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
-                    if standing.hit_at.is_some() && hit.reach() == crate::limit::Reach::Plan {
+                    if standing.hit_at.is_some()
+                        && hit.reach() == crate::limit::Reach::Plan
+                        && hit.at.is_none_or(|at| standing.counts(at))
+                    {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                         standing.hit_window = hit.minutes().or(standing.hit_window);
                     }
@@ -6374,6 +6425,15 @@ impl Desk {
                                 Some(f) => st.turn_failures.insert(id, f),
                                 None => st.turn_failures.remove(&id),
                             };
+                            // A reply it wrote: the call on its sign-in
+                            // succeeded then.
+                            if let Some(ok) = t.ok_at {
+                                let raw = Self::raw_running(&st, id);
+                                if Self::mark_ok(&mut st, &raw, ok) {
+                                    drop(st);
+                                    self.keep_standing();
+                                }
+                            }
                         }
                         self.change(id, |r, _| {
                             r.origin = Origin::External;
@@ -6393,6 +6453,7 @@ impl Desk {
                     let now = Utc::now();
                     let mut tail = tail.unwrap_or_default();
                     let failure = tail.failure.take();
+                    let ok_at = tail.ok_at;
                     let r = SessionRecord {
                         id: Uuid::new_v4(),
                         engine: Engine::Claude,
@@ -6429,7 +6490,16 @@ impl Desk {
                     if let Some(f) = failure {
                         self.0.state.lock().turn_failures.insert(r.id, f);
                     }
+                    let new_id = r.id;
                     self.save(r);
+                    if let Some(ok) = ok_at {
+                        let mut st = self.0.state.lock();
+                        let raw = Self::raw_running(&st, new_id);
+                        if Self::mark_ok(&mut st, &raw, ok) {
+                            drop(st);
+                            self.keep_standing();
+                        }
+                    }
                 }
             }
         }

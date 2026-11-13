@@ -26,9 +26,10 @@ impl InstallPool for DeskPool {
         self.desk
             .pool_accounts()
             .into_iter()
-            .map(|(id, full_until)| PoolAccount {
+            .map(|(id, full_until, cleared_at)| PoolAccount {
                 id: id.to_string(),
                 full_until,
+                cleared_at,
             })
             .collect()
     }
@@ -42,9 +43,15 @@ impl InstallPool for DeskPool {
         person == self.owner
     }
 
-    fn cooling(&self, id: &str, until: DateTime<Utc>) {
+    fn cooling(&self, id: &str, until: DateTime<Utc>, at: DateTime<Utc>) {
         if let Ok(id) = Uuid::parse_str(id) {
-            self.desk.hub_cooling(id, until);
+            self.desk.hub_cooling(id, until, at);
+        }
+    }
+
+    fn served(&self, id: &str) {
+        if let Ok(id) = Uuid::parse_str(id) {
+            self.desk.hub_served(id);
         }
     }
 

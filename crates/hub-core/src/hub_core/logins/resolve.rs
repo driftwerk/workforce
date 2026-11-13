@@ -237,9 +237,23 @@ impl Login {
                 Notice::Auth => return Some(self.refuse(round.failure_line.clone(), caller)),
                 Notice::Other => return None,
             },
-            (None, false) => return None,
+            (None, false) => {
+                self.served_well();
+                return None;
+            }
         };
         Some(self.cool(&limit, caller))
+    }
+
+    /// A round on this login succeeded: it isn't at its limit, whatever was
+    /// heard before, here or (for a pool account) in Desk.
+    fn served_well(&self) {
+        CooldownStore::global().clear_since(&self.key, Utc::now());
+        if let Credential::Pooled(id) = &self.credential {
+            if let Some(pool) = super::install_pool::of(&self.slot.vault) {
+                pool.served(id);
+            }
+        }
     }
 }
 
@@ -374,8 +388,10 @@ pub fn resolve(
 /// usable at `now`: not known to be full by Desk, not cooling here, not
 /// refused for good. `None` when the hub has no pool, or the pool may not
 /// serve this call ([`pool_serves`]). Its token is not read here: only as
-/// the call's CLI starts. An account Desk knows is full cools here until
-/// its reset; one cooling here is told to Desk.
+/// the call's CLI starts. An account Desk knows is full is skipped, never
+/// cooled here from Desk's word; one cooling here is told to Desk, with
+/// when it was refused. A refusal from before the account's last sign-in
+/// or success no longer cools it.
 fn pooled(
     vaults: &Vaults<'_>,
     miss: &Miss,
@@ -398,26 +414,24 @@ fn pooled(
             vault: Arc::clone(vault),
             key: super::install_pool::slot_key(&account.id),
         };
-        if let Some(full) = account.full_until.filter(|u| *u > now) {
-            cooldowns.note(
-                &key,
-                &LimitSignal {
-                    status: LimitStatus::Rejected,
-                    resets_at: Some(full),
-                    window: None,
-                },
-                now,
-            );
+        if let Some(cleared) = account.cleared_at {
+            cooldowns.clear_since(&key, cleared);
         }
         if cooldowns.is_dead(&slot, &credential.fingerprint()) {
             refused = true;
             continue;
         }
-        if let Some(until) = cooldowns.until(&key, now) {
+        if let Some((until, at)) = cooldowns.cooling_at(&key, now) {
             if account.full_until.is_none_or(|f| f < until) {
-                pool.cooling(&account.id, until);
+                pool.cooling(&account.id, until, at);
             }
             soonest = Some(soonest.map_or(until, |s| s.min(until)));
+            continue;
+        }
+        // Desk knows it is full: skipped, and left for Desk to say when it
+        // isn't (a sign-in, a success, its reset).
+        if let Some(full) = account.full_until.filter(|u| *u > now) {
+            soonest = Some(soonest.map_or(full, |s| s.min(full)));
             continue;
         }
         return Some(Ok(Login {
@@ -1187,6 +1201,12 @@ mod tests {
         accounts: Vec<(&'static str, &'static str, Option<DateTime<Utc>>)>,
         person: Uuid,
         told: parking_lot::Mutex<Vec<(String, DateTime<Utc>)>>,
+        /// When each was refused, as told.
+        told_at: parking_lot::Mutex<Vec<DateTime<Utc>>>,
+        /// When each was last signed in or served, as Desk would say.
+        cleared: parking_lot::Mutex<std::collections::HashMap<String, DateTime<Utc>>>,
+        /// Which were told a call on them succeeded.
+        served: parking_lot::Mutex<Vec<String>>,
         /// Whose tokens were read.
         read: parking_lot::Mutex<Vec<String>>,
     }
@@ -1197,6 +1217,9 @@ mod tests {
                 accounts,
                 person: Uuid::parse_str(ALICE).unwrap(),
                 told: parking_lot::Mutex::new(Vec::new()),
+                told_at: parking_lot::Mutex::new(Vec::new()),
+                cleared: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                served: parking_lot::Mutex::new(Vec::new()),
                 read: parking_lot::Mutex::new(Vec::new()),
             })
         }
@@ -1210,6 +1233,7 @@ mod tests {
                     |(id, _, full_until)| super::super::install_pool::PoolAccount {
                         id: (*id).into(),
                         full_until: *full_until,
+                        cleared_at: self.cleared.lock().get(*id).copied(),
                     },
                 )
                 .collect()
@@ -1224,8 +1248,12 @@ mod tests {
         fn serves(&self, person: Uuid) -> bool {
             person == self.person
         }
-        fn cooling(&self, id: &str, until: DateTime<Utc>) {
+        fn cooling(&self, id: &str, until: DateTime<Utc>, at: DateTime<Utc>) {
             self.told.lock().push((id.into(), until));
+            self.told_at.lock().push(at);
+        }
+        fn served(&self, id: &str) {
+            self.served.lock().push(id.into());
         }
     }
 
@@ -1340,6 +1368,130 @@ mod tests {
             ("gmail", "sk-ant-oat01-gmail", Some(soon)),
         ]);
         assert_eq!(call(&full).unwrap_err().cooling_until(), Some(soon));
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[test]
+    fn desks_word_that_an_account_is_full_is_never_cooled_here_so_it_cant_outlive_desks() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let later = Utc::now() + chrono::Duration::days(4);
+        let call = |pool: &Arc<Pool>| {
+            pooled_for(
+                &f,
+                pool,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        let full = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", Some(later)),
+            ("gmail", "sk-ant-oat01-gmail", None),
+        ]);
+        assert!(
+            matches!(&call(&full).unwrap().credential, Credential::Pooled(id) if id == "gmail")
+        );
+        let key = super::super::install_pool::login_key("starmoire");
+        assert_eq!(cooldowns.until(&key, Utc::now()), None, "not cooled here");
+        assert!(full.told.lock().is_empty(), "nothing told back");
+        // Desk no longer says so (signed in again, a success): it serves.
+        let room = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", None),
+            ("gmail", "sk-ant-oat01-gmail", None),
+        ]);
+        assert!(
+            matches!(&call(&room).unwrap().credential, Credential::Pooled(id) if id == "starmoire")
+        );
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[test]
+    fn a_refusal_is_told_with_its_own_time_and_ends_at_the_accounts_next_sign_in() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let call = |pool: &Arc<Pool>| {
+            pooled_for(
+                &f,
+                pool,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        let pool = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", None),
+            ("gmail", "sk-ant-oat01-gmail", None),
+        ]);
+        let refused_at = Utc::now() - chrono::Duration::hours(2);
+        let reset = Utc::now() + chrono::Duration::days(2);
+        let key = super::super::install_pool::login_key("starmoire");
+        cooldowns.note(
+            &key,
+            &LimitSignal {
+                status: LimitStatus::Rejected,
+                resets_at: Some(reset),
+                window: Some("seven_day".into()),
+            },
+            refused_at,
+        );
+        assert!(
+            matches!(&call(&pool).unwrap().credential, Credential::Pooled(id) if id == "gmail")
+        );
+        assert_eq!(
+            pool.told_at.lock().clone(),
+            vec![refused_at],
+            "as of when it was refused, not now"
+        );
+        // Signed in again since (or a call on it succeeded): over here too.
+        pool.cleared.lock().insert(
+            "starmoire".into(),
+            refused_at + chrono::Duration::minutes(1),
+        );
+        assert!(
+            matches!(&call(&pool).unwrap().credential, Credential::Pooled(id) if id == "starmoire")
+        );
+        assert_eq!(cooldowns.until(&key, Utc::now()), None);
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[test]
+    fn a_round_that_succeeds_on_a_pool_account_ends_its_cooldown_and_tells_desk() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let pool = Pool::of(vec![("served-once", "sk-ant-oat01-served", None)]);
+        let login = pooled_for(
+            &f,
+            &pool,
+            &alice(),
+            &AgentOwner::Unowned,
+            &install_policy(),
+            &cooldowns,
+        )
+        .unwrap();
+        let reset = Utc::now() + chrono::Duration::days(2);
+        CooldownStore::global().note(
+            &login.key,
+            &LimitSignal {
+                status: LimitStatus::Rejected,
+                resets_at: Some(reset),
+                window: None,
+            },
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+        let round = RoundEnd {
+            limit: None,
+            usage: Vec::new(),
+            failed: false,
+            notice: "",
+            stderr_tail: "",
+            failure_line: String::new(),
+        };
+        assert!(login.settle(&round, "desk").is_none());
+        assert_eq!(CooldownStore::global().until(&login.key, Utc::now()), None);
+        assert_eq!(pool.served.lock().clone(), vec!["served-once".to_string()]);
         super::super::install_pool::set(&f.global, None);
     }
 
