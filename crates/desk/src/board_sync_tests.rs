@@ -1000,6 +1000,23 @@ fn a_jira_row_says_its_type_epic_links_and_prs() {
             ..Default::default()
         },
         "a bare row says only its state"
+    );
+}
+
+#[test]
+fn a_jira_priority_shows_bars_by_its_place_in_the_site_s_order() {
+    let four: Vec<String> = ["Now", "Soon", "Next", "Later"].map(String::from).to_vec();
+    let ranks: Vec<_> = four.iter().map(|p| priority_rank(p, &four)).collect();
+    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(4)]);
+    let five: Vec<String> = ["Highest", "High", "Medium", "Low", "Lowest"]
+        .map(String::from)
+        .to_vec();
+    let ranks: Vec<_> = five.iter().map(|p| priority_rank(p, &five)).collect();
+    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(3), Some(4)]);
+    assert_eq!(priority_rank("Unknown", &four), None);
+    assert_eq!(priority_rank("Now", &[]), None);
+}
+
 /// PLT-2692's rendered description, as Jira sent it: an issue macro is an
 /// indented span, which made a code block of its key and status.
 const ISSUE_MACRO: &str = "<p>Following the completion of Unified Login (<a href=\"https://acme.atlassian.net/browse/PLT-875\" class=\"external-link\" rel=\"nofollow noreferrer\">PLT-875</a>), this epic covers:</p>\n\n<ol>\n\t<li>Ongoing small fixes.</li>\n\t<li>The next phase, building on the foundation established in \n    <span class=\"jira-issue-macro\" data-jira-key=\"PLT-875\" >\n                <a href=\"https://acme.atlassian.net/browse/PLT-875\" class=\"jira-issue-macro-key issue-link\"  title=\"Unified login\" >\n            <img class=\"icon\" src=\"https://acme.atlassian.net/images/icons/issuetypes/epic.svg\" />\n            PLT-875\n        </a>\n                                                    <span class=\"aui-lozenge aui-lozenge-subtle aui-lozenge-success\">Done</span>\n            </span>\n. This needs scoping out.</li>\n</ol>\n";
@@ -1164,17 +1181,6 @@ fn an_address_that_would_break_its_link_is_dropped() {
 }
 
 #[test]
-fn a_jira_priority_shows_bars_by_its_place_in_the_site_s_order() {
-    let four: Vec<String> = ["Now", "Soon", "Next", "Later"].map(String::from).to_vec();
-    let ranks: Vec<_> = four.iter().map(|p| priority_rank(p, &four)).collect();
-    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(4)]);
-    let five: Vec<String> = ["Highest", "High", "Medium", "Low", "Lowest"]
-        .map(String::from)
-        .to_vec();
-    let ranks: Vec<_> = five.iter().map(|p| priority_rank(p, &five)).collect();
-    assert_eq!(ranks, vec![Some(1), Some(2), Some(3), Some(3), Some(4)]);
-    assert_eq!(priority_rank("Unknown", &four), None);
-    assert_eq!(priority_rank("Now", &[]), None);
 fn preformatted_text_keeps_no_marks_and_its_own_fence() {
     assert_eq!(
         html_text("<pre><b>bold</b> <a href=\"https://x.test/\">x</a></pre>"),
