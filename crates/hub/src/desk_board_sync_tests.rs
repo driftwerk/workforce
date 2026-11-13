@@ -123,6 +123,7 @@ impl Tool for FakeJiraTool {
         }
         let key = input["issue_key"].as_str().unwrap_or_default().to_string();
         let out = match self.name {
+            "jira.list_fields" => json!({ "fields": {}, "priorities": [] }),
             "jira.list_projects" => json!({ "count": 2, "projects": [
                 { "key": "ACME", "id": "1", "name": "Acme web" },
                 { "key": "OPS", "id": "2", "name": "Operations" } ] }),
@@ -327,6 +328,7 @@ pub(crate) fn register_jira(
             "jira.myself",
             "jira.attachment_read",
             "jira.list_comments",
+            "jira.list_fields",
             "jira.list_projects",
         ]
         .iter(),
@@ -1065,7 +1067,10 @@ async fn the_pull_imports_the_filter_s_issues_from_its_own_project_only() {
         assert!(s.cursor.is_some());
         assert_eq!(s.paused, None);
         // Every call went with the person's token, through the hub's tools.
+        // The site's fields are read first, once a day.
         let calls = remote.jira.lock().unwrap().calls.clone();
+        assert_eq!(calls[0].0, "jira.list_fields");
+        let calls = &calls[1..];
         assert!(calls
             .iter()
             .all(|(tool, _)| workforce_desk::board_sync::JIRA_TOOLS.contains(&tool.as_str())));
@@ -1777,6 +1782,7 @@ async fn a_device_token_on_another_agent_sees_only_the_sync_tools() {
         "jira_get_issue",
         "jira_get_project",
         "jira_list_comments",
+        "jira_list_fields",
         "jira_list_projects",
         "jira_list_transitions",
         "jira_myself",
