@@ -120,14 +120,8 @@ pub(crate) fn stamp_tool_whitelist(session: &mut Session) {
     }
 }
 
-/// The tools `session`'s turn is offered, decided in one place for every
-/// turn path: none in a game sandbox; the agent's registry with the
-/// session's local agent standing in for `exec.run`; without outbound
-/// delivery tools when the caller delivers; and narrowed to a whitelist
-/// — `whitelist`, else the turn's declared [`tool_whitelist`], else the
-/// one stamped on the session — as a frozen [`exclusive_registry`].
-///
-/// [`tool_whitelist`]: workforce_agent::runner::tool_whitelist
+/// [`turn_tools_in`] for a turn that isn't its person's own.
+#[cfg(test)]
 pub(crate) async fn turn_tools(
     service: &AgentService,
     session: &Session,
@@ -136,9 +130,16 @@ pub(crate) async fn turn_tools(
     turn_tools_in(service, session, whitelist, false).await
 }
 
-/// [`turn_tools`], and with `private` (the turn's prompt may carry its
-/// person's own context: [`PromptPrivacy::Private`]) what their Desk shared.
+/// The tools `session`'s turn is offered, decided in one place for every
+/// turn path: none in a game sandbox; the agent's registry with the
+/// session's local agent standing in for `exec.run`; without outbound
+/// delivery tools when the caller delivers; and narrowed to a whitelist
+/// — `whitelist`, else the turn's declared [`tool_whitelist`], else the
+/// one stamped on the session — as a frozen [`exclusive_registry`]. With
+/// `private` (the turn's prompt may carry its person's own context:
+/// [`PromptPrivacy::Private`]), also what their Desk shared.
 ///
+/// [`tool_whitelist`]: workforce_agent::runner::tool_whitelist
 /// [`PromptPrivacy::Private`]: workforce_hub_core::serve::PromptPrivacy::Private
 pub(crate) async fn turn_tools_in(
     service: &AgentService,

@@ -329,7 +329,7 @@ impl KnowsStore for MemoryKnows {
             })
             .collect();
         // Exchanges Desk flagged as reading like instructions go last.
-        hits.sort_by_key(|i| flagged(i));
+        hits.sort_by_key(flagged);
         hits.truncate(usize::try_from(read.limit).unwrap_or(0));
         Ok(hits)
     }

@@ -341,11 +341,21 @@ impl Work {
         if hits.is_empty() {
             return Ok("Nothing shared matches that.".into());
         }
+        // A conversation's exchanges name their session by its account.
+        let accounts = self.kind("account", Read::default()).await?;
+        let named = |id: &str| {
+            accounts
+                .iter()
+                .find(|a| a.session.as_deref() == Some(id))
+                .map(|a| s(&a.body, "name"))
+                .filter(|n| !n.is_empty())
+        };
         let mut out = String::new();
         for h in hits {
             let name = [s(&h.body, "session"), s(&h.body, "name")]
                 .into_iter()
                 .find(|n| !n.is_empty())
+                .or_else(|| h.session.as_deref().and_then(named))
                 .or(h.session.as_deref())
                 .unwrap_or("");
             out.push_str(&format!(
