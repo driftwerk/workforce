@@ -1805,6 +1805,7 @@ mod allow_at_once;
 
 mod decisions;
 mod items;
+mod preferences;
 mod promises;
 mod updates;
 
