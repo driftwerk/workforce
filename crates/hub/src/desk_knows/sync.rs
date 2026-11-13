@@ -307,24 +307,45 @@ impl KnowsSync {
         if pending.is_empty() {
             return Ok(());
         }
-        let size: usize = pending.iter().map(Outgoing::bytes).sum();
+        let mut size: usize = pending.iter().map(Outgoing::bytes).sum();
         let mut landed = self.push(&target, &pending).await;
+        let mut count = pending.len();
+        let mut done: Vec<Outgoing> = Vec::new();
         // One item the agent's hub won't take must not hold up the rest:
         // each is tried alone, and one refused as it is is passed over (it
         // would be refused again), named in the log by its kind and ref.
-        if matches!(landed, Err(Failed::Rejected(_))) {
+        // When none at all is taken the hub is refusing the feed (a version
+        // it can't read, say), so nothing is marked and the agent backs off:
+        // otherwise its whole feed would be counted as held and never resent.
+        let one_by_one = matches!(landed, Err(Failed::Rejected(_)));
+        if one_by_one {
             landed = Ok(());
+            count = 0;
+            size = 0;
+            let mut passed = Vec::new();
             for o in &pending {
                 match self.push(&target, std::slice::from_ref(o)).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        count += 1;
+                        size += o.bytes();
+                        done.push(o.clone());
+                    }
                     Err(Failed::Rejected(why)) => {
                         tracing::warn!(agent = %agent, kind = %o.held.kind, reference = %o.held.reference, why = %why, "the agent's hub won't take an item; passed over");
+                        passed.push(o.clone());
                     }
                     Err(e) => {
                         landed = Err(e);
                         break;
                     }
                 }
+            }
+            if landed.is_ok() && count == 0 {
+                landed = Err(Failed::Refused(
+                    "the agent's hub took none of the items".to_string(),
+                ));
+            } else {
+                done.extend(passed);
             }
         }
         {
@@ -333,17 +354,25 @@ impl KnowsSync {
             match &landed {
                 Ok(()) => {
                     s.backoff = None;
-                    s.sent.push_back((now, pending.len(), size));
+                    s.sent.push_back((now, count, size));
                 }
-                Err(e) => s.failed(now, matches!(e, Failed::Refused(_))),
+                Err(e) => {
+                    if count > 0 {
+                        s.sent.push_back((now, count, size));
+                    }
+                    s.failed(now, matches!(e, Failed::Refused(_)))
+                }
             }
         }
+        let marked: &[Outgoing] = if one_by_one { &done } else { &pending };
+        if !marked.is_empty() {
+            self.desk
+                .knows_mark_sent(agent, marked, Utc::now())
+                .await
+                .map_err(|e| Failed::Retry(e.to_string()))?;
+        }
         landed?;
-        self.desk
-            .knows_mark_sent(agent, &pending, Utc::now())
-            .await
-            .map_err(|e| Failed::Retry(e.to_string()))?;
-        tracing::info!(target: "sentinel.audit", agent = %agent, items = pending.len(), bytes = size, "Desk shared work with an agent");
+        tracing::info!(target: "sentinel.audit", agent = %agent, items = count, bytes = size, "Desk shared work with an agent");
         Ok(())
     }
 
