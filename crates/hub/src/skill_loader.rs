@@ -29,7 +29,7 @@ use workforce_agent::llm::environment::SkillVariants;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::Tool;
 use workforce_common::settings::WorkforceConfig;
-use workforce_skills::adapters::auth::shared_get;
+use workforce_skills::adapters::auth::{address_for, shared_get};
 
 use crate::serve::AgentService;
 use crate::vault::Vault;
@@ -1676,6 +1676,23 @@ fn credential_families() -> Vec<CatalogEntry> {
     entries
 }
 
+/// Settings an instance of a Desk connector holds beside its keys, which
+/// its adapter reads: `(connector, key, what it is)`.
+pub const INSTANCE_SETTINGS: &[(&str, &str, &str)] = &[
+    ("github", "base_url", "API address (GitHub Enterprise)"),
+    ("github", "app_id", "GitHub App id"),
+    ("github", "app_private_key", "GitHub App private key"),
+    ("jira", "default_project", "Default project key"),
+    ("linear", "default_team_id", "Default team id"),
+    ("datadog", "base_url", "API address"),
+    ("email", "imap_port", "IMAP port"),
+    ("email", "smtp_port", "SMTP port"),
+    ("email", "tls", "Use TLS"),
+    ("email", "display_name", "Display name"),
+    ("email", "connect_timeout_secs", "Connect timeout (seconds)"),
+    ("email", "command_timeout_secs", "Command timeout (seconds)"),
+];
+
 /// Per-skill "default <thing>" selector pointers (`skills/<skill>/default_<x>`)
 /// that pick the active workspace when a tool omits it. Recognised + addable so
 /// the pointer is never badged unrecognised. Suffixes are irregular (xero uses
@@ -1841,6 +1858,69 @@ pub fn credential_catalog() -> Vec<CatalogEntry> {
                     per_user_allowed: meta.default_scope.allows_per_user(),
                     required: wc.required,
                     description: wc.description.to_string(),
+                    multiline: false,
+                });
+            }
+            // What else an instance of a Desk connector holds that its
+            // adapter reads: moved with it from where a single connection
+            // kept it.
+            for (connector, key, description) in INSTANCE_SETTINGS {
+                let template = format!("{prefix}{{{var_name}}}/{key}");
+                if *connector != meta.tool_prefix
+                    || dotted
+                    || entries
+                        .iter()
+                        .any(|e: &CatalogEntry| e.template == template)
+                {
+                    continue;
+                }
+                entries.push(CatalogEntry {
+                    id: template.clone(),
+                    skill: Some(meta.name.to_string()),
+                    group: group.clone(),
+                    label: format!("{} — {description} (per {var_name})", meta.name),
+                    template,
+                    variables: vec![CatalogVariable {
+                        name: var_name.to_string(),
+                        label: var_label.to_string(),
+                        placeholder: "change-me".to_string(),
+                        example: None,
+                    }],
+                    source: "builtin",
+                    addable: true,
+                    scope,
+                    managed_by: managed,
+                    per_user_allowed: meta.default_scope.allows_per_user(),
+                    required: false,
+                    description: description.to_string(),
+                    multiline: false,
+                });
+            }
+            // The name a person gave the connection in Desk's Connections:
+            // not a secret, kept beside its keys at its tier.
+            if workforce_common::connector_binding::CONNECTORS.contains(&meta.tool_prefix)
+                && !dotted
+            {
+                let template = format!("{prefix}{{{var_name}}}/label");
+                entries.push(CatalogEntry {
+                    id: template.clone(),
+                    skill: Some(meta.name.to_string()),
+                    group: group.clone(),
+                    label: format!("{} — connection name (per {var_name})", meta.name),
+                    template,
+                    variables: vec![CatalogVariable {
+                        name: var_name.to_string(),
+                        label: var_label.to_string(),
+                        placeholder: "change-me".to_string(),
+                        example: None,
+                    }],
+                    source: "builtin",
+                    addable: false,
+                    scope,
+                    managed_by: managed,
+                    per_user_allowed: meta.default_scope.allows_per_user(),
+                    required: false,
+                    description: "The name Desk shows for this connection".to_string(),
                     multiline: false,
                 });
             }
@@ -2234,7 +2314,9 @@ pub fn load_skill_from_vault(
     }
     LOADING_PINS.with(|p| *p.borrow_mut() = Some(registry.credential_pins()));
     let _loading = Loading;
-    match skill_name {
+    let names_store = workforce_common::connector_binding::instance_prefix(skill_name)
+        .map(|_| layered_user_store(Arc::clone(&vault), global_vault.clone()));
+    let loaded = match skill_name {
         "github" => load_github_from_vault(vault, global_vault, config, registry),
         "google" => load_google_from_vault(vault, global_vault, registry),
         "linear" => load_linear_from_vault(vault, global_vault, config, registry),
@@ -2252,7 +2334,104 @@ pub fn load_skill_from_vault(
         "obscura" => load_obscura_from_vault(vault, global_vault, config, registry),
         "email" => load_email_from_vault(vault, global_vault, config, registry),
         _ => Err(eyre::eyre!("Unknown built-in skill: {}", skill_name)),
+    };
+    loaded.map(|mut loaded| {
+        if let Some(names) = names_store
+            .as_deref()
+            .and_then(|store| connection_names(skill_name, store))
+        {
+            loaded.context_hint = Some(match loaded.context_hint.take() {
+                Some(hint) => format!("{hint}\n{names}"),
+                None => names,
+            });
+        }
+        loaded
+    })
+}
+
+/// The default instance the loading agent's connections name for
+/// `connector` (`[skills.connections]`), if they name one.
+fn pinned_default(connector: &str) -> Option<String> {
+    LOADING_PINS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .and_then(|slot| slot.default_instance(connector))
+    })
+}
+
+/// The instance a call naming none gets: the one the agent's connections
+/// name first, else the hub-wide selector at `path`.
+fn selector(
+    store: &dyn workforce_common::settings::SecretStore,
+    connector: &str,
+    path: &str,
+) -> Option<String> {
+    pinned_default(connector).or_else(|| shared_get(store, path))
+}
+
+/// What the agent is told of `connector`'s connections it may use: each by
+/// the name the person gave it in Desk, which is its default and which only
+/// read, and, with several, to ask when a request doesn't say and to say
+/// which it used. `None` where none is named.
+fn connection_names(
+    connector: &str,
+    store: &dyn workforce_common::settings::SecretStore,
+) -> Option<String> {
+    let prefix = workforce_common::connector_binding::instance_prefix(connector)?;
+    let mut named: Vec<(String, String)> = store
+        .list(Some(prefix))
+        .into_iter()
+        .filter_map(|path| {
+            let key = path
+                .strip_prefix(prefix)?
+                .strip_suffix("/label")?
+                .to_string();
+            let label: String = store
+                .get(&path)?
+                .chars()
+                .filter(|c| !c.is_control() && *c != '"')
+                .take(80)
+                .collect();
+            Some((key, label.trim().to_string()))
+        })
+        .filter(|(key, label)| !key.contains('/') && !label.is_empty())
+        .collect();
+    named.sort();
+    named.dedup_by(|a, b| a.0 == b.0);
+    if named.is_empty() {
+        return None;
     }
+    let pins = LOADING_PINS.with(|p| p.borrow().clone());
+    let default = pinned_default(connector);
+    let parts: Vec<String> = named
+        .iter()
+        .map(|(key, label)| {
+            let mut notes = Vec::new();
+            if default.as_deref() == Some(key.as_str()) {
+                notes.push("default");
+            }
+            if pins
+                .as_ref()
+                .is_some_and(|p| p.read_only_instance(connector, key))
+            {
+                notes.push("read only");
+            }
+            match notes.is_empty() {
+                true => format!("\"{key}\" is {label}"),
+                false => format!("\"{key}\" is {label} ({})", notes.join(", ")),
+            }
+        })
+        .collect();
+    let mut said = format!(
+        "Your {connector} connections, by the names the person uses for them: {}.",
+        parts.join(", ")
+    );
+    if named.len() > 1 {
+        said.push_str(
+            " When a request doesn't make clear which one it means, ask. When you use one, say which.",
+        );
+    }
+    Some(said)
 }
 
 /// The instance the skill will use when a call names none, by the adapters'
@@ -2280,7 +2459,7 @@ fn github_vault_config(
         .filter_map(|path| {
             let name = path.strip_prefix(prefix)?.strip_suffix(suffix)?.to_string();
             let token = store.get(&path)?;
-            let base_url = shared_get(store, &format!("{prefix}{name}/base_url"))
+            let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"))
                 .unwrap_or_else(|| config.github.base_url.clone());
             Some((
                 name.clone(),
@@ -2293,7 +2472,7 @@ fn github_vault_config(
         })
         .collect();
 
-    let default_workspace = shared_get(store, "skills/github/default_workspace");
+    let default_workspace = selector(store, "github", "skills/github/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2423,7 +2602,8 @@ fn load_google_from_vault(
         }
     }
 
-    let default_ws = vault.get("skills/google/default_workspace");
+    let default_ws =
+        pinned_default("google").or_else(|| vault.get("skills/google/default_workspace"));
 
     // Build GoogleApi per workspace.
     let mut account_apis: std::collections::HashMap<String, Arc<GoogleApi>> =
@@ -2564,7 +2744,7 @@ fn linear_vault_config(
         }
     }
 
-    let default_workspace = shared_get(store, "skills/linear/default_workspace");
+    let default_workspace = selector(store, "linear", "skills/linear/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2707,7 +2887,7 @@ fn jira_vault_config(
             warn!(workspace = name, "Skipping Jira workspace: missing email");
             continue;
         };
-        let site = shared_get(store, &format!("{prefix}{name}/site"));
+        let site = address_for(store, &path, &format!("{prefix}{name}/site"));
         let default_project = shared_get(store, &format!("{prefix}{name}/default_project"));
 
         let project_keys: Vec<String> = shared_get(store, &format!("{prefix}{name}/project_keys"))
@@ -2735,7 +2915,7 @@ fn jira_vault_config(
         );
     }
 
-    let default_workspace = shared_get(store, "skills/jira/default_workspace");
+    let default_workspace = selector(store, "jira", "skills/jira/default_workspace");
     let effective_default = effective_default(&workspaces, default_workspace.as_deref());
 
     let context_hint = if !workspaces.is_empty() {
@@ -2796,7 +2976,7 @@ fn jira_vault_config(
         let api_token = store
             .get("skills/jira/api_token")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/jira/api_token'"))?;
-        let site = shared_get(store, "skills/jira/site");
+        let site = address_for(store, "skills/jira/api_token", "skills/jira/site");
         let default_project = shared_get(store, "skills/jira/default_project");
 
         workforce_skills::adapters::jira::JiraSkillConfig {
@@ -2881,9 +3061,9 @@ fn datadog_vault_config(
             warn!(account = name, "Skipping Datadog account: missing app_key");
             continue;
         };
-        let site =
-            shared_get(store, &format!("{prefix}{name}/site")).unwrap_or_else(|| "us1".to_string());
-        let base_url = shared_get(store, &format!("{prefix}{name}/base_url"));
+        let site = address_for(store, &path, &format!("{prefix}{name}/site"))
+            .unwrap_or_else(|| "us1".to_string());
+        let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"));
 
         accounts.insert(
             name.to_string(),
@@ -2896,7 +3076,7 @@ fn datadog_vault_config(
         );
     }
 
-    let default_account = shared_get(store, "skills/datadog/default_account");
+    let default_account = selector(store, "datadog", "skills/datadog/default_account");
     let effective_default = effective_default(&accounts, default_account.as_deref());
 
     let context_hint = if !accounts.is_empty() {
@@ -2938,8 +3118,8 @@ fn datadog_vault_config(
         let app_key = store
             .get("skills/datadog/app_key")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/datadog/app_key'"))?;
-        let site = shared_get(store, "skills/datadog/site");
-        let base_url = shared_get(store, "skills/datadog/base_url");
+        let site = address_for(store, "skills/datadog/api_key", "skills/datadog/site");
+        let base_url = address_for(store, "skills/datadog/api_key", "skills/datadog/base_url");
 
         workforce_skills::adapters::datadog::DatadogSkillConfig {
             api_key: Some(api_key),
@@ -3012,7 +3192,7 @@ fn metabase_vault_config(
         let Some(api_key) = store.get(&path) else {
             continue;
         };
-        let site_url = shared_get(store, &format!("{prefix}{name}/site_url"));
+        let site_url = address_for(store, &path, &format!("{prefix}{name}/site_url"));
         let max_query_rows = shared_get(store, &format!("{prefix}{name}/max_query_rows"))
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -3027,7 +3207,7 @@ fn metabase_vault_config(
         );
     }
 
-    let default_instance = shared_get(store, "skills/metabase/default_instance");
+    let default_instance = selector(store, "metabase", "skills/metabase/default_instance");
     let effective_default = effective_default(&instances, default_instance.as_deref());
 
     let context_hint = if !instances.is_empty() {
@@ -3067,7 +3247,7 @@ fn metabase_vault_config(
                  - vault.set('skills/metabase/instances/<name>/{{api_key,site_url}}', '...') for multi-instance"
             )
         })?;
-        let site_url = shared_get(store, "skills/metabase/site_url");
+        let site_url = address_for(store, "skills/metabase/api_key", "skills/metabase/site_url");
         let max_query_rows = shared_get(store, "skills/metabase/max_query_rows")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -4125,7 +4305,7 @@ fn load_email_from_vault(
         });
     }
 
-    let default_account = shared_get(store.as_ref(), "skills/email/default_account");
+    let default_account = selector(store.as_ref(), "email", "skills/email/default_account");
 
     let context_hint = {
         let mut parts: Vec<String> = accounts
@@ -4388,6 +4568,44 @@ pub(crate) fn ensure_adapters_loaded(service: &AgentService, wanted: impl Fn(&st
 
 #[cfg(test)]
 mod tests {
+    /// On a hub running Desk, a connection's address is the one kept with
+    /// its key: a site an agent wrote at its own tier is never where the
+    /// person's key goes, at load or per request.
+    #[tokio::test]
+    async fn on_desk_a_connections_address_is_the_one_kept_with_its_key() {
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin};
+        struct Every;
+        impl PinSource for Every {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
+        let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
+        let ws = |f: &str| format!("skills/jira/workspaces/acme/{f}");
+        for (f, v) in [
+            ("site", "https://acme.atlassian.net"),
+            ("email", "sam@acme.example"),
+            ("api_token", "person-token"),
+        ] {
+            global.set(&format!("users/sam/{}", ws(f)), v).unwrap();
+        }
+        agent.set(&ws("site"), "https://evil.example").unwrap();
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Every));
+        let store = crate::user_config::LayeredUserVault::new(agent, Some(global)).with_pins(pins);
+        workforce_agent::runner::CURRENT_USER_ID
+            .scope("sam".to_string(), async move {
+                let (config, _) = jira_vault_config(&store).unwrap();
+                assert_eq!(
+                    config.workspaces["acme"].site.as_deref(),
+                    Some("https://acme.atlassian.net")
+                );
+            })
+            .await;
+    }
+
     use super::*;
     use workforce_agent::runner::CURRENT_USER_ID;
     use workforce_agent::tools::registry::ToolRegistry;

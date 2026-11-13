@@ -32,7 +32,34 @@ pub struct DormantInstance {
 /// unvalidated, so the caller's own `clients.get(name)` lookup produces its usual
 /// "unknown instance" error. Bound, a `requested` outside the set is refused and
 /// the chosen pin must be one the skill loaded.
+///
+/// Whichever way the instance is chosen, a write the agent's connections say
+/// only reads there is refused ([`read_only`]).
 pub fn resolve_instance<V>(
+    skill: &str,
+    requested: Option<&str>,
+    default: &str,
+    clients: &HashMap<String, V>,
+) -> Result<String, DormantInstance> {
+    let chosen = choose_instance(skill, requested, default, clients)?;
+    match workforce_common::credential_pin::write_refused(skill, &chosen) {
+        true => Err(DormantInstance {
+            message: read_only(skill, &chosen),
+        }),
+        false => Ok(chosen),
+    }
+}
+
+/// Why a write to `instance` of `skill` didn't happen.
+fn read_only(skill: &str, instance: &str) -> String {
+    format!(
+        "The `{instance}` connection of {skill} only reads for this agent, so nothing was changed. \
+         The person allows changes to it in the agent's Connectors in Desk; say which connection \
+         you would have used."
+    )
+}
+
+fn choose_instance<V>(
     skill: &str,
     requested: Option<&str>,
     default: &str,
@@ -150,6 +177,48 @@ mod tests {
         ACTIVE_ENVIRONMENT.sync_scope(name.to_string(), || {
             ACTIVE_SKILL_INSTANCES.sync_scope(pins, f)
         })
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_connection_that_only_reads_is_refused_however_it_was_chosen() {
+        use std::sync::Arc;
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin, Writing};
+        struct Globex;
+        impl PinSource for Globex {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn read_only_instance(&self, skill: &str, instance: &str) -> bool {
+                (skill, instance) == ("jira", "globex")
+            }
+        }
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Globex));
+        let c = clients(&["acme", "globex"]);
+        let writing = Writing {
+            connector: "jira".into(),
+            pins,
+        };
+        writing
+            .scope(async {
+                // Named, by default, and by an environment's pin alike.
+                let named = resolve_instance("jira", Some("globex"), "acme", &c).unwrap_err();
+                assert!(named.message.contains("only reads"), "{}", named.message);
+                assert!(resolve_instance("jira", None, "globex", &c).is_err());
+                with_env("work", &[("jira", &["globex"])], || {
+                    assert!(resolve_instance("jira", None, "acme", &c).is_err());
+                });
+                assert_eq!(
+                    resolve_instance("jira", Some("acme"), "globex", &c).unwrap(),
+                    "acme"
+                );
+            })
+            .await;
+        // A read to it goes ahead.
+        assert_eq!(
+            resolve_instance("jira", Some("globex"), "acme", &c).unwrap(),
+            "globex"
+        );
     }
 
     #[test]
