@@ -189,7 +189,11 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         assert_eq!(r.status, ServedStatus::Refused, "{:?}", r.body);
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a0));
         eventually("left to the person", async || {
-            d.view(started).unwrap().waits_on_you.is_some().then_some(())
+            d.view(started)
+                .unwrap()
+                .waits_on_you
+                .is_some()
+                .then_some(())
         })
         .await;
         let rows = d
@@ -203,7 +207,11 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             .unwrap_or_else(|| panic!("{rows:?}"));
         assert_eq!(left.how, How::Escalated);
         assert!(left.why.contains("isn't connected"), "{}", left.why);
-        assert!(left.what.contains("(by allan on driftwerk)"), "{}", left.what);
+        assert!(
+            left.what.contains("(by allan on driftwerk)"),
+            "{}",
+            left.what
+        );
         d.decide(started, a0, workforce_desk::model::Decision::Deny, None)
             .unwrap();
         let _ = asked.await;
@@ -253,7 +261,10 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         let behaviour = &answered["hookSpecificOutput"]["decision"];
         assert_eq!(behaviour["behavior"], "deny", "{answered}");
         assert!(
-            behaviour["message"].as_str().unwrap_or_default().contains("cargo clean"),
+            behaviour["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cargo clean"),
             "{answered}"
         );
 
@@ -269,7 +280,11 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             );
         }
         eventually("left to the person", async || {
-            d.view(started).unwrap().waits_on_you.is_some().then_some(())
+            d.view(started)
+                .unwrap()
+                .waits_on_you
+                .is_some()
+                .then_some(())
         })
         .await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a3));
