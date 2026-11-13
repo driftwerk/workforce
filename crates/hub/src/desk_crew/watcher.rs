@@ -391,12 +391,21 @@ impl CrewHub {
             // is a request Desk allows at once itself (`allow`).
             Kind::NeedsYou => {
                 unbound
-                    && !subject
-                        .id
-                        .parse()
-                        .ok()
-                        .and_then(|s| self.desk.view(s).ok())
-                        .is_some_and(|v| self.answers_at_once(&v))
+                    && match event.approval_id.as_deref() {
+                        // A request: only while it still waits and isn't
+                        // one Desk allows at once itself (`allow`), which
+                        // has often answered it by now.
+                        Some(a) => subject
+                            .id
+                            .parse()
+                            .ok()
+                            .and_then(|s| self.desk.view(s).ok())
+                            .is_some_and(|v| {
+                                v.pending.as_ref().is_some_and(|p| p.id.to_string() == a)
+                                    && !self.answers_at_once(&v)
+                            }),
+                        None => true,
+                    }
             }
             _ => false,
         };

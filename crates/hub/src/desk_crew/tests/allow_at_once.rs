@@ -5,7 +5,8 @@
 //! turn wouldn't approve, as its view of it was cut short) is allowed the
 //! moment it is asked, with no turn of the boss's, while the person drives
 //! the session too, and kept as the boss's decision. What reads its own
-//! settings waits, and its DM says so.
+//! settings wait, however the command reaches them, and so does what a
+//! session Desk's breaker paused asks; its DM says each once.
 
 use super::*;
 use workforce_desk::charge::How;
@@ -75,6 +76,27 @@ async fn act_fully_allows_a_read_with_a_variable_at_once_and_keeps_it_as_a_decis
             calls,
             "no model call stood between the request and its answer"
         );
+        // Past the coalesce window too, no turn was woken for it: a turn
+        // the boss's own sweep wakes may carry it in Desk's notes on its
+        // crew, never as what it is woken for.
+        tokio::time::sleep(FAST.coalesce * 4).await;
+        let woken: Vec<String> = llm
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"].to_string())
+            // What it is woken with, past the hub's per-turn context.
+            .filter(|c| {
+                c.rsplit("END SYSTEM CONTEXT")
+                    .next()
+                    .is_some_and(|asked| asked.contains("man-567"))
+            })
+            .collect();
+        assert!(woken.is_empty(), "woken for an allowed request: {woken:?}");
         let kept = eventually("its decision", async || {
             let rows = d.store().decisions_since("desk", since, 50).await.unwrap();
             rows.into_iter().find(|r| r.session == Some(s.id))
@@ -95,29 +117,39 @@ async fn act_fully_allows_a_read_with_a_variable_at_once_and_keeps_it_as_a_decis
             .unwrap();
         assert_eq!(behavior(&answer), "allow", "{answer}");
 
-        // Its own settings, where its budget is, wait on the person, and
-        // its DM says so.
-        let own = format!("cat {}", overseer.workspace.join("config.toml").display());
+        // Its own settings, where its budget is, wait on the person, however
+        // the command reaches them, and its DM says so once.
+        let ws = overseer.workspace.display().to_string();
+        let own = format!("M={ws}; sed -n 1,5p $M/config.toml");
         let waits = asked(&url, &own);
         let p = eventually("its own settings, waiting", async || {
             d.view(s.id).unwrap().pending.filter(|p| p.detail == own)
         })
         .await;
-        eventually("the DM to say it waits", async || {
-            let dm = overseer
+        let said = || {
+            overseer
                 .sessions
                 .find(DESK_CHANNEL, PERSON)
                 .ok()
-                .flatten()?;
-            dm.messages
-                .iter()
-                .any(|m| {
-                    m.content.contains("is waiting on you to allow")
-                        && m.content.contains("config.toml")
+                .flatten()
+                .map_or(0, |dm| {
+                    dm.messages
+                        .iter()
+                        .filter(|m| {
+                            m.content.contains("is waiting on you to allow")
+                                && m.content.contains("config.toml")
+                        })
+                        .count()
                 })
-                .then_some(())
+        };
+        eventually("the DM to say it waits", async || {
+            (said() > 0).then_some(())
         })
         .await;
+        // Several sweeps on, it is still said once, and still waits.
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert_eq!(said(), 1, "said once");
+        assert!(d.view(s.id).unwrap().pending.is_some_and(|q| q.id == p.id));
         d.decide(
             s.id,
             p.id,
@@ -126,6 +158,50 @@ async fn act_fully_allows_a_read_with_a_variable_at_once_and_keeps_it_as_a_decis
         )
         .unwrap();
         assert_eq!(behavior(&waits.await.unwrap()), "deny");
+
+        // A session Desk's breaker paused goes on only at the person's
+        // word: what it asks waits, and is allowed once they say Continue.
+        d.set_breaker_rules(workforce_desk::Rules { loops: true })
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            hook(
+                &url,
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test -p acme"}}),
+            )
+            .await;
+        }
+        let subject = format!("session:{}", s.id);
+        eventually("the breaker to pause it", async || {
+            d.breaker_needs()
+                .into_iter()
+                .find(|n| n.id == format!("breaker:{subject}"))
+        })
+        .await;
+        let paused = asked(&url, "ls");
+        eventually("the DM to say the breaker holds it", async || {
+            let dm = overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .ok()
+                .flatten()?;
+            dm.messages
+                .iter()
+                .any(|m| m.content.contains("`Bash(ls)`") && m.content.contains("breaker"))
+                .then_some(())
+        })
+        .await;
+        assert!(
+            d.view(s.id).unwrap().pending.is_some(),
+            "the breaker holds it"
+        );
+        d.breaker_continue(&subject, By::you()).unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), paused)
+            .await
+            .expect("allowed once the person lets it go on")
+            .unwrap();
+        assert_eq!(behavior(&answer), "allow", "{answer}");
     })
     .await;
 }

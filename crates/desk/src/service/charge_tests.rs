@@ -1094,3 +1094,40 @@ async fn a_held_bosss_queued_messages_are_withdrawn() {
     })
     .await;
 }
+
+/// What reaches an agent's own settings is told however it is written:
+/// what Act fully allows at once must never be one of them.
+#[test]
+fn a_command_that_may_reach_an_agents_settings_is_told_however_it_is_written() {
+    let home = std::path::Path::new("/h");
+    let ws = std::path::Path::new("/h/.workforce/agents/desk");
+    let settings = vec![ws.join("config.toml"), ws.join("heartbeats")];
+    let elsewhere = std::path::Path::new("/h/dev/acme");
+    let may = |c: &str| command_may_touch_settings(c, elsewhere, &settings, home);
+    for c in [
+        "cat /h/.workforce/agents/desk/config.toml",
+        "cat ~/.workforce/agents/desk/config.toml",
+        "cat $HOME/.workforce/agents/desk/config.toml",
+        "cat ${HOME}/.workforce/agents/desk/config.toml",
+        "cat /h/.workforce//agents/desk/./config.toml",
+        "cd /h/.workforce/agents/desk && sed -i s/a/b/ config.toml",
+        "M=/h/.workforce/agents/desk; echo x >> $M/config.toml",
+        "cat $W/config.toml",
+        "cat ../../.workforce/agents/*/config.toml",
+        "ls `pwd`/heartbeats",
+    ] {
+        assert!(may(c), "{c}");
+    }
+    assert!(
+        command_may_touch_settings("cat config.toml", ws, &settings, home),
+        "run inside a workspace"
+    );
+    for c in [
+        "M=/x/memory; cat $M/a.md | head -80",
+        "cat config.toml",
+        "cargo test -p acme",
+        "gh pr view 551",
+    ] {
+        assert!(!may(c), "{c}");
+    }
+}

@@ -11,7 +11,7 @@
 //! (one of those, or a request asked in a terminal Desk can't answer) is
 //! said once in the boss's DM, so nothing waits on the person unsaid.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use workforce_desk::model::{DeskEvent, SessionView};
 
 use super::actions::Action;
 use super::watcher::tracked;
-use super::{name_of, CrewHub};
+use super::{name_of, CrewHub, FULL_SPEND_UNREAD};
 
 /// How often every waiting request is looked at again, whatever events
 /// were missed.
@@ -35,6 +35,9 @@ const SWEEP: Duration = Duration::from_secs(2);
 /// Why an unbound boss allowed a request, as its decision says.
 pub(super) const WHY: &str = "Act fully: every request is allowed at once";
 
+/// How much of a request its decision and a DM show.
+const SHOWN: usize = 200;
+
 /// What became of a request Desk looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -42,16 +45,23 @@ pub(crate) enum Outcome {
     Allowed(String),
     /// Not the unbound boss's: the usual rules answer it.
     NotOurs,
-    /// Its boss is unbound but it can't be allowed: why, as said in its DM.
+    /// Its boss is unbound but it can't be allowed yet, for a moment (a
+    /// start not settled): looked at again, and said to no one.
+    Soon,
+    /// Its boss is unbound (or at Act fully, not in force) but it can't be
+    /// allowed: why, as said in its DM.
     Waits(String),
 }
+
+/// What was said in the DMs of requests that wait: by request, its boss
+/// and why. Each reason is said once a boss while it holds anything.
+pub(crate) type Told = HashMap<Uuid, (String, String)>;
 
 pub(super) async fn allow_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
     let mut sweep = tokio::time::interval(SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The requests whose wait was said in a DM: each once.
-    let mut told: HashSet<Uuid> = HashSet::new();
+    let mut told = Told::new();
     loop {
         let sessions: Vec<Uuid> = tokio::select! {
             () = cancel.cancelled() => return,
@@ -67,7 +77,12 @@ pub(super) async fn allow_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Err(RecvError::Lagged(_)) => waiting(&crew),
                 Err(RecvError::Closed) => return,
             },
-            _ = sweep.tick() => waiting(&crew),
+            // With no boss unbound, a sweep has nothing to allow; what is
+            // asked is still looked at as it comes, to say why it waits.
+            _ = sweep.tick() => match crew.desk.any_boss_unbound() {
+                true => waiting(&crew),
+                false => Vec::new(),
+            },
         };
         for id in sessions {
             crew.allow_waiting(id, &mut told).await;
@@ -80,7 +95,7 @@ pub(super) async fn allow_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 .into_iter()
                 .filter_map(|v| v.pending.map(|p| p.id))
                 .collect();
-            told.retain(|a| open.contains(a));
+            told.retain(|a, _| open.contains(a));
         }
     }
 }
@@ -95,6 +110,22 @@ fn waiting(crew: &CrewHub) -> Vec<Uuid> {
         .collect()
 }
 
+/// A request as a decision or a DM shows it: one line, clipped. Desk's
+/// `tool` names what it asks already (`Bash(ls)`) when it can.
+fn shown(tool: &str, detail: &str) -> String {
+    let whole = match detail.trim() {
+        d if d.is_empty() || tool.contains('(') => tool.to_string(),
+        d => format!("{tool}({d})"),
+    };
+    workforce_desk::crew::one_line(&whole, SHOWN)
+}
+
+/// A request's text, quoted where a model reads it as the session's words,
+/// never Desk's.
+fn quoted(ask: &str) -> String {
+    format!("`{}`", ask.replace('`', "'"))
+}
+
 impl CrewHub {
     /// The boss over `view`: the one that runs it, else the overseer whose
     /// scope sees it and tracks its kind.
@@ -102,7 +133,7 @@ impl CrewHub {
         if let Some(c) = self.desk.charge_of(view.id).filter(|c| c.live()) {
             return Some(c.boss);
         }
-        let (s, o) = self.overseer_of_group(view.group.as_ref().map(|g| g.id.as_str()))?;
+        let (s, o) = self.overseer_of_session(view.id)?;
         (o.level != Level::Watch && tracked(&o, &Party::session(view)))
             .then(|| s.agent_id.as_str().to_string())
     }
@@ -117,30 +148,9 @@ impl CrewHub {
     }
 
     /// Allows session `id`'s waiting request, when its boss is unbound.
-    /// What can't be allowed is said in the boss's DM, once (`told`).
-    pub(crate) async fn allow_waiting(&self, id: Uuid, told: &mut HashSet<Uuid>) -> Outcome {
-        let outcome = self.allow_now(id).await;
-        let (Outcome::Waits(why), Ok(view)) = (&outcome, self.desk.view(id)) else {
-            return outcome;
-        };
-        let Some(p) = view.pending.as_ref() else {
-            return outcome;
-        };
-        if told.insert(p.id) {
-            if let Some(boss) = self.boss_over(&view) {
-                let ask = format!("{}({})", p.tool, p.detail);
-                let ask = workforce_desk::crew::clip(ask.trim_end_matches("()"), 200);
-                self.tell_dm(
-                    &boss,
-                    &format!("{} is waiting on you to allow {ask}: {why}", view.label()),
-                )
-                .await;
-            }
-        }
-        outcome
-    }
-
-    async fn allow_now(&self, id: Uuid) -> Outcome {
+    /// What can't be allowed is said in the boss's DM, each reason once
+    /// a boss while it holds anything (`told`).
+    pub(crate) async fn allow_waiting(&self, id: Uuid, told: &mut Told) -> Outcome {
         let Ok(view) = self.desk.view(id) else {
             return Outcome::NotOurs;
         };
@@ -150,17 +160,56 @@ impl CrewHub {
         let Some(boss) = self.boss_over(&view) else {
             return Outcome::NotOurs;
         };
-        if !self.desk.boss_unbound(&boss) {
-            // At Act fully but not in force (its budget spent, its spend
-            // unread): the person is told, and the boss acts within Desk.
-            if let Some((_, o)) = self.overseer_named(&boss) {
+        let outcome = self
+            .allow_now(&view, &p, &boss, told.contains_key(&p.id))
+            .await;
+        let Outcome::Waits(why) = &outcome else {
+            return outcome;
+        };
+        if told.contains_key(&p.id) {
+            return outcome;
+        }
+        let said = told.values().any(|(b, w)| *b == boss && w == why);
+        told.insert(p.id, (boss.clone(), why.clone()));
+        if !said {
+            let ask = quoted(&shown(&p.tool, &p.detail));
+            self.tell_dm(
+                &boss,
+                &format!("{} is waiting on you to allow {ask}: {why}", view.label()),
+            )
+            .await;
+        }
+        outcome
+    }
+
+    /// Allows `view`'s request `p` as `boss`, when it is unbound. `again`:
+    /// it was looked at and waits already, so a failure is not news.
+    async fn allow_now(
+        &self,
+        view: &SessionView,
+        p: &workforce_desk::model::PendingApproval,
+        boss: &str,
+        again: bool,
+    ) -> Outcome {
+        if !self.desk.boss_unbound(boss) {
+            // At Act fully but not in force (its budget spent): the person
+            // is told, and the boss acts within Desk.
+            if let Some((_, o)) = self.overseer_named(boss) {
                 if o.level == Level::Full {
-                    if let Err(why) = self.fully(&boss, &o) {
-                        return Outcome::Waits(format!("I can't answer it myself: {why}"));
+                    match self.fully(boss, &o) {
+                        Err(why) if why == FULL_SPEND_UNREAD => return Outcome::Soon,
+                        Err(why) => {
+                            return Outcome::Waits(format!("I can't answer it myself: {why}"))
+                        }
+                        Ok(_) => {}
                     }
                 }
             }
             return Outcome::NotOurs;
+        }
+        // A start not settled: which sessions bosses run, where home is.
+        if !self.desk.charges_loaded() || !self.desk.boss_home_known() {
+            return Outcome::Soon;
         }
         if !p.answerable {
             return Outcome::Waits(
@@ -168,20 +217,20 @@ impl CrewHub {
             );
         }
         let name = self
-            .overseer_named(&boss)
-            .map_or_else(|| boss.clone(), |(s, _)| name_of(&s));
-        let ask = match p.detail.trim() {
-            "" => p.tool.clone(),
-            d => format!("{}({d})", p.tool),
-        };
-        let by = By::manager(&boss, &name, &format!("{WHY}: {ask}"));
+            .overseer_named(boss)
+            .map_or_else(|| boss.to_string(), |(s, _)| name_of(&s));
+        let by = By::manager(
+            boss,
+            &name,
+            &format!("{WHY}: {}", shown(&p.tool, &p.detail)),
+        );
         let action = Action::Approve {
-            session: id,
+            session: view.id,
             approval: p.id,
         };
         match self.perform(&action, by).await {
             Ok(done) => {
-                tracing::info!(session = %id, boss = %boss, "allowed at once at Act fully");
+                tracing::info!(session = %view.id, %boss, "allowed at once at Act fully");
                 Outcome::Allowed(done)
             }
             // Answered meanwhile (in its terminal, by the person, by the
@@ -189,7 +238,7 @@ impl CrewHub {
             Err(_)
                 if self
                     .desk
-                    .view(id)
+                    .view(view.id)
                     .ok()
                     .and_then(|v| v.pending)
                     .map(|q| q.id)
@@ -198,7 +247,11 @@ impl CrewHub {
                 Outcome::NotOurs
             }
             Err(why) => {
-                tracing::warn!(session = %id, boss = %boss, %why, "couldn't allow a request at Act fully");
+                if again {
+                    tracing::debug!(session = %view.id, %boss, %why, "a request still waits at Act fully");
+                } else {
+                    tracing::warn!(session = %view.id, %boss, %why, "couldn't allow a request at Act fully");
+                }
                 Outcome::Waits(format!("I couldn't allow it: {why}"))
             }
         }

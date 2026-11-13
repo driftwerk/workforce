@@ -465,13 +465,16 @@ pub(crate) fn fully_given(
         return Ok(full);
     };
     match spent {
-        None => Err(
-            "Act fully waits until today's spend is read, so it acts within Desk for now.".into(),
-        ),
+        None => Err(FULL_SPEND_UNREAD.into()),
         Some(spent) if spent >= budget => Err(full_spent_why(spent, budget)),
         Some(_) => Ok(full),
     }
 }
+
+/// Why Act fully isn't in force for a moment, at a start: today's spend
+/// isn't read yet.
+pub(crate) const FULL_SPEND_UNREAD: &str =
+    "Act fully waits until today's spend is read, so it acts within Desk for now.";
 
 /// [`fully_given`] for the overseer `agent`: a boss served from a grant
 /// acts fully only under a daily budget its grant gives; this hub's own

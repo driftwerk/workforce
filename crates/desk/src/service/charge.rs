@@ -664,9 +664,9 @@ impl Desk {
 
     /// Whether `id`'s open request `approval` would read or change an
     /// agent's own settings (its config, where its budget and limits are),
-    /// as far as Desk can tell: a file it names, or a command that names
-    /// one of those files' folders. What Desk can't read counts as not;
-    /// not knowing where home is yet, everything counts.
+    /// as far as Desk can tell: a file it names, or a command that may
+    /// reach one ([`command_may_touch_settings`]). Not knowing where home
+    /// is yet, everything counts.
     fn touches_agent_settings(&self, id: Uuid, approval: Uuid) -> bool {
         let settings = self.0.state.lock().charges.agent_settings.clone();
         if settings.is_empty() {
@@ -692,14 +692,12 @@ impl Desk {
             charge::What::Change(paths) | charge::What::Read(paths) => {
                 paths.iter().any(|p| named(p))
             }
-            charge::What::Command(command) => settings.iter().any(|s| {
-                let shown = s.display().to_string();
-                let tilde = s
-                    .strip_prefix(&home)
-                    .map(|rest| format!("~/{}", rest.display()))
-                    .unwrap_or_default();
-                command.contains(&shown) || (!tilde.is_empty() && command.contains(&tilde))
-            }),
+            charge::What::Command(command) => command_may_touch_settings(
+                command,
+                std::path::Path::new(&view.cwd),
+                &settings,
+                &home,
+            ),
             _ => false,
         }
     }
@@ -739,6 +737,18 @@ impl Desk {
         self.full_of(boss).unbound
     }
 
+    /// Whether Desk knows where home is yet: until it does, an unbound
+    /// boss allows nothing, as what a request reaches can't be told.
+    pub fn boss_home_known(&self) -> bool {
+        self.0.boss_bounds.lock().is_some()
+    }
+
+    /// Whether any boss is unbound now: else no request is Desk's to allow
+    /// at once, and nothing need be looked at.
+    pub fn any_boss_unbound(&self) -> bool {
+        self.0.state.lock().charges.full.values().any(|g| g.unbound)
+    }
+
     /// `id`'s open request `approval`: the one it waits on, or another of
     /// Codex's.
     fn pending_of(&self, id: Uuid, approval: Uuid) -> Option<crate::model::PendingApproval> {
@@ -775,18 +785,35 @@ impl Desk {
         // what reads or changes an agent's own settings: its budget and
         // limits stay the person's.
         let unbound = self.full_of(&boss.party.id).unbound;
-        if unbound && decision == Decision::Allow && self.touches_agent_settings(id, approval) {
-            return Err(DeskError::Conflict(
-                "it reads or changes an agent's own settings, where its budget and limits are: \
-                 it's the person's to allow"
-                    .into(),
-            ));
+        if unbound && decision == Decision::Allow {
+            // Held by its Desk budget or a breaker of its own, it takes no
+            // turn, and allows nothing either.
+            if let Some(why) = self.agent_held_why(&boss.party.id) {
+                return Err(DeskError::Conflict(format!(
+                    "{} is {why}: it's the person's to allow until they let it go on",
+                    boss.party.name
+                )));
+            }
+            if self.0.boss_bounds.lock().is_none() {
+                return Err(DeskError::Conflict(
+                    "Desk doesn't know yet where home is, so it can't tell what it reaches".into(),
+                ));
+            }
+            if self.touches_agent_settings(id, approval) {
+                return Err(DeskError::Conflict(
+                    "it may read or change an agent's own settings, where its budget and limits \
+                     are: it's the person's to allow"
+                        .into(),
+                ));
+            }
         }
+        // A session Desk's breaker paused goes on only at the person's
+        // word, whoever runs it.
+        self.breaker_refuses_prompt(id, Some(boss))?;
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
         }
         self.boss_holds(id, Some(boss))?;
-        self.breaker_refuses_prompt(id, Some(boss))?;
         // Allowing what it asks drives it; denying makes nothing happen.
         if decision == Decision::Allow {
             self.mode_lets(id, Some(boss))?;
@@ -1461,6 +1488,59 @@ fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
         .filter(|o| o.status.success())?;
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Whether `command`, run in `cwd`, may read or change one of `settings`
+/// (agents' own config files and folders, each inside its workspace), as
+/// far as its text can tell. It errs towards yes, as Act fully allows
+/// whatever it says no to:
+/// - it names a workspace, however written (`~`, `$HOME`, `//`, `/./`);
+/// - it runs inside a workspace;
+/// - it names one of those files or folders by name and the path to it
+///   can't be read from the text (a variable, a substitution, a glob, `..`).
+pub(crate) fn command_may_touch_settings(
+    command: &str,
+    cwd: &std::path::Path,
+    settings: &[std::path::PathBuf],
+    home: &std::path::Path,
+) -> bool {
+    let home_s = home.display().to_string();
+    let mut text = command
+        .replace("${HOME}", &home_s)
+        .replace("$HOME", &home_s)
+        .replace("~/", &format!("{home_s}/"));
+    loop {
+        let next = text.replace("/./", "/").replace("//", "/");
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+    let real = |p: &std::path::Path| {
+        crate::computer::boss::resolve_real(p).unwrap_or_else(|| p.to_path_buf())
+    };
+    let cwd = real(cwd);
+    let mut roots: Vec<std::path::PathBuf> = settings
+        .iter()
+        .filter_map(|s| s.parent().map(real))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    if roots.iter().any(|r| {
+        cwd.starts_with(r) || text.contains(&r.display().to_string()) || {
+            // As written, before resolving its links.
+            let shown = r.display().to_string();
+            !shown.is_empty() && command.contains(&shown)
+        }
+    }) {
+        return true;
+    }
+    let unread = ['$', '`', '*', '?', '['].iter().any(|c| text.contains(*c)) || text.contains("..");
+    unread
+        && settings
+            .iter()
+            .filter_map(|s| s.file_name())
+            .any(|name| text.contains(name.to_string_lossy().as_ref()))
 }
 
 #[cfg(test)]

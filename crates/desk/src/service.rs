@@ -3564,8 +3564,13 @@ impl Desk {
             self.boss_decides(id, approval, decision, boss)?;
         }
         // Allowing what it asks drives it: in a mode that doesn't ask, only
-        // the person's or its unbound boss's.
-        if decision != Decision::Deny && decision != Decision::Cancel {
+        // the person's or an unbound boss's, which allows what any session
+        // it oversees asks (and types into only one it runs).
+        let unbound_allows = decision == Decision::Allow
+            && by.as_ref().is_some_and(|b| {
+                b.party.kind == crew::PartyKind::Manager && self.full_of(&b.party.id).unbound
+            });
+        if decision != Decision::Deny && decision != Decision::Cancel && !unbound_allows {
             self.mode_lets_anyone(id, by.as_ref())?;
         }
         let codex = self
