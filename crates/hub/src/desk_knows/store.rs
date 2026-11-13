@@ -160,16 +160,17 @@ impl KnowsStore for MemoryKnows {
         let mut kept = self.0.lock();
         let start = kept.len();
         kept.retain(|(_, kind, _), (i, _)| !(kind == TRANSCRIPT && i.at < before));
-        // Each (person, agent)'s conversations, newest first, past the cap.
+        // Each (person, agent)'s items past the cap: conversations first,
+        // oldest first, then the rest, oldest first.
         let mut by_owner: BTreeMap<
             (Uuid, String),
-            Vec<((Owner, String, String), DateTime<Utc>, i64)>,
+            Vec<((Owner, String, String), (bool, DateTime<Utc>), i64)>,
         > = BTreeMap::new();
-        for (k, (i, _)) in kept.iter().filter(|((_, kind, _), _)| kind == TRANSCRIPT) {
+        for (k, (i, _)) in kept.iter() {
             by_owner
                 .entry((k.0.person, k.0.agent.clone()))
                 .or_default()
-                .push((k.clone(), i.at, i64::from(i.bytes())));
+                .push((k.clone(), (k.1 != TRANSCRIPT, i.at), i64::from(i.bytes())));
         }
         for (_, mut rows) in by_owner {
             rows.sort_by(|a, b| b.1.cmp(&a.1));
@@ -349,8 +350,9 @@ pub mod postgres {
                 .execute(
                     "DELETE FROM items i USING ( \
                        SELECT person, source, agent, kind, ref, \
-                         sum(bytes) OVER (PARTITION BY person, agent ORDER BY at DESC, ref) AS running \
-                       FROM items WHERE kind = $1) o \
+                         sum(bytes) OVER (PARTITION BY person, agent \
+                           ORDER BY (kind <> $1) DESC, at DESC, kind, ref) AS running \
+                       FROM items) o \
                      WHERE o.running > $2 AND i.person = o.person AND i.source = o.source \
                        AND i.agent = o.agent AND i.kind = o.kind AND i.ref = o.ref",
                     &[&TRANSCRIPT, &max_bytes],
@@ -430,22 +432,26 @@ pub(crate) mod tests {
         // Sent again: replaced, once.
         let mut again = item("account", "a1", "s1", now);
         again.body = serde_json::json!({ "text": "newer" });
+        let again_bytes = again.bytes();
         store.push(&allan, &[again], now).await.unwrap();
         let s = store.status(&allan).await.unwrap();
         assert_eq!(s.kinds["account"].items, 1);
         assert_eq!(s.kinds[TRANSCRIPT].items, 3);
         // Prune by age: the 200-day-old conversation goes; then by size,
-        // past one item's bytes, the older of the two left goes.
+        // with room for the account and one conversation, the older of the
+        // two left goes: conversations go first, the account stays.
         let x = i64::from(item(TRANSCRIPT, "x2", "s2", now).bytes());
+        let account = i64::from(again_bytes);
         assert_eq!(
             store
-                .prune(now - chrono::Duration::days(90), x)
+                .prune(now - chrono::Duration::days(90), x + account)
                 .await
                 .unwrap(),
             2
         );
         let s = store.status(&allan).await.unwrap();
         assert_eq!(s.kinds[TRANSCRIPT].items, 1);
+        assert_eq!(s.kinds["account"].items, 1);
         // Forget by item, by session, then the rest by kind.
         store
             .push(&allan, &[item(TRANSCRIPT, "x4", "s3", now)], now)

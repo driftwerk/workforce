@@ -165,6 +165,10 @@ pub async fn mint(
     if !cfg.enabled {
         return disabled();
     }
+    // A token that could only be refused is never minted.
+    if let Err(r) = store() {
+        return r;
+    }
     let (device, person) = match paired_device(&state, &headers).await {
         Ok(d) => d,
         Err(r) => return r.into_response(),
@@ -199,31 +203,6 @@ pub async fn mint(
     };
     let now = Utc::now();
     let actor = person.to_string();
-    // One live token per (device, agent): a fresh one replaces it.
-    match store.list_tokens_for_identity(person) {
-        Ok(held) => {
-            for t in held.iter().filter(|t| {
-                t.is_live(now)
-                    && t.scope() == Some(TokenScope::DeskKnows)
-                    && t.minted_by_device() == Some(device.id.as_str())
-                    && t.desk_link.as_ref().is_some_and(|l| l.agent_id == agent_id)
-            }) {
-                if store.revoke_token(t.id, Some(person), now).unwrap_or(false) {
-                    crate::boss_links::audit(
-                        state.telemetry_store.as_ref(),
-                        &actor,
-                        "desk_knows.revoke",
-                        t,
-                        "replaced",
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "desk knows token store error");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
-        }
-    }
     let minted = remote_mcp_token::mint_as(TokenScope::DeskKnows);
     let record = RemoteMcpToken {
         id: Uuid::new_v4(),
@@ -252,6 +231,33 @@ pub async fn mint(
     if let Err(e) = store.create_token(&record) {
         warn!(error = %e, "desk knows token store error");
         return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+    }
+    // One live token per (device, agent): the fresh one, made first so a
+    // failure leaves the old one working, replaces it.
+    match store.list_tokens_for_identity(person) {
+        Ok(held) => {
+            for t in held.iter().filter(|t| {
+                t.id != record.id
+                    && t.is_live(now)
+                    && t.scope() == Some(TokenScope::DeskKnows)
+                    && t.minted_by_device() == Some(device.id.as_str())
+                    && t.desk_link.as_ref().is_some_and(|l| l.agent_id == agent_id)
+            }) {
+                if store.revoke_token(t.id, Some(person), now).unwrap_or(false) {
+                    crate::boss_links::audit(
+                        state.telemetry_store.as_ref(),
+                        &actor,
+                        "desk_knows.revoke",
+                        t,
+                        "replaced",
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "desk knows token store error");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+        }
     }
     crate::boss_links::audit(
         state.telemetry_store.as_ref(),
@@ -416,6 +422,21 @@ struct PushBody {
     items: Vec<PushItem>,
 }
 
+/// Whether any string or key in `v` holds a NUL.
+fn has_nul(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(a) => a.iter().any(has_nul),
+        Value::Object(m) => m.iter().any(|(k, v)| k.contains('\0') || has_nul(v)),
+        _ => false,
+    }
+}
+
+/// The earliest time an item may say it is of.
+fn earliest() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(946_684_800, 0).unwrap_or_default()
+}
+
 /// One pushed item, checked: a known kind, plain ids, an object body whose
 /// text is a string within [`MAX_TEXT`].
 fn checked(i: PushItem) -> Result<Item, String> {
@@ -442,6 +463,15 @@ fn checked(i: PushItem) -> Result<Item, String> {
     let Some(obj) = i.body.as_object() else {
         return Err("Each item's body is an object.".into());
     };
+    // Postgres keeps no NUL in JSON: one would fail the whole push, and
+    // every retry of it.
+    if has_nul(&i.body) {
+        return Err("An item's body has a NUL character.".into());
+    }
+    let now = Utc::now();
+    if i.at < earliest() || i.at > now + Duration::days(1) {
+        return Err("An item's time is out of range.".into());
+    }
     match obj.get("text") {
         Some(Value::String(t)) if t.chars().count() <= MAX_TEXT => {}
         Some(Value::String(_)) => {
@@ -620,6 +650,12 @@ mod tests {
             json!({"kind": "account", "ref": "a1", "at": at, "body": {"words": "x"}}),
             json!({"kind": "transcript", "ref": "a1", "at": at, "body": {"text": "x".repeat(MAX_TEXT + 1)}}),
             json!({"kind": "account", "ref": "a1", "group": "x".repeat(MAX_NAME + 1), "at": at, "body": {"text": "x"}}),
+            // Postgres keeps no NUL, anywhere in a body.
+            json!({"kind": "account", "ref": "a1", "at": at, "body": {"text": "x", "deep": ["a\0b"]}}),
+            json!({"kind": "account", "ref": "a1", "at": at, "body": {"text": "x", "k\0": 1}}),
+            // A time far off, which no prune would ever reach.
+            json!({"kind": "transcript", "ref": "a1", "at": "9999-01-01T00:00:00Z", "body": {"text": "x"}}),
+            json!({"kind": "transcript", "ref": "a1", "at": "1970-01-01T00:00:00Z", "body": {"text": "x"}}),
         ] {
             assert!(item(bad.clone()).is_err(), "{bad}");
         }
