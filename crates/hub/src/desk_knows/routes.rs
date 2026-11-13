@@ -256,6 +256,8 @@ pub async fn mint(
         }
         Err(e) => {
             warn!(error = %e, "desk knows token store error");
+            // The fresh one is held by no one: it goes too.
+            let _ = store.revoke_token(record.id, Some(person), now);
             return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
         }
     }
