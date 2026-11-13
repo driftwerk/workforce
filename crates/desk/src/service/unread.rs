@@ -249,6 +249,11 @@ impl Desk {
             })
             .collect();
         puts.extend(folded);
+        for p in &puts {
+            if let ReadPlace::Session(id) = p.place {
+                self.account_looked(id);
+            }
+        }
         let changed = self.0.store.put_reads(owner, &puts).await?;
         self.announce_reads(&changed);
         Ok(changed)
@@ -529,14 +534,9 @@ pub(crate) mod tests {
                 None,
                 "approved",
             ));
-            let mut summary = d.unread(&NoCrew, YOU).await.unwrap();
-            for _ in 0..100 {
-                if summary.activity.count > 0 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                summary = d.unread(&NoCrew, YOU).await.unwrap();
-            }
+            // The notes are queued to be written: read once the queue is.
+            d.persisted().await;
+            let summary = d.unread(&NoCrew, YOU).await.unwrap();
             assert_eq!(summary.floor, floor);
             let main = &summary.rooms[0];
             assert_eq!(

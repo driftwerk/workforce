@@ -212,7 +212,7 @@ fn gate_with(
             .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
         {
             None => GateOutcome::RequireApproval {
-                reason,
+                reason: with_notice(tools, tool_name, reason),
                 allow_save_allow,
                 holds,
             },
@@ -461,6 +461,38 @@ pub fn combine_with_tool_requirement(
         matched_rule,
         evaluation_time_us,
     }
+}
+
+/// `reason`, a prompt's, after the notice `tool_name`'s tool always gives
+/// ([`Tool::approval_notice`](crate::tools::Tool::approval_notice)), once.
+pub fn with_notice(tools: &ToolRegistry, tool_name: &str, reason: String) -> String {
+    match tools.get(tool_name).and_then(|tool| tool.approval_notice()) {
+        Some(notice) if reason.starts_with(&notice) => reason,
+        Some(notice) if reason.trim().is_empty() || reason == notice => notice,
+        Some(notice) => format!("{notice}\n\n{reason}"),
+        None => reason,
+    }
+}
+
+/// The answers a prompt for `tool_name` offers: `options`, but only Allow
+/// once and Deny (once or always) when the tool demands approval itself
+/// ([`Tool::approval_requirement`](crate::tools::Tool::approval_requirement)).
+/// Such a tool asks again on every call, so an "always", a session or a
+/// folder answer would promise what it can't keep.
+pub fn options_for_tool(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    mut options: workforce_core::policy::PermissionPromptOptions,
+) -> workforce_core::policy::PermissionPromptOptions {
+    if tools
+        .get(tool_name)
+        .is_some_and(|tool| tool.approval_requirement().is_some())
+    {
+        options.allow_always = false;
+        options.allow_session = false;
+        options.allow_in_folder = None;
+    }
+    options
 }
 
 /// Apply the requirement the live registered tool declares, re-read on every
@@ -1202,6 +1234,111 @@ mod tests {
         }
     }
 
+    /// A tool that asks for itself is offered Allow once and Deny alone:
+    /// it asks again on every call, so no "always", session or folder
+    /// answer is offered for it; any other tool's prompt is as it was.
+    #[test]
+    fn a_self_gated_tools_prompt_offers_once_or_deny_alone() {
+        let tools = ToolRegistry::new();
+        tools.register(Arc::new(GatedTool(Arc::new(AtomicUsize::new(0)))));
+        tools.register(Arc::new(EchoTool));
+        let wide = workforce_core::policy::PermissionPromptOptions {
+            allow_session: true,
+            allow_in_folder: Some("~/dev/acme-web".into()),
+            ..workforce_core::policy::PermissionPromptOptions::ask(true)
+        };
+        let gated = options_for_tool(&tools, "record-keeper.apply_change", wide.clone());
+        assert!(gated.allow_once && gated.deny_once);
+        assert!(!gated.allow_always && !gated.allow_session && gated.allow_in_folder.is_none());
+        let other = options_for_tool(&tools, "echo", wide.clone());
+        assert!(other.allow_always && other.allow_session && other.allow_in_folder.is_some());
+        // And whatever policy says, the call asks, with no "always".
+        let calls = Arc::new(Calls::default());
+        let g = gates(&calls, None, CascadeState::Allow);
+        let out = as_user(|| {
+            gate_tool_call(
+                &g,
+                &permissive_policy(),
+                &tools,
+                "record-keeper.apply_change",
+                &serde_json::json!({}),
+            )
+        });
+        assert!(matches!(
+            out,
+            GateOutcome::RequireApproval {
+                allow_save_allow: false,
+                ..
+            }
+        ));
+    }
+
+    /// A tool whose prompt always says who is asking, whatever else does.
+    struct NoticedTool;
+
+    #[async_trait::async_trait]
+    impl Tool for NoticedTool {
+        fn name(&self) -> &str {
+            "noticed"
+        }
+        fn description(&self) -> &str {
+            "noticed"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn approval_requirement(&self) -> Option<String> {
+            Some("From Acme's boss conversation.".into())
+        }
+        fn approval_notice(&self) -> Option<String> {
+            Some("From Acme's boss conversation.".into())
+        }
+        async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::success(input, 1))
+        }
+    }
+
+    /// A tool's notice heads its prompt whoever else asks, said once: alone
+    /// when only the tool asks, before policy's own words when policy asks
+    /// too.
+    #[test]
+    fn a_tools_notice_heads_its_prompt_whoever_asks() {
+        let tools = ToolRegistry::new();
+        tools.register(Arc::new(NoticedTool));
+        let calls = Arc::new(Calls::default());
+        let g = gates(&calls, None, CascadeState::Allow);
+        let reason_under = |policy: &PolicyEngine| match as_user(|| {
+            gate_tool_call(&g, policy, &tools, "noticed", &serde_json::json!({}))
+        }) {
+            GateOutcome::RequireApproval { reason, .. } => reason,
+            _ => panic!("it asks"),
+        };
+        assert_eq!(
+            reason_under(&permissive_policy()),
+            "From Acme's boss conversation."
+        );
+        let asking = PolicyEngine::from_yaml(
+            "rules:\n  - name: ask-all\n    scope: global\n    tool: \"*\"\n    action: ask\n",
+        )
+        .unwrap();
+        let both = reason_under(&asking);
+        assert!(both.starts_with("From Acme's boss conversation."), "{both}");
+        assert_eq!(both.matches("boss conversation").count(), 1, "{both}");
+        assert!(
+            both.len() > "From Acme's boss conversation.".len(),
+            "policy's words kept too"
+        );
+        assert_eq!(
+            with_notice(
+                &tools,
+                "noticed",
+                "From Acme's boss conversation.\n\nx".into()
+            ),
+            "From Acme's boss conversation.\n\nx",
+            "never twice"
+        );
+    }
+
     struct EchoTool;
 
     #[async_trait::async_trait]
@@ -1787,7 +1924,7 @@ mod tests {
     fn desk(attended: bool) -> workforce_common::channels::desk::DeskScope {
         use workforce_common::channels::desk::{DeskPlace, DeskTarget};
         workforce_common::channels::desk::DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
             owner: "person-1".into(),
             attended,
             relayed: false,

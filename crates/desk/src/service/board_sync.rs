@@ -656,7 +656,7 @@ impl Desk {
                 // verified email names, never the key's owner.
                 let shared_me =
                     s.me.as_deref()
-                        .filter(|_| s.me_source == Some(board::MeSource::VouchedByEmail));
+                        .filter(|_| s.me_source.is_some_and(board::MeSource::on_a_shared_key));
                 let mut page: Option<String> = None;
                 for n in 0.. {
                     if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
@@ -1448,10 +1448,10 @@ impl Desk {
                     s.me_name = Some(me.name);
                     s.me_source = Some(board::MeSource::Vouched);
                 }
-                crate::board_sync::Who::ByEmail(me) => {
+                crate::board_sync::Who::ByEmail(me, source) => {
                     s.me = Some(me.id);
                     s.me_name = Some(me.name);
-                    s.me_source = Some(board::MeSource::VouchedByEmail);
+                    s.me_source = Some(source);
                 }
                 // A vouched id the hub no longer stands behind is dropped;
                 // one the person typed is theirs to keep.
@@ -1537,8 +1537,8 @@ impl Desk {
             .await
             .map_err(&said)?;
         let me = match who {
-            Who::Person(me) | Who::ByEmail(me) if me.id == known => me,
-            Who::Person(me) | Who::ByEmail(me) => {
+            Who::Person(me) | Who::ByEmail(me, _) if me.id == known => me,
+            Who::Person(me) | Who::ByEmail(me, _) => {
                 return Err(DeskError::Conflict(format!(
                     "{hub} now says you are {} on {title}, not who this board knew: nothing was assigned. Check who you are on the board, then take it.",
                     me.name

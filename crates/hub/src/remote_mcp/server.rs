@@ -119,6 +119,12 @@ pub fn curated_surface(
     surface
 }
 
+/// What the plain route's 403 says when the default agent does not admit
+/// the caller. A client of this hub (a Desk's board sync) knows it by these
+/// words and goes on to the agents it may reach, so they are kept as they
+/// are.
+pub const DEFAULT_NOT_ADMITTED: &str = "this hub's default agent does not admit you; connect to /mcp/agents/{agent_id} for an agent you can use";
+
 pub fn router(remote: Arc<RemoteMcpState>) -> Router {
     Router::new()
         .route(
@@ -227,11 +233,7 @@ async fn serve(
         // The plain route serves the default agent: one that does not admit
         // the caller leaves them nothing to call through it.
         Err(Unreachable::Denied(_)) if agent_id.is_none() => {
-            return (
-                StatusCode::FORBIDDEN,
-                "this hub's default agent does not admit you; connect to /mcp/agents/{agent_id} for an agent you can use",
-            )
-                .into_response()
+            return (StatusCode::FORBIDDEN, DEFAULT_NOT_ADMITTED).into_response()
         }
         // A named agent the caller may not use reads as one that is not
         // there, so ids cannot be probed.
@@ -316,6 +318,7 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
     let narrowed = ToolRegistry::empty_like(surface);
     workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
         .iter()
+        .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
@@ -406,6 +409,7 @@ mod tests {
         let allow = RemoteMcpConfig::DEFAULT_TOOLS_ALLOW;
         for tool in workforce_core::desk::BOARD_SYNC_JIRA_TOOLS
             .iter()
+            .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
         {

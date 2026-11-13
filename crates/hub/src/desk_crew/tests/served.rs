@@ -26,7 +26,7 @@ impl Authorize for HubToken {
     }
 }
 
-async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+pub(super) async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
     let app = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken));
     let res = app
         .oneshot(
@@ -50,14 +50,14 @@ async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, 
     )
 }
 
-fn allan() -> BossRef {
+pub(super) fn allan() -> BossRef {
     BossRef::Remote {
         hub: "driftwerk".into(),
         agent: "allan".into(),
     }
 }
 
-fn grant(members: &[uuid::Uuid], folder: &Path, level: &str, sees: &str) -> Value {
+pub(super) fn grant(members: &[uuid::Uuid], folder: &Path, level: &str, sees: &str) -> Value {
     json!({
         "grantVersion": 1, "revision": 1, "name": "Acme",
         "boss": "remote:driftwerk/allan", "level": level, "sees": sees,
@@ -516,6 +516,582 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
         let r = crew.serve_crew(call(bob), "acme").await;
         assert_eq!(r.status, ServedStatus::Refused);
         assert!(r.body.get("said").is_none(), "{:?}", r.body);
+    })
+    .await;
+}
+
+/// What happens in a grant's group wakes its remote boss with what its
+/// Sees shows and no more: never its own actions or the person's, never
+/// another group's or another session's, never past the hand-off limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_boss_is_woken_by_its_groups_own_sessions_at_what_it_sees() {
+    use workforce_desk::crew::{Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let other = new_session(&d, dir.path(), "globex-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let put = |sees: &'static str, revision: u64| {
+            let (d, acme_api) = (d.clone(), acme_api.clone());
+            async move {
+                let mut body = grant(&[mine.id], &acme_api, "act", sees);
+                body["revision"] = json!(revision);
+                let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", body).await;
+                assert_eq!(code, StatusCode::OK, "{out}");
+            }
+        };
+        put("status", 1).await;
+        let event =
+            |kind, actor: Party, about: &workforce_desk::model::SessionView, group: &str| {
+                let mut e = Event::new(
+                    kind,
+                    actor,
+                    Some(Party::session(about)),
+                    "deployed to prod with the secret plan",
+                );
+                e.group = Some(group.into());
+                e.reason = Some("because the hidden reason".into());
+                e
+            };
+        let session = Party::session(&mine);
+
+        // At Status: the kind and the session, no words.
+        let woke = crew
+            .served_event(
+                "acme",
+                &allan(),
+                &event(Kind::Finished, session.clone(), &mine, "acme"),
+            )
+            .expect("a turn's end wakes it");
+        let line = woke["line"].as_str().unwrap();
+        assert!(
+            line.contains("acme-web") && line.contains("finished"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("secret") && !line.contains("hidden"),
+            "{line}"
+        );
+        assert_eq!(woke["subject"], json!(mine.id.to_string()));
+
+        // Nothing it or the person did, nor what isn't its group's or its
+        // session's, nor past the hand-off limit, nor what wakes nobody.
+        let quiet = [
+            event(
+                Kind::Finished,
+                Party::manager("driftwerk/allan", "Allan"),
+                &mine,
+                "acme",
+            ),
+            event(Kind::Finished, Party::you(), &mine, "acme"),
+            event(Kind::Finished, session.clone(), &other, "acme"),
+            event(Kind::Finished, session.clone(), &mine, "globex"),
+            {
+                let mut e = event(Kind::Question, session.clone(), &mine, "acme");
+                e.hop = i16::from(workforce_core::desk::MAX_HOPS);
+                e
+            },
+            event(Kind::Nudged, session.clone(), &mine, "acme"),
+        ];
+        for e in &quiet {
+            assert!(crew.served_event("acme", &allan(), e).is_none(), "{e:?}");
+        }
+        // Nor for a group with no grant.
+        assert!(crew
+            .served_event(
+                "globex",
+                &allan(),
+                &event(Kind::Finished, session.clone(), &mine, "globex")
+            )
+            .is_none());
+
+        // Two links of one group, for two bosses: only the grant's own
+        // boss's link is told, and the other's is forgotten.
+        let bob = BossRef::Remote {
+            hub: "driftwerk".into(),
+            agent: "bob".into(),
+        };
+        let finished = event(Kind::Finished, session.clone(), &mine, "acme");
+        assert!(crew.served_event("acme", &allan(), &finished).is_some());
+        assert!(
+            crew.served_event("acme", &bob, &finished).is_none(),
+            "not the grant's boss"
+        );
+        let link = |agent: &str| -> crate::desk_uplink::HeldLink {
+            serde_json::from_value(json!({
+                "group": "acme", "hub": "driftwerk", "hubUrl": "https://boss.example.com",
+                "linkId": uuid::Uuid::new_v4(), "tokenId": uuid::Uuid::new_v4(),
+                "token": "wfb_x", "expiresAt": chrono::Utc::now() + chrono::Duration::days(1),
+                "engineId": "devbox", "agentId": agent,
+            }))
+            .unwrap()
+        };
+        assert!(!crate::desk_uplink::boss_moved(&crew, &link("allan")));
+        assert!(crate::desk_uplink::boss_moved(&crew, &link("bob")));
+
+        // At Replies, its words too.
+        put("replies", 2).await;
+        let woke = crew
+            .served_event(
+                "acme",
+                &allan(),
+                &event(Kind::Question, session.clone(), &mine, "acme"),
+            )
+            .unwrap();
+        let line = woke["line"].as_str().unwrap();
+        assert!(
+            line.contains("secret plan") && line.contains("hidden reason"),
+            "{line}"
+        );
+    })
+    .await;
+}
+
+/// A remote boss is given each request open in a session it runs, by what
+/// is open rather than the event that raised it, once, as a local boss is
+/// (#251); no local boss is given it; the badge says why it waits on the
+/// person when the remote boss won't answer; and once the person answers
+/// on Desk, the boss's late answer does nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_boss_is_given_each_open_request_once_and_no_local_boss_is() {
+    use std::collections::{HashMap, HashSet};
+    use workforce_desk::crew::{Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let put = |level: &'static str, revision: u64| {
+            let (d, acme_api) = (d.clone(), acme_api.clone());
+            async move {
+                let mut body = grant(&[mine.id], &acme_api, level, "status");
+                body["revision"] = json!(revision);
+                let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", body).await;
+                assert_eq!(code, StatusCode::OK, "{out}");
+            }
+        };
+        put("act", 1).await;
+        let r = serve(
+            &crew,
+            allan(),
+            "crew.start_session",
+            json!({"folder": acme_api.to_string_lossy(), "goal": "Fix the date picker",
+                   "engine": "claude", "reason": "Next up."}),
+        )
+        .await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        let started = eventually("Allan's session", async || {
+            d.charges()
+                .into_iter()
+                .find(|c| c.boss == "driftwerk/allan")
+                .map(|c| c.session)
+        })
+        .await;
+        let url = hook_url(dir.path(), started).await;
+        let ask = |command: &str| {
+            let url = url.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": command}});
+            tokio::spawn(async move { hook(&url, body).await })
+        };
+        let pending = |command: &'static str| {
+            let d = d.clone();
+            async move {
+                eventually(command, async || {
+                    d.view(started)
+                        .unwrap()
+                        .pending
+                        .filter(|p| p.detail == command)
+                })
+                .await
+                .id
+            }
+        };
+
+        let asked = ask("cargo build --release");
+        let a = pending("cargo build --release").await;
+        let mut offered = HashMap::new();
+        let owed = eventually("the request given to Allan", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(owed.len(), 1, "{owed:?}");
+        let (given, frame) = &owed[0];
+        assert_eq!(*given, a);
+        assert_eq!(frame["kind"], "needs_you");
+        assert_eq!(frame["subject"], json!(started));
+        let line = frame["line"].as_str().unwrap();
+        assert!(line.contains(&a.to_string()), "{line}");
+        assert!(
+            !line.contains("cargo build"),
+            "Sees status: no words: {line}"
+        );
+        // Once.
+        assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+        // Never to another boss, nor by the event that raised it.
+        assert!(crew
+            .owed_remote(
+                "acme",
+                &BossRef::Remote {
+                    hub: "driftwerk".into(),
+                    agent: "bob".into()
+                },
+                &mut HashMap::new()
+            )
+            .is_empty());
+        let mut raised = Event::new(
+            Kind::NeedsYou,
+            Party::session(&d.view(started).unwrap()),
+            Some(Party::session(&d.view(started).unwrap())),
+            "wants to run cargo build --release",
+        );
+        raised.group = Some("acme".into());
+        raised.approval_id = Some(a.to_string());
+        assert!(crew.served_event("acme", &allan(), &raised).is_none());
+        // No local boss is given it.
+        assert!(crew
+            .owed_asks(&mut HashSet::new())
+            .iter()
+            .all(|(s, _, _)| *s != started));
+
+        // Who it waits on: no uplink carries Allan's link, so the person.
+        crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("isn't connected")),
+            "{why:?}"
+        );
+        {
+            let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
+            crew.overseers();
+            assert_eq!(d.view(started).unwrap().waits_on_you, None, "Allan has it");
+            // Left open past its time with Allan, it is the person's, once.
+            for o in offered.values_mut() {
+                o.at -= crate::desk_crew::served::LEFT_AFTER;
+            }
+            assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+            let why = d.view(started).unwrap().waits_on_you;
+            assert!(
+                why.as_deref()
+                    .is_some_and(|w| w.contains("left this to you")),
+                "{why:?}"
+            );
+            assert!(offered.values().all(|o| o.left));
+        }
+        crew.overseers();
+        assert!(
+            d.view(started).unwrap().waits_on_you.is_some(),
+            "gone again"
+        );
+
+        // The person answers on Desk first: Allan's late answer does nothing.
+        d.decide(
+            started,
+            a,
+            workforce_desk::model::Decision::Allow,
+            Some(By::you()),
+        )
+        .unwrap();
+        let said = asked.await.unwrap();
+        assert_eq!(said["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        let late = serve(
+            &crew,
+            allan(),
+            "crew.deny",
+            json!({"session_id": started, "approval_id": a.to_string(), "reason": "Too slow."}),
+        )
+        .await;
+        assert_ne!(late.status, ServedStatus::Ok, "{:?}", late.body);
+
+        // A new request is given again; at Suggest too, and the badge says
+        // the person decides; at Watch, never.
+        let _asked = ask("cargo test --all");
+        let b = pending("cargo test --all").await;
+        let owed = eventually("the next request", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(owed[0].0, b);
+        put("suggest", 2).await;
+        let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
+        crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("only suggests")),
+            "{why:?}"
+        );
+        assert!(!crew
+            .owed_remote("acme", &allan(), &mut HashMap::new())
+            .is_empty());
+        put("watch", 3).await;
+        crew.overseers();
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("only watches")),
+            "{why:?}"
+        );
+        assert!(crew
+            .owed_remote("acme", &allan(), &mut HashMap::new())
+            .is_empty());
+    })
+    .await;
+}
+
+/// A request left to the person once a remote boss had it too long is
+/// answered once, whoever answers first: the boss then the person (on Desk
+/// or through the boss link's ask), or the person then the boss; the late
+/// answer does nothing, and leaving an answered request to the person
+/// again changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
+    use std::collections::HashMap;
+    use workforce_desk::model::DeskEvent;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(&[mine.id], &acme_api, "act", "replies"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let r = serve(
+            &crew,
+            allan(),
+            "crew.start_session",
+            json!({"folder": acme_api.to_string_lossy(), "goal": "Fix the date picker",
+                   "engine": "claude", "reason": "Next up."}),
+        )
+        .await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        let started = eventually("Allan's session", async || {
+            d.charges()
+                .into_iter()
+                .find(|c| c.boss == "driftwerk/allan")
+                .map(|c| c.session)
+        })
+        .await;
+        let url = hook_url(dir.path(), started).await;
+        let ask = |command: &str| {
+            let url = url.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": command}});
+            tokio::spawn(async move { hook(&url, body).await })
+        };
+        let pending = |command: &'static str| {
+            let d = d.clone();
+            async move {
+                eventually(command, async || {
+                    d.view(started)
+                        .unwrap()
+                        .pending
+                        .filter(|p| p.detail == command)
+                })
+                .await
+                .id
+            }
+        };
+        let behavior = |v: Value| v["hookSpecificOutput"]["decision"]["behavior"].clone();
+        let _up = crew.remote_up(vec!["driftwerk/allan".into()]);
+        let mut offered = HashMap::new();
+        // Leaving `approval`, answered, to the person shows nothing new.
+        let leaves_nothing = |approval: uuid::Uuid| {
+            let (_, mut rx) = d.subscribe();
+            d.leave_to_person(started, approval);
+            while let Ok(e) = rx.try_recv() {
+                if let DeskEvent::Session { session } = e {
+                    assert_ne!(session.id, started, "shown again for an answered request");
+                }
+            }
+            assert!(d
+                .view(started)
+                .unwrap()
+                .waits_on_you
+                .as_deref()
+                .is_none_or(|w| !w.contains("left this to you")));
+        };
+
+        // The boss answers first: the person's answer, on Desk or through
+        // the link's ask, does nothing.
+        let asked = ask("cargo build --release");
+        let a = pending("cargo build --release").await;
+        let first = eventually("given to Allan", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(first[0].0, a);
+        for o in offered.values_mut() {
+            o.at -= crate::desk_crew::served::LEFT_AFTER;
+        }
+        assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("left this to you")),
+            "{why:?}"
+        );
+        let link = uuid::Uuid::new_v4();
+        let up = crew.asks_up(link, "acme", &allan(), false).await;
+        assert_eq!(up.len(), 1, "left to the person, it goes up: {up:?}");
+        let r = serve(
+            &crew,
+            allan(),
+            "crew.deny",
+            json!({"session_id": started, "approval_id": a.to_string(), "reason": "Not now."}),
+        )
+        .await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        assert_eq!(behavior(asked.await.unwrap()), "deny");
+        assert_eq!(up[0]["class"], "anywhere", "{up:?}");
+        let person = "4b1f7c2a-0000-4000-8000-000000000001";
+        // Every late answer through the link's ask does nothing, Allow
+        // first.
+        let late_ask = |ask: Value, choice: &'static str| {
+            let crew = Arc::clone(&crew);
+            async move {
+                crew.remote_decision(
+                    link,
+                    "acme",
+                    &allan(),
+                    Some(person),
+                    &json!({"type": "decision", "askId": ask["askId"], "linkId": link,
+                            "nonce": ask["nonce"], "choice": choice,
+                            "decider": {"identityId": person, "via": "slack"}}),
+                )
+                .await
+            }
+        };
+        let stopped = || {
+            matches!(
+                d.view(started).unwrap().state,
+                workforce_desk::model::SessionState::Stopped
+                    | workforce_desk::model::SessionState::Closed
+            )
+        };
+        for choice in ["allow", "deny", "stop"] {
+            let back = late_ask(up[0].clone(), choice).await;
+            assert_eq!(back["type"], "ask_closed", "{choice}: {back}");
+            assert_eq!(back["how"], "answered_in_desk", "{choice}: {back}");
+            assert!(!stopped(), "{choice}");
+        }
+        assert!(d
+            .decide(
+                started,
+                a,
+                workforce_desk::model::Decision::Allow,
+                Some(By::you())
+            )
+            .is_err());
+        assert!(d.view(started).unwrap().pending.is_none());
+        leaves_nothing(a);
+
+        // The person answers first: the boss's answer does nothing.
+        let asked = ask("cargo test --all");
+        let b = pending("cargo test --all").await;
+        // A new request isn't left to the person by the one before.
+        assert!(d
+            .view(started)
+            .unwrap()
+            .waits_on_you
+            .as_deref()
+            .is_none_or(|w| !w.contains("left this to you")));
+        let given = eventually("given to Allan", async || {
+            let o = crew.owed_remote("acme", &allan(), &mut offered);
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+        assert_eq!(given[0].0, b);
+        for o in offered.values_mut() {
+            o.at -= crate::desk_crew::served::LEFT_AFTER;
+        }
+        assert!(crew.owed_remote("acme", &allan(), &mut offered).is_empty());
+        let why = d.view(started).unwrap().waits_on_you;
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("left this to you")),
+            "{why:?}"
+        );
+        let up = crew.asks_up(link, "acme", &allan(), false).await;
+        assert_eq!(up.len(), 1, "left to the person, it goes up: {up:?}");
+        assert_eq!(up[0]["class"], "anywhere", "{up:?}");
+        d.decide(
+            started,
+            b,
+            workforce_desk::model::Decision::Allow,
+            Some(By::you()),
+        )
+        .unwrap();
+        assert_eq!(behavior(asked.await.unwrap()), "allow");
+        let late = serve(
+            &crew,
+            allan(),
+            "crew.deny",
+            json!({"session_id": started, "approval_id": b.to_string(), "reason": "Too slow."}),
+        )
+        .await;
+        assert_ne!(late.status, ServedStatus::Ok, "{:?}", late.body);
+        // Nor the person's late answer through the link's ask, Allow first.
+        for choice in ["allow", "deny", "stop"] {
+            let back = late_ask(up[0].clone(), choice).await;
+            assert_eq!(back["type"], "ask_closed", "{choice}: {back}");
+            assert_ne!(back["how"], "decided", "{choice}: {back}");
+            assert!(!stopped(), "{choice}");
+        }
+        assert!(d.view(started).unwrap().pending.is_none());
+        leaves_nothing(b);
     })
     .await;
 }

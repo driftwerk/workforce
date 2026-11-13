@@ -2,6 +2,8 @@
 //! the person at the machine, tracked through hooks and app-server events,
 //! kept in a Postgres registry, and restored after a restart.
 
+pub mod account;
+pub mod account_store;
 mod adopt;
 pub mod api;
 pub mod asking;
@@ -12,6 +14,9 @@ mod board_api;
 pub mod board_store;
 pub mod board_sync;
 pub mod board_sync_store;
+pub mod boss_ask;
+pub mod boss_ask_store;
+pub mod boss_shell;
 pub mod breaker;
 pub mod budget_store;
 pub mod charge;
@@ -27,6 +32,8 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
+pub mod decision;
+pub mod decision_store;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;
@@ -58,6 +65,8 @@ mod move_api;
 pub mod move_store;
 pub mod moves;
 pub mod never;
+pub mod open_item;
+pub mod open_item_store;
 pub mod overview;
 pub mod plan;
 mod plan_api;
@@ -79,6 +88,8 @@ mod testing;
 pub mod ticket_files;
 mod token_pipe;
 mod transcript;
+pub mod update;
+pub mod update_store;
 pub mod usage;
 mod vt;
 mod worktree;
@@ -87,7 +98,8 @@ pub use adopt::HubInternal;
 pub use api::{router, sessions_router, Authorize};
 pub use conversations::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,
-    Conversations, Cursor, Page, PutRead, Said, Speaker, SpeakerKind,
+    Conversations, Copied, CopyToChat, Cursor, Delete, Deleted, Match, Matches, Page, PutRead,
+    Said, SavedMemory, Speaker, SpeakerKind, Thread, Threads,
 };
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
@@ -103,6 +115,7 @@ pub use service::{
     Options, Removal, Removed, RestorePolicy, Sender as LineSender, SessionMcp, SessionMemory,
     SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped, UNGROUPED,
 };
+pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
     TicketQuery, TicketView,

@@ -124,7 +124,7 @@ pub struct Where<'a> {
 /// What runs inside `$( … )`, backticks and parentheses is a command of its
 /// own; redirections are words (a file read or written is named either
 /// way).
-fn commands(text: &str) -> Vec<Vec<String>> {
+pub(crate) fn commands(text: &str) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word: Option<String> = None;
@@ -179,13 +179,13 @@ fn commands(text: &str) -> Vec<Vec<String>> {
 }
 
 /// A program's name without its folder: `/bin/rm` is `rm`.
-fn program(w: &str) -> &str {
+pub(crate) fn program(w: &str) -> &str {
     w.rsplit('/').next().unwrap_or(w)
 }
 
 /// `words` from the program on: variable assignments and wrappers
 /// (`sudo`, `env A=b`, `nice`, `timeout 5`, `xargs`, …) before it skipped.
-fn from_program(words: &[String]) -> &[String] {
+pub(crate) fn from_program(words: &[String]) -> &[String] {
     let mut i = 0;
     while i < words.len() {
         let w = words[i].as_str();
@@ -1142,6 +1142,39 @@ pub fn said(text: &str) -> Option<Never> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .find_map(|l| command(l, &nowhere))
+}
+
+/// Whether `text` speaks of secrets anywhere in it, as [`said`] reads
+/// them: its phrases, a file credentials are kept in, or a line that reads
+/// as a command reading or exporting them. Unlike [`said`], another limit
+/// said first doesn't hide it.
+pub fn says_secrets(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let phrases = SAID
+        .iter()
+        .filter(|(n, _)| *n == Never::Secrets)
+        .flat_map(|(_, p)| p.iter());
+    if phrases.clone().any(|p| phrase_in(&lower, p)) {
+        return true;
+    }
+    if commands(text)
+        .iter()
+        .flatten()
+        .any(|w| secret_file(w) || secret_variable(w))
+    {
+        return true;
+    }
+    let nowhere = Where {
+        cwd: None,
+        own: None,
+        home: Path::new("/nonexistent-home"),
+        scratch: &[],
+    };
+    text.lines()
+        .chain(text.split('`').skip(1).step_by(2))
+        .flat_map(|l| commands(l).into_iter())
+        .any(|w| one(&w, &nowhere, 0) == Some(Never::Secrets))
+        || said(text) == Some(Never::Secrets)
 }
 
 // ── Pages ────────────────────────────────────────────────────────────────

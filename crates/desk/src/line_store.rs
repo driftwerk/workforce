@@ -123,7 +123,8 @@ impl DeskStore {
             .query_opt(
                 &format!(
                     "SELECT {COLUMNS} FROM line_messages \
-                     WHERE in_reply_to = $1 AND kind = 'answer' ORDER BY at LIMIT 1"
+                     WHERE in_reply_to = $1 AND kind = 'answer' AND delivery <> 'withdrawn' \
+                     ORDER BY at LIMIT 1"
                 ),
                 &[&ask],
             )
@@ -227,6 +228,52 @@ impl DeskStore {
             .as_ref()
             .map(message)
             .transpose()
+    }
+
+    /// Withdraws the one message `id` a boss sent a session (a tell, or its
+    /// answer to the session's question) while it is queued or held: it
+    /// never goes in. An answer taken back puts its question back with the
+    /// person, as `escalation` says. The message as it now is, and the
+    /// question put back; `None` when it had already gone in (or isn't a
+    /// boss's).
+    pub async fn line_withdraw_one(
+        &self,
+        id: Uuid,
+        escalation: &crate::line::Escalation,
+    ) -> Result<Option<(LineMessage, Option<LineMessage>)>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let Some(row) = tx
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'withdrawn', updated_at = now() \
+                     WHERE id = $1 AND sender ->> 'kind' = 'manager' AND kind IN ('tell', 'answer') \
+                     AND delivery IN ('queued', 'held') RETURNING {COLUMNS}"
+                ),
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let withdrawn = message(&row)?;
+        let mut reopened = None;
+        if let (LineKind::Answer, Some(ask)) = (withdrawn.kind, withdrawn.in_reply_to) {
+            reopened = tx
+                .query_opt(
+                    &format!(
+                        "UPDATE line_messages SET asked = 'escalated', escalation = $2, updated_at = now() \
+                         WHERE id = $1 AND kind = 'ask' AND asked = 'answered' RETURNING {COLUMNS}"
+                    ),
+                    &[&ask, &serde_json::to_value(escalation)?],
+                )
+                .await?
+                .as_ref()
+                .map(message)
+                .transpose()?;
+        }
+        tx.commit().await?;
+        Ok(Some((withdrawn, reopened)))
     }
 
     /// Gives what waits for the session `from` (queued, or held while it
@@ -419,6 +466,99 @@ impl DeskStore {
             .iter()
             .map(message)
             .collect()
+    }
+
+    /// Withdraws the question `ask` when it is still in one of the states
+    /// `from`: one statement, so an answer, a dismissal or a lapse that
+    /// came first stands. The row as it now is, or `None` when it didn't
+    /// move.
+    pub async fn line_withdraw_ask(
+        &self,
+        ask: Uuid,
+        from: &[Asked],
+    ) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        let from: Vec<&str> = from.iter().map(|a| a.as_str()).collect();
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET asked = 'withdrawn', updated_at = now() \
+                     WHERE id = $1 AND kind = 'ask' AND asked = ANY($2) RETURNING {COLUMNS}"
+                ),
+                &[&ask, &from],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
+    }
+
+    /// Gives the question `ask` to the person with `escalation`, while it
+    /// is still open (or already given): one statement, so an answer, a
+    /// dismissal or a lapse that came first stands. The row as it now is,
+    /// or `None` when it didn't move.
+    pub async fn line_escalate_ask(
+        &self,
+        ask: Uuid,
+        escalation: &crate::line::Escalation,
+    ) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET asked = 'escalated', escalation = $2, updated_at = now() \
+                     WHERE id = $1 AND kind = 'ask' AND asked IN ('open', 'escalated') \
+                     RETURNING {COLUMNS}"
+                ),
+                &[&ask, &serde_json::to_value(escalation)?],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
+    }
+
+    /// Moves a row still waiting for its session between `queued` and
+    /// `held`: one statement, so a row taken, withdrawn or edited meanwhile
+    /// is left as it is. The row as it now is, or `None` when it didn't
+    /// move.
+    pub async fn line_set_waiting(&self, id: Uuid, to: Delivery) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = $2, updated_at = now() \
+                     WHERE id = $1 AND delivery IN ('queued', 'held') AND delivery <> $2 \
+                     RETURNING {COLUMNS}"
+                ),
+                &[&id, &to.as_str()],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
+    }
+
+    /// Puts a row delivered to `session` back in its queue, as it was
+    /// before: one statement, so a row that moved on meanwhile is left as
+    /// it is. The row as it now is, or `None` when it didn't move.
+    pub async fn line_untake(&self, id: Uuid, session: &str) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'queued', delivered_at = NULL, \
+                     updated_at = now() \
+                     WHERE id = $1 AND delivery = 'delivered' \
+                     AND recipient ->> 'kind' = 'session' AND recipient ->> 'id' = $2 \
+                     RETURNING {COLUMNS}"
+                ),
+                &[&id, &session],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
     }
 
     /// The person sets `ask` aside unanswered: one waiting on them, or one

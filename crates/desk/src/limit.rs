@@ -31,6 +31,11 @@ pub struct LimitHit {
     /// `seven_day_opus`, … None when only the message was seen.
     pub window: Option<String>,
     pub resets_at: Option<DateTime<Utc>>,
+    /// When Claude Code wrote the refusal, as its transcript line says.
+    /// None when it is heard as it happens (a hook, a reply's words): now.
+    /// A line read again later (a restart, a transcript re-read) keeps its
+    /// own time, so it is never taken for a fresh refusal.
+    pub at: Option<DateTime<Utc>>,
 }
 
 /// How a turn ended that didn't end well, as Claude Code reported it.
@@ -74,6 +79,7 @@ impl LimitHit {
         LimitHit {
             window: window_in_words(said).map(str::to_string),
             resets_at: None,
+            at: None,
         }
     }
 
@@ -149,6 +155,11 @@ pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
         resets_at: field("resetsAt")
             .and_then(Value::as_i64)
             .and_then(|s| DateTime::from_timestamp(s, 0)),
+        at: v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.to_utc()),
     }))
 }
 
@@ -161,6 +172,7 @@ mod tests {
         let hit = |w: &str| LimitHit {
             window: Some(w.into()),
             resets_at: None,
+            at: None,
         };
         assert_eq!(hit("five_hour").minutes(), Some(300));
         assert_eq!(hit("seven_day").minutes(), Some(10_080));
@@ -178,7 +190,8 @@ mod tests {
             ),
             TurnFailure::Limit(LimitHit {
                 window: None,
-                resets_at: None
+                resets_at: None,
+                at: None
             })
         );
         assert!(
@@ -298,7 +311,25 @@ mod tests {
             Some(TurnFailure::Limit(LimitHit {
                 window: Some("five_hour".into()),
                 resets_at: DateTime::from_timestamp(1_792_137_600, 0),
+                at: None,
             }))
+        );
+        // The line's own time is the refusal's: read again later (after a
+        // restart), it is as old as it is.
+        let mut stamped = line.clone();
+        stamped["timestamp"] = "2026-11-13T08:15:59.099Z".into();
+        let hit = in_transcript_line(&stamped)
+            .unwrap()
+            .limit()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            hit.at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-11-13T08:15:59.099Z")
+                    .unwrap()
+                    .to_utc()
+            )
         );
         // An API key's 429, as 2.1.319 wrote it: a failed turn, never the
         // plan's limit, whatever its words.

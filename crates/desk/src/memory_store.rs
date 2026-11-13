@@ -290,6 +290,18 @@ impl DeskStore {
                 .await
                 .context("keeping an exchange")?;
             }
+            // Which exchanges this session's record holds, whoever kept
+            // them: a resumed or forked conversation's account reads its
+            // copied history through these.
+            let at: Vec<DateTime<Utc>> = w.closed.iter().chain(w.open).map(|x| x.at).collect();
+            tx.execute(
+                "INSERT INTO memory_record_keys (session, engine, key, at) \
+                 SELECT $1, $2, k, a FROM unnest($3::text[], $4::timestamptz[]) AS t(k, a) \
+                 ON CONFLICT DO NOTHING",
+                &[&w.session, &w.engine.as_str(), &keys, &at],
+            )
+            .await
+            .context("noting which exchanges a session's record holds")?;
             // Exchanges that closed are to be read for notes: due as the
             // turn ends, at most every ten minutes.
             if !w.closed.is_empty() {
@@ -417,6 +429,45 @@ impl DeskStore {
             .await?
             .map(|r| r.try_get(0))
             .transpose()?)
+    }
+
+    /// Sets or clears (none) each of `settings` in one transaction.
+    pub async fn put_settings(&self, settings: &[(&str, Option<Value>)]) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        for (key, value) in settings {
+            match value {
+                Some(value) => {
+                    tx.execute(
+                        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) \
+                         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
+                        &[key, value],
+                    )
+                    .await?;
+                }
+                None => {
+                    tx.execute("DELETE FROM settings WHERE key = $1", &[key])
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// How many exchanges, from how many sessions, ended more than `days`
+    /// ago: what a sweep keeping `days` would remove.
+    pub async fn older_than(&self, days: u32) -> Result<(i64, i64)> {
+        let client = self.pool().get().await?;
+        let days = i32::try_from(days).unwrap_or(i32::MAX);
+        let row = client
+            .query_one(
+                "SELECT COUNT(*), COUNT(DISTINCT session) FROM memory_exchanges \
+                 WHERE COALESCE(ended, at) < now() - make_interval(days => $1)",
+                &[&days],
+            )
+            .await?;
+        Ok((row.try_get(0)?, row.try_get(1)?))
     }
 
     pub async fn put_setting(&self, key: &str, value: &Value) -> Result<()> {
@@ -621,6 +672,11 @@ impl DeskStore {
         tx.execute(
             "DELETE FROM memory_reads WHERE at < now() - interval '90 days'",
             &[],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM memory_record_keys WHERE at < now() - make_interval(days => $1)",
+            &[&days],
         )
         .await?;
         tx.execute(
@@ -841,6 +897,18 @@ pub(crate) async fn forget_memory_in(
         let (session, group): (Uuid, Option<String>) = (row.try_get(0)?, row.try_get(1)?);
         queue_purge(tx, group.as_deref(), &Purge::Session { session }).await?;
     }
+    // What its record held, and its account, which was written from it.
+    tx.execute(
+        "DELETE FROM memory_record_keys WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM session_accounts WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await
+    .context("forgetting sessions' accounts")?;
     let readers: Vec<String> = ids.iter().map(|id| format!("session:{id}")).collect();
     tx.execute(
         "DELETE FROM memory_reads WHERE reader = ANY($1)",

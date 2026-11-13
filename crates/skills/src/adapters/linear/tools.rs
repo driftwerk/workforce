@@ -2247,7 +2247,7 @@ impl Tool for LinearViewerTool {
                 ))
             }
         };
-        let query = "query { viewer { id name email displayName } }";
+        let query = "query { viewer { id name email displayName organization { urlKey } } }";
         // A shared key's viewer is whoever owns the key, not the caller.
         let personal = client.key_is_personal();
         match client.query(query, serde_json::json!({})).await {
@@ -2260,6 +2260,8 @@ impl Tool for LinearViewerTool {
                         "display_name": v["displayName"],
                         "email": v["email"],
                         "personal": personal,
+                        // Which Linear workspace this is.
+                        "workspace": v["organization"]["urlKey"],
                     }),
                     start.elapsed().as_millis() as u64,
                 ))
@@ -2527,6 +2529,10 @@ impl Tool for LinearMembersListTool {
                     "type": "string",
                     "description": "Only the members with exactly this email (any case)"
                 },
+                "name": {
+                    "type": "string",
+                    "description": "Only the members whose name or display name contains this (any case)"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -2556,48 +2562,38 @@ impl Tool for LinearMembersListTool {
 
         let limit = coerce_to_u64(&input["limit"]).unwrap_or(100).min(250);
 
-        // An email, when given, is a variable: never written into the query.
-        let email = input["email"]
-            .as_str()
-            .map(str::trim)
-            .filter(|e| !e.is_empty());
-        let query = match email {
-            Some(_) => {
-                r#"
-            query($first: Int!, $email: String!) {
-                users(first: $first, filter: { email: { eqIgnoreCase: $email } }) {
+        // An email or a name, when given, is a variable: never written into
+        // the query.
+        let given = |key: &str| {
+            input[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let filter = match (given("email"), given("name")) {
+            (Some(email), _) => serde_json::json!({ "email": { "eqIgnoreCase": email } }),
+            (None, Some(name)) => serde_json::json!({ "or": [
+                { "name": { "containsIgnoreCase": name } },
+                { "displayName": { "containsIgnoreCase": name } },
+            ] }),
+            (None, None) => Value::Null,
+        };
+        let query = r#"
+            query($first: Int!, $filter: UserFilter) {
+                users(first: $first, filter: $filter) {
                     nodes {
                         id
                         name
                         email
                         displayName
                         active
+                        avatarUrl
                     }
                 }
             }
-        "#
-            }
-            None => {
-                r#"
-            query($first: Int!) {
-                users(first: $first) {
-                    nodes {
-                        id
-                        name
-                        email
-                        displayName
-                        active
-                    }
-                }
-            }
-        "#
-            }
-        };
-
-        let variables = match email {
-            Some(e) => serde_json::json!({ "first": limit, "email": e }),
-            None => serde_json::json!({ "first": limit }),
-        };
+        "#;
+        let variables = serde_json::json!({ "first": limit, "filter": filter });
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match client.query(query, variables).await {

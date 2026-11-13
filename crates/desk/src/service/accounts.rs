@@ -490,10 +490,18 @@ impl Desk {
 
     /// The person's Claude accounts for the hub's own model calls (the
     /// overseer, the Floor's gists), in the order a switch takes them (the
-    /// default first), and when each is known to be full. Never their
-    /// tokens ([`Desk::pool_token`]); one whose sign-in can't be used is
-    /// left out.
-    pub fn pool_accounts(&self) -> Vec<(Uuid, Option<chrono::DateTime<Utc>>)> {
+    /// default first), when each is known to be full, and since when a
+    /// refusal heard of it is over (its last sign-in or success). Never
+    /// their tokens ([`Desk::pool_token`]); one whose sign-in can't be used
+    /// is left out.
+    #[allow(clippy::type_complexity)]
+    pub fn pool_accounts(
+        &self,
+    ) -> Vec<(
+        Uuid,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+    )> {
         if self.0.opts.account_keys.is_none() {
             return Vec::new();
         }
@@ -515,7 +523,8 @@ impl Desk {
                 let full = Self::full_now(&st, Some(a.id)).map(|until| {
                     until.unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(15))
                 });
-                (a.id, full)
+                let cleared = Self::standing_of(&st, Self::canonical(&st, Some(a.id))).cleared_at();
+                (a.id, full, cleared)
             })
             .collect()
     }
@@ -554,13 +563,25 @@ impl Desk {
         }
     }
 
-    /// A call of the hub's own on `account` was refused at its limit: it is
-    /// full until `until` for Desk too.
-    pub fn hub_cooling(&self, account: Uuid, until: chrono::DateTime<Utc>) {
+    /// A call of the hub's own on `account` was refused at its limit at
+    /// `at`: it is full until `until` for Desk too. Kept as of when it was
+    /// refused, never as of when it was told, so a refusal told again (the
+    /// hub telling what it still cools) is never a newer one; and one from
+    /// before the account's last sign-in or success is over.
+    pub fn hub_cooling(
+        &self,
+        account: Uuid,
+        until: chrono::DateTime<Utc>,
+        at: chrono::DateTime<Utc>,
+    ) {
         let now = Utc::now();
+        let at = at.min(now);
         {
             let mut st = self.0.state.lock();
             if !st.accounts.iter().any(|a| a.id == account) {
+                return;
+            }
+            if !Self::standing_of(&st, Some(account)).counts(at) {
                 return;
             }
             // Already full until then as it reads now: nothing new.
@@ -574,7 +595,14 @@ impl Desk {
             // Kept as the account's own: the call ran on its token.
             let raw = super::identities::Raw::Account(account);
             let standing = Self::standing_mut(&mut st, &raw);
-            standing.hit_at = Some(now);
+            // A later stop already kept stands; the same one told again
+            // (the hub still cooling it) is nothing new.
+            if standing.hit_at.is_some_and(|kept| kept > at)
+                || (standing.hit_at == Some(at) && standing.hit_until == Some(until))
+            {
+                return;
+            }
+            standing.hit_at = Some(at);
             standing.hit_until = Some(until);
             standing.hit_window = None;
             Self::wrote_hit(&mut st, &raw, super::identities::Writer::Pool);
@@ -585,6 +613,21 @@ impl Desk {
             let desk = self.clone();
             rt.spawn(async move { desk.accounts_moved().await });
         }
+    }
+
+    /// A call of the hub's own on `account`, begun at `at`, succeeded: a
+    /// stop it had from before then is over.
+    pub fn hub_served(&self, account: Uuid, at: chrono::DateTime<Utc>) {
+        if !self.0.state.lock().accounts.iter().any(|a| a.id == account) {
+            return;
+        }
+        // Told from wherever a login is settled, which may have no runtime.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let raw = super::identities::Raw::Account(account);
+            Self::mark_ok(&mut self.0.state.lock(), &raw, at);
+            return;
+        }
+        self.ok_seen(&super::identities::Raw::Account(account), at);
     }
 
     /// An account by the name the person or an agent gave it.
@@ -962,7 +1005,17 @@ impl Desk {
                 st.sign_in_problems.remove(&id);
                 st.links.remove(&id);
                 st.prints.remove(&super::identities::Raw::Account(id));
-                st.standing.remove(&Some(id));
+                // What it knew goes, and when it was signed in is kept: a
+                // stop told back from before (a transcript's old refusal,
+                // the hub's cooldown, another computer) is over, here and
+                // in the hub's pool ([`Desk::pool_accounts`]).
+                st.standing.insert(
+                    Some(id),
+                    crate::engine_accounts::Standing {
+                        signed_in_at: Some(Utc::now()),
+                        ..Default::default()
+                    },
+                );
             }
         }
         self.keep_prints();

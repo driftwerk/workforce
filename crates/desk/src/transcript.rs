@@ -24,6 +24,9 @@ pub struct Tail {
     /// API error: the plan's limit (which window, and when it resets), or
     /// another failure.
     pub failure: Option<crate::limit::TurnFailure>,
+    /// When Claude Code last wrote a reply that wasn't an API error: a call
+    /// on its sign-in that succeeded then.
+    pub ok_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The last `/login` run in it that Claude Code said succeeded ("Login
     /// successful"): its line's id and when. It signs the CLI in again, so
     /// the session runs on that sign-in from then on. One cancelled or
@@ -133,6 +136,13 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
                 .collect();
             if !text.is_empty() {
                 let said = text.join("\n");
+                // A reply, not an API error: the call it came from succeeded.
+                if tail.failure.is_none() && !crate::limit::says_plan_limit(&said) {
+                    let at = str_at("timestamp")
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                        .map(|t| t.to_utc());
+                    tail.ok_at = at.or(tail.ok_at);
+                }
                 tail.last_reply = Some(clip(&said));
                 tail.said = Some(said);
             }
@@ -349,6 +359,7 @@ mod tests {
                 last_reply: Some("Done, tests pass.".into()),
                 said: Some("Done, tests pass.".into()),
                 failure: None,
+                ok_at: None,
                 last_login: None,
                 pending_login: None,
             }
@@ -490,6 +501,32 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_says_when_its_last_call_succeeded_and_when_a_refusal_was_written() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in [
+            r#"{"type":"user","timestamp":"2026-11-13T08:00:00Z","message":{"role":"user","content":"fix it"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-13T08:01:00Z","message":{"content":[{"type":"text","text":"Fixed."}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-13T08:15:59Z","isApiErrorMessage":true,"apiError":"usage_limit_reached","quotaLimits":{"status":"rejected","resetsAt":1795071600,"rateLimitType":"seven_day"},"error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your weekly limit · resets Nov 19, 7am (UTC)"}]}}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+        }
+        let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().to_utc();
+        let t = read_tail(f.path()).unwrap();
+        assert_eq!(t.ok_at, Some(at("2026-11-13T08:01:00Z")), "not the refusal");
+        let hit = t.failure.unwrap().limit().cloned().unwrap();
+        assert_eq!(hit.at, Some(at("2026-11-13T08:15:59Z")));
+        // Answered since: the last call that succeeded is that one.
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-11-13T11:30:00Z","message":{{"content":[{{"type":"text","text":"Done."}}]}}}}"#
+        )
+        .unwrap();
+        let t = read_tail(f.path()).unwrap();
+        assert_eq!(t.ok_at, Some(at("2026-11-13T11:30:00Z")));
+        assert_eq!(t.failure, None);
+    }
+
+    #[test]
     fn a_transcript_that_ends_on_the_plans_limit_says_when_it_resets() {
         let refused = r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"seven_day"}},"quotaLimits":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"seven_day"},"error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your weekly limit · resets Fri 9am"}]}}"#;
         let write = |lines: &[&str]| {
@@ -509,6 +546,7 @@ mod tests {
             Some(crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
                 window: Some("seven_day".into()),
                 resets_at: chrono::DateTime::from_timestamp(1_792_137_600, 0),
+                at: None,
             }))
         );
         assert_eq!(

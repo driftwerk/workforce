@@ -273,14 +273,20 @@ async fn keep_memory_to_scope(
 /// conversations there are left there ([`crate::memory_fence::leave_sessions`]).
 /// Once written, a failure can't undo the write: it is tried once more and
 /// then logged loudly.
-fn leave_conversations(service: &AgentService, left: &str) {
+async fn leave_conversations(service: &AgentService, left: &str) {
+    // A Slack thread that is a boss conversation now and isn't once left is
+    // told so, once, in the thread.
+    let threads = crate::boss_links::slack::boss_threads(service);
     for attempt in 0..2 {
         match crate::memory_fence::leave_sessions(
             service.sessions.as_ref(),
             service.agent_id.as_str(),
             left,
         ) {
-            Ok(_) => return,
+            Ok(_) => {
+                crate::boss_links::slack::tell_ended(service, threads).await;
+                return;
+            }
             Err(e) if attempt == 0 => {
                 tracing::warn!(agent_id = %service.agent_id, error = %format!("{e:#}"), "a boss's conversations weren't left with its old group; trying again");
             }
@@ -624,7 +630,7 @@ async fn save_one(
     tracing::info!(agent_id = %service.agent_id, via = edit.edited_via, "Agent config.toml saved");
     // Only now it is written: a refused write leaves them as they were.
     if let Some(left) = &left {
-        leave_conversations(service, left);
+        leave_conversations(service, left).await;
     }
 
     let restart_required = service.reload_config().await.unwrap_or_else(|e| {

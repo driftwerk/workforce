@@ -257,6 +257,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// What a prompt for a call of this tool always says, whoever asks: the
+    /// gate puts it before the reason policy, the computer gate or any other
+    /// gate gives, so no other wording replaces it. `None`, the default,
+    /// leaves the reason as the gates give it.
+    fn approval_notice(&self) -> Option<String> {
+        None
+    }
+
     /// What THIS call does to a messaging surface: reads it, or writes to a
     /// destination on a platform. The cross-surface gate reads it to hold a
     /// write outside the Desk conversation a person is in for their say.

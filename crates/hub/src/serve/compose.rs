@@ -3425,6 +3425,17 @@ fn register_messaging_tools(
             tools,
             Arc::clone(identity_store_handle),
         )));
+        // Or whom they chose to be there.
+        tools.register(Arc::new(crate::chosen_me::MembersNamed::new(
+            on,
+            tools,
+            Arc::clone(identity_store_handle),
+        )));
+        tools.register(Arc::new(crate::chosen_me::ChooseMe::new(
+            on,
+            tools,
+            Arc::clone(identity_store_handle),
+        )));
     }
     tools.register(Arc::new(
         crate::identity_lifecycle_tool::IdentityLifecycleTool,

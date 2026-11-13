@@ -21,20 +21,29 @@ use workforce_desk::scope::Seen;
 
 use crate::serve::AgentService;
 
-use super::actions::{Action, Gate};
+use super::actions::{Action, Gate, Target};
 use super::watcher::reported;
 use super::CrewHub;
 
-/// Every `crew.*` tool: the reading ones first.
-pub const READ: [&str; 5] = [
+/// Every `crew.*` tool: the ones it has at every level first (its reads,
+/// and what it asks of the person, which is never gated).
+pub const READ: [&str; 12] = [
     "crew.overview",
     "crew.activity",
+    "crew.account",
+    super::decisions::NAME,
     "crew.history",
     super::spend::NAME,
     super::board::NAME,
+    super::items::ASK,
+    super::items::CLOSE,
+    super::items::OPEN,
+    super::items::PROMISE,
+    super::items::ORDER,
 ];
-pub const ACT: [&str; 20] = [
+pub const ACT: [&str; 21] = [
     "crew.nudge",
+    "crew.ask_session",
     "crew.escalate",
     "crew.approve",
     "crew.deny",
@@ -110,6 +119,12 @@ fn reason_schema() -> Value {
 
 fn session_schema() -> Value {
     json!({ "type": "string", "description": "A session id from crew.overview" })
+}
+
+/// A session id from crew.overview, read.
+fn session_id(s: &str) -> Result<uuid::Uuid, String> {
+    s.parse()
+        .map_err(|_| "That isn’t a session id from crew.overview.".to_string())
 }
 
 fn ticket_schema() -> Value {
@@ -316,22 +331,9 @@ impl CrewTool {
             "crew.history" => {
                 let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
                 if let Some(session) = input["session_id"].as_str() {
-                    let id: uuid::Uuid = session
-                        .parse()
-                        .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
+                    let id = session_id(session)?;
                     crew.session_seen(id, seen)?;
-                    let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
-                    let terminal = crew.desk.terminal_text(id, 3000).ok();
-                    let said = json!({
-                        "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
-                        "goal": v.goal, "cwd": v.cwd,
-                        "last_prompt": v.last_prompt, "last_reply": v.last_reply,
-                        "pending": v.pending, "terminal": terminal,
-                    });
-                    return Ok(json!({
-                        "state": v.state,
-                        "session": reported(&said.to_string(), "the session"),
-                    }));
+                    return self.session_said(crew, id);
                 }
                 let agent = input["agent_id"]
                     .as_str()
@@ -358,10 +360,115 @@ impl CrewTool {
                     "messages": reported(&messages.to_string(), &format!("{agent}'s Desk DM")),
                 }))
             }
+            "crew.account" => {
+                let id = session_id(
+                    input["session_id"]
+                        .as_str()
+                        .ok_or("Say which session: a session_id from crew.overview.")?,
+                )?;
+                crew.session_seen(id, seen)?;
+                self.account(crew, id, input["question"].as_str()).await
+            }
             super::spend::NAME => crew.spend(input, seen).await,
+            // Its own log only: nothing of another boss's is read.
+            super::decisions::NAME => {
+                crew.decisions_tool(b.service.agent_id.as_str(), input)
+                    .await
+            }
             super::board::NAME => crew.board(seen).await,
+            super::items::ASK
+            | super::items::CLOSE
+            | super::items::OPEN
+            | super::items::PROMISE
+            | super::items::ORDER => crew.items_tool(self.name, b, input).await,
             _ => Err("not a reading tool".into()),
         }
+    }
+
+    /// Session `id`'s last prompt, reply, pending request and screen: what
+    /// crew.history gives of it, and crew.account when it keeps no account.
+    fn session_said(&self, crew: &Arc<CrewHub>, id: uuid::Uuid) -> Result<Value, String> {
+        let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
+        let terminal = crew.desk.terminal_text(id, 3000).ok();
+        let said = json!({
+            "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
+            "goal": v.goal, "cwd": v.cwd,
+            "last_prompt": v.last_prompt, "last_reply": v.last_reply,
+            "pending": v.pending, "terminal": terminal,
+        });
+        Ok(json!({
+            "state": v.state,
+            "session": reported(&said.to_string(), "the session"),
+        }))
+    }
+
+    /// Session `id`'s running account, brought up to date first when it is
+    /// stale; with `question`, the answer its recent conversation gives.
+    /// With no account (none yet, or none can be read): what crew.history
+    /// says of it.
+    async fn account(
+        &self,
+        crew: &Arc<CrewHub>,
+        id: uuid::Uuid,
+        question: Option<&str>,
+    ) -> Result<Value, String> {
+        let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
+        let read = crew.desk.account_read(id).await.unwrap_or_else(|e| {
+            tracing::warn!(session = %id, error = %e, "a session's account couldn't be read; its history is given");
+            workforce_desk::AccountRead {
+                account: None,
+                refreshed: false,
+                stale: false,
+            }
+        });
+        let mut out = match read.account {
+            Some(a) => {
+                let as_of = a
+                    .written_at
+                    .with_timezone(&crew.desk.timezone())
+                    .format("%H:%M")
+                    .to_string();
+                let mut out = json!({
+                    "state": v.state,
+                    "account": reported(&a.render(), "the session's account"),
+                    "as_of": as_of,
+                    "age_minutes": a.age(chrono::Utc::now()).num_minutes(),
+                });
+                if read.stale {
+                    out["note"] = json!(format!(
+                        "It couldn't be brought up to date just now: this is as of {as_of}, so say so."
+                    ));
+                }
+                out
+            }
+            None => {
+                let mut out = self.session_said(crew, id)?;
+                out["note"] = json!(
+                    "Desk keeps no account of it yet: this is its last prompt, reply and screen."
+                );
+                out
+            }
+        };
+        if let Some(q) = question.map(str::trim).filter(|q| !q.is_empty()) {
+            use workforce_desk::AccountAnswer;
+            out["answer"] = match crew.desk.account_question(id, q).await {
+                Ok(AccountAnswer::Answered(answer)) => json!(reported(
+                    &answer,
+                    "an answer from the session's own conversation"
+                )),
+                Ok(AccountAnswer::NotInRecord) => json!(
+                    "Its account and recent conversation don't say. If it matters, ask the session (crew.ask_session, if you may act)."
+                ),
+                Ok(AccountAnswer::Unavailable) => json!(
+                    "That couldn't be looked up just now (Desk's notes are thin today, or its model is busy): answer from the account, and say so."
+                ),
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "a question about a session couldn't be answered");
+                    json!("That couldn't be looked up just now: answer from the account, and say so.")
+                }
+            };
+        }
+        Ok(out)
     }
 
     async fn act(&self, crew: &Arc<CrewHub>, b: &Bound, input: &Value) -> Result<Value, String> {
@@ -381,6 +488,9 @@ impl CrewTool {
             }
         }
         let mut action = Action::parse(self.name, &kept)?;
+        // Tried, whatever comes of it (done, suggested, refused, failed):
+        // its turn didn't let the session wait.
+        crew.acted_on(b.service.agent_id.as_str(), CrewHub::session_of(&action));
         // Nothing outside its scope is looked into, before anything is said
         // of it or the gate weighs it.
         crew.in_scope(&action, &b.seen).await?;
@@ -407,9 +517,21 @@ impl CrewTool {
             o.insert("ticket_id".into(), json!(id.to_string()));
             o.insert("ticket".into(), json!(key));
         }
-        let input = &kept;
         let oversight = &b.oversight;
-        let by = crew.by_boss(&b.service, reason);
+        // Always working in real sessions, a start goes to the session it
+        // already runs for it when one fits, as the start would have run:
+        // told the goal, not a new one.
+        let reused = crew
+            .reuse_instead(&mut action, oversight, b.service.agent_id.as_str())
+            .await;
+        let reason = match &reused {
+            Some((_, name)) => format!(
+                "{reason} (gave it to {name}, already there, rather than starting a new session)"
+            ),
+            None => reason.to_string(),
+        };
+        let input = &kept;
+        let by = crew.by_boss(&b.service, &reason);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
             Gate::Refuse => match &action {
@@ -423,8 +545,36 @@ impl CrewTool {
             },
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
-                let done = crew.perform(&action, by).await?;
-                Ok(json!({ "done": done }))
+                let actor = by.party.clone();
+                let Some((start, name)) = reused else {
+                    let done = crew.perform(&action, by).await?;
+                    return Ok(json!({ "done": done }));
+                };
+                let Action::Nudge { to: Target::Session(s), .. } = &action else {
+                    return Err("That isn't a session to give work to.".into());
+                };
+                let s = *s;
+                let (done, gave) = crew.give_or_start(&action, &start, s, by).await?;
+                if !gave {
+                    return Ok(json!({ "done": done }));
+                }
+                // Activity, and the Floor's rail, say which session got the
+                // work instead of a new one, and why.
+                if let Ok(v) = crew.desk.view(s) {
+                    let mut e = crew::Event::new(
+                        crew::Kind::Nudged,
+                        actor,
+                        Some(crew::Party::session(&v)),
+                        format!("gave {name} the work rather than starting a new session"),
+                    );
+                    e.reason = Some(reason.clone());
+                    crew.desk.note(e);
+                }
+                Ok(json!({
+                    "done": done,
+                    "reused": name,
+                    "note": format!("{name} was already there for this, idle in the same folder, so it got the work instead of a new session. Pass new: true only when the person asks for a new one."),
+                }))
             }
             Gate::Suggest(why) => {
                 if action.starts_session() {
@@ -525,7 +675,13 @@ impl CrewTool {
     ) -> Option<Result<Value, String>> {
         let named = input["session_id"].as_str()?;
         let (machine, id) = super::relay::machine_session(named)?;
-        if !RELAYED.contains(&self.name) {
+        // A machine keeps no account of its sessions here: what it gives
+        // is its history of one, as crew.history reads it.
+        let name = match self.name {
+            "crew.account" => "crew.history",
+            n => n,
+        };
+        if !RELAYED.contains(&name) {
             return Some(Err(format!(
                 "{} can't be done to a session on {machine} yet; tell the person instead.",
                 self.name
@@ -544,8 +700,7 @@ impl CrewTool {
         }
         // What its own level here doesn't let it do, it doesn't ask of a
         // machine either; the machine decides at no more than it.
-        if self.name != "crew.history"
-            && b.oversight.level == workforce_common::oversight::Level::Watch
+        if name != "crew.history" && b.oversight.level == workforce_common::oversight::Level::Watch
         {
             return Some(Err(
                 "You only watch the crew: tell the person what you would do instead.".into(),
@@ -559,10 +714,7 @@ impl CrewTool {
         sent["session_id"] = json!(id.to_string());
         let agent = b.service.agent_id.as_str();
         Some(
-            match crew
-                .relay(machine, g, self.name, sent, agent, &ceiling)
-                .await
-            {
+            match crew.relay(machine, g, name, sent, agent, &ceiling).await {
                 Ok(a) => {
                     let said = reported(
                         &workforce_desk::sees::capped(
@@ -592,12 +744,20 @@ pub(crate) fn describe(name: &str) -> &'static str {
     match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::decisions::NAME => super::decisions::DESCRIPTION,
+            super::items::ASK => super::items::ASK_DESCRIPTION,
+            super::items::CLOSE => super::items::CLOSE_DESCRIPTION,
+            super::items::OPEN => super::items::OPEN_DESCRIPTION,
+            super::items::PROMISE => super::items::PROMISE_DESCRIPTION,
+            super::items::ORDER => super::items::ORDER_DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
             super::handover::NAME => super::handover::DESCRIPTION,
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
+            "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
+            "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure.",
@@ -607,7 +767,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots).",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you always work in real sessions, a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
@@ -632,6 +792,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
     match name {
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
+        super::decisions::NAME => super::decisions::schema(),
+        super::items::ASK | super::items::CLOSE | super::items::OPEN => super::items::schema(name),
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
@@ -646,6 +808,17 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             "session_id": session_schema(),
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
         }}),
+        "crew.account" => json!({ "type": "object", "properties": {
+            "session_id": session_schema(),
+            "question": { "type": "string", "description": "Something specific the account may not say, answered from the session's recent conversation" }
+        }, "required": ["session_id"] }),
+        "crew.ask_session" => act(
+            props(json!({
+                "session_id": session_schema(),
+                "question": { "type": "string", "description": "What to ask it, plainly" }
+            })),
+            &["session_id", "question"],
+        ),
         "crew.nudge" => act(
             props(json!({
                 "agent_id": { "type": "string" },
@@ -705,7 +878,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "name": { "type": "string" },
                     "engine": { "type": "string", "enum": engines },
                     "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
-                    "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" }
+                    "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
+                    "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
                 })),
                 &["folder", "goal"],
             )

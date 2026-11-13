@@ -109,6 +109,7 @@ pub async fn deliver_routed_approval(
 ) {
     let requester_slack = slack_id_for(svc, requester_user_id).unwrap_or_default();
     let mut delivered_mentions: Vec<String> = Vec::new();
+    let mut asked_in_thread = false;
 
     for approver_id in approver_user_ids {
         let Some(slack_id) = slack_id_for(svc, approver_id) else {
@@ -127,6 +128,11 @@ pub async fn deliver_routed_approval(
                 continue;
             }
         };
+        // An approver asked in the very DM the request was made in (a Desk
+        // group's boss thread) is asked in its thread, where it was made.
+        let in_thread = (dm_channel == origin_channel)
+            .then(|| origin_thread.map(str::to_string))
+            .flatten();
         let blocks = crate::slack_blocks::routed_permission_prompt_blocks(
             agent_id,
             tool_name,
@@ -144,7 +150,7 @@ pub async fn deliver_routed_approval(
             .send_message(&OutboundMessage {
                 channel: dm_channel.clone(),
                 text: fallback,
-                thread_id: None,
+                thread_id: in_thread.clone(),
                 username: None,
                 icon_url: None,
                 blocks: Some(blocks),
@@ -157,6 +163,9 @@ pub async fn deliver_routed_approval(
                 {
                     tracing::warn!(error = %e, "failed to record approval DM coordinates");
                 }
+                if in_thread.is_some() {
+                    asked_in_thread = true;
+                }
                 delivered_mentions.push(format!("<@{slack_id}>"));
             }
             Err(e) => {
@@ -165,7 +174,8 @@ pub async fn deliver_routed_approval(
         }
     }
 
-    if origin_channel.is_empty() {
+    // Asked where it was made: no notice there besides.
+    if origin_channel.is_empty() || asked_in_thread {
         return;
     }
     let who = if delivered_mentions.is_empty() {
@@ -323,6 +333,12 @@ pub async fn deliver_routed_for_invocations(
     // The person a run made in Desk acts for is asked there; designated
     // approvers in Slack, as ever.
     let desk = workforce_agent::runner::current_desk().filter(|scope| !scope.attended);
+    // A Desk group's boss woken with nobody there asks its person on Desk
+    // as well as in Slack: they are recorded as its approver, so Desk lists
+    // it for them to answer.
+    let boss_wake = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+        .try_with(|o| o == crate::boss_links::wake::ORIGIN)
+        .unwrap_or(false);
     for req in routed {
         let row = match store.get(&req.request_id) {
             Ok(Some(row)) if row.is_pending() => row,
@@ -335,6 +351,14 @@ pub async fn deliver_routed_for_invocations(
                 continue;
             }
         };
+        if boss_wake && req.approver_user_ids.contains(&row.requester_id) {
+            match store.add_target(&row.request_id, &row.requester_id, "") {
+                Ok(()) => super::approvers_changed([row.requester_id.as_str()]),
+                Err(e) => {
+                    tracing::warn!(error = %e, request = %row.request_id, "a boss's routed approval wasn't recorded for its person")
+                }
+            }
+        }
         let (on_desk, in_slack): (Vec<String>, Vec<String>) = req
             .approver_user_ids
             .iter()
@@ -596,6 +620,118 @@ mod tests {
 
         assert!(card.contains("POST https://example.test/notes"), "{card}");
         assert!(!card.contains("REQUESTERS-PRIVATE-BODY"), "{card}");
+    }
+
+    /// A Slack surface that opens one DM and records what is posted, by
+    /// channel and thread.
+    #[derive(Default)]
+    struct OneDm(parking_lot::Mutex<Vec<(String, Option<String>, String)>>);
+
+    #[async_trait::async_trait]
+    impl ChannelSurface for OneDm {
+        fn platform(&self) -> &str {
+            "slack"
+        }
+        fn capabilities(&self) -> workforce_common::channels::ChannelCapabilities {
+            Default::default()
+        }
+        async fn add_reaction(&self, _: &workforce_common::channels::Reaction) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(
+            &self,
+            _: &workforce_common::channels::Reaction,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn open_conversation(&self, _: &str) -> eyre::Result<String> {
+            Ok("D0SAM".into())
+        }
+        async fn send_message(
+            &self,
+            m: &OutboundMessage,
+        ) -> eyre::Result<workforce_common::channels::SentMessage> {
+            let mut sent = self.0.lock();
+            sent.push((m.channel.clone(), m.thread_id.clone(), m.text.clone()));
+            Ok(workforce_common::channels::SentMessage {
+                channel: m.channel.clone(),
+                message_id: format!("1.{}", sent.len()),
+                thread_id: m.thread_id.clone(),
+                platform: "slack".into(),
+            })
+        }
+    }
+
+    /// What a boss woken with nobody there asks is asked of its person in
+    /// the group's own thread (with no notice besides), and listed for them
+    /// on Desk too.
+    #[tokio::test]
+    async fn a_boss_wakes_ask_reaches_its_person_in_the_thread_and_on_desk() {
+        use workforce_identity::store::IdentityStore as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(tmp.path()).await;
+        let identities = workforce_identity::sqlite::SqliteIdentityStore::in_memory().unwrap();
+        let mut sam = workforce_identity::types::Identity::new(
+            "Sam",
+            workforce_identity::types::IdentityRole::Member,
+        );
+        sam.linked_ids.insert("slack".into(), "U0SAM".into());
+        identities.create(&sam).unwrap();
+        service.set_identity_store(Arc::new(identities));
+        let store: Arc<dyn PendingApprovalStore> =
+            Arc::new(super::super::store::SqlitePendingApprovalStore::in_memory().unwrap());
+        service.set_pending_approval_store(Arc::clone(&store));
+        let slack = Arc::new(OneDm::default());
+        service.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as Arc<dyn ChannelSurface>,
+        );
+        let person = sam.id.to_string();
+        let core = workforce_agent::runner::PendingApprovalCore {
+            request_id: "r1".into(),
+            agent_id: "allan".into(),
+            session_key: "slack:T1:D0SAM:17.1".into(),
+            channel_id: "D0SAM".into(),
+            requester_user_id: person.clone(),
+            tool_name: "http.request".into(),
+            tool_input: serde_json::json!({}),
+            reason: "allan wants to use http.request from Acme's boss conversation.".into(),
+            allow_self_approval: true,
+            approver_user_ids: vec![person.clone()],
+            ttl: std::time::Duration::from_secs(3600),
+        };
+        store
+            .insert_core(
+                &core,
+                Some("T1"),
+                Some("17.1"),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let routed = invocation(
+            "require_approval",
+            serde_json::json!({"approval_request_id": "r1", "approver_user_ids": [person], "detail": "GET x"}),
+        );
+        workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+            .scope(crate::boss_links::wake::ORIGIN.to_string(), async {
+                deliver_routed_for_invocations(&service, &[routed]).await
+            })
+            .await;
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 1, "the card alone: {posted:?}");
+        assert_eq!(posted[0].0, "D0SAM");
+        assert_eq!(
+            posted[0].1.as_deref(),
+            Some("17.1"),
+            "in the group's thread"
+        );
+        let targets = store.targets("r1").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].approver_id, person,
+            "listed for Sam to answer on Desk"
+        );
+        assert_eq!(targets[0].slack_user_id, "U0SAM");
     }
 
     #[test]

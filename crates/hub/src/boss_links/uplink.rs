@@ -169,6 +169,11 @@ pub struct Uplinks {
     unproved: parking_lot::Mutex<HashMap<String, usize>>,
     pending: parking_lot::Mutex<HashMap<Uuid, Pending>>,
     timing: parking_lot::Mutex<Timing>,
+    /// Where the links' wake-ups go ([`super::wake`]), once this hub wakes
+    /// bosses.
+    wakes: std::sync::OnceLock<tokio::sync::mpsc::Sender<super::wake::Wake>>,
+    /// How many of each link's wakes wait on the queue now.
+    wakes_waiting: parking_lot::Mutex<HashMap<Uuid, usize>>,
     #[cfg(test)]
     pub(crate) hub: parking_lot::Mutex<Option<String>>,
 }
@@ -183,6 +188,52 @@ impl std::fmt::Debug for Uplinks {
 
 /// What a link's call came to.
 pub type CallResult = Result<Value, String>;
+
+/// Why a link checked again didn't hold, and whether that was only this hub
+/// not being able to check it now (not the engine's doing).
+#[derive(Debug)]
+pub struct Rechecked {
+    pub why: String,
+    pub unavailable: bool,
+}
+
+impl Rechecked {
+    fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            unavailable: false,
+        }
+    }
+}
+
+impl From<Rechecked> for String {
+    fn from(r: Rechecked) -> Self {
+        r.why
+    }
+}
+
+/// The most `event` frames a socket takes for one link a minute: the rest
+/// are dropped before any check, and nothing is counted against it.
+pub const EVENTS_PER_MINUTE: u32 = 30;
+
+/// The most `ask` frames one link is taken a minute; the rest are dropped
+/// before any check (the engine sends an open ask again on its next socket).
+pub const ASKS_PER_MINUTE: u32 = 30;
+
+/// Whether `link` is past `most` this minute in `seen`, counting this one.
+fn past_share(seen: &mut HashMap<Uuid, (Instant, u32)>, link: Uuid, most: u32) -> bool {
+    let now = Instant::now();
+    let (since, n) = seen.entry(link).or_insert((now, 0));
+    if now.duration_since(*since) >= Duration::from_secs(60) {
+        (*since, *n) = (now, 0);
+    }
+    *n += 1;
+    *n > most
+}
+
+/// The most wakes of one link waiting to be gathered at once: one link's
+/// flood never takes another's place.
+pub const WAKES_WAITING_PER_LINK: usize = 8;
 
 /// A place among the unproved sockets, given back when dropped.
 struct Unproved {
@@ -205,6 +256,13 @@ impl Drop for Unproved {
 }
 
 impl Uplinks {
+    /// Sends `frame` down whichever socket carries `link` now; false when
+    /// none does or its queue is full.
+    pub(crate) fn notify_link(&self, link: Uuid, frame: Value) -> bool {
+        let socket = self.links.lock().get(&link).cloned();
+        socket.is_some_and(|s| s.links.lock().contains_key(&link) && s.notify(frame))
+    }
+
     /// A place for one more socket of token `token_id` from `address` to
     /// prove itself, unless either has as many open as it may.
     fn unproved(
@@ -274,6 +332,45 @@ impl Uplinks {
             .collect()
     }
 
+    /// Sends this hub's links' wake-ups to `tx`: once.
+    pub fn wake_into(&self, tx: tokio::sync::mpsc::Sender<super::wake::Wake>) {
+        let _ = self.wakes.set(tx);
+    }
+
+    /// Hands `wake` on, when this hub wakes bosses; never waits. Each link
+    /// has [`WAKES_WAITING_PER_LINK`] places: past them its wakes are
+    /// dropped, and no other link's are.
+    fn wake(&self, wake: super::wake::Wake) {
+        let Some(tx) = self.wakes.get() else {
+            return;
+        };
+        let link = wake.link_id;
+        {
+            let mut waiting = self.wakes_waiting.lock();
+            let n = waiting.entry(link).or_default();
+            if *n >= WAKES_WAITING_PER_LINK {
+                tracing::warn!(%link, "a boss's wake-up was dropped: its link's places are full");
+                return;
+            }
+            *n += 1;
+        }
+        if tx.try_send(wake).is_err() {
+            self.wake_taken(link);
+            tracing::warn!(%link, "a boss's wake-up was dropped: the queue is full");
+        }
+    }
+
+    /// One of `link`'s wakes was taken off the queue.
+    pub(crate) fn wake_taken(&self, link: Uuid) {
+        let mut waiting = self.wakes_waiting.lock();
+        if let Some(n) = waiting.get_mut(&link) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                waiting.remove(&link);
+            }
+        }
+    }
+
     /// The links on a socket now of the group `group_key` minted for
     /// `person` and `agent`, with each one's engine name as registered at
     /// mint: all a boss tool in that group's conversation may call. Never
@@ -331,13 +428,13 @@ impl Uplinks {
         state: &GatewayState,
         socket: &Arc<Socket>,
         link_id: Uuid,
-    ) -> Result<LiveLink, String> {
+    ) -> Result<LiveLink, Rechecked> {
         let token = socket
             .links
             .lock()
             .get(&link_id)
             .map(|l| l.token.clone())
-            .ok_or_else(|| "That boss link isn't connected.".to_string())?;
+            .ok_or_else(|| Rechecked::refused("That boss link isn't connected."))?;
         match authenticate_link(state, &token) {
             Ok(live) if live.link.link_id == link_id => {
                 if let Some(l) = socket.links.lock().get_mut(&link_id) {
@@ -348,7 +445,7 @@ impl Uplinks {
             Ok(_) | Err(LinkRefusal::Unauthenticated) => {
                 let why = LinkRefusal::Unauthenticated.to_string();
                 self.drop_link(socket, link_id, &why).await;
-                Err(why)
+                Err(Rechecked::refused(why))
             }
             // Couldn't check now: not sent; dropped once it has gone on.
             Err(LinkRefusal::Unavailable) => {
@@ -360,12 +457,15 @@ impl Uplinks {
                     self.drop_link(socket, link_id, &LinkRefusal::Unavailable.to_string())
                         .await;
                 }
-                Err(LinkRefusal::Unavailable.to_string())
+                Err(Rechecked {
+                    why: LinkRefusal::Unavailable.to_string(),
+                    unavailable: true,
+                })
             }
             Err(why) => {
                 let why = why.to_string();
                 self.drop_link(socket, link_id, &why).await;
-                Err(why)
+                Err(Rechecked::refused(why))
             }
         }
     }
@@ -759,6 +859,9 @@ async fn run(
     let mut ticker = tokio::time::interval(timing.ping_every);
     ticker.tick().await;
     let mut unanswered = 0u32;
+    // Each link's events this minute: (since, how many).
+    let mut events: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let mut asks: HashMap<Uuid, (Instant, u32)> = HashMap::new();
     let mut bad = 0u32;
     loop {
         if bad > MAX_BAD_FRAMES {
@@ -799,9 +902,79 @@ async fn run(
                         // counted against the engine.
                         let _ = uplinks.take_result(&socket, call_id, result);
                     }
-                    // Frames of later versions (asks_open, catch_up, …) are
-                    // RB6's and RB7's: not counted against it.
-                    Some("asks_open" | "catch_up" | "event" | "ask" | "ask_closed") => {}
+                    // A wake-up for the link's boss: bound to the link this
+                    // socket proved and still holds, its person, agent and
+                    // group the link's, whatever the frame says.
+                    Some("event") => {
+                        let Some(link) = frame["linkId"].as_str().and_then(|l| l.parse::<Uuid>().ok()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        if !socket.links.lock().contains_key(&link) {
+                            bad += 1;
+                            continue;
+                        }
+                        // Past its minute's share: dropped before any check.
+                        if past_share(&mut events, link, EVENTS_PER_MINUTE) {
+                            continue;
+                        }
+                        let live = match uplinks.recheck(&state, &socket, link).await {
+                            Ok(live) => live,
+                            // This hub couldn't check: not the engine's doing.
+                            Err(r) if r.unavailable => continue,
+                            Err(_) => {
+                                bad += 1;
+                                continue;
+                            }
+                        };
+                        match super::wake::Wake::of(&live, &frame) {
+                            Some(wake) => uplinks.wake(wake),
+                            None => bad += 1,
+                        }
+                    }
+                    // What a link's sessions ask its person, and what came
+                    // of it: bound to the link this socket proved and still
+                    // holds, checked again, and kept for the link's person
+                    // and agent whatever the frame says.
+                    Some(kind @ ("ask" | "ask_closed" | "decision_refused")) => {
+                        let Some(link) = frame["linkId"].as_str().and_then(|l| l.parse::<Uuid>().ok()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        if !socket.links.lock().contains_key(&link) {
+                            bad += 1;
+                            continue;
+                        }
+                        if past_share(&mut asks, link, ASKS_PER_MINUTE) {
+                            continue;
+                        }
+                        let live = match uplinks.recheck(&state, &socket, link).await {
+                            Ok(live) => live,
+                            Err(r) if r.unavailable => continue,
+                            Err(_) => {
+                                bad += 1;
+                                continue;
+                            }
+                        };
+                        if kind == "ask" {
+                            if super::asks::Asked::of(&frame, chrono::Utc::now()).is_none() {
+                                bad += 1;
+                                continue;
+                            }
+                            let (state, hub) = (Arc::clone(&state), hub.clone());
+                            tokio::spawn(async move {
+                                let _ = super::asks::asked(&state, &live, &frame, &hub).await;
+                            });
+                        } else {
+                            let state = Arc::clone(&state);
+                            tokio::spawn(async move {
+                                super::asks::closed(&state, &live, &frame).await;
+                            });
+                        }
+                    }
+                    // Frames of later versions (asks_open, catch_up, …):
+                    // not counted against it.
+                    Some("asks_open" | "catch_up") => {}
                     _ => bad += 1,
                 }
             }
@@ -916,11 +1089,12 @@ fn handshake(
     let links: Vec<Value> = accepted
         .iter()
         .map(|(id, live)| {
-            json!({"linkId": id, "tokenId": live.token.id, "group": live.link.group_name})
+            json!({"linkId": id, "tokenId": live.token.id, "group": live.link.group_name,
+                   "identityId": live.person.id})
         })
         .collect();
     let ready = json!({"type": "ready", "links": links, "refused": refused,
-                       "engine": hello.engine.name});
+                       "engine": hello.engine.name, "features": ["asks"]});
     let _ = socket.tx.try_send(Message::Text(ready.to_string().into()));
     Ok(accepted)
 }

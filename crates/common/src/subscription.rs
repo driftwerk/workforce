@@ -517,6 +517,9 @@ pub enum Origin {
     Floor,
     /// Reading whether a Desk session's turn ended asking the person.
     DeskReading,
+    /// A turn in a Desk group's boss conversation on a boss hub: an agent
+    /// running another person's Desk group.
+    DeskBoss,
 }
 
 /// The channel prefix of memory-consolidation sessions, which marks their
@@ -549,13 +552,26 @@ impl Origin {
             Self::VoiceSummary => "voice_summary",
             Self::Floor => "floor",
             Self::DeskReading => "desk_reading",
+            Self::DeskBoss => "desk_boss",
         }
+    }
+
+    /// [`Self::of_turn`] for a turn in `session`: a boss conversation's,
+    /// wherever it is had (Desk, a Slack DM thread), is [`Self::DeskBoss`].
+    pub fn of_session_turn(user: &str, session: &crate::session::Session, voice: bool) -> Self {
+        if session.claims_desk_boss() {
+            return Self::DeskBoss;
+        }
+        Self::of_turn(user, &session.channel, voice)
     }
 
     /// The origin of a turn entering through the service, from the
     /// triggering source (`user`), the session channel, and whether the turn
     /// was spoken.
     pub fn of_turn(user: &str, channel: &str, voice: bool) -> Self {
+        if workforce_core::desk::is_desk_boss_channel(channel) {
+            return Self::DeskBoss;
+        }
         match user {
             HEARTBEAT => Self::Heartbeat,
             SCHEDULER if channel.starts_with(CONSOLIDATION_CHANNEL_PREFIX) => Self::Consolidation,
@@ -815,6 +831,30 @@ mod tests {
             assert_eq!(CredentialTier::try_from(VaultSource::from(tier)), Ok(tier));
         }
         assert!(CredentialTier::try_from(VaultSource::Unknown).is_err());
+    }
+
+    #[test]
+    fn a_boss_conversations_turns_cost_as_desk_boss_wherever_they_are_had() {
+        let person = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";
+        assert_eq!(
+            Origin::of_turn(person, "desk:boss:k", false),
+            Origin::DeskBoss
+        );
+        assert_eq!(
+            Origin::of_turn(person, "desk:boss:k", true),
+            Origin::DeskBoss
+        );
+        let mut thread = crate::session::Session::new("slack:W1:D1:1.2", person, "allan");
+        assert_eq!(
+            Origin::of_session_turn(person, &thread, false),
+            Origin::Interactive
+        );
+        thread.metadata = serde_json::json!({ crate::session::DESK_BOSS_KEY: { "groupKey": "k" } });
+        assert_eq!(
+            Origin::of_session_turn(person, &thread, false),
+            Origin::DeskBoss
+        );
+        assert_eq!(Origin::DeskBoss.as_str(), "desk_boss");
     }
 
     #[test]

@@ -26,14 +26,17 @@
 //! [`DeskBossConfig::token_ttl_days`]: workforce_common::settings::DeskBossConfig::token_ttl_days
 //! [`Capability::DeskBoss`]: crate::authz::Capability::DeskBoss
 
+pub mod asks;
 pub mod auth;
 pub mod conversation;
 pub mod engine_key;
 pub mod hold;
 pub mod links;
 pub mod merge;
+pub mod slack;
 pub mod tools;
 pub mod uplink;
+pub mod wake;
 
 #[cfg(test)]
 mod tests;

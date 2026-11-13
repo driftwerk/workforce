@@ -582,6 +582,16 @@ pub struct Extras {
     /// The plan a plan card shows, as of the revision it was posted for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<MentionedPlan>,
+    /// What the boss decided, each with its Undo where it has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<crate::decision::DecisionLine>,
+    /// What the boss asks of the person (needs you, still waiting), with
+    /// its answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<crate::open_item::MentionedItem>,
+    /// A boss's update, as the chat renders it in place of its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::update::MentionedUpdate>,
 }
 
 impl Extras {
@@ -590,6 +600,9 @@ impl Extras {
             && self.suggestions.is_empty()
             && self.questions.is_empty()
             && self.plan.is_none()
+            && self.decisions.is_empty()
+            && self.item.is_none()
+            && self.update.is_none()
     }
 }
 
@@ -632,6 +645,25 @@ pub struct MentionedSuggestion {
     pub state: SuggestionState,
 }
 
+/// Why a decision wasn't undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoRefused {
+    NotFound,
+    /// Undone already: once is all.
+    Already,
+    /// It can't be undone (what ran is fixed forward), or the undo failed.
+    Cant(String),
+}
+
+/// Why an open item wasn't answered or dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemRefused {
+    NotFound,
+    /// Closed already.
+    Closed,
+    Cant(String),
+}
+
 /// The hub's side of the crew: its agents, the overseer, and doing what a
 /// suggestion proposed.
 #[async_trait::async_trait]
@@ -664,6 +696,24 @@ pub trait Crew: Send + Sync {
     /// Does what `suggestion` proposed, as you; what went wrong in plain
     /// words.
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String>;
+    /// Undoes the boss's decision `id`, as you: what was done, or why it
+    /// can't be, in plain words. [`UndoRefused::Already`] when it is
+    /// already undone.
+    async fn undo_decision(&self, _id: uuid::Uuid) -> Result<String, UndoRefused> {
+        Err(UndoRefused::Cant(
+            "There is no boss here to undo it.".into(),
+        ))
+    }
+    /// Answers the boss's open item `id` with `answer`, as you: the item
+    /// is closed here, in the same request, and the answer goes on to
+    /// whoever asked.
+    async fn answer_item(&self, _id: uuid::Uuid, _answer: &str) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here to answer.".into()))
+    }
+    /// Drops the boss's open item `id` unanswered, as you.
+    async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
     /// What still needs `person` (the desk's own person when none is
     /// named), from the floor; `None` where the hub keeps none.
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {

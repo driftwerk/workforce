@@ -1667,3 +1667,104 @@ async fn a_reply_names_its_question_as_the_session_read_it_mark_or_id() {
     })
     .await;
 }
+
+/// A move on a row is one statement that checks where the row is: what
+/// moved it first stands, and is not written over by a copy read before.
+#[tokio::test]
+async fn a_row_that_moved_on_is_not_written_over_by_a_move_decided_from_an_older_read() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let session = Uuid::new_v4();
+        let sess = |id: Uuid| Party {
+            kind: PartyKind::Session,
+            id: id.to_string(),
+            name: "scout".into(),
+            engine: None,
+            origin: None,
+        };
+        let ask = |to: Party| {
+            LineMessage::new(sess(session), to, LineKind::Ask, "Which branch?".into(), 0)
+        };
+
+        // A question dismissed after it was read stays dismissed.
+        let q = ask(Party::you());
+        store.put_line(&q).await.unwrap();
+        store.line_dismiss(q.id).await.unwrap().unwrap();
+        assert!(store
+            .line_withdraw_ask(q.id, &[Asked::Open, Asked::Escalated, Asked::Lapsed])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .line_escalate_ask(
+                q.id,
+                &line::Escalation {
+                    why: String::new(),
+                    options: vec![],
+                    draft: None,
+                }
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.line_message(q.id).await.unwrap().unwrap().asked,
+            Some(Asked::Dismissed)
+        );
+
+        // An open one is withdrawn, once.
+        let q = ask(Party::you());
+        store.put_line(&q).await.unwrap();
+        let gone = store
+            .line_withdraw_ask(q.id, &[Asked::Open])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gone.asked, Some(Asked::Withdrawn));
+        assert!(store
+            .line_withdraw_ask(q.id, &[Asked::Open])
+            .await
+            .unwrap()
+            .is_none());
+
+        // A row taken is not put back to waiting, nor held, by a decision
+        // made before it was taken; and goes back only to its own session.
+        let mut m = LineMessage::new(
+            Party::desk(),
+            sess(session),
+            LineKind::Tell,
+            "hello".into(),
+            0,
+        );
+        store.put_line(&m).await.unwrap();
+        store
+            .line_take(m.id, Delivery::Delivered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .line_set_waiting(m.id, Delivery::Held)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .line_untake(m.id, &Uuid::new_v4().to_string())
+            .await
+            .unwrap()
+            .is_none());
+        let back = store
+            .line_untake(m.id, &session.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((back.delivery, back.delivered_at), (Delivery::Queued, None));
+        m = store
+            .line_set_waiting(m.id, Delivery::Held)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.delivery, Delivery::Held);
+    })
+    .await;
+}

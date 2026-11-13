@@ -711,11 +711,48 @@ fn who_the_person_is_comes_from_the_hub_s_identity_tool() {
             System::Jira,
             &json!({ "user": { "id": "557058:abc", "name": "Sam" }, "why": null })
         ),
-        Who::ByEmail(Assignee {
-            id: "557058:abc".into(),
-            name: "Sam".into()
-        })
+        Who::ByEmail(
+            Assignee {
+                id: "557058:abc".into(),
+                name: "Sam".into()
+            },
+            crate::board::MeSource::VouchedByEmail
+        )
     );
+    // Slack's word on the email is said as such.
+    assert_eq!(
+        by_email_of(
+            System::Linear,
+            &json!({ "user": { "id": "8a7b6c5d-0000-4000-8000-00000000000a", "name": "Sam" }, "why": null, "source": "slack" })
+        ),
+        Who::ByEmail(
+            Assignee {
+                id: "8a7b6c5d-0000-4000-8000-00000000000a".into(),
+                name: "Sam".into()
+            },
+            crate::board::MeSource::VouchedBySlack
+        )
+    );
+    assert!(crate::board::MeSource::VouchedBySlack.vouched());
+    // And whom they chose to be.
+    assert_eq!(
+        by_email_of(
+            System::Jira,
+            &json!({ "user": { "id": "557058:kay", "name": "Kay" }, "why": null, "source": "chosen" })
+        ),
+        Who::ByEmail(
+            Assignee {
+                id: "557058:kay".into(),
+                name: "Kay".into()
+            },
+            crate::board::MeSource::Chosen
+        )
+    );
+    assert!(
+        crate::board::MeSource::Chosen.vouched()
+            && crate::board::MeSource::Chosen.on_a_shared_key()
+    );
+    assert!(crate::board::MeSource::VouchedBySlack.on_a_shared_key());
     assert_eq!(
         by_email_of(
             System::Jira,
