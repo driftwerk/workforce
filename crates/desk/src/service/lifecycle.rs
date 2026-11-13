@@ -653,7 +653,14 @@ impl Desk {
             }
             None => {}
         }
-        self.handoff_ended(id).await;
+        let busy = matches!(
+            r.state,
+            SessionState::Working
+                | SessionState::Blocked
+                | SessionState::Asking
+                | SessionState::Done
+        );
+        self.handoff_ended(id, busy).await;
         let view = self.view(id)?;
         if let Some(by) = by {
             self.note(by.event(

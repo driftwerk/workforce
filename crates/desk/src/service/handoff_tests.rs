@@ -1027,7 +1027,7 @@ async fn a_handoff_a_restart_cut_short_is_undone_at_start() {
         })
         .await;
         w._cancel.cancel();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         {
             let client = w.store.pool().get().await.unwrap();
             client
@@ -1109,6 +1109,99 @@ async fn a_source_still_starting_is_stopped_when_its_work_is_handed_on() {
             !v.live && v.state == crate::model::SessionState::Stopped
         })
         .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ending_the_session_a_work_went_to_in_its_first_turn_keeps_the_handoff() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let target =
+            w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        // At work on its first turn, nothing answered yet.
+        w.d.change(target, |r, _| r.state = crate::model::SessionState::Working);
+        w.d.end(target, Some(By::you())).await.unwrap();
+        assert_eq!(kept(&w.store, w.acme, target).await, (Some(target), true));
+        assert_eq!(w.d.work_sessions(w.acme), vec![w.acme, target]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_restart_keeps_a_handoff_whose_session_took_its_work_up_or_still_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let w = world(&pool, dir.path(), false).await;
+        let wrote =
+            w.d.handoff(w.acme, &confirmed(Engine::Codex), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        let runs =
+            w.d.handoff(w.globex, &confirmed(Engine::Claude), By::you())
+                .await
+                .unwrap()
+                .session
+                .id;
+        for id in [wrote, runs] {
+            until("its record kept", async || {
+                w.store.get(id).await.unwrap().is_some()
+            })
+            .await;
+        }
+        w._cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // One wrote to its rollout before the hub went, nothing answered;
+        // the other was resumed in the person's own terminal, and runs.
+        let rollout = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"brief"}}"#,
+        )
+        .unwrap();
+        {
+            let client = w.store.pool().get().await.unwrap();
+            client
+                .execute(
+                    "UPDATE sessions SET transcript = $2 WHERE id = $1",
+                    &[&wrote, &rollout.to_string_lossy().as_ref()],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "UPDATE sessions SET origin = 'external', external_pid = $2, state = 'working' \
+                     WHERE id = $1",
+                    &[&runs, &i32::try_from(std::process::id()).unwrap()],
+                )
+                .await
+                .unwrap();
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let next = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            stand_ins(dir.path()),
+            super::Floor::default(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept(&w.store, w.acme, wrote).await, (Some(wrote), true));
+        assert_eq!(kept(&w.store, w.globex, runs).await, (Some(runs), true));
+        assert_eq!(next.lineage().head(w.globex), runs);
+        assert_eq!(
+            next.view(runs).unwrap().state,
+            crate::model::SessionState::Working,
+            "never closed under it"
+        );
+        cancel.cancel();
     })
     .await;
 }

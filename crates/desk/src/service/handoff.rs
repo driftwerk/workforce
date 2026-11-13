@@ -216,14 +216,22 @@ impl Desk {
     /// it up ([`rules::took_none_up`]), or has no record at all: the
     /// session it came from holds the work again, and can hand it on
     /// again. Whether it was undone.
-    async fn undo_untaken(&self, id: Uuid, r: Option<&SessionRecord>) -> bool {
-        let Some(link) = self.lineage().links.get(&id).cloned() else {
+    async fn undo_untaken(&self, id: Uuid, r: Option<&SessionRecord>, busy: bool) -> bool {
+        let l = self.lineage();
+        let Some(link) = l.links.get(&id).cloned() else {
             return false;
         };
+        // It handed the work on (or back) itself: part of the chain now.
+        if l.handed_off(id) {
+            return false;
+        }
         let untaken = match r {
             None => true,
             Some(r) => match self.0.store.kept_a_turn(id).await {
-                Ok(kept) => rules::took_none_up(&link, r.created_at, r.last_reply.is_some(), kept),
+                Ok(kept) => {
+                    let acted = busy || kept || r.last_reply.is_some() || wrote(r);
+                    rules::took_none_up(&link, r.created_at, acted)
+                }
                 Err(e) => {
                     tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't tell whether a handed-off session took up its work; its handoff stays");
                     return false;
@@ -238,15 +246,16 @@ impl Desk {
         true
     }
 
-    /// Session `id` was ended: when it was started for a handoff and took
-    /// none of its work up, the handoff is undone.
-    pub(super) async fn handoff_ended(&self, id: Uuid) {
+    /// Session `id` was ended, `busy` when it was in a turn then: when it
+    /// was started for a handoff and took none of its work up, the handoff
+    /// is undone.
+    pub(super) async fn handoff_ended(&self, id: Uuid, busy: bool) {
         let _one = self.0.handoff.write.lock().await;
         let Ok(r) = self.record(id) else {
             return;
         };
         if r.state == SessionState::Closed {
-            self.undo_untaken(id, Some(&r)).await;
+            self.undo_untaken(id, Some(&r), busy).await;
         }
     }
 
@@ -272,7 +281,11 @@ impl Desk {
                     }
                 },
             };
-            if !self.undo_untaken(id, r.as_ref()).await {
+            // Running still, in another terminal: never closed under it.
+            if r.as_ref().is_some_and(|r| r.state.is_running()) {
+                continue;
+            }
+            if !self.undo_untaken(id, r.as_ref(), false).await {
                 continue;
             }
             if self.is_open(id) {
@@ -1271,6 +1284,18 @@ struct Checked {
     ask: Ask,
     /// A hand back's: when this session was handed the work.
     since: Option<DateTime<Utc>>,
+}
+
+/// Whether `r`'s engine wrote anything of its own to its transcript; so
+/// when it can't be told.
+fn wrote(r: &SessionRecord) -> bool {
+    let Some(path) = r.transcript.as_deref() else {
+        return false;
+    };
+    match crate::transcript::engine_acted(Path::new(path), r.engine == Engine::Codex) {
+        Ok(acted) => acted,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// What the person calls `r`.

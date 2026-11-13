@@ -322,6 +322,28 @@ pub fn read_codex_tail(path: &Path) -> std::io::Result<Tail> {
         }))
 }
 
+/// Whether the engine did anything in the transcript at `path`, beyond
+/// the prompt it was started on: a Claude Code assistant line, or a Codex
+/// item that isn't the person's, its developer's or the system's message.
+/// One too long to read whole did.
+pub fn engine_acted(path: &Path, codex: bool) -> std::io::Result<bool> {
+    if std::fs::metadata(path)?.len() > TAIL_BYTES {
+        return Ok(true);
+    }
+    Ok(tail_lines(path)?
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|v| match codex {
+            false => v["type"] == "assistant",
+            true => {
+                let p = &v["payload"];
+                v["type"] == "response_item"
+                    && !(p["type"] == "message"
+                        && matches!(p["role"].as_str(), Some("user" | "developer" | "system")))
+            }
+        }))
+}
+
 pub fn clip(s: &str) -> String {
     let s = s.trim();
     if s.chars().count() <= REPLY_MAX {
@@ -612,5 +634,27 @@ mod tests {
             results_in(lines.into_iter(), &ids),
             ["toolu_A".to_string()].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn an_engine_acted_once_it_said_or_did_anything_beyond_its_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, lines: &[&str]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, lines.join("\n")).unwrap();
+            p
+        };
+        let prompt = r#"{"type":"user","message":{"content":"Call Desk's brief tool first"}}"#;
+        let said =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reading it."}]}}"#;
+        assert!(!engine_acted(&file("c0", &[prompt]), false).unwrap());
+        assert!(engine_acted(&file("c1", &[prompt, said]), false).unwrap());
+        let asked =
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#;
+        let dev = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[]}}"#;
+        let call = r#"{"type":"response_item","payload":{"type":"function_call","name":"brief"}}"#;
+        assert!(!engine_acted(&file("x0", &[dev, asked]), true).unwrap());
+        assert!(engine_acted(&file("x1", &[dev, asked, call]), true).unwrap());
+        assert!(engine_acted(&dir.path().join("none"), false).is_err());
     }
 }
