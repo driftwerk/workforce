@@ -188,9 +188,14 @@ pub fn render(a: &MentionedAway, u: &MentionedUpdate, decided: &[String]) -> Str
     if !a.headline.is_empty() {
         out.push(a.headline.clone());
     }
+    // The catch-up says each decision itself: the sessions' paragraphs
+    // here, never the update's brief.
     let mut middle = MentionedUpdate {
         waiting: Vec::new(),
         footer: None,
+        headline: String::new(),
+        brief: Vec::new(),
+        more_items: 0,
         ..u.clone()
     };
     middle.decisions.clear();
@@ -198,17 +203,9 @@ pub fn render(a: &MentionedAway, u: &MentionedUpdate, decided: &[String]) -> Str
     if !body.is_empty() {
         out.push(body);
     }
-    match decided {
-        [] => {}
-        [one] => out.push(format!("I decided: {one}")),
-        many => out.push(format!(
-            "I decided {} things:\n{}",
-            many.len(),
-            many.iter()
-                .map(|d| format!("- {d}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )),
+    // Each decision one line, as it reads: "21:12 ✓ … — why".
+    if !decided.is_empty() {
+        out.push(decided.join("\n"));
     }
     if let Some(h) = &a.handled {
         out.push(h.clone());
@@ -369,6 +366,7 @@ mod tests {
                 holding_up: None,
                 recommendation: None,
                 options: vec!["Yes".into()],
+                detail: None,
             }],
             ..Default::default()
         };
@@ -383,8 +381,7 @@ mod tests {
         let order = [
             "Welcome back. One thing needs you. Billing finished.",
             "**Billing** (moving billing) — It finished.",
-            "I decided 2 things:\n- 21:12 · let it retry",
-            "- 21:40 · not yet",
+            "21:12 · let it retry — nothing had changed\n21:40 · not yet",
             "I handled 2 of 3 myself.",
             "Still waiting on you:\n- Add deleted leads? (2 h)",
             "Set aside until you say",

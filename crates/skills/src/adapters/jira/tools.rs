@@ -78,6 +78,188 @@ fn attachment_summaries(fields: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The roles a site's own custom fields play, by the field ids a caller
+/// names (`custom_fields`): `points`, `sprint`, `start_date` and
+/// `development`. Ids differ per site; `jira.list_fields` finds them.
+const CUSTOM_ROLES: &[&str] = &["points", "sprint", "start_date", "development"];
+
+/// The custom field ids `input.custom_fields` names, by role: only ids
+/// that look like one (`customfield_123`), so nothing else is asked for.
+fn custom_fields(input: &Value) -> Vec<(&'static str, String)> {
+    CUSTOM_ROLES
+        .iter()
+        .filter_map(|role| {
+            let id = input["custom_fields"][role].as_str()?;
+            let ok = id
+                .strip_prefix("customfield_")
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            ok.then(|| (*role, id.to_string()))
+        })
+        .collect()
+}
+
+/// An issue another one points at (its parent, a linked issue): key,
+/// summary (wrapped), type, and status.
+fn issue_ref(i: &Value, source: &str) -> Value {
+    let f = &i["fields"];
+    json!({
+        "key": i["key"],
+        "summary": wrap_field(&f["summary"], source),
+        "issuetype": f["issuetype"]["name"],
+        "hierarchy_level": f["issuetype"]["hierarchyLevel"],
+        "status": f["status"]["name"],
+        "status_category": f["status"]["statusCategory"]["key"],
+    })
+}
+
+/// The Development field's pull-request summary (`devsummarycf`): how many
+/// PRs and their overall state, from the JSON Jira keeps inside its text
+/// (`{pullrequest={…}, json={"cachedValue":…}}`). Null when it has none.
+fn development_summary(v: &Value) -> Value {
+    let parsed = match v {
+        Value::String(s) => s
+            .find("json=")
+            .and_then(|at| {
+                let rest = s[at + 5..].trim_end();
+                let rest = rest.strip_suffix('}').unwrap_or(rest);
+                serde_json::from_str::<Value>(rest).ok()
+            })
+            .unwrap_or(Value::Null),
+        Value::Object(_) => v.clone(),
+        _ => Value::Null,
+    };
+    let overall = &parsed["cachedValue"]["summary"]["pullrequest"]["overall"];
+    match overall["count"].as_u64() {
+        Some(count) if count > 0 => json!({
+            "count": count,
+            "state": overall["state"],
+            "open": overall["open"],
+        }),
+        _ => Value::Null,
+    }
+}
+
+/// What a search row or a read issue carries besides its own words, for
+/// each field asked for (`asked`; `None`: every one): parent, sub-tasks and
+/// links reduced to key, summary, type and status, components and fix versions by
+/// name, comments by count, and the site's custom fields by role. Never a
+/// comment's or a linked issue's body.
+fn issue_extras(
+    f: &Value,
+    asked: Option<&[String]>,
+    custom: &[(&'static str, String)],
+    source: &str,
+) -> serde_json::Map<String, Value> {
+    let wants = |name: &str| asked.is_none_or(|a| a.iter().any(|f| f == name));
+    let names = |v: &Value, what: &str| -> Value {
+        Value::Array(
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| wrap_field(&c["name"], &format!("{source}.{what}")))
+                .collect(),
+        )
+    };
+    let mut out = serde_json::Map::new();
+    if wants("issuetype") {
+        out.insert(
+            "issuetype_level".into(),
+            f["issuetype"]["hierarchyLevel"].clone(),
+        );
+    }
+    if wants("parent") && f["parent"].is_object() {
+        out.insert(
+            "parent".into(),
+            issue_ref(&f["parent"], &format!("{source}.parent_summary")),
+        );
+    }
+    if wants("subtasks") {
+        out.insert(
+            "subtasks".into(),
+            Value::Array(
+                f["subtasks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    // Each one's key, summary (wrapped), type and status:
+                    // Jira's own sub-task rows say no more (not who has it).
+                    .map(|s| issue_ref(s, &format!("{source}.subtask_summary")))
+                    .collect(),
+            ),
+        );
+    }
+    if wants("issuelinks") {
+        out.insert(
+            "issuelinks".into(),
+            Value::Array(
+                f["issuelinks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|l| {
+                        // Read from this issue: an inward issue is what it
+                        // "is blocked by", an outward one what it "blocks".
+                        let (direction, other) = match (&l["inwardIssue"], &l["outwardIssue"]) {
+                            (i, _) if i.is_object() => ("inward", i),
+                            (_, o) if o.is_object() => ("outward", o),
+                            _ => return None,
+                        };
+                        let mut r = issue_ref(other, &format!("{source}.link_summary"));
+                        r["direction"] = json!(direction);
+                        r["link_type"] = l["type"]["name"].clone();
+                        r["relation"] = l["type"][direction].clone();
+                        Some(r)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if wants("components") {
+        out.insert("components".into(), names(&f["components"], "component"));
+    }
+    if wants("fixVersions") {
+        out.insert(
+            "fix_versions".into(),
+            names(&f["fixVersions"], "fix_version"),
+        );
+    }
+    if wants("comment") {
+        out.insert("comment_total".into(), f["comment"]["total"].clone());
+    }
+    if wants("created") {
+        out.insert("created".into(), f["created"].clone());
+    }
+    if wants("reporter") {
+        out.insert("reporter".into(), f["reporter"]["displayName"].clone());
+    }
+    for (role, id) in custom {
+        let v = &f[id.as_str()];
+        let value = match *role {
+            "points" => v.as_f64().map_or(Value::Null, |p| json!(p)),
+            "start_date" => v.as_str().map_or(Value::Null, |d| json!(d)),
+            "development" => development_summary(v),
+            // A sprint field holds every sprint the issue was in: each
+            // one's name (wrapped), state and dates.
+            _ => Value::Array(
+                v.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|s| {
+                        json!({
+                            "name": wrap_field(&s["name"], &format!("{source}.sprint")),
+                            "state": s["state"],
+                            "start": s["startDate"],
+                            "end": s["endDate"],
+                        })
+                    })
+                    .collect(),
+            ),
+        };
+        out.insert((*role).into(), value);
+    }
+    out
+}
+
 /// Resolve which Jira workspace to use for a given tool input.
 ///
 /// Resolution order:
@@ -299,7 +481,8 @@ impl Tool for JiraSearchTool {
                 "jql": { "type": "string", "description": "JQL query, e.g. 'project = ENG AND status = \"In Progress\"'" },
                 "fields": { "type": "array", "items": { "type": "string" }, "description": "Field IDs to return (default: summary,status,assignee,priority,updated)" },
                 "next_page_token": { "type": "string", "description": "Pagination cursor from a previous response" },
-                "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" }
+                "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" },
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development (e.g. {\"points\": \"customfield_10016\"}). Each comes back under its role's name." }
             },
             "required": ["jql"]
         })
@@ -321,7 +504,7 @@ impl Tool for JiraSearchTool {
             "updated".to_string(),
             "issuetype".to_string(),
         ];
-        let fields: Vec<String> = input
+        let mut fields: Vec<String> = input
             .get("fields")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -330,6 +513,9 @@ impl Tool for JiraSearchTool {
                     .collect()
             })
             .unwrap_or(default_fields);
+        let custom = custom_fields(&input);
+        fields.extend(custom.iter().map(|(_, id)| id.clone()));
+        let asked = fields.clone();
 
         // A description asked for comes rendered, as `jira.get_issue` gives it.
         let described = fields.iter().any(|f| f == "description");
@@ -390,6 +576,9 @@ impl Tool for JiraSearchTool {
                         if due {
                             out["duedate"] = f["duedate"].clone();
                         }
+                        if let Value::Object(o) = &mut out {
+                            o.extend(issue_extras(f, Some(&asked), &custom, "jira.search"));
+                        }
                         if labelled {
                             out["labels"] = Value::Array(
                                 f["labels"]
@@ -444,7 +633,8 @@ impl Tool for JiraGetIssueTool {
             "type": "object",
             "properties": {
                 "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
-                "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" }
+                "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." }
             },
             "required": ["issue_key"]
         })
@@ -456,6 +646,7 @@ impl Tool for JiraGetIssueTool {
             Ok(s) => s.to_string(),
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
+        let custom = custom_fields(&input);
 
         let path = format!("{REST}/issue/{key}?expand=renderedFields,changelog");
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -487,6 +678,13 @@ impl Tool for JiraGetIssueTool {
                     "duedate": f["duedate"],
                     "attachments": attachment_summaries(f),
                 });
+                let mut out = out;
+                if let Value::Object(o) = &mut out {
+                    // Its labels and reporter are said above, as before.
+                    let mut extras = issue_extras(f, None, &custom, "jira.get_issue");
+                    extras.remove("reporter");
+                    o.extend(extras);
+                }
                 Ok(ToolResult::success(out, duration_ms))
             }
             Err(e) => Ok(ToolResult::from_report(
@@ -776,6 +974,112 @@ impl Tool for JiraAssignIssueTool {
 // ──────────────────────────────────────────────────────────────────────
 // 6b. jira.myself
 // ──────────────────────────────────────────────────────────────────────
+
+jira_tool_struct!(JiraListFieldsTool);
+
+/// The custom fields `jira.list_fields` finds by role, from `/field`: the
+/// story points (Jira Software's own estimate first), the sprint, the start
+/// date and the Development summary. Absent when the site has none.
+fn field_roles(fields: &[Value]) -> Value {
+    let custom = |f: &&Value| f["custom"].as_bool() == Some(true);
+    let schema = |f: &Value| {
+        f["schema"]["custom"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let named = |f: &Value, n: &str| {
+        f["name"]
+            .as_str()
+            .is_some_and(|x| x.eq_ignore_ascii_case(n))
+    };
+    let numeric = |f: &Value| f["schema"]["type"].as_str() == Some("number");
+    let id = |f: Option<&Value>| f.map_or(Value::Null, |f| f["id"].clone());
+    let all: Vec<&Value> = fields.iter().filter(custom).collect();
+    let points = all
+        .iter()
+        .find(|f| schema(f).ends_with(":jsw-story-points"))
+        .or_else(|| {
+            all.iter()
+                .find(|f| numeric(f) && named(f, "Story point estimate"))
+        })
+        .or_else(|| all.iter().find(|f| numeric(f) && named(f, "Story Points")))
+        .copied();
+    let sprint = all
+        .iter()
+        .find(|f| schema(f) == "com.pyxis.greenhopper.jira:gh-sprint")
+        .copied();
+    let start = all
+        .iter()
+        .find(|f| named(f, "Start date") && f["schema"]["type"].as_str() == Some("date"))
+        .copied();
+    let development = all
+        .iter()
+        .find(|f| schema(f).ends_with(":devsummarycf"))
+        .or_else(|| all.iter().find(|f| named(f, "Development")))
+        .copied();
+    json!({
+        "points": id(points),
+        "sprint": id(sprint),
+        "start_date": id(start),
+        "development": id(development),
+    })
+}
+
+#[async_trait]
+impl Tool for JiraListFieldsTool {
+    fn name(&self) -> &str {
+        "jira.list_fields"
+    }
+    fn description(&self) -> &str {
+        "This Jira site's own custom fields by role (story points, sprint, start date, Development), for jira.search's and jira.get_issue's custom_fields, and its priorities, highest first."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) }
+            }
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let client = resolve_or_fail!(self, input, start);
+        let fields = match client.get(&format!("{REST}/field")).await {
+            Ok(v) => v.as_array().cloned().unwrap_or_default(),
+            Err(e) => {
+                return Ok(ToolResult::from_report(
+                    &e.wrap_err("Failed to list Jira's fields"),
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+        };
+        // Priorities come in the site's own order, highest first. A site
+        // that won't list them still answers its fields.
+        let priorities: Vec<Value> = match client
+            .get(&format!("{REST}/priority/search?maxResults=100"))
+            .await
+        {
+            Ok(v) => v["values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| json!({ "id": p["id"], "name": p["name"] }))
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "Jira's priorities weren't listed");
+                vec![]
+            }
+        };
+        Ok(ToolResult::success(
+            json!({
+                "fields": field_roles(&fields),
+                "priorities": priorities,
+            }),
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+}
 
 jira_tool_struct!(JiraMyselfTool);
 
@@ -1957,6 +2261,109 @@ impl Tool for JiraApiTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLT-2549's Development field, as Jira's search returns it.
+    const DEV_FIELD: &str = r#"{pullrequest={dataType=pullrequest, state=MERGED, stateCount=2}, json={"cachedValue":{"errors":[],"summary":{"pullrequest":{"overall":{"count":2,"lastUpdated":"2026-11-02T20:22:50.000+0000","stateCount":2,"state":"MERGED","dataType":"pullrequest","open":false},"byInstanceType":{"oAuth-com.github.integration.production":{"count":2,"name":"GitHub"}}}}},"isStale":true}}"#;
+
+    #[test]
+    fn the_development_field_says_how_many_prs_and_their_state() {
+        assert_eq!(
+            development_summary(&json!(DEV_FIELD)),
+            json!({ "count": 2, "state": "MERGED", "open": false })
+        );
+        assert_eq!(development_summary(&json!("{}")), Value::Null);
+        assert_eq!(development_summary(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn a_search_row_passes_links_parent_and_counts_never_bodies() {
+        let f = json!({
+            "issuetype": { "name": "Story", "hierarchyLevel": 0 },
+            "parent": { "key": "PLT-2282", "fields": { "summary": "Q3 support",
+                "issuetype": { "name": "Epic", "hierarchyLevel": 1 },
+                "status": { "name": "Product Review", "statusCategory": { "key": "new" } } } },
+            "issuelinks": [{ "id": "1", "type": { "name": "Blocks", "inward": "is blocked by", "outward": "blocks" },
+                "inwardIssue": { "key": "PLT-2979", "fields": { "summary": "Rotate creds",
+                    "issuetype": { "name": "Task" }, "status": { "name": "Backlog", "statusCategory": { "key": "new" } } } } }],
+            "subtasks": [{ "key": "PLT-1", "fields": { "status": { "statusCategory": { "key": "done" } } } }],
+            "comment": { "total": 3, "comments": [{ "body": "secret words" }] },
+            "customfield_10016": 5.0,
+            "customfield_10000": DEV_FIELD,
+        });
+        let asked: Vec<String> = ["issuetype", "parent", "issuelinks", "subtasks", "comment"]
+            .map(String::from)
+            .to_vec();
+        let custom = custom_fields(&json!({ "custom_fields": {
+            "points": "customfield_10016", "development": "customfield_10000",
+            "sprint": "status; drop" } }));
+        assert_eq!(custom.len(), 2, "an id that isn't one is never asked for");
+        let out = Value::Object(issue_extras(&f, Some(&asked), &custom, "jira.search"));
+        assert_eq!(out["issuetype_level"], 0);
+        assert_eq!(out["parent"]["key"], "PLT-2282");
+        assert_eq!(out["parent"]["hierarchy_level"], 1);
+        let link = &out["issuelinks"][0];
+        assert_eq!(
+            (&link["key"], &link["direction"], &link["relation"]),
+            (
+                &json!("PLT-2979"),
+                &json!("inward"),
+                &json!("is blocked by")
+            )
+        );
+        assert!(link["summary"].as_str().unwrap().contains("Rotate creds"));
+        assert_eq!(out["subtasks"][0]["status_category"], "done");
+        assert_eq!(out["comment_total"], 3);
+        assert!(!out.to_string().contains("secret words"));
+        assert_eq!(out["points"], 5.0);
+        assert_eq!(out["development"]["count"], 2);
+        assert!(out.get("components").is_none(), "not asked, not said");
+    }
+
+    #[test]
+    fn a_sub_task_comes_with_its_summary_wrapped_and_its_status() {
+        let f = json!({
+            "subtasks": [{ "key": "ACME-7", "fields": {
+                "summary": "Write the migration",
+                "issuetype": { "name": "Sub-task", "hierarchyLevel": -1 },
+                "status": { "name": "In Review", "statusCategory": { "key": "indeterminate" } },
+                "priority": { "name": "High" } } }],
+        });
+        let asked = vec!["subtasks".to_string()];
+        let out = Value::Object(issue_extras(&f, Some(&asked), &[], "jira.search"));
+        let sub = &out["subtasks"][0];
+        assert_eq!(sub["key"], "ACME-7");
+        let summary = sub["summary"].as_str().unwrap();
+        assert!(summary.contains("Write the migration"));
+        assert_ne!(
+            summary, "Write the migration",
+            "someone else's words are wrapped"
+        );
+        assert_eq!(sub["status"], "In Review");
+        assert_eq!(sub["status_category"], "indeterminate");
+        assert_eq!(sub["issuetype"], "Sub-task");
+        assert_eq!(sub["hierarchy_level"], -1);
+    }
+
+    #[test]
+    fn a_site_s_fields_are_found_by_role() {
+        let fields = vec![
+            json!({ "id": "summary", "name": "Summary", "custom": false }),
+            json!({ "id": "customfield_10026", "name": "Story Points", "custom": true, "schema": { "type": "number", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:float" } }),
+            json!({ "id": "customfield_10016", "name": "Story point estimate", "custom": true, "schema": { "type": "number", "custom": "com.pyxis.greenhopper.jira:jsw-story-points" } }),
+            json!({ "id": "customfield_10020", "name": "Sprint", "custom": true, "schema": { "type": "array", "custom": "com.pyxis.greenhopper.jira:gh-sprint" } }),
+            json!({ "id": "customfield_10015", "name": "Start date", "custom": true, "schema": { "type": "date", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:datepicker" } }),
+            json!({ "id": "customfield_10000", "name": "Development", "custom": true, "schema": { "type": "any", "custom": "com.atlassian.jira.plugins.jira-development-integration-plugin:devsummarycf" } }),
+        ];
+        assert_eq!(
+            field_roles(&fields),
+            json!({ "points": "customfield_10016", "sprint": "customfield_10020",
+                "start_date": "customfield_10015", "development": "customfield_10000" })
+        );
+        assert_eq!(
+            field_roles(&fields[..2]),
+            json!({ "points": "customfield_10026", "sprint": null, "start_date": null, "development": null })
+        );
+    }
 
     type ClientMap = Arc<HashMap<String, Arc<JiraClient>>>;
     type PrefixMap = Arc<HashMap<String, String>>;

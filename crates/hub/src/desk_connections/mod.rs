@@ -1709,6 +1709,20 @@ impl Connections {
         }
     }
 
+    /// Starts GitHub's device sign-in for instance `key` of a setup an
+    /// agent runs.
+    pub(super) async fn begin_github(
+        self: &Arc<Self>,
+        person: &str,
+        c: &'static Connector,
+        level: Level,
+        key: Option<String>,
+        name: Option<String>,
+    ) -> Result<Started, Refusal> {
+        self.vault_at(Self::tiers(c, &level)[0], &level)?;
+        self.start_github(person, c, level, key, name).await
+    }
+
     async fn start_github(
         self: &Arc<Self>,
         person: &str,
@@ -2224,7 +2238,7 @@ pub fn install(
             Arc::new(connections)
         })
         .clone();
-    router(Arc::clone(state), connections)
+    router(Arc::clone(state), Arc::clone(&connections)).merge(setup::install(state, connections))
 }
 
 struct Routes {
@@ -2330,6 +2344,7 @@ macro_rules! person {
 
 // After `person!`, which its routes use.
 pub mod picks;
+pub mod setup;
 
 /// Connections' routes over `connections`.
 pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router {

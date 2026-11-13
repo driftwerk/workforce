@@ -391,6 +391,12 @@ impl ExtensionCell {
     }
 
     /// Lets go: Desk's tab closes. Whether it was open.
+    /// Brings this tab to the front of the person's Chrome window, as a
+    /// setup card's "Show the sign-in page" asks. Whether Chrome did.
+    pub(super) async fn front(&self) -> bool {
+        *self.open.lock().unwrap() && self.ask("front", json!({})).await.is_ok()
+    }
+
     pub(super) async fn close(&self) -> bool {
         let was = std::mem::replace(&mut *self.open.lock().unwrap(), false);
         if was {
@@ -801,9 +807,6 @@ impl ExtensionCell {
     /// Reads a new key off a key page and hands it to the hub's secret path,
     /// never to the model: what [`keys`] describes.
     pub(super) async fn capture_key(&self, selector: &str, connector: &str) -> Result<Value> {
-        let page = keys::page_for(connector).ok_or_else(|| {
-            eyre!("Desk reads a new key only for a connector it sets up, not `{connector}`.")
-        })?;
         let Some(hooks) = hooks::hooks() else {
             return Err(eyre!(NO_BROWSER));
         };
@@ -819,6 +822,14 @@ impl ExtensionCell {
                     "Desk keeps a new key only for the conversation setting the connector up, and this call came from none."
                 ));
             };
+            // The page is the setup's: no setup waiting on a key here, no read.
+            let page = hooks
+                .key_page(&self.user, &self.agent, &conversation, connector)
+                .ok_or_else(|| {
+                    eyre!(
+                        "No {connector} setup in this conversation is waiting on a key, so Desk reads none. Start one with connections.setup."
+                    )
+                })?;
             if !keys::matches(&page, url) {
                 return Err(eyre!(
                     "Desk's tab isn't on {connector}'s key page, so no key was read."
@@ -827,7 +838,7 @@ impl ExtensionCell {
             let read = self
                 .ask(
                     "capture_key",
-                    json!({ "selector": selector, "origin": page.origin, "paths": page.paths }),
+                    json!({ "selector": selector, "origin": page.origin, "paths": keys::paths_at(&page, url) }),
                 )
                 .await?;
             let value = read["value"].as_str().unwrap_or_default().to_string();
@@ -839,7 +850,15 @@ impl ExtensionCell {
             // Only its length is said of it: nothing of the key itself.
             let length = value.chars().count();
             let test = hooks
-                .keep_key(&self.user, &conversation, connector, &value)
+                .keep_key(hooks::KeyRead {
+                    user: &self.user,
+                    agent: &self.agent,
+                    conversation: &conversation,
+                    connector,
+                    origin: read["origin"].as_str().unwrap_or_default(),
+                    path: read["path"].as_str().unwrap_or_default(),
+                    key: &value,
+                })
                 .map_err(|e| eyre!(e))?;
             drop(value);
             self.done(keys::CAPTURE_KEY, None).await;
