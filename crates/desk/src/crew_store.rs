@@ -457,7 +457,11 @@ impl DeskStore {
     async fn decisions_now(&self, extras: &mut HashMap<String, Extras>) {
         let ids: Vec<uuid::Uuid> = extras
             .values()
-            .flat_map(|e| e.decisions.iter())
+            .flat_map(|e| {
+                e.decisions
+                    .iter()
+                    .chain(e.update.iter().flat_map(|u| u.decisions.iter()))
+            })
             .filter_map(|l| l.id.parse().ok())
             .collect();
         if ids.is_empty() {
@@ -482,6 +486,13 @@ impl DeskStore {
             for l in e.decisions.iter_mut() {
                 if let Some(d) = rows.iter().find(|d| d.id.to_string() == l.id) {
                     *l = d.line_now(delivery.get(&d.id).copied());
+                }
+            }
+            // An update's lines keep the composer's words; one kept before
+            // the layout takes the row's.
+            for l in e.update.iter_mut().flat_map(|u| u.decisions.iter_mut()) {
+                if let Some(d) = rows.iter().find(|d| d.id.to_string() == l.id) {
+                    l.laid_out_from(d);
                 }
             }
         }

@@ -480,12 +480,16 @@ async fn every_turn_is_given_the_preferences_that_cover_it() {
         assert!(!never(&lp), "unbound line turn: {lp}");
         let dm = super::super::dm_oversight_hint(&overseer).expect("a DM hint");
         assert!(!never(&dm), "unbound DM: {dm}");
-        // Bound (a switch off), the never-list holds as before.
+        // Bound (below Act fully, whatever its switches say: Act fully is
+        // unbound), it answers within what the person allowed.
         let mut bound = o.clone();
-        bound.act.interrupt = false;
+        bound.level = workforce_common::oversight::Level::Act;
         assert!(!crew.unbound(&bound));
         let lp = crew.line_prompt(docs.id, &[], &ended, &bound);
-        assert!(never(&lp), "bound line turn: {lp}");
+        assert!(
+            lp.contains("You may answer within what the person allowed"),
+            "bound line turn: {lp}"
+        );
     })
     .await;
 }
@@ -548,6 +552,10 @@ async fn bound_what_a_setting_leaves_to_the_person_names_it() {
         assert!(left.what.starts_with("left it to you:"), "{}", left.what);
         assert!(left.why.contains("I couldn't do it myself"), "{}", left.why);
         assert!(left.why.to_lowercase().contains("interrupt"), "names the setting: {}", left.why);
+        // Laid out as left to the person: nothing was sent.
+        assert_eq!(left.kind, workforce_desk::decision::DecisionKind::Escalated);
+        assert_eq!(left.brief, "Left it to you.");
+        assert_eq!(left.message, None);
     })
     .await;
 }

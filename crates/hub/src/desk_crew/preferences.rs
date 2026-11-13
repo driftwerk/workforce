@@ -14,6 +14,10 @@ use workforce_desk::preference::{self, PrefScope, PrefSource, PrefState, Prefere
 use workforce_desk::preference_store::PrefChange;
 use workforce_desk::rooms::YOU;
 
+use workforce_desk::crew::ItemRefused;
+use workforce_desk::open_item::{NewItem, OpenItem, OpenKind, OpenState};
+use workforce_desk::open_item_store::Opened;
+
 use super::tools::Bound;
 use super::CrewHub;
 
@@ -219,27 +223,18 @@ impl CrewHub {
             },
         );
         p.from_item = item;
-        let store = self.desk.store();
-        // The same case and scope said again replaces the older one.
-        let same: Vec<Preference> = store
-            .preferences_of(YOU, boss_scope, false)
+        // The same case and scope said again, or kept from the same ask,
+        // gives way to this one.
+        let tz = self.desk.timezone();
+        let replaced: Vec<String> = self
+            .desk
+            .store()
+            .preference_keep(&p)
             .await
             .map_err(Self::pref_err)?
-            .into_iter()
-            .filter(|o| o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text))
+            .iter()
+            .map(|o| format!("{} (from {})", o.rule(), o.date(tz)))
             .collect();
-        // The older one goes first, so a failure never leaves two that
-        // both apply.
-        let tz = self.desk.timezone();
-        let mut replaced = Vec::new();
-        for o in &same {
-            store
-                .preference_set_state(o.id, PrefState::Retired)
-                .await
-                .map_err(Self::pref_err)?;
-            replaced.push(format!("{} (from {})", o.rule(), o.date(tz)));
-        }
-        store.preference_put(&p).await.map_err(Self::pref_err)?;
         let mut said = format!(
             "Kept as preference {}: when {}, {} (for {}).",
             p.id,
@@ -394,6 +389,347 @@ impl CrewHub {
                  the kind of case, so their answer can become a preference."
             ),
         })
+    }
+}
+
+/// The key of the item that asks whether to change a preference the
+/// person overruled.
+const OVERRULED: &str = "overrule:";
+/// Its answers.
+const CHANGE_IT: &str = "Change it";
+const KEEP_IT: &str = "Keep it";
+const FORGET_IT: &str = "Forget it";
+
+/// What an "always" does, readable cold: an answer of its own words
+/// ("make it wait for green") as it is; a bare one ("Yes", "Merge") with the
+/// question it answered, so the rule says what it says yes to.
+fn rule_then(i: &OpenItem, answer: &str) -> String {
+    let answer = answer.trim();
+    if answer.is_empty() || answer.split_whitespace().count() >= 3 {
+        return answer.to_string();
+    }
+    let first = i
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // The question itself, past a "<session> asks:" lead.
+    let asked = first.split_once(" asks: ").map_or(first, |(_, q)| q).trim();
+    let asked: String = match asked.chars().count() > 160 {
+        true => asked.chars().take(159).collect::<String>() + "…",
+        false => asked.to_string(),
+    };
+    if asked.is_empty() {
+        return answer.to_string();
+    }
+    let answer = answer.trim_end_matches(['.', '!']);
+    format!("answer “{answer}” to “{asked}”")
+}
+
+/// The person's answer to an ask, as it was closed with it: none for an
+/// answer that went on to a session (its words are the session's line's).
+fn answer_of(i: &OpenItem) -> Option<String> {
+    let why = i.closed_why.as_deref()?;
+    ["You answered: ", "They answered: "]
+        .iter()
+        .find_map(|p| why.strip_prefix(p))
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+}
+
+impl CrewHub {
+    /// The person keeps a preference themselves (Desk's boss settings):
+    /// for the boss of the ask it came from when `from_item`, else of
+    /// `boss_scope` (the main boss when none), which must be a boss here.
+    pub(crate) async fn person_prefers(
+        &self,
+        when: &str,
+        then: &str,
+        scope: &str,
+        from_item: Option<Uuid>,
+        boss_scope: Option<&str>,
+    ) -> Result<Preference, ItemRefused> {
+        let cant = |e: eyre::Report| ItemRefused::Cant(Self::pref_err(e));
+        let (when, then) = (when.trim(), then.trim());
+        if when.is_empty() {
+            return Err(ItemRefused::Cant("Say the kind of case.".into()));
+        }
+        if then.is_empty() {
+            return Err(ItemRefused::Cant("Say what to do then.".into()));
+        }
+        let scope = PrefScope::parse(scope).map_err(ItemRefused::Cant)?;
+        let store = self.desk.store();
+        let boss_scope = match from_item {
+            Some(id) => {
+                let item = store
+                    .open_item(id)
+                    .await
+                    .map_err(cant)?
+                    .ok_or(ItemRefused::NotFound)?;
+                let Some((_, o)) = self.overseer_named(&item.boss) else {
+                    return Err(ItemRefused::Cant("Its boss isn't here any more.".into()));
+                };
+                preference::boss_scope_of(o.scope.group())
+            }
+            None => {
+                let named = boss_scope
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or(preference::MAIN);
+                if !self
+                    .overseers()
+                    .iter()
+                    .any(|(_, o)| preference::boss_scope_of(o.scope.group()) == named)
+                {
+                    return Err(ItemRefused::Cant("There is no boss for that here.".into()));
+                }
+                named.to_string()
+            }
+        };
+        let mut p = Preference::new(
+            &boss_scope,
+            when,
+            then,
+            scope,
+            match from_item {
+                Some(_) => PrefSource::Asked,
+                None => PrefSource::Said,
+            },
+        );
+        p.from_item = from_item;
+        store.preference_keep(&p).await.map_err(cant)?;
+        Ok(p)
+    }
+
+    /// "Always" on item `id`: the person's answer becomes their preference
+    /// for the case the item said it settles, from then on. Once: pressed
+    /// again, the one kept is said.
+    pub(crate) async fn always_item(
+        &self,
+        id: Uuid,
+        then: Option<&str>,
+    ) -> Result<String, ItemRefused> {
+        let cant = |e: eyre::Report| ItemRefused::Cant(Self::pref_err(e));
+        let store = self.desk.store();
+        let item = store
+            .open_item(id)
+            .await
+            .map_err(cant)?
+            .ok_or(ItemRefused::NotFound)?;
+        let tz = self.desk.timezone();
+        if let Some(p) = store.preference_from_item(id).await.map_err(cant)? {
+            return Ok(format!(
+                "Already kept, from {}: when {}, {}.",
+                p.date(tz),
+                p.when_text,
+                p.then_text
+            ));
+        }
+        let when = item
+            .generalizes
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .ok_or_else(|| {
+                ItemRefused::Cant(
+                    "That question doesn't settle a kind of case, so there is nothing to keep."
+                        .into(),
+                )
+            })?;
+        // A session's question closes when its session takes the answer,
+        // after the answer went: with the answer in hand it is kept now.
+        let sent_to_its_session = item.line_message.is_some() && then.is_some();
+        if item.state != OpenState::Closed && !sent_to_its_session {
+            return Err(ItemRefused::Cant("Answer it first.".into()));
+        }
+        let then = then
+            .map(str::to_string)
+            .or_else(|| answer_of(&item))
+            .ok_or_else(|| {
+                ItemRefused::Cant("Say what to do then: your answer went to the session.".into())
+            })?;
+        let Some((_, o)) = self.overseer_named(&item.boss) else {
+            return Err(ItemRefused::Cant("Its boss isn't here any more.".into()));
+        };
+        let scope = match store.item_prefer_scope(id).await.map_err(cant)? {
+            Some(s) => PrefScope::parse(&s).unwrap_or(PrefScope::All),
+            None => PrefScope::All,
+        };
+        let boss_scope = preference::boss_scope_of(o.scope.group());
+        let then = rule_then(&item, &then);
+        let mut p = Preference::new(&boss_scope, when, &then, scope, PrefSource::Asked);
+        p.from_item = Some(id);
+        // Kept first, so a failure loses nothing; a second press racing
+        // this one finds it kept (one per item, by the index).
+        if let Err(e) = store.preference_put(&p).await {
+            if let Ok(Some(kept)) = store.preference_from_item(id).await {
+                return Ok(format!(
+                    "Already kept, from {}: when {}, {}.",
+                    kept.date(tz),
+                    kept.when_text,
+                    kept.then_text
+                ));
+            }
+            return Err(cant(e));
+        }
+        // The same case and scope kept before gives way to this one.
+        for old in store
+            .preferences_of(YOU, &boss_scope, false)
+            .await
+            .map_err(cant)?
+            .into_iter()
+            .filter(|o| {
+                o.id != p.id && o.scope == p.scope && o.when_text.eq_ignore_ascii_case(&p.when_text)
+            })
+        {
+            store
+                .preference_set_state(old.id, PrefState::Retired)
+                .await
+                .map_err(cant)?;
+        }
+        Ok(format!(
+            "From now on: when {}, {} (for {}).",
+            p.when_text,
+            p.then_text,
+            p.scope.said()
+        ))
+    }
+
+    /// The person undid `undone`, a decision made by their preference
+    /// `pref`: counted, set aside at the second time, and asked whether to
+    /// change it ("Change it", "Keep it", "Forget it"), once per preference
+    /// while the question is open.
+    pub(crate) async fn overruled(&self, boss: &str, pref: Uuid, undone: &str) {
+        let store = self.desk.store();
+        let p = match store.preference_overruled(pref).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "an overrule of a preference wasn't counted");
+                return;
+            }
+        };
+        let tz = self.desk.timezone();
+        // Only an active one is counted, so set aside now is by this undo.
+        let set_aside = p.state == PrefState::Paused;
+        let paused = match set_aside {
+            true => " I've set it aside until you say otherwise, as you undid it twice.",
+            false => "",
+        };
+        let mut new = NewItem::ask(
+            boss,
+            OpenKind::Ask,
+            None,
+            &format!(
+                "You undid “{}”, which I did per your preference from {} ({}; preference {}). Should I change that preference?{paused}",
+                undone.trim_end_matches('.'),
+                p.date(tz),
+                p.rule(),
+                p.id
+            ),
+        );
+        new.dedupe_key = format!("{OVERRULED}{pref}");
+        new.options = vec![CHANGE_IT.into(), KEEP_IT.into(), FORGET_IT.into()];
+        match store.item_open(&new).await {
+            Ok(Opened::New(i)) => {
+                self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
+                    .await;
+            }
+            // Asked already; set aside by this undo, it is said again so
+            // the person knows.
+            Ok(Opened::Again(i)) if set_aside => {
+                self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
+                    .await;
+            }
+            Ok(Opened::Again(_)) => {}
+            Err(e) => tracing::warn!(error = %e, "asking about an overruled preference failed"),
+        }
+    }
+
+    /// The person answered `closed`, when it asked whether to change an
+    /// overruled preference: kept or forgotten here, and said; `None` for
+    /// any other item, or "Change it", which goes on to the boss for the
+    /// new words.
+    pub(crate) async fn overrule_answered(
+        &self,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<String> {
+        let pref: Uuid = closed.dedupe_key.strip_prefix(OVERRULED)?.parse().ok()?;
+        let state = match answer.trim() {
+            a if a.eq_ignore_ascii_case(KEEP_IT) => PrefState::Active,
+            a if a.eq_ignore_ascii_case(FORGET_IT) => PrefState::Retired,
+            _ => return None,
+        };
+        match self.desk.store().preference_set_state(pref, state).await {
+            Ok(Some(p)) => Some(match state {
+                PrefState::Active => format!("Kept: when {}, {}.", p.when_text, p.then_text),
+                _ => format!("Forgot: when {}, {}.", p.when_text, p.then_text),
+            }),
+            Ok(None) => Some("That preference isn't there any more.".into()),
+            Err(e) => {
+                tracing::warn!(error = %e, "an overruled preference's answer wasn't kept");
+                Some("Desk couldn't keep that just now: say it in the chat.".into())
+            }
+        }
+    }
+
+    /// How many needs the boss `agent` (the main one when none) handled
+    /// since `since` (the start of today when none), in all and per day.
+    pub(crate) async fn handled_counts(
+        &self,
+        agent: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<Value> {
+        let boss = match agent {
+            Some(a) => self.overseer_named(a).map(|(s, _)| s)?,
+            None => self
+                .overseer_for(&workforce_common::oversight::Scope::Ungrouped)
+                .map(|(s, _)| s)?,
+        };
+        let boss = boss.agent_id.as_str().to_string();
+        let since = since.unwrap_or_else(|| workforce_desk::crew::Crew::midnight(self));
+        let tz = self.desk.timezone();
+        let store = self.desk.store();
+        let all = match store.decisions_handled(&boss, since).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "a boss's handled counts couldn't be read");
+                return None;
+            }
+        };
+        let days = store
+            .decisions_handled_by_day(&boss, since, tz)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "a boss's handled counts by day couldn't be read");
+                Vec::new()
+            });
+        let counts = |h: &workforce_desk::decision::Handled| {
+            json!({
+                "needs": h.needs(),
+                "yourself": h.itself(),
+                "preference": h.preference,
+                "own": h.own,
+                "escalated": h.escalated,
+                "personFirst": h.person_first,
+            })
+        };
+        let mut out = counts(&all);
+        out["agent"] = json!(boss);
+        out["since"] = json!(since.to_rfc3339());
+        out["said"] = json!(workforce_desk::decision::handled_said(&all));
+        out["days"] = json!(days
+            .iter()
+            .map(|(d, h)| {
+                let mut v = counts(h);
+                v["day"] = json!(d.to_string());
+                v
+            })
+            .collect::<Vec<_>>());
+        Some(out)
     }
 }
 

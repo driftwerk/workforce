@@ -481,6 +481,9 @@ pub struct ManagerView {
     /// Groups closed to everyone but the person: named for a boss that
     /// oversees nothing now, so neither it nor the main overseer sees them.
     pub sealed: Vec<String>,
+    /// What the main overseer handled today: the Floor's "handled N of M".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// A sidebar group's boss, as Desk shows it on the group and its row.
@@ -492,6 +495,9 @@ pub struct GroupBoss {
     pub group: String,
     /// `watch`, `suggest` or `act`.
     pub level: String,
+    /// What it handled today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled: Option<crate::decision::Handled>,
 }
 
 /// The overseer as the desk needs it.
@@ -724,6 +730,42 @@ pub trait Crew: Send + Sync {
     /// Drops the boss's open item `id` unanswered, as you.
     async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// "Always": the person's answer to the boss's open item `id` becomes
+    /// one of their preferences, for the kind of case the item said it
+    /// settles; `then` in place of their answer's words when given.
+    async fn always_item(
+        &self,
+        _id: uuid::Uuid,
+        _then: Option<&str>,
+    ) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// The person keeps a preference themselves: `when`, `then`, what it
+    /// covers (`scope`), for the boss of the ask `from_item` when given,
+    /// else of `boss_scope` (the main boss when none). The same case and
+    /// scope, or the one kept from the same ask, gives way to it.
+    async fn keep_preference(
+        &self,
+        _when: &str,
+        _then: &str,
+        _scope: &str,
+        _from_item: Option<uuid::Uuid>,
+        _boss_scope: Option<&str>,
+    ) -> Result<crate::preference::Preference, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// How many needs the boss `agent` (the main boss when none is named)
+    /// handled itself, by the person's preferences, gave the person, or the
+    /// person got to first, since `since` (the start of today when none),
+    /// in all and per day: what "handled 23 of 25 myself" says. `None`
+    /// where there is no such boss.
+    async fn handled(
+        &self,
+        _agent: Option<&str>,
+        _since: Option<DateTime<Utc>>,
+    ) -> Option<serde_json::Value> {
+        None
     }
     /// The person is typing in the boss `agent`'s DM: what it would post
     /// waits for a pause. False when `agent` is no boss here.

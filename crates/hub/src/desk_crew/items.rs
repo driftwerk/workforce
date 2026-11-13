@@ -56,7 +56,7 @@ pub const OPEN: &str = "crew.open_items";
 pub const PROMISE: &str = "crew.promise";
 pub const ORDER: &str = "crew.order";
 
-pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
+pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Say it in full so it reads cold (text), what it holds up (holding_up), your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"). For the update's layout, also give it in one line (question), its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself.";
 pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
@@ -84,7 +84,12 @@ pub fn schema(name: &str) -> Value {
             "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
-            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" }
+            "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
+            "question": { "type": "string", "description": "The ask in one line, shown bold above the rest, e.g. \"Two staging records need a decision before the next PR.\"" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers, each one short line, at most 6, when there are several" },
+            "recommended": { "type": "string", "description": "The one of options you recommend, word for word" },
+            "not_blocking": { "type": "string", "description": "What carries on meanwhile, e.g. \"The docs PR doesn't depend on it\"" },
+            "scope": { "type": "string", "description": "With generalizes: what the person's \"always\" would cover: all (default), group:<id>, or repo:<owner/name> when the case is about a repository's work (merging, deploying)" }
         }, "required": ["text"] }),
         PROMISE => json!({ "type": "object", "properties": {
             "session_id": { "type": "string" },
@@ -106,7 +111,7 @@ pub fn schema(name: &str) -> Value {
 }
 
 /// An item's text as a needs-you post.
-fn needs_you(i: &OpenItem) -> String {
+pub(super) fn needs_you(i: &OpenItem) -> String {
     let mut s = format!("**Needs you.** {}", i.text);
     if let Some(h) = i.holding_up.as_deref().filter(|h| !h.trim().is_empty()) {
         s.push_str(&format!("\n\nHolding up: {}", h.trim()));
@@ -255,30 +260,104 @@ impl CrewHub {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
+        // What an "always" would cover, checked now so a bad one is said
+        // to the boss, not found when the person presses it.
+        let prefer_scope = match some("scope") {
+            Some(s) => Some(workforce_desk::preference::PrefScope::parse(&s)?.text()),
+            None => None,
+        };
         let mut new = NewItem::ask(boss, kind, session, text).generalizing(some("generalizes"));
         new.holding_up = some("holding_up");
         new.recommendation = some("recommendation");
-        new.options = input["options"]
-            .as_array()
-            .map(|o| {
-                o.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let list = |k: &str| -> Vec<String> {
+            input[k]
+                .as_array()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|o| !o.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        new.options = list("options");
+        let recommended = match some("recommended") {
+            None => None,
+            Some(r) => {
+                // One of the options it offers: these, else those it
+                // offered when it asked this before.
+                let options = match new.options.is_empty() {
+                    false => new.options.clone(),
+                    true => self
+                        .desk
+                        .store()
+                        .items_not_closed(Some(boss))
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|i| i.dedupe_key == new.dedupe_key)
+                        .map(|i| i.options)
+                        .unwrap_or_default(),
+                };
+                match open_item::matching_option(&options, &r) {
+                    Some(o) => Some(o.to_string()),
+                    None if options.is_empty() => {
+                        return Err(
+                            "recommended must be one of the options, and none are offered: give options too."
+                                .into(),
+                        )
+                    }
+                    None => {
+                        return Err(format!(
+                            "recommended must be one of the options, word for word: {}.",
+                            options
+                                .iter()
+                                .map(|o| format!("“{o}”"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                }
+            }
+        };
+        let points: Vec<String> = list("items")
+            .iter()
+            .take(open_item::POINTS)
+            .map(|p| crew::one_line(p, open_item::POINT_CHARS))
+            .collect();
+        new.layout = open_item::AskLayout {
+            question: some("question")
+                .map(|q| crew::one_line(&q, workforce_desk::update::QUESTION_CHARS)),
+            points,
+            recommended,
+            not_blocking: some("not_blocking").map(|n| crew::one_line(&n, open_item::POINT_CHARS)),
+        };
         // Its turn's reply is not also kept as a question of its own.
         self.asked_person
             .lock()
             .insert(boss.to_string(), crew::now());
-        let opened = self
+        let mut opened = self
             .desk
             .store()
             .item_open(&new)
             .await
             .map_err(Self::item_err)?;
+        if let (Some(scope), true) = (&prefer_scope, opened.item().generalizes.is_some()) {
+            match self
+                .desk
+                .store()
+                .item_set_prefer_scope(opened.item().id, scope)
+                .await
+            {
+                // Its card says what an "always" would cover.
+                Ok(()) => match &mut opened {
+                    Opened::New(i) | Opened::Again(i) => i.prefer_scope = Some(scope.clone()),
+                },
+                Err(e) => tracing::warn!(error = %e, "an ask's preference scope wasn't kept"),
+            }
+        }
         let tz = self.desk.timezone();
         match opened {
             Opened::New(i) => {
@@ -705,6 +784,11 @@ impl CrewHub {
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
             .ok_or(ItemRefused::Closed)?;
+        // "You undid … Should I change that preference?": keeping or
+        // forgetting it is done here; changing it goes to the boss.
+        if let Some(done) = self.overrule_answered(&closed, answer).await {
+            return Ok(done);
+        }
         let Some((service, _)) = self.overseer_named(&closed.boss) else {
             return Ok("Answered.".into());
         };
@@ -1287,11 +1371,13 @@ mod tests {
                     said_count: if n == 0 { 3 } else { 1 },
                     raised_at: None,
                     sessions: vec![],
+                    prefer_scope: None,
                     changed_at: now,
                     state: OpenState::Open,
                     closed_at: None,
                     closed_by: None,
                     closed_why: None,
+                    layout: Default::default(),
                 }
             })
             .collect();
