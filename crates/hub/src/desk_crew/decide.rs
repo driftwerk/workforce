@@ -43,14 +43,14 @@ use super::{name_of, CrewHub, FULL_SPEND_UNREAD};
 const SWEEP: Duration = Duration::from_secs(2);
 
 /// How long one decision call may take before it is tried again.
-pub(super) const WITHIN: Duration = Duration::from_secs(30);
+pub(crate) const WITHIN: Duration = Duration::from_secs(30);
 
 /// How long a request may be in its decision call (two tries, and a
 /// margin): past it, it is decided or left to the person.
 pub(super) const DECIDING: chrono::TimeDelta = chrono::TimeDelta::seconds(70);
 
 /// What starts every decision call: how a reader (or a test) knows one.
-pub(super) const MARK: &str = "[Desk decision]";
+pub(crate) const MARK: &str = "[Desk decision]";
 
 /// How many decision calls a boss makes at once.
 const AT_ONCE: usize = 3;
@@ -61,7 +61,7 @@ const SHOWN: usize = 200;
 /// How much of a session's last reply the call is given.
 const LAST_REPLY: usize = 3000;
 
-const SYSTEM: &str = "You are the boss of coding sessions you oversee for the person, at Act fully: \
+pub(crate) const SYSTEM: &str = "You are the boss of coding sessions you oversee for the person, at Act fully: \
 you decide yourself, now, whether a session may do what it asks. You are given the whole request, \
 never cut short, with what the session is for and where it stands. Judge it as the person would want: \
 allow what serves the session's work; deny what is wrong, risky or not what the work needs, and say \
@@ -626,38 +626,8 @@ impl CrewHub {
     ) -> Result<String, String> {
         // The hub's own work for the person whose Desk this is: it may run
         // on their accounts when the install's login is at its limit.
-        let (response, served) = crate::hub_core::logins::install_pool::hub_own_work(
-            with_served_log(service.llm.create_message(
-                Some(system),
-                &[LlmMessage::user(prompt.to_string())],
-                &[],
-                None,
-                Some(400),
-                true,
-            )),
-        )
-        .await;
-        let response = response.map_err(|e| e.to_string())?;
-        let model = response.model.clone();
-        service.cost_tracker.record(CostEntry {
-            task_type: Some("desk_decision"),
-            description: Some("desk:decision"),
-            served,
-            ..CostEntry::new(
-                service.agent_id.as_str(),
-                &model,
-                TokenCounts::from(&response.usage),
-                Origin::DeskReading,
-            )
-        });
-        Ok(response
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect())
+        crate::hub_core::logins::install_pool::hub_own_work(decision_call(service, system, prompt))
+            .await
     }
 
     /// Records that `boss` left `view`'s request `p` to the person, saying
@@ -692,6 +662,50 @@ impl CrewHub {
             tracing::warn!(%boss, error = %e, "saying a waiting request in the DM failed");
         }
     }
+}
+
+/// One call to `service`'s own model for a decision, on whichever hub holds
+/// `service` (the person's own, or a remote boss's): its text. It runs on
+/// `service`'s own model alone, never another's.
+pub(crate) async fn decision_call(
+    service: &crate::serve::AgentService,
+    system: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let (response, served) = with_served_log(service.llm.create_message(
+        Some(system),
+        &[LlmMessage::user(prompt.to_string())],
+        &[],
+        None,
+        Some(400),
+        true,
+    ))
+    .await;
+    let response = response.map_err(|e| e.to_string())?;
+    let model = response.model.clone();
+    // Charged to whom it runs as, when anyone: a remote boss's call, run as
+    // its link's person, counts against their budget too.
+    let identity = crate::user_config::current_billing_identity_id();
+    service.cost_tracker.record(CostEntry {
+        task_type: Some("desk_decision"),
+        identity_id: identity.as_deref(),
+        description: Some("desk:decision"),
+        served,
+        ..CostEntry::new(
+            service.agent_id.as_str(),
+            &model,
+            TokenCounts::from(&response.usage),
+            Origin::DeskReading,
+        )
+    });
+    Ok(response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect())
 }
 
 #[cfg(test)]

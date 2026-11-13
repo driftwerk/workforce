@@ -32,7 +32,7 @@ mod answer;
 mod away;
 mod board;
 pub(crate) mod context;
-mod decide;
+pub(crate) mod decide;
 mod decisions;
 mod deliver;
 mod extras;
