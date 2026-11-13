@@ -309,6 +309,7 @@ impl Desk {
             .change_board_sync(id, move |_, old| Ok((None, old.or(Some(prefix)))))
             .await
             .map_err(internal)?;
+        // Its issues' files went with the link (`change_board_sync`).
         for mut t in self.0.store.board_tickets(id).await.map_err(internal)? {
             if let Some(e) = t.external.as_mut().filter(|e| e.synced) {
                 e.synced = false;
@@ -1105,6 +1106,7 @@ impl Desk {
             // Read with today's reader: never read again for its old shape.
             e.html_read = crate::board_sync::HTML_READ;
         }
+        e.details = crate::board_sync::details_of(issue, Some(&e.details));
         e.remote_updated_at = e.remote_updated_at.max(issue.updated_at);
         e.synced = true;
         e.flagged = e.flagged || issue.flagged;
@@ -1117,8 +1119,31 @@ impl Desk {
         if p.state.is_some() {
             e.seen.state = Some(t.state);
         }
+        // Its files never fail its pull: the list is kept next time.
+        let files = match &issue.files {
+            Some(files) => match self
+                .0
+                .store
+                .put_remote_files(t.id, files, &Self::pulled_by(s).party)
+                .await
+            {
+                Ok(changed) => changed,
+                Err(e) => {
+                    tracing::warn!(ticket = %t.id, error = %e, "a ticket's files weren't kept");
+                    false
+                }
+            },
+            None => false,
+        };
         if said.is_empty() {
             self.save_ticket(&mut t).await?;
+            if files {
+                if let Ok(v) = self.view_ticket(t).await {
+                    self.announce(DeskEvent::Ticket {
+                        ticket: Box::new(v),
+                    });
+                }
+            }
             return Ok(false);
         }
         t.updated_at = at;
@@ -1175,6 +1200,7 @@ impl Desk {
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
                 html_read: crate::board_sync::HTML_READ,
+                details: crate::board_sync::details_of(issue, None),
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -1187,6 +1213,11 @@ impl Desk {
         };
         if !self.0.store.import_ticket(&mut t).await.map_err(internal)? {
             return Ok(false);
+        }
+        if let Some(files) = &issue.files {
+            if let Err(e) = self.0.store.put_remote_files(t.id, files, &by.party).await {
+                tracing::warn!(ticket = %t.id, error = %e, "an imported ticket's files weren't kept");
+            }
         }
         let text = format!(
             "imported {} “{}”",
@@ -2101,6 +2132,7 @@ impl Desk {
             clipped: false,
             // Its body is Desk's own: never read again for an old shape.
             html_read: crate::board_sync::HTML_READ,
+            details: Default::default(),
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

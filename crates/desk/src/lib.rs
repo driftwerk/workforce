@@ -88,6 +88,7 @@ pub mod state;
 pub mod store;
 #[cfg(test)]
 mod testing;
+pub mod ticket_files;
 mod token_pipe;
 mod transcript;
 pub mod update;
@@ -126,6 +127,7 @@ pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
 };
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
+pub use service::{FileBytes, READ_FRESH};
 pub use service::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};

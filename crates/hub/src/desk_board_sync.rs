@@ -137,10 +137,13 @@ impl HubRemote {
         agent: Option<&str>,
     ) -> Result<Self, RemoteError> {
         let base = url.trim_end_matches('/');
+        // Marked as the board sync, a program: the hub offers it the file
+        // readers it keeps off a model's client.
+        let mark = workforce_core::desk::BOARD_SYNC_CALLER;
         let path = match agent {
-            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}"),
+            Some(a) if agent_id_ok(a) => format!("{base}/mcp/agents/{a}?{mark}"),
             Some(_) => return Err(RemoteError::Refused("that isn't an agent's id".into())),
-            None => format!("{base}/mcp"),
+            None => format!("{base}/mcp?{mark}"),
         };
         let endpoint = url::Url::parse(&path)
             .map_err(|_| RemoteError::Offline("the hub's address isn't one".into()))?;
@@ -453,6 +456,7 @@ impl LocalRemote {
                     identity_id: self.person.clone(),
                     agent_id: service.agent_id.to_string(),
                 },
+                program: true,
             },
             ctx,
             router: if quiet {
@@ -835,7 +839,7 @@ fn missing_words(hub: &str, system: System, _tools: &[String]) -> String {
     )
 }
 
-fn paused_words(hub: &str, system: System, p: &Paused) -> String {
+pub(crate) fn paused_words(hub: &str, system: System, p: &Paused) -> String {
     match p {
         Paused::Missing { tools } => missing_words(hub, system, tools),
         Paused::Refused { reason } if reason == NO_AGENT_LETS_YOU_IN => no_agent_words(hub),
@@ -856,13 +860,22 @@ struct TokenQuery {
     token: Option<String>,
 }
 
-fn refusal(status: StatusCode, error: &str) -> Response {
+pub(crate) fn refusal(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
 /// The person asking: signed in as themselves, holding this hub.
 async fn person(r: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<String, Response> {
-    let state = &r.sync.state;
+    person_of(&r.sync, headers, token).await
+}
+
+/// The person asking `sync`'s hub: signed in as themselves, holding it.
+pub(crate) async fn person_of(
+    sync: &BoardSync,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<String, Response> {
+    let state = &sync.state;
     let caller = resolve_caller_context(state, headers, token).await;
     match caller.auth_failure {
         Some(AuthFailure::InvalidCredentials) => {
@@ -1806,4 +1819,4 @@ pub fn install(state: &Arc<GatewayState>, desk: Desk) -> (Arc<BoardSync>, Router
 
 #[cfg(test)]
 #[path = "desk_board_sync_tests.rs"]
-mod tests;
+pub(crate) mod tests;

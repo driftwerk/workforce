@@ -367,6 +367,17 @@ impl Tool for LinearIssueListTool {
                             identifier
                             title
                         }}
+                        dueDate
+                        attachments(first: 25) {{
+                            nodes {{
+                                id
+                                title
+                                subtitle
+                                url
+                                sourceType
+                                createdAt
+                            }}
+                        }}
                         createdAt
                         updatedAt
                         url
@@ -537,6 +548,17 @@ impl Tool for LinearIssueGetTool {
                             id
                             name
                             color
+                        }
+                    }
+                    dueDate
+                    attachments(first: 25) {
+                        nodes {
+                            id
+                            title
+                            subtitle
+                            url
+                            sourceType
+                            createdAt
                         }
                     }
                     createdAt
@@ -2251,6 +2273,210 @@ impl Tool for LinearViewerTool {
                     start.elapsed().as_millis() as u64,
                 ))
             }
+        }
+    }
+}
+
+// ── linear.upload_read ─────────────────────────────────────────────────
+
+/// A chunk of a file uploaded to Linear (a picture in an issue's
+/// description), for Desk's board sync: read with the workspace's key, from
+/// `https://uploads.linear.app/` only.
+pub struct LinearUploadReadTool {
+    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    default_workspace: String,
+    prefix_map: Arc<HashMap<String, String>>,
+}
+
+impl LinearUploadReadTool {
+    pub fn new(
+        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        default_workspace: String,
+        prefix_map: Arc<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            clients,
+            default_workspace,
+            prefix_map,
+        }
+    }
+}
+
+/// Whether `id` can be a Linear issue's identifier (`ENG-123`).
+fn identifier_ok(id: &str) -> bool {
+    let Some((team, n)) = id.rsplit_once('-') else {
+        return false;
+    };
+    let mut t = team.chars();
+    t.next().is_some_and(|c| c.is_ascii_uppercase())
+        && t.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && team.len() <= 10
+        && !n.is_empty()
+        && n.len() <= 12
+        && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The addresses a Markdown description links to or shows (`[..](url)`,
+/// `![..](url)`), as written.
+fn linked_urls(description: &str) -> Vec<&str> {
+    description
+        .match_indices("](")
+        .map(|(i, _)| {
+            let rest = &description[i + 2..];
+            let end = rest
+                .find(|c: char| c == ')' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect()
+}
+
+/// Whether `url` is one of issue `issue`'s own files: an attachment it
+/// lists, or an upload its description shows or links to.
+fn issue_lists(issue: &Value, url: &str) -> bool {
+    let attached = issue["attachments"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|a| a["url"].as_str() == Some(url));
+    attached
+        || issue["description"]
+            .as_str()
+            .is_some_and(|d| linked_urls(d).contains(&url))
+}
+
+/// The type a Linear upload's address says, for the answer; the reader
+/// sniffs the bytes whatever this says.
+fn upload_type(url: &str) -> &'static str {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+#[async_trait]
+impl Tool for LinearUploadReadTool {
+    fn name(&self) -> &str {
+        "linear.upload_read"
+    }
+
+    fn description(&self) -> &str {
+        "Desk's board sync reads a file uploaded to Linear (https://uploads.linear.app/...) with this, a base64 chunk at a time."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The upload's https://uploads.linear.app/ address" },
+                "identifier": { "type": "string", "description": "The issue it is on, like 'DW-107'. Only a file that issue shows or lists is read." },
+                "offset": { "type": "integer", "minimum": 0 },
+                "length": { "type": "integer", "minimum": 1, "description": "At most 524288" },
+                "workspace": {
+                    "type": "string",
+                    "description": workspace_description(&self.clients, &self.default_workspace)
+                }
+            },
+            "required": ["identifier", "url"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        use crate::adapters::file_read::{self, memo};
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = match resolve_client(
+            &self.clients,
+            &self.default_workspace,
+            &self.prefix_map,
+            &input,
+        ) {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolResult::failure(format!("{e}"), ms())),
+        };
+        let url = match input["url"].as_str() {
+            Some(u) if file_read::is_linear_upload(u) => u.to_string(),
+            _ => {
+                return Ok(ToolResult::failure(
+                    "url is a file uploaded to Linear, at https://uploads.linear.app/",
+                    ms(),
+                ))
+            }
+        };
+        let range = match file_read::range_of(&input) {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        // Only a file its issue shows or lists is read: any upload's address
+        // alone would reach every file the key can see.
+        let identifier = match input["identifier"].as_str() {
+            Some(i) if identifier_ok(i) => i.to_string(),
+            _ => {
+                return Ok(ToolResult::failure(
+                    "identifier is the issue the file is on, like ENG-123",
+                    ms(),
+                ))
+            }
+        };
+        // Kept by the issue too: a kept file was checked against that issue.
+        let key = match client.credential_key() {
+            Ok(k) => format!("linear:{k}:{identifier}:{url}"),
+            Err(e) => return Ok(ToolResult::from_report(&e, ms())),
+        };
+        // Read once for every caller missing it at once, then kept.
+        let download = async {
+            let query = r#"
+                query($id: String!) {
+                    issue(id: $id) {
+                        description
+                        attachments(first: 50) { nodes { url } }
+                    }
+                }
+            "#;
+            match client
+                .query(query, serde_json::json!({ "id": identifier }))
+                .await
+            {
+                Ok(data) if issue_lists(&data["issue"], &url) => {}
+                Ok(_) => {
+                    return Err(ToolResult::failure(
+                        format!("{identifier} doesn't show or list that file"),
+                        ms(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {identifier}'s files")),
+                        ms(),
+                    ))
+                }
+            }
+            match client.get_file(&url).await {
+                Ok(bytes) => Ok((bytes, upload_type(&url).to_string())),
+                Err(e) => {
+                    warn!(error = %e, "A Linear upload wasn't read");
+                    Err(ToolResult::from_report(
+                        &e.wrap_err("Failed to read the Linear upload"),
+                        ms(),
+                    ))
+                }
+            }
+        };
+        match memo().fetch_once(&key, download).await {
+            Ok((bytes, media_type)) => Ok(ToolResult::success(
+                file_read::chunk(&bytes, &media_type, range),
+                ms(),
+            )),
+            Err(failed) => Ok(failed),
         }
     }
 }
@@ -3992,6 +4218,113 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         (clients, prefix)
+    }
+
+    /// A file is read only when its issue shows or lists it.
+    #[test]
+    fn an_upload_is_its_issue_s_only_when_it_shows_or_lists_it() {
+        let shown = "https://uploads.linear.app/a/b/shot.png";
+        let issue = serde_json::json!({
+            "description": format!("Steps:\n![the page]({shown})\nSee [spec](https://uploads.linear.app/a/c/spec.pdf) too"),
+            "attachments": { "nodes": [ { "url": "https://uploads.linear.app/a/d/log.txt" } ] },
+        });
+        assert!(issue_lists(&issue, shown));
+        assert!(issue_lists(
+            &issue,
+            "https://uploads.linear.app/a/c/spec.pdf"
+        ));
+        assert!(issue_lists(
+            &issue,
+            "https://uploads.linear.app/a/d/log.txt"
+        ));
+        for other in [
+            "https://uploads.linear.app/a/b/other.png",
+            "https://uploads.linear.app/a/b/shot.pn",
+            "https://uploads.linear.app/a/b",
+        ] {
+            assert!(!issue_lists(&issue, other), "{other}");
+        }
+        assert!(
+            !issue_lists(&serde_json::Value::Null, shown),
+            "no issue, no file"
+        );
+        assert!(identifier_ok("ENG-12"));
+        for bad in [
+            "eng-12",
+            "ENG-",
+            "-12",
+            "ENG-12/x",
+            "ENG-12\"",
+            "TOOLONGTEAMKEY-1",
+        ] {
+            assert!(!identifier_ok(bad), "{bad}");
+        }
+    }
+
+    /// An upload walked past what its issue shows is refused before anything
+    /// is downloaded, and none is read without its issue.
+    #[tokio::test]
+    async fn upload_read_reads_only_what_its_issue_shows() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "issue": {
+                    "description": "![shot](https://uploads.linear.app/a/b/shot.png)",
+                    "attachments": { "nodes": [] }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        let clients: HashMap<String, Arc<LinearClient>> = [(
+            "main".to_string(),
+            Arc::new(LinearClient::new("key", &server.uri()).unwrap()),
+        )]
+        .into();
+        let tool = LinearUploadReadTool::new(Arc::new(clients), "main".into(), Arc::default());
+        let walked = tool
+            .execute(serde_json::json!({ "identifier": "ENG-1", "url": "https://uploads.linear.app/a/b/someone-elses.png" }))
+            .await
+            .unwrap();
+        assert!(!walked.success);
+        assert!(walked
+            .error
+            .unwrap_or_default()
+            .contains("doesn't show or list that file"));
+        let unnamed = tool
+            .execute(serde_json::json!({ "url": "https://uploads.linear.app/a/b/shot.png" }))
+            .await
+            .unwrap();
+        assert!(!unnamed.success, "never without its issue");
+    }
+
+    /// Linear's key goes only to Linear's own uploads: any other address is
+    /// refused before a request is made.
+    #[tokio::test]
+    async fn upload_read_refuses_any_address_but_linear_s_uploads() {
+        let (clients, prefix) = fixture();
+        let tool = LinearUploadReadTool::new(Arc::new(clients), "main".into(), Arc::new(prefix));
+        for url in [
+            "https://evil.example/uploads.linear.app/x.png",
+            "http://uploads.linear.app/x.png",
+            "https://uploads.linear.app.evil.example/x.png",
+            "https://key@uploads.linear.app/x.png",
+        ] {
+            let r = tool
+                .execute(serde_json::json!({ "identifier": "MAIN-1", "url": url }))
+                .await
+                .unwrap();
+            assert!(!r.success, "{url}");
+        }
+        assert_eq!(
+            upload_type("https://uploads.linear.app/a/b/Shot.PNG?x=1"),
+            "image/png"
+        );
+        assert_eq!(
+            upload_type("https://uploads.linear.app/a/b/notes"),
+            "application/octet-stream"
+        );
     }
 
     #[test]

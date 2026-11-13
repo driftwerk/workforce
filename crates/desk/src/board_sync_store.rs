@@ -118,7 +118,10 @@ impl DeskStore {
 
     /// Changes board `id`'s link with `change`, in one step: what the sync
     /// loop and the person write never overwrite each other. `None` when
-    /// there's no such board. The prefix is set to `prefix` with it.
+    /// there's no such board. The prefix is set to `prefix` with it. When
+    /// the link goes, or the hub or person it reads through changes, its
+    /// tickets' remote files go with it, in the same step: what was read
+    /// as one person, through one hub, is never served for another.
     pub async fn change_board_sync(
         &self,
         id: Uuid,
@@ -137,7 +140,14 @@ impl DeskStore {
         };
         let sync: Option<Sync> = json_of(row.try_get("sync")?)?;
         let prefix: Option<String> = row.try_get("prefix")?;
+        let read_as = |s: &Option<Sync>| s.as_ref().map(|s| (s.via.clone(), s.person.clone()));
+        let was = read_as(&sync);
         let (sync, prefix) = change(sync, prefix)?;
+        if was.is_some() && was != read_as(&sync) {
+            tx.execute(crate::ticket_files::FORGET_REMOTE_FILES, &[&id])
+                .await
+                .context("forgetting a board's remote files")?;
+        }
         tx.execute(
             "UPDATE boards SET sync = $2, prefix = $3, updated_at = now() WHERE id = $1",
             &[

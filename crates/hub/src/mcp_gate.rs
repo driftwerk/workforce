@@ -211,6 +211,10 @@ pub struct CallSite {
     pub access: ToolAccessSnapshot,
     pub spill: SpillConfig,
     pub audit: CallAudit,
+    /// The caller is a program, not a model: Desk's board sync, by this
+    /// hub's own route or a paired device's token. Only then is a file's
+    /// chunk ([`workforce_agent::spill::is_file_chunk`]) left unstaged.
+    pub program: bool,
 }
 
 impl CallSite {
@@ -234,16 +238,41 @@ impl CallSite {
                 exec.duration_ms,
             );
         }
-        let (_, output) = spill_tool_output(
+        let output = staged(
+            self.program,
+            &self.spill,
+            tools,
             name,
             exec.output_text,
             exec.output,
-            false,
-            &self.spill,
-            RetrievalSurface::from_registry(tools),
         );
         ToolResult::success(tokenised(output, name), exec.duration_ms)
     }
+}
+
+/// A settled call's output, staged by the spill as for any caller, except
+/// a file's chunk read by a `program` (the board sync): it needs the bytes,
+/// not a handle, and no model reads it.
+fn staged(
+    program: bool,
+    spill: &SpillConfig,
+    tools: &ToolRegistry,
+    name: &str,
+    text: String,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    if program && workforce_agent::spill::is_file_chunk(name, &output) {
+        return output;
+    }
+    spill_tool_output(
+        name,
+        text,
+        output,
+        false,
+        spill,
+        RetrievalSurface::from_registry(tools),
+    )
+    .1
 }
 
 /// `output` with every credential in it tokenised, kept structured when there
@@ -1056,5 +1085,58 @@ mod tests {
             choice_names(&PermissionPromptOptions::ask(false)),
             ["allow_once", "deny_once", "deny_always"]
         );
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    /// A file's chunk is left whole only for a program's call; a model's
+    /// (a round, an external client) is staged as any other output.
+    #[test]
+    fn only_a_program_s_call_leaves_a_file_chunk_unstaged() {
+        // The process's store, which the first caller installs for good.
+        static DIR: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            workforce_agent::artifacts::set_global_store(
+                workforce_agent::artifacts::FsArtifactStore::new(dir.path().to_path_buf())
+                    .expect("store"),
+            );
+            dir
+        });
+        std::sync::LazyLock::force(&DIR);
+        let chunk = serde_json::json!({
+            "kind": workforce_agent::spill::FILE_BYTES_KIND,
+            "media_type": "image/png",
+            "size": 600_000,
+            "offset": 0,
+            "length": 600_000,
+            "data": "A".repeat(800_000),
+        });
+        // A surface that can read a staged output back.
+        let tools = ToolRegistry::new();
+        tools.register(crate::mcp_turn::testing::Probe::named(
+            workforce_agent::spill::RETRIEVE_TOOL_NAME,
+        ));
+        let stage = |program| {
+            workforce_agent::runner::CURRENT_AGENT_ID.sync_scope("gate-chunk".to_string(), || {
+                workforce_agent::runner::CURRENT_SESSION_ID.sync_scope(
+                    "gate-chunk-session".to_string(),
+                    || {
+                        staged(
+                            program,
+                            &SpillConfig::default(),
+                            &tools,
+                            "jira.attachment_read",
+                            chunk.to_string(),
+                            chunk.clone(),
+                        )
+                    },
+                )
+            })
+        };
+        assert_eq!(stage(true), chunk, "the board sync gets the bytes");
+        assert_ne!(stage(false), chunk, "a model's call is staged");
     }
 }
