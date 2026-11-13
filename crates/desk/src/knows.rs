@@ -219,13 +219,13 @@ pub struct GridFacts {
     pub sessions: Vec<Uuid>,
 }
 
-/// The sessions in a grid's panes, from the value the page keeps under
-/// `grid.<id>` (`src/grids/model.ts` in workforce-desk): `{id, name,
-/// panes: [{content: {kind: "session", sessionId, machine?}}]}`. A
-/// machine's session is left for that machine (Sees K7); a value that
-/// isn't a grid holds none.
-pub fn grid_facts(value: &serde_json::Value) -> Option<GridFacts> {
-    let id = value.get("id")?.as_str()?.to_string();
+/// The sessions in the panes of grid `id`, from the value the page keeps
+/// under `grid.<id>` (`src/grids/model.ts` in workforce-desk): `{id, name,
+/// panes: [{content: {kind: "session", sessionId, machine?}}]}`. The grid
+/// is the key's, whatever id its value names. A machine's session is left
+/// for that machine (Sees K7); a value that isn't a grid holds none.
+pub fn grid_facts(id: &str, value: &serde_json::Value) -> Option<GridFacts> {
+    let id = id.to_string();
     let panes = value.get("panes")?.as_array()?;
     let sessions = panes
         .iter()
@@ -584,13 +584,15 @@ mod tests {
             "placement": {"kind": "main"}
         });
         assert_eq!(
-            grid_facts(&v),
+            grid_facts("g1", &v),
             Some(GridFacts {
                 id: "g1".into(),
                 sessions: vec![u(1)]
             })
         );
-        assert_eq!(grid_facts(&serde_json::json!({"id": 3})), None);
+        // The key's grid, whatever its value says.
+        assert_eq!(grid_facts("g2", &v).unwrap().id, "g2");
+        assert_eq!(grid_facts("g1", &serde_json::json!({"id": 3})), None);
     }
 
     #[test]

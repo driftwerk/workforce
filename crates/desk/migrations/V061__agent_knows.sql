@@ -30,11 +30,16 @@ CREATE TABLE knows_sent (
     boss       TEXT,
     bytes      INT         NOT NULL,
     sent_at    TIMESTAMPTZ NOT NULL,
+    -- The person chose to let the agent keep it, outside its rule.
+    kept_at    TIMESTAMPTZ,
+    -- The delete (a knows_log row) the person chose for it, until done.
+    deleting   UUID,
     -- The agent's copy was deleted.
     deleted_at TIMESTAMPTZ,
     PRIMARY KEY (agent, kind, ref)
 );
 CREATE INDEX knows_sent_held ON knows_sent (agent, session) WHERE deleted_at IS NULL;
+CREATE INDEX knows_sent_at ON knows_sent (agent, sent_at);
 
 -- How far each kind has been shared with each agent.
 CREATE TABLE knows_cursors (

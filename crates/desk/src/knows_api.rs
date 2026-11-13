@@ -121,10 +121,11 @@ async fn rule(
 
 #[derive(Deserialize)]
 struct RuleBody {
-    #[serde(default)]
     places: Vec<String>,
+    /// Left out: as it was.
     #[serde(default)]
-    transcripts: bool,
+    transcripts: Option<bool>,
+    /// Left out: as it was.
     #[serde(default)]
     digest: Option<String>,
 }
@@ -142,14 +143,19 @@ async fn put_rule(
     let Some(agent) = agent_of(&hub, &agent) else {
         return not_an_agent();
     };
+    let before = match s.desk.store().knows_rule(&agent).await {
+        Ok(k) => k.map(|k| k.rule).unwrap_or_default(),
+        Err(e) => return failed(DeskError::Internal(e)),
+    };
     let digest = match body.digest.as_deref().map(str::trim) {
-        None | Some("") => Digest::Off,
+        None | Some("") => before.digest,
         Some(d) => match Digest::parse(d) {
             Ok(d) => d,
             Err(_) => return error(StatusCode::BAD_REQUEST, "digest is off, live or daily."),
         },
     };
-    let rule = match Rule::new(&body.places, body.transcripts, digest) {
+    let transcripts = body.transcripts.unwrap_or(before.transcripts);
+    let rule = match Rule::new(&body.places, transcripts, digest) {
         Ok(r) => r,
         Err(why) => return error(StatusCode::BAD_REQUEST, why),
     };
@@ -201,20 +207,7 @@ async fn log(
         return not_an_agent();
     };
     match s.desk.store().knows_log(&agent).await {
-        Ok(entries) => {
-            // The refs a delete covered are this hub's own: the page is told
-            // the counts.
-            let entries: Vec<_> = entries
-                .into_iter()
-                .map(|mut e| {
-                    if let Some(d) = e.detail.as_object_mut() {
-                        d.remove("refs");
-                    }
-                    e
-                })
-                .collect();
-            Json(json!({ "log": entries })).into_response()
-        }
+        Ok(entries) => Json(json!({ "log": entries })).into_response(),
         Err(e) => failed(DeskError::Internal(e)),
     }
 }
@@ -361,6 +354,10 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["covered"]["items"], 1);
+            // Kept: settled, so nothing waits on the person, and a delete
+            // after it covers nothing.
+            let (_, body) = send(&app, "GET", uri, None).await;
+            assert_eq!(body["heldOutside"]["items"], 0);
             let (_, body) = send(
                 &app,
                 "POST",
@@ -368,17 +365,125 @@ mod tests {
                 Some(json!({ "choice": "delete" })),
             )
             .await;
-            assert_eq!(body["covered"]["transcripts"], 1);
+            assert_eq!(body["covered"]["items"], 0);
+            assert!(d.store().knows_pending_deletes().await.unwrap().is_empty());
+            // Narrowed to a group the session isn't in: the account is
+            // outside now, and deleting it waits on the agent's hub.
+            let (_, body) = send(
+                &app,
+                "PUT",
+                uri,
+                Some(json!({ "places": ["group:patchwork"] })),
+            )
+            .await;
+            assert_eq!(body["heldOutside"]["items"], 1);
+            assert_eq!(body["rule"]["transcripts"], false, "left out: as it was");
+            assert_eq!(body["rule"]["digest"], "live", "left out: as it was");
+            let (_, body) = send(
+                &app,
+                "POST",
+                &format!("{uri}/held"),
+                Some(json!({ "choice": "delete" })),
+            )
+            .await;
+            assert_eq!(body["covered"]["items"], 1);
             let pending = d.store().knows_pending_deletes().await.unwrap();
             assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].1.detail["refs"], json!([[TRANSCRIPT, "x1"]]));
-            // The page reads the log's counts, never the refs.
+            assert_eq!(
+                d.store()
+                    .knows_deleting("driftwerk/allan", pending[0].1.id)
+                    .await
+                    .unwrap(),
+                [("account".to_string(), "a1".to_string())]
+            );
             let (_, body) = send(&app, "GET", &format!("{uri}/log"), None).await;
-            let log = body["log"].as_array().unwrap();
-            assert_eq!(log.len(), 4);
-            assert!(log.iter().all(|e| e["detail"].get("refs").is_none()));
+            let whats: Vec<&str> = body["log"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["what"].as_str().unwrap())
+                .collect();
+            assert_eq!(whats, ["delete", "rule", "keep", "rule", "rule"]);
             let (_, body) = send(&app, "GET", "/api/desk/knows", None).await;
             assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_world_reads_each_grid_by_its_key_and_skips_the_index() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = uuid::Uuid::from_u128(5);
+            let pane =
+                json!({ "id": "a", "content": { "kind": "session", "sessionId": s.to_string() } });
+            d.put_state(
+                "grid.g1",
+                json!({ "id": "other", "name": "One", "panes": [pane] }),
+            )
+            .await
+            .unwrap();
+            d.put_state("grid.index", json!(["g1"])).await.unwrap();
+            let w = d.knows_world().await.unwrap();
+            assert_eq!(w.grids.len(), 1);
+            assert_eq!(
+                (w.grids[0].id.as_str(), w.grids[0].sessions.as_slice()),
+                ("g1", &[s][..])
+            );
+            let rule = Rule::new(&["grid:other".into()], false, Digest::Off).unwrap();
+            assert!(!crate::knows::resolve("local/mia", &rule, &w)
+                .sessions
+                .contains(&s));
+        })
+        .await;
+    }
+
+    /// Lets anyone use the desk, and no one hold it.
+    struct NotTheHolder;
+
+    #[async_trait::async_trait]
+    impl Authorize for NotTheHolder {
+        async fn authorize(
+            &self,
+            _: &HeaderMap,
+            _: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Ok(None)
+        }
+        async fn authorize_holder(
+            &self,
+            _: &HeaderMap,
+            _: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Err(StatusCode::FORBIDDEN)
+        }
+        fn is_hub_token(&self, _: &HeaderMap) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_holder_changes_a_rule_or_chooses_what_is_kept() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let app = knows_router(desk(pool, dir.path()).await, Arc::new(NotTheHolder));
+            let uri = "/api/desk/knows/driftwerk/allan";
+            let (status, _) = send(&app, "PUT", uri, Some(json!({ "places": ["all"] }))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, _) = send(
+                &app,
+                "POST",
+                &format!("{uri}/held"),
+                Some(json!({ "choice": "delete" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(send(&app, "GET", uri, None).await.0, StatusCode::OK);
+            assert_eq!(
+                send(&app, "GET", "/api/desk/knows", None).await.0,
+                StatusCode::OK
+            );
         })
         .await;
     }

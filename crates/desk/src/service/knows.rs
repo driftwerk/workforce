@@ -90,7 +90,11 @@ impl Desk {
             .map_err(internal)?
             .into_iter()
             .filter(|l| l.key != "grid.index")
-            .filter_map(|l| l.value.as_ref().and_then(knows::grid_facts))
+            .filter_map(|l| {
+                // By its key, never by what its value says it is.
+                let id = l.key.strip_prefix("grid.")?;
+                knows::grid_facts(id, l.value.as_ref()?)
+            })
             .collect();
         let runs = store
             .charges()
@@ -175,19 +179,18 @@ impl Desk {
             .map(|k| k.rule)
             .unwrap_or_default();
         let (outside, count) = self.knows_outside(agent, &rule).await?;
-        let items: Vec<[&str; 2]> = outside
+        let items: Vec<(String, String)> = outside
             .iter()
-            .map(|h| [h.kind.as_str(), h.reference.as_str()])
+            .map(|h| (h.kind.clone(), h.reference.clone()))
             .collect();
         let detail = serde_json::json!({
             "items": count.items,
             "transcripts": count.transcripts,
             "sessions": count.sessions,
-            "refs": if delete { serde_json::json!(items) } else { serde_json::Value::Null },
         });
         if count.items > 0 {
             self.store()
-                .knows_choice(agent, delete, &detail, Utc::now())
+                .knows_choice(agent, delete, &items, &detail, Utc::now())
                 .await
                 .map_err(internal)?;
         }

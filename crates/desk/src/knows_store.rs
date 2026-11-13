@@ -139,13 +139,15 @@ impl DeskStore {
         kept(&row)
     }
 
-    /// What `agent` holds now: everything shared with it and not deleted.
+    /// What `agent` holds now that the person hasn't settled: everything
+    /// shared with it, not deleted, not being deleted, and not kept by the
+    /// person's choice.
     pub async fn knows_held(&self, agent: &str) -> Result<Vec<Held>> {
         let client = self.pool().get().await?;
         client
             .query(
                 "SELECT kind, ref, session, group_id, board, boss FROM knows_sent \
-                 WHERE agent = $1 AND deleted_at IS NULL",
+                 WHERE agent = $1 AND deleted_at IS NULL AND deleting IS NULL AND kept_at IS NULL",
                 &[&agent],
             )
             .await?
@@ -164,7 +166,9 @@ impl DeskStore {
     }
 
     /// Records what was shared with `agent`: each item once, its size and
-    /// time renewed when sent again, and held again if it was deleted.
+    /// time renewed when sent again, and held again (no longer kept by
+    /// choice) if it was deleted or kept. A pending delete stays: the sync
+    /// never sends what is being deleted ([`Self::knows_deleting`]).
     pub async fn knows_sent_put(
         &self,
         agent: &str,
@@ -182,7 +186,7 @@ impl DeskStore {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (agent, kind, ref) DO UPDATE SET session = EXCLUDED.session, \
                    group_id = EXCLUDED.group_id, board = EXCLUDED.board, boss = EXCLUDED.boss, \
-                   bytes = EXCLUDED.bytes, sent_at = EXCLUDED.sent_at, deleted_at = NULL",
+                   bytes = EXCLUDED.bytes, sent_at = EXCLUDED.sent_at, deleted_at = NULL, kept_at = NULL",
             )
             .await?;
         for s in sent {
@@ -207,27 +211,57 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Logs the person's choice for what `agent` held outside its rule:
-    /// `keep` is done at once; `delete` waits until the agent's hub has
-    /// deleted the copies ([`Self::knows_deleted`]). Answers its id.
+    /// Logs the person's choice for `items` (kind, ref) that `agent` holds
+    /// outside its rule, and marks them, in one transaction: kept, done at
+    /// once; or being deleted, until the agent's hub has deleted them
+    /// ([`Self::knows_deleted`]). Answers the log row's id.
     pub async fn knows_choice(
         &self,
         agent: &str,
         delete: bool,
+        items: &[(String, String)],
         detail: &Value,
         now: DateTime<Utc>,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        let client = self.pool().get().await?;
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
         let what = if delete { "delete" } else { "keep" };
         let done: Option<DateTime<Utc>> = (!delete).then_some(now);
-        client
-            .execute(
-                "INSERT INTO knows_log (id, at, agent, what, detail, done_at) VALUES ($1, $2, $3, $4, $5, $6)",
-                &[&id, &now, &agent, &what, detail, &done],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO knows_log (id, at, agent, what, detail, done_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&id, &now, &agent, &what, detail, &done],
+        )
+        .await?;
+        let (kinds, refs): (Vec<&str>, Vec<&str>) =
+            items.iter().map(|(k, r)| (k.as_str(), r.as_str())).unzip();
+        tx.execute(
+            "UPDATE knows_sent SET \
+               deleting = CASE WHEN $6 THEN $2::uuid ELSE deleting END, \
+               kept_at = CASE WHEN $6 THEN kept_at ELSE $5::timestamptz END \
+             FROM unnest($3::text[], $4::text[]) AS d(kind, ref) \
+             WHERE knows_sent.agent = $1 AND knows_sent.kind = d.kind AND knows_sent.ref = d.ref \
+               AND knows_sent.deleted_at IS NULL AND knows_sent.deleting IS NULL",
+            &[&agent, &id, &kinds, &refs, &now, &delete],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(id)
+    }
+
+    /// What is being deleted from `agent`'s copies: (kind, ref) of each, for
+    /// the sync never to send again until it is done.
+    pub async fn knows_deleting(&self, agent: &str, log: Uuid) -> Result<Vec<(String, String)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT kind, ref FROM knows_sent WHERE agent = $1 AND deleting = $2",
+                &[&agent, &log],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
     }
 
     /// The deletes still waiting on an agent's hub, oldest first.
@@ -245,25 +279,14 @@ impl DeskStore {
             .collect()
     }
 
-    /// The delete `log` is done: the agent's copies of `items` (kind, ref)
-    /// are marked deleted and the log row says when, in one transaction.
-    pub async fn knows_deleted(
-        &self,
-        agent: &str,
-        log: Uuid,
-        items: &[(String, String)],
-        now: DateTime<Utc>,
-    ) -> Result<()> {
+    /// The delete `log` is done: the agent's copies it covered are marked
+    /// deleted, and the log row says when, in one transaction.
+    pub async fn knows_deleted(&self, agent: &str, log: Uuid, now: DateTime<Utc>) -> Result<()> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
-        let (kinds, refs): (Vec<&str>, Vec<&str>) =
-            items.iter().map(|(k, r)| (k.as_str(), r.as_str())).unzip();
         tx.execute(
-            "UPDATE knows_sent SET deleted_at = $2 \
-             FROM unnest($3::text[], $4::text[]) AS d(kind, ref) \
-             WHERE knows_sent.agent = $1 AND knows_sent.kind = d.kind AND knows_sent.ref = d.ref \
-               AND knows_sent.deleted_at IS NULL",
-            &[&agent, &now, &kinds, &refs],
+            "UPDATE knows_sent SET deleted_at = $3, deleting = NULL WHERE agent = $1 AND deleting = $2",
+            &[&agent, &log, &now],
         )
         .await?;
         tx.execute(
@@ -429,29 +452,69 @@ mod tests {
                 .knows_choice(
                     "driftwerk/allan",
                     true,
+                    &[(TRANSCRIPT.into(), "x1".into())],
                     &serde_json::json!({"items": 1}),
                     now,
                 )
                 .await
                 .unwrap();
             assert_eq!(store.knows_pending_deletes().await.unwrap().len(), 1);
-            store
-                .knows_deleted(
+            // Being deleted: no longer held for a narrowing to ask about, and
+            // named for the sync to leave alone.
+            assert_eq!(store.knows_held("driftwerk/allan").await.unwrap().len(), 1);
+            assert_eq!(
+                store.knows_deleting("driftwerk/allan", log).await.unwrap(),
+                [(TRANSCRIPT.to_string(), "x1".to_string())]
+            );
+            // A second choice over the same rows marks none of them again.
+            let again = store
+                .knows_choice(
                     "driftwerk/allan",
-                    log,
+                    true,
                     &[(TRANSCRIPT.into(), "x1".into())],
+                    &serde_json::json!({"items": 1}),
                     now,
                 )
+                .await
+                .unwrap();
+            assert!(store
+                .knows_deleting("driftwerk/allan", again)
+                .await
+                .unwrap()
+                .is_empty());
+            store
+                .knows_deleted("driftwerk/allan", log, now)
+                .await
+                .unwrap();
+            store
+                .knows_deleted("driftwerk/allan", again, now)
                 .await
                 .unwrap();
             let held_now = store.knows_held("driftwerk/allan").await.unwrap();
             assert_eq!(held_now.len(), 1);
             assert_eq!(held_now[0].kind, "account");
             assert!(store.knows_pending_deletes().await.unwrap().is_empty());
+            // Kept by choice: settled, until it is sent again.
             store
-                .knows_choice("driftwerk/allan", false, &serde_json::json!({}), now)
+                .knows_choice(
+                    "driftwerk/allan",
+                    false,
+                    &[("account".into(), "a1".into())],
+                    &serde_json::json!({}),
+                    now,
+                )
                 .await
                 .unwrap();
+            assert!(store
+                .knows_held("driftwerk/allan")
+                .await
+                .unwrap()
+                .is_empty());
+            store
+                .knows_sent_put("driftwerk/allan", &[held("account", "a1", Some(s))], now)
+                .await
+                .unwrap();
+            assert_eq!(store.knows_held("driftwerk/allan").await.unwrap().len(), 1);
             let whats: Vec<String> = store
                 .knows_log("driftwerk/allan")
                 .await
