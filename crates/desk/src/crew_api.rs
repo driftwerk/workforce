@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use chrono::{DateTime, Utc};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -463,7 +463,11 @@ async fn item_always(
         return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
     };
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let then = body.then.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let then = body
+        .then
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
     item_result(s.crew.always_item(id, then).await)
 }
 
@@ -719,20 +723,28 @@ mod tests {
             );
             let always = |n: u128| format!("/api/desk/items/{}/always", uuid::Uuid::from_u128(n));
             let (status, said) = call_json(&app, &always(1), &json!({ "then": " wait " })).await;
-            assert_eq!((status, said["done"].as_str()), (StatusCode::OK, Some("From now on: wait")));
+            assert_eq!(
+                (status, said["done"].as_str()),
+                (StatusCode::OK, Some("From now on: wait"))
+            );
             let (status, said) = call(&app, "POST", &always(1)).await;
             assert_eq!(
                 (status, said["done"].as_str()),
                 (StatusCode::OK, Some("From now on: your answer")),
                 "no body: their answer"
             );
-            assert_eq!(call(&app, "POST", &always(2)).await.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                call(&app, "POST", &always(2)).await.0,
+                StatusCode::NOT_FOUND
+            );
             let (status, h) = call(&app, "GET", "/api/desk/handled").await;
             assert_eq!((status, h["yourself"].as_u64()), (StatusCode::OK, Some(23)));
             let (_, h) = call(&app, "GET", "/api/desk/handled?since=2026-11-12T18:00:00Z").await;
             assert_eq!(h["since"], "2026-11-12T18:00:00Z");
             assert_eq!(
-                call(&app, "GET", "/api/desk/handled?since=yesterday").await.0,
+                call(&app, "GET", "/api/desk/handled?since=yesterday")
+                    .await
+                    .0,
                 StatusCode::BAD_REQUEST
             );
             assert_eq!(
@@ -1012,7 +1024,10 @@ mod tests {
             let (_, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(
                 m,
-                json!({"agentId": "desk", "level": "suggest", "bosses": [], "sealed": []})
+                json!({
+                    "agentId": "desk", "level": "suggest", "bosses": [], "sealed": [],
+                    "handled": {"own": 0, "preference": 0, "escalated": 0, "personFirst": 0},
+                })
             );
 
             let made = |text: &str| Suggestion {
