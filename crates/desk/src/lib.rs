@@ -87,6 +87,8 @@ pub mod store;
 mod testing;
 mod token_pipe;
 mod transcript;
+pub mod update;
+pub mod update_store;
 pub mod usage;
 mod vt;
 mod worktree;

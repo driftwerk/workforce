@@ -1804,6 +1804,7 @@ mod act_fully_budget;
 mod decisions;
 mod items;
 mod promises;
+mod updates;
 
 mod remote_asks;
 mod served;
@@ -2925,7 +2926,7 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             dir.path(),
             pool,
             "5433",
-            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n",
             &[],
         )
         .await;

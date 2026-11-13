@@ -659,12 +659,24 @@ impl Desk {
         let limits = *self.0.accounts.limits.lock();
         let share = match kind {
             CheapKind::Question => Some(limits.account_questions_per_day),
-            CheapKind::Account => None,
+            CheapKind::Account | CheapKind::Update => None,
         };
         self.0
             .store
             .cheap_take(self.derive_day(), kind, limits.cheap_calls_per_day, share)
             .await
+    }
+
+    /// Takes one of the day's cheap calls for a boss's update; false past
+    /// the ceiling, when it is written plainly.
+    pub async fn update_take(&self) -> eyre::Result<bool> {
+        self.account_take(CheapKind::Update).await
+    }
+
+    /// The day's cheap calls so far, and the ceiling on them.
+    pub async fn cheap_today(&self) -> eyre::Result<(i64, u32)> {
+        let cap = self.0.accounts.limits.lock().cheap_calls_per_day;
+        Ok((self.0.store.cheap_calls(self.derive_day()).await?, cap))
     }
 
     /// Whether the day's cheap calls are spent.

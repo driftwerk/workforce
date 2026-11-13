@@ -15,7 +15,7 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
-//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false }
+//! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10 }
 //! ```
 //!
 //! `[oversight.updates]` holds the cheap model's day: every session's
@@ -26,6 +26,10 @@
 //! `close_from_accounts` lets a session's account close what the boss
 //! asked the person about it, once the account shows the matter is past;
 //! off until accounts and open items have run in real use.
+//! `enabled` is the update composer: what changed on the crew, gathered
+//! for `every_minutes` after the first result and sent by
+//! `max_wait_minutes` at the latest, as one update in the boss's DM.
+//! Off, updates are posted plainly from the rows.
 //!
 //! `full` is **Act fully**: everything `act` does, and, in the repositories
 //! `[oversight.full] repos` names (`owner/name`, which is GitHub's, a
@@ -328,7 +332,18 @@ pub struct Updates {
     /// Whether a session's account may close an open item about it once
     /// it shows the matter is past (the rule-based closers are always on).
     pub close_from_accounts: bool,
+    /// The update composer: the boss's updates written from what changed,
+    /// in place of its check-ins' prose at Act. Off: plain updates.
+    pub enabled: bool,
+    /// How long an update gathers after a result, and the least time
+    /// between two.
+    pub every_minutes: u32,
+    /// How long a small change waits at most.
+    pub max_wait_minutes: u32,
 }
+
+/// The longest an update may gather or wait.
+pub const MAX_UPDATE_MINUTES: i64 = 240;
 
 /// The most cheap calls a day may allow.
 pub const MAX_CHEAP_CALLS: i64 = 10_000;
@@ -428,6 +443,9 @@ impl Default for Oversight {
                 cheap_calls_per_day: 500,
                 account_questions_per_day: 60,
                 close_from_accounts: false,
+                enabled: true,
+                every_minutes: 3,
+                max_wait_minutes: 10,
             },
         }
     }
@@ -677,6 +695,24 @@ impl Oversight {
                 )
             }
         };
+        let every_minutes = whole(
+            updates,
+            "every_minutes",
+            d.updates.every_minutes,
+            1..=MAX_UPDATE_MINUTES,
+            &format!(
+                "The minutes an update gathers must be a whole number from 1 to {MAX_UPDATE_MINUTES}."
+            ),
+        )?;
+        let max_wait_minutes = whole(
+            updates,
+            "max_wait_minutes",
+            d.updates.max_wait_minutes.max(every_minutes),
+            i64::from(every_minutes)..=MAX_UPDATE_MINUTES,
+            &format!(
+                "The most minutes a small change waits for an update must be a whole number from {every_minutes} (how long an update gathers) to {MAX_UPDATE_MINUTES}."
+            ),
+        )?;
         let minutes = |key: &str, default: u32, what: &str| {
             whole(
                 wake,
@@ -886,6 +922,14 @@ impl Oversight {
                     d.updates.close_from_accounts,
                     "closing what it asked from sessions' accounts",
                 )?,
+                enabled: switch(
+                    updates,
+                    "enabled",
+                    d.updates.enabled,
+                    "writing its updates with the cheap model",
+                )?,
+                every_minutes,
+                max_wait_minutes,
             },
         })
     }
@@ -1185,6 +1229,33 @@ mod tests {
                 .unwrap_err()
                 .contains("cheap model")
         );
+        // The composer: on, gathering 3 minutes, a small change by 10.
+        assert!(d.updates.enabled);
+        assert_eq!(
+            (d.updates.every_minutes, d.updates.max_wait_minutes),
+            (3, 10)
+        );
+        let set = parse(
+            "[oversight]\nupdates = { enabled = false, every_minutes = 15, max_wait_minutes = 20 }\n",
+        )
+        .unwrap();
+        assert!(!set.updates.enabled);
+        assert_eq!(
+            (set.updates.every_minutes, set.updates.max_wait_minutes),
+            (15, 20)
+        );
+        // A wait shorter than the gathering is refused; a long gathering
+        // with the wait unsaid waits as long.
+        assert!(
+            parse("[oversight]\nupdates = { every_minutes = 5, max_wait_minutes = 4 }\n")
+                .unwrap_err()
+                .contains("small change")
+        );
+        let long = parse("[oversight]\nupdates = { every_minutes = 30 }\n").unwrap();
+        assert_eq!(long.updates.max_wait_minutes, 30);
+        assert!(parse("[oversight]\nupdates = { every_minutes = 0 }\n")
+            .unwrap_err()
+            .contains("gathers"));
     }
 
     /// Messaging agents and sessions started in another terminal are each

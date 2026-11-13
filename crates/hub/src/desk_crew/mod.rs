@@ -47,6 +47,8 @@ mod scope;
 pub(crate) mod served;
 mod spend;
 mod tools;
+mod updates;
+pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
 
@@ -159,6 +161,8 @@ pub struct CrewHub {
     /// The DM sessions running a message another overseer sent on: not
     /// the person's, so never their order.
     relayed_turns: Mutex<std::collections::HashSet<String>>,
+    /// Who writes the updates' paragraphs; none: plainly.
+    update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The work turns each overseer spent on its sessions' turn ends, by
     /// its agent.
     work: Mutex<HashMap<String, work::WorkRun>>,
@@ -529,6 +533,7 @@ impl CrewHub {
             turn_acts: Mutex::default(),
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
+            update_writer: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
@@ -553,6 +558,7 @@ impl CrewHub {
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }

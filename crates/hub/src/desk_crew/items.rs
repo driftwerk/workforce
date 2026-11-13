@@ -144,6 +144,26 @@ fn line_closed(asked: Option<Asked>, session: &str) -> Option<(ClosedBy, String)
     }
 }
 
+/// What a promise or order the boss kept says, once, at `tz`: when it was
+/// asked, what it was and what showed it done. None for anything else.
+pub(super) fn kept_line(closed: &OpenItem, tz: chrono_tz::Tz) -> Option<String> {
+    let why = closed.closed_why.as_deref()?.strip_prefix("Done: ")?;
+    if closed.closed_by != Some(ClosedBy::Boss) || closed.done_when.as_deref() == Some(REPLIED) {
+        return None;
+    }
+    let at = closed.opened_at.with_timezone(&tz).format("%H:%M");
+    let what = match closed.kind {
+        OpenKind::Order => format!("The change you asked for at {at}"),
+        OpenKind::Promise => format!("What I promised at {at}"),
+        _ => return None,
+    };
+    Some(format!(
+        "{what} (“{}”) is {}: {why}",
+        crew::one_line(&closed.text, 200),
+        closed.done_when.as_deref().unwrap_or("done"),
+    ))
+}
+
 /// What is said of `due` (one boss's items due to be said again, oldest
 /// first) at `now`: at most [`RESTATED_AT_ONCE`], the last counting the
 /// rest; each with whether this restatement parks it.
@@ -988,25 +1008,17 @@ impl CrewHub {
                 Ok(Some(closed)) => {
                     tracing::info!(item = %closed.id, by = by.as_str(), %why, "an open item closed");
                     let tz = self.desk.timezone();
-                    let at = closed.opened_at.with_timezone(&tz).format("%H:%M");
                     match (closed.kind, by) {
                         // Kept: reported once, with when it was asked.
-                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss) => {
-                            let what = match closed.kind {
-                                OpenKind::Order => format!("The change you asked for at {at}"),
-                                _ => format!("What I promised at {at}"),
-                            };
-                            self.say(
-                                &closed.boss,
-                                format!(
-                                    "{what} (“{}”) is {}: {}",
-                                    crew::one_line(&closed.text, 200),
-                                    closed.done_when.as_deref().unwrap_or("done"),
-                                    why.trim_start_matches("Done: ")
-                                ),
-                            )
-                            .await;
+                        // With the composer on, it goes in the next update.
+                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss)
+                            if !o.as_ref().is_some_and(|o| o.updates.enabled) =>
+                        {
+                            if let Some(text) = kept_line(&closed, tz) {
+                                self.say(&closed.boss, text).await;
+                            }
                         }
+                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss) => {}
                         (OpenKind::Promise | OpenKind::Order, ClosedBy::Lapsed) => {
                             self.say(
                                 &closed.boss,
@@ -1063,6 +1075,24 @@ impl CrewHub {
     /// Says again what has waited on the person past its time, for each
     /// boss: at most [`RESTATED_AT_ONCE`], the rest counted; the third
     /// restatement parks it.
+    /// Of `items` (one boss's, under `o`), what is due to be said again at
+    /// `now`, as [`restatements`] says it.
+    pub(super) fn due_again<'a>(
+        &self,
+        items: &'a [OpenItem],
+        o: &Oversight,
+        now: DateTime<Utc>,
+    ) -> Vec<(&'a OpenItem, String, bool)> {
+        if o.wake.remind_minutes == 0 {
+            return Vec::new();
+        }
+        let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
+        let first = minute * FIRST_RESTATE.num_minutes() as i32;
+        let remind = minute * o.wake.remind_minutes as i32;
+        let due: Vec<&OpenItem> = items.iter().filter(|i| i.due(now, first, remind)).collect();
+        restatements(&due, now)
+    }
+
     async fn resurface(&self, items: &[OpenItem]) {
         let now = Utc::now();
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
@@ -1072,7 +1102,8 @@ impl CrewHub {
             let Some((_, o)) = self.overseer_named(&i.boss) else {
                 continue;
             };
-            if o.wake.remind_minutes == 0 {
+            // With the composer on, what is due goes in the boss's update.
+            if o.wake.remind_minutes == 0 || o.updates.enabled {
                 continue;
             }
             let remind = minute * o.wake.remind_minutes as i32;

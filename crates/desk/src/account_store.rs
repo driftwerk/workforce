@@ -18,6 +18,8 @@ pub enum CheapKind {
     Account,
     /// Answering a question about a session from its exchanges.
     Question,
+    /// Writing a boss's update.
+    Update,
 }
 
 impl CheapKind {
@@ -25,6 +27,7 @@ impl CheapKind {
         match self {
             Self::Account => "account",
             Self::Question => "question",
+            Self::Update => "update",
         }
     }
 }

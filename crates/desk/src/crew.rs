@@ -589,6 +589,9 @@ pub struct Extras {
     /// its answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<crate::open_item::MentionedItem>,
+    /// A boss's update, as the chat renders it in place of its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::update::MentionedUpdate>,
 }
 
 impl Extras {
@@ -599,6 +602,7 @@ impl Extras {
             && self.plan.is_none()
             && self.decisions.is_empty()
             && self.item.is_none()
+            && self.update.is_none()
     }
 }
 
