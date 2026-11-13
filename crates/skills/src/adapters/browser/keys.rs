@@ -23,27 +23,24 @@ pub struct KeyPage {
     pub origin: String,
     /// The path prefixes its key pages are under.
     pub paths: Vec<String>,
+    /// Whether one leading segment of the account's own may come before a
+    /// prefix: Linear's `/acme/settings/account/security`.
+    pub workspace_segment: bool,
     /// What one of its keys looks like, whole.
     pub shape: Regex,
 }
 
 static PAGES: LazyLock<RwLock<Vec<KeyPage>>> = LazyLock::new(Default::default);
 
-/// Registers (or replaces) `page` for its connector.
+/// Registers (or replaces) `page` for its connector at its origin. A
+/// connector may have key pages at several origins (Datadog's regions, each
+/// person's own Metabase): every one is hidden, and none replaces another's.
+/// The registry says which pages to hide and never to picture; which page a
+/// key is *read* off is the hub's, per setup (`BrowserHooks::key_page`).
 pub fn register(page: KeyPage) {
     let mut pages = PAGES.write().unwrap();
-    pages.retain(|p| p.connector != page.connector);
+    pages.retain(|p| p.connector != page.connector || p.origin != page.origin);
     pages.push(page);
-}
-
-/// `connector`'s key pages, if it has any.
-pub fn page_for(connector: &str) -> Option<KeyPage> {
-    PAGES
-        .read()
-        .unwrap()
-        .iter()
-        .find(|p| p.connector == connector)
-        .cloned()
 }
 
 /// Whether `url` is on one of `page`'s key pages.
@@ -52,7 +49,47 @@ pub fn matches(page: &KeyPage, url: &str) -> bool {
         return false;
     };
     super::address::origin_of(url).as_deref() == Some(page.origin.as_str())
-        && page.paths.iter().any(|p| under(u.path(), p))
+        && page.paths.iter().any(|p| {
+            under(u.path(), p)
+                || (page.workspace_segment
+                    && after_segment(u.path()).is_some_and(|rest| under(rest, p)))
+        })
+}
+
+/// `path` without its first segment (`/acme/settings` → `/settings`), when
+/// that segment is one an account could be named (letters, digits, `-`,
+/// `_`).
+fn after_segment(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix('/')?;
+    let cut = rest.find('/')?;
+    let segment = &rest[..cut];
+    (!segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then(|| &rest[cut..])
+}
+
+/// `page`'s prefixes as they stand on the tab at `url`: where one leading
+/// segment of the account's own may come first and the tab has one, that
+/// segment is written in (`/acme/settings/account/security`), so the
+/// extension's read checks the page whole, in the same call, without
+/// knowing about workspaces.
+pub fn paths_at(page: &KeyPage, url: &str) -> Vec<String> {
+    let Some(u) = super::address::parse(url) else {
+        return page.paths.clone();
+    };
+    let path = u.path();
+    page.paths
+        .iter()
+        .map(|p| match under(path, p) || !page.workspace_segment {
+            true => p.clone(),
+            false => match after_segment(path).filter(|rest| under(rest, p)) {
+                Some(rest) => format!("{}{}", &path[..path.len() - rest.len()], p),
+                None => p.clone(),
+            },
+        })
+        .collect()
 }
 
 /// Whether `path` is `prefix` or under it, a whole segment at a time:
@@ -131,6 +168,7 @@ pub(super) fn fixture_page() -> KeyPage {
         connector: "fixture".into(),
         origin: "https://keys.example".into(),
         paths: vec!["/settings/api".into()],
+        workspace_segment: false,
         shape: Regex::new(r"fx_[A-Za-z0-9]{24}").unwrap(),
     }
 }
@@ -157,6 +195,77 @@ mod tests {
         assert!(shaped(&page, "fx_abcdefghijklmnopqrstuvwx"));
         assert!(!shaped(&page, "x fx_abcdefghijklmnopqrstuvwx"));
         assert!(!shaped(&page, "fx_short"));
+    }
+
+    #[test]
+    fn a_workspace_segment_may_come_first_and_is_written_into_the_paths_sent() {
+        let page = KeyPage {
+            connector: "fixture-ws".into(),
+            origin: "https://ws.example".into(),
+            paths: vec!["/settings/account/security".into(), "/settings/api".into()],
+            workspace_segment: true,
+            shape: Regex::new(r"ws_[a-z]{8}").unwrap(),
+        };
+        assert!(matches(&page, "https://ws.example/settings/api"));
+        assert!(matches(
+            &page,
+            "https://ws.example/acme/settings/account/security"
+        ));
+        assert!(matches(
+            &page,
+            "https://ws.example/acme-2_x/settings/api/new"
+        ));
+        for not in [
+            "https://ws.example/a/b/settings/api",
+            "https://ws.example/acme/settings/apikeys",
+            "https://ws.example/ac%20me/settings/api",
+            "https://ws.example/acme",
+        ] {
+            assert!(!matches(&page, not), "{not}");
+        }
+        // Without the flag, a segment first is another page.
+        let flat = KeyPage {
+            workspace_segment: false,
+            ..page.clone()
+        };
+        assert!(!matches(&flat, "https://ws.example/acme/settings/api"));
+        assert_eq!(
+            paths_at(&page, "https://ws.example/acme/settings/account/security"),
+            vec![
+                "/acme/settings/account/security".to_string(),
+                "/settings/api".to_string()
+            ]
+        );
+        assert_eq!(
+            paths_at(&page, "https://ws.example/settings/api"),
+            vec![
+                "/settings/account/security".to_string(),
+                "/settings/api".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pages_at_several_origins_stay_registered_side_by_side() {
+        let at = |origin: &str| KeyPage {
+            connector: "fixture-many".into(),
+            origin: origin.into(),
+            paths: vec!["/admin/keys".into()],
+            workspace_segment: false,
+            shape: Regex::new(r"mm_[a-z]{8}").unwrap(),
+        };
+        register(at("https://one.example"));
+        register(at("https://two.example"));
+        register(at("https://one.example"));
+        assert!(is_key_page("https://one.example/admin/keys"));
+        assert!(is_key_page("https://two.example/admin/keys"));
+        let n = PAGES
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|p| p.connector == "fixture-many")
+            .count();
+        assert_eq!(n, 2);
     }
 
     #[test]

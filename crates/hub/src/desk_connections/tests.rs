@@ -1859,6 +1859,95 @@ mod setups {
 
     const LINEAR_PAGE: (&str, &str) = ("https://linear.app", "/settings/account/security");
 
+    /// What `browser.capture_key` reaches through Desk's browser hooks: the
+    /// turn's own caller, the setup's page as the browser checks it, and the
+    /// key kept from where the extension says it read it.
+    #[tokio::test]
+    async fn the_browser_reaches_a_setup_only_from_its_own_turn() {
+        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
+        use workforce_skills::adapters::browser::keys;
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        s.start(&allan, "linear", Some("Acme"), None).await.unwrap();
+        let in_turn = |person: &'static str, key: &'static str, f: Box<dyn FnOnce() + Send>| {
+            CURRENT_USER_ID.sync_scope(person.to_string(), || {
+                CURRENT_SESSION_ID.sync_scope("s-allan".to_string(), || {
+                    CURRENT_SESSION_KEY.sync_scope(key.to_string(), f)
+                })
+            })
+        };
+        // Outside a turn, or when the browser's word disagrees with the
+        // turn's, there is no caller and so no page.
+        assert!(s.turn_caller(SARAH, "allan", "desk:allan").is_none());
+        let s = Arc::new(s);
+        let s2 = Arc::clone(&s);
+        in_turn(
+            SARAH,
+            "desk:allan",
+            Box::new(move || {
+                assert!(s2.turn_caller("mallory", "allan", "desk:allan").is_none());
+                assert!(s2.turn_caller(SARAH, "allan", "desk:other").is_none());
+                let who = s2.turn_caller(SARAH, "allan", "desk:allan").unwrap();
+                assert_eq!(who.session.as_deref(), Some("s-allan"));
+                // Ben runs no setup in this conversation: nothing to read.
+                let ben = s2.turn_caller(SARAH, "ben", "desk:allan").unwrap();
+                assert!(s2.browser_page(&ben, "linear").is_none());
+                // Linear's page, with its workspace's segment, and registered so
+                // the browser hides it and takes no picture of it.
+                let page = s2.browser_page(&who, "linear").unwrap();
+                let at = "https://linear.app/acme/settings/account/security";
+                assert!(keys::matches(&page, at));
+                assert!(keys::is_key_page(at));
+                assert!(keys::shaped(&page, GOOD));
+                assert!(!keys::shaped(&page, "lin_api_x"));
+                assert_eq!(
+                    keys::paths_at(&page, at)[0],
+                    "/acme/settings/account/security"
+                );
+                // Read where the extension says, the key is held; read
+                // elsewhere, it is dropped.
+                assert!(s2
+                    .keep_key(
+                        &who,
+                        "linear",
+                        None,
+                        "https://linear.app",
+                        "/acme/settings/api-x",
+                        Secret::new(GOOD.into())
+                    )
+                    .is_err());
+                let kept = s2
+                    .keep_key(
+                        &who,
+                        "linear",
+                        None,
+                        "https://linear.app",
+                        "/acme/settings/account/security",
+                        Secret::new(GOOD.into()),
+                    )
+                    .unwrap();
+                assert!(kept.test.starts_with("ready"), "{}", kept.test);
+                assert!(!format!("{kept:?}").contains(GOOD));
+            }),
+        );
+    }
+
+    #[test]
+    fn every_known_key_page_is_hidden_before_a_setup_starts() {
+        use workforce_skills::adapters::browser::keys;
+        setup::register_key_pages();
+        for at in [
+            "https://id.atlassian.com/manage-profile/security/api-tokens",
+            "https://linear.app/acme/settings/api",
+            "https://github.com/settings/personal-access-tokens/new",
+            "https://app.datadoghq.eu/organization-settings/api-keys",
+            "https://app.ddog-gov.com/personal-settings/application-keys",
+        ] {
+            assert!(keys::is_key_page(at), "{at}");
+        }
+        assert!(!keys::is_key_page("https://linear.app/acme/issue/ACM-1"));
+    }
+
     #[tokio::test]
     async fn an_agent_sets_itself_up_and_the_key_never_comes_back() {
         let cache = Arc::new(crate::secret_cache::InMemorySecretCache::with_defaults());
@@ -1894,7 +1983,6 @@ mod setups {
                 LINEAR_PAGE.1,
                 Secret::new(GOOD.into()),
             )
-            .await
             .unwrap();
         // Held, not sent: the check is connections.test's, which asks.
         assert!(kept.test.starts_with("ready"), "{}", kept.test);
@@ -2025,7 +2113,6 @@ mod setups {
                 "/acme/settings/account/security",
                 Secret::new(GOOD.into()),
             )
-            .await
             .unwrap();
         assert!(kept.test.starts_with("ready"), "{}", kept.test);
     }
@@ -2060,7 +2147,6 @@ mod setups {
                     path,
                     Secret::new(value.into()),
                 )
-                .await
                 .unwrap_err();
             assert!(e.contains(want), "{e}");
         }
@@ -2075,7 +2161,6 @@ mod setups {
                 LINEAR_PAGE.1,
                 Secret::new(BAD.into()),
             )
-            .await
             .unwrap();
         assert!(kept.test.starts_with("ready"), "{}", kept.test);
         s.test(&allan, &started.id).await.unwrap_err();
@@ -2096,7 +2181,6 @@ mod setups {
                 LINEAR_PAGE.1,
                 Secret::new(GOOD.into())
             )
-            .await
             .unwrap_err()
             .contains("No linear setup"));
     }
@@ -2157,7 +2241,6 @@ mod setups {
             LINEAR_PAGE.1,
             Secret::new(GOOD.into()),
         )
-        .await
         .unwrap();
         s.test(&ben, &for_all.id).await.unwrap();
         assert!(keys(&h.global).contains(&mine(&ws("default", "api_key"))));
@@ -2227,7 +2310,6 @@ mod setups {
             "/manage-profile/security/api-tokens",
             Secret::new(token.into()),
         )
-        .await
         .unwrap();
         // A key the service refused is dropped: nothing is held for it.
 
@@ -2248,7 +2330,6 @@ mod setups {
                 "/admin/settings/authentication/api-keys",
                 Secret::new("mb_0123456789abcdefghij".into())
             )
-            .await
             .unwrap_err()
             .contains("key page"));
         // Datadog's site is a region.
@@ -2268,7 +2349,6 @@ mod setups {
                 "/organization-settings/api-keys",
                 Secret::new("0123456789abcdef0123456789abcdef".into()),
             )
-            .await
             .unwrap();
         assert_eq!(held.test, "still needs app_key");
         // Once a key is held, nothing about where it goes changes.

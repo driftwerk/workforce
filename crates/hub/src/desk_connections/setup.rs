@@ -61,6 +61,7 @@ use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::secret::Secret;
 use workforce_core::computer::Effect;
 use workforce_desk::connections::Level;
+use workforce_skills::adapters::browser::keys as browser_keys;
 
 use super::catalog::{self, Connector};
 use super::check::Found;
@@ -118,6 +119,10 @@ struct Recipe {
     workspace_segment: bool,
     /// Whether a value is shaped like `field`'s.
     shaped: fn(&str, &str) -> bool,
+    /// What any of its keys looks like, whole, as a pattern: what the
+    /// browser checks a read against and hides on its key pages. Looser
+    /// than [`Self::shaped`], which is checked per field after.
+    shape: &'static str,
     where_label: Option<&'static str>,
     page_label: &'static str,
     sign_in_label: &'static str,
@@ -187,6 +192,40 @@ fn site_origin(service: &str, raw: &str) -> Result<String, String> {
     })
 }
 
+/// `connector`'s key page at `origin`, as the browser's registry holds it.
+fn browser_page(connector: &str, origin: &str) -> Option<browser_keys::KeyPage> {
+    let r = recipe(connector)?;
+    Some(browser_keys::KeyPage {
+        connector: connector.to_string(),
+        origin: origin.to_string(),
+        paths: r.paths.iter().map(|p| p.to_string()).collect(),
+        workspace_segment: r.workspace_segment,
+        shape: regex::Regex::new(r.shape).expect("a recipe's shape compiles"),
+    })
+}
+
+/// Registers every key page whose origin is known before a setup starts
+/// (Jira's, Linear's, GitHub's, and each Datadog region's), so their text
+/// is hidden and they are never pictured, whoever opens them. A person's
+/// own Metabase is registered once its site is kept.
+pub fn register_key_pages() {
+    for service in ["jira", "linear", "github"] {
+        if let Some(r) = recipe(service) {
+            for origin in (r.origins)(&BTreeMap::new()) {
+                if let Some(page) = browser_page(service, &origin) {
+                    browser_keys::register(page);
+                }
+            }
+        }
+    }
+    for site in DATADOG_SITES {
+        let fields = BTreeMap::from([("site".to_string(), site.to_string())]);
+        if let Some(page) = browser_page("datadog", &datadog_web(&fields)) {
+            browser_keys::register(page);
+        }
+    }
+}
+
 fn metabase_origin(fields: &BTreeMap<String, String>) -> Option<String> {
     let site = super::check::address(fields.get("site_url")?);
     workforce_skills::adapters::browser::origin_of(&site)
@@ -200,6 +239,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             paths: &["/manage-profile/security/api-tokens"],
             workspace_segment: false,
             shaped: |_, v| plain_token(v, 24),
+            shape: r"[!#-&(-~]{24,4096}",
             where_label: Some("Find your Atlassian site"),
             page_label: "Open id.atlassian.com › Security › API tokens",
             sign_in_label: "Sign in to Atlassian",
@@ -213,6 +253,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             paths: &["/settings/account/security", "/settings/api"],
             workspace_segment: true,
             shaped: |_, v| v.starts_with("lin_api_") && plain_token(v, 20),
+            shape: r"lin_api_[!#-&(-~]{12,4088}",
             where_label: None,
             page_label: "Open Linear › Settings › Security & access",
             sign_in_label: "Sign in to Linear",
@@ -234,6 +275,7 @@ fn recipe(service: &str) -> Option<Recipe> {
                     _ => hex && v.len() == 40,
                 }
             },
+            shape: r"[0-9a-fA-F]{40}|[0-9a-fA-F]{32}",
             where_label: Some("Find your Datadog site"),
             page_label: "Open Datadog › Organization settings › Keys",
             sign_in_label: "Sign in to Datadog",
@@ -247,6 +289,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             paths: &["/admin/settings/authentication/api-keys"],
             workspace_segment: false,
             shaped: |_, v| v.starts_with("mb_") && plain_token(v, 16),
+            shape: r"mb_[!#-&(-~]{13,4093}",
             where_label: Some("Find your Metabase address"),
             page_label: "Open Metabase › Admin › Authentication › API keys",
             sign_in_label: "Sign in to Metabase",
@@ -260,6 +303,7 @@ fn recipe(service: &str) -> Option<Recipe> {
             shaped: |_, v| {
                 (v.starts_with("github_pat_") || v.starts_with("ghp_")) && plain_token(v, 20)
             },
+            shape: r"(?:github_pat_|ghp_)[!#-&(-~]{9,4085}",
             where_label: None,
             page_label: "Open GitHub › Settings › Personal access tokens",
             sign_in_label: "Sign in to GitHub",
@@ -772,6 +816,13 @@ impl Setups {
             };
             let value = value.as_str();
             s.fields.insert(field.to_string(), value.to_string());
+            if (s.service, field) == ("metabase", "site_url") {
+                if let Some(page) =
+                    metabase_origin(&s.fields).and_then(|o| browser_page("metabase", &o))
+                {
+                    browser_keys::register(page);
+                }
+            }
             if Some(field) == c.site {
                 s.relabel("where", format!("Found your site: {value}"));
                 s.mark("where", StepState::Done, None);
@@ -839,6 +890,40 @@ impl Setups {
         .ok()
     }
 
+    /// The caller of the turn running now, as the browser names it: `user`'s
+    /// `agent` in the conversation whose session key is `conversation`.
+    /// `None` outside a conversation, or when the turn's own person isn't
+    /// `user`, so the browser's word alone never makes a caller.
+    pub fn turn_caller(&self, user: &str, agent: &str, conversation: &str) -> Option<Caller> {
+        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY, CURRENT_USER_ID};
+        let person = CURRENT_USER_ID.try_with(|u| u.clone()).ok()?;
+        let key = CURRENT_SESSION_KEY.try_with(|k| k.clone()).ok()?;
+        if person != user || key != conversation || conversation.is_empty() {
+            return None;
+        }
+        let session = CURRENT_SESSION_ID
+            .try_with(|s| s.clone())
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(Caller {
+            overseer: self.callers.oversees(agent),
+            person,
+            agent: agent.to_string(),
+            session: Some(session),
+            session_key: Some(key),
+        })
+    }
+
+    /// [`Self::key_page`] as the browser takes it: what `browser.capture_key`
+    /// checks the tab against and sends the extension's read. It is also
+    /// registered, so its text is hidden and it is never pictured.
+    pub fn browser_page(&self, caller: &Caller, connector: &str) -> Option<browser_keys::KeyPage> {
+        let page = self.key_page(caller, connector)?;
+        let shaped = browser_page(connector, &page.origin)?;
+        browser_keys::register(shaped.clone());
+        Some(shaped)
+    }
+
     /// Keeps `value`, a key the browser read off `read_origin` and
     /// `read_path` for the setup `caller`'s conversation is running for
     /// `connector`: its `field` (the next one still to read where none is
@@ -847,7 +932,7 @@ impl Setups {
     /// anywhere: once every key is held, the agent checks it with
     /// `connections.test`, which asks the person first. What comes back
     /// holds none of it.
-    pub async fn keep_key(
+    pub fn keep_key(
         &self,
         caller: &Caller,
         connector: &str,
@@ -875,10 +960,19 @@ impl Setups {
                 .find(|x| x.name == f && x.secret)
                 .map(|x| x.name)
                 .ok_or_else(|| format!("{} has no key named {f}", c.name))?,
-            None => *page
-                .fields
-                .first()
-                .ok_or("Every key this setup needs is held already.")?,
+            // The first still to read that it is shaped for: Datadog's API
+            // and application keys may be read in either order.
+            None => {
+                let first = *page
+                    .fields
+                    .first()
+                    .ok_or("Every key this setup needs is held already.")?;
+                page.fields
+                    .iter()
+                    .copied()
+                    .find(|f| (recipe.shaped)(f, value.expose_secret()))
+                    .unwrap_or(first)
+            }
         };
         if !(recipe.shaped)(field, value.expose_secret()) {
             return Err(
@@ -1476,6 +1570,7 @@ pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Conne
     let setups = INSTALLED
         .get_or_init(|| Arc::new(Setups::new(connections, Arc::new(Hub(Arc::clone(state))))))
         .clone();
+    register_key_pages();
     Router::new()
         .route("/api/desk/connection-setups", get(list_route))
         .route(

@@ -9,6 +9,9 @@
 //! - `POST /api/desk/browser/stop` (`{ "agent"?: … }`): closes them now,
 //!   stops the turns using them, and drops every "Allow for this session"
 //!   a browser holds.
+//! - `POST /api/desk/browser/show` (`{ "agent": … }`): brings that agent's
+//!   tab to the front of the person's Chrome, for a setup card's "Show the
+//!   sign-in page"; `{ "shown": bool }`.
 //! - `GET /api/desk/browser/shots/{file}`: one screenshot an activity row
 //!   names.
 //! - `GET`/`PUT /api/desk/browser/settings`: whether Desk uses the
@@ -369,6 +372,36 @@ impl BrowserHooks for DeskHooks {
         true
     }
 
+    fn key_page(
+        &self,
+        user: &str,
+        agent: &str,
+        conversation: &str,
+        connector: &str,
+    ) -> Option<browser::keys::KeyPage> {
+        let setups = crate::desk_connections::setup::installed()?;
+        let caller = setups.turn_caller(user, agent, conversation)?;
+        setups.browser_page(&caller, connector)
+    }
+
+    fn keep_key(&self, read: browser::KeyRead<'_>) -> Result<String, String> {
+        let setups = crate::desk_connections::setup::installed()
+            .ok_or("Connections aren't running on this hub, so no key was kept.")?;
+        let caller = setups
+            .turn_caller(read.user, read.agent, read.conversation)
+            .ok_or("Desk keeps a new key only in the conversation setting the connection up.")?;
+        setups
+            .keep_key(
+                &caller,
+                read.connector,
+                None,
+                read.origin,
+                read.path,
+                workforce_common::secret::Secret::new(read.key.to_string()),
+            )
+            .map(|kept| kept.test)
+    }
+
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String> {
         if self.unbound(agent) {
             return None;
@@ -422,7 +455,7 @@ impl BrowserHooks for DeskHooks {
             let shown = done
                 .screenshot
                 .as_deref()
-                .filter(|_| !browser::shows_keys(&done.url));
+                .filter(|_| !browser::keys::is_key_page(&done.url));
             let shot = match shown {
                 Some(png) => match keep_shot(&shots, png) {
                     Ok(name) => Some(name),
@@ -610,6 +643,19 @@ async fn stop(
             "The browser closed, but Desk couldn't drop its allowances for this session. Try Stop again.",
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct ShowBody {
+    agent: String,
+}
+
+/// `agent`'s tab to the front of the person's Chrome, for a setup card's
+/// "Show the sign-in page": `{shown}`, false when it has none open or Chrome
+/// isn't connected. The person's only, like Stop.
+async fn show(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>, Json(b): Json<ShowBody>) -> Response {
+    holder!(r, h, q);
+    Json(json!({ "shown": browser::show(&b.agent).await })).into_response()
 }
 
 /// What Stop does, for one agent or all: cancels the turns using the
@@ -884,6 +930,7 @@ pub fn install(
     Router::new()
         .route("/api/desk/browser", get(list))
         .route("/api/desk/browser/stop", post(stop))
+        .route("/api/desk/browser/show", post(show))
         .route("/api/desk/browser/shots/{file}", get(shot))
         .route(
             "/api/desk/browser/settings",
