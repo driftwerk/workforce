@@ -550,8 +550,8 @@ fn a_linear_profile_reads_as_a_mention_and_goes_back() {
         ),
         (
             "cc [@Bo](https://linear.app/acme/profiles/bo.k) and <https://linear.app/acme/profiles/ann>",
-            "cc :mention[Bo \\[K\\]]{url=\"https://linear.app/acme/profiles/bo.k\" text=\"@Bo\"} and :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\"}",
-            "cc [@Bo](https://linear.app/acme/profiles/bo.k) and https://linear.app/acme/profiles/ann",
+            "cc :mention[Bo \\[K\\]]{url=\"https://linear.app/acme/profiles/bo.k\" text=\"@Bo\"} and :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\" form=\"autolink\"}",
+            "cc [@Bo](https://linear.app/acme/profiles/bo.k) and <https://linear.app/acme/profiles/ann>",
         ),
     ];
     for (input, want, back) in cases {
@@ -570,6 +570,7 @@ fn a_linear_profile_reads_as_a_mention_and_goes_back() {
         "x[Ann](https://linear.app/acme/profiles/ann)",
         "see:https://linear.app/acme/profiles/ann",
         "[say \"hi\"](https://linear.app/acme/profiles/ann)",
+        "[a\\\\](https://linear.app/acme/profiles/ann)",
         "https://linear.app/acme/profiles/ann/activity",
     ];
     for input in untouched {
@@ -588,6 +589,25 @@ fn a_linear_profile_reads_as_a_mention_and_goes_back() {
             2
         ),
         vec!["ann".to_string(), "bo.k".to_string()]
+    );
+    // A collapsible's title, however its profile is written.
+    for title in [
+        ":::details[Notes <https://linear.app/acme/profiles/ann>]",
+        ":::details[\\[Ann\\](https://linear.app/acme/profiles/ann)]",
+    ] {
+        assert_eq!(linear_mentions(title, ws, &names), title);
+    }
+    // A collapsible from Linear: its title as it came, its lines read.
+    let input = "+++ [Ann](https://linear.app/acme/profiles/ann)\nAsk https://linear.app/acme/profiles/ann\n+++";
+    let read = linear_mentions(&linear_markdown(input, "MAN-1", url), ws, &names);
+    assert_eq!(
+        read,
+        ":::details[\\[Ann\\](https://linear.app/acme/profiles/ann)]\nAsk :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\"}\n:::"
+    );
+    assert_eq!(linear_out(&read), input);
+    assert_eq!(
+        linear_profile_slugs(":::details[https://linear.app/acme/profiles/bo.k]", ws, 5),
+        Vec::<String>::new()
     );
     // A mention typed in Desk, with no profile behind it, goes as typed.
     assert_eq!(linear_out(":mention[Ann]"), ":mention[Ann]");

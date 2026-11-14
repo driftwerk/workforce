@@ -1391,6 +1391,8 @@ struct Profile<'a> {
     url: &'a str,
     slug: &'a str,
     text: Option<&'a str>,
+    /// Written `<address>`.
+    angled: bool,
 }
 
 /// The addresses of workspace `ws`'s Linear profiles in `line`, bare, as
@@ -1423,6 +1425,7 @@ fn linear_profiles_in<'a>(line: &'a str, ws: &str) -> Vec<Profile<'a>> {
                         url: dest,
                         slug,
                         text: Some(text),
+                        angled: false,
                     });
                 }
                 i = to;
@@ -1446,6 +1449,7 @@ fn linear_profiles_in<'a>(line: &'a str, ws: &str) -> Vec<Profile<'a>> {
                             url: inner,
                             slug,
                             text: None,
+                            angled: true,
                         });
                     }
                     i = end + 1;
@@ -1474,6 +1478,7 @@ fn linear_profiles_in<'a>(line: &'a str, ws: &str) -> Vec<Profile<'a>> {
                     url,
                     slug,
                     text: None,
+                    angled: false,
                 });
             }
             i += url.len().max(1);
@@ -1489,7 +1494,7 @@ fn linear_profiles_in<'a>(line: &'a str, ws: &str) -> Vec<Profile<'a>> {
 pub fn linear_profile_slugs(md: &str, ws: &str, max: usize) -> Vec<String> {
     let mut slugs: Vec<String> = vec![];
     for (l, code) in fenced_lines(md) {
-        if code {
+        if code || l.trim_start().starts_with(":::") {
             continue;
         }
         for p in linear_profiles_in(l, ws) {
@@ -1506,8 +1511,9 @@ pub fn linear_profile_slugs(md: &str, ws: &str, max: usize) -> Vec<String> {
 
 /// `md` (a Linear description, as Desk markdown) with each of workspace
 /// `ws`'s profiles that `names` has (by slug) as a mention of that member,
-/// `:mention[Name]{url="…"}`, a link's words kept as `text="…"` so it goes
-/// back as it came ([`linear_out`]). Anything else as it is.
+/// `:mention[Name]{url="…"}`, a link's words kept as `text="…"` (an
+/// autolink as `form="autolink"`) so it goes back as it came
+/// ([`linear_out`]). Never in a collapsible's title. Anything else as it is.
 pub fn linear_mentions(md: &str, ws: &str, names: &HashMap<String, String>) -> String {
     if names.is_empty() {
         return md.to_string();
@@ -1515,7 +1521,8 @@ pub fn linear_mentions(md: &str, ws: &str, names: &HashMap<String, String>) -> S
     let lines: Vec<String> = fenced_lines(md)
         .into_iter()
         .map(|(l, code)| {
-            if code {
+            // A collapsible's title goes back as a title: left as it is.
+            if code || l.trim_start().starts_with(":::") {
                 return l.to_string();
             }
             let mut out = String::with_capacity(l.len());
@@ -1525,8 +1532,9 @@ pub fn linear_mentions(md: &str, ws: &str, names: &HashMap<String, String>) -> S
                     continue;
                 };
                 let text = match p.text {
-                    Some(t) if t.contains('"') => continue,
+                    Some(t) if t.contains(['"', '\\']) => continue,
                     Some(t) => format!(" text=\"{t}\""),
+                    None if p.angled => " form=\"autolink\"".to_string(),
                     None => String::new(),
                 };
                 out.push_str(&l[last..p.at]);
@@ -1607,10 +1615,15 @@ fn linear_mention_at(line: &str, at: usize) -> Option<(String, usize)> {
         }
         None => (None, rest),
     };
+    let (angled, rest) = match rest.strip_prefix(" form=\"autolink\"") {
+        Some(r) if text.is_none() => (true, r),
+        _ => (false, rest),
+    };
     let rest = rest.strip_prefix('}')?;
-    let back = match text {
-        Some(t) => format!("[{t}]({url})"),
-        None => url.to_string(),
+    let back = match (text, angled) {
+        (Some(t), _) => format!("[{t}]({url})"),
+        (None, true) => format!("<{url}>"),
+        (None, false) => url.to_string(),
     };
     Some((back, line.len() - rest.len()))
 }
