@@ -561,7 +561,8 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
         assert_eq!(
             d.engine_sign_in(second.id).unwrap().state,
             EngineSignInState::Failed {
-                why: super::engine_sign_ins::DEVICE_FAILED.into()
+                why: super::engine_sign_ins::DEVICE_FAILED.into(),
+                instead: None,
             }
         );
         assert!(d.cancel_engine_sign_in(second.id).is_ok());
@@ -684,10 +685,18 @@ fn devin_browser() -> (&'static [u8], &'static [u8]) {
 async fn devin_failed(d: &Desk, id: Uuid) -> String {
     use super::engine_sign_ins::EngineSignInState;
     until(|| match d.engine_sign_in(id).unwrap().state {
-        EngineSignInState::Failed { why } => Some(why),
+        EngineSignInState::Failed { why, .. } => Some(why),
         _ => None,
     })
     .await
+}
+
+/// The way on Desk is offered beside Devin's failed sign-in `id`.
+fn devin_instead(d: &Desk, id: Uuid) -> Option<String> {
+    match d.engine_sign_in(id).unwrap().state {
+        super::engine_sign_ins::EngineSignInState::Failed { instead, .. } => instead,
+        other => panic!("not failed: {other:?}"),
+    }
 }
 
 /// What Desk says of Devin's sign-in on this computer now.
@@ -906,7 +915,7 @@ async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
         d.engine_sign_in_token(again.id, "devin-pasted-wrong")
             .unwrap();
         let failed = until(|| match d.engine_sign_in(again.id).unwrap().state {
-            EngineSignInState::Failed { why } => Some(why),
+            EngineSignInState::Failed { why, .. } => Some(why),
             _ => None,
         })
         .await;
@@ -1030,6 +1039,11 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
         std::fs::write(dir.path().join("devin-no-code"), "").unwrap();
         let lost = d.start_engine_sign_in(Engine::Devin, false).unwrap();
         assert_eq!(devin_failed(&d, lost.id).await, sign_ins::DEVIN_NO_ANSWER);
+        // A code to paste is offered beside it, as a field, not in words.
+        assert_eq!(
+            devin_instead(&d, lost.id).as_deref(),
+            Some(sign_ins::DEVIN_PASTE_INSTEAD)
+        );
         std::fs::remove_file(dir.path().join("devin-no-code")).unwrap();
 
         // Enter taken, then nothing, or something else: never in the
@@ -1039,12 +1053,17 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
             let _ = std::fs::remove_file(dir.path().join("got-key"));
             let stalled = d.start_engine_sign_in(Engine::Devin, false).unwrap();
             let why = until(|| match state(stalled.id) {
-                EngineSignInState::Failed { why } => Some(why),
+                EngineSignInState::Failed { why, .. } => Some(why),
                 EngineSignInState::Browser { .. } => panic!("{after}: in the browser"),
                 _ => None,
             })
             .await;
             assert_eq!(why, sign_ins::DEVIN_ASKED_UNKNOWN, "{after}");
+            assert_eq!(
+                devin_instead(&d, stalled.id).as_deref(),
+                Some(sign_ins::DEVIN_PASTE_INSTEAD),
+                "{after}"
+            );
             assert_eq!(key(), "\\r", "{after}: Enter was pressed");
             std::fs::remove_file(dir.path().join(after)).unwrap();
         }
@@ -1080,6 +1099,8 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
             devin_failed(&d, manual.id).await,
             sign_ins::DEVIN_PAGE_UNKNOWN
         );
+        // Nothing is offered beside a failure that offers nothing.
+        assert_eq!(devin_instead(&d, manual.id), None);
         assert!(
             d.start_engine_sign_in(Engine::Gemini, false).is_err(),
             "Gemini signs in another way"
