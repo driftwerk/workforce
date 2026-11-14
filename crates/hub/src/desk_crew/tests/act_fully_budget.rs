@@ -14,7 +14,7 @@ const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 200\n";
 
 /// A call of `usd` in `session`'s ledger, paid as `billing`.
-async fn spent(d: &Desk, session: uuid::Uuid, billing: Billing, usd: f64) {
+pub(super) async fn spent(d: &Desk, session: uuid::Uuid, billing: Billing, usd: f64) {
     d.store()
         .ledger_write(
             session,

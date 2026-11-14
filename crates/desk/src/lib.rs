@@ -63,6 +63,7 @@ mod line_api;
 pub mod line_store;
 pub mod lineage_store;
 pub mod local;
+pub mod machine_spent_store;
 pub mod memory;
 pub mod memory_derive_store;
 pub mod memory_index_store;

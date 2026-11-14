@@ -15,12 +15,13 @@
 //!   holds a grant for whose boss is on another hub get none: one boss per
 //!   group, and the main overseer's calls aren't relayed yet.
 //! - **What it may do:** its level as it runs here now
-//!   ([`CrewHub::level_now`]), never above Act, and its own
-//!   `[oversight.act]` switches and `parallel`. Act fully isn't carried
-//!   to machines yet: each machine would count its own spend against the
-//!   whole daily budget, so the boss could spend it once here and again
-//!   on every machine. A boss at Act fully here acts within Desk there,
-//!   and no budget is sent, until spend is counted across them.
+//!   ([`CrewHub::level_now`]), and its own `[oversight.act]` switches and
+//!   `parallel`. At Act fully the grant carries its daily budget (with none
+//!   set here, the most Act fully allows), and that budget is one across
+//!   this computer and every machine ([`super::shared_budget`]): each
+//!   machine acts fully only while this hub's take, at most
+//!   [`super::relayed_decide::FRESH`] old, says so with what was spent
+//!   everywhere else.
 //! - **What it sees:** everything, terminals included, as its
 //!   `crew.history` here shows them; the machine still redacts and caps
 //!   every string.
@@ -56,6 +57,10 @@ pub struct Wanted {
     /// The boss, as this hub's agent id and as the person knows it.
     pub agent: String,
     pub agent_name: String,
+    /// When the agent was made here (its workspace's birth), so an agent
+    /// made again with the same id isn't taken for the one the person said
+    /// yes to. None where this computer can't say.
+    pub agent_since: Option<String>,
     /// What `PUT /api/desk/grants/{group}` says, but its revision and the
     /// sessions leaving it, which only the machine's copy can tell.
     pub grant: Value,
@@ -93,11 +98,38 @@ fn act_of(o: &Oversight) -> Value {
     })
 }
 
-/// `level`, never above Act: what a machine is given ([module](self)).
-fn at_most_act(level: Level) -> Level {
-    match level {
-        Level::Full => Level::Act,
-        l => l,
+/// `act` with Act fully's daily budget for a machine: the boss's own, or
+/// the most Act fully allows when it set none.
+fn with_budget(mut act: Value, o: &Oversight) -> Value {
+    let usd = o
+        .full
+        .budget_usd_per_day()
+        .unwrap_or(workforce_common::oversight::MAX_FULL_BUDGET_USD);
+    act["budget_usd_per_day"] = json!(usd);
+    act
+}
+
+/// When `workspace` was made, as a mark that changes when an agent is made
+/// again with the same id: its birth time where the file system keeps one,
+/// with its inode on Unix.
+fn made_at(workspace: &std::path::Path) -> Option<String> {
+    let m = std::fs::metadata(workspace).ok()?;
+    let born = m
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().to_string());
+    #[cfg(unix)]
+    let ino = Some(std::os::unix::fs::MetadataExt::ino(&m).to_string());
+    #[cfg(not(unix))]
+    let ino: Option<String> = None;
+    match (born, ino) {
+        (None, None) => None,
+        (b, i) => Some(format!(
+            "{}-{}",
+            b.unwrap_or_default(),
+            i.unwrap_or_default()
+        )),
     }
 }
 
@@ -163,7 +195,12 @@ impl CrewHub {
             if by_machine.is_empty() {
                 continue;
             }
-            let level = at_most_act(self.level_now(agent, o).0);
+            let level = self.level_now(agent, o).0;
+            let act = match level {
+                Level::Full => with_budget(act_of(o), o),
+                _ => act_of(o),
+            };
+            let since = made_at(&service.workspace);
             let name: String = match g.name.trim() {
                 "" => g.id.clone(),
                 n => n
@@ -184,7 +221,7 @@ impl CrewHub {
                     "folders": [],
                     "repos": [],
                     "members": members,
-                    "act": act_of(o),
+                    "act": act.clone(),
                 });
                 out.machines
                     .entry(m.to_string())
@@ -194,6 +231,7 @@ impl CrewHub {
                         group: g.id.clone(),
                         agent: agent.to_string(),
                         agent_name: super::name_of(service),
+                        agent_since: since.clone(),
                         grant,
                     });
             }

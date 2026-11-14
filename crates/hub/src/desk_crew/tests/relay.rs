@@ -529,12 +529,12 @@ async fn a_group_bossed_from_another_hub_is_never_wanted_for_a_boss_here() {
 /// count its own spend against the whole budget. The grant acts within
 /// Desk, with no budget and nothing to ship from, in force here or not.
 #[tokio::test(flavor = "multi_thread")]
-async fn act_fully_here_is_act_within_desk_on_a_machine_with_no_budget() {
+async fn act_fully_here_is_act_fully_on_a_machine_with_its_one_budget_once_its_spend_is_read() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let full = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 25\n";
-        let (_sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", full, &[]).await;
+        let (sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", full, &[]).await;
         let remote = uuid::Uuid::new_v4();
         d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
             .await
@@ -544,22 +544,50 @@ async fn act_fully_here_is_act_within_desk_on_a_machine_with_no_budget() {
         })
         .await;
         let wanted = async || eventually("the grants", async || crew.machine_grants()).await;
-        for read in [false, true] {
-            if read {
-                crew.read_spent_today(&crew.overseers()).await;
-                assert_eq!(
-                    crew.level_now("desk", &crew.overseer_named("desk").unwrap().1)
-                        .0,
-                    workforce_common::oversight::Level::Full,
-                    "in force here"
-                );
-            }
-            let w = wanted().await;
-            let g = &w.machines["devbox"].grants[0].grant;
-            assert_eq!(g["level"], "act", "{g}");
-            assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
-            assert_eq!(g["repos"], json!([]));
-        }
+        // Today's spend not read yet: acting within Desk, no budget.
+        let w = wanted().await;
+        let g = &w.machines["devbox"].grants[0].grant;
+        assert_eq!(g["level"], "act", "{g}");
+        assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
+        // Read: Act fully, with its budget, which the machines count once
+        // with this computer.
+        crew.read_spent_today(&crew.overseers()).await;
+        assert_eq!(
+            crew.level_now("desk", &crew.overseer_named("desk").unwrap().1)
+                .0,
+            workforce_common::oversight::Level::Full,
+            "in force here"
+        );
+        let w = wanted().await;
+        let wg = &w.machines["devbox"].grants[0];
+        assert_eq!(wg.grant["level"], "full", "{}", wg.grant);
+        assert_eq!(wg.grant["act"]["budget_usd_per_day"], 25.0);
+        assert_eq!(
+            wg.grant["repos"],
+            json!([]),
+            "Act fully ships nowhere from a grant"
+        );
+        assert!(
+            wg.agent_since.is_some(),
+            "this computer says when Sarah was made"
+        );
+        assert!(serde_json::from_value::<workforce_desk::grant::GrantPut>({
+            let mut g = wg.grant.clone();
+            g["revision"] = json!(1);
+            g
+        })
+        .is_ok());
+        // With no budget set here, the most Act fully allows.
+        let none = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"full\"\n";
+        write_config(&sarah, none);
+        let w = eventually("no budget", async || {
+            crew.machine_grants().filter(|w| {
+                w.machines["devbox"].grants[0].grant["act"]["budget_usd_per_day"]
+                    == workforce_common::oversight::MAX_FULL_BUDGET_USD
+            })
+        })
+        .await;
+        assert_eq!(w.machines["devbox"].grants[0].grant["level"], "full");
     })
     .await;
 }

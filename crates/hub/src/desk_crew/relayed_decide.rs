@@ -76,15 +76,42 @@ const TAKE_AGE: Duration = Duration::from_millis(2_500);
 /// How long the overseer's model may take: 5 s under the machine's wait.
 const HERE_WITHIN: Duration = super::decide::WITHIN.saturating_sub(Duration::from_secs(5));
 
+/// How long a machine's answer that it counts the shared budget
+/// ([`super::shared_budget`]) lets the Mac say Act fully is in force there.
+const CONFIRMED_FOR: Duration = Duration::from_secs(10);
+
 /// A boss and group, as the machine keys its relayed decisions: the
 /// boss's party (`home/<agent>`) and the group's id.
 type Key = (String, String);
 
+/// Whether `party` is a boss relayed from the home (`home/<agent>`).
+pub(crate) fn relayed_party(party: &str) -> bool {
+    party
+        .strip_prefix(workforce_desk::grant::HOME_HUB)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The home's last word that Act fully is in force for a boss and group,
+/// with what its one daily budget counts (designs/act-fully-machines-design.md).
+#[derive(Debug, Clone, Copy)]
+struct Home {
+    /// When the home sent it.
+    at: Instant,
+    /// Where the home counts today from.
+    from: chrono::DateTime<chrono::Utc>,
+    /// What its sessions here spent since `from`, as read for that take (or
+    /// since, [`CrewHub::refresh_relayed_spent`]).
+    here: f64,
+    /// What the home said was spent everywhere else since `from`.
+    elsewhere: f64,
+}
+
 /// What a machine holds of its relayed bosses' decisions.
 #[derive(Default)]
 pub(crate) struct Outbox {
-    /// When the home last said Act fully is in force for each.
-    homes: HashMap<Key, Instant>,
+    /// When the home last said Act fully is in force for each, and what
+    /// was spent.
+    homes: HashMap<Key, Home>,
     /// What waits to be taken, oldest first.
     queued: HashMap<Key, VecDeque<(Uuid, String)>>,
     /// Who waits for each answer, and whose it is.
@@ -155,7 +182,73 @@ impl CrewHub {
             .lock()
             .homes
             .get(&(party.to_string(), group.to_string()))
-            .is_some_and(|at| at.elapsed() < FRESH)
+            .is_some_and(|h| h.at.elapsed() < FRESH)
+    }
+
+    /// What Act fully's one budget counts as spent today for `party`
+    /// (`home/<agent>`), by its home's word that is still fresh: its
+    /// sessions' spend here and everywhere else. None without one, so it
+    /// doesn't act fully.
+    pub(crate) fn relayed_spent(&self, party: &str) -> Option<f64> {
+        let out = self.relayed.lock();
+        let fresh: Vec<&Home> = out
+            .homes
+            .iter()
+            .filter(|((p, _), h)| p == party && h.at.elapsed() < FRESH)
+            .map(|(_, h)| h)
+            .collect();
+        let elsewhere = fresh.iter().map(|h| h.elsewhere).reduce(f64::max)?;
+        Some(fresh.iter().map(|h| h.here).sum::<f64>() + elsewhere)
+    }
+
+    /// What `group`'s sessions here spent since `from` in real money (calls
+    /// a key paid for, never the person's plans); none when it can't be
+    /// read.
+    async fn group_spent(&self, group: &str, from: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+        let now = chrono::Utc::now();
+        let filter = workforce_desk::ledger_store::Filter {
+            seen: Some(
+                self.desk
+                    .seen_by(&workforce_common::oversight::Scope::Group(
+                        group.to_string(),
+                    )),
+            ),
+            ..Default::default()
+        };
+        match self.desk.billed_usd(from.min(now), now, &filter).await {
+            Ok(usd) => super::shared_budget::usd_of(&json!(usd)),
+            Err(e) => {
+                tracing::warn!(%group, error = %e, "couldn't read a relayed boss's spend; Act fully waits until it can");
+                None
+            }
+        }
+    }
+
+    /// Reads again what `party`'s sessions here spent, for each of its
+    /// home's words that is still fresh, from where that word counts: after
+    /// a decision, before its verdict is judged. One that can't be read
+    /// ends the word.
+    pub(crate) async fn refresh_relayed_spent(&self, party: &str) {
+        let fresh: Vec<(Key, chrono::DateTime<chrono::Utc>)> = self
+            .relayed
+            .lock()
+            .homes
+            .iter()
+            .filter(|((p, _), h)| p == party && h.at.elapsed() < FRESH)
+            .map(|(k, h)| (k.clone(), h.from))
+            .collect();
+        for (key, from) in fresh {
+            let read = self.group_spent(&key.1, from).await;
+            let mut out = self.relayed.lock();
+            match read {
+                Some(usd) => {
+                    if let Some(h) = out.homes.get_mut(&key).filter(|h| h.from == from) {
+                        h.here = h.here.max(usd);
+                    }
+                }
+                None => out.end(&key),
+            }
+        }
     }
 
     /// One decision call by `boss` (`home/<agent>`), relayed from the home,
@@ -180,7 +273,7 @@ impl CrewHub {
         let (tx, rx) = oneshot::channel();
         {
             let mut out = self.relayed.lock();
-            if out.homes.get(&key).is_none_or(|at| at.elapsed() >= FRESH) {
+            if out.homes.get(&key).is_none_or(|h| h.at.elapsed() >= FRESH) {
                 return Err(Failed {
                     why: "its home isn't connected".into(),
                     code: Some(Code::Link),
@@ -207,8 +300,12 @@ impl CrewHub {
 
     /// The home's take for `boss`'s decisions in `group` ([`TAKE`]): it
     /// says whether Act fully is in force for it there (`inForce`, at the
-    /// level `ceiling` says), and is handed what waits, each once.
-    pub(crate) fn take_relayed(
+    /// level `ceiling` says), where today's count starts there
+    /// (`countFrom`) and what was spent everywhere else
+    /// (`spentElsewhereUsd`), and is handed what waits, each once. Its
+    /// answer says what the group's sessions here spent since `countFrom`
+    /// (`spentUsd`), for the home to count ([`super::shared_budget`]).
+    pub(crate) async fn take_relayed(
         &self,
         boss: &BossRef,
         group: &str,
@@ -229,17 +326,32 @@ impl CrewHub {
             .map(|at| chrono::Utc::now().timestamp_millis() - at)
             .filter(|ms| (-1_000..TAKE_AGE.as_millis() as i64).contains(ms))
             .map(|ms| Duration::from_millis(ms.max(0) as u64));
+        // Where the home counts today from: not ahead of the clock, and not
+        // over a month back.
+        let now = chrono::Utc::now();
+        let from = input["countFrom"]
+            .as_i64()
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .filter(|f| *f <= now + chrono::Duration::seconds(5))
+            .filter(|f| now - *f <= chrono::Duration::days(32));
+        let here = match (ours, from) {
+            (true, Some(f)) => self.group_spent(group, f).await,
+            _ => None,
+        };
+        let elsewhere = super::shared_budget::usd_of(&input["spentElsewhereUsd"]);
         let in_force = ours
             && ceiling.level == Level::Full
             && input["inForce"].as_bool() == Some(true)
-            && age.is_some();
+            && age.is_some()
+            && here.is_some()
+            && elsewhere.is_some();
         let most = input["most"]
             .as_u64()
             .map_or(MOST_TAKEN, |m| (m as usize).min(MOST_TAKEN));
         let decisions: Vec<Value> = {
             let mut out = self.relayed.lock();
             // Homes not heard from within FRESH: forgotten.
-            out.homes.retain(|_, at| at.elapsed() < FRESH);
+            out.homes.retain(|_, h| h.at.elapsed() < FRESH);
             if !in_force {
                 out.end(&key);
                 Vec::new()
@@ -247,7 +359,17 @@ impl CrewHub {
                 let sent = age
                     .and_then(|a| Instant::now().checked_sub(a))
                     .unwrap_or_else(Instant::now);
-                out.homes.insert(key.clone(), sent);
+                if let (Some(from), Some(here), Some(elsewhere)) = (from, here, elsewhere) {
+                    out.homes.insert(
+                        key.clone(),
+                        Home {
+                            at: sent,
+                            from,
+                            here,
+                            elsewhere,
+                        },
+                    );
+                }
                 let mut handed = Vec::new();
                 while handed.len() < most {
                     let Some((id, prompt)) = out.queued.get_mut(&key).and_then(VecDeque::pop_front)
@@ -267,10 +389,12 @@ impl CrewHub {
             return refused(&workforce_desk::scope::not_ours(None));
         }
         let full = in_force && self.served_full(&key.0).is_some();
-        (
-            ServedStatus::Ok,
-            json!({ "full": full, "decisions": decisions }),
-        )
+        let mut body = json!({ "full": full, "decisions": decisions });
+        if let (Some(f), Some(usd)) = (from, here) {
+            body["countFrom"] = json!(f.timestamp_millis());
+            body["spentUsd"] = json!(usd);
+        }
+        (ServedStatus::Ok, body)
     }
 
     /// The home's answer for one of `boss`'s decisions in `group`
@@ -311,7 +435,7 @@ impl CrewHub {
             }
             // Its home not heard from within FRESH: what it decided isn't
             // taken as said now.
-            let fresh = out.homes.get(&key).is_some_and(|at| at.elapsed() < FRESH);
+            let fresh = out.homes.get(&key).is_some_and(|h| h.at.elapsed() < FRESH);
             out.taken.remove(&id);
             out.waiting.remove(&id).map(|(_, tx)| (tx, fresh))
         });
@@ -365,6 +489,11 @@ struct Pump {
     busy: bool,
     /// The last take said Act fully is in force.
     said: bool,
+    /// When the machine last answered with its spend for the count that
+    /// starts then ([`super::shared_budget`]): only a machine that counts
+    /// the one budget is told Act fully is in force, within
+    /// [`CONFIRMED_FOR`] of its answer.
+    counts: Option<(chrono::DateTime<chrono::Utc>, Instant)>,
     /// The decision calls made lately, and the room for them at once.
     calls: VecDeque<Instant>,
     at_once: Arc<tokio::sync::Semaphore>,
@@ -393,6 +522,7 @@ impl Default for Pump {
             next: Instant::now(),
             busy: false,
             said: false,
+            counts: None,
             calls: VecDeque::new(),
             at_once: Arc::new(tokio::sync::Semaphore::new(AT_ONCE)),
         }
@@ -491,48 +621,73 @@ async fn take(
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
-    let ceiling = Ceiling {
-        level: o.level,
-        act: o.act,
-    };
+    let ceiling = crew.ceiling_now(&agent, &o);
     let started = Instant::now();
+    // One budget across this Mac and every machine: where today's count
+    // starts here, and what was spent everywhere but this machine.
+    let from = crew.count_from(&o);
+    let elsewhere = from.and_then(|f| crew.spent_elsewhere(&agent, machine, f));
     // As many as there is room to decide now: none is refused for pace.
-    let most = {
+    // In force there only once the machine said it counts this budget, so
+    // an engine that counts only its own spend never acts fully.
+    let (most, counts) = {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
-        p.room(started)
+        let counts = p
+            .counts
+            .is_some_and(|(f, at)| Some(f) == from && started.duration_since(at) < CONFIRMED_FOR);
+        (p.room(started), counts)
     };
+    let says = in_force && counts && elsewhere.is_some();
+    let mut input = json!({
+        "inForce": says,
+        "sentAt": chrono::Utc::now().timestamp_millis(),
+        "most": most,
+    });
+    if let Some(f) = from {
+        input["countFrom"] = json!(f.timestamp_millis());
+    }
+    if let Some(e) = elsewhere {
+        input["spentElsewhereUsd"] = json!(e);
+    }
     let got = crew
-        .relay(
-            machine,
-            group,
-            TAKE,
-            json!({
-                "inForce": in_force,
-                "sentAt": chrono::Utc::now().timestamp_millis(),
-                "most": most,
-            }),
-            &agent,
-            &ceiling,
-        )
+        .relay(machine, group, TAKE, input, &agent, &ceiling)
         .await;
     let (full, decisions) = match &got {
         Ok(a) if a.status == ServedStatus::Ok => (
-            a.body["full"].as_bool() == Some(true),
+            says && a.body["full"].as_bool() == Some(true),
             a.body["decisions"].as_array().cloned().unwrap_or_default(),
         ),
         _ => (false, Vec::new()),
     };
+    // What the machine said it spent, for the count this take named.
+    let reported = match (&got, from) {
+        (Ok(a), Some(f)) if a.status == ServedStatus::Ok => {
+            let echoed = a.body["countFrom"].as_i64() == Some(f.timestamp_millis());
+            super::shared_budget::usd_of(&a.body["spentUsd"])
+                .filter(|_| echoed)
+                .map(|usd| (f, usd))
+        }
+        _ => None,
+    };
+    if let Some((f, usd)) = reported {
+        crew.machine_reported(&agent, machine, f, usd).await;
+    }
     {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
         p.busy = false;
-        p.said = in_force && got.is_ok();
+        p.said = says && got.is_ok();
+        if let Some((f, _)) = reported {
+            p.counts = Some((f, Instant::now()));
+        }
         // From when it began, so a slow round trip doesn't let Act fully
-        // lapse between takes; one that failed is tried again soon.
+        // lapse between takes; one that failed is tried again soon. A
+        // machine that just said it counts the budget is told at once.
         p.next = started
             + match (&got, full) {
                 (_, true) => TAKE_EVERY,
+                (Ok(_), false) if in_force && reported.is_some() => TAKE_EVERY,
                 (Err(_), false) if in_force => TAKE_EVERY * 3,
                 _ => IDLE_EVERY,
             };
@@ -645,10 +800,7 @@ async fn decide_one(
         Err((code, why)) => json!({"decideId": id, "error": why, "code": code.as_str()}),
     };
     tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
-    let ceiling = Ceiling {
-        level: o.level,
-        act: o.act,
-    };
+    let ceiling = crew.ceiling_now(&agent, &o);
     if let Err(why) = crew
         .relay(machine, group, DECIDED, input, &agent, &ceiling)
         .await
