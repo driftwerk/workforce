@@ -141,7 +141,7 @@ fn development_summary(v: &Value) -> Value {
 
 /// What a search row or a read issue carries besides its own words, for
 /// each field asked for (`asked`; `None`: every one): parent, sub-tasks and
-/// links reduced to key, type and status, components and fix versions by
+/// links reduced to key, summary, type and status, components and fix versions by
 /// name, comments by count, and the site's custom fields by role. Never a
 /// comment's or a linked issue's body.
 fn issue_extras(
@@ -181,12 +181,9 @@ fn issue_extras(
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|s| {
-                        json!({
-                            "key": s["key"],
-                            "status_category": s["fields"]["status"]["statusCategory"]["key"],
-                        })
-                    })
+                    // Each one's key, summary (wrapped), type and status:
+                    // Jira's own sub-task rows say no more (not who has it).
+                    .map(|s| issue_ref(s, &format!("{source}.subtask_summary")))
                     .collect(),
             ),
         );
@@ -2330,6 +2327,31 @@ mod tests {
         assert_eq!(out["points"], 5.0);
         assert_eq!(out["development"]["count"], 2);
         assert!(out.get("components").is_none(), "not asked, not said");
+    }
+
+    #[test]
+    fn a_sub_task_comes_with_its_summary_wrapped_and_its_status() {
+        let f = json!({
+            "subtasks": [{ "key": "ACME-7", "fields": {
+                "summary": "Write the migration",
+                "issuetype": { "name": "Sub-task", "hierarchyLevel": -1 },
+                "status": { "name": "In Review", "statusCategory": { "key": "indeterminate" } },
+                "priority": { "name": "High" } } }],
+        });
+        let asked = vec!["subtasks".to_string()];
+        let out = Value::Object(issue_extras(&f, Some(&asked), &[], "jira.search"));
+        let sub = &out["subtasks"][0];
+        assert_eq!(sub["key"], "ACME-7");
+        let summary = sub["summary"].as_str().unwrap();
+        assert!(summary.contains("Write the migration"));
+        assert_ne!(
+            summary, "Write the migration",
+            "someone else's words are wrapped"
+        );
+        assert_eq!(sub["status"], "In Review");
+        assert_eq!(sub["status_category"], "indeterminate");
+        assert_eq!(sub["issuetype"], "Sub-task");
+        assert_eq!(sub["hierarchy_level"], -1);
     }
 
     #[test]

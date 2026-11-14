@@ -29,6 +29,7 @@
 pub mod asks;
 pub mod auth;
 pub mod conversation;
+pub mod decide;
 pub mod engine_key;
 pub mod hold;
 pub mod links;
@@ -117,10 +118,12 @@ pub fn audit_revoke(
     token: &RemoteMcpToken,
     how: &str,
 ) {
-    if token.scope() != Some(TokenScope::DeskBoss) {
-        return;
-    }
-    audit(telemetry, actor, "desk_boss.revoke", token, how);
+    let action = match token.scope() {
+        Some(TokenScope::DeskBoss) => "desk_boss.revoke",
+        Some(TokenScope::DeskKnows) => "desk_knows.revoke",
+        _ => return,
+    };
+    audit(telemetry, actor, action, token, how);
 }
 
 /// [`audit_revoke`]'s line and row, for any action on a link.

@@ -17,6 +17,9 @@ pub const TOKEN_PREFIX: &str = "wfr_";
 /// [`TOKEN_PREFIX`], so the remote MCP routes, which take only `wfr_`, never
 /// look one up, and redaction knows it by sight.
 pub const DESK_BOSS_TOKEN_PREFIX: &str = "wfb_";
+/// What a Desk knows token starts with: the token a person's Desk pushes
+/// what one of their agents here knows of their Desk work with (Sees).
+pub const DESK_KNOWS_TOKEN_PREFIX: &str = "wfk_";
 /// The scope entry that names the paired device a token was minted by:
 /// `device:<device id>`. It binds the token to that device, and is not a
 /// kind of its own.
@@ -52,16 +55,24 @@ pub enum TokenScope {
     /// here that bosses one of the person's Desk groups. It reaches no
     /// other route.
     DeskBoss,
+    /// What one agent here knows of the person's Desk work, pushed by their
+    /// Desk, and nothing else: it reaches only the Desk knows routes.
+    DeskKnows,
 }
 
 impl TokenScope {
-    pub const ALL: [TokenScope; 2] = [TokenScope::RemoteMcp, TokenScope::DeskBoss];
+    pub const ALL: [TokenScope; 3] = [
+        TokenScope::RemoteMcp,
+        TokenScope::DeskBoss,
+        TokenScope::DeskKnows,
+    ];
 
     /// The scope entry stored for this kind.
     pub fn key(self) -> &'static str {
         match self {
             TokenScope::RemoteMcp => "remote_mcp",
             TokenScope::DeskBoss => "desk_boss",
+            TokenScope::DeskKnows => "desk_knows",
         }
     }
 
@@ -70,6 +81,7 @@ impl TokenScope {
         match self {
             TokenScope::RemoteMcp => TOKEN_PREFIX,
             TokenScope::DeskBoss => DESK_BOSS_TOKEN_PREFIX,
+            TokenScope::DeskKnows => DESK_KNOWS_TOKEN_PREFIX,
         }
     }
 
@@ -90,7 +102,7 @@ impl TokenScope {
         };
         let kind = TokenScope::ALL.into_iter().find(|k| k.key() == *kind)?;
         match kind {
-            TokenScope::DeskBoss if devices.is_empty() => None,
+            TokenScope::DeskBoss | TokenScope::DeskKnows if devices.is_empty() => None,
             kind => Some(kind),
         }
     }
@@ -157,6 +169,7 @@ impl RemoteMcpToken {
         match (TokenScope::of(&self.scopes)?, &self.desk_link) {
             (TokenScope::RemoteMcp, None) => Some(TokenScope::RemoteMcp),
             (TokenScope::DeskBoss, Some(_)) => Some(TokenScope::DeskBoss),
+            (TokenScope::DeskKnows, Some(_)) => Some(TokenScope::DeskKnows),
             _ => None,
         }
     }
