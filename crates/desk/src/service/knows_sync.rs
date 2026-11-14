@@ -207,6 +207,37 @@ impl Desk {
         Ok(out)
     }
 
+    /// The bytes sent to `agent` in the day up to `now`, for its limit
+    /// (kept across restarts, by the hour: never less than was sent).
+    pub async fn knows_spent_day(&self, agent: &str, now: DateTime<Utc>) -> Result<u64, DeskError> {
+        let bytes = self
+            .store()
+            .knows_spent_day(agent, now)
+            .await
+            .map_err(internal)?;
+        Ok(u64::try_from(bytes).unwrap_or(0))
+    }
+
+    /// `items` and `bytes` were sent to `agent` at `now`, counted for its
+    /// day's limit.
+    pub async fn knows_spend(
+        &self,
+        agent: &str,
+        now: DateTime<Utc>,
+        items: usize,
+        bytes: usize,
+    ) -> Result<(), DeskError> {
+        self.store()
+            .knows_spent_add(
+                agent,
+                now,
+                i64::try_from(items).unwrap_or(i64::MAX),
+                i64::try_from(bytes).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(internal)
+    }
+
     /// `agent`'s hub took `sent`: recorded, so it isn't sent again and a
     /// narrowing can offer to delete it.
     pub async fn knows_mark_sent(

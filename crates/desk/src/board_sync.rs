@@ -66,6 +66,31 @@ pub fn members_tool(system: System) -> &'static str {
     }
 }
 
+/// The name of the one member in `answer` (from [`members_tool`]) whose
+/// profile is `https://linear.app/<ws>/profiles/<slug>`: their full name,
+/// else the name shown. None when no one's is, or more than one's.
+pub fn profile_member(answer: &Value, ws: &str, slug: &str) -> Option<String> {
+    let want = format!("https://linear.app/{ws}/profiles/{slug}");
+    let hits: Vec<&Value> = answer["members"]
+        .as_array()?
+        .iter()
+        .filter(|m| {
+            m["url"]
+                .as_str()
+                .is_some_and(|u| u.trim_end_matches('/') == want)
+        })
+        .collect();
+    let [m] = hits.as_slice() else {
+        return None;
+    };
+    [&m["full_name"], &m["name"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
 /// The hub's tool that keeps (`{id, name}`) or clears (`{clear: true}`)
 /// whom the person chose to be there: only ever their own.
 pub fn choose_tool(system: System) -> &'static str {

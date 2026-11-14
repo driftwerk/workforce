@@ -37,7 +37,7 @@
 //!
 //! An engine may also send `decide` up (`linkId`, `decideId`, `prompt`): a
 //! request at Act fully for the link's boss to decide on its own model,
-//! answered by `decided` (`decideId`, `text` or `error`); see
+//! answered by `decided` (`decideId`, `text`, or `error` and its `code`); see
 //! [`super::decide`]. `ready` says `"decide"` among its `features`.
 
 use std::collections::{HashMap, HashSet};
@@ -1016,23 +1016,27 @@ async fn run(
                             bad += 1;
                             continue;
                         };
-                        let refuse = |why: &str| {
-                            socket.notify(super::decide::answered(link, id, Err(why.to_string())));
+                        use super::decide::{Code, Refused};
+                        let refuse = |code: Code, why: &str| {
+                            socket.notify(super::decide::answered(link, id, Err(Refused::new(code, why))));
                         };
-                        let Some((id, prompt)) = super::decide::asked(&frame) else {
-                            // Answered, and counted: a flood of them closes it.
-                            bad += 1;
-                            refuse("not a decision its hub takes");
-                            continue;
+                        let prompt = match super::decide::asked(&frame) {
+                            Ok(prompt) => prompt,
+                            Err(code) => {
+                                // Answered, and counted: a flood of them closes it.
+                                bad += 1;
+                                refuse(code, "not a decision its hub takes");
+                                continue;
+                            }
                         };
                         let Some(permit) = uplinks.decide_room(link) else {
-                            refuse("its hub decides no more for it just now");
+                            refuse(Code::Paced, "its hub decides no more for it just now");
                             continue;
                         };
                         let live = match uplinks.recheck(&state, &socket, link).await {
                             Ok(live) => live,
                             Err(r) => {
-                                refuse(&r.why);
+                                refuse(Code::Link, &r.why);
                                 continue;
                             }
                         };

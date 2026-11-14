@@ -32,6 +32,8 @@ struct Client {
     plan: uuid::Uuid,
     /// A handover note its boss is asked to write.
     handover: uuid::Uuid,
+    /// Its sidebar group's id.
+    group: String,
 }
 
 struct Clients {
@@ -128,6 +130,7 @@ async fn client(
         .id;
     let handover = asked_handover(d, &session, group, boss).await;
     Client {
+        group: group.to_string(),
         session,
         agent,
         boss,
@@ -384,14 +387,35 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "ticket": other.ticket, "state": "done", "reason": r }),
             true,
         )],
-        "crew.plan" => vec![(
-            json!({
-                "goal": "Ship it",
-                "board": other.ticket.split('-').next().unwrap_or_default(),
-                "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
-            }),
-            true,
-        )],
+        "crew.plan" => vec![
+            (
+                json!({
+                    "goal": "Ship it",
+                    "board": other.ticket.split('-').next().unwrap_or_default(),
+                    "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "goal": "Ship it",
+                    "new_board": { "name": "Mine now", "group": other.group },
+                    "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+                }),
+                true,
+            ),
+        ],
+        // A new board in another's group, by its id or its name.
+        super::super::plan::BOARD_CREATE => vec![
+            (
+                json!({ "name": "Mine now", "prefix": "MNW", "group": other.group, "reason": r }),
+                true,
+            ),
+            (
+                json!({ "name": "Mine now", "group": other.group.to_uppercase(), "reason": r }),
+                true,
+            ),
+        ],
         "crew.plan_update" => vec![(
             json!({ "plan_id": other.plan.to_string(), "goal": "Ship it", "why": r }),
             true,
@@ -445,12 +469,27 @@ async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &s
                     true => format!("There's no {}.", other.ticket),
                     false => refusal.to_string(),
                 };
-                assert_eq!(
-                    r.error.as_deref(),
-                    Some(words.as_str()),
-                    "{} {name} {input}",
-                    boss.agent_id
-                );
+                // A board named that isn't its own also says how to make
+                // one, and a group that isn't which to name, after the same
+                // words.
+                let said = r.error.as_deref().unwrap_or_default();
+                if input.get("board").is_some() {
+                    assert!(
+                        said.starts_with(&words) && said.contains("new_board"),
+                        "{} {name} {input}: {said}",
+                        boss.agent_id
+                    );
+                } else if input.pointer("/new_board/group").is_some()
+                    || *name == super::super::plan::BOARD_CREATE
+                {
+                    assert!(
+                        said.starts_with(&words) && said.contains("Name one of your groups"),
+                        "{} {name} {input}: {said}",
+                        boss.agent_id
+                    );
+                } else {
+                    assert_eq!(said, words, "{} {name} {input}", boss.agent_id);
+                }
             }
         }
     }

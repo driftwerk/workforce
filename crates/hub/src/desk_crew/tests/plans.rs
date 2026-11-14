@@ -189,11 +189,13 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
     .await;
 }
 
-/// Unbound, a boss's plan is its own to approve: it starts at once, four
-/// of five tickets up to its limit, the fifth when one finishes, and its
-/// changes to the plan apply as they are made.
+/// Unbound, a boss's plan is still a draft for the person until their own
+/// words ask for the work to start: asked only to plan, nothing starts and
+/// the person is asked; told to start it, the boss approves it with their
+/// words and it starts, four of five tickets up to its limit, the fifth
+/// when one finishes, and its changes to the plan apply as they are made.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
+async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) =
@@ -216,7 +218,31 @@ async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
             .unwrap()
             .parse()
             .unwrap();
-        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        // Asked only for a plan: a draft, whatever its level.
+        assert_eq!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(r.output["note"].as_str().unwrap().contains("ready for review"), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(started(&d).is_empty(), "nothing starts unasked");
+        assert_eq!(d.plan_needs().len(), 1, "the person is asked to approve it");
+        // start_now with no words of the person's is refused.
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "start_now": {}, "why": "Go." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(started(&d).is_empty());
+        // The person says to start it: the boss starts it, saying their words.
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "Looks good, start it now" },
+                "why": "The person asked to start it.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["plan"]["state"], "proposed", "{r:?}");
         assert!(d.plan_needs().is_empty(), "nothing waits on the person");
         let four = eventually("four sessions", async || {
             let s = started(&d);
@@ -1068,6 +1094,273 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
         })
         .await;
         assert_eq!(d.plan(id).await.unwrap().summary.plan.paused, None);
+    })
+    .await;
+}
+
+/// Below unbound, start_now changes nothing: a boss's plan waits for the
+/// person whatever it quotes. A start_now that doesn't read changes
+/// nothing else of the call either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Make the suite green",
+                "tickets": tickets(dir.path(), 2),
+                "start_now": { "person_said": "Start it now" },
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "Go ahead" },
+                "why": "The person asked.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["plan"]["state"], "proposed", "{r:?}");
+        // One that doesn't read: refused before the goal changes.
+        let before = d.plan(id).await.unwrap().summary.plan.revision;
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "goal": "Make the whole suite green",
+                "start_now": { "person_said": "  " },
+                "why": "Wider.",
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap();
+        assert_eq!(p.summary.plan.revision, before, "nothing changed");
+        assert_eq!(p.summary.plan.goal, "Make the suite green");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(started(&d).is_empty(), "nothing starts");
+        assert_eq!(d.plan_needs().len(), 1, "the person is asked");
+    })
+    .await;
+}
+
+/// Unbound and told to start the work, crew.plan approves its plan as it
+/// proposes it, and Desk starts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_boss_told_to_start_starts_its_plan_as_it_proposes_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, super::unbound::UNBOUND).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Make the suite green",
+                "tickets": tickets(dir.path(), 2),
+                "start_now": { "person_said": "Plan it and run it" },
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty());
+        eventually("its sessions", async || {
+            (started(&d).len() == 2).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The boss sets up its own board: `crew.plan` with `new_board` makes it
+/// and files the plan there; a board it names that it doesn't have says
+/// how to make one; `crew.board_create` makes one or gives back the one it
+/// has; and `crew.plan_update` with `board` re-files every ticket there
+/// under new keys, its needs kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.board_create").then_some(())
+        })
+        .await;
+        // A plan already on the boss's board, Desk's own.
+        let p = proposed(&d, dir.path(), 2).await;
+        let id = p.summary.plan.id;
+        let old: Vec<uuid::Uuid> = p.tickets.iter().map(|t| t.ticket.ticket.id).collect();
+        assert!(p.tickets[0].ticket.key.as_deref().unwrap().starts_with("DES-"));
+        let plan = overseer.tools.get("crew.plan").unwrap();
+        let mut two = tickets(dir.path(), 2);
+        two[1]["needs"] = json!([0]);
+
+        // A prefix it has no board for: the way to one is said.
+        let r = plan
+            .execute(json!({ "goal": "Vellev work", "board": "VEL", "tickets": two }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        let said = r.error.unwrap();
+        assert!(said.starts_with("That isn't one of yours.") && said.contains("new_board"), "{said}");
+
+        // new_board makes it, and the plan goes on it.
+        let r = plan
+            .execute(json!({
+                "goal": "Vellev work",
+                "new_board": { "name": "Vellev", "prefix": "vel" },
+                "tickets": two,
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let keys: Vec<&str> = r.output["proposed"]["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["VEL-1", "VEL-2"]);
+        let vel = d.store().board_by_prefix("VEL").await.unwrap().unwrap();
+        assert_eq!(vel.name, "Vellev");
+        assert_eq!(vel.group, None, "in the boss's own scope");
+
+        // Made once: asked again, the board it has comes back.
+        let create = overseer.tools.get("crew.board_create").unwrap();
+        let r = create
+            .execute(json!({ "name": "Vellev", "prefix": "VEL", "reason": "The person asked." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["made"], false);
+        assert_eq!(r.output["board"]["id"], vel.id.to_string());
+        assert_eq!(d.boards().await.unwrap().iter().filter(|b| b.prefix.as_deref() == Some("VEL")).count(), 1);
+        let r = create
+            .execute(json!({ "name": "Vellev ops", "prefix": "VOP", "reason": "The person asked." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["made"], true);
+        // A prefix that can't be one is said plainly.
+        let r = create
+            .execute(json!({ "name": "Bad", "prefix": "v", "reason": "The person asked." }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+
+        // The first plan, moved onto VOP: new keys, the same tickets,
+        // still the plan's.
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id.to_string(), "board": "VOP", "why": "The person wants it on its own board." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["change"], "board");
+        let moved = d.plan(id).await.unwrap();
+        let vop = d.store().board_by_prefix("VOP").await.unwrap().unwrap();
+        assert_eq!(moved.summary.plan.board, vop.id);
+        let now: Vec<uuid::Uuid> = moved.tickets.iter().map(|t| t.ticket.ticket.id).collect();
+        assert_eq!(now, old);
+        let keys: Vec<String> = moved.tickets.iter().map(|t| t.ticket.key.clone().unwrap()).collect();
+        assert_eq!(keys, ["VOP-1", "VOP-2"]);
+        assert!(moved.tickets.iter().all(|t| t.ticket.ticket.board == vop.id));
+        assert_eq!(d.plan_tickets(id).await.unwrap().len(), 2, "still the plan's");
+        // Moved again with new_board and a goal change in one call: both apply.
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "new_board": { "name": "Suite", "prefix": "STE" },
+                "goal": "Make the whole suite green",
+                "why": "Its own board, and wider.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let keys: Vec<String> = r.output["plan"]["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, ["STE-1", "STE-2"]);
+
+        // A move with a stale change: neither applies, and the keys stand.
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "board": "VEL",
+                "revision": 999,
+                "goal": "Something else",
+                "why": "Back to Vellev.",
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        let ste = d.store().board_by_prefix("STE").await.unwrap().unwrap();
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.board, ste.id);
+
+        // A board of another group: said, with the way to one of its own.
+        d.change_layout(|l| l.create("other", "Other", &[], None)).await.unwrap();
+        d.create_board(workforce_desk::NewBoard {
+            name: "Other work".into(),
+            group: Some("other".into()),
+            prefix: Some("OTH".into()),
+        })
+        .await
+        .unwrap();
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "board": "OTH", "why": "Elsewhere." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(r.error.unwrap().contains("new_board"));
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.board, ste.id);
+
+        // Without a prefix, made once and then the same board.
+        let r = create
+            .execute(json!({ "name": "Notes", "reason": "The person asked." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["made"], true);
+        let again = create
+            .execute(json!({ "name": "Notes", "reason": "The person asked." }))
+            .await
+            .unwrap();
+        assert_eq!(again.output["made"], false, "{again:?}");
+        assert_eq!(again.output["board"]["id"], r.output["board"]["id"]);
     })
     .await;
 }

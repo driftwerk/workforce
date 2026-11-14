@@ -71,7 +71,8 @@ fn hub() -> Hub {
         "linear.members_list",
         json!({ "members": [
             { "id": KAY, "name": "kay", "displayName": "K. Hendrickse", "email": "kay@linear.example",
-              "active": true, "avatarUrl": "https://avatars.example/kay.png" },
+              "active": true, "avatarUrl": "https://avatars.example/kay.png",
+              "url": "https://linear.app/acme/profiles/kay" },
             { "id": ANA, "name": "ana", "displayName": "Ana", "email": "ana@example.com", "active": true },
             { "id": "8a7b6c5d-0000-4000-8000-0000000000cc", "name": "kayleigh", "displayName": "Kayleigh",
               "email": "kayleigh@example.com", "active": false },
@@ -140,7 +141,10 @@ async fn a_member_list_never_carries_an_email_and_needs_a_name() {
     assert!(out.success, "{:?}", out.error);
     assert_eq!(
         out.output,
-        json!({ "members": [{ "id": KAY, "name": "K. Hendrickse", "avatar": "https://avatars.example/kay.png" }] })
+        // Its profile's address and full name too: what a description's
+        // mention of them is read by.
+        json!({ "members": [{ "id": KAY, "name": "K. Hendrickse", "avatar": "https://avatars.example/kay.png",
+                              "url": "https://linear.app/acme/profiles/kay", "full_name": "kay" }] })
     );
     assert!(!out.output.to_string().contains('@'));
     // One letter (or none): no listing everyone.

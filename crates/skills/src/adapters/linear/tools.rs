@@ -2733,6 +2733,7 @@ impl Tool for LinearMembersListTool {
                         displayName
                         active
                         avatarUrl
+                        url
                     }
                 }
             }

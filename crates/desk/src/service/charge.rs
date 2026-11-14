@@ -562,7 +562,7 @@ impl Desk {
         let run = &self.0.opts.run_dir;
         bounds
             .withheld
-            .push(std::fs::canonicalize(run).unwrap_or_else(|_| run.clone()));
+            .push(crate::computer::boss::resolve_real(run).unwrap_or_else(|| run.clone()));
         *self.0.boss_bounds.lock() = Some(bounds);
     }
 

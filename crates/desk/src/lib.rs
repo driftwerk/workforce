@@ -103,6 +103,7 @@ pub mod ticket_markdown;
 mod token_pipe;
 mod transcript;
 pub mod update;
+pub mod update_brief;
 pub mod update_store;
 pub mod usage;
 mod vt;
@@ -117,6 +118,8 @@ pub use conversations::{
     Said, SavedMemory, Speaker, SpeakerKind, Thread, Threads,
 };
 pub use crew_store::CheckIn;
+/// Where the person's own Devin config is, from the environment given.
+pub use devin_config::person_path as devin_person_config;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::KnowsGather;
@@ -124,7 +127,7 @@ pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
     BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
 };
-pub use service::{check_hub_id, check_hub_url, LinkBoard};
+pub use service::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
     Import, Imported, Layout, LedgerPage, LineError, MemoryHitView, MemorySearch, NewTerminal,

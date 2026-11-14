@@ -756,6 +756,142 @@ impl Desk {
         .await
     }
 
+    /// A board of Desk's own in `group` for a boss's work: the one with
+    /// `prefix` when it is there already (in `group`, not synced), else
+    /// one made, named `name`. The prefix comes from the name when none is
+    /// said. A prefix another board has, elsewhere, is refused in plain
+    /// words; nothing of that board is said.
+    pub async fn board_in_group(
+        &self,
+        group: Option<&str>,
+        name: &str,
+        prefix: Option<&str>,
+    ) -> Result<(Board, bool), DeskError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(DeskError::Invalid("A board needs a name.".into()));
+        }
+        let prefix = match prefix.map(|p| p.trim().to_ascii_uppercase()) {
+            Some(p) if !p.is_empty() => {
+                board::check_prefix(&p).map_err(DeskError::Invalid)?;
+                p
+            }
+            _ => board::prefix_of(name),
+        };
+        // Its own with that prefix, as it is; another's is taken.
+        let taken = || {
+            DeskError::Conflict(format!(
+                "The prefix {prefix} is another board's; pass a different prefix in new_board."
+            ))
+        };
+        let had = async || -> Result<Option<Board>, DeskError> {
+            match self
+                .0
+                .store
+                .board_by_prefix(&prefix)
+                .await
+                .map_err(internal)?
+            {
+                Some(b) if b.group.as_deref() == group && b.sync.is_none() => Ok(Some(b)),
+                Some(_) => Err(taken()),
+                None => Ok(None),
+            }
+        };
+        if let Some(b) = had().await? {
+            return Ok((b, false));
+        }
+        match self
+            .create_board(NewBoard {
+                name: name.to_string(),
+                group: group.map(str::to_string),
+                prefix: Some(prefix.clone()),
+            })
+            .await
+        {
+            Ok(b) => Ok((b, true)),
+            // Made meanwhile by another call: its own, or taken.
+            Err(DeskError::Conflict(_)) => had().await?.map(|b| (b, false)).ok_or_else(taken),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Re-files plan `id` on board `board`, as `by`: every ticket of it
+    /// moves there under a new key, still in the plan, with what it needs,
+    /// its links, history and whoever has it. The board is in the plan's
+    /// group and one of Desk's own; nothing moves while a ticket of it is
+    /// starting.
+    pub async fn move_plan(&self, id: Uuid, board: Uuid, by: &By) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let mut p = self.plan_of(id).await?;
+        if p.board == board {
+            return self.plan_detail(p).await;
+        }
+        let to = self.board_of(board).await?;
+        if to.group != p.group {
+            return Err(DeskError::Invalid(format!(
+                "{} isn't in the plan's group: name a board of that group, or pass new_board to make one there.",
+                to.name
+            )));
+        }
+        if let Some(sync) = &to.sync {
+            return Err(DeskError::Invalid(format!(
+                "{} is synced with {} {}: a plan's tickets go on a board of Desk's own; name another, or pass new_board.",
+                to.name,
+                sync.system.title(),
+                sync.target
+            )));
+        }
+        let _one = self.0.plan_starting.lock().await;
+        let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+        // One filed in another tracker keeps its place there: moving it
+        // would cut its link.
+        if let Some(t) = rows.iter().find(|t| t.external.is_some()) {
+            return Err(DeskError::Invalid(format!(
+                "“{}” of the plan is filed in another tracker, so the plan stays where it is; \
+                 move that ticket off the plan first, or leave the plan on its board.",
+                crew::one_line(&t.title, 80)
+            )));
+        }
+        let mine: HashSet<Uuid> = rows.iter().map(|t| t.id).collect();
+        let starting = self.0.store.starting().await.map_err(internal)?;
+        if starting.iter().any(|s| mine.contains(&s.ticket)) {
+            return Err(DeskError::Conflict(
+                "A ticket of the plan is starting its session now; try the move again in a moment."
+                    .into(),
+            ));
+        }
+        let from = self.board_of(p.board).await?;
+        p.board = to.id;
+        p.updated_at = crew::now();
+        let moved = self
+            .0
+            .store
+            .move_plan_board(&p, to.id)
+            .await
+            .map_err(internal)?;
+        let n = moved.len();
+        for t in moved {
+            if let Ok(v) = self.view_ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
+        self.plan_note(
+            &p,
+            by,
+            Kind::PlanChanged,
+            format!(
+                "moved a plan's {n} {} from {} to {}: {}",
+                if n == 1 { "ticket" } else { "tickets" },
+                from.name,
+                to.name,
+                crew::one_line(&p.goal, 120)
+            ),
+        );
+        self.plan_saved(&p).await
+    }
+
     async fn add_revision(
         &self,
         p: &Plan,
@@ -1116,7 +1252,10 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        // An unbound boss approves its own plans: the person let it.
+        // An unbound boss approves its own plans: the person let it. The
+        // hub asks this for one only on the person's own words asking for
+        // the work to start (`crew.plan`'s `start_now`); a plan it only
+        // proposes stays a draft.
         let unbound = by.party.kind == PartyKind::Manager
             && !crate::grant::is_served(&by.party.id)
             && self.full_of(&by.party.id).unbound;

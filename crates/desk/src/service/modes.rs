@@ -408,6 +408,10 @@ impl Desk {
             view
         };
         let confirmed = match (running && not_started.is_none(), r.engine) {
+            // Claude says the mode it runs in on every hook. Devin is said
+            // to, but whether it does before its turn ends is unverified
+            // until a real hook capture (#307) decides: until then it isn't
+            // waited on, and its mode is left unconfirmed.
             (true, Engine::Claude) => {
                 let until = tokio::time::Instant::now() + READ_BACK;
                 loop {

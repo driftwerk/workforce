@@ -113,6 +113,45 @@ pub(crate) fn delivered(
     });
 }
 
+/// A boss's update (or catch-up) sent to `owner`'s Desk DM `session_id`
+/// with `agent_id`, logged as a turn begun and ended as it landed: its
+/// `purpose` the turn's task and its `state` the answer, both plain words
+/// from the update's brief ([`workforce_desk::update_brief::floor_line`]),
+/// so the Floor says what the boss is for and where things stand, never
+/// the update's prose. It asks nothing: what waits on the person is its
+/// own card.
+pub(crate) fn briefed(
+    log: &dyn TurnLog,
+    agent_id: &str,
+    owner: &str,
+    session_id: &str,
+    purpose: &str,
+    state: &str,
+) {
+    let (id, at) = (Uuid::new_v4(), crew::now());
+    let mut turn = opened(
+        id,
+        owner,
+        agent_id,
+        session_id,
+        agent_id.to_string(),
+        Place::Dm,
+        at,
+    );
+    turn.task = Some(purpose.to_string());
+    log.send(TurnOp::Begin {
+        turn: Box::new(turn),
+        by_person: false,
+    });
+    log.send(TurnOp::End {
+        turn: id,
+        at,
+        outcome: Outcome::Finished,
+        answer: Some(state.to_string()),
+        question: None,
+    });
+}
+
 impl AgentTurn {
     /// Logs a turn of agent `agent_id` (called `name`) that began at
     /// `started_at`, unless it is housekeeping: a heartbeat, a monitor,
@@ -486,6 +525,35 @@ pub(crate) mod tests {
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].ask, "Retry it?");
         assert_eq!(needs[0].place, Place::Room { room, thread: None });
+    }
+
+    #[tokio::test]
+    async fn a_bosss_update_is_logged_as_its_purpose_and_state_and_asks_nothing() {
+        let recorded = Recorded::default();
+        briefed(
+            &recorded,
+            "boss",
+            "u1",
+            "s1",
+            "Keeping you posted on the crew.",
+            "Unblocked web's release; one thing for you.",
+        );
+        let scope = Scope {
+            owner: "u1".into(),
+            personal: false,
+        };
+        let turns = recorded.relevant(&scope, crew::now()).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].task.as_deref(),
+            Some("Keeping you posted on the crew.")
+        );
+        assert_eq!(
+            turns[0].answer.as_deref(),
+            Some("Unblocked web's release; one thing for you.")
+        );
+        assert_eq!(turns[0].outcome, Some(Outcome::Finished));
+        assert!(workforce_desk::floor::open_needs(&turns).is_empty());
     }
 
     #[test]

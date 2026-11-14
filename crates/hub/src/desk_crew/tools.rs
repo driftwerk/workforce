@@ -43,7 +43,7 @@ pub const READ: [&str; 14] = [
     super::preferences::PREFER,
     super::preferences::PREFERENCES,
 ];
-pub const ACT: [&str; 21] = [
+pub const ACT: [&str; 22] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -61,6 +61,7 @@ pub const ACT: [&str; 21] = [
     "crew.release",
     super::plan::NAME,
     super::plan::UPDATE,
+    super::plan::BOARD_CREATE,
     super::handover::NAME,
     "crew.handoff",
     "crew.set_mode",
@@ -794,6 +795,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
+            super::plan::BOARD_CREATE => super::plan::BOARD_CREATE_DESCRIPTION,
             super::handover::NAME => super::handover::DESCRIPTION,
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
@@ -801,7 +803,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
-            "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure.",
+            "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
             "crew.stop" => "Stop a running Desk session; its conversation is kept. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
@@ -848,6 +850,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
+        super::plan::BOARD_CREATE => super::plan::board_create_schema(),
         super::handover::NAME => super::handover::schema(),
         super::own_settings::NAME => super::own_settings::schema(),
         "crew.activity" => json!({ "type": "object", "properties": {
@@ -1020,7 +1023,13 @@ impl Tool for CrewTool {
             relayed
         } else if READ.contains(&self.name) {
             self.read(&crew, &bound, &input).await
-        } else if [super::plan::NAME, super::plan::UPDATE].contains(&self.name) {
+        } else if [
+            super::plan::NAME,
+            super::plan::UPDATE,
+            super::plan::BOARD_CREATE,
+        ]
+        .contains(&self.name)
+        {
             crew.plan_tool(self.name, &bound, &input).await
         } else if self.name == super::handover::NAME {
             crew.handover_tool(&bound, &input).await

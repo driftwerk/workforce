@@ -8,6 +8,7 @@ use super::tests::options;
 use super::*;
 use crate::store::build_pool;
 use workforce_postgres::test_support::with_test_pool;
+use workforce_postgres::PostgresPool;
 
 /// A `devin` that logs its arguments, prints `list.json` for `list`, and
 /// otherwise posts `SessionStart` (a resume when given `-r`) and its
@@ -24,12 +25,18 @@ config="$2"
 hook="${{config%.devin.json}}.hook"
 post() {{ curl -sf --max-time 5 -K "$hook" -H "X-Desk-Devin-Event: $1" --data-binary "$2" > /dev/null; }}
 source=startup
-for a in "$@"; do [ "$a" = -r ] && source=resume; done
+mode=normal
+prev=
+for a in "$@"; do
+  [ "$a" = -r ] && source=resume
+  [ "$prev" = --permission-mode ] && mode="$a"
+  prev="$a"
+done
 for a in "$@"; do last="$a"; done
 post SessionStart '{{"session_id":"ses_fake1","source":"'$source'"}}'
 post UserPromptSubmit '{{"session_id":"ses_fake1","prompt_id":"p1","prompt":"'"$last"'"}}'
 sed 's/^{{$/{{"notify":"always",/' "$config" > "$d/saved" && cat "$d/saved" > "$config"
-post Stop '{{"session_id":"ses_fake1","prompt_id":"p1","stop_hook_active":false,"last_assistant_message":"Done: the tests pass."}}'
+post Stop '{{"session_id":"ses_fake1","prompt_id":"p1","stop_hook_active":false,"permission_mode":"'$mode'","last_assistant_message":"Done: the tests pass."}}'
 exec sleep 60
 "#,
         dir = dir.display()
@@ -271,6 +278,283 @@ async fn desks_run_folder_holding_devins_hook_tokens_is_withheld_from_every_boss
         assert!(bounds
             .withheld
             .contains(&std::fs::canonicalize(&run).unwrap()));
+    })
+    .await;
+}
+
+/// A Desk on the fake `devin`, the person's config at `home`, and a
+/// Devin session it started in `work`, its first turn over.
+async fn devin_desk(
+    pool: PostgresPool,
+    dir: &Path,
+    tune: impl FnOnce(&mut Options),
+) -> (Desk, CancellationToken) {
+    let home = dir.join("home");
+    let mine = home.join(".config/devin/config.json");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    if !mine.exists() {
+        std::fs::write(&mine, "{}\n").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    if !dir.join("list.json").exists() {
+        std::fs::write(dir.join("list.json"), "[]").unwrap();
+    }
+    let mut o = options(dir).with_program(Engine::Devin, fake_devin(dir));
+    o.env.insert("HOME".into(), home.display().to_string());
+    tune(&mut o);
+    DeskStore::migrate(&pool).await.unwrap();
+    let cancel = CancellationToken::new();
+    let d = Desk::start(
+        DeskStore::from_pool(pool),
+        o,
+        Default::default(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    (d, cancel)
+}
+
+async fn devin_session(d: &Desk, dir: &Path) -> SessionView {
+    let s = d
+        .create(
+            NewSession {
+                fresh_worktree: false,
+                engine: Engine::Devin,
+                view: None,
+                name: "tests".into(),
+                cwd: dir.join("work").to_string_lossy().into_owned(),
+                goal: "make the tests pass".into(),
+                worktree: None,
+                prompt: Some("run the tests".into()),
+                approvals: None,
+                approve_for_me: false,
+                fast: false,
+                account: None,
+                env: Default::default(),
+                group: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    until("its turn ended", || {
+        d.view(s.id)
+            .is_ok_and(|v| v.state == SessionState::Done && v.last_reply.is_some())
+    })
+    .await;
+    s
+}
+
+/// The new run's `Stop` reached Desk: on its new hook file and token.
+async fn its_next_hook_lands(d: &Desk, id: Uuid, what: &str) {
+    until(what, || {
+        d.view(id)
+            .is_ok_and(|v| v.state == SessionState::Done && v.last_reply.is_some())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_devin_session_started_again_at_once_keeps_its_new_runs_files() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("list.json"), r#"[{"id":"ses_fake1"}]"#).unwrap();
+        let (d, _cancel) = devin_desk(pool, dir.path(), |_| {}).await;
+        let s = devin_session(&d, dir.path()).await;
+        let files = devin::SessionFiles::of(&dir.path().join("run"), s.id);
+
+        // Ending a run's files takes a while: a resume the moment its
+        // process is gone would otherwise start before they are ended.
+        d.0.state.lock().devin_end_delay = Some(Duration::from_millis(600));
+        // A new mode while it runs: stopped and resumed in place, the
+        // moment its process is gone.
+        d.change(s.id, |r, _| r.last_reply = None);
+        let set = d
+            .set_mode(s.id, crate::mode::Mode::AcceptEdits, By::you())
+            .await
+            .unwrap();
+        assert!(set.not_started.is_none(), "{:?}", set.not_started);
+        assert_eq!(
+            set.confirmed, None,
+            "Devin's mode is never waited on until a real capture says it is sent"
+        );
+        its_next_hook_lands(&d, s.id, "the new run's Stop landed").await;
+        let args = last_args(dir.path());
+        assert!(args.iter().any(|a| a == "-r"), "{args:?}");
+        // The run before's end never takes the new run's files, nor says
+        // its state over the new one's.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(files.hook.exists() && files.config.exists());
+        assert!(d.0.state.lock().live.contains_key(&s.id));
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+
+        // Restarted with a prompt: the same.
+        d.change(s.id, |r, _| r.last_reply = None);
+        d.restart(s.id, Some("again".into()), By::you())
+            .await
+            .unwrap();
+        its_next_hook_lands(&d, s.id, "the restarted run's Stop landed").await;
+        assert_eq!(
+            last_args(dir.path()).last().map(String::as_str),
+            Some("again")
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(files.hook.exists() && files.config.exists());
+        assert!(d.0.state.lock().live.contains_key(&s.id));
+        d.stop(s.id, None).unwrap();
+        until("its files went", || !files.hook.exists()).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_resume_devin_refuses_leaves_none_of_its_files() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _cancel) = devin_desk(pool, dir.path(), |_| {}).await;
+        let s = devin_session(&d, dir.path()).await;
+        d.stop(s.id, None).unwrap();
+        until("it stopped", || !d.0.state.lock().live.contains_key(&s.id)).await;
+        let files = devin::SessionFiles::of(&dir.path().join("run"), s.id);
+        until("its files went", || !files.hook.exists()).await;
+        // An id that would read as an option, and Devin still lists it.
+        d.change(s.id, |r, _| r.cli_session_id = Some("-x".into()));
+        std::fs::write(dir.path().join("list.json"), r#"[{"id":"-x"}]"#).unwrap();
+        let starts = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let refused = d.resume(s.id, None, None).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("wouldn't pass on"),
+            "{refused}"
+        );
+        for f in [&files.config, &files.base, &files.hook] {
+            assert!(!f.exists(), "{} left", f.display());
+        }
+        assert!(!d.0.state.lock().live.contains_key(&s.id));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("args.log")).unwrap(),
+            starts,
+            "Devin never ran"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_devin_resume_that_fails_while_its_run_ends_keeps_what_the_end_said() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _cancel) = devin_desk(pool, dir.path(), |_| {}).await;
+        let s = devin_session(&d, dir.path()).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+        // A resume Devin refuses, made while the run before is still ending.
+        d.change(s.id, |r, _| r.cli_session_id = Some("-x".into()));
+        std::fs::write(dir.path().join("list.json"), r#"[{"id":"-x"}]"#).unwrap();
+        d.0.state.lock().devin_end_delay = Some(Duration::from_millis(600));
+        d.stop(s.id, None).unwrap();
+        until("its process went", || {
+            !d.0.state.lock().live.contains_key(&s.id)
+        })
+        .await;
+        let refused = d.resume(s.id, None, None).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("wouldn't pass on"),
+            "{refused}"
+        );
+        // Read after the end, never before it: its `Stopped` stays.
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_devin_session_removed_while_it_runs_leaves_no_files() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _cancel) = devin_desk(pool, dir.path(), |_| {}).await;
+        let s = devin_session(&d, dir.path()).await;
+        let files = devin::SessionFiles::of(&dir.path().join("run"), s.id);
+        assert!(files.hook.exists());
+        d.forget(s.id).await.unwrap();
+        until("its files went", || {
+            !files.hook.exists() && !files.config.exists() && !files.base.exists()
+        })
+        .await;
+        // What Devin saved is still written back.
+        let mine = dir.path().join("home/.config/devin/config.json");
+        let v = devin_config::parse(&std::fs::read_to_string(&mine).unwrap()).unwrap();
+        assert_eq!(v["notify"], "always");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn devin_files_stay_when_the_holder_couldnt_say_what_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let running = Uuid::new_v4();
+        let files = devin::SessionFiles::of(&run, running);
+        files
+            .write(
+                &run,
+                "http://127.0.0.1:9/hook/x/y",
+                60,
+                false,
+                &devin_config::Person::Read {
+                    config: serde_json::json!({}),
+                    real: None,
+                },
+            )
+            .unwrap();
+        let (_d, _cancel) = devin_desk(pool, dir.path(), |o| {
+            o.holder = Some(HolderOptions {
+                socket: dir.path().join("no-holder.sock"),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+        })
+        .await;
+        for f in [&files.config, &files.base, &files.hook] {
+            assert!(f.exists(), "{} ended", f.display());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_devin_session_the_holder_kept_keeps_its_files_when_the_hub_starts_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+        let dir = tempfile::tempdir().unwrap();
+        let holder = HolderOptions {
+            socket: socket.clone(),
+            token: crate::holder::tests::TOKEN.into(),
+        };
+        let kept = holder.clone();
+        let (first, first_cancel) =
+            devin_desk(pool.clone(), dir.path(), move |o| o.holder = Some(kept)).await;
+        let s = devin_session(&first, dir.path()).await;
+        let files = devin::SessionFiles::of(&dir.path().join("run"), s.id);
+        first_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(first);
+
+        let (second, _cancel) =
+            devin_desk(pool, dir.path(), move |o| o.holder = Some(holder)).await;
+        assert!(second.view(s.id).unwrap().live, "taken back");
+        // Its shell may have moved before the restart: where a relative
+        // path lands is unknown until Devin says.
+        assert!(
+            second.0.state.lock().live[&s.id].moved,
+            "taken back unmoved"
+        );
+        for f in [&files.config, &files.base, &files.hook] {
+            assert!(f.exists(), "{} ended under it", f.display());
+        }
+        // It ends: then they go.
+        second.stop(s.id, None).unwrap();
+        until("its files went", || !files.hook.exists()).await;
+        holder_cancel.cancel();
     })
     .await;
 }

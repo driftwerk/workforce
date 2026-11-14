@@ -6,6 +6,12 @@
 //!   Answers it once.
 //! - `DELETE /api/me/desk-knows-tokens/{id}` (the device): revokes one it
 //!   minted. Taken even while `[desk_knows]` is off.
+//! - `DELETE /api/me/desk-knows-tokens/engines/{engine}` (the device): revokes
+//!   every one this device minted for that engine, so a Desk that is taken
+//!   away (a machine removed) shares no more even where it can't be reached.
+//! - `POST /api/desk-knows/revoke` (**the `wfk_` token alone**): the token
+//!   ends itself, for the Desk that held it to unlink the agent. Taken
+//!   whatever the settings say or the person's state: it only narrows.
 //! - `POST /api/desk-knows/push` `{items: [{kind, ref, session?, group?, at,
 //!   body}]}` (**the `wfk_` token alone**): keeps them for the person, the
 //!   agent and the device. At most [`MAX_ITEMS`] items and [`MAX_BODY`]
@@ -155,6 +161,47 @@ fn plain(text: &str, max: usize) -> Option<&str> {
     (!t.is_empty() && t.chars().count() <= max && !t.chars().any(char::is_control)).then_some(t)
 }
 
+/// Whether a fresh token for `agent` from `device`'s `engine` replaces
+/// `t`: a live Desk knows token of the same device, agent and engine.
+fn replaced(
+    t: &RemoteMcpToken,
+    device: &str,
+    agent: &str,
+    engine: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    t.is_live(now)
+        && t.scope() == Some(TokenScope::DeskKnows)
+        && t.minted_by_device() == Some(device)
+        && t.desk_link
+            .as_ref()
+            .is_some_and(|l| l.agent_id == agent && l.engine_id == engine)
+}
+
+/// An engine's id, as its rows are kept by (`<device>/<engine>`): letters,
+/// digits, `-`, `_` and `.`, not dots alone.
+fn engine_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !id.chars().all(|c| c == '.')
+}
+
+/// Whether a push from engine `engine` says how the agent hears of the
+/// person's work: from their own computer's alone.
+fn sets_digest(engine: Option<&str>) -> bool {
+    engine == Some(HOME_ENGINE)
+}
+
+/// `GET /api/me/desk-knows-tokens/engines`: that this hub keeps each of
+/// the person's engines' tokens and rows apart (Sees K7). A Desk links a
+/// machine only with a hub that says so: an older one would replace the
+/// person's computer's token with the machine's.
+pub async fn engines() -> Response {
+    Json(json!({ "engines": true })).into_response()
+}
+
 /// `POST /api/me/desk-knows-tokens`.
 pub async fn mint(
     State(state): State<Arc<GatewayState>>,
@@ -189,7 +236,7 @@ pub async fn mint(
         Err(r) => return r,
     };
     let (Some(engine_id), Some(engine_name)) = (
-        plain(&body.engine.id, MAX_NAME),
+        plain(&body.engine.id, MAX_NAME).filter(|id| engine_id_ok(id)),
         plain(&body.engine.name, MAX_NAME),
     ) else {
         return err(StatusCode::BAD_REQUEST, "Say the engine's id and name.");
@@ -232,17 +279,15 @@ pub async fn mint(
         warn!(error = %e, "desk knows token store error");
         return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
     }
-    // One live token per (device, agent): the fresh one, made first so a
-    // failure leaves the old one working, replaces it.
+    // One live token per (device, agent, engine): the fresh one, made first
+    // so a failure leaves the old one working, replaces it. A machine's
+    // engine holds its own beside the Mac's (Sees K7).
     match store.list_tokens_for_identity(person) {
         Ok(held) => {
-            for t in held.iter().filter(|t| {
-                t.id != record.id
-                    && t.is_live(now)
-                    && t.scope() == Some(TokenScope::DeskKnows)
-                    && t.minted_by_device() == Some(device.id.as_str())
-                    && t.desk_link.as_ref().is_some_and(|l| l.agent_id == agent_id)
-            }) {
+            for t in held
+                .iter()
+                .filter(|t| t.id != record.id && replaced(t, &device.id, &agent_id, engine_id, now))
+            {
                 if store.revoke_token(t.id, Some(person), now).unwrap_or(false) {
                     crate::boss_links::audit(
                         state.telemetry_store.as_ref(),
@@ -329,6 +374,133 @@ pub async fn revoke(
     }
 }
 
+/// `DELETE /api/me/desk-knows-tokens/engines/{engine}`: every live Desk
+/// work token this device minted for `engine`, revoked. Only this device's
+/// own: a token of another device or engine is never reached.
+pub async fn revoke_engine(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(engine): Path<String>,
+) -> Response {
+    let (device, person) = match paired_device(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    if !engine_id_ok(&engine) {
+        return err(StatusCode::BAD_REQUEST, "That isn't an engine's id.");
+    }
+    let store = match tokens(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let held = match store.list_tokens_for_identity(person) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(error = %e, "desk knows token store error");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+        }
+    };
+    let now = Utc::now();
+    let mut revoked = 0u32;
+    let mut failed = false;
+    for t in held.iter().filter(|t| {
+        t.is_live(now)
+            && t.scope() == Some(TokenScope::DeskKnows)
+            && t.minted_by_device() == Some(device.id.as_str())
+            && t.desk_link.as_ref().is_some_and(|l| l.engine_id == engine)
+    }) {
+        match store.revoke_token(t.id, Some(person), now) {
+            Ok(true) => {
+                revoked += 1;
+                crate::boss_links::audit(
+                    state.telemetry_store.as_ref(),
+                    &person.to_string(),
+                    "desk_knows.revoke",
+                    t,
+                    "engine removed",
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "desk knows token store error");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+    }
+    Json(json!({ "revoked": revoked })).into_response()
+}
+
+/// `POST /api/desk-knows/revoke`: the bearer `wfk_` token ends itself. A
+/// token this hub doesn't know, or that has ended, is "unauthorized": to
+/// the Desk that held it, the same as done.
+pub async fn revoke_self(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    let unknown = || {
+        err(
+            StatusCode::UNAUTHORIZED,
+            "This hub doesn't know that token, or it has ended.",
+        )
+    };
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| t.starts_with(DESK_KNOWS_TOKEN_PREFIX))
+    else {
+        return unknown();
+    };
+    let store = match tokens(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let now = Utc::now();
+    let token = match store.get_token_by_hash(&remote_mcp_token::hash_token(presented)) {
+        Ok(Some(t)) if t.is_live(now) && t.scope() == Some(TokenScope::DeskKnows) => t,
+        Ok(_) => return unknown(),
+        Err(e) => {
+            warn!(error = %e, "desk knows token lookup failed");
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This hub couldn't check that token; try again.",
+            );
+        }
+    };
+    match store.revoke_token(token.id, Some(token.identity_id), now) {
+        Ok(_) => {
+            crate::boss_links::audit(
+                state.telemetry_store.as_ref(),
+                &token.identity_id.to_string(),
+                "desk_knows.revoke",
+                &token,
+                "unlinked",
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "desk knows token store error");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "token store error")
+        }
+    }
+}
+
+/// The engine a Desk on the person's own computer names itself by.
+pub const HOME_ENGINE: &str = "local";
+
+/// Whose a token's pushes are: the minting device for the Desk on the
+/// person's computer (its own engine), and that device's engine beside it
+/// for a machine's (`<device>/<engine>`). Each keeps its own rows, so a
+/// machine's forget never takes what the Mac shared, nor the Mac's a
+/// machine's (Sees K7).
+pub fn source_of(device: &str, engine: &str) -> String {
+    if engine == HOME_ENGINE {
+        device.to_string()
+    } else {
+        format!("{device}/{engine}")
+    }
+}
+
 /// A `wfk_` token that is live now: whose and for which agent.
 pub struct Live {
     pub token: RemoteMcpToken,
@@ -399,7 +571,7 @@ pub fn authenticate(
     Ok(Live {
         owner: Owner {
             person: token.identity_id,
-            source: device,
+            source: source_of(&device, &link.engine_id),
             agent: link.agent_id,
         },
         token,
@@ -536,11 +708,17 @@ pub async fn push(
             return err(StatusCode::BAD_REQUEST, "A digest is off, live or daily.");
         }
     }
+    // How the agent hears of it is the person's own computer's to say: a
+    // machine's push never sets it (Sees K7).
+    let digest = parsed
+        .digest
+        .as_ref()
+        .filter(|_| sets_digest(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())));
     let store = match store() {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(d) = &parsed.digest {
+    if let Some(d) = digest {
         if let Err(e) = store.set_digest(&live.owner, d, Utc::now()).await {
             warn!(error = %format!("{e:#}"), "keeping how Desk wants its digest failed");
             return err(
@@ -556,7 +734,7 @@ pub async fn push(
                 &live.owner.person.to_string(),
                 "desk_knows.push",
                 &live.token,
-                &match (&parsed.digest, kept) {
+                &match (digest, kept) {
                     (Some(d), 0) => format!("digest {d}"),
                     (Some(d), _) => format!("{kept} items, digest {d}"),
                     (None, _) => format!("{kept} items"),
@@ -661,6 +839,71 @@ mod tests {
 
     fn item(v: Value) -> Result<Item, String> {
         checked(serde_json::from_value(v).unwrap())
+    }
+
+    fn token(device: &str, agent: &str, engine: &str) -> RemoteMcpToken {
+        let now = Utc::now();
+        RemoteMcpToken {
+            id: Uuid::new_v4(),
+            identity_id: Uuid::new_v4(),
+            label: String::new(),
+            token_hash: String::new(),
+            scopes: vec![
+                TokenScope::DeskKnows.key().to_string(),
+                format!("{DEVICE_SCOPE_PREFIX}{device}"),
+            ],
+            created_at: now,
+            expires_at: now + Duration::days(30),
+            last_used_at: None,
+            revoked_at: None,
+            desk_link: Some(DeskLink {
+                link_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                group_key: String::new(),
+                desk_group_key: String::new(),
+                group_name: String::new(),
+                engine_id: engine.into(),
+                engine_name: "Desk".into(),
+                engine_public_key: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_fresh_token_replaces_only_its_own_engines_for_the_agent() {
+        let now = Utc::now();
+        let mac = token("d1", "allan", HOME_ENGINE);
+        assert!(replaced(&mac, "d1", "allan", HOME_ENGINE, now));
+        // A machine's engine keeps its own beside the Mac's.
+        assert!(!replaced(&mac, "d1", "allan", "devbox", now));
+        assert!(replaced(
+            &token("d1", "allan", "devbox"),
+            "d1",
+            "allan",
+            "devbox",
+            now
+        ));
+        // Another agent's, or another device's, stays.
+        assert!(!replaced(&mac, "d1", "lattice", HOME_ENGINE, now));
+        assert!(!replaced(&mac, "d2", "allan", HOME_ENGINE, now));
+    }
+
+    #[test]
+    fn a_machines_pushes_are_its_own_and_the_macs_stay_the_devices() {
+        assert_eq!(source_of("d1", HOME_ENGINE), "d1");
+        assert_eq!(source_of("d1", "devbox"), "d1/devbox");
+    }
+
+    #[test]
+    fn only_the_persons_own_computer_sets_the_digest_and_an_engine_is_named_plainly() {
+        assert!(sets_digest(Some(HOME_ENGINE)));
+        assert!(!sets_digest(Some("devbox")));
+        assert!(!sets_digest(None));
+        assert!(engine_id_ok("local"));
+        assert!(engine_id_ok("devbox-2"));
+        for bad in ["", ".", "..", "a/b", "a b", &"x".repeat(65)] {
+            assert!(!engine_id_ok(bad), "{bad}");
+        }
     }
 
     #[test]
