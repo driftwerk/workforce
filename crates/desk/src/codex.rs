@@ -429,6 +429,9 @@ pub enum CodexEvent {
     Question {
         request: Value,
         question: crate::claude::Question,
+        /// Its questions whole (`item/tool/requestUserInput`, none of them
+        /// secret): what a boss that answers its dialogs answers.
+        asks: Option<Value>,
     },
     /// A request it asked was answered, by Desk or the terminal (the
     /// request's JSON-RPC id).
@@ -507,6 +510,10 @@ pub struct Ask {
 pub struct Reply {
     pub request: Value,
     pub decision: Decision,
+    /// A question's answers, by its questions' ids
+    /// (`ToolRequestUserInputResponse.answers`): sent in place of a
+    /// decision.
+    pub answers: Option<Value>,
 }
 
 /// Codex's word for `d`, in an approval's answer.
@@ -591,15 +598,54 @@ fn changed_paths(change: &Value) -> Vec<String> {
     out
 }
 
+/// What a file change item it started changes, by item id: the files, and
+/// each one's change (its kind and diff, as Codex said them).
+#[derive(Debug, Default)]
+pub struct Changed {
+    pub files: HashMap<String, Vec<String>>,
+    pub diffs: HashMap<String, Vec<Value>>,
+}
+
+/// How much of one file's diff a request carries, and of all of them.
+const DIFF_MAX: usize = 4000;
+const DIFFS_MAX: usize = 16000;
+
+/// What a command request runs, whole: the command and where, the kind of
+/// action and its environment, and what it asks of its sandbox (network,
+/// a standing rule); never Codex's own account of it (`reason`, its parsed
+/// `commandActions`), nor its bookkeeping.
+fn what_runs(params: &Value) -> Value {
+    let mut v = params.clone();
+    if let Some(o) = v.as_object_mut() {
+        for k in [
+            "threadId",
+            "turnId",
+            "itemId",
+            "startedAtMs",
+            "approvalId",
+            "reason",
+            "commandActions",
+            "availableDecisions",
+            "cwd",
+        ] {
+            o.remove(k);
+        }
+        o.retain(|_, v| !v.is_null());
+    }
+    v
+}
+
 /// The approval a server request is, when it is one Desk answers: a
-/// command's, or a file change's (whose files its item named, in `files`).
+/// command's, or a file change's (whose files and diffs its item named, in
+/// `changed`).
 pub fn ask_of(
     method: &str,
     id: &Value,
     params: &Value,
-    files: &HashMap<String, Vec<String>>,
+    changed: &Changed,
     home: Option<&Path>,
 ) -> Option<Seen> {
+    let files = &changed.files;
     let thread = params.get("threadId")?.as_str()?.to_string();
     let cwd = params
         .get("cwd")
@@ -620,15 +666,28 @@ pub fn ask_of(
                 false => actions.join("; "),
             };
             // What runs is `command`; its actions are Codex's reading of it.
-            let input = run.map(|c| json!({ "command": c }));
+            let input = run.map(|_| what_runs(params));
             ("Bash", command, input)
         }
         "item/fileChange/requestApproval" => {
             let item = params.get("itemId").and_then(Value::as_str)?;
             // A grant of a folder for the rest of the session rides along.
-            let input = files
+            let mut left = DIFFS_MAX;
+            let changes: Vec<Value> = changed
+                .diffs
                 .get(item)
-                .map(|f| json!({ "paths": f, "grantRoot": params.get("grantRoot") }));
+                .into_iter()
+                .flatten()
+                .map(|c| {
+                    let diff = c.get("diff").and_then(Value::as_str).unwrap_or_default();
+                    let shown = crate::crew::clip(diff, DIFF_MAX.min(left));
+                    left = left.saturating_sub(shown.len());
+                    json!({"path": c.get("path"), "kind": c.get("kind"), "diff": shown})
+                })
+                .collect();
+            let input = files.get(item).map(
+                |f| json!({ "paths": f, "grantRoot": params.get("grantRoot"), "changes": changes }),
+            );
             let named = files
                 .get(item)
                 .map(|f| {
@@ -673,6 +732,7 @@ pub fn question_of(method: &str, id: &Value, params: &Value) -> Option<Seen> {
             .filter(|t| !t.is_empty())
             .map(str::to_string)
     };
+    let mut asks = None;
     let question = match method {
         // One the turn goes on past (`isBlocking: false`) doesn't wait.
         "item/tool/requestUserInput"
@@ -681,6 +741,11 @@ pub fn question_of(method: &str, id: &Value, params: &Value) -> Option<Seen> {
             let questions = params.get("questions")?.as_array()?;
             let first = questions.first()?;
             let detail = text(first, "question").or_else(|| text(first, "header"))?;
+            // A secret is the person's to type, always.
+            let secret = questions
+                .iter()
+                .any(|q| q.get("isSecret").and_then(Value::as_bool) == Some(true));
+            asks = (!secret).then(|| Value::Array(questions.clone()));
             let options: Vec<String> = first
                 .get("options")
                 .and_then(Value::as_array)
@@ -713,6 +778,7 @@ pub fn question_of(method: &str, id: &Value, params: &Value) -> Option<Seen> {
         event: CodexEvent::Question {
             request: id.clone(),
             question,
+            asks,
         },
     })
 }
@@ -903,8 +969,8 @@ pub struct Follower {
     /// already has its thread. Otherwise at the thread's first status, so
     /// the TUI loads it first, with its own settings.
     at_once: bool,
-    /// The files each file change item it started touches, by item id.
-    files: HashMap<String, Vec<String>>,
+    /// The files each file change item it started touches, and how.
+    files: Changed,
     /// The requests it forwarded that nobody has answered, by id.
     open: HashMap<String, String>,
     home: Option<PathBuf>,
@@ -924,7 +990,7 @@ impl Follower {
             thread,
             subscribed: false,
             at_once: false,
-            files: HashMap::new(),
+            files: Changed::default(),
             open: HashMap::new(),
             home,
             turn: None,
@@ -1012,6 +1078,13 @@ impl Follower {
                     .then(|| question_of(method, id, &params))
                     .flatten()
                     .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                // One a boss may answer is open until answered anywhere.
+                if let Some(s) = asked
+                    .as_ref()
+                    .filter(|s| matches!(&s.event, CodexEvent::Question { asks: Some(_), .. }))
+                {
+                    self.open.insert(id.to_string(), s.thread.clone());
+                }
                 (asks.into_iter().chain(asked).collect(), None)
             }
             (None, Some(method)) => {
@@ -1029,7 +1102,20 @@ impl Follower {
                             .flatten()
                             .flat_map(changed_paths)
                             .collect();
-                        let known = self.files.entry(item.to_string()).or_default();
+                        // Each file's latest change, as later words say it.
+                        let diffs = self.files.diffs.entry(item.to_string()).or_default();
+                        for c in params
+                            .pointer("/item/changes")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            match diffs.iter_mut().find(|d| d.get("path") == c.get("path")) {
+                                Some(d) => *d = c.clone(),
+                                None => diffs.push(c.clone()),
+                            }
+                        }
+                        let known = self.files.files.entry(item.to_string()).or_default();
                         for p in paths {
                             if !known.contains(&p) {
                                 known.push(p);
@@ -1145,6 +1231,9 @@ impl Follower {
 
 /// The answer to send for `reply`.
 fn answer_of(reply: &Reply) -> Option<Value> {
+    if let Some(answers) = &reply.answers {
+        return Some(json!({ "id": reply.request, "result": { "answers": answers } }));
+    }
     let decision = codex_decision(reply.decision)?;
     Some(json!({ "id": reply.request, "result": { "decision": decision } }))
 }
@@ -1764,7 +1853,7 @@ pub(crate) mod tests {
             "item/commandExecution/requestApproval",
             &json!(0),
             &escalated(),
-            &HashMap::new(),
+            &Changed::default(),
             Some(home),
         )
         .unwrap();
@@ -1779,7 +1868,8 @@ pub(crate) mod tests {
                 choices: vec![Decision::Allow, Decision::Cancel],
                 whole: Some(crate::model::Request {
                     tool: "Bash".into(),
-                    input: json!({"command": "/bin/zsh -lc 'rm victim.txt'"}),
+                    input: json!({"command": "/bin/zsh -lc 'rm victim.txt'", "kind": "command",
+                        "environmentId": "local", "proposedExecpolicyAmendment": ["rm", "victim.txt"]}),
                     cwd: Some("/Users/k/repo".into()),
                     read_only: false,
                 }),
@@ -1793,7 +1883,7 @@ pub(crate) mod tests {
             "item/commandExecution/requestApproval",
             &json!(4),
             &plain,
-            &HashMap::new(),
+            &Changed::default(),
             None,
         )
         .map(|s| s.event) else {
@@ -1816,7 +1906,7 @@ pub(crate) mod tests {
             "execCommandApproval",
         ] {
             assert_eq!(
-                ask_of(other, &json!(1), &escalated(), &HashMap::new(), None),
+                ask_of(other, &json!(1), &escalated(), &Changed::default(), None),
                 None
             );
         }
@@ -1830,7 +1920,9 @@ pub(crate) mod tests {
                 "message": "Which database?", "requestedSchema": {"type": "object", "properties": {}}}}));
         assert_eq!(send, None, "never answered from Desk");
         let [Seen {
-            event: CodexEvent::Question { request, question },
+            event: CodexEvent::Question {
+                request, question, ..
+            },
             ..
         }] = &seen[..]
         else {
@@ -1882,8 +1974,19 @@ pub(crate) mod tests {
         };
         let whole = ask.whole.as_ref().unwrap();
         assert_eq!(
-            whole.input,
-            json!({"paths": ["/Users/k/repo/a.rs", "/Users/k/other/a.rs", "/Users/k/.zshrc"], "grantRoot": "/Users/k"})
+            (&whole.input["paths"], &whole.input["grantRoot"]),
+            (
+                &json!([
+                    "/Users/k/repo/a.rs",
+                    "/Users/k/other/a.rs",
+                    "/Users/k/.zshrc"
+                ]),
+                &json!("/Users/k")
+            )
+        );
+        assert_eq!(
+            whole.input["changes"][0]["kind"]["move_path"],
+            "/Users/k/other/a.rs"
         );
     }
 
@@ -1895,6 +1998,13 @@ pub(crate) mod tests {
             "item": {"type": "fileChange", "id": "fc-1", "status": "inProgress",
                 "changes": [{"path": "/Users/k/repo/a.rs", "kind": "update", "diff": ""},
                             {"path": "/etc/hosts", "kind": "update", "diff": ""}]}}}),
+        );
+        // A later word says the hosts change whole.
+        f.heard(
+            &json!({"method": "item/updated", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-1", "status": "inProgress",
+                "changes": [{"path": "/etc/hosts", "kind": "update",
+                    "diff": "+127.0.0.1 bank.example"}]}}}),
         );
         let (seen, send) = f.heard(
             &json!({"id": 7, "method": "item/fileChange/requestApproval",
@@ -1918,6 +2028,12 @@ pub(crate) mod tests {
         );
         assert_eq!(ask.why.as_deref(), Some("needs write access"));
         assert_eq!(ask.request, json!(7));
+        // What its boss decides on is what changes, not why Codex says so.
+        let input = &ask.whole.as_ref().unwrap().input;
+        assert_eq!(input["changes"][1]["path"], "/etc/hosts");
+        assert_eq!(input["changes"][1]["diff"], "+127.0.0.1 bank.example");
+        assert_eq!(input["changes"].as_array().unwrap().len(), 2);
+        assert!(!input.to_string().contains("needs write access"));
     }
 
     #[test]
@@ -1994,14 +2110,16 @@ pub(crate) mod tests {
         assert_eq!(
             answer_of(&Reply {
                 request: json!(0),
-                decision: Decision::AllowForSession
+                decision: Decision::AllowForSession,
+                answers: None,
             }),
             Some(json!({"id": 0, "result": {"decision": "acceptForSession"}}))
         );
         assert_eq!(
             answer_of(&Reply {
                 request: json!(0),
-                decision: Decision::Terminal
+                decision: Decision::Terminal,
+                answers: None,
             }),
             None
         );
@@ -2090,6 +2208,7 @@ pub(crate) mod tests {
             .send(Reply {
                 request: ask.request,
                 decision: Decision::Allow,
+                answers: None,
             })
             .unwrap();
         let answer = next_sent(&mut ws, |v| v.get("result").is_some()).await;
@@ -2110,6 +2229,7 @@ pub(crate) mod tests {
             .send(Reply {
                 request: json!(0),
                 decision: Decision::Allow,
+                answers: None,
             })
             .unwrap();
         assert_eq!(next!().event, CodexEvent::Late(json!(0)));

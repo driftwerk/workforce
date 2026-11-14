@@ -396,8 +396,19 @@ impl CrewHub {
             .as_ref()
             .and_then(|r| r.input.get("questions").cloned())
             .unwrap_or_else(|| serde_json::json!([{"question": p.detail, "options": p.options}]));
+        // Codex takes each question's answer by its id.
+        let codex = p
+            .request
+            .as_ref()
+            .is_some_and(|r| r.input.get("codex") == Some(&serde_json::Value::Bool(true)));
+        let shape = match codex {
+            true => "This dialog is Codex's: after ANSWER: put, on that one line, a JSON object of each \
+                     question's id to its answer: an option's label exactly, or your own words where the \
+                     question takes other answers (isOther).\n\n",
+            false => "",
+        };
         let prompt = format!(
-            "{MARK} A session you oversee asks this in a dialog. Answer it now.\n\n{}\n\n{}{prefs}",
+            "{MARK} A session you oversee asks this in a dialog. Answer it now.\n\n{shape}{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&questions.to_string(), "its questions"),
         );
