@@ -790,3 +790,56 @@ async fn a_codex_session_is_never_handed_to_a_served_boss_even_stopped() {
     })
     .await;
 }
+
+/// At Act fully, a grant as the routes show it says what its sessions here
+/// spent today, as its daily budget counts it: only calls a key paid for.
+/// Below Act fully it says nothing.
+#[tokio::test]
+async fn a_grant_at_act_fully_says_what_its_sessions_spent_today() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let s = Uuid::new_v4();
+        let mut full = body(1, "Acme", &[s]);
+        full["level"] = json!("full");
+        full["sees"] = json!("everything");
+        full["act"] = json!({"budget_usd_per_day": 20.0});
+        put(&d, "g-acme", full).await;
+        put(&d, "g-docs", body(1, "Docs", &[Uuid::new_v4()])).await;
+        let at = Utc::now();
+        for (key, usd, billing) in [("k1", 1.25, "key"), ("k2", 5.0, "plan")] {
+            sql(
+                &d,
+                "INSERT INTO ledger (engine, key, session, at, usd, priced, billing, group_id) \
+                 VALUES ('claude', $1, $2, $3, $4, 'reported', $5, 'g-acme')",
+                &[&key, &s, &at, &usd, &billing],
+            )
+            .await;
+        }
+        let app = crate::api::sessions_router(d.clone(), Arc::new(crate::testing::Bearer));
+        let (code, out) = call(&app, "GET", "/api/desk/grants", Some("hub-token"), None).await;
+        assert_eq!(code, 200, "{out}");
+        let of = |group: &str| {
+            out["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["group"] == group)
+                .cloned()
+                .unwrap_or_else(|| panic!("{out}"))
+        };
+        assert_eq!(of("g-acme")["spentTodayUsd"], json!(1.25), "{out}");
+        assert!(of("g-docs").get("spentTodayUsd").is_none(), "{out}");
+        let (code, one) = call(
+            &app,
+            "GET",
+            "/api/desk/grants/g-acme",
+            Some("hub-token"),
+            None,
+        )
+        .await;
+        assert_eq!(code, 200, "{one}");
+        assert_eq!(one["spentTodayUsd"], json!(1.25), "{one}");
+    })
+    .await;
+}

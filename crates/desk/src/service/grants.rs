@@ -66,6 +66,11 @@ pub struct GrantView {
     pub grant: Grant,
     pub live: bool,
     pub why: Option<String>,
+    /// At Act fully, the real money its sessions here spent today (calls a
+    /// key paid for, never the person's plans), as its budget counts it;
+    /// none below Act fully, or when it can't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent_today_usd: Option<f64>,
 }
 
 /// Every grant here, and the engine's switches.
@@ -264,7 +269,50 @@ impl Desk {
             live: why.is_none(),
             why,
             grant: g,
+            spent_today_usd: None,
         }
+    }
+
+    /// What `g`'s sessions here spent today, at Act fully: what its daily
+    /// budget is judged by on this engine.
+    async fn spent_today_of(&self, g: &mut GrantView) {
+        if g.grant.level != grant::Level::Full {
+            return;
+        }
+        let now = Utc::now();
+        let midnight = self.period_start(crate::ledger::Period::Day, now);
+        let scope = match g.grant.group.as_str() {
+            UNGROUPED => crate::scope::Scope::Ungrouped,
+            group => crate::scope::Scope::Group(group.to_string()),
+        };
+        let filter = crate::ledger_store::Filter {
+            seen: Some(self.seen_by(&scope)),
+            ..Default::default()
+        };
+        match self.billed_usd(midnight, now, &filter).await {
+            Ok(usd) => g.spent_today_usd = Some(usd),
+            Err(e) => tracing::warn!(
+                group = %g.grant.group,
+                error = %e,
+                "couldn't read a grant's spend today"
+            ),
+        }
+    }
+
+    /// [`Self::grants_view`], with each Act fully grant's spend today.
+    pub async fn grants_view_spent(&self, n: &Native) -> GrantsView {
+        let mut v = self.grants_view(n);
+        for g in &mut v.grants {
+            self.spent_today_of(g).await;
+        }
+        v
+    }
+
+    /// [`Self::grant_view`], with its spend today at Act fully.
+    pub async fn grant_view_spent(&self, n: &Native, group: &str) -> Option<GrantView> {
+        let mut g = self.grant_view(n, group)?;
+        self.spent_today_of(&mut g).await;
+        Some(g)
     }
 
     /// Every grant here, and the engine's switches.
