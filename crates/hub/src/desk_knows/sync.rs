@@ -548,6 +548,12 @@ impl KnowsSync {
         // it can't read, say), so nothing is marked and the agent backs off:
         // otherwise its whole feed would be counted as held and never resent.
         let one_by_one = matches!(landed, Err(Failed::Rejected(_)));
+        // A bulk push that failed outright (not retried one by one) sent
+        // nothing: nothing is counted against the day.
+        if landed.is_err() && !one_by_one {
+            count = 0;
+            size = 0;
+        }
         if one_by_one {
             landed = Ok(());
             count = 0;
@@ -602,7 +608,15 @@ impl KnowsSync {
                 tracing::warn!(agent = %agent, error = %e, "what was sent to an agent wasn't counted for its day");
             }
         }
-        let marked: &[Outgoing] = if one_by_one { &done } else { &pending };
+        // Held as sent only what the agent's hub took: a bulk push that
+        // failed took nothing, and is sent again.
+        let marked: &[Outgoing] = if one_by_one {
+            &done
+        } else if landed.is_ok() {
+            &pending
+        } else {
+            &[]
+        };
         if !marked.is_empty() {
             self.desk
                 .knows_mark_sent(agent, marked, Utc::now())
