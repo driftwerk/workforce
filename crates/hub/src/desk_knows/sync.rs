@@ -193,7 +193,15 @@ struct Spent {
 }
 
 impl Spent {
-    fn room(&mut self, now: Instant, limits: &DeskKnowsSyncConfig) -> (usize, usize) {
+    /// What may be sent now: items and bytes. `day_bytes` is what the day
+    /// holds as kept in Postgres, which a restart doesn't forget; what this
+    /// run sent is counted too, and the larger of the two stands.
+    fn room(
+        &mut self,
+        now: Instant,
+        limits: &DeskKnowsSyncConfig,
+        day_bytes: usize,
+    ) -> (usize, usize) {
         let day = Duration::from_secs(24 * 60 * 60);
         while self
             .sent
@@ -208,7 +216,12 @@ impl Spent {
             .filter(|(at, _, _)| now.duration_since(*at) <= Duration::from_secs(60))
             .map(|(_, n, _)| n)
             .sum();
-        let bytes: usize = self.sent.iter().map(|(_, _, b)| b).sum();
+        let bytes: usize = self
+            .sent
+            .iter()
+            .map(|(_, _, b)| b)
+            .sum::<usize>()
+            .max(day_bytes);
         let items = (limits.send_per_minute as usize).saturating_sub(minute);
         let bytes = (limits.send_mb_per_day as usize * 1024 * 1024).saturating_sub(bytes);
         (items.min(BATCH_ITEMS), bytes.min(BATCH_BYTES))
@@ -475,13 +488,23 @@ impl KnowsSync {
     /// a time, within its limits.
     async fn send(&self, agent: &str, rule: &workforce_desk::knows::Rule) -> Result<(), Failed> {
         let now = Instant::now();
+        if self.spent.lock().get(agent).is_some_and(|s| s.waiting(now)) {
+            return Ok(());
+        }
+        // The day's bytes are Postgres's, not this run's: a restart gives
+        // no agent a fresh day.
+        let day_bytes = self
+            .desk
+            .knows_spent_day(agent, Utc::now())
+            .await
+            .map_err(|e| Failed::Retry(e.to_string()))?;
         let (items, bytes) = {
             let mut spent = self.spent.lock();
-            let s = spent.entry(agent.to_string()).or_default();
-            if s.waiting(now) {
-                return Ok(());
-            }
-            s.room(now, &self.limits)
+            spent.entry(agent.to_string()).or_default().room(
+                now,
+                &self.limits,
+                usize::try_from(day_bytes).unwrap_or(usize::MAX),
+            )
         };
         if items == 0 || bytes == 0 {
             return Ok(());
@@ -525,6 +548,12 @@ impl KnowsSync {
         // it can't read, say), so nothing is marked and the agent backs off:
         // otherwise its whole feed would be counted as held and never resent.
         let one_by_one = matches!(landed, Err(Failed::Rejected(_)));
+        // A bulk push that failed outright (not retried one by one) sent
+        // nothing: nothing is counted against the day.
+        if landed.is_err() && !one_by_one {
+            count = 0;
+            size = 0;
+        }
         if one_by_one {
             landed = Ok(());
             count = 0;
@@ -572,7 +601,22 @@ impl KnowsSync {
                 }
             }
         }
-        let marked: &[Outgoing] = if one_by_one { &done } else { &pending };
+        // What went out counts against the day, whether or not the rest of
+        // this pass lands.
+        if count > 0 || size > 0 {
+            if let Err(e) = self.desk.knows_spend(agent, Utc::now(), count, size).await {
+                tracing::warn!(agent = %agent, error = %e, "what was sent to an agent wasn't counted for its day");
+            }
+        }
+        // Held as sent only what the agent's hub took: a bulk push that
+        // failed took nothing, and is sent again.
+        let marked: &[Outgoing] = if one_by_one {
+            &done
+        } else if landed.is_ok() {
+            &pending
+        } else {
+            &[]
+        };
         if !marked.is_empty() {
             self.desk
                 .knows_mark_sent(agent, marked, Utc::now())
@@ -1037,12 +1081,20 @@ mod tests {
         };
         let mut s = Spent::default();
         let t0 = Instant::now();
-        assert_eq!(s.room(t0, &limits), (BATCH_ITEMS, BATCH_BYTES));
+        assert_eq!(s.room(t0, &limits, 0), (BATCH_ITEMS, BATCH_BYTES));
         s.sent.push_back((t0, 200, 512 * 1024));
-        assert_eq!(s.room(t0, &limits), (100, 512 * 1024));
+        assert_eq!(s.room(t0, &limits, 0), (100, 512 * 1024));
         // A minute on, the items are back; the day's bytes aren't.
         let later = t0 + Duration::from_secs(61);
-        assert_eq!(s.room(later, &limits), (BATCH_ITEMS, 512 * 1024));
+        assert_eq!(s.room(later, &limits, 0), (BATCH_ITEMS, 512 * 1024));
+        // A restarted hub has sent nothing it remembers, but Postgres
+        // does: a fresh run holds the day's bytes as kept, and the larger
+        // of the two stands.
+        let mut fresh = Spent::default();
+        assert_eq!(fresh.room(t0, &limits, 512 * 1024).1, 512 * 1024);
+        assert_eq!(fresh.room(t0, &limits, 1024 * 1024), (BATCH_ITEMS, 0));
+        assert_eq!(fresh.room(t0, &limits, 5 * 1024 * 1024), (BATCH_ITEMS, 0));
+        assert_eq!(s.room(later, &limits, 1024 * 1024).1, 0);
         assert!(!s.waiting(t0));
         s.failed(t0, false);
         assert!(s.waiting(t0));
