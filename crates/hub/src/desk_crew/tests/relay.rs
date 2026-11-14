@@ -299,7 +299,7 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         // the most, with the rest of the call, is over it.
         let r = tool("crew.interrupt")
             .execute(json!({"session_id": format!("devbox/{remote}"),
-                            "reason": "x".repeat(256 * 1024 - 64)}))
+                            "reason": "x".repeat(256 * 1024 - 200)}))
             .await
             .unwrap();
         assert!(r.error.as_deref().unwrap_or_default().contains("too large"), "{r:?}");
