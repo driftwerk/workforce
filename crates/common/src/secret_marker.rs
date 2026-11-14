@@ -211,7 +211,7 @@ pub struct CapturedSecret {
 ///
 /// Wire form: `[[secret:<id> type=<LABEL> preview=<PREVIEW>]]`
 ///
-/// Example: `[[secret:8a3f...0c2e type=ANTHROPIC_KEY preview=sk-an...wXyZ]]`
+/// Example: `[[secret:8a3f...0c2e type=ANTHROPIC_KEY preview=***]]`
 ///
 /// Choices:
 ///  * `[[ ... ]]` delimiters are uncommon in normal prose / code and don't
@@ -371,7 +371,7 @@ pub fn parse_markers_spanned(text: &str) -> Vec<(std::ops::Range<usize>, Marker)
 }
 
 /// Replace every marker in `text` with a human form. Used at outbound
-/// user surfaces so a leaked marker reads as `sk-an...wXyZ` (auto) or its
+/// user surfaces so a leaked marker reads as `***` (auto) or its
 /// bare name (named) rather than the noisy bracket form.
 pub fn render_markers_as_preview(text: &str) -> String {
     // A closure, not `"$3"`: `preview` is optional, and the literal expansion
@@ -385,25 +385,13 @@ pub fn render_markers_as_preview(text: &str) -> String {
     NAMED_MARKER_REGEX.replace_all(&auto, "$1").into_owned()
 }
 
-/// Build the partial-preview form `first4...last4` for a captured
-/// secret. Values shorter than 16 chars collapse to `***` to avoid
-/// leaking via the prefix. Three ASCII dots, deliberately matching the
-/// shape the operator asked for (`abcd...wxyz`).
-pub fn preview_of(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() < 16 {
-        return "***".to_string();
-    }
-    let head: String = chars.iter().take(4).collect();
-    let tail: String = chars
-        .iter()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}...{tail}")
+/// The preview a captured secret's marker carries: always `***`, whatever
+/// the value. No character of a secret is shown (no prefix, no tail): the
+/// marker's label (`type=`) says what kind it is and its id which one, and a
+/// fragment of a credential is itself a leak. The value is taken only so a
+/// caller reads as it always did.
+pub fn preview_of(_value: &str) -> String {
+    "***".to_string()
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -752,15 +740,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_of_short_value_is_stars() {
-        assert_eq!(preview_of("short"), "***");
-        // Boundary: exactly 15 chars -> ***
-        assert_eq!(preview_of("123456789012345"), "***");
-    }
-
-    #[test]
-    fn preview_of_long_value_is_first4_dots_last4() {
-        assert_eq!(preview_of("abcdefghij1234567890wxyz"), "abcd...wxyz");
+    fn a_preview_never_shows_a_character_of_the_secret() {
+        for value in ["short", "123456789012345", "abcdefghij1234567890wxyz", ""] {
+            assert_eq!(preview_of(value), "***", "{value:?}");
+        }
     }
 
     #[test]

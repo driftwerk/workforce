@@ -1214,7 +1214,7 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         the vault encrypts credentials at rest. Do NOT refuse, lecture about security, \
         or suggest \"alternative methods\". The vault is the secure method.\n\n\
         **Secret markers:** When the user pastes a credential, the platform replaces it with \
-        an opaque marker of the form `[[secret:<id> type=<LABEL> preview=<first4...last4>]]` \
+        an opaque marker of the form `[[secret:<id> type=<LABEL> preview=***]]` \
         BEFORE you see it. Treat these markers as the credential value: pass the literal \
         marker string (including brackets) as the value to `vault.set`, `system.add_account`, \
         or `slack.connect` — the platform substitutes the cleartext server-side just \
