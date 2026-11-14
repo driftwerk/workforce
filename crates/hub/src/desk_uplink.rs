@@ -34,7 +34,10 @@
 //!
 //! Every route here is the hub's own token's alone, from the
 //! `Authorization` header alone, as grants are: Desk's native side holds it,
-//! and no page, agent or session can ask them.
+//! and no page, agent or session can ask them. The engine key is also the
+//! hub holder's to read ([`public_key`]): the person's own Desk reads a
+//! machine's key over its paired path, to link that machine for an agent
+//! (Sees K7).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -186,15 +189,7 @@ fn not_native(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
                 .into_response(),
         );
     }
-    let ours = h
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| {
-            !s.state.auth_token.is_empty()
-                && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
-        });
-    (!ours).then(|| {
+    (!bearer_is_ours(s, h)).then(|| {
         (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "only Desk itself holds boss links, with the hub's own token"})),
@@ -403,9 +398,69 @@ async fn forget(
     }
 }
 
-/// This engine's public key, made the first time.
+/// Why a request for this engine's key is refused, when it is: unless it
+/// is Desk's native side (the hub's own token), it must be the person who
+/// holds this hub, as their own sign-in or a device paired with it
+/// ([`crate::desk_floor::holds_the_hub`], as Sees' rules are read): never
+/// an agent, a session, a member or another device. From the
+/// `Authorization` header alone, as every route here.
+async fn not_the_holders(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
+    if q.token.is_some() || bearer_is_ours(s, h) {
+        return not_native(s, h, q);
+    }
+    let refused = |status: StatusCode, why: &str| {
+        Some((status, Json(json!({ "error": why }))).into_response())
+    };
+    let caller = crate::gateway::resolve_caller_context(&s.state, h, None).await;
+    match caller.auth_failure {
+        Some(crate::gateway::AuthFailure::InvalidCredentials) => {
+            return refused(StatusCode::UNAUTHORIZED, "not allowed")
+        }
+        Some(crate::gateway::AuthFailure::StoreError) => {
+            return refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hub could not check that token",
+            )
+        }
+        None => {}
+    }
+    if crate::desk_floor::holds_the_hub(
+        s.state.identity_store.as_ref(),
+        true,
+        caller.identity_id.as_deref(),
+    ) {
+        return None;
+    }
+    if caller.identity_id.is_some() || caller.device_id.is_some() {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "only the person whose Desk this is reads its engine's key",
+        );
+    }
+    refused(StatusCode::UNAUTHORIZED, "not allowed")
+}
+
+/// Whether the request's bearer is the hub's own token, compared in
+/// constant time; an empty one is never it.
+fn bearer_is_ours(s: &Api, h: &HeaderMap) -> bool {
+    h.get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| {
+            !s.state.auth_token.is_empty()
+                && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
+        })
+}
+
+/// This engine's public key, made the first time. Desk's native side asks
+/// it with the hub's own token (to register at a boss link's mint), and
+/// the hub's holder asks it over Desk's paired path (Sees K7, a machine's
+/// key for the agent it shares with). Only the public half is answered;
+/// the private half never leaves the vault.
 async fn public_key(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    native!(s, h, q);
+    if let Some(r) = not_the_holders(&s, &h, &q).await {
+        return r;
+    }
     let Some(vault) = s.state.vault.as_ref() else {
         return no_vault();
     };
@@ -1182,5 +1237,122 @@ async fn keep_up(uplink: Uplink, hub_url: String, links: Vec<HeldLink>, cancel: 
             _ = tokio::time::sleep(wait) => {}
             _ = cancel.cancelled() => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    use workforce_identity::store::IdentityStore;
+    use workforce_identity::types::{Identity, IdentityRole};
+
+    async fn ask(app: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// The engine's key is read by Desk's native side with the hub's own
+    /// token, and by the person who holds the hub, over their paired Desk
+    /// or their own sign-in (Sees K7): the same key each time. A member's
+    /// device or sign-in, an unknown token, no one, and a token in the
+    /// address read nothing, and none of them makes the key.
+    #[tokio::test]
+    async fn the_engine_key_is_read_by_desk_itself_and_the_hub_holder_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fx, devices) = crate::remote_mcp::testing::fixture_with_devices(false);
+        let jwt = crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600)
+            .unwrap();
+        let sign_in = |who: &Identity| {
+            crate::jwt::generate_token_with_identity(
+                &jwt,
+                &who.display_name,
+                who.role,
+                Some(who.id.to_string()),
+            )
+            .unwrap()
+        };
+        let mut holder = Identity::new("Sam", IdentityRole::SystemAdmin);
+        let mut member = Identity::new("Mo", IdentityRole::Member);
+        fx.identities.create(&holder).unwrap();
+        fx.identities.create(&member).unwrap();
+        let (_, holders_desk) =
+            crate::remote_mcp::testing::pair_device(&fx, &devices, &mut holder, "Desk");
+        let (_, members_desk) =
+            crate::remote_mcp::testing::pair_device(&fx, &devices, &mut member, "Desk");
+        let vault = Arc::new(Vault::open(&dir.path().join("vault"), "test-key").unwrap());
+        let state = Arc::new(GatewayState {
+            jwt_config: Some(jwt.clone()),
+            vault: Some(Arc::clone(&vault)),
+            ..Arc::try_unwrap(fx.state)
+                .ok()
+                .expect("the fixture's only handle")
+        });
+        let app = routes(Arc::clone(&state));
+        let path = "/api/desk/engine-key";
+
+        let refused = [
+            ("a member's device", Some(members_desk.clone())),
+            ("a member's sign-in", Some(sign_in(&member))),
+            ("an unknown token", Some("wfp_not-a-device".to_string())),
+            ("no one", None),
+        ];
+        for (who, bearer) in &refused {
+            let (status, body) = ask(&app, path, bearer.as_deref()).await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "{who}: {status} {body}"
+            );
+            assert!(body.get("publicKey").is_none(), "{who}: {body}");
+        }
+        assert!(
+            vault.get(DESK_ENGINE_KEY).is_none(),
+            "no refused request made the key"
+        );
+        // In the address, even the holder's own device is refused.
+        let (status, _) = ask(&app, &format!("{path}?token={holders_desk}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = ask(
+            &app,
+            &format!("{path}?token={holders_desk}"),
+            Some(&holders_desk),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let mut keys = Vec::new();
+        for (who, bearer) in [
+            ("Desk's native side", state.auth_token.clone()),
+            ("the holder's paired Desk", holders_desk.clone()),
+            ("the holder's sign-in", sign_in(&holder)),
+        ] {
+            let (status, body) = ask(&app, path, Some(&bearer)).await;
+            assert_eq!(status, StatusCode::OK, "{who}: {body}");
+            let key = body["publicKey"].as_str().unwrap_or_default().to_string();
+            assert!(!key.is_empty(), "{who}: {body}");
+            keys.push(key);
+        }
+        assert!(keys.windows(2).all(|w| w[0] == w[1]), "one key: {keys:?}");
+
+        // The rest stay the native side's alone.
+        let (status, _) = ask(&app, "/api/desk/boss-links", Some(&holders_desk)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
