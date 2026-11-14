@@ -1008,7 +1008,8 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
         )
         .await;
         assert_eq!(code, 409);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Held in the browser past the wait for it to say so: still waiting.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
         assert_eq!(
             state(started.id),
             EngineSignInState::browser(),

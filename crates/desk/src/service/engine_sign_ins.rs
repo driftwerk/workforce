@@ -22,7 +22,6 @@
 //! answers; the kitty keyboard flags, cursor and device are answered too,
 //! for robustness.
 //!
-//!
 //! The CLI keeps the sign-in where its sessions read it. Nothing it signs
 //! in with passes through Desk but a pasted code, on its way to the CLI.
 //!
@@ -216,6 +215,9 @@ pub const DEVIN_ASKED_UNKNOWN: &str = "Devin's sign-in asked something Desk does
 /// What they read when Devin, with no browser, showed a prompt but no page
 /// Desk trusts.
 pub const DEVIN_PAGE_UNKNOWN: &str = "Devin's sign-in showed no page Desk knows to sign in on. Sign in in a terminal with `devin auth login`.";
+/// What they read when Devin, with no browser, showed its page but never
+/// asked for the code from it.
+pub const DEVIN_NO_CODE_PROMPT: &str = "Devin's sign-in showed its page but didn't ask for the code. Sign in in a terminal with `devin auth login`.";
 /// Devin couldn't listen for the browser's answer on this computer.
 pub const DEVIN_NO_CALLBACK: &str = "Devin couldn't start its sign-in on this computer: another app may be using what it needs. Paste a code instead, or sign in in a terminal with `devin auth login`.";
 /// The browser's answer never reached Devin.
@@ -820,6 +822,12 @@ impl Desk {
         if let Some(at) = entered_at {
             if said.in_browser {
                 self.engine_sign_in_moved(id, EngineSignInState::browser());
+            } else if state == EngineSignInState::Starting && said.asks && !said.picker {
+                // Asked something else after Enter: said now.
+                return Some(Ended::failed(
+                    DEVIN_ASKED_UNKNOWN,
+                    "asked something unknown after Enter",
+                ));
             } else if state == EngineSignInState::Starting
                 && since.saturating_sub(at) > DEVIN_BROWSER_IN
             {
@@ -835,7 +843,7 @@ impl Desk {
             // no page Desk knows above it has none to show.
             if said.asks {
                 return Some(match said.url {
-                    Some(_) => Ended::failed(DEVIN_ASKED_UNKNOWN, "asked other than a code"),
+                    Some(_) => Ended::failed(DEVIN_NO_CODE_PROMPT, "asked other than a code"),
                     None => Ended::failed(DEVIN_PAGE_UNKNOWN, "no page Desk knows"),
                 });
             }
@@ -867,6 +875,9 @@ impl Desk {
         }
         if since > DEVIN_SHOWS_IN {
             return Some(match manual {
+                true if said.url.is_some() => {
+                    Ended::failed(DEVIN_NO_CODE_PROMPT, "no code prompt in time")
+                }
                 true => Ended::failed(DEVIN_NO_PAGE, "showed no page in time"),
                 false => Ended::failed(DEVIN_ASKED_UNKNOWN, "showed nothing known in time"),
             });
@@ -1332,6 +1343,17 @@ mod tests {
         );
         // The real page carries no redirect_uri: its state and challenge are enough.
         assert!(!REAL_PAGE.contains("redirect_uri"));
+        // One that would send the browser elsewhere is never taken.
+        let away = "https://app.devin.ai/auth/cli/continue?state=a&code_challenge=b&redirect_uri=https://evil.example/cb";
+        assert_eq!(devin_said(&raw.replace(REAL_PAGE, away)).url, None);
+        assert_eq!(devin_said(&format!("Visit {away} to sign in")).url, None);
+        let fine = away.replace("&redirect_uri=https://evil.example/cb", "");
+        assert_eq!(
+            devin_said(&format!("Visit {fine} to sign in"))
+                .url
+                .as_deref(),
+            Some(fine.as_str())
+        );
         for cut in [
             "state=Zx8q3V1kQ2&",
             "code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&",
