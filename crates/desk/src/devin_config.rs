@@ -105,7 +105,7 @@ const WRITTEN_BACK_NAMED: [&str; 2] = ["keymap", "show_path"];
 /// with: a key that answers a permission prompt or changes the mode would
 /// turn the person's next keypress into a grant (Devin's prompt answers
 /// Once and Always on number keys).
-const KEYMAP_NOT_WRITTEN_BACK_ROOTS: [&str; 10] = [
+const KEYMAP_NOT_WRITTEN_BACK_ROOTS: [&str; 15] = [
     "allow",
     "approv",
     "permission",
@@ -116,7 +116,21 @@ const KEYMAP_NOT_WRITTEN_BACK_ROOTS: [&str; 10] = [
     "yolo",
     "danger",
     "autonom",
+    "accept",
+    "smart",
+    "plan",
+    "always",
+    "once",
 ];
+
+/// The keymap's contexts Devin documents (docs.devin.ai, config file and
+/// keyboard shortcuts): its prompts' and modes' aren't, so no other is
+/// written back.
+const KEYMAP_CONTEXTS: [&str; 5] = ["global", "editor", "input", "list", "readbox_input"];
+
+/// Documented actions the roots above would hold back, written back by
+/// these exact names: `accept_line` submits what is typed.
+const KEYMAP_ACTIONS_WRITTEN_BACK: [&str; 1] = ["accept_line"];
 
 /// The words of a mode setting's name, besides `mode`, that make it the
 /// permission mode's: Devin's is `permission_mode` (docs.devin.ai, config
@@ -218,11 +232,22 @@ fn protected_text(v: &str) -> bool {
 /// one that answers a permission prompt or changes the mode.
 fn protected_keymap_name(name: &str) -> bool {
     words_of(name).iter().any(|w| {
-        w == "mode"
+        // `mode` anywhere in a word (`cyclemode`), but `model`'s.
+        w.replace("model", "").contains("mode")
             || KEYMAP_NOT_WRITTEN_BACK_ROOTS
                 .iter()
                 .any(|r| w.starts_with(r))
     })
+}
+
+/// Whether the keymap's key `name`, at `depth` (2: a context, 3: an
+/// action), is never written back: a context Devin doesn't document, or
+/// an action named as a permission's or a mode's.
+fn protected_keymap_key(depth: usize, name: &str) -> bool {
+    match depth {
+        2 => !KEYMAP_CONTEXTS.contains(&name),
+        _ => !KEYMAP_ACTIONS_WRITTEN_BACK.contains(&name) && protected_keymap_name(name),
+    }
 }
 
 /// Whether `v` is a key spec (`ctrl-shift-k`, `K`, `ctrl--`): one key, or
@@ -244,7 +269,7 @@ fn keymap_shaped(depth: usize, v: &Value) -> bool {
     match (depth, v) {
         (1 | 2, Value::Object(o)) => o
             .iter()
-            .all(|(k, v)| !protected_keymap_name(k) && keymap_shaped(depth + 1, v)),
+            .all(|(k, v)| !protected_keymap_key(depth + 1, k) && keymap_shaped(depth + 1, v)),
         (3, Value::String(s)) => key_spec(s),
         (3, Value::Array(a)) => a.iter().all(|v| v.as_str().is_some_and(key_spec)),
         _ => false,
@@ -257,7 +282,7 @@ fn keymap_names_one(depth: usize, v: &Value) -> bool {
     match (depth, v) {
         (1 | 2, Value::Object(o)) => o
             .iter()
-            .any(|(k, v)| protected_keymap_name(k) || keymap_names_one(depth + 1, v)),
+            .any(|(k, v)| protected_keymap_key(depth + 1, k) || keymap_names_one(depth + 1, v)),
         _ => false,
     }
 }
@@ -470,7 +495,12 @@ fn protected(change: &Change, base: &Value) -> bool {
 fn protected_in_keymap(change: &Change, base: &Value) -> bool {
     let depth = change.path.len();
     depth > 3
-        || change.path[1..].iter().any(|k| protected_keymap_name(k))
+        || change
+            .path
+            .iter()
+            .enumerate()
+            .skip(1)
+            .any(|(i, k)| protected_keymap_key(i + 1, k))
         || change
             .value
             .as_ref()
@@ -1337,9 +1367,18 @@ mod tests {
             json!({"keymap": {"global": {"deny": "n", "reject_edit": "r", "trust_folder": "t"}}}),
             json!({"keymap": {"global": {"toggle_bypass": "b", "yolo": "y", "go_autonomous": "a"}}}),
             json!({"keymap": {"global": {"dangerous": "d"}}}),
+            // Under names Devin doesn't document: its prompts' and modes'.
+            json!({"keymap": {"prompt": {"always": "1", "once": "4"}}}),
+            json!({"keymap": {"prompts": {"answer_always": "1"}}}),
+            json!({"keymap": {"global": {"accept_edits": "a"}}}),
+            json!({"keymap": {"input": {"plan": "p", "smart": "s"}}}),
+            json!({"keymap": {"input": {"cyclemode": "m"}}}),
+            json!({"keymap": {"global": {"answer_once": "1"}}}),
+            json!({"keymap": {"global": {"toggle_planmode": "p"}}}),
         ] {
             assert!(changes(&json!({}), &ended).0.is_empty(), "{ended}");
-            let base = json!({"keymap": {"permission_prompt": {}, "approval": {}, "input": {}, "global": {}}});
+            let base = json!({"keymap": {"permission_prompt": {}, "approval": {}, "prompt": {},
+                "prompts": {}, "input": {}, "global": {}}});
             assert!(
                 changes(&base, &ended).0.is_empty(),
                 "{ended} into a context"
@@ -1351,6 +1390,32 @@ mod tests {
             &json!({"keymap": {"permission_prompt": "x"}}),
         );
         assert!(kept.is_empty(), "{kept:?}");
+        // Only the contexts Devin documents; their actions by any name but
+        // a permission's or a mode's (`accept_line` by that name alone).
+        for (ctx, action) in [
+            ("global", "clear_screen"),
+            ("global", "next_model"),
+            ("editor", "accept_line"),
+            ("editor", "beginning_of_line"),
+            ("input", "accept_line"),
+            ("list", "page_down"),
+            ("readbox_input", "open_external_editor"),
+        ] {
+            let ended = json!({"keymap": { ctx: { action: "ctrl-k" } }});
+            assert_eq!(changes(&json!({}), &ended).0.len(), 1, "{ctx}.{action}");
+        }
+        for ctx in ["chat", "Global", "permission", "modes", "x"] {
+            let ended = json!({"keymap": { ctx: { "clear_screen": "ctrl-k" } }});
+            assert!(changes(&json!({}), &ended).0.is_empty(), "{ctx}");
+            let base = json!({"keymap": { ctx: {} }});
+            assert!(changes(&base, &ended).0.is_empty(), "{ctx} there already");
+        }
+        assert!(changes(
+            &json!({}),
+            &json!({"keymap": {"editor": {"acceptLine": "k"}}})
+        )
+        .0
+        .is_empty());
         // A keymap anywhere but the top is no keymap.
         let (kept, _) = changes(
             &json!({}),
