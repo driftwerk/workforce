@@ -2433,7 +2433,7 @@ impl Desk {
             // login; what it says nothing readable of, its file says.
             (Engine::Devin, Some(_)) => {
                 let added = self.0.state.lock().session_env.clone();
-                let env = engine::without_devin_keys(&self.with_added(&added));
+                let env = engine::devin_login_env(&self.with_added(&added));
                 let said =
                     self.cli_says_in(program, &["auth", "status"], &env)
                         .await
