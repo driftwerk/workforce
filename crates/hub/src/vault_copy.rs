@@ -63,6 +63,10 @@ pub(crate) fn copy_credential(
     store: &dyn SecretStore,
     req: &CopyRequest<'_>,
 ) -> Option<Vec<CopyOutcome>> {
+    // A Desk link is never copied, at any tier, whichever caller asks.
+    if workforce_common::vault_scope::is_desk_link(req.path) {
+        return None;
+    }
     let value = read_source_value(store, req)?;
     Some(
         req.to_users
@@ -134,7 +138,7 @@ fn copy_to_user(
 /// Whether user id `u` is one path segment: none with a separator or `..`
 /// puts a per-user key under another.
 fn one_segment(u: &str) -> bool {
-    !u.contains(['/', '\\']) && !u.contains("..")
+    !u.is_empty() && u != "." && !u.contains(['/', '\\', '\0']) && !u.contains("..")
 }
 
 /// Drop empty and duplicate destination ids, preserving first-seen order.
@@ -456,6 +460,39 @@ mod tests {
             value_at(&store, Some("carol"), "hubs/x", VaultSource::GlobalPerUser),
             None
         );
+    }
+
+    /// A Desk link at a shared tier is never copied, whichever caller asks,
+    /// and no user id that isn't one plain segment names a source or a
+    /// destination.
+    #[test]
+    fn a_desk_link_is_never_copied_and_user_ids_are_one_segment() {
+        let (_dir, store) = store();
+        seed(
+            &store,
+            None,
+            "desk/links/x",
+            "wfr_link",
+            VaultSource::Global,
+        );
+        let dests = vec!["carol".to_string()];
+        let got = copy_credential(
+            &store,
+            &req(
+                "desk/links/x",
+                VaultSource::Global,
+                VaultSource::GlobalPerUser,
+                None,
+                &dests,
+            ),
+        );
+        assert!(got.is_none());
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "x/../y"] {
+            assert!(!one_segment(bad), "{bad:?}");
+        }
+        for good in ["bob", "bob@acme.io", "7c9e6679-7425-40de-944b-e07fc1f90ae7"] {
+            assert!(one_segment(good), "{good:?}");
+        }
     }
 
     #[test]
