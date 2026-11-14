@@ -254,7 +254,7 @@ impl CrewHub {
         let unbound: HashSet<String> = self.desk.unbound_bosses().into_iter().collect();
         let mut s = seen.lock();
         // Seen up to a sweep late: a turn's end in between is its too.
-        let since = Utc::now() - chrono::Duration::from_std(SWEEP * 3).unwrap_or_default();
+        let since = Utc::now() - chrono::Duration::from_std(SWEEP * 3 / 2).unwrap_or_default();
         s.unbound_since.retain(|b, _| unbound.contains(b));
         for b in unbound {
             s.unbound_since.entry(b).or_insert(since);
@@ -333,7 +333,7 @@ impl CrewHub {
                     crew.tell_dm(
                         &boss,
                         &format!(
-                            "{} has gone on {CONTINUES} times on my word alone, so I've stopped it there: it's yours to look at.",
+                            "{} has taken {CONTINUES} steps in a row without you, so I've stopped it there: it's yours to look at.",
                             view.label()
                         ),
                     )
@@ -373,7 +373,12 @@ impl CrewHub {
         seen: &parking_lot::Mutex<Seen>,
     ) -> Judged {
         let Some((service, o)) = self.overseer_named(boss) else {
-            if self.still_bosses(view) {
+            let still = self.desk.view(view.id).is_ok_and(|now| {
+                now.state == SessionState::Done
+                    && now.prompts == view.prompts
+                    && self.still_bosses(&now)
+            });
+            if still {
                 self.hand_to_work(view, seen);
             }
             return Judged::Done;
@@ -426,9 +431,10 @@ impl CrewHub {
         if self.person_has_questions(&now, boss) {
             return Judged::Later;
         }
-        // Act fully ended meanwhile: its full turn takes it, as before.
+        // Act fully ended meanwhile, or another boss has it now: the full
+        // turn takes it, as before.
         if !self.still_decides(&now, boss) || !self.judges_turn_ends_itself(&now) {
-            if self.still_bosses(&now) && !self.desk.boss_unbound(boss) {
+            if self.still_bosses(&now) {
                 self.hand_to_work(&now, seen);
             }
             return Judged::Done;
