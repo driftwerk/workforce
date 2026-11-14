@@ -298,7 +298,10 @@ impl CrewHub {
         };
         // The person is in that session themselves: it's theirs.
         if let Some(s) = session {
-            if self.person_in(s, crew::now() - self.desk.hold_for(boss)) {
+            // Only while they are at it (the wheel's hold): a later ask is
+            // the boss's to make.
+            let hold = self.desk.hold_for(boss);
+            if self.person_in_for(s, crew::now() - hold, hold) {
                 return Ok(json!(
                     "Not asked: the person is in that session themselves right now, so it's theirs. Don't ask about it; carry on with the rest."
                 ));
@@ -711,13 +714,27 @@ impl CrewHub {
     }
 
     /// Whether the person has taken part in `session` themselves since
-    /// `since` (typed, prompted, wrote or answered there), or has its wheel
-    /// now: then the boss says nothing about its questions.
+    /// `since` (typed or prompted there), within its boss's answer gap of
+    /// now (`[oversight.wake] answer_after_minutes`, never less than
+    /// `hold_minutes`), or has its wheel now: then the boss says nothing
+    /// about its questions.
     pub(crate) fn person_in(&self, session: Uuid, since: DateTime<Utc>) -> bool {
-        // Since then, or within the wheel's hold of now: they are at it.
-        let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
-        let hold = minute * workforce_desk::charge::HOLD.num_minutes() as i32;
-        let since = since.min(crew::now() - hold);
+        let o = self
+            .overseer_of_session(session)
+            .map(|(_, o)| o)
+            .unwrap_or_default();
+        self.person_in_for(session, since, self.answer_gap(&o))
+    }
+
+    /// [`Self::person_in`] with the gap given: the boss's own, worked out
+    /// once for many items.
+    pub(crate) fn person_in_for(
+        &self,
+        session: Uuid,
+        since: DateTime<Utc>,
+        gap: chrono::Duration,
+    ) -> bool {
+        let since = since.min(crew::now() - gap);
         self.desk
             .person_input_at(session)
             .is_some_and(|at| at > since)

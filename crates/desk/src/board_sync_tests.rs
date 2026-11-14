@@ -51,6 +51,7 @@ fn synced(state: TicketState) -> Ticket {
         assignee: None,
         clipped: false,
         html_read: 0,
+        html_prints: vec![],
         details: Default::default(),
         dev: None,
     });
@@ -1203,6 +1204,81 @@ fn preformatted_text_keeps_no_marks_and_its_own_fence() {
     assert_eq!(
         html_text("<pre>&lt;tag&gt; &amp; x</pre>"),
         "```\n<tag> & x\n```"
+    );
+}
+
+/// A body read as ADF on open stays while a pull reads the same HTML it
+/// took the place of, is never sent back, and gives way when the
+/// description changes there.
+#[test]
+fn a_body_read_as_adf_stays_until_the_description_changes_there() {
+    let html_body = "It **times** out.";
+    let mut t = synced(TicketState::Todo);
+    let e = t.external.as_mut().unwrap();
+    e.html_read = ADF_READ;
+    e.html_prints = vec![body_print(html_body)];
+    t.body = ":::panel{tone=info}\nIt **times** out.\n:::".into();
+    t.external.as_mut().unwrap().seen.body = t.body.clone();
+    let issue = |body: &str, newer: bool| Issue {
+        updated_at: match newer {
+            true => Utc::now(),
+            false => Utc::now() - Duration::hours(2),
+        },
+        ..jira_issue(
+            &json!({ "key": "ACME-482", "summary": "Fix the login", "status": "To Do",
+                "updated": "2026-11-09T10:00:00.000+0000",
+                "description_html": format!("<p>{body}</p>") }),
+            "",
+        )
+        .unwrap()
+    };
+    let same = issue("It <b>times</b> out.", true);
+    assert_eq!(same.body.as_deref(), Some(html_body));
+    assert_eq!(
+        pulled(&t, &same, &BTreeMap::new()).body,
+        None,
+        "changed there, not its words"
+    );
+    assert_eq!(
+        pulled(&t, &issue("It <b>times</b> out.", false), &BTreeMap::new()).body,
+        None
+    );
+    assert_eq!(
+        pulled(&t, &issue("Now it works.", true), &BTreeMap::new())
+            .body
+            .as_deref(),
+        Some("Now it works.")
+    );
+    // Unedited, it never goes back; edited here, it goes as plain markdown.
+    assert_eq!(push_of(&t, &[]).body, None);
+    t.body = "Ask :mention[Dana], edited here".into();
+    assert_eq!(
+        push_of(&t, &[]).body.as_deref(),
+        Some("Ask @Dana, edited here")
+    );
+    // Held only in part: never sent, read as ADF or not.
+    t.external.as_mut().unwrap().clipped = true;
+    assert_eq!(push_of(&t, &[]).body, None);
+    t.external.as_mut().unwrap().clipped = false;
+    t.external.as_mut().unwrap().html_read = HTML_READ;
+    assert_eq!(
+        push_of(&t, &[]).body.as_deref(),
+        Some("Ask :mention[Dana], edited here")
+    );
+}
+
+/// A Linear description's issue links and collapsibles are read as Desk
+/// writes them.
+#[test]
+fn a_linear_description_reads_with_its_links_and_collapsibles() {
+    let l = linear_issue(&json!({ "identifier": "MAN-4", "title": "Four",
+        "url": "https://linear.app/acme/issue/MAN-4/four",
+        "description": "Needs MAN-3.\n+++ Logs\nx\n+++",
+        "updatedAt": "2026-11-09T10:00:00.000Z", "state": { "name": "Todo", "type": "unstarted" } }))
+    .unwrap();
+    assert_eq!(
+        l.body.as_deref(),
+        Some("Needs [MAN-3](https://linear.app/acme/issue/MAN-3).\n:::details[Logs]\nx\n:::")
     );
 }
 
