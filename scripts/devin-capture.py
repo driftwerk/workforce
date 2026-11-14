@@ -339,7 +339,23 @@ LABEL_WORDS = set(
     out path plan primary provider region role roles scope scopes server session
     signed source sso status stored subscription team teams the tier to token
     true type updated url user username using valid verified via webapp with
-    workspace workspaces yes you
+    workspace workspaces yes you title date time count repo branch state kind
+    model last first summary description message messages cost duration
+    """.split()
+)
+
+# Things a computer's name is made of that name no one, and that model names
+# (`gemini-2.5-pro`) are made of too.
+MACHINE_WORDS = {"macbook", "pro", "air", "mini", "imac", "studio", "max", "ultra", "mac"}
+
+# Words never scrubbed as a name, even when they are one (a user called
+# `dev`, a role of `admin`): they are what field names and values are made of.
+COMMON_WORDS = LABEL_WORDS | MACHINE_WORDS | set(
+    """
+    user users dev admin administrator root test tester guest owner member
+    members viewer editor free enterprise personal null ubuntu runner devin
+    cognition local home work shared staff everyone wheel git main master
+    com org net edu gov
     """.split()
 )
 
@@ -353,11 +369,13 @@ def plain_label(label):
     return bool(words) and all(w.lower() in LABEL_WORDS for w in words)
 
 
-def labels_of(said):
+def labels_of(said, thrown=None):
     """`devin auth status`'s lines as their labels alone. A label is kept
     only if each of its words is a LABEL_WORD; its value never is. A line
     that isn't a label and a value is kept only if all its words are
-    LABEL_WORDS, and otherwise counted."""
+    LABEL_WORDS, and otherwise counted. What is left out goes to `thrown`,
+    so it is scrubbed from everything else too."""
+    thrown = [] if thrown is None else thrown
     lines = []
     for line in said.splitlines():
         line = line.strip()
@@ -367,35 +385,49 @@ def labels_of(said):
             r"^(\S.{0,38}?\S)\s{2,}(\S.*)$", line
         )
         if m:
-            label = m.group(1) if plain_label(m.group(1)) else "<label>"
+            if plain_label(m.group(1)):
+                label = m.group(1)
+            else:
+                label = "<label>"
+                thrown.append(m.group(1))
+            if m.group(2):
+                thrown.append(m.group(2))
             lines.append(label + (": <value>" if m.group(2) else ":"))
         elif plain_label(line):
             lines.append(line)
         else:
+            thrown.extend(w for w in line.split() if w.lower() not in LABEL_WORDS)
             n = len(line.split())
             lines.append("<line: %d word%s>" % (n, "" if n == 1 else "s"))
     return lines
 
 
-def key_paths(value, prefix=""):
+def key_paths(value, thrown=None, prefix="", strings=True):
     """A JSON value's key paths (`a.b`, `a[].c`), each key kept only if it is
-    a plain label: a key could be an org's name."""
+    a plain label: a key could be an org's name. Keys left out, and strings
+    when `strings`, go to `thrown`."""
     paths = set()
     if isinstance(value, dict):
         for k, x in value.items():
-            path = (prefix + "." if prefix else "") + (k if plain_label(k) else "<key>")
+            plain = plain_label(k)
+            if not plain and thrown is not None:
+                thrown.append(k)
+            path = (prefix + "." if prefix else "") + (k if plain else "<key>")
             paths.add(path)
-            paths |= key_paths(x, path)
+            paths |= key_paths(x, thrown, path, strings)
     elif isinstance(value, list):
         for x in value:
-            paths |= key_paths(x, prefix + "[]")
+            paths |= key_paths(x, thrown, prefix + "[]", strings)
+    elif isinstance(value, str) and strings and thrown is not None and not plain_label(value):
+        thrown.append(value)
     return paths
 
 
 SIGNED_IN_KEY = re.compile(r"(?i)^(is_?)?((logged|signed)_?in|authenticated)$")
 
 
-def auth_status(raw):
+def auth_status(raw, thrown=None):
+    thrown = [] if thrown is None else thrown
     out = {k: raw.get(k) for k in ("exit", "error") if k in raw}
     stdout, stderr = raw.get("stdout") or "", raw.get("stderr") or ""
     try:
@@ -404,13 +436,13 @@ def auth_status(raw):
         parsed = None
     if isinstance(parsed, (dict, list)):
         # JSON says itself by its keys; none of its values are kept.
-        out["jsonKeyPaths"] = sorted(key_paths(parsed))
+        out["jsonKeyPaths"] = sorted(key_paths(parsed, thrown))
         flags = [
             v for k, v in (parsed.items() if isinstance(parsed, dict) else [])
             if SIGNED_IN_KEY.match(k) and isinstance(v, bool)
         ]
         out["signedIn"] = flags[0] if flags else None
-        out["labels"] = labels_of(stderr)
+        out["labels"] = labels_of(stderr, thrown)
         return out
     lower = (stdout + "\n" + stderr).lower()
     out["signedIn"] = (
@@ -418,17 +450,50 @@ def auth_status(raw):
         if re.search(r"not (logged|signed) in", lower)
         else (True if re.search(r"(logged|signed) in", lower) else None)
     )
-    out["labels"] = labels_of(stdout + "\n" + stderr)
+    out["labels"] = labels_of(stdout + "\n" + stderr, thrown)
     return out
+
+
+def session_list(raw, session=None, thrown=None):
+    """`devin list` as its shape alone: key paths and a count for JSON, a
+    line count otherwise. Nothing it says is kept; the names in it (keys
+    that aren't labels, `/org/<name>` in a URL) go to `thrown`, and the
+    parsed list is returned too, for its NAME_KEYS."""
+    thrown = [] if thrown is None else thrown
+    out = {k: raw.get(k) for k in ("exit", "error") if k in raw}
+    stdout = raw.get("stdout") or ""
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        out["jsonKeyPaths"] = sorted(key_paths(parsed, thrown, strings=False))
+        for found in NAMED_SEGMENT.findall(stdout) + GIT_SSH.findall(stdout):
+            thrown.extend(found[1:3])
+        if isinstance(parsed, list):
+            out["entries"] = len(parsed)
+            out["listsThisSession"] = bool(session) and any(
+                session in json.dumps(e) for e in parsed
+            )
+    else:
+        out["stdoutLines"] = len(stdout.splitlines())
+    out["stderrLines"] = len((raw.get("stderr") or "").splitlines())
+    return out, parsed
 
 
 SECRET_KEYS = re.compile(
     r"(?i)(token|secret|passw(or)?d|api[_-]?key|authori[sz]ation|auth(?!or)|bearer|cookie|"
-    r"credential|session[_-]?key|private|signature|(^|[_-])(key|pat)$)"
+    r"credential|session[_-]?key|private|signature|(?-i:[a-z0-9]Key)$|(^|[_-])(key|pat)$)"
 )
 # Whatever is under these is the person's: their names are kept, not their
 # values.
-WHOLE_KEYS = re.compile(r"^(env|headers)$", re.I)
+WHOLE_KEYS = re.compile(r"(?i)(^|_)(env|environment|env_vars|headers|extra_headers)$")
+# A key whose value names someone: an org, a team, a user, an author.
+NAME_KEYS = re.compile(
+    r"(?i)(^|_)(org|orgs|organization|team|workspace|account|user|username|owner|"
+    r"created_by|updated_by|author|committer|display_name|full_name|login|email)"
+    r"(_(name|id|display_name|login|email|slug|handle))?$"
+)
 # Starting only where a run starts: linear on a long run with no `@`.
 EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
@@ -439,6 +504,12 @@ BEARER = re.compile(
     r"(?i)(?<![A-Za-z0-9])(bearer|token|basic)(\s+|\s*[:=]\s*)"
     r"((?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{8,})"
 )
+# `name=value`, `name: "value"`, `\"name\": \"value\"`: judged by the name.
+KEY_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,63})(\\?[\"']?[ \t]*[:=][ \t]*)"
+    r"(?:(\\?[\"'])([^\"'\\\n]+)|([^\s\"'\\,;&}\])<]+))"
+)
+NOT_A_SECRET = re.compile(r"(?i)^(-?[0-9.]+|true|false|null|none|bearer|basic|token)$")
 # The vendors' key shapes, exactly: case, separator and length.
 VENDOR_KEY = re.compile(
     r"\b(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"
@@ -447,44 +518,86 @@ VENDOR_KEY = re.compile(
 QUERY_SECRET = re.compile(
     r"(?i)([?&;](?:[a-z_]*(?:token|key|secret|sig|code|password|auth)[a-z_]*)=)([^&\s\"']+)"
 )
+# `git@host:user/repo`, and `https://github.com/user/repo`.
+GIT_SSH = re.compile(r"(?<![\w.-])([\w.-]+@[A-Za-z0-9.-]+):([\w.-]+?)/([\w.-]+?)(\.git)?(?![\w.-])")
+GIT_HTTPS = re.compile(
+    r"(?i)(https?://(?:[^/@\s]+@)?(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/)"
+    r"([\w.-]+)(?:/([\w.-]+?)(\.git)?(?![\w.-]))?"
+)
+URL_USER = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@")
+# A path segment after one of these names someone: `/org/acme/`, `/home/alice`.
+NAMED_SEGMENT = re.compile(
+    r"(?i)(/(?:orgs?|organi[sz]ations?|teams?|workspaces?|users?|u|accounts?|home|members?)/)"
+    r"([^/\s?#\"'<>]+)"
+)
 # Long runs: whether one is a key, token or hash is decided by `long_run`.
-LONG = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+LONG = re.compile(r"[A-Za-z0-9+/_-]{32,}={0,2}")
 MCP = re.compile(r"\bmcp__([A-Za-z0-9_-]+?)__")
+
+
+def mixed_random(run):
+    """A digit, and upper and lower case in fair share: base64, not a name
+    (camelCase has far fewer capitals)."""
+    letters = [c for c in run if c.isalpha()]
+    if not letters or not any(c.isdigit() for c in run):
+        return False
+    upper = sum(c.isupper() for c in letters)
+    return upper >= 0.2 * len(letters) and len(letters) - upper >= 0.2 * len(letters)
 
 
 def looks_random(run):
     """Whether a run with no `/` in it reads as a key, token or hash rather
-    than a name: a digit and both cases in fair share, or mostly digits and
-    hex."""
-    letters = [c for c in run if c.isalpha()]
+    than a name: base64-like, or mostly digits and hex."""
+    if mixed_random(run):
+        return True
     digits = sum(c.isdigit() for c in run)
     if not digits:
         return False
-    upper = sum(c.isupper() for c in letters)
-    lower = len(letters) - upper
-    if letters and upper >= 0.2 * len(letters) and lower >= 0.2 * len(letters):
-        return True
     hexish = sum(c in "0123456789abcdefABCDEF" for c in run)
     return hexish >= 0.9 * len(run) or digits >= 0.25 * len(run)
 
 
-# Things a computer's name is made of that name no one, and that model names
-# (`gemini-2.5-pro`) are made of too.
-MACHINE_WORDS = {"macbook", "pro", "air", "mini", "imac", "studio", "max", "ultra", "mac"}
+def name_parts(value):
+    """`value` and its parts of three or more characters, as words to
+    scrub: never a common word, a number, or a sentence."""
+    if not isinstance(value, str) or len(value) > 80:
+        return []
+    out = []
+    # An address's domain is a provider's (gmail, com), not the person's.
+    local = value.split("@")[0] if EMAIL.fullmatch(value.strip()) else value
+    for w in [value.strip()] + re.split(r"[^A-Za-z0-9]+", local):
+        w = re.sub(r"['\u2019]s$", "", w.strip(" \t\"'()[],"))
+        if len(w) >= 3 and re.search(r"[A-Za-z]", w) and w.lower() not in COMMON_WORDS:
+            out.append(w)
+    return out
+
+
+def git_config(key):
+    if not shutil.which("git"):
+        return ""
+    try:
+        return subprocess.run(
+            ["git", "config", "--get", key],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def own_words():
-    """The person's user, full and computer names: never in what is sent."""
-    words = {getpass.getuser()}
+    """The person's user, full, git and computer names: never in what is sent."""
+    words = [getpass.getuser()]
     machine = {socket.gethostname().split(".")[0]}
     try:
         import pwd
 
-        gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0]
-        words.add(gecos)
-        words.update(gecos.split())
+        words.append(pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0])
     except Exception:  # noqa: BLE001 - not every system has them
         pass
+    words += [git_config("user.name"), git_config("user.email")]
     if sys.platform == "darwin":
         for key in ("ComputerName", "LocalHostName"):
             try:
@@ -499,24 +612,49 @@ def own_words():
                 name = ""
             if name:
                 machine.add(name)
-    for name in list(machine):
-        words.add(name)
-        # "Alice's MacBook Pro": Alice, not MacBook or Pro.
-        for part in re.split(r"[\s_-]+", name):
-            part = re.sub(r"['’]s$", "", part)
-            if part.lower() not in MACHINE_WORDS:
-                words.add(part)
-    # Longest first, so a full name goes before its parts.
-    return sorted((w for w in words if w and len(w) >= 3), key=len, reverse=True)
+    # "Alice's MacBook Pro": Alice, not MacBook or Pro.
+    return [p for w in words + sorted(machine) for p in name_parts(w)]
 
 
 class Scrubber:
     """Replaces what could say who the person is, or let anyone in."""
 
-    def __init__(self, home):
+    def __init__(self, home, folder=None, words=()):
         self.home = home
-        self.words = own_words()
+        self.folder = os.path.basename(folder) if folder else None
+        self.words = set()
+        self.add_words(own_words())
+        self.add_words(words)
         self.seen = {}
+
+    def add_words(self, values, keep=()):
+        """Adds `values` (and their parts) to the names scrubbed; never one of
+        `keep`, the payloads' own field names."""
+        keep = {k.lower() for k in keep}
+        for v in values:
+            self.words.update(p for p in name_parts(v) if p.lower() not in keep)
+        # Longest first, so a full name goes before its parts.
+        self.ordered = sorted(self.words, key=len, reverse=True)
+
+    def learn(self, value, keys=None):
+        """The values under NAME_KEYS anywhere in `value`, as names; returns
+        every key seen."""
+        found, keys = [], set() if keys is None else keys
+
+        def walk(v):
+            if isinstance(v, list):
+                for x in v:
+                    walk(x)
+            elif isinstance(v, dict):
+                for k, x in v.items():
+                    keys.add(k)
+                    if NAME_KEYS.search(k) and isinstance(x, str):
+                        found.append(x)
+                    walk(x)
+
+        walk(value)
+        self.add_words(found, keep=keys)
+        return keys
 
     def place(self, kind, found, fold=False):
         # Each one numbered, so the same value reads the same everywhere and
@@ -529,37 +667,81 @@ class Scrubber:
     def mark(self, kind, fold=False):
         return lambda m: self.place(kind, m.group(0), fold)
 
+    def name(self, found):
+        return self.place("name", found, fold=True) if found else found
+
     def long_run(self, m):
         run = m.group(0)
         if "/" not in run:
             return self.place("long", run) if looks_random(run) else run
-        # A path, unless it reads as base64: not rooted, no empty segment,
-        # no extension after it, and random as a whole.
-        rooted = run.startswith("/") or m.start() > 0 and m.string[m.start() - 1] in "~."
-        extension = m.string[m.end() : m.end() + 1] == "."
-        if not rooted and "//" not in run and not run.endswith("/") and not extension:
-            if looks_random(run.replace("/", "")):
-                return self.place("long", run)
+        # Base64 first, the `/`s ignored; a path's segments only if it isn't.
+        core = run.strip("/")
+        lead, trail = run[: len(run) - len(run.lstrip("/"))], run[len(run.rstrip("/")) :]
+        if len(core.replace("/", "")) >= 32 and mixed_random(core.replace("/", "")):
+            return lead + self.place("long", core) + trail
         return "/".join(
             self.place("long", seg) if len(seg) >= 32 and looks_random(seg) else seg
             for seg in run.split("/")
         )
 
+    def key_value(self, m):
+        found = m.group(4) or m.group(5)
+        if NOT_A_SECRET.match(found) or found.startswith("<"):
+            return m.group(0)
+        if SECRET_KEYS.search(m.group(1)):
+            hidden = self.place("redacted", found)
+        elif NAME_KEYS.search(m.group(1)) or re.match(r"(?i)^organi[sz]ation$", m.group(1)):
+            hidden = self.name(found)
+        else:
+            return m.group(0)
+        return m.group(1) + m.group(2) + (m.group(3) or "") + hidden
+
+    def email(self, m):
+        # `git@github.com:` is a remote's host, not an address.
+        if m.group(0).lower().startswith("git@") and m.string[m.end() : m.end() + 1] == ":":
+            return m.group(0)
+        return self.place("email", m.group(0), fold=True)
+
     def text(self, s):
+        # JSON in a string is scrubbed as JSON, so its keys judge its values.
+        if s[:1] in "{[" and s.rstrip()[-1:] in "}]":
+            try:
+                parsed = json.loads(s)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(self.value(parsed))
         if self.home and len(self.home) > 1:
             s = re.sub(re.escape(self.home) + r"(?=/|$|[\s\"'])", "~", s)
+        if self.folder:
+            s = s.replace(self.folder, "<capture-folder>")
         s = MCP.sub(lambda m: "mcp__" + self.place("server", m.group(1)) + "__", s)
         s = UUID.sub(self.mark("uuid", fold=True), s)
         s = JWT.sub(self.mark("token"), s)
         s = BEARER.sub(lambda m: m.group(1) + m.group(2) + self.place("token", m.group(3)), s)
+        s = KEY_VALUE.sub(self.key_value, s)
         s = QUERY_SECRET.sub(lambda m: m.group(1) + self.place("redacted", m.group(2)), s)
         s = VENDOR_KEY.sub(self.mark("key"), s)
-        s = EMAIL.sub(self.mark("email", fold=True), s)
+        s = GIT_SSH.sub(
+            lambda m: m.group(1) + ":" + self.name(m.group(2)) + "/" + self.name(m.group(3)) + (m.group(4) or ""),
+            s,
+        )
+        s = GIT_HTTPS.sub(
+            lambda m: m.group(1) + self.name(m.group(2))
+            + ("/" + self.name(m.group(3)) + (m.group(4) or "") if m.group(3) else ""),
+            s,
+        )
+        s = URL_USER.sub(lambda m: m.group(1) + self.name(m.group(2)) + "@", s)
+        s = NAMED_SEGMENT.sub(
+            lambda m: m.group(1) + (m.group(2) if m.group(2).startswith("<") else self.name(m.group(2))),
+            s,
+        )
+        s = EMAIL.sub(self.email, s)
         s = LONG.sub(self.long_run, s)
-        for word in self.words:
+        for word in self.ordered:
             s = re.sub(
                 r"(?<!\w)" + re.escape(word) + r"(?!\w)",
-                lambda m: self.place("name", m.group(0), fold=True),
+                lambda m: self.name(m.group(0)),
                 s,
                 flags=re.I,
             )
@@ -567,7 +749,8 @@ class Scrubber:
 
     def value(self, v, secret=False):
         """`v` scrubbed. Under a key that names a secret, every string is
-        replaced; keys, numbers, booleans and the shape are kept."""
+        replaced; under one that names someone, it is a name. Keys, numbers,
+        booleans and the shape are kept."""
         if isinstance(v, str):
             return "<redacted>" if secret and v else self.text(v)
         if isinstance(v, list):
@@ -579,7 +762,10 @@ class Scrubber:
                 while k2 in out:  # never merge two keys into one
                     k2 = "%s#" % k2
                 hidden = secret or bool(WHOLE_KEYS.search(k) or SECRET_KEYS.search(k))
-                out[k2] = self.value(x, hidden)
+                if not hidden and NAME_KEYS.search(k) and isinstance(x, str) and x:
+                    out[k2] = self.name(x)
+                else:
+                    out[k2] = self.value(x, hidden)
             return out
         return v
 
@@ -728,6 +914,12 @@ def capture(devin, home, folder):
         finally:
             remove(observe)
 
+        if not read_log(log) and first_exit:
+            say(
+                "Devin ended (exit %s) before it ran anything, so there is nothing to "
+                "capture. Check that `devin` starts on its own, then try again." % first_exit
+            )
+            return 1
         if not read_log(log):
             say(
                 "Devin didn't run the test hooks, so there is nothing to capture. "
@@ -743,16 +935,6 @@ def capture(devin, home, folder):
         ]
         session = next((s for s in started if isinstance(s, str) and s), None)
         listed = output_of(devin, ["list", "--format", "json"], work)
-        try:
-            entries = json.loads(listed.get("stdout") or "null")
-            if isinstance(entries, list):
-                # Only this capture's own session, should the list hold others.
-                listed["stdout"] = json.dumps(
-                    [e for e in entries if session and session in json.dumps(e)]
-                )
-                listed["entries"] = len(entries)
-        except ValueError:
-            pass
 
         say(
             "Run 2 of 2: the test hook answers for Devin now. Don't press anything until it "
@@ -777,13 +959,17 @@ def capture(devin, home, folder):
 
         records = read_log(log)
         events, tools = shapes(records)
+        # What auth status and the list say of anyone is scrubbed everywhere.
+        thrown = []
+        status = auth_status(status, thrown)
+        listed, entries = session_list(listed, session, thrown)
         result = {
             "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "platform": sys.platform,
             "hadOwnConfig": had_config,
             "userConfigChangedDuringRun": fingerprint(home) != before,
             "version": version,
-            "authStatus": auth_status(status),
+            "authStatus": status,
             "list": listed,
             "resumedById": session is not None,
             "exits": [first_exit, second_exit],
@@ -795,7 +981,10 @@ def capture(devin, home, folder):
         result.update(own_hooks(mine))
         # The capture's own keys are its own ("authStatus" names no secret);
         # everything under them is scrubbed.
-        scrub = Scrubber(home)
+        scrub = Scrubber(home, folder)
+        keys = scrub.learn(records)
+        scrub.learn(entries, keys)
+        scrub.add_words(thrown, keep=keys)
         result = {k: scrub.value(v) for k, v in result.items()}
         # Written whole or not at all: an interrupt never leaves half of it.
         private_file(part, json.dumps(result, indent=2))
