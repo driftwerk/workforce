@@ -32,6 +32,8 @@ fn draft(dir: &Path, titles: &[(&str, &[usize])]) -> Draft {
                 folder: dir.to_string_lossy().into_owned(),
                 view: None,
                 needs: needs.to_vec(),
+                machine: None,
+                model: None,
             })
             .collect(),
     }
@@ -67,6 +69,8 @@ fn kept(p: &PlanDetail) -> Vec<DraftTicket> {
                 .iter()
                 .filter_map(|n| ids.iter().position(|i| i == n))
                 .collect(),
+            machine: None,
+            model: None,
         })
         .collect()
 }

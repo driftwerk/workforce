@@ -153,6 +153,12 @@ fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
 
+/// What the ticket tool says on one of the person's machines of a ticket
+/// it can't see.
+const MACHINE_BOARD: &str = "Tickets for work on this machine are on the board on the person's \
+own computer, which this machine's Desk doesn't hold, so the ticket tool can't see or move them \
+here. Say plainly in your replies what you finished and what is left; your boss moves the ticket.";
+
 fn written(e: BoardWrite) -> DeskError {
     match e {
         BoardWrite::PrefixTaken(_) => DeskError::Conflict(e.to_string()),
@@ -1116,6 +1122,45 @@ impl Desk {
             .await
     }
 
+    /// Gives `t` to `started`, its plan's session on one of the person's
+    /// machines (`<machine>/<id>`, which no local session's id is), in
+    /// Doing. That machine's hub holds no board, so the session isn't told
+    /// on its line here: its prompt says the ticket.
+    pub(super) async fn assign_machine_session(
+        &self,
+        mut t: Ticket,
+        key: &str,
+        started: &super::plans::Started,
+        by: &By,
+    ) -> Result<TicketView, DeskError> {
+        let machine = started.machine.as_deref().ok_or_else(|| {
+            DeskError::Invalid("That session isn't on one of your machines.".into())
+        })?;
+        let party = Party {
+            kind: PartyKind::Session,
+            id: format!("{machine}/{}", started.id),
+            name: started.name.clone(),
+            engine: None,
+            origin: None,
+        };
+        let mut at = now();
+        loop {
+            t.assignee = Some(party.clone());
+            self.to_column(&mut t, TicketState::Doing, at).await?;
+            match self.0.store.put_ticket(&mut t).await {
+                Ok(()) => break,
+                Err(TicketWrite::Stale) => {
+                    t = self.ticket_of(t.id).await?;
+                    at = now();
+                }
+                Err(e) => return Err(stale(e)),
+            }
+        }
+        let text = format!("gave {key} to {} on {machine}", started.name);
+        self.ticket_changed(t, by, Kind::TicketAssigned, Some(party), text)
+            .await
+    }
+
     async fn assign_agent(
         &self,
         mut t: Ticket,
@@ -1491,6 +1536,19 @@ impl Desk {
         }
     }
 
+    /// On a machine, a ticket the tool can't find here is on the person's
+    /// own computer's board, which this machine doesn't hold: said so,
+    /// never only that there's no such ticket.
+    fn not_on_machine(&self, why: String, key: Option<&str>) -> String {
+        if !self.0.opts.bosses.machine {
+            return why;
+        }
+        match key {
+            Some(k) => format!("{k}: {MACHINE_BOARD}"),
+            None => MACHINE_BOARD.to_string(),
+        }
+    }
+
     /// Runs the line's `ticket` tool for the session `caller`.
     pub(super) async fn ticket_call(
         &self,
@@ -1529,14 +1587,23 @@ impl Desk {
                 for t in mine {
                     out.push(self.ticket_said(caller, t).await.map_err(say)?);
                 }
+                if out.is_empty() && self.0.opts.bosses.machine {
+                    return Ok(json!({ "tickets": out, "note": MACHINE_BOARD }));
+                }
                 Ok(json!({ "tickets": out }))
             }
             TicketCall::Get { key } => {
-                let t = self.named_ticket(caller, Some(&key)).await?;
+                let t = self
+                    .named_ticket(caller, Some(&key))
+                    .await
+                    .map_err(|e| self.not_on_machine(e, Some(&key)))?;
                 self.ticket_said(caller, t).await.map_err(say)
             }
             TicketCall::Update { key, state } => {
-                let t = self.named_ticket(caller, key.as_deref()).await?;
+                let t = self
+                    .named_ticket(caller, key.as_deref())
+                    .await
+                    .map_err(|e| self.not_on_machine(e, key.as_deref()))?;
                 let k = self.key_of(&t).await.map_err(say)?;
                 if t.session() != Some(caller) {
                     return Err(match &t.assignee {
@@ -1562,7 +1629,10 @@ impl Desk {
                 Ok(json!({ "key": v.key, "state": v.ticket.state }))
             }
             TicketCall::Comment { key, text } => {
-                let t = self.named_ticket(caller, key.as_deref()).await?;
+                let t = self
+                    .named_ticket(caller, key.as_deref())
+                    .await
+                    .map_err(|e| self.not_on_machine(e, key.as_deref()))?;
                 let k = self.key_of(&t).await.map_err(say)?;
                 let text = crate::line::typable(&text).trim().to_string();
                 board::within("comment", &text, board::COMMENT_MAX)?;

@@ -169,6 +169,47 @@ pub struct Planned {
     /// The tickets of the plan it needs done first.
     #[serde(default)]
     pub needs: Vec<Uuid>,
+    /// The person's machine it runs on, as the sidebar names it
+    /// (`devbox`); none is this computer. Its folder is that machine's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The model its session runs, as its engine names it; none is the
+    /// engine's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// What a draft says of this computer as a ticket's machine.
+pub const THIS_COMPUTER: &str = "local";
+/// The longest model name a ticket says.
+pub const MODEL_MAX: usize = 100;
+
+/// Whether `name` can name one of the person's machines, as the sidebar
+/// does (`session:<machine>/<id>`): letters, digits, `-`, `_` and `.`, not
+/// starting with a dot, and not this computer's own word.
+pub fn machine_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name.len() <= 100
+        && !name.eq_ignore_ascii_case(THIS_COMPUTER)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Whether `model` reads as a model's name on an engine's command line,
+/// never as an option: `claude-opus-4-1`, `gpt-5.5`, `sonnet[1m]`,
+/// `us.anthropic.claude-sonnet-4-5:0`.
+pub fn model_ok(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MODEL_MAX
+        && model
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && model.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '[' | ']' | '@')
+        })
 }
 
 /// What a plan may spend, as the person approves it: counted over every
@@ -334,6 +375,15 @@ pub struct DraftTicket {
     /// The places in the list (from 0) of the tickets it needs done first.
     #[serde(default)]
     pub needs: Vec<usize>,
+    /// The person's machine it runs on (`devbox`), or [`THIS_COMPUTER`];
+    /// none keeps a ticket the plan has where it runs, and starts a new
+    /// one on this computer.
+    #[serde(default)]
+    pub machine: Option<String>,
+    /// The model its session runs; `""` is the engine's default, none
+    /// keeps a ticket the plan has on its model.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// What is wrong with a plan, in the words the person and the boss read.
@@ -370,6 +420,16 @@ pub enum Problem {
     NoLine { ticket: usize, engine: &'static str },
     #[error("Ticket {ticket}'s folder {folder:?} isn't a folder on this computer.")]
     NoFolder { ticket: usize, folder: String },
+    #[error("Ticket {ticket}'s folder {folder:?} isn't a full path on {machine}: give it as /home/… or /Users/… there.")]
+    NoMachineFolder {
+        ticket: usize,
+        folder: String,
+        machine: String,
+    },
+    #[error("Ticket {ticket} names the machine {machine:?}, which can't be one of the person's machines; name one as the sidebar does (like devbox), or local for this computer.")]
+    BadMachine { ticket: usize, machine: String },
+    #[error("Ticket {ticket} names the model {model:?}, which can't be a model's name.")]
+    BadModel { ticket: usize, model: String },
     #[error("Ticket {ticket} isn't one this plan has; leave out its id to add it.")]
     UnknownTicket { ticket: usize },
     #[error("Ticket {ticket} is in the list twice.")]
@@ -460,6 +520,31 @@ pub fn snapshot_of(
                 }
             },
         };
+        let was = before.and_then(|b| b.ticket(ids[i]));
+        let machine = match t.machine.as_deref().map(str::trim) {
+            None => was.and_then(|w| w.machine.clone()),
+            Some(m) if m.is_empty() || m.eq_ignore_ascii_case(THIS_COMPUTER) => None,
+            Some(m) if machine_ok(m) => Some(m.to_string()),
+            Some(m) => {
+                problems.push(Problem::BadMachine {
+                    ticket,
+                    machine: m.to_string(),
+                });
+                None
+            }
+        };
+        let model = match t.model.as_deref().map(str::trim) {
+            None => was.and_then(|w| w.model.clone()),
+            Some("") => None,
+            Some(m) if model_ok(m) => Some(m.to_string()),
+            Some(m) => {
+                problems.push(Problem::BadModel {
+                    ticket,
+                    model: m.chars().filter(|c| !c.is_control()).take(120).collect(),
+                });
+                None
+            }
+        };
         let mut needs = Vec::new();
         for &n in &t.needs {
             match ids.get(n) {
@@ -481,6 +566,8 @@ pub fn snapshot_of(
                 folder: t.folder.trim().to_string(),
                 view,
                 needs,
+                machine,
+                model,
             });
         }
     }
@@ -541,15 +628,33 @@ pub fn validate(
         if len > BODY_MAX {
             problems.push(Problem::LongBody { ticket, len });
         }
-        if let Some(p) = engine_problem(ticket, t.engine, t.view, engines) {
-            problems.push(p);
-        }
         let folder = t.folder.trim();
-        if !std::path::Path::new(folder).is_absolute() || !is_dir(folder) {
-            problems.push(Problem::NoFolder {
-                ticket,
-                folder: t.folder.clone(),
-            });
+        match &t.machine {
+            // On a machine, what is there is the machine's to say when the
+            // session starts: here only that it can start there at all.
+            Some(machine) => {
+                if let Some(p) = startable_problem(ticket, t.engine, t.view) {
+                    problems.push(p);
+                }
+                if !folder.starts_with('/') {
+                    problems.push(Problem::NoMachineFolder {
+                        ticket,
+                        folder: t.folder.clone(),
+                        machine: machine.clone(),
+                    });
+                }
+            }
+            None => {
+                if let Some(p) = engine_problem(ticket, t.engine, t.view, engines) {
+                    problems.push(p);
+                }
+                if !std::path::Path::new(folder).is_absolute() || !is_dir(folder) {
+                    problems.push(Problem::NoFolder {
+                        ticket,
+                        folder: t.folder.clone(),
+                    });
+                }
+            }
         }
         for n in &t.needs {
             if *n == t.id {
@@ -601,6 +706,13 @@ fn engine_problem(
             engine: title,
         });
     }
+    startable_problem(ticket, engine, view)
+}
+
+/// What keeps `engine` in `view` from running a boss's ticket anywhere:
+/// Desk can't start it there, or it has no line for its boss.
+fn startable_problem(ticket: usize, engine: Engine, view: Option<View>) -> Option<Problem> {
+    let title = engine.title();
     let Some(view) = view
         .or_else(|| engine::views(engine).first().copied())
         .filter(|&v| engine::runs(engine, v))
@@ -670,6 +782,12 @@ pub struct PlanTicket {
     pub folder: Option<String>,
     #[serde(default)]
     pub view: Option<View>,
+    /// The person's machine it runs on; none is this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The model its session runs; none is its engine's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// A session or an agent has it.
     #[serde(default)]
     pub assigned: bool,
@@ -746,10 +864,12 @@ pub fn next_starts(
     let states: HashMap<Uuid, TicketState> = tickets.iter().map(|t| (t.id, t.state)).collect();
     let mut ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &states)).collect();
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
-    let mut in_use: HashSet<&str> = tickets
+    // A folder is in use on its own computer: the same path on a machine is
+    // another folder.
+    let mut in_use: HashSet<(Option<&str>, &str)> = tickets
         .iter()
         .filter(|t| t.state == TicketState::Doing || t.starting)
-        .filter_map(|t| t.folder.as_deref())
+        .filter_map(|t| t.folder.as_deref().map(|f| (t.machine.as_deref(), f)))
         .collect();
     let mut busy = busy;
     let mut out = Vec::new();
@@ -765,7 +885,7 @@ pub fn next_starts(
             engine,
             folder: folder.to_string(),
             view: t.view,
-            worktree: !in_use.insert(folder),
+            worktree: !in_use.insert((t.machine.as_deref(), folder)),
         });
         busy += 1;
     }
@@ -853,7 +973,11 @@ pub fn plan_change(
         let Some(was) = applied.ticket(t.id) else {
             continue;
         };
-        let moved = was.engine != t.engine || was.folder != t.folder || was.view != t.view;
+        let moved = was.engine != t.engine
+            || was.folder != t.folder
+            || was.view != t.view
+            || was.machine != t.machine
+            || was.model != t.model;
         if moved && started.contains(&t.id) {
             return Err(Problem::Started {
                 title: was.title.clone(),
@@ -865,9 +989,16 @@ pub fn plan_change(
     }
     let engines: HashSet<Engine> = applied.tickets.iter().map(|t| t.engine).collect();
     let folders: HashSet<&str> = applied.tickets.iter().map(|t| t.folder.as_str()).collect();
+    let machines: HashSet<Option<&str>> = applied
+        .tickets
+        .iter()
+        .map(|t| t.machine.as_deref())
+        .collect();
     let elsewhere = next.tickets.iter().any(|t| {
         applied.ticket(t.id).is_some()
-            && (!engines.contains(&t.engine) || !folders.contains(t.folder.as_str()))
+            && (!engines.contains(&t.engine)
+                || !folders.contains(t.folder.as_str())
+                || !machines.contains(&t.machine.as_deref()))
     });
     let said = next.tickets.iter().any(|t| {
         applied
@@ -973,6 +1104,19 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         }
         if was.folder != t.folder || was.view != t.view {
             said.push(format!("moved {} to {}", q(t), t.folder));
+        }
+        if was.machine != t.machine {
+            said.push(format!(
+                "moved {} to {}",
+                q(t),
+                t.machine.as_deref().unwrap_or("this computer")
+            ));
+        }
+        if was.model != t.model {
+            said.push(match &t.model {
+                Some(m) => format!("set {} to run {m}", q(t)),
+                None => format!("set {} to its engine's own model", q(t)),
+            });
         }
     }
     if before.budget != after.budget {

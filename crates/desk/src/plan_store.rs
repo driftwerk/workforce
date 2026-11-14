@@ -120,6 +120,10 @@ pub struct Runs {
     pub engine: Option<Engine>,
     pub folder: Option<String>,
     pub view: Option<View>,
+    /// The person's machine it runs on; none is this computer.
+    pub machine: Option<String>,
+    /// The model its session runs; none is its engine's default.
+    pub model: Option<String>,
 }
 
 /// A `starting` link: the session about to start for a ticket.
@@ -270,13 +274,15 @@ impl DeskStore {
         client
             .execute(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
-                 version = version + 1 WHERE id = $1",
+                 machine = $6, model = $7, version = version + 1 WHERE id = $1",
                 &[
                     &ticket,
                     &runs.plan,
                     &runs.engine.map(Engine::as_str),
                     &runs.folder,
                     &runs.view.map(View::as_str),
+                    &runs.machine,
+                    &runs.model,
                 ],
             )
             .await?;
@@ -288,7 +294,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT id, plan, engine, folder, view FROM tickets WHERE plan = $1",
+                "SELECT id, plan, engine, folder, view, machine, model FROM tickets WHERE plan = $1",
                 &[&plan_id],
             )
             .await?
@@ -303,6 +309,8 @@ impl DeskStore {
                         engine: engine.as_deref().map(Engine::parse).transpose()?,
                         folder: r.try_get("folder")?,
                         view: view.as_deref().map(View::parse).transpose()?,
+                        machine: r.try_get("machine")?,
+                        model: r.try_get("model")?,
                     },
                 ))
             })
@@ -351,7 +359,7 @@ impl DeskStore {
             .query_opt(
                 "UPDATE tickets SET state = $3, rank = $4, state_at = $5, updated_at = $5, \
                  version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
-                 RETURNING version, engine, folder, view",
+                 RETURNING version, engine, folder, view, machine, model",
                 &[
                     &t.id,
                     &t.version,
@@ -383,6 +391,8 @@ impl DeskStore {
             engine: engine.as_deref().map(Engine::parse).transpose()?,
             folder: row.try_get(2)?,
             view: view.as_deref().map(View::parse).transpose()?,
+            machine: row.try_get(4)?,
+            model: row.try_get(5)?,
         })
     }
 
@@ -410,13 +420,16 @@ impl DeskStore {
             t.number = row.try_get(0)?;
             crate::board_store::insert_ticket_in(&*tx, t).await?;
             tx.execute(
-                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5 WHERE id = $1",
+                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
+                 machine = $6, model = $7 WHERE id = $1",
                 &[
                     &t.id,
                     &runs.plan,
                     &runs.engine.map(Engine::as_str),
                     &runs.folder,
                     &runs.view.map(View::as_str),
+                    &runs.machine,
+                    &runs.model,
                 ],
             )
             .await?;
@@ -604,6 +617,8 @@ mod tests {
                         folder: "/work/acme-web".into(),
                         view: None,
                         needs: vec![],
+                        machine: None,
+                        model: None,
                     }],
                 },
             };
@@ -622,6 +637,8 @@ mod tests {
                 engine: Some(Engine::Codex),
                 folder: Some("/work/acme-api".into()),
                 view: Some(View::Terminal),
+                machine: Some("devbox".into()),
+                model: Some("gpt-5.5".into()),
             };
             s.put_runs(t.id, &runs).await.unwrap();
             assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs)]);
@@ -644,6 +661,8 @@ mod tests {
                 engine: Some(Engine::Claude),
                 folder: Some("/work/acme-web".into()),
                 view: None,
+                machine: None,
+                model: None,
             },
         )
         .await
@@ -713,6 +732,8 @@ mod tests {
                     engine: Some(Engine::Claude),
                     folder: Some("/work/acme-api".into()),
                     view: None,
+                    machine: None,
+                    model: None,
                 },
             )
             .await
@@ -776,6 +797,8 @@ mod tests {
                 engine: Some(Engine::Claude),
                 folder: Some("/work".into()),
                 view: None,
+                machine: None,
+                model: None,
             };
             let mut rows = vec![(first, runs.clone()), (second, runs)];
             let r = Revision {

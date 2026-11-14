@@ -221,6 +221,12 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Plans' sessions on the person's machines, as last read there, by
+    /// `<machine>/<id>`; and when each machine was last read.
+    machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
+    machine_read: Mutex<HashMap<String, std::time::Instant>>,
+    /// Each machine's plan reads that failed in a row.
+    machine_down: Mutex<HashMap<String, u32>>,
     /// Sessions a start's work was given to, held from other starts until
     /// [`actions::REUSE_CLAIM`] has passed.
     reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
@@ -618,6 +624,9 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            machine_seen: Mutex::default(),
+            machine_read: Mutex::default(),
+            machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),
@@ -1123,6 +1132,47 @@ impl CrewHub {
 
 #[async_trait]
 impl Crew for CrewHub {
+    /// Through the relay Desk's native side takes, as a boss's relayed
+    /// call goes: only [`relay::DESK_CALLS`], which no boss's tool sends.
+    async fn machine_call(
+        &self,
+        machine: &str,
+        group: Option<&str>,
+        boss: &str,
+        call: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, workforce_desk::crew::MachineRefused> {
+        use workforce_desk::crew::MachineRefused;
+        if !relay::DESK_CALLS.contains(&call) || !relay::machine_ok(machine) {
+            return Err(MachineRefused::Refused(format!(
+                "{call} isn't asked of a machine."
+            )));
+        }
+        // The plan's start is the person's, who approved it: the boss's own
+        // ceiling is only what the call carries.
+        let Some((_, o)) = self.overseer_named(boss) else {
+            return Err(MachineRefused::Refused(format!(
+                "{boss} isn't a boss here."
+            )));
+        };
+        let ceiling = served::Ceiling {
+            level: o.level,
+            act: o.act,
+        };
+        let a = self
+            .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
+            .await?;
+        match a.status {
+            served::ServedStatus::Ok => Ok(a.body),
+            _ => Err(MachineRefused::Refused(
+                a.body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| format!("{machine} refused it."), str::to_string),
+            )),
+        }
+    }
+
     /// Every agent whose config names `group` for a boss is switched off
     /// and names it no more, through the same write as any change (history,
     /// admission, hot reload), so the group opens to the main overseer from

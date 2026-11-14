@@ -41,6 +41,8 @@ fn ticket(n: u128, state: TicketState, needs: &[u128]) -> PlanTicket {
         engine: Some(Engine::Claude),
         folder: Some("/work/acme-web".into()),
         view: None,
+        machine: None,
+        model: None,
         assigned: false,
         starting: false,
     }
@@ -55,6 +57,8 @@ fn planned(n: u128, title: &str, needs: &[u128]) -> Planned {
         folder: "/work/acme-web".into(),
         view: None,
         needs: needs.iter().map(|&x| u(x)).collect(),
+        machine: None,
+        model: None,
     }
 }
 
@@ -99,6 +103,8 @@ fn draft_ticket(title: &str, needs: &[usize]) -> DraftTicket {
         folder: "/work/acme-web".into(),
         view: None,
         needs: needs.to_vec(),
+        machine: None,
+        model: None,
     }
 }
 
@@ -265,6 +271,124 @@ fn a_draft_refuses_a_subagent_an_unknown_engine_and_bad_needs() {
         ]
     );
     assert!(plain(&problems).starts_with("Ticket 1 asks for a sub-agent"));
+}
+
+#[test]
+fn a_ticket_says_its_machine_and_model_and_keeps_them_unless_changed() {
+    let mut there = planned(7, "Add the cart API", &[]);
+    there.machine = Some("devbox".into());
+    there.model = Some("gpt-5.5".into());
+    let before = Snapshot {
+        parallel: None,
+        budget: None,
+        goal: "Ship".into(),
+        tickets: vec![there, planned(8, "Wire it", &[])],
+    };
+    let mut kept = draft_ticket("Add the cart API", &[]);
+    kept.id = Some(u(7));
+    let mut moved = draft_ticket("Wire it", &[]);
+    moved.id = Some(u(8));
+    moved.machine = Some(" devbox ".into());
+    moved.model = Some("claude-opus-4-8[1m]".into());
+    let mut home = kept.clone();
+    home.machine = Some("local".into());
+    home.model = Some(String::new());
+    let draft = |a: DraftTicket, b: DraftTicket| Draft {
+        goal: "Ship".into(),
+        tickets: vec![a, b],
+    };
+    let s = snapshot_of(
+        &draft(kept, moved.clone()),
+        Some(&before),
+        Engine::Claude,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(
+        s.tickets[0].machine.as_deref(),
+        Some("devbox"),
+        "kept when not said"
+    );
+    assert_eq!(s.tickets[0].model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(s.tickets[1].machine.as_deref(), Some("devbox"));
+    assert_eq!(s.tickets[1].model.as_deref(), Some("claude-opus-4-8[1m]"));
+    let s = snapshot_of(
+        &draft(home, moved.clone()),
+        Some(&before),
+        Engine::Claude,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(s.tickets[0].machine, None, "local is this computer");
+    assert_eq!(s.tickets[0].model, None, "blank is the engine's own");
+
+    let mut bad = moved.clone();
+    bad.machine = Some("../etc".into());
+    bad.model = Some("-rf; rm".into());
+    let problems = snapshot_of(
+        &draft(bad, moved),
+        Some(&before),
+        Engine::Claude,
+        &mut counter(),
+    )
+    .unwrap_err();
+    assert!(
+        problems.contains(&Problem::BadMachine {
+            ticket: 1,
+            machine: "../etc".into()
+        }),
+        "{problems:?}"
+    );
+    assert!(
+        problems.contains(&Problem::BadModel {
+            ticket: 1,
+            model: "-rf; rm".into()
+        }),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn a_machine_ticket_is_checked_there_not_on_this_computer() {
+    // Its folder isn't on this computer's disk, and its engine needn't be
+    // installed here: the machine says so when it starts.
+    let mut there = planned(1, "On devbox", &[]);
+    there.machine = Some("devbox".into());
+    there.folder = "/home/dev/vellev".into();
+    there.engine = Engine::Codex;
+    let mut relative = planned(2, "Relative there", &[]);
+    relative.machine = Some("devbox".into());
+    relative.folder = "vellev".into();
+    let mut pane = planned(3, "No way to start there", &[]);
+    pane.machine = Some("devbox".into());
+    pane.engine = Engine::Cursor;
+    let s = Snapshot {
+        parallel: None,
+        budget: None,
+        goal: "Ship".into(),
+        tickets: vec![there, relative, pane],
+    };
+    let problems = validate(&s, &engines(), &|_| false).unwrap_err();
+    assert!(
+        !problems
+            .iter()
+            .any(|p| format!("{p:?}").contains("ticket: 1")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.contains(&Problem::NoMachineFolder {
+            ticket: 2,
+            folder: "vellev".into(),
+            machine: "devbox".into()
+        }),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| format!("{p:?}").contains("ticket: 3")),
+        "{problems:?}"
+    );
 }
 
 #[test]
@@ -845,6 +969,8 @@ fn over_the_limit_nothing_starts_until_it_drains() {
             engine: Some(Engine::Claude),
             folder: Some("/work/acme-web".into()),
             view: None,
+            machine: None,
+            model: None,
             assigned: false,
             starting: false,
         });
@@ -852,4 +978,18 @@ fn over_the_limit_nothing_starts_until_it_drains() {
     assert!(next_starts(&p, &tickets, 5, 4, None).is_empty());
     assert!(next_starts(&p, &tickets, 4, 4, None).is_empty());
     assert_eq!(next_starts(&p, &tickets, 3, 4, None).len(), 1);
+}
+
+#[test]
+fn the_same_folder_on_another_computer_needs_no_copy_of_its_own() {
+    let mut here = ticket(1, TicketState::Todo, &[]);
+    here.folder = Some("/work/acme-web".into());
+    let mut there = ticket(2, TicketState::Todo, &[]);
+    there.machine = Some("devbox".into());
+    let mut there_too = ticket(3, TicketState::Todo, &[]);
+    there_too.machine = Some("devbox".into());
+    let p = plan(PlanState::Running);
+    let starts = next_starts(&p, &[here, there, there_too], 0, 4, None);
+    let copies: Vec<bool> = starts.iter().map(|s| s.worktree).collect();
+    assert_eq!(copies, [false, false, true], "only the second on devbox");
 }

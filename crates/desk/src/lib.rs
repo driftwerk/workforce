@@ -141,6 +141,7 @@ pub use service::{
 };
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
+    Started,
 };
 pub use service::{CommentPost, FileBytes, PostVia, READ_FRESH};
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
