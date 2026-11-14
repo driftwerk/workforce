@@ -668,37 +668,12 @@ mod tests {
         assert!(svc.initiate("app", vec![], None, None, None, None).is_err());
     }
 
-    /// What `run` logs on this thread, as one string.
-    fn logged(run: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let log = Captured::default();
-        let writer = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        let bytes = log.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
     #[test]
     fn a_device_pairing_code_is_never_logged() {
         let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
         let svc = DevicePairingService::new(store, device_config());
         let mut code = String::new();
-        let log = logged(|| {
+        let log = crate::logged(|| {
             let req = svc
                 .initiate("test-phone", vec!["chat".into()], None, None, None, None)
                 .unwrap();
