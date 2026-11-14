@@ -927,10 +927,10 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
         let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
         let q = d.store().line_message(ask).await.unwrap().unwrap();
         crew.post_question(&q).await;
-        // Within the hold (two test minutes) it waits for them.
+        // Within the wheel's hold it waits for them.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(dm_posts(&overseer, "acme-web asks:").is_empty(), "nothing posted");
-        assert!(crew.held_questions.lock().contains(&ask));
+        assert!(crew.is_held(ask).await);
         assert!(d.store().item_of_line(ask).await.unwrap().is_none());
 
         // Asked of the person before they stepped in: posted, then settled.
@@ -992,8 +992,10 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
 }
 
 /// A session's question asked a moment after the person was at that
-/// session is held, not dropped, in a session a boss runs too; once they
-/// have left it a hold's time, the next look posts it.
+/// session is held, not dropped, in a session a boss runs too, and kept in
+/// Postgres so a restart still says it; once they have left it for the
+/// boss's answer gap (`answer_after_minutes`, 10 by default), the next look
+/// posts it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_asked_just_after_the_person_left_is_held_then_posted() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -1048,10 +1050,7 @@ async fn a_question_asked_just_after_the_person_left_is_held_then_posted() {
         d.person_typing(run.id).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         let ask = ask_in(run.id, "May I rerun the flaky e2e job?").await;
-        assert!(
-            crew.held_questions.lock().contains(&ask),
-            "held, not dropped"
-        );
+        assert!(crew.is_held(ask).await, "held, not dropped");
         assert!(d.store().item_of_line(ask).await.unwrap().is_none());
 
         // One no boss runs: held, then posted once a hold's time passed.
@@ -1063,16 +1062,69 @@ async fn a_question_asked_just_after_the_person_left_is_held_then_posted() {
             "May I bump the API's rate limit for the load test?",
         )
         .await;
-        // Held a moment (two test minutes; not asserted, as a slow runner
-        // may take longer), then posted.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Held for the answer gap (ten test minutes; not asserted, as a
+        // slow runner may take longer), kept where a restart finds it, then
+        // posted.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
         crew.look_at_items().await;
         eventually("the held card", async || {
             dm_posts(&overseer, "acme-api asks:").into_iter().next()
         })
         .await;
-        assert!(!crew.held_questions.lock().contains(&ask));
+        assert!(!crew.is_held(ask).await);
         assert!(d.store().item_of_line(ask).await.unwrap().is_some());
+    })
+    .await;
+}
+
+/// A question held before a restart is still said after it: what is held
+/// is read from Postgres, never from memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_held_before_a_restart_is_said_after_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "May I drop the stale preview environments?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let id: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        d.line_escalate(
+            id,
+            &By::manager("desk", "Desk", "It can't be undone."),
+            workforce_desk::line::Escalation {
+                why: "It can't be undone.".into(),
+                options: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        // As a hub before the restart left it: held, and nothing in memory.
+        d.store().held_question_put(id).await.unwrap();
+        crew.look_at_items().await;
+        eventually("the held card", async || {
+            dm_posts(&overseer, "acme-api asks:").into_iter().next()
+        })
+        .await;
+        assert!(!crew.is_held(id).await);
+        // One no longer waiting on the person is let go unsaid.
+        d.store().held_question_put(uuid::Uuid::new_v4()).await.unwrap();
+        crew.post_held_questions().await;
+        assert!(d.store().held_questions().await.unwrap().is_empty());
     })
     .await;
 }

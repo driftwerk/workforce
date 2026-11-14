@@ -182,8 +182,9 @@ impl CrewHub {
         };
         // The person is in that session themselves, answering it or
         // typing there: theirs, and nothing is posted about it. At it only
-        // a moment before it asked, it waits for them to leave it a hold's
-        // time ([`CrewHub::post_held_questions`]).
+        // a moment before it asked, it is held (in Postgres, so a restart
+        // keeps it) until they have left it for its boss's answer gap
+        // ([`CrewHub::post_held_questions`]).
         if let Some(s) = q.from_session() {
             // Theirs for good: input since it asked, or the wheel pinned or
             // taken by a click since. A wheel that is theirs only from
@@ -200,15 +201,17 @@ impl CrewHub {
                 });
             let since_asked = taken || self.desk.person_input_at(s).is_some_and(|at| at > q.at);
             if since_asked {
-                self.held_questions.lock().remove(&q.id);
+                self.let_go(q.id).await;
                 return;
             }
             if self.person_in(s, q.at) {
-                self.held_questions.lock().insert(q.id);
+                if let Err(e) = self.desk.store().held_question_put(q.id).await {
+                    tracing::warn!(error = %format!("{e:#}"), "holding a session's question failed");
+                }
                 return;
             }
         }
-        self.held_questions.lock().remove(&q.id);
+        self.let_go(q.id).await;
         let e = q.escalation.clone().unwrap_or(Escalation {
             why: String::new(),
             options: Vec::new(),
@@ -295,16 +298,41 @@ impl CrewHub {
             .await;
     }
 
+    /// Lets the held session question `id` go, if it was held.
+    async fn let_go(&self, id: Uuid) {
+        if let Err(e) = self.desk.store().held_question_drop(id).await {
+            tracing::info!(error = %format!("{e:#}"), "a held question wasn't let go");
+        }
+    }
+
+    /// Whether the session question `id` is held now.
+    #[cfg(test)]
+    pub(crate) async fn is_held(&self, id: Uuid) -> bool {
+        self.desk
+            .store()
+            .held_questions()
+            .await
+            .unwrap_or_default()
+            .contains(&id)
+    }
+
     /// Says each held session question ([`Self::post_question`]) still
-    /// waiting on the person, once they have left its session a hold's
-    /// time; one they answered there, or that stopped waiting, is dropped.
+    /// waiting on the person, once they have left its session for its
+    /// boss's answer gap; one they answered there, or that stopped waiting,
+    /// is let go.
     pub(crate) async fn post_held_questions(&self) {
-        let held: Vec<Uuid> = self.held_questions.lock().iter().copied().collect();
+        let held = match self.desk.store().held_questions().await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "the held questions couldn't be read");
+                return;
+            }
+        };
         for id in held {
             let q = match self.desk.store().line_message(id).await {
                 Ok(Some(q)) if q.asked == Some(workforce_desk::line::Asked::Escalated) => q,
                 Ok(_) => {
-                    self.held_questions.lock().remove(&id);
+                    self.let_go(id).await;
                     continue;
                 }
                 Err(e) => {
