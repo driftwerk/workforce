@@ -350,6 +350,45 @@ impl DeskStore {
             .collect()
     }
 
+    /// Holds the session question `message` until the person has left its
+    /// session: kept across restarts.
+    pub async fn held_question_put(&self, message: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO boss_held_questions (line_message) VALUES ($1) \
+                 ON CONFLICT (line_message) DO NOTHING",
+                &[&message],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Lets the session question `message` go: said, theirs, or no longer
+    /// waiting.
+    pub async fn held_question_drop(&self, message: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "DELETE FROM boss_held_questions WHERE line_message = $1",
+                &[&message],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The session questions held, oldest first.
+    pub async fn held_questions(&self) -> Result<Vec<Uuid>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT line_message FROM boss_held_questions ORDER BY held_at",
+                &[],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
     /// The item not closed for the session question `message`, if one.
     pub async fn item_of_line(&self, message: Uuid) -> Result<Option<OpenItem>> {
         let client = self.pool().get().await?;

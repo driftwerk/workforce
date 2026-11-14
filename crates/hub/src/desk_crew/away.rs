@@ -443,11 +443,15 @@ impl CrewHub {
         let b = self.batch(service, o, state, now, Some(read_post)).await;
         let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
         let asks = |i: &&OpenItem| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm);
+        let gap = self.answer_gap(o);
         let waiting: Vec<&OpenItem> = open
             .iter()
             .filter(asks)
             .filter(|i| i.state == OpenState::Open)
-            .filter(|i| i.session.is_none_or(|s| !self.person_in(s, i.opened_at)))
+            .filter(|i| {
+                i.session
+                    .is_none_or(|s| !self.person_in_for(s, i.opened_at, gap))
+            })
             .collect();
         let parked: Vec<ParkedItem> = open
             .iter()
