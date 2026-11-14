@@ -90,7 +90,10 @@ pub fn shown(u: &MentionedUpdate, hidden: &dyn Fn(&str) -> bool) -> MentionedUpd
 /// Whether [`shown`] left out anything of `u`, so that `shown` is all that
 /// may be said: no headline of `u`'s own over it.
 pub fn hides(u: &MentionedUpdate, shown: &MentionedUpdate) -> bool {
-    u.headline != shown.headline
+    let items = |u: &MentionedUpdate| u.brief.iter().map(|g| g.items.len()).sum::<usize>();
+    items(u) != items(shown)
+        || u.needs_you.len() != shown.needs_you.len()
+        || u.sessions.len() != shown.sessions.len()
 }
 
 /// Whether `u` (already [`shown`]) says anything at all.
@@ -251,13 +254,18 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
             continue;
         }
         // `[name]`, alone or opening its line.
+        // `[name]` alone, or opening a done or for-you line; never a
+        // link (`[x](…)`), a checkbox or a tag in prose (`[WIP] …`).
         if let Some((name, rest)) = l.strip_prefix('[').and_then(|r| r.split_once(']')) {
-            let name = bare(name);
-            label = (!name.is_empty() && !name.eq_ignore_ascii_case(CREW_LABEL))
-                .then(|| clip(name, 60));
-            l = bare(rest);
-            if l.is_empty() {
-                continue;
+            let rest = bare(rest);
+            if !rest.starts_with('(') && (rest.is_empty() || marked(rest)) {
+                let name = bare(name);
+                label = (!name.is_empty() && !name.eq_ignore_ascii_case(CREW_LABEL))
+                    .then(|| clip(name, 60));
+                l = rest;
+                if l.is_empty() {
+                    continue;
+                }
             }
         }
         let item = |kind: BriefKind, rest: &str| {
@@ -277,15 +285,7 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
                 at,
             })
         };
-        let done = ["✔️", "✅", "✓", "✔", "☑️", "☑"]
-            .iter()
-            .find_map(|m| l.strip_prefix(m))
-            .map(bare);
-        let for_you = ["● for you", "for you", "needs you", "● needs you"]
-            .iter()
-            .find_map(|p| strip_ci(l, p))
-            .filter(|r| r.is_empty() || r.starts_with([':', ' ', '—', '–', '-']))
-            .map(|r| bare(r.trim_start_matches([':', ' ', '—', '–', '-'])));
+        let (done, for_you) = (done_of(l), for_you_of(l));
         let parsed = match (done, for_you) {
             // A suggestion is never something done.
             (Some(rest), _) if suggests(rest) => None,
@@ -370,13 +370,18 @@ fn bare(s: &str) -> &str {
     let mut s = s.trim();
     loop {
         let before = s.len();
-        s = s
-            .trim_matches(['*', '_', '~', '\u{fe0f}'])
-            .trim_start_matches(['-', '•'])
-            .trim();
+        s = s.trim_matches(['*', '~', '\u{fe0f}']).trim();
+        // A list mark is one followed by a space: `-5%` and `3.5x` are
+        // the line's own.
+        for mark in ["- ", "• ", "[ ] ", "[x] ", "[X] "] {
+            if let Some(rest) = s.strip_prefix(mark) {
+                s = rest.trim();
+            }
+        }
         let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         if digits > 0 {
-            if let Some(rest) = s[digits..].strip_prefix(['.', ')']) {
+            let rest = &s[digits..];
+            if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
                 s = rest.trim();
             }
         }
@@ -386,10 +391,38 @@ fn bare(s: &str) -> &str {
     }
 }
 
+const DONE_MARKS: [&str; 6] = ["✔️", "✅", "✓", "✔", "☑️", "☑"];
+
+/// What a done line says after its mark.
+fn done_of(l: &str) -> Option<&str> {
+    DONE_MARKS.iter().find_map(|m| l.strip_prefix(m)).map(bare)
+}
+
+/// What a for-you line says after "For you" (or "Needs you") and its
+/// colon or dash.
+fn for_you_of(l: &str) -> Option<&str> {
+    ["● for you", "for you", "● needs you", "needs you"]
+        .iter()
+        .find_map(|p| strip_ci(l, p))
+        .map(str::trim_start)
+        .filter(|r| r.starts_with([':', '—', '–', '-']))
+        .map(|r| bare(r.trim_start_matches([':', '—', '–', '-'])))
+}
+
+/// Whether `l` is a done or for-you line.
+fn marked(l: &str) -> bool {
+    done_of(l).is_some() || for_you_of(l).is_some()
+}
+
 /// Whether `l` is a suggestion, a plan or a question, never a fact.
 fn suggests(l: &str) -> bool {
     let l = l.trim();
     let lower = l.to_lowercase();
+    let opens = |p: &str| {
+        lower
+            .strip_prefix(p)
+            .is_some_and(|r| r.is_empty() || r.starts_with([' ', ',', ':']))
+    };
     l.ends_with('?')
         || [
             "i suggest",
@@ -411,11 +444,11 @@ fn suggests(l: &str) -> bool {
             "i'll",
             "here's",
             "here is",
-            "options:",
-            "option:",
+            "options",
+            "option",
         ]
         .iter()
-        .any(|p| lower.starts_with(p))
+        .any(|p| opens(p))
 }
 
 /// `s` without `prefix`, matched ignoring ASCII case.
@@ -722,6 +755,46 @@ mod tests {
         let all = lines.join("\n");
         assert!(!all.contains("suggest"), "{all}");
         assert!(!all.contains("tag the release"), "{all}");
+    }
+
+    #[test]
+    fn what_reads_like_a_mark_but_is_the_lines_own_is_kept() {
+        let reply = "[WIP] Release is unblocked\n\
+            - [x] ✓ -5% latency on the api — cache warmed\n\
+            [acme-web] ✓ 3.5x faster builds - sccache on\n\
+            ✓ Suggested fix merged — review passed\n\
+            ✓ I can rerun it later\n\
+            For you the build passed\n\
+            [PR 12](https://x.example) merged";
+        let u = parse_reply(reply, Utc::now());
+        assert_eq!(u.headline, "[WIP] Release is unblocked");
+        let all: Vec<(String, String)> = u
+            .brief
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| (g.label.clone(), i.action.clone())))
+            .collect();
+        assert_eq!(
+            all,
+            [
+                ("Crew".to_string(), "-5% latency on the api".to_string()),
+                ("acme-web".to_string(), "3.5x faster builds".to_string()),
+                ("acme-web".to_string(), "Suggested fix merged".to_string()),
+            ]
+        );
+        assert_eq!(u.more_items, 0);
+    }
+
+    #[test]
+    fn hiding_only_a_sessions_paragraph_is_hiding() {
+        let u = typical();
+        let s = shown(&u, &|_| false);
+        assert!(!hides(&u, &s));
+        let mut only = typical();
+        only.brief.clear();
+        only.needs_you.clear();
+        let s = shown(&only, &|s| s == WEB);
+        assert!(hides(&only, &s));
+        assert!(!says_anything(&MentionedUpdate { kept: vec![], ..s }));
     }
 
     #[test]

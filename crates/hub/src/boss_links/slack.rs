@@ -194,7 +194,8 @@ pub async fn post_blocks_in_thread(
     blocks: Vec<Value>,
 ) -> Result<(), String> {
     let text = crate::slack_manager::sanitize_outbound_logged(text);
-    send(service, key, &text, Some(blocks)).await
+    // No blocks at all: the text alone.
+    send(service, key, &text, (!blocks.is_empty()).then_some(blocks)).await
 }
 
 /// Posts `text` as it is into the Slack DM thread `key`.

@@ -807,18 +807,16 @@ impl CrewHub {
             use workforce_desk::update_brief as brief;
             let shown = brief::shown(&p.update, &hidden);
             // All of it about sessions the person is in: nothing is said.
-            if !brief::says_anything(&shown) && p.away.is_none() {
+            let hid = brief::hides(&p.update, &shown);
+            if !brief::says_anything(&shown) && (p.away.is_none() || hid) {
                 return;
             }
             // A catch-up's own headline, unless it was written over what
             // is no longer said.
-            let away = p
-                .away
-                .as_ref()
-                .map(|a| match brief::hides(&p.update, &shown) {
-                    true => "",
-                    false => a.headline.as_str(),
-                });
+            let away = p.away.as_ref().map(|a| match hid {
+                true => "",
+                false => a.headline.as_str(),
+            });
             let (purpose, state) = brief::floor_line(&shown, away);
             let state = workforce_common::redact::redact_secrets(&state);
             crate::floor::agents::briefed(
