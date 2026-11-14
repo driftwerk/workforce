@@ -139,6 +139,14 @@ fn each_adf_node_reads_as_its_desk_markdown() {
             "**Owner**:mention[Ann]:mention[Bo]",
         ),
         (
+            "no space before an inline picture's name that starts with a colon",
+            json!([p(json!([
+                t("Owner"),
+                { "type": "mediaInline", "attrs": { "id": "x", "type": "file", "alt": ":)" } }
+            ]))]),
+            "Owner:)",
+        ),
+        (
             "a date",
             json!([p(json!([t("Due "), { "type": "date", "attrs": { "timestamp": "1795996800000" } }]))]),
             "Due :date[2026-11-30]",
