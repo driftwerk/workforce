@@ -31,6 +31,7 @@ env:
 jobs:
   build:
     name: Build the hub for macOS (arm64)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     timeout-minutes: 90
     permissions:
@@ -71,4 +72,5 @@ jobs:
           name: workforce-aarch64-apple-darwin-${{ env.SHA }}
           path: out/
           retention-days: 14
+          overwrite: true
           if-no-files-found: error
