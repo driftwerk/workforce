@@ -441,7 +441,9 @@ impl Live {
             self.pending = Some(next.pending);
             self.held = Some(next.raised);
             self.answer = next.answer;
-        } else if let Some((question, raised)) = self.open_question.clone() {
+        } else if let Some((mut question, raised)) = self.open_question.clone() {
+            // Nothing holds it for an answer any more: its dialog asks.
+            question.answerable = false;
             self.pending = Some(question);
             self.held = Some(raised);
         }
@@ -3598,7 +3600,7 @@ impl Desk {
             .live
             .get(&id)
             .and_then(|l| l.pending.clone());
-        let (answer, seen) = {
+        let (answer, seen, question) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
@@ -3614,11 +3616,32 @@ impl Desk {
                     "only Codex's requests take that answer".into(),
                 ));
             }
+            // Its hook gave up waiting (a dialog's hold timed out): nothing
+            // is answered here.
             let answer = live
                 .answer
                 .take()
+                .filter(|a| !a.is_closed())
                 .ok_or_else(|| DeskError::Conflict("the terminal is asking for this one".into()))?;
+            // A dialog's question held at its start: its boss's deny is its
+            // answer.
+            let question = live.holder().is_some_and(|h| h.question);
+            let boss_says = by
+                .as_ref()
+                .is_some_and(|b| b.party.kind == crew::PartyKind::Manager && b.reason.is_some());
             match decision {
+                // Answered in its place: it is over, its dialog never opens.
+                Decision::Deny if question && boss_says => {
+                    live.open_question = None;
+                    live.ask_ended();
+                    st.decided.insert(approval);
+                }
+                // Anything else of a dialog's question: its dialog opens.
+                _ if question => {
+                    if let Some(p) = live.pending.as_mut() {
+                        p.answerable = false;
+                    }
+                }
                 Decision::Terminal => {
                     if let Some(p) = live.pending.as_mut() {
                         p.answerable = false;
@@ -3630,7 +3653,7 @@ impl Desk {
                     st.decided.insert(approval);
                 }
             }
-            (answer, seen)
+            (answer, seen, question)
         };
         // A boss's deny says why, and what to do instead, to the session.
         let because = by
@@ -3641,7 +3664,20 @@ impl Desk {
                 let r = r.trim_end_matches(" (unbound: no limits)");
                 format!("Denied by {name}, who oversees this session: {r}")
             });
+        // Its boss's answer to a dialog's question, given in its place.
+        let answered = by
+            .as_ref()
+            .filter(|b| question && b.party.kind == crew::PartyKind::Manager)
+            .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
+            .map(|(name, r)| {
+                format!("{name}, who oversees this session, answered this for the person: {r}")
+            });
         let _ = answer.send(match decision {
+            Decision::Deny if answered.is_some() => {
+                claude::answered_for(answered.as_deref().unwrap_or_default())
+            }
+            // Its dialog opens: the person answers it there.
+            _ if question => claude::ask_in_terminal(),
             Decision::Allow => claude::allow(),
             Decision::Deny => match &because {
                 Some(m) => claude::deny_saying(m),
@@ -5022,48 +5058,87 @@ impl Desk {
                     }
                 }
             }
-            Hook::Question { id: call, question } => self.change(id, |r, l| {
-                let Some(l) = l else { return };
-                // The same call again (its permission check after its
-                // start) is the same question, still asked.
-                let same = |h: &Raised| h.question && (call.is_none() || h.call == call);
-                if l.holder().is_some_and(same)
-                    || l.open_question.as_ref().is_some_and(|(_, h)| same(h))
-                {
-                    return;
-                }
-                r.state = SessionState::Blocked;
-                r.asked = None;
-                l.current_tool = None;
-                l.reading = None;
-                let pending = PendingApproval {
-                    id: Uuid::new_v4(),
-                    tool: question.tool,
-                    detail: question.detail,
-                    since: Utc::now(),
-                    // Only its terminal's dialog can answer it.
-                    answerable: false,
-                    choices: Vec::new(),
-                    why: question.why,
-                    options: question.options,
-                    request: None,
-                    call: call.clone(),
-                    agent: inside.clone(),
-                    cli_session: r.cli_session_id.clone(),
+            Hook::Question {
+                id: call,
+                question,
+                asks,
+            } => {
+                // An AskUserQuestion at its start, in the session's own thread,
+                // that its Act fully boss answers while the person isn't in
+                // control: held for the boss, its dialog opening only if the
+                // boss leaves it to them or doesn't answer in time.
+                let hold = asks.filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
+                let (tx, rx) = oneshot::channel();
+                let mut held = None;
+                self.change(id, |r, l| {
+                    let Some(l) = l else { return };
+                    // The same call again (its permission check after its
+                    // start) is the same question, still asked.
+                    let same = |h: &Raised| h.question && (call.is_none() || h.call == call);
+                    if l.holder().is_some_and(same)
+                        || l.open_question.as_ref().is_some_and(|(_, h)| same(h))
+                    {
+                        return;
+                    }
+                    r.state = SessionState::Blocked;
+                    r.asked = None;
+                    l.current_tool = None;
+                    l.reading = None;
+                    let pending = PendingApproval {
+                        id: Uuid::new_v4(),
+                        tool: question.tool,
+                        detail: question.detail,
+                        since: Utc::now(),
+                        // Only its terminal's dialog can answer it, unless it is
+                        // held for its boss.
+                        answerable: hold.is_some(),
+                        choices: Vec::new(),
+                        why: question.why,
+                        options: question.options,
+                        request: hold.clone().map(|input| crate::model::Request {
+                            tool: claude::DIALOG_TOOL.into(),
+                            input,
+                            cwd: Some(r.cwd.clone()),
+                            read_only: true,
+                        }),
+                        call: call.clone(),
+                        agent: inside.clone(),
+                        cli_session: r.cli_session_id.clone(),
+                    };
+                    let raised = Raised {
+                        pending: pending.id,
+                        agent: inside.clone(),
+                        question: true,
+                        call,
+                    };
+                    // What shows again once an ask in front of it ends: only
+                    // its dialog answers it then, as its hold has no sender.
+                    if inside.is_none() {
+                        let shown = PendingApproval {
+                            answerable: false,
+                            ..pending.clone()
+                        };
+                        l.open_question = Some((shown, raised.clone()));
+                    }
+                    l.held = Some(raised);
+                    if hold.is_some() {
+                        held = Some(pending.id);
+                    }
+                    l.pending = Some(pending);
+                    l.answer = held.is_some().then_some(tx);
+                });
+                let Some(pending) = held else {
+                    return answer();
                 };
-                let raised = Raised {
-                    pending: pending.id,
-                    agent: inside.clone(),
-                    question: true,
-                    call,
+                return match tokio::time::timeout(claude::DIALOG_HOLD, rx).await {
+                    Ok(Ok(answered)) => answered,
+                    // Not answered in time: its dialog asks the person.
+                    _ => {
+                        self.release_dialog(id, pending);
+                        claude::ask_in_terminal()
+                    }
                 };
-                if inside.is_none() {
-                    l.open_question = Some((pending.clone(), raised.clone()));
-                }
-                l.held = Some(raised);
-                l.pending = Some(pending);
-                l.answer = None;
-            }),
+            }
             Hook::ToolEnd {
                 id: call,
                 interrupt,
