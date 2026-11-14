@@ -100,6 +100,14 @@ fn copy_to_user(
     if req.from_tier == req.to_tier && req.from_user == Some(uid) {
         return CopyStatus::Source;
     }
+    // One user, one path segment; and never into a Desk link, however the
+    // id and path put together say it.
+    if uid.contains(['/', '\\'])
+        || uid.contains("..")
+        || workforce_common::vault_scope::is_desk_link(&format!("users/{uid}/{}", req.path))
+    {
+        return CopyStatus::Error("that can't be copied to this user".into());
+    }
     run_with_optional_identity(Some(uid.to_string()), || {
         let exists = store
             .inspect(req.path)
@@ -364,6 +372,46 @@ mod tests {
         assert_eq!(
             value_at(&store, None, "p", VaultSource::AgentSpecific).as_deref(),
             Some("SHARED")
+        );
+    }
+
+    /// A destination id that is more than one segment can't land the copy
+    /// under another user's key, a Desk link least of all.
+    #[test]
+    fn a_copy_never_lands_in_a_desk_link_by_way_of_the_user_id() {
+        let (_dir, store) = store();
+        seed(&store, None, "hubs/x", "wfr_elsewhere", VaultSource::Global);
+        let dests = vec![
+            "bob/desk".to_string(),
+            "bob\\desk".to_string(),
+            "..".to_string(),
+        ];
+        let outcomes = copy_credential(
+            &store,
+            &req(
+                "hubs/x",
+                VaultSource::Global,
+                VaultSource::GlobalPerUser,
+                None,
+                &dests,
+            ),
+        )
+        .unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o.status, CopyStatus::Error(_))),
+            "{:?}",
+            outcomes.iter().map(|o| &o.status).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            value_at(
+                &store,
+                Some("bob"),
+                "desk/hubs/x",
+                VaultSource::GlobalPerUser
+            ),
+            None
         );
     }
 

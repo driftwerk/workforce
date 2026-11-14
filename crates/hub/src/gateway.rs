@@ -12655,6 +12655,17 @@ async fn agent_vault_copy(
         let refused = crate::hub_core::logins::store::DeskLinkRefused;
         return Err(reject_json(StatusCode::FORBIDDEN, &refused.to_string()));
     }
+    // A user id is one path segment: one with a separator or `..` would
+    // put the copy under another key (`users/bob/desk/...`, a Desk link).
+    let one_segment = |u: &str| !u.contains(['/', '\\']) && !u.contains("..");
+    if !body.user_id.as_deref().is_none_or(one_segment)
+        || !body.to_user_ids.iter().all(|u| one_segment(u))
+    {
+        return Err(reject_json(
+            StatusCode::BAD_REQUEST,
+            "a user id can't hold '/', '\\' or '..'",
+        ));
+    }
     let from_user = resolve_source_user(from, body.user_id.as_deref())?;
     let to_users = dedup_destinations(&body.to_user_ids);
     if to_users.is_empty() {
