@@ -227,11 +227,11 @@ fn who(p: &Party) -> String {
     }
 }
 
-/// What every DM turn of a boss is told before it speaks of a session.
 /// What an unbound boss is told of its plans: a draft for the person,
 /// started only on their word (a bound one can't approve one at all).
 pub(super) const PLAN_DRAFT: &str = "A plan you make is a draft for the person to review and approve; start one only when their own words ask you to start the work (start_now).";
 
+/// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
 impl CrewHub {

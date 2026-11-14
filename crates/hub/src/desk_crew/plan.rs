@@ -423,6 +423,8 @@ impl CrewHub {
             .iter()
             .filter_map(|t| t.ticket.key.clone().map(|k| (k, t.ticket.ticket.id)))
             .collect();
+        // Read before anything changes: one that doesn't read changes nothing.
+        let start_now = start_now_of(input)?;
         let tickets = match input.get("tickets") {
             Some(_) => Some(tickets_of(input, &known)?),
             None => None,
@@ -462,7 +464,7 @@ impl CrewHub {
             self.post_plan(&b.service, p, &text).await;
         }
         // A draft started on the person's word, by an unbound boss.
-        if let Some(said) = start_now_of(input)? {
+        if let Some(said) = start_now {
             let draft = changed.plan.summary.plan.approved_revision.is_none();
             if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
                 let approved = self.approve_said(b, &changed.plan, &said).await?;

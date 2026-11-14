@@ -1116,7 +1116,10 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        // An unbound boss approves its own plans: the person let it.
+        // An unbound boss approves its own plans: the person let it. The
+        // hub asks this for one only on the person's own words asking for
+        // the work to start (`crew.plan`'s `start_now`); a plan it only
+        // proposes stays a draft.
         let unbound = by.party.kind == PartyKind::Manager
             && !crate::grant::is_served(&by.party.id)
             && self.full_of(&by.party.id).unbound;

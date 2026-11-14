@@ -1097,3 +1097,101 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
     })
     .await;
 }
+
+/// Below unbound, start_now changes nothing: a boss's plan waits for the
+/// person whatever it quotes. A start_now that doesn't read changes
+/// nothing else of the call either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Make the suite green",
+                "tickets": tickets(dir.path(), 2),
+                "start_now": { "person_said": "Start it now" },
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "Go ahead" },
+                "why": "The person asked.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["plan"]["state"], "proposed", "{r:?}");
+        // One that doesn't read: refused before the goal changes.
+        let before = d.plan(id).await.unwrap().summary.plan.revision;
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "goal": "Make the whole suite green",
+                "start_now": { "person_said": "  " },
+                "why": "Wider.",
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap();
+        assert_eq!(p.summary.plan.revision, before, "nothing changed");
+        assert_eq!(p.summary.plan.goal, "Make the suite green");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(started(&d).is_empty(), "nothing starts");
+        assert_eq!(d.plan_needs().len(), 1, "the person is asked");
+    })
+    .await;
+}
+
+/// Unbound and told to start the work, crew.plan approves its plan as it
+/// proposes it, and Desk starts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_boss_told_to_start_starts_its_plan_as_it_proposes_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, super::unbound::UNBOUND).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Make the suite green",
+                "tickets": tickets(dir.path(), 2),
+                "start_now": { "person_said": "Plan it and run it" },
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty());
+        eventually("its sessions", async || {
+            (started(&d).len() == 2).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
