@@ -385,6 +385,12 @@ fn curl_program() -> &'static str {
 /// catch-all would fire both for a question), waiting as long as a
 /// question's start may be held for its boss ([`claude::DIALOG_WAIT_SECS`]):
 /// every other call Desk answers at once.
+///
+/// The `PermissionRequest` hook is always fail-closed, both ways Devin
+/// documents (`fail_closed: true`, and exit 2 with its reason on stderr):
+/// a hub that can't be reached, or doesn't answer in time, means Devin
+/// refuses the call, never that it runs without Desk asked. Asking in the
+/// terminal is an answer (`{}`), not a failure, so it still goes there.
 pub fn hooks(
     hook_file: &Path,
     approval_timeout_secs: u64,
@@ -406,7 +412,7 @@ pub fn hooks(
         ("SessionStart", PLAIN_SECS, false),
         ("UserPromptSubmit", PLAIN_SECS, false),
         ("PreToolUse", claude::DIALOG_WAIT_SECS, fail_closed),
-        ("PermissionRequest", approval_timeout_secs, false),
+        ("PermissionRequest", approval_timeout_secs, true),
         ("PostToolUse", PLAIN_SECS, false),
         ("Stop", PLAIN_SECS, false),
         ("SessionEnd", PLAIN_SECS, false),
@@ -1086,7 +1092,13 @@ mod tests {
             );
             assert!(c.contains("-K '/run dir/0.hook'"), "{c}");
             assert!(c.contains(&format!("{EVENT_HEADER}: {e}")), "{c}");
-            assert!(h.get("fail_closed").is_none());
+            match e {
+                "PermissionRequest" => {
+                    assert_eq!(h["fail_closed"], true, "never runs unasked");
+                    assert!(c.ends_with("exit 2; }"), "{c}");
+                }
+                _ => assert!(h.get("fail_closed").is_none(), "{e}"),
+            }
         }
         let timeout = |e: &str| hooks[e][0]["hooks"][0]["timeout"].as_u64().unwrap();
         assert_eq!(timeout("PermissionRequest"), 3605);
@@ -1097,6 +1109,8 @@ mod tests {
         assert_eq!(pre["fail_closed"], true);
         assert!(pre["command"].as_str().unwrap().ends_with("exit 2; }"));
         assert!(closed["Stop"][0]["hooks"][0].get("fail_closed").is_none());
+        let asks = &closed["PermissionRequest"][0]["hooks"][0];
+        assert_eq!(asks["fail_closed"], true);
     }
 
     /// The pre-tool hook of a session a served boss would run: Desk not
