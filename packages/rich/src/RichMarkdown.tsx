@@ -29,6 +29,8 @@ const InLink = createContext(false);
 function Link({ node, ...props }: ComponentProps<"a"> & ExtraProps) {
   void node;
   const { latest } = useHost();
+  const own = props.href ? latest.current.link?.(props.href, props.children) : undefined;
+  if (own !== undefined && own !== null) return <InLink.Provider value>{own}</InLink.Provider>;
   return (
     <InLink.Provider value>
       <a

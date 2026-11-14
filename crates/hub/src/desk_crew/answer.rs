@@ -90,7 +90,11 @@ pub(crate) enum Review {
 pub(super) fn review(text: &str) -> Option<Review> {
     text.lines().map(str::trim).find_map(|l| {
         let (w, rest) = l.split_once(':')?;
-        let rest = rest.trim().trim_start_matches('*').trim();
+        // `**APPROVE:** …`: the bold around its word, not its text's own.
+        let rest = match w.trim_start().starts_with('*') {
+            true => rest.trim_start().trim_start_matches('*').trim(),
+            false => rest.trim(),
+        };
         if rest.is_empty() {
             return None;
         }
@@ -625,10 +629,12 @@ impl CrewHub {
                         said = Some(r);
                         break;
                     }
-                    None => failed = format!(
+                    None => {
+                        failed = format!(
                         "its review was neither an approval, changes nor a question for you (“{}”)",
                         workforce_desk::crew::one_line(&text, 120)
-                    ),
+                    )
+                    }
                 },
                 Ok(Err(e)) => {
                     failed = format!(

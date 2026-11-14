@@ -5312,8 +5312,11 @@ impl Desk {
                         check
                             && !theirs
                             && approval.is_some_and(|(p, at)| {
-                                at.elapsed() < claude::DIALOG_HOLD * 2
-                                    && presented.as_ref() == Some(&p)
+                                let same = presented.as_deref().map(str::trim) == Some(p.trim());
+                                if !same {
+                                    tracing::debug!(session = %id, "a plan's check isn't the plan its boss approved: the person's");
+                                }
+                                at.elapsed() < claude::DIALOG_HOLD * 2 && same
                             })
                     });
                     if approved {

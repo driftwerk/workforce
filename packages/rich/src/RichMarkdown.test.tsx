@@ -2,6 +2,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import type { ReactNode } from "react";
 import { RichMarkdown } from "./RichMarkdown";
 import { RichHostProvider } from "./host";
 import { ALL_RICH_FEATURES, type RichFeatures } from "./fence";
@@ -117,6 +118,43 @@ describe("RichMarkdown links", () => {
     const { container } = render(<RichMarkdown text={LINKS} />);
     expect(hrefs(container)).not.toContain("desk://room/r1/msg/m1");
     expect(hrefs(container)).toContain("https://example.com");
+  });
+
+  it("lets the host draw a link its own way, and keeps the ordinary link otherwise", () => {
+    const seen: string[] = [];
+    const link = (href: string, children: ReactNode) => {
+      seen.push(href);
+      return href.startsWith("desk:") ? <span data-testid="chip">{children}</span> : undefined;
+    };
+    const { container } = render(
+      <RichHostProvider host={{ link, linkSchemes: ["desk"] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(screen.getByTestId("chip").textContent).toBe("the message");
+    expect(hrefs(container)).not.toContain("desk://room/r1/msg/m1");
+    expect(hrefs(container)).toContain("https://example.com");
+    // Only an address the scheme policy kept ever reaches the host.
+    expect(seen).toEqual(["desk://room/r1/msg/m1", "https://example.com"]);
+  });
+
+  it("draws the ordinary link when the host returns null", () => {
+    const { container } = render(
+      <RichHostProvider host={{ link: () => null, linkSchemes: ["desk"] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(hrefs(container)).toContain("desk://room/r1/msg/m1");
+  });
+
+  it("never hands the host a scheme it didn't declare", () => {
+    const link = vi.fn((_href: string) => undefined);
+    render(
+      <RichHostProvider host={{ link }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(link.mock.calls.map((c) => c[0])).toEqual(["https://example.com"]);
   });
 
   it("never keeps javascript:, declared or not", () => {
