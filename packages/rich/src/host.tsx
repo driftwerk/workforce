@@ -5,6 +5,7 @@
 
 import { createContext, useContext, useMemo, useRef, type ReactNode, type RefObject } from "react";
 
+import type { Directive } from "./directives";
 import type { SubmitValue, TablePage } from "./spec";
 
 /** A remote markdown image, as {@link RichHost.remoteImage} is given it. */
@@ -45,6 +46,26 @@ export interface RichHost {
    *  renders, so what it returns should read any changing state itself (a
    *  component that subscribes) rather than from the closure. */
   link?(href: string, children: ReactNode): ReactNode | null | undefined;
+  /** Draw a markdown directive (`:mention[Ann]`, `::name`, `:::panel{tone=info}`
+   *  … `:::`) the host's own way. Present, directives are read in the markdown;
+   *  absent, they're never parsed, and text that looks like one stays words.
+   *  Return `undefined` or `null` for one it doesn't draw: that reads as it was
+   *  written (`:mention[Ann]`, or a container's fence lines around its
+   *  content), since directive syntax catches prose too (`12:30`). A text
+   *  directive stands inside a paragraph, so it must be phrasing content; a
+   *  leaf or container directive stands where a block does. Its attributes are
+   *  the author's words: draw only values the host knows. */
+  directive?(directive: Directive): ReactNode | null | undefined;
+  /** Draw a markdown image the host's own way, such as a file of its own named
+   *  by a scheme in `imageSchemes`. Called with the image's source after the
+   *  scheme policy, and its alt text; return `undefined` or `null` to draw it
+   *  as any image is. It stands where an inline image would, often inside a
+   *  paragraph, so it must be phrasing content. An image in one of
+   *  `imageSchemes` it doesn't draw isn't drawn at all: only its alt text. */
+  image?(src: string, alt: string): ReactNode | null | undefined;
+  /** Image source schemes of the host's own, kept for `image` to draw. Never
+   *  a link's, and never `javascript`, `vbscript`, `data` or `file`. */
+  imageSchemes?: readonly string[];
   /** Link schemes kept besides the web's (http, https, mailto), opened through
    *  `openUrl`. Every other scheme is stripped from agent markdown. */
   linkSchemes?: readonly string[];
@@ -90,6 +111,10 @@ interface HostHandle {
   remoteImageSlot: boolean;
   /** `linkSchemes`, joined, so a host rebuilt with the same list keeps its renderers. */
   schemes: string;
+  /** `imageSchemes`, joined, likewise. */
+  imageSchemes: string;
+  /** Whether the host draws directives (`directive`): only then are they parsed. */
+  directives: boolean;
 }
 
 const NO_HOST: HostHandle = {
@@ -101,6 +126,8 @@ const NO_HOST: HostHandle = {
   remoteImages: "render",
   remoteImageSlot: false,
   schemes: "",
+  imageSchemes: "",
+  directives: false,
 };
 
 const HostContext = createContext<HostHandle>(NO_HOST);
@@ -115,9 +142,11 @@ export function RichHostProvider({ host, children }: { host: RichHost; children:
   const remoteImages: HostHandle["remoteImages"] = host.remoteImages === "link" ? "link" : "render";
   const remoteImageSlot = !!host.remoteImage;
   const schemes = (host.linkSchemes ?? []).join(",");
+  const imageSchemes = (host.imageSchemes ?? []).join(",");
+  const directives = !!host.directive;
   const handle = useMemo(
-    () => ({ latest, tables, files, forms, answered, remoteImages, remoteImageSlot, schemes }),
-    [tables, files, forms, answered, remoteImages, remoteImageSlot, schemes],
+    () => ({ latest, tables, files, forms, answered, remoteImages, remoteImageSlot, schemes, imageSchemes, directives }),
+    [tables, files, forms, answered, remoteImages, remoteImageSlot, schemes, imageSchemes, directives],
   );
   return <HostContext.Provider value={handle}>{children}</HostContext.Provider>;
 }
