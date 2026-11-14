@@ -744,10 +744,28 @@ mod tests {
     #[test]
     fn subscription_providers_route_like_other_providers() {
         let reg = default_reg();
-        for (name, provider, powerful, cheap) in [
-            ("chatgpt", Provider::ChatGpt, "gpt-6.1-sol", "gpt-6-luna"),
-            ("claude-code", Provider::ClaudeCode, "opus", "haiku"),
-            ("codex", Provider::Codex, "gpt-6.1-sol", "gpt-6-luna"),
+        for (name, provider, powerful, standard, cheap) in [
+            (
+                "chatgpt",
+                Provider::ChatGpt,
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-luna",
+            ),
+            (
+                "claude-code",
+                Provider::ClaudeCode,
+                "opus",
+                "sonnet",
+                "haiku",
+            ),
+            (
+                "codex",
+                Provider::Codex,
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-luna",
+            ),
         ] {
             assert_eq!(
                 parse_provider_tier_key(name).unwrap(),
@@ -758,6 +776,7 @@ mod tests {
                 reg.resolve_routed_model(&format!("{name}:powerful"), "anthropic"),
                 (Some(name.to_string()), powerful.to_string())
             );
+            assert_eq!(reg.resolve_model("standard", name), standard);
             assert_eq!(reg.resolve_model("cheap", name), cheap);
             let routed = format!("{name}:{powerful}");
             assert_eq!(split_routing_prefix(&routed), (Some(name), powerful));

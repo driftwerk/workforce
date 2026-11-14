@@ -107,8 +107,8 @@ cheap = "glm-5.3-flash"
 # plain function calls on every model it lists for a ChatGPT sign-in
 # (verified 2026-10-16; gpt-5.5 retired from ChatGPT sign-ins 2026-10-14).
 [chatgpt]
-powerful = "gpt-6.1-sol"
-standard = "gpt-6-sol"
+powerful = "gpt-6-astra"
+standard = "gpt-6.1-sol"
 cheap = "gpt-6-luna"
 
 [claude-code]
@@ -117,8 +117,8 @@ standard = "sonnet"
 cheap = "haiku"
 
 [codex]
-powerful = "gpt-6.1-sol"
-standard = "gpt-6-sol"
+powerful = "gpt-6-astra"
+standard = "gpt-6.1-sol"
 cheap = "gpt-6-luna"
 
 # Bedrock identifiers below are written without a geo prefix so they work

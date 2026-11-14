@@ -9994,7 +9994,7 @@ pub const DEFAULT_CODEX_TOOL_TIMEOUT_SECS: u64 = 300;
 /// The short names a round may use for Codex models, and what they resolve to.
 pub const DEFAULT_CODEX_MODELS: &[(&str, &str)] = &[
     ("astra", "gpt-6-astra"),
-    ("sol", "gpt-5.6-sol"),
+    ("sol", "gpt-6.1-sol"),
     ("terra", "gpt-5.6-terra"),
     ("luna", "gpt-5.6-luna"),
 ];
