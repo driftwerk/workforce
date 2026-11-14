@@ -1080,6 +1080,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         // device mints and revokes; the `wfk_` token pushes, forgets and
         // reads its counts, each checking its own token.
         .route("/api/me/desk-knows-tokens", post(crate::desk_knows::routes::mint))
+        .route("/api/me/desk-knows-tokens/engines", get(crate::desk_knows::routes::engines))
         .route("/api/me/desk-knows-tokens/{id}", axum::routing::delete(crate::desk_knows::routes::revoke))
         .route(
             "/api/desk-knows/push",
