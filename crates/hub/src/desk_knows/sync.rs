@@ -851,6 +851,9 @@ async fn put_link(
         person: person.clone(),
         revoking: false,
     };
+    // Not while an unlink of it is under way: it would be overwritten
+    // after being read as not revoking.
+    let _one = r.unlinking.lock().await;
     // The token is for the hub the address names, and only that one.
     if !bound(&hub, &link) {
         return refusal(
