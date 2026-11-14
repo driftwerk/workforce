@@ -261,7 +261,7 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
         // link (`[x](…)`), a checkbox or a tag in prose (`[WIP] …`).
         if let Some((name, rest)) = l.strip_prefix('[').and_then(|r| r.split_once(']')) {
             let rest = bare(rest);
-            let checkbox = matches!(name.trim(), "" | "x" | "X");
+            let checkbox = matches!(name.trim(), "" | "x" | "X") && !rest.starts_with('(');
             if checkbox {
                 l = rest;
             } else if !rest.starts_with('(') && (rest.is_empty() || marked(rest)) {
@@ -298,7 +298,7 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
             (Some(rest), _) => item(BriefKind::Done, rest),
             (None, Some(rest)) => item(BriefKind::ForYou, rest),
             (None, None) => {
-                if headline.is_none() && items.is_empty() && label.is_none() && !suggests(l) {
+                if headline.is_none() && items.is_empty() && label.is_none() && !offers(l) {
                     headline = headline_line(l);
                 }
                 None
@@ -422,6 +422,18 @@ fn for_you_of(l: &str) -> Option<&str> {
 /// Whether `l` is a done or for-you line.
 fn marked(l: &str) -> bool {
     done_of(l).is_some() || for_you_of(l).is_some()
+}
+
+/// Whether `l`, a line that is no done line, offers something: a
+/// suggestion ([`suggests`]) or a choice ("Option A", "Suggest we…").
+fn offers(l: &str) -> bool {
+    let lower = bare(l).to_lowercase();
+    suggests(l)
+        || ["suggest", "option", "options"].iter().any(|p| {
+            lower
+                .strip_prefix(p)
+                .is_some_and(|r| r.is_empty() || r.starts_with([' ', ':', ',', '-', '—', '–', '*']))
+        })
 }
 
 /// Whether `l` is a suggestion, a plan or a question, never a fact.
@@ -777,7 +789,8 @@ mod tests {
             ---\n\
             [x]\n\
             ✓ Option flag added\n\
-            Options: drop or keep";
+            Options: drop or keep\n\
+            [x](https://x.example) merged";
         let u = parse_reply(reply, Utc::now());
         assert_eq!(u.headline, "[WIP] Release is unblocked");
         let all: Vec<(String, String)> = u
@@ -798,6 +811,14 @@ mod tests {
 
     #[test]
     fn rules_and_underscored_or_starred_marks_read_as_the_form() {
+        for opener in [
+            "Suggest we drop it",
+            "Option A — keep it",
+            "**Options:** drop or keep",
+        ] {
+            let u = parse_reply(&format!("{opener}\n✓ Merged the fix"), Utc::now());
+            assert_eq!(u.headline, "1 done.", "{opener}");
+        }
         let u = parse_reply(
             "---\nAll moving.\n__[acme-web]__\n_✓ Merged the fix_\n**For you** — Rotate the key",
             Utc::now(),
