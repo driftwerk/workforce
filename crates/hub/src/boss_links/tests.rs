@@ -2392,6 +2392,7 @@ mod uplink_tests {
         let v = decided(&mut a).await.expect("refused, said so");
         assert_eq!(v["decideId"], json!(id));
         assert!(v.get("text").is_none() && v["error"].is_string(), "{v}");
+        assert_eq!(v["code"], "not_a_decision", "{v}");
         let calls = llms[0].received_requests().await.unwrap().len();
 
         // A revoked link's decision makes no call: it is refused, or its
@@ -2405,6 +2406,7 @@ mod uplink_tests {
         .await;
         if let Some(v) = decided(&mut a).await {
             assert!(v.get("text").is_none() && v["error"].is_string(), "{v}");
+            assert_eq!(v["code"], "link", "{v}");
         }
         assert_eq!(llms[0].received_requests().await.unwrap().len(), calls);
     }

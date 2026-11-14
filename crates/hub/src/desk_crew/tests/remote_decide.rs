@@ -22,7 +22,7 @@ async fn a_decision_goes_up_its_link_and_only_its_own_answer_comes_back() {
         let none = crew
             .remote_decision_call(boss, "acme", "[Desk decision] x")
             .await;
-        assert!(none.unwrap_err().contains("isn't connected"));
+        assert!(none.unwrap_err().why.contains("isn't connected"));
 
         let link = uuid::Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -58,6 +58,28 @@ async fn a_decision_goes_up_its_link_and_only_its_own_answer_comes_back() {
         );
         assert_eq!(asking.await.unwrap().unwrap(), "DENY: no\nINSTEAD: ask");
 
+        // A refusal comes back with its code, and only the code says
+        // whether to ask again: an unknown one is asked again.
+        for (code, want) in [
+            (json!("budget"), Some(crate::boss_links::decide::Code::Budget)),
+            (json!("something_new"), None),
+            (Value::Null, None),
+        ] {
+            let asking = {
+                let crew = Arc::clone(&crew);
+                tokio::spawn(async move { crew.remote_decision_call(boss, "acme", "[Desk decision] z").await })
+            };
+            let f = rx.recv().await.unwrap();
+            crew.decided(
+                &up,
+                &json!({"type": "decided", "linkId": link, "decideId": f["decideId"],
+                        "error": "its hub's budget for it is spent", "code": code}),
+            );
+            let failed = asking.await.unwrap().unwrap_err();
+            assert_eq!(failed.code, want);
+            assert_eq!(failed.again(), want.is_none());
+        }
+
         // Longer than its hub takes: never sent, so its hub's socket isn't
         // charged with it.
         let long = format!(
@@ -65,7 +87,9 @@ async fn a_decision_goes_up_its_link_and_only_its_own_answer_comes_back() {
             "x".repeat(crate::boss_links::decide::MAX_PROMPT)
         );
         let refused = crew.remote_decision_call(boss, "acme", &long).await;
-        assert_eq!(refused.unwrap_err(), crate::desk_crew::remote_decide::TOO_LONG);
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.code, Some(crate::boss_links::decide::Code::TooLong));
+        assert!(!refused.again());
         assert!(rx.try_recv().is_err(), "nothing went up");
 
         // A second socket for the same boss and group, dropped, leaves the
@@ -82,7 +106,7 @@ async fn a_decision_goes_up_its_link_and_only_its_own_answer_comes_back() {
         };
         let _ = rx.recv().await.unwrap();
         drop(up);
-        assert!(asking.await.unwrap().unwrap_err().contains("went down"));
+        assert!(asking.await.unwrap().unwrap_err().why.contains("went down"));
         assert!(!crew.decides_remotely(boss, "acme"));
     })
     .await;

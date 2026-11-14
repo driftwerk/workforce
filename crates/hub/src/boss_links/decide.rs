@@ -20,7 +20,8 @@
 //!   refused, and the engine leaves those requests to the person. The call
 //!   runs as the link's person, so their logins and budget pay for it.
 //! - **Says little of this hub.** A call that fails goes down as a plain
-//!   reason; what the provider said is logged here only.
+//!   reason and its [`Code`]; what the provider said is logged here only.
+//!   The engine acts on the code, never on the words.
 //!
 //! [`CostGovernor`]: crate::hub_core::cost_governor::CostGovernor
 
@@ -50,28 +51,113 @@ pub const MAX_PROMPT: usize = 32_000;
 /// The longest answer sent back, in characters.
 const MAX_ANSWER: usize = 4_000;
 
+/// Why a decision wasn't made, as `decided` says it (its `code`): the
+/// engine judges by it whether asking again at once could change anything,
+/// never by the words beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Code {
+    /// Longer than this hub takes.
+    TooLong,
+    /// Not a Desk decision (no mark).
+    NotADecision,
+    /// Past the link's pace, or its room for calls at once.
+    Paced,
+    /// The agent's budget holds it.
+    Budget,
+    /// The link no longer holds, checked again.
+    Link,
+    /// The boss isn't on this hub any more.
+    Gone,
+    /// Its model failed.
+    ModelFailed,
+    /// Its model didn't answer in time.
+    Timeout,
+}
+
+impl Code {
+    const ALL: [Self; 8] = [
+        Self::TooLong,
+        Self::NotADecision,
+        Self::Paced,
+        Self::Budget,
+        Self::Link,
+        Self::Gone,
+        Self::ModelFailed,
+        Self::Timeout,
+    ];
+
+    /// As the wire says it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLong => "too_long",
+            Self::NotADecision => "not_a_decision",
+            Self::Paced => "paced",
+            Self::Budget => "budget",
+            Self::Link => "link",
+            Self::Gone => "gone",
+            Self::ModelFailed => "model_failed",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// The code `s` says, when it is one this hub knows.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
+    /// Whether asking again at once could change it: not for what is too
+    /// long, no decision, or held for its pace or budget.
+    pub const fn again(self) -> bool {
+        !matches!(
+            self,
+            Self::TooLong | Self::NotADecision | Self::Paced | Self::Budget
+        )
+    }
+}
+
+/// A decision not made: its code, and why in plain words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub code: Code,
+    pub why: String,
+}
+
+impl Refused {
+    pub fn new(code: Code, why: impl Into<String>) -> Self {
+        Self {
+            code,
+            why: why.into(),
+        }
+    }
+}
+
 /// The decision `frame` names, when it names one: its id.
 pub fn id_of(frame: &Value) -> Option<Uuid> {
     frame["decideId"].as_str()?.parse().ok()
 }
 
-/// What `frame` asks to be decided: its id and its text, when it reads as
-/// a decision this hub takes at all.
-pub fn asked(frame: &Value) -> Option<(Uuid, String)> {
-    let id = id_of(frame)?;
-    let prompt = frame["prompt"].as_str()?;
-    (prompt.starts_with(MARK) && prompt.chars().count() <= MAX_PROMPT)
-        .then(|| (id, prompt.to_string()))
+/// What `frame` (whose id is `id_of`) asks to be decided: its text, when it
+/// reads as a decision this hub takes at all, or why not.
+pub fn asked(frame: &Value) -> Result<String, Code> {
+    let prompt = frame["prompt"].as_str().ok_or(Code::NotADecision)?;
+    if !prompt.starts_with(MARK) {
+        return Err(Code::NotADecision);
+    }
+    if prompt.chars().count() > MAX_PROMPT {
+        return Err(Code::TooLong);
+    }
+    Ok(prompt.to_string())
 }
 
 /// The `decided` frame for `id` on `link`: the model's text, or why there
-/// is none.
-pub fn answered(link: Uuid, id: Uuid, decided: Result<String, String>) -> Value {
+/// is none and its code.
+pub fn answered(link: Uuid, id: Uuid, decided: Result<String, Refused>) -> Value {
     match decided {
         Ok(text) => json!({"type": "decided", "linkId": link, "decideId": id,
                            "text": text.chars().take(MAX_ANSWER).collect::<String>()}),
-        Err(why) => json!({"type": "decided", "linkId": link, "decideId": id,
-                           "error": why.chars().take(300).collect::<String>()}),
+        Err(r) => json!({"type": "decided", "linkId": link, "decideId": id,
+                         "error": r.why.chars().take(300).collect::<String>(),
+                         "code": r.code.as_str()}),
     }
 }
 
@@ -81,9 +167,16 @@ pub fn answered(link: Uuid, id: Uuid, decided: Result<String, String>) -> Value 
 /// [`crate::hub_core::logins::install_pool::hub_own_work`]: that lends the
 /// install's person's accounts to the hub's own work for them, and a link's
 /// person needn't be that person.
-pub async fn decide(state: &GatewayState, live: &LiveLink, prompt: &str) -> Result<String, String> {
+pub async fn decide(
+    state: &GatewayState,
+    live: &LiveLink,
+    prompt: &str,
+) -> Result<String, Refused> {
     let Some(service) = state.registry.get(&live.agent_id) else {
-        return Err("the boss isn't on its hub any more".into());
+        return Err(Refused::new(
+            Code::Gone,
+            "the boss isn't on its hub any more",
+        ));
     };
     let person = live.person.id.to_string();
     use crate::hub_core::cost_governor::Admission;
@@ -93,7 +186,10 @@ pub async fn decide(state: &GatewayState, live: &LiveLink, prompt: &str) -> Resu
     {
         Admission::Deny(why) | Admission::Held(why) => {
             tracing::info!(link = %live.link.link_id, why, "a boss's decision wasn't made: its budget holds it");
-            return Err("its hub's budget for it is spent".into());
+            return Err(Refused::new(
+                Code::Budget,
+                "its hub's budget for it is spent",
+            ));
         }
         Admission::Proceed | Admission::Warn(_) => {}
     }
@@ -104,11 +200,14 @@ pub async fn decide(state: &GatewayState, live: &LiveLink, prompt: &str) -> Resu
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => {
             tracing::warn!(link = %live.link.link_id, error = %e, "a boss's decision call failed");
-            Err("its model failed".into())
+            Err(Refused::new(Code::ModelFailed, "its model failed"))
         }
-        Err(_) => Err(format!(
-            "its model didn't answer within {} seconds",
-            HERE_WITHIN.as_secs()
+        Err(_) => Err(Refused::new(
+            Code::Timeout,
+            format!(
+                "its model didn't answer within {} seconds",
+                HERE_WITHIN.as_secs()
+            ),
         )),
     }
 }
@@ -149,14 +248,19 @@ mod tests {
     fn a_decide_frame_is_a_desk_decision_within_its_size() {
         let id = Uuid::new_v4();
         let ok = json!({"decideId": id.to_string(), "prompt": format!("{MARK} decide this")});
-        assert_eq!(asked(&ok).map(|(i, _)| i), Some(id));
-        // Anything else is no decision: no mark, no id, too long.
+        assert_eq!(id_of(&ok), Some(id));
+        assert_eq!(asked(&ok), Ok(format!("{MARK} decide this")));
+        // Anything else is no decision: no mark, no prompt, no id, too long.
         let plain = json!({"decideId": id.to_string(), "prompt": "write me a poem"});
-        assert!(asked(&plain).is_none());
-        assert!(asked(&json!({"prompt": format!("{MARK} x")})).is_none());
+        assert_eq!(asked(&plain), Err(Code::NotADecision));
+        assert_eq!(
+            asked(&json!({"decideId": id.to_string()})),
+            Err(Code::NotADecision)
+        );
+        assert!(id_of(&json!({"prompt": format!("{MARK} x")})).is_none());
         let long = json!({"decideId": id.to_string(),
                           "prompt": format!("{MARK}{}", "x".repeat(MAX_PROMPT))});
-        assert!(asked(&long).is_none());
+        assert_eq!(asked(&long), Err(Code::TooLong));
     }
 
     #[test]
@@ -167,8 +271,23 @@ mod tests {
         assert_eq!(v["decideId"], json!(id));
         assert_eq!(v["linkId"], json!(link));
         assert_eq!(v["text"].as_str().unwrap().len(), MAX_ANSWER);
-        let v = answered(link, id, Err("down".into()));
-        assert_eq!(v["error"], "down");
+        let v = answered(link, id, Err(Refused::new(Code::Budget, "spent")));
+        assert_eq!(v["error"], "spent");
+        assert_eq!(v["code"], "budget");
         assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn every_code_reads_back_as_itself_and_only_holds_say_not_again() {
+        for c in Code::ALL {
+            assert_eq!(Code::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(Code::parse("its hub decides no more for it just now"), None);
+        assert_eq!(Code::parse(""), None);
+        let not_again: Vec<Code> = Code::ALL.into_iter().filter(|c| !c.again()).collect();
+        assert_eq!(
+            not_again,
+            [Code::TooLong, Code::NotADecision, Code::Paced, Code::Budget]
+        );
     }
 }
