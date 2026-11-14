@@ -35,6 +35,7 @@ async fn asking_session(d: &Desk, dir: &Path) -> SessionView {
             approvals: Some(Approvals::Terminal),
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             env: Default::default(),
             group: None,

@@ -276,6 +276,14 @@ pub fn boss_safe(engine: Engine) -> bool {
     matches!(engine, Engine::Claude)
 }
 
+/// Whether `model` can be the model of an `engine` session: a name that
+/// reads only as a model's on its command line, never as an option or as
+/// more than one argument ([`crate::plan::model_ok`]); Devin's own rule is
+/// narrower ([`crate::devin::model_ok`]).
+pub fn model_ok(engine: Engine, model: &str) -> bool {
+    crate::plan::model_ok(model) && (engine != Engine::Devin || crate::devin::model_ok(model))
+}
+
 pub fn runs(engine: Engine, view: View) -> bool {
     views(engine).contains(&view)
 }
@@ -802,6 +810,30 @@ pub fn view_of(engine: Engine, program: Option<&Path>, read: Option<&Installed>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's model is a name, never an option or more than one
+    /// argument; Devin's rule is narrower.
+    #[test]
+    fn a_model_is_only_a_models_name() {
+        for e in [Engine::Claude, Engine::Codex, Engine::Devin] {
+            for m in [
+                "opus",
+                "gpt-6.1-sol",
+                "us.anthropic.claude-sonnet-4-5:0",
+                "a/b",
+            ] {
+                assert!(model_ok(e, m), "{e:?} {m}");
+            }
+            for m in [
+                "-m", "--model", "a b", "a\"b", "a=b", "a\nb", "a;b", "$(x)", "", "é",
+            ] {
+                assert!(!model_ok(e, m), "{e:?} {m:?}");
+            }
+            assert!(!model_ok(e, &"a".repeat(201)));
+        }
+        assert!(model_ok(Engine::Claude, "sonnet[1m]"));
+        assert!(!model_ok(Engine::Devin, "sonnet[1m]"));
+    }
 
     #[test]
     fn claude_code_codex_and_devin_run_and_each_in_a_terminal() {

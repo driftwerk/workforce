@@ -1151,6 +1151,7 @@ impl CrewHub {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
+                    model: None,
                     account: None,
                     env: Default::default(),
                     group: (g.group != workforce_desk::UNGROUPED).then(|| g.group.clone()),

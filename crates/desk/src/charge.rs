@@ -771,6 +771,7 @@ mod tests {
             engine_version: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             name: "acme-web".into(),
             goal: String::new(),

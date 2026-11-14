@@ -272,6 +272,7 @@ async fn a_desk_total_holds_agents_new_starts_never_the_persons_and_never_runnin
             approvals: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             env: Default::default(),
             group: None,

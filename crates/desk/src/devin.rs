@@ -64,7 +64,7 @@ pub fn spawn(s: &DevinSpawn<'_>) -> Result<Spawn> {
         args.extend(["-r".to_string(), session_id.to_string()]);
     }
     if let Some(m) = s.model {
-        if !is_name(m, "-_.:/") {
+        if !model_ok(m) {
             eyre::bail!("a Devin model name Desk wouldn't pass on");
         }
         args.extend(["--model".to_string(), m.to_string()]);
@@ -82,6 +82,12 @@ pub fn spawn(s: &DevinSpawn<'_>) -> Result<Spawn> {
         cwd: s.cwd.to_path_buf(),
         env,
     })
+}
+
+/// Whether Devin is passed `model` as its `--model`: a plain name of
+/// letters, digits and `-_.:/`, narrower than other engines' (no `[1m]`).
+pub fn model_ok(model: &str) -> bool {
+    is_name(model, "-_.:/")
 }
 
 /// Whether `s` is a plain name: letters, digits and `extra`, not starting

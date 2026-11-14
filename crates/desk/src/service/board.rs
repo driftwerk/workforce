@@ -914,6 +914,7 @@ impl Desk {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
+                    model: None,
                     account: None,
                     env: BTreeMap::new(),
                     group,
