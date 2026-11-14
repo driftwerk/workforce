@@ -66,12 +66,27 @@ const PLAIN_EVENTS: [&str; 7] = [
 /// The question tool whose start Desk may hold for its boss to answer.
 pub const DIALOG_TOOL: &str = "AskUserQuestion";
 
+/// The plan a session presents to leave plan mode, whose start Desk may
+/// hold for its boss to review.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
+
+/// The tools whose start has its own hook entry, waiting for its boss.
+const DIALOG_TOOLS: &str = "(AskUserQuestion|ExitPlanMode)";
+
 /// How long its start's hook may take: past it, Claude Code goes on and its
 /// dialog opens. Desk answers well within it ([`DIALOG_HOLD`]).
 pub const DIALOG_WAIT_SECS: u64 = 60;
 
 /// How long Desk holds a question's start for its boss to answer.
 pub const DIALOG_HOLD: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// What approves a plan its boss reviewed, at its permission check: the
+/// dialog that asks the person to approve it doesn't open. The documented
+/// `PermissionRequest` allow; that the plan's check comes as one is not
+/// yet seen on a real session (if it doesn't, the dialog opens as before).
+pub fn plan_approved() -> Value {
+    allow()
+}
 
 /// What answers a question at its start, so its dialog never opens: the
 /// call is refused with the answer as its reason, which the model reads as
@@ -127,13 +142,15 @@ pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed
         // A question's start has its own entry, waiting long enough for its
         // boss to answer it; every other call's, the catch-all (a matcher
         // is a regular expression: verified on 2.1.325 that it leaves the
-        // question out).
+        // question out). A dialog's start is never fail-closed: it allows
+        // nothing (a question's answer, a plan's approval, goes through its
+        // own permission check, which keeps the fail-closed hook).
         if event == "PreToolUse" {
             hooks.insert(
                 event.into(),
                 json!([
-                    { "matcher": format!("^(?!{DIALOG_TOOL}$).*"), "hooks": [hook] },
-                    { "matcher": DIALOG_TOOL, "hooks": [http_hook(hook_url, DIALOG_WAIT_SECS)] }
+                    { "matcher": format!("^(?!{DIALOG_TOOLS}$).*"), "hooks": [hook] },
+                    { "matcher": format!("^{DIALOG_TOOLS}$"), "hooks": [http_hook(hook_url, DIALOG_WAIT_SECS)] }
                 ]),
             );
             continue;
@@ -281,6 +298,11 @@ pub enum Hook {
         /// input, every question and its options. Its boss may answer it
         /// there, before its dialog opens ([`answered_for`]).
         asks: Option<Value>,
+        /// Its permission check (`PermissionRequest`), not its start.
+        check: bool,
+        /// The plan it presents in full (`ExitPlanMode`'s input), when sent:
+        /// what a boss's approval is matched to.
+        plan: Option<String>,
     },
     /// Auto mode refused a tool call: the call's id, when the CLI says.
     Denied {
@@ -374,9 +396,13 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             id: p.tool_use_id.clone(),
             question: question.unwrap_or_default(),
             asks: (p.hook_event_name == "PreToolUse"
-                && p.tool_name.as_deref() == Some(DIALOG_TOOL))
+                && matches!(p.tool_name.as_deref(), Some(DIALOG_TOOL | PLAN_TOOL)))
             .then(|| p.tool_input.clone())
             .flatten(),
+            check: p.hook_event_name == "PermissionRequest",
+            plan: (p.tool_name.as_deref() == Some(PLAN_TOOL))
+                .then(|| plan_of(p.tool_input.as_ref()))
+                .flatten(),
         },
         "PreToolUse" => Hook::ToolStart {
             tool: tool().0,
@@ -575,6 +601,11 @@ pub fn question_of(tool: &str, input: Option<&Value>) -> Option<Question> {
     }
 }
 
+/// The plan an `ExitPlanMode` call presents, in full.
+pub fn plan_of(input: Option<&Value>) -> Option<String> {
+    input?.get("plan")?.as_str().map(str::to_string)
+}
+
 /// The sub-agent a hook fired inside, if it fired inside one.
 pub fn agent_of(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<Payload>(body).ok()?.agent_id
@@ -688,14 +719,17 @@ pub(crate) mod tests {
         // its own entry, waiting for its boss.
         assert_eq!(
             s["hooks"]["PreToolUse"][0]["matcher"],
-            "^(?!AskUserQuestion$).*"
+            "^(?!(AskUserQuestion|ExitPlanMode)$).*"
         );
         assert_eq!(
             (
                 s["hooks"]["PreToolUse"][1]["matcher"].as_str(),
                 s["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"].as_u64()
             ),
-            (Some("AskUserQuestion"), Some(DIALOG_WAIT_SECS))
+            (
+                Some("^(AskUserQuestion|ExitPlanMode)$"),
+                Some(DIALOG_WAIT_SECS)
+            )
         );
         let compact = &s["hooks"]["PreCompact"][0]["hooks"][0];
         assert_eq!(
@@ -831,7 +865,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             s["hooks"]["PreToolUse"][0]["matcher"],
-            "^(?!AskUserQuestion$).*"
+            "^(?!(AskUserQuestion|ExitPlanMode)$).*"
         );
         assert_eq!(
             hook_settings("http://h", 60),

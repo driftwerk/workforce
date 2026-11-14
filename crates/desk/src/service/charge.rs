@@ -353,6 +353,10 @@ impl Desk {
         let held = {
             let mut st = self.0.state.lock();
             st.charges.driven.insert(id, Utc::now());
+            // A plan its boss approved is the person's to approve now.
+            if let Some(l) = st.live.get_mut(&id) {
+                l.plan_approved = None;
+            }
             // Codex's question held for its boss is theirs now, in front or
             // waiting behind another ask.
             if let Some((_, q)) = st.live.get_mut(&id).and_then(|l| l.codex_question.as_mut()) {

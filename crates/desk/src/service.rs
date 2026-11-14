@@ -283,6 +283,11 @@ pub(crate) struct Live {
     /// an MCP server's request), by its request's id: only the terminal
     /// answers it.
     codex_question: Option<(Value, PendingApproval)>,
+    /// Its boss approved the plan it presents (that plan, in full, and
+    /// when): that plan's permission check is allowed in the person's
+    /// place, once, while they aren't in control. Gone when the person
+    /// drives it, or its main thread goes on or presents another plan.
+    plan_approved: Option<(String, std::time::Instant)>,
     /// The calls each thread (the main thread's, `None`, or a sub-agent's)
     /// started that haven't ended, oldest first: Claude Code runs some side
     /// by side, and a permission request names none of them.
@@ -1274,6 +1279,18 @@ fn decided_note(
     };
     let me = Some(Party::session(view));
     let label = view.label();
+    if p.tool == "Plan" {
+        let plan = crew::clip(&p.detail, 120);
+        let (kind, text) = match decision {
+            Decision::Allow => (Kind::Approved, format!("approved {label}'s plan “{plan}”")),
+            Decision::Deny | Decision::Cancel => (
+                Kind::Denied,
+                format!("asked {label} to change its plan “{plan}”"),
+            ),
+            Decision::AllowForSession | Decision::Terminal => return None,
+        };
+        return Some(by.event(kind, me, text).approval(p.id));
+    }
     let (kind, text) = match decision {
         Decision::Allow => (Kind::Approved, format!("allowed {label} to {what}")),
         Decision::Deny => (Kind::Denied, format!("denied {label} to {what}")),
@@ -1951,6 +1968,7 @@ impl Desk {
                     held: None,
                     open_question: None,
                     codex_question: None,
+                    plan_approved: None,
                     flights: HashMap::new(),
                     behind: Vec::new(),
                     own_key: None,
@@ -3677,7 +3695,7 @@ impl Desk {
             .live
             .get(&id)
             .and_then(|l| l.pending.clone());
-        let (answer, seen, question) = {
+        let (answer, seen, question, plan) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
@@ -3706,7 +3724,21 @@ impl Desk {
             let boss_says = by
                 .as_ref()
                 .is_some_and(|b| b.party.kind == crew::PartyKind::Manager && b.reason.is_some());
+            let plan = question && live.pending.as_ref().is_some_and(|p| p.tool == "Plan");
             match decision {
+                // A plan its boss approved: its start goes on, and its
+                // permission check is allowed in the person's place
+                // (`plan_approved`); else its dialog asks them, as before.
+                Decision::Allow if plan && boss_says => {
+                    live.plan_approved = live
+                        .pending
+                        .as_ref()
+                        .and_then(|p| claude::plan_of(p.request.as_ref().map(|r| &r.input)))
+                        .map(|plan| (plan, std::time::Instant::now()));
+                    if let Some(p) = live.pending.as_mut() {
+                        p.answerable = false;
+                    }
+                }
                 // Answered in its place: it is over, its dialog never opens.
                 Decision::Deny if question && boss_says => {
                     live.open_question = None;
@@ -3730,7 +3762,7 @@ impl Desk {
                     st.decided.insert(approval);
                 }
             }
-            (answer, seen, question)
+            (answer, seen, question, plan)
         };
         // A boss's deny says why, and what to do instead, to the session.
         let because = by
@@ -3746,8 +3778,13 @@ impl Desk {
             .as_ref()
             .filter(|b| question && b.party.kind == crew::PartyKind::Manager)
             .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
-            .map(|(name, r)| {
-                format!("{name}, who oversees this session, answered this for the person: {r}")
+            .map(|(name, r)| match plan {
+                true => format!(
+                    "{name}, who oversees this session, reviewed the plan for the person and wants these changes first: {r} Revise the plan and present it again."
+                ),
+                false => {
+                    format!("{name}, who oversees this session, answered this for the person: {r}")
+                }
             });
         let _ = answer.send(match decision {
             Decision::Deny if answered.is_some() => {
@@ -4803,6 +4840,7 @@ impl Desk {
                 held: None,
                 open_question: None,
                 codex_question: None,
+                plan_approved: None,
                 flights: HashMap::new(),
                 behind: Vec::new(),
                 own_key: None,
@@ -5210,9 +5248,11 @@ impl Desk {
                         asking::went_on(&mut l.denials, false);
                     }
                     // The main thread went on: the question it asked is over
-                    // (its own hook turned it down, or it was answered).
+                    // (its own hook turned it down, or it was answered), and
+                    // a plan approved before is spent.
                     if inside.is_none() {
                         l.end_question();
+                        l.plan_approved = None;
                     }
                     // What still asks (a call run beside this one, or
                     // the main thread's question shown again) waits on.
@@ -5249,12 +5289,40 @@ impl Desk {
                 id: call,
                 question,
                 asks,
+                check,
+                plan: presented,
             } => {
                 // An AskUserQuestion at its start, in the session's own thread,
                 // that its Act fully boss answers while the person isn't in
                 // control: held for the boss, its dialog opening only if the
                 // boss leaves it to them or doesn't answer in time.
-                let hold = asks.filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
+                let hold = asks
+                    .clone()
+                    .filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
+                // A plan its boss approved at its start: that plan's
+                // permission check (which names no call) is allowed in the
+                // person's place, once, soon after, while they still aren't
+                // in control. Another plan, or one presented after, is the
+                // person's (or its boss's again).
+                let plan = question.tool == "Plan";
+                if plan && inside.is_none() {
+                    let theirs = !self.holds_dialog_for_boss(id);
+                    let approved = self.0.state.lock().live.get_mut(&id).is_some_and(|l| {
+                        let approval = l.plan_approved.take();
+                        check
+                            && !theirs
+                            && approval.is_some_and(|(p, at)| {
+                                let same = presented.as_deref().map(str::trim) == Some(p.trim());
+                                if !same {
+                                    tracing::debug!(session = %id, "a plan's check isn't the plan its boss approved: the person's");
+                                }
+                                at.elapsed() < claude::DIALOG_HOLD * 2 && same
+                            })
+                    });
+                    if approved {
+                        return claude::plan_approved();
+                    }
+                }
                 let (tx, rx) = oneshot::channel();
                 let mut held = None;
                 self.change(id, |r, l| {
@@ -5283,7 +5351,10 @@ impl Desk {
                         why: question.why,
                         options: question.options,
                         request: hold.clone().map(|input| crate::model::Request {
-                            tool: claude::DIALOG_TOOL.into(),
+                            tool: match plan {
+                                true => claude::PLAN_TOOL.into(),
+                                false => claude::DIALOG_TOOL.into(),
+                            },
                             input,
                             cwd: Some(r.cwd.clone()),
                             read_only: true,
