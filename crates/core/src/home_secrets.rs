@@ -39,6 +39,8 @@ pub const START_FILES: &[&str] = &[
     ".gitconfig",
     ".config/git",
     ".config/fish",
+    // Devin's config runs its hooks' commands.
+    ".config/devin",
     "Library/LaunchAgents",
 ];
 
