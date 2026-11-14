@@ -120,6 +120,33 @@ fn each_adf_node_reads_as_its_desk_markdown() {
             ":status[Done]{tone=success} :status[Blocked]{tone=danger} :status[Doing]{tone=info} :status[Wait]{tone=warning} :status[Idea]{tone=purple} :status[New]{tone=neutral}",
         ),
         (
+            "a mention, status or date right after a word, a space between: one starts a word",
+            json!([p(json!([
+                t("Owner"), { "type": "mention", "attrs": { "id": "x", "text": "@Ann" } },
+                t(" is 日本"), { "type": "status", "attrs": { "text": "Done", "color": "green" } },
+                t(" by v2"), { "type": "date", "attrs": { "timestamp": "1795996800000" } },
+                t(" ("), { "type": "mention", "attrs": { "id": "y", "text": "@Bo" } }, t(")")
+            ]))]),
+            "Owner :mention[Ann] is 日本 :status[Done]{tone=success} by v2 :date[2026-11-30] (:mention[Bo])",
+        ),
+        (
+            "no space after a mark's close or another directive",
+            json!([p(json!([
+                { "type": "text", "text": "Owner", "marks": [{ "type": "strong" }] },
+                { "type": "mention", "attrs": { "id": "x", "text": "@Ann" } },
+                { "type": "mention", "attrs": { "id": "y", "text": "@Bo" } }
+            ]))]),
+            "**Owner**:mention[Ann]:mention[Bo]",
+        ),
+        (
+            "no space before an inline picture's name that starts with a colon",
+            json!([p(json!([
+                t("Owner"),
+                { "type": "mediaInline", "attrs": { "id": "x", "type": "file", "alt": ":)" } }
+            ]))]),
+            "Owner:)",
+        ),
+        (
             "a date",
             json!([p(json!([t("Due "), { "type": "date", "attrs": { "timestamp": "1795996800000" } }]))]),
             "Due :date[2026-11-30]",
