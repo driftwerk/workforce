@@ -419,14 +419,13 @@ impl Desk {
         self.change(id, |_, _| {});
     }
 
-    /// When the person last gave `id` input: typed in its terminal,
-    /// prompted it, or wrote to it.
-    /// When the person last gave session `id` input: typed in it, or
-    /// prompted it.
+    /// When the person last gave session `id` input ([`Self::last_input`]).
     pub fn last_input_of(&self, id: Uuid) -> Option<DateTime<Utc>> {
         Self::last_input(&self.0.state.lock(), id)
     }
 
+    /// When the person last gave `id` input: typed in its terminal,
+    /// prompted it, or wrote to it.
     pub(super) fn last_input(st: &super::State, id: Uuid) -> Option<DateTime<Utc>> {
         let typed = st.live.get(&id).and_then(|l| l.pty.typed_at());
         typed.max(st.charges.driven.get(&id).copied())
@@ -876,8 +875,6 @@ impl Desk {
         self.0.boss_bounds.lock().is_some()
     }
 
-    /// Whether any boss is unbound now: else no request is Desk's to allow
-    /// at once, and nothing need be looked at.
     /// The bosses unbound now.
     pub fn unbound_bosses(&self) -> Vec<String> {
         let st = self.0.state.lock();
@@ -889,6 +886,8 @@ impl Desk {
             .collect()
     }
 
+    /// Whether any boss is unbound now: else no request is Desk's to allow
+    /// at once, and nothing need be looked at.
     pub fn any_boss_unbound(&self) -> bool {
         self.0.state.lock().charges.full.values().any(|g| g.unbound)
     }

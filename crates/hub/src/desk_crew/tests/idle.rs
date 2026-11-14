@@ -109,7 +109,9 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         ends(&url, "Wrote the migration; the tests aren't run yet.").await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(
-            calls_about(&llm, "the tests aren't run yet").await.is_empty(),
+            calls_about(&llm, "the tests aren't run yet")
+                .await
+                .is_empty(),
             "no call while the person is in control"
         );
         assert!(told(&d, s.id).await.is_empty(), "nothing sent");
@@ -131,7 +133,11 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         assert!(kept.why.contains("the change isn't verified"), "{kept:?}");
         // Judged once, however many sweeps.
         tokio::time::sleep(Duration::from_millis(3000)).await;
-        assert_eq!(calls_about(&llm, "the tests aren't run yet").await.len(), 1, "one call");
+        assert_eq!(
+            calls_about(&llm, "the tests aren't run yet").await.len(),
+            1,
+            "one call"
+        );
         assert_eq!(told(&d, s.id).await.len(), 1, "told once");
         // No full turn was woken for it.
         let full = woken(&llm, "the tests aren't run yet").await;
@@ -149,11 +155,16 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         })
         .await;
         assert!(
-            rows.iter().any(|r| r.session == Some(s2.id) && r.what == "let acme-web wait"),
+            rows.iter()
+                .any(|r| r.session == Some(s2.id) && r.what == "let acme-web wait"),
             "{rows:?}"
         );
         assert!(told(&d, s2.id).await.is_empty(), "nothing sent to it");
         assert_eq!(said(&overseer, &["acme-web"]), 0, "nothing said in the DM");
+        assert!(
+            woken(&llm, "the release is out").await.is_empty(),
+            "no full turn"
+        );
 
         // Only the person can say: one line in the DM.
         let s3 = new_session(&d, &base, "invites").await;
@@ -168,18 +179,35 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         })
         .await;
         assert!(told(&d, s3.id).await.is_empty(), "nothing sent to it");
+        assert!(
+            woken(&llm, "Staged the invites").await.is_empty(),
+            "no full turn"
+        );
 
         // Its next step needs the boss's own tools: its full turn takes the
         // turn's end, as before the fast call.
         let s5 = new_session(&d, &base, "reports").await;
         let url5 = hook_url(&base, s5.id).await;
-        ends(&url5, "Drafted the quarterly report; finance must sign it off.").await;
+        ends(
+            &url5,
+            "Drafted the quarterly report; finance must sign it off.",
+        )
+        .await;
         eventually("its full turn", async || {
             (!woken(&llm, "Drafted the quarterly report").await.is_empty()).then_some(())
         })
         .await;
-        assert_eq!(calls_about(&llm, "Drafted the quarterly report").await.len(), 1, "one fast call");
-        assert!(told(&d, s5.id).await.is_empty(), "the fast call sent it nothing");
+        assert_eq!(
+            calls_about(&llm, "Drafted the quarterly report")
+                .await
+                .len(),
+            1,
+            "one fast call"
+        );
+        assert!(
+            told(&d, s5.id).await.is_empty(),
+            "the fast call sent it nothing"
+        );
 
         // Its model's answer is none of them: tried once more, then its full
         // turn takes it, never silence.
@@ -187,10 +215,19 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         let url4 = hook_url(&base, s4.id).await;
         ends(&url4, "Refactored the billing module.").await;
         eventually("its full turn", async || {
-            (!woken(&llm, "Refactored the billing module").await.is_empty()).then_some(())
+            (!woken(&llm, "Refactored the billing module")
+                .await
+                .is_empty())
+            .then_some(())
         })
         .await;
-        assert_eq!(calls_about(&llm, "Refactored the billing module").await.len(), 2, "tried twice");
+        assert_eq!(
+            calls_about(&llm, "Refactored the billing module")
+                .await
+                .len(),
+            2,
+            "tried twice"
+        );
         assert_eq!(said(&overseer, &["billing", "couldn't decide"]), 0);
     })
     .await;

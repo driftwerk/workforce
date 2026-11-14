@@ -96,7 +96,8 @@ pub(super) fn next(text: &str) -> Option<Next> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .skip_while(|l| {
-            !word(l).is_some_and(|(w, _)| matches!(w.as_str(), "CONTINUE" | "DONE" | "WORK" | "ASK"))
+            !word(l)
+                .is_some_and(|(w, _)| matches!(w.as_str(), "CONTINUE" | "DONE" | "WORK" | "ASK"))
         });
     let (w, rest) = word(lines.next()?)?;
     if rest.is_empty() {
@@ -105,7 +106,11 @@ pub(super) fn next(text: &str) -> Option<Next> {
     match w.as_str() {
         "CONTINUE" => {
             let why = lines
-                .find_map(|l| word(l).filter(|(w, _)| w == "WHY").map(|(_, r)| r.to_string()))
+                .find_map(|l| {
+                    word(l)
+                        .filter(|(w, _)| w == "WHY")
+                        .map(|(_, r)| r.to_string())
+                })
                 .map(|w| workforce_desk::crew::clip(&w, SHOWN))
                 .unwrap_or_default();
             Some(Next::Continue {
@@ -233,17 +238,26 @@ impl CrewHub {
             && view.live
             && view.pending.is_none()
             && view.asked.is_none()
+            && view.failure.is_none()
             && self.judges_turn_ends_itself(view)
+    }
+
+    /// Whether `view`'s turn's end, which its boss's fast call didn't get to
+    /// judge, is still its boss's: then its full turn takes it, as the
+    /// work turn and check-in paths passed it by.
+    fn still_bosses(&self, view: &SessionView) -> bool {
+        self.boss_over(view).is_some() && self.desk.charge_of(view.id).is_none_or(|c| c.live())
     }
 
     /// Notes since when each boss has been at Act fully.
     fn note_unbound(&self, seen: &parking_lot::Mutex<Seen>) {
         let unbound: HashSet<String> = self.desk.unbound_bosses().into_iter().collect();
         let mut s = seen.lock();
-        let now = Utc::now();
+        // Seen up to a sweep late: a turn's end in between is its too.
+        let since = Utc::now() - chrono::Duration::from_std(SWEEP * 3).unwrap_or_default();
         s.unbound_since.retain(|b, _| unbound.contains(b));
         for b in unbound {
-            s.unbound_since.entry(b).or_insert(now);
+            s.unbound_since.entry(b).or_insert(since);
         }
     }
 
@@ -267,19 +281,35 @@ impl CrewHub {
         let Some(boss) = self.boss_over(&view) else {
             return;
         };
+        let key = (view.id, view.prompts);
+        if seen.lock().judged.contains(&key) {
+            return;
+        }
+        let gap = self
+            .overseer_named(&boss)
+            .map(|(_, o)| self.answer_gap(&o))
+            .unwrap_or_default();
         if self.person_has_questions(&view, &boss) {
             return;
         }
         let now = Utc::now();
-        let key = (view.id, view.prompts);
         {
             let mut s = seen.lock();
-            // Since the boss is at Act fully, and recent.
+            // Since the boss is at Act fully, and recent (as long as the
+            // person may have held it, at least): when it ended as Desk
+            // said, else when it last changed.
+            let ended = s
+                .ends
+                .get(&view.id)
+                .map(|e| e.at)
+                .filter(|at| *at >= view.updated_at - chrono::Duration::seconds(5))
+                .unwrap_or(view.updated_at);
+            let window = chrono::Duration::minutes(RECENT_MINUTES).max(gap * 2);
             let fresh = s
                 .unbound_since
                 .get(&boss)
-                .is_some_and(|since| view.updated_at >= *since)
-                && now - view.updated_at < chrono::Duration::minutes(RECENT_MINUTES);
+                .is_some_and(|since| ended >= *since)
+                && now - ended < window;
             if !fresh || s.judged.contains(&key) {
                 return;
             }
@@ -343,6 +373,9 @@ impl CrewHub {
         seen: &parking_lot::Mutex<Seen>,
     ) -> Judged {
         let Some((service, o)) = self.overseer_named(boss) else {
+            if self.still_bosses(view) {
+                self.hand_to_work(view, seen);
+            }
             return Judged::Done;
         };
         let name = name_of(&service);
@@ -387,14 +420,17 @@ impl CrewHub {
         let Ok(now) = self.desk.view(view.id) else {
             return Judged::Done;
         };
-        if now.state != SessionState::Done || now.prompts != view.prompts || now.pending.is_some()
-        {
+        if now.state != SessionState::Done || now.prompts != view.prompts || now.pending.is_some() {
             return Judged::Done;
         }
         if self.person_has_questions(&now, boss) {
             return Judged::Later;
         }
+        // Act fully ended meanwhile: its full turn takes it, as before.
         if !self.still_decides(&now, boss) || !self.judges_turn_ends_itself(&now) {
+            if self.still_bosses(&now) && !self.desk.boss_unbound(boss) {
+                self.hand_to_work(&now, seen);
+            }
             return Judged::Done;
         }
         let label = view.label();
@@ -405,6 +441,10 @@ impl CrewHub {
             }
             Some(Next::Work(what)) => {
                 tracing::info!(session = %view.id, %boss, what, "a session's next step needs the boss's full turn");
+                // A step on the boss's word too.
+                if let Some(run) = seen.lock().runs.get_mut(&view.id) {
+                    run.steps += 1;
+                }
                 self.hand_to_work(view, seen);
             }
             Some(Next::Ask(ask)) => {
