@@ -232,12 +232,12 @@ impl NewItem {
 
     /// The person's order, in their words, with the sessions working on it;
     /// keyed by their message (`message`) when it came from one, else by its
-    /// words.
+    /// sessions and all of its words ([`order_text_key`]).
     pub fn order(boss: &str, text: &str, sessions: Vec<Uuid>, message: Option<&str>) -> Self {
         Self {
             dedupe_key: match message {
                 Some(m) => format!("order:{m}"),
-                None => format!("order:text:{}", normalised(text)),
+                None => order_text_key(text, &sessions),
             },
             sessions,
             ..Self::ask(boss, OpenKind::Order, None, text)
@@ -263,6 +263,65 @@ pub fn normalised(text: &str) -> String {
         .map(str::to_lowercase)
         .collect();
     words.join(" ").chars().take(200).collect()
+}
+
+/// How close in time two of the person's orders are for near-same words
+/// to be one order ([`same_order`]).
+pub const SAME_ORDER_WITHIN: Duration = Duration::minutes(30);
+
+/// Words that change nothing of what an order asks.
+const FILLER: &[&str] = &[
+    "a", "an", "the", "and", "so", "just", "please", "pls", "now", "ok", "okay", "also", "too",
+    "really", "you", "can", "could", "it", "that", "this", "make", "sure", "all", "as", "well",
+];
+
+/// An order's words in order: lower case, all of it (never cut short),
+/// filler left out, a plural's or "-ing"'s ending taken off ("keeps
+/// going" is "keep go").
+fn order_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !FILLER.contains(&w.as_str()))
+        .map(|w| {
+            let stem = |end: &str| w.strip_suffix(end).filter(|s| s.chars().count() >= 3);
+            stem("ing").or_else(|| stem("s")).unwrap_or(&w).to_string()
+        })
+        .collect()
+}
+
+/// The fewest words of substance an order has to be merged with another:
+/// "ship it" or "go ahead" means what it is about, never the same twice.
+const SAME_ORDER_WORDS: usize = 3;
+
+/// Whether two of the person's orders say the same thing: the same words
+/// in the same order, once case, punctuation and filler are set aside. A
+/// "not", a number, which way round ("staging to prod") or any other word
+/// of substance that differs keeps them apart, as does an order too short
+/// to mean anything alone, so an order is never lost into one it doesn't
+/// repeat.
+pub fn same_order(a: &str, b: &str) -> bool {
+    let (a, b) = (order_words(a), order_words(b));
+    a.len() >= SAME_ORDER_WORDS && a == b
+}
+
+/// The key of an order kept by its words (the boss's record of it): its
+/// sessions, sorted, and a digest of all its words, never cut short, so
+/// "ship it" about two sessions, or two long orders that differ only at
+/// the end, are two.
+pub fn order_text_key(text: &str, sessions: &[Uuid]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut ids: Vec<String> = sessions.iter().map(Uuid::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let digest = Sha256::digest(words.join(" ").as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("order:text:{}:{hex}", ids.join(","))
 }
 
 /// The key of a session's question on its line.
@@ -845,10 +904,52 @@ mod tests {
             "an ask never lapses"
         );
         assert!(NewItem::order("desk", "Ship it", vec![], Some("m1")).dedupe_key == "order:m1");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let key = |t: &str, s: Vec<Uuid>| NewItem::order("desk", t, s, None).dedupe_key;
+        assert_eq!(key("Ship it!", vec![a, b]), key("ship  it", vec![b, a]));
+        assert_ne!(key("Ship it", vec![a]), key("Ship it", vec![b]));
+        let long = "x ".repeat(150);
+        assert_ne!(
+            key(&format!("{long} deploy"), vec![]),
+            key(&format!("{long} stop"), vec![])
+        );
         assert_eq!(
             NewItem::promise("desk", one, "x", " Merged ").dedupe_key,
             format!("promise:{one}:merged")
         );
+    }
+
+    #[test]
+    fn near_same_orders_are_one_and_others_stay_apart() {
+        assert!(same_order(
+            "Make sure the cufflink migration keeps going.",
+            "the Cufflink migration, keep it going please"
+        ));
+        assert!(same_order(
+            "Don't start any new work",
+            "don't start any new work now"
+        ));
+        for (a, b) in [
+            ("Merge PR 12", "Don't merge PR 12"),
+            ("Merge PR 12", "Merge PR 13"),
+            ("Deploy the api to staging", "Deploy the api to production"),
+            (
+                "Keep the cufflink migration going",
+                "Keep the cufflink migration going and take over",
+            ),
+            ("", ""),
+            ("Ship it", "ship it"),
+            (
+                "Move the prod data to staging",
+                "Move the staging data to prod",
+            ),
+            (
+                format!("{} then deploy", "x ".repeat(120)).as_str(),
+                format!("{} then stop", "x ".repeat(120)).as_str(),
+            ),
+        ] {
+            assert!(!same_order(a, b), "{a} / {b}");
+        }
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //! request of a session it runs is decided by its own model, one decision
 //! call made on its own hub (here, the link it goes up), and nothing is
 //! allowed for it by default. What it decides is done as it, recorded with
-//! its reason naming its hub; a call that fails is tried once more, then the
-//! request is the person's; and what it decided is dropped once it is no
+//! its reason naming its hub; a call that fails is tried once more (unless
+//! its hub's code says that changes nothing), then the request is the
+//! person's; and what it decided is dropped once it is no
 //! longer its to decide. This engine judges all of it, as it acts.
 
 use super::served::native;
@@ -309,6 +310,33 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         .await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a3));
         d.decide(started, a3, workforce_desk::model::Decision::Deny, None)
+            .unwrap();
+        let _ = asked.await;
+
+        // Its hub holds it for its pace, as its code says: not asked again
+        // at once, whatever its words, and the person's.
+        let asked = ask(&url, "make docs");
+        let a5 = pending(&d, started, "make docs").await;
+        let f = decide_frame(&mut rx).await;
+        crew.decided(
+            &up,
+            &json!({"type": "decided", "linkId": f["linkId"], "decideId": f["decideId"],
+                    "error": "words that say nothing of a pace", "code": "paced"}),
+        );
+        eventually("left to the person", async || {
+            d.view(started)
+                .unwrap()
+                .waits_on_you
+                .is_some()
+                .then_some(())
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while let Ok(f) = rx.try_recv() {
+            assert_ne!(f["type"], "decide", "asked again: {f}");
+        }
+        assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a5));
+        d.decide(started, a5, workforce_desk::model::Decision::Deny, None)
             .unwrap();
         let _ = asked.await;
 

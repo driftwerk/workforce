@@ -1564,3 +1564,37 @@ fn what_an_answer_can_t_say_of_children_is_kept() {
     let d = details_of(&linear, Some(&was(vec![known])), &[]);
     assert_eq!(d.facts.children[0].assignee, None, "Linear said no one");
 }
+
+/// A description's mention is the one member whose profile it is: by their
+/// full name, else the name shown; none when none or two are.
+#[test]
+fn a_profile_is_the_one_member_whose_it_is() {
+    let answer = json!({ "members": [
+        { "id": "1", "name": "ann", "full_name": "Ann Lee", "url": "https://linear.app/acme/profiles/ann" },
+        { "id": "2", "name": "anna", "full_name": "", "url": "https://linear.app/acme/profiles/anna/" },
+        { "id": "3", "name": "annie", "url": "https://linear.app/other/profiles/annie" },
+    ] });
+    assert_eq!(
+        profile_member(&answer, "acme", "ann").as_deref(),
+        Some("Ann Lee")
+    );
+    assert_eq!(
+        profile_member(&answer, "acme", "anna").as_deref(),
+        Some("anna")
+    );
+    assert_eq!(profile_member(&answer, "acme", "annie"), None);
+    // A hub that doesn't say members' profiles: no one.
+    assert_eq!(
+        profile_member(
+            &json!({ "members": [{ "id": "1", "name": "ann" }] }),
+            "acme",
+            "ann"
+        ),
+        None
+    );
+    let twice = json!({ "members": [
+        { "id": "1", "name": "a", "url": "https://linear.app/acme/profiles/ann" },
+        { "id": "2", "name": "b", "url": "https://linear.app/acme/profiles/ann" },
+    ] });
+    assert_eq!(profile_member(&twice, "acme", "ann"), None);
+}

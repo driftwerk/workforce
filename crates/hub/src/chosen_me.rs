@@ -140,10 +140,17 @@ pub fn members_named(on: On, answer: &Value, needle: &str) -> Vec<Value> {
                 .filter(|n| !n.trim().is_empty())
                 .collect();
             let name = *shown.first()?;
+            let mut member = json!({ "id": id, "name": name, "avatar": u[avatar].as_str().filter(|a| !is_gravatar(a)) });
+            // On Linear, its profile's address and full name too: what a
+            // description's mention of them is read by.
+            if on == On::Linear {
+                member["url"] = json!(u["url"].as_str());
+                member["full_name"] = json!(u["name"].as_str());
+            }
             shown
                 .iter()
                 .any(|n| n.to_lowercase().contains(&needle))
-                .then(|| json!({ "id": id, "name": name, "avatar": u[avatar].as_str().filter(|a| !is_gravatar(a)) }))
+                .then_some(member)
         })
         .take(MAX_MEMBERS)
         .collect()
@@ -191,7 +198,7 @@ impl Tool for MembersNamed {
     fn description(&self) -> &str {
         match self.on {
             On::Jira => "The active Jira users on this agent's key whose name contains `name` (at least 2 characters), as {members: [{id, name, avatar}]}, at most 20: to choose who you are there with identity.jira_choose_me. Never emails.",
-            On::Linear => "The active Linear members on this agent's key whose name contains `name` (at least 2 characters), as {members: [{id, name, avatar}]}, at most 20: to choose who you are there with identity.linear_choose_me. Never emails.",
+            On::Linear => "The active Linear members on this agent's key whose name contains `name` (at least 2 characters), as {members: [{id, name, avatar, url, full_name}]}, at most 20: to choose who you are there with identity.linear_choose_me. Never emails.",
         }
     }
 
