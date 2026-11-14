@@ -156,7 +156,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
                 post(
                     &app,
                     &token,
-                    relayed(TAKE, json!({"inForce": in_force}), "local:sarah", level),
+                    relayed(TAKE, json!({"inForce": in_force, "sentAt": chrono::Utc::now().timestamp_millis()}), "local:sarah", level),
                 )
                 .await
             }
@@ -195,11 +195,27 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         let out = post(
             &app,
             &token,
-            relayed(TAKE, json!({"inForce": true}), "local:bob", "full"),
+            relayed(TAKE, json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis()}), "local:bob", "full"),
         )
         .await;
         assert_eq!(out["status"], "refused", "{out}");
         assert!(!crew.home_holds_full("home/bob", "acme"));
+        // A take held up on its way, or that doesn't say when it was sent,
+        // says nothing of now: still bound.
+        for sent in [
+            json!(chrono::Utc::now().timestamp_millis() - 10_000),
+            json!(chrono::Utc::now().timestamp_millis() + 60_000),
+            Value::Null,
+        ] {
+            let out = post(
+                &app,
+                &token,
+                relayed(TAKE, json!({"inForce": true, "sentAt": sent}), "local:sarah", "full"),
+            )
+            .await;
+            assert_eq!(out["body"]["full"], false, "{out}");
+            assert!(crew.served_full(SARAH).is_none());
+        }
 
         // Both hold: unbound, and nothing allowed for her by default.
         let out = take(true, "full").await;
@@ -440,19 +456,26 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
             .iter()
             .all(|c| c.input["inForce"] == true && c.machine == "devbox"));
 
-        // Act fully no longer in force here (today's budget spent): the
-        // next take says so, and no take says in force after it.
-        // Held spent: the hub's own loops read today's spend again (none,
-        // here) and would put it back.
-        let spender = {
-            let (crew, agent) = (Arc::clone(&crew), agent.clone());
-            tokio::spawn(async move {
-                loop {
-                    crew.spent_today.lock().insert(agent.clone(), 100.0);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-        };
+        // Act fully no longer in force here (Desk holds Sarah, over her
+        // budget): the next take says so, and no take says in force after it.
+        {
+            use workforce_core::budget::{OnExceed, Period, Standing, Status, Unit};
+            let now = chrono::Utc::now();
+            let over = Standing {
+                budget: uuid::Uuid::new_v4(),
+                period: Period::Day,
+                unit: Unit::Usd,
+                used: 26.0,
+                of: 25.0,
+                status: Status::Over,
+                on_exceed: OnExceed::Pause,
+                from: now - chrono::Duration::hours(1),
+                to: now + chrono::Duration::hours(10),
+                shared: false,
+            };
+            d.agent_stand(&agent, "Sarah", vec![over], false);
+            assert!(d.agent_held(&agent).is_some());
+        }
         let ended = eventually("a take saying it isn't in force", async || {
             seen.lock()
                 .iter()
@@ -469,7 +492,6 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
                 .all(|c| c.tool != TAKE || c.input["inForce"] == false),
             "no take says in force after it ended"
         );
-        spender.abort();
         poller.abort();
     })
     .await;

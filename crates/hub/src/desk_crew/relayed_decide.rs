@@ -55,8 +55,9 @@ const TAKE_EVERY: Duration = Duration::from_secs(1);
 /// How often, when the machine says its grant doesn't put the boss at Act
 /// fully, or can't be reached.
 const IDLE_EVERY: Duration = Duration::from_secs(10);
-/// The most decisions one take hands out.
-const MOST_TAKEN: usize = 4;
+/// The most decisions one take hands out: no more than the Mac has room
+/// to decide at once, and fewer when it says so (`most`).
+const MOST_TAKEN: usize = AT_ONCE;
 /// The most decisions waiting for one boss and group on a machine.
 const MOST_WAITING: usize = 32;
 /// The most decision calls the Mac makes for one machine's group a minute,
@@ -65,6 +66,13 @@ const PER_MINUTE: usize = 30;
 const AT_ONCE: usize = 3;
 /// The longest answer taken, in characters.
 const MAX_ANSWER: usize = 4_000;
+/// The oldest a take may be when it reaches the machine, by the time the
+/// Mac sent it (`sentAt`): one later than this (a courier held up) says
+/// nothing of Act fully now. Within it, its word holds [`FRESH`] from when
+/// it was sent, never from when it came. Assumes the two clocks agree to
+/// within a second or so (both keep network time); a Mac clock behind the
+/// machine's only binds the boss sooner.
+const TAKE_AGE: Duration = Duration::from_millis(2_500);
 /// How long the overseer's model may take: 5 s under the machine's wait.
 const HERE_WITHIN: Duration = super::decide::WITHIN.saturating_sub(Duration::from_secs(5));
 
@@ -214,17 +222,34 @@ impl CrewHub {
             .desk
             .grant_live(group)
             .is_ok_and(|g| g.boss.as_ref() == Some(boss));
-        let in_force =
-            ours && ceiling.level == Level::Full && input["inForce"].as_bool() == Some(true);
+        // How long ago the Mac sent it; none for one too old, from the
+        // future, or that doesn't say.
+        let age = input["sentAt"]
+            .as_i64()
+            .map(|at| chrono::Utc::now().timestamp_millis() - at)
+            .filter(|ms| (-1_000..TAKE_AGE.as_millis() as i64).contains(ms))
+            .map(|ms| Duration::from_millis(ms.max(0) as u64));
+        let in_force = ours
+            && ceiling.level == Level::Full
+            && input["inForce"].as_bool() == Some(true)
+            && age.is_some();
+        let most = input["most"]
+            .as_u64()
+            .map_or(MOST_TAKEN, |m| (m as usize).min(MOST_TAKEN));
         let decisions: Vec<Value> = {
             let mut out = self.relayed.lock();
+            // Homes not heard from within FRESH: forgotten.
+            out.homes.retain(|_, at| at.elapsed() < FRESH);
             if !in_force {
                 out.end(&key);
                 Vec::new()
             } else {
-                out.homes.insert(key.clone(), Instant::now());
+                let sent = age
+                    .and_then(|a| Instant::now().checked_sub(a))
+                    .unwrap_or_else(Instant::now);
+                out.homes.insert(key.clone(), sent);
                 let mut handed = Vec::new();
-                while handed.len() < MOST_TAKEN {
+                while handed.len() < most {
                     let Some((id, prompt)) = out.queued.get_mut(&key).and_then(VecDeque::pop_front)
                     else {
                         break;
@@ -299,7 +324,9 @@ impl CrewHub {
             boss: Some(boss.key()),
             group: Some(group.to_string()),
             tool: DECIDED,
-            input: json!({"decideId": id, "code": input["code"]}).to_string(),
+            input: json!({"decideId": id,
+                          "code": input["code"].as_str().and_then(Code::parse).map(Code::as_str)})
+            .to_string(),
             input_hash: {
                 use sha2::Digest;
                 hex::encode(sha2::Sha256::digest(input.to_string().as_bytes()))
@@ -338,6 +365,23 @@ struct Pump {
     /// The decision calls made lately, and the room for them at once.
     calls: VecDeque<Instant>,
     at_once: Arc<tokio::sync::Semaphore>,
+}
+
+impl Pump {
+    /// How many decision calls there is room for now: at once, and within
+    /// the minute's.
+    fn room(&mut self, now: Instant) -> usize {
+        while self
+            .calls
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            self.calls.pop_front();
+        }
+        self.at_once
+            .available_permits()
+            .min(PER_MINUTE.saturating_sub(self.calls.len()))
+    }
 }
 
 impl Default for Pump {
@@ -448,12 +492,23 @@ async fn take(
         level: o.level,
         act: o.act,
     };
+    let started = Instant::now();
+    // As many as there is room to decide now: none is refused for pace.
+    let most = {
+        let mut p = pumps.lock();
+        let p = p.entry(k.clone()).or_default();
+        p.room(started)
+    };
     let got = crew
         .relay(
             machine,
             group,
             TAKE,
-            json!({ "inForce": in_force }),
+            json!({
+                "inForce": in_force,
+                "sentAt": chrono::Utc::now().timestamp_millis(),
+                "most": most,
+            }),
             &agent,
             &ceiling,
         )
@@ -470,7 +525,14 @@ async fn take(
         let p = p.entry(k.clone()).or_default();
         p.busy = false;
         p.said = in_force && got.is_ok();
-        p.next = Instant::now() + if full { TAKE_EVERY } else { IDLE_EVERY };
+        // From when it began, so a slow round trip doesn't let Act fully
+        // lapse between takes; one that failed is tried again soon.
+        p.next = started
+            + match (&got, full) {
+                (_, true) => TAKE_EVERY,
+                (Err(_), false) if in_force => TAKE_EVERY * 3,
+                _ => IDLE_EVERY,
+            };
     }
     for d in decisions {
         let (Some(id), Some(prompt)) = (d["decideId"].as_str(), d["prompt"].as_str()) else {
@@ -502,35 +564,44 @@ async fn decide_one(
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
     let refuse = |code: Code, why: &str| Err::<String, _>((code, why.to_string()));
-    let slot = {
-        let mut p = pumps.lock();
-        let p = p.entry(k.clone()).or_default();
-        let now = Instant::now();
-        while p
-            .calls
-            .front()
-            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
-        {
-            p.calls.pop_front();
-        }
-        match (p.calls.len() < PER_MINUTE)
-            .then(|| Arc::clone(&p.at_once).try_acquire_owned().ok())
-            .flatten()
-        {
-            Some(slot) => {
-                p.calls.push_back(now);
-                Some(slot)
-            }
-            None => None,
-        }
-    };
-    let decided = if !prompt.starts_with(super::decide::MARK) {
-        refuse(Code::NotADecision, "not a decision its home takes")
+    let checked = if !prompt.starts_with(super::decide::MARK) {
+        Some(refuse(Code::NotADecision, "not a decision its home takes"))
     } else if prompt.chars().count() > MAX_PROMPT {
-        refuse(
+        Some(refuse(
             Code::TooLong,
             "the request is too long for its home to decide",
-        )
+        ))
+    } else {
+        None
+    };
+    // Room for it: a take hands out no more than there is, so this waits
+    // only on calls just begun; a call counts once it is to be made.
+    let slot = match checked {
+        Some(_) => None,
+        None => {
+            let at_once = {
+                let mut p = pumps.lock();
+                let p = p.entry(k.clone()).or_default();
+                (p.room(Instant::now()) > 0).then(|| Arc::clone(&p.at_once))
+            };
+            match at_once {
+                Some(s) => tokio::time::timeout(TAKE_EVERY, s.acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .inspect(|_| {
+                        let mut p = pumps.lock();
+                        p.entry(k.clone())
+                            .or_default()
+                            .calls
+                            .push_back(Instant::now());
+                    }),
+                None => None,
+            }
+        }
+    };
+    let decided = if let Some(refused) = checked {
+        refused
     } else if slot.is_none() {
         refuse(Code::Paced, "its home decides no more for it just now")
     } else if !crew.relay_in_force(&agent, &o) {
@@ -557,6 +628,14 @@ async fn decide_one(
         }
     };
     drop(slot);
+    // Stopped, held or spent at home while its model answered: what it
+    // decided isn't sent.
+    let decided = match decided {
+        Ok(_) if !crew.relay_in_force(&agent, &o) => {
+            refuse(Code::NotInForce, "Act fully isn't in force for it at home")
+        }
+        d => d,
+    };
     let input = match decided {
         Ok(text) => json!({"decideId": id,
                            "text": text.chars().take(MAX_ANSWER).collect::<String>()}),
