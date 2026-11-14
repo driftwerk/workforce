@@ -93,6 +93,11 @@ pub(crate) struct Relays {
     taken: std::collections::HashSet<Uuid>,
 }
 
+/// What only Desk's own plan runner asks a machine through the relay, never
+/// a boss's tool: its sessions, and a new session started there. Desk's
+/// native side sends each to the machine's own sessions route.
+pub const DESK_CALLS: [&str; 2] = ["desk.sessions", "desk.session_start"];
+
 /// Whether `name` can name a machine: no `/`, `:` or space in it.
 pub fn machine_ok(name: &str) -> bool {
     !name.is_empty()
@@ -123,10 +128,27 @@ impl CrewHub {
         agent: &str,
         ceiling: &super::served::Ceiling,
     ) -> Result<RelayAnswer, String> {
+        self.relay_as(machine, group, tool, input, agent, ceiling)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Self::relay`], saying whether what didn't come back may have
+    /// reached the machine.
+    pub(crate) async fn relay_as(
+        &self,
+        machine: &str,
+        group: &str,
+        tool: &str,
+        input: Value,
+        agent: &str,
+        ceiling: &super::served::Ceiling,
+    ) -> Result<RelayAnswer, workforce_desk::crew::MachineRefused> {
+        use workforce_desk::crew::MachineRefused;
         let unreached = || {
-            format!(
+            MachineRefused::Unreached(format!(
                 "{machine} can't be reached: Desk isn't open on this Mac, or {machine} isn't connected."
-            )
+            ))
         };
         // No one takes calls: nothing is queued to wait on.
         let polled = self
@@ -179,9 +201,9 @@ impl CrewHub {
             Ok(Ok(answer)) => Ok(answer),
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
-            _ if taken => Err(format!(
+            _ if taken => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
-            )),
+            ))),
             _ => Err(unreached()),
         }
     }

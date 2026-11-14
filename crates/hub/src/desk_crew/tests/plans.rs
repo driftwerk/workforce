@@ -1364,3 +1364,123 @@ async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
     })
     .await;
 }
+
+/// A plan's tickets run where the person said: on devbox, its session is
+/// started there through Desk's courier, once, with the ticket's model and
+/// that machine's folder; the ticket is that session's, and its turns wake
+/// the boss, who moves the ticket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_boss() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+
+        // devbox, as Desk's native side carries to it: its sessions, and
+        // each start it was sent.
+        let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let starts: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let poller = {
+            let (crew, there, starts) =
+                (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&starts));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        assert_eq!(c.machine, "devbox");
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(there.lock().clone()),
+                            "desk.session_start" => {
+                                starts.lock().push(c.input.clone());
+                                let s = json!({
+                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                });
+                                there.lock().push(s.clone());
+                                s
+                            }
+                            other => panic!("{other} relayed"),
+                        };
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Speed up vellev's recall",
+                "machine": "devbox",
+                "model": "claude-opus-4-8",
+                "tickets": [{"title": "Profile recall", "folder": "/home/dev/vellev"}],
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let ticket = &r.output["proposed"]["tickets"][0];
+        assert_eq!(ticket["machine"], "devbox", "{r:?}");
+        assert_eq!(ticket["model"], "claude-opus-4-8");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+
+        let started = eventually("its session on devbox", async || {
+            let p = d.plan(id).await.ok()?;
+            let t = &p.tickets[0].ticket.ticket;
+            let a = t.assignee.as_ref()?;
+            (t.state == TicketState::Doing).then(|| a.id.clone())
+        })
+        .await;
+        let sent = starts.lock().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let key = d.plan(id).await.unwrap().tickets[0]
+            .ticket
+            .key
+            .clone()
+            .unwrap();
+        assert_eq!(sent[0]["name"], json!(key));
+        assert_eq!(sent[0]["cwd"], "/home/dev/vellev");
+        assert_eq!(sent[0]["model"], "claude-opus-4-8");
+        assert!(
+            sent[0]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("person's own computer"),
+            "{sent:?}"
+        );
+        let made = there.lock()[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(started, format!("devbox/{made}"));
+        // No local session for it, and none started twice.
+        assert!(d.list().iter().all(|v| v.name != key));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(starts.lock().len(), 1);
+
+        // Its turn ends there: the boss is told, with its reply.
+        there.lock()[0]["state"] = json!("idle");
+        there.lock()[0]["lastReply"] = json!("Recall is 3x faster now.");
+        eventually("the boss told", async || {
+            (said(&llm, "finished a turn").await > 0).then_some(())
+        })
+        .await;
+        assert!(said(&llm, "Recall is 3x faster now.").await > 0);
+        poller.abort();
+    })
+    .await;
+}

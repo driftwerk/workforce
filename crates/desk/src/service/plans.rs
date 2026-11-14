@@ -71,6 +71,10 @@ pub struct PlanTicketView {
     pub engine: Option<Engine>,
     pub folder: Option<String>,
     pub view: Option<View>,
+    /// The person's machine it runs on; none is this computer.
+    pub machine: Option<String>,
+    /// The model its session runs; none is its engine's default.
+    pub model: Option<String>,
     /// Its session is being started.
     pub starting: bool,
     /// What holds its session, while Desk's breaker does: the ticket is
@@ -160,6 +164,35 @@ impl From<DeskError> for StartRefused {
     fn from(e: DeskError) -> Self {
         Self::Failed(e)
     }
+}
+
+/// A plan's ticket's session, started: on this computer (`machine` none),
+/// or on one of the person's machines, by its id there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    pub id: Uuid,
+    pub machine: Option<String>,
+    pub name: String,
+}
+
+impl Started {
+    /// Its sidebar item: `session:<id>`, or `session:<machine>/<id>`.
+    pub fn item(&self) -> String {
+        match &self.machine {
+            Some(m) => format!("session:{m}/{}", self.id),
+            None => super::session_item(self.id),
+        }
+    }
+}
+
+/// What a machine ticket's session is told besides its ticket: its board
+/// is on the person's own computer, which its machine doesn't hold.
+pub fn machine_note(key: &str, machine: &str) -> String {
+    format!(
+        "{key}'s board is on the person's own computer, not on {machine}: the ticket tool here \
+         can't see it, so don't use it for {key}. Say plainly in your replies what you finished \
+         and what is left; your boss moves the ticket."
+    )
 }
 
 /// What dropping a plan does with the sessions working on it.
@@ -366,6 +399,8 @@ impl Desk {
                     engine: r.engine,
                     folder: r.folder,
                     view: r.view,
+                    machine: r.machine,
+                    model: r.model,
                     ticket: v,
                 }
             })
@@ -694,6 +729,8 @@ impl Desk {
                     engine: Some(t.engine),
                     folder: Some(t.folder.clone()),
                     view: t.view,
+                    machine: t.machine.clone(),
+                    model: t.model.clone(),
                 },
             ));
             rank += RANK_STEP;
@@ -1000,7 +1037,10 @@ impl Desk {
                 row.updated_at = crew::now();
                 self.save_ticket(&mut row).await?;
             }
-            if was.is_some_and(|w| (w.engine, &w.folder, w.view) != (t.engine, &t.folder, t.view)) {
+            if was.is_some_and(|w| {
+                (w.engine, &w.folder, w.view, &w.machine, &w.model)
+                    != (t.engine, &t.folder, t.view, &t.machine, &t.model)
+            }) {
                 self.put_runs(p, t).await?;
             }
             let want: HashSet<Uuid> = t
@@ -1043,6 +1083,8 @@ impl Desk {
                     engine: Some(t.engine),
                     folder: Some(t.folder.clone()),
                     view: t.view,
+                    machine: t.machine.clone(),
+                    model: t.model.clone(),
                 },
             )
             .await
@@ -1694,7 +1736,7 @@ impl Desk {
         start: &Start,
         boss: &Party,
         by: &By,
-    ) -> Result<SessionView, StartRefused> {
+    ) -> Result<Started, StartRefused> {
         let _one = self.0.plan_starting.lock().await;
         if let Some((_, ask)) = self.plan_starts_held(p.group.as_deref(), p.id) {
             return Err(StartRefused::Skipped(format!(
@@ -1752,7 +1794,7 @@ impl Desk {
         s: Starting,
         boss: Option<&Party>,
         by: &By,
-    ) -> Result<Option<SessionView>, DeskError> {
+    ) -> Result<Option<Started>, DeskError> {
         let _one = self.0.plan_starting.lock().await;
         let t = match self.ticket_of(s.ticket).await {
             Ok(t) => t,
@@ -1765,7 +1807,11 @@ impl Desk {
         if let Ok(view) = self.view(s.session) {
             self.plan_link(t, view.clone(), by).await;
             self.end_start_of(&s).await;
-            return Ok(Some(view));
+            return Ok(Some(Started {
+                id: view.id,
+                machine: None,
+                name: view.label().to_string(),
+            }));
         }
         let plan_id = self.0.store.plan_of_ticket(t.id).await.map_err(internal)?;
         let p = match plan_id {
@@ -1800,6 +1846,7 @@ impl Desk {
                 && (o.state == TicketState::Doing || o.starting)
                 && o.folder.is_some()
                 && o.folder == runs.folder
+                && o.machine == runs.machine
         });
         self.plan_launch(&p, t, s.session, &runs, worktree, boss, by)
             .await
@@ -1865,16 +1912,30 @@ impl Desk {
         worktree: bool,
         boss: &Party,
         by: &By,
-    ) -> Result<SessionView, DeskError> {
+    ) -> Result<Started, DeskError> {
         let s = Starting {
             ticket: t.id,
             session,
             at: crew::now(),
         };
-        let started = self
-            .plan_spawn(p, &t, session, runs, worktree, boss, by)
-            .await;
-        let view = match started {
+        let launched = match runs.machine.clone() {
+            None => self
+                .plan_spawn(p, &t, session, runs, worktree, boss, by)
+                .await
+                .map(|v| {
+                    let started = Started {
+                        id: v.id,
+                        machine: None,
+                        name: v.label().to_string(),
+                    };
+                    (started, Some(v))
+                }),
+            Some(m) => self
+                .plan_spawn_on(&m, p, &t, runs, worktree, boss)
+                .await
+                .map(|started| (started, None)),
+        };
+        let (started, view) = match launched {
             Ok(v) => v,
             Err(e) => {
                 self.undo_start(&s).await;
@@ -1882,10 +1943,148 @@ impl Desk {
                 return Err(e);
             }
         };
-        self.plan_link(t, view.clone(), by).await;
+        match view {
+            Some(view) => self.plan_link(t, view, by).await,
+            None => self.plan_link_on(p, t, &started, by).await,
+        }
         self.end_start_of(&s).await;
         self.plan_touched(p.id).await;
-        Ok(view)
+        Ok(started)
+    }
+
+    /// The session for `t` on `machine`, through Desk on this computer: the
+    /// one there already for it (named for its key, in its folder), when
+    /// one is, so a start cut off or never answered is never made twice;
+    /// else one started there now in the machine's own folder, its prompt
+    /// saying its board is here.
+    async fn plan_spawn_on(
+        &self,
+        machine: &str,
+        p: &Plan,
+        t: &Ticket,
+        runs: &Runs,
+        worktree: bool,
+        boss: &Party,
+    ) -> Result<Started, DeskError> {
+        let key = self.key_of(t).await?;
+        let needs = self.need_keys(t).await?;
+        let (Some(engine), Some(folder)) = (runs.engine, runs.folder.clone()) else {
+            return Err(DeskError::Invalid(format!(
+                "{key} doesn't say where its session runs."
+            )));
+        };
+        let crew = self.plan_crew().ok_or_else(|| {
+            DeskError::Invalid(format!("{machine} can't be reached from this hub."))
+        })?;
+        let refused = |e: crew::MachineRefused| match e {
+            crew::MachineRefused::Refused(why) => {
+                DeskError::Invalid(format!("{machine} didn't start {key}: {why}"))
+            }
+            e => DeskError::Invalid(e.to_string()),
+        };
+        let group = p.group.as_deref();
+        let listed = crew
+            .machine_call(
+                machine,
+                group,
+                &boss.id,
+                "desk.sessions",
+                serde_json::json!({}),
+            )
+            .await
+            .map_err(refused)?;
+        let listed: Vec<crew::MachineSession> = serde_json::from_value(listed)
+            .map_err(|_| DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")))?;
+        let made_in = |cwd: &str| {
+            cwd == folder
+                || cwd.starts_with(&format!("{}/.worktrees/", folder.trim_end_matches('/')))
+        };
+        if let Some(there) = listed
+            .iter()
+            .find(|s| s.name == key && made_in(&s.cwd) && s.state != SessionState::Closed.as_str())
+        {
+            return Ok(Started {
+                id: there.id,
+                machine: Some(machine.to_string()),
+                name: there.label().to_string(),
+            });
+        }
+        let prompt = format!(
+            "{}\n\n{}",
+            board::handed_text(&key, t, &needs),
+            machine_note(&key, machine)
+        );
+        let mut body = serde_json::json!({
+            "engine": engine.as_str(),
+            "name": key,
+            "cwd": folder,
+            "goal": board::goal_of(&key, t),
+            "prompt": prompt,
+        });
+        if let Some(view) = runs.view {
+            body["view"] = view.as_str().into();
+        }
+        // Its own worktree there, when another of the plan's tickets works
+        // in the same folder: the machine makes it.
+        if worktree {
+            body["worktree"] = branch_for(&key).into();
+        }
+        if let Some(model) = &runs.model {
+            body["model"] = model.clone().into();
+        }
+        let made = crew
+            .machine_call(machine, group, &boss.id, "desk.session_start", body)
+            .await
+            .map_err(refused)?;
+        let made: crew::MachineSession = serde_json::from_value(made).map_err(|_| {
+            DeskError::Invalid(format!(
+                "{machine} started {key}, but its answer couldn't be read; Desk finds it there next time."
+            ))
+        })?;
+        Ok(Started {
+            id: made.id,
+            machine: Some(machine.to_string()),
+            name: made.label().to_string(),
+        })
+    }
+
+    fn plan_crew(&self) -> Option<std::sync::Arc<dyn crew::Crew>> {
+        self.0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Gives `t` to `started`, its session on one of the person's machines:
+    /// that session in the plan's group in the sidebar, and the ticket its.
+    async fn plan_link_on(&self, p: &Plan, t: Ticket, started: &Started, by: &By) {
+        let item = started.item();
+        if let Some(g) = p
+            .group
+            .clone()
+            .filter(|g| self.layout().groups.iter().any(|x| &x.id == g))
+        {
+            if self.group_of_member(&item).as_deref() != Some(g.as_str()) {
+                if let Err(e) = self.change_layout(|l| l.put(&item, &g, None)).await {
+                    tracing::info!(%item, error = %e, "a machine's plan session wasn't put in its group");
+                }
+            }
+        }
+        let id = t.id;
+        let key = match self.key_of(&t).await {
+            Ok(k) => k,
+            Err(_) => "a ticket".into(),
+        };
+        let Ok(now) = self.ticket_of(id).await else {
+            return;
+        };
+        if now.assignee.is_some() || now.state != TicketState::Doing {
+            return;
+        }
+        if let Err(e) = self.assign_machine_session(now, &key, started, by).await {
+            tracing::info!(ticket = %id, error = %e, "a started ticket wasn't given to its machine's session");
+        }
     }
 
     /// The session for `t`, started as `session`.
@@ -1982,6 +2181,8 @@ fn plan_ticket(v: &super::TicketView, runs: Option<&Runs>, starting: bool) -> Pl
         engine: r.engine,
         folder: r.folder,
         view: r.view,
+        machine: r.machine,
+        model: r.model,
         assigned: v.ticket.assignee.is_some(),
         starting,
     }
@@ -2003,6 +2204,8 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
             engine: Some(t.engine),
             folder: Some(t.folder.clone()),
             view: t.view,
+            machine: t.machine.clone(),
+            model: t.model.clone(),
             assigned: false,
             starting: false,
         })

@@ -87,6 +87,7 @@ mod ledger;
 mod plans;
 pub use plans::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
+    Started,
 };
 #[cfg(test)]
 mod lifecycle_tests;

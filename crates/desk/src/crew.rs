@@ -688,10 +688,75 @@ pub enum ItemRefused {
     Cant(String),
 }
 
+/// Why a call to one of the person's machines came to nothing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineRefused {
+    /// Nothing reached it: Desk isn't open on this computer, or the
+    /// machine isn't connected. Nothing was done there.
+    Unreached(String),
+    /// It refused, in its own words, before doing anything.
+    Refused(String),
+    /// It may have had it, but no answer came: what it did isn't known.
+    Unknown(String),
+}
+
+impl std::fmt::Display for MachineRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreached(w) | Self::Refused(w) | Self::Unknown(w) => f.write_str(w),
+        }
+    }
+}
+
+/// What one of the person's machines lists of its own sessions in Desk
+/// (`GET /api/desk/sessions` there), as much as a plan reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineSession {
+    pub id: uuid::Uuid,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub cwd: String,
+    /// Its state as the machine says it (`working`, `idle`, `closed`…).
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub last_reply: Option<String>,
+}
+
+impl MachineSession {
+    /// What the person calls it.
+    pub fn label(&self) -> &str {
+        self.display_name
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
+}
+
 /// The hub's side of the crew: its agents, the overseer, and doing what a
 /// suggestion proposed.
 #[async_trait::async_trait]
 pub trait Crew: Send + Sync {
+    /// Asks one of the person's machines, through Desk on this computer,
+    /// what only Desk's own plan runner asks of it: `desk.sessions` (its
+    /// sessions) or `desk.session_start` (`input` a new session's body),
+    /// for the plan of `boss` in `group`. Its answer's body.
+    async fn machine_call(
+        &self,
+        machine: &str,
+        _group: Option<&str>,
+        _boss: &str,
+        _call: &str,
+        _input: serde_json::Value,
+    ) -> Result<serde_json::Value, MachineRefused> {
+        Err(MachineRefused::Unreached(format!(
+            "{machine} can't be reached from this hub."
+        )))
+    }
     /// The agent overseeing the crew, if one does.
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.
