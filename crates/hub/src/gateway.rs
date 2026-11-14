@@ -8781,7 +8781,16 @@ async fn pair_device_status(
             Ok(Json(serde_json::json!({ "status": "pending" })))
         }
         workforce_pairing::types::PairingStatus::Approved => {
-            if let Some(token) = req.pending_token.clone() {
+            if req.pending_token.is_some() && req.collectable_token(chrono::Utc::now()).is_none() {
+                // Not collected in time: the copy goes, and the code is as
+                // good as expired (the device pairs again), not "used".
+                let _ = pairing.clear_pending_token_async(req.id.clone()).await;
+                return Err(StatusCode::NOT_FOUND);
+            }
+            if let Some(token) = req
+                .collectable_token(chrono::Utc::now())
+                .map(str::to_string)
+            {
                 // One-time token retrieval — clear it after returning
                 let _ = pairing.clear_pending_token_async(req.id.clone()).await;
                 Ok(Json(serde_json::json!({

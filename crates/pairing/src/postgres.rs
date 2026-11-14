@@ -372,6 +372,14 @@ impl PairingStore for PostgresPairingStore {
                     &[&cutoff],
                 )
                 .await?;
+            // A token nobody collected in time goes too.
+            let collect_by = cutoff - chrono::Duration::seconds(PENDING_TOKEN_TTL_SECS);
+            conn.execute(
+                "UPDATE device_pairing_requests SET pending_token = NULL
+                 WHERE pending_token IS NOT NULL AND (approved_at IS NULL OR approved_at < $1)",
+                &[&collect_by],
+            )
+            .await?;
             Ok((c + d + n) as usize)
         })
     }
