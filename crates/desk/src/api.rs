@@ -2310,9 +2310,15 @@ pub(crate) fn voice_router(
 async fn hook(
     State(desk): State<Desk>,
     Path((id, token)): Path<(Uuid, String)>,
+    h: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match desk.hook(id, &token, &body).await {
+    // A Devin hook says the event it posts for, should its payload not.
+    let event = h
+        .get(crate::devin::EVENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|e| e.len() <= 64 && e.chars().all(|c| c.is_ascii_alphanumeric()));
+    match desk.hook_of(id, &token, &body, event).await {
         Some(answer) => Json(answer).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }

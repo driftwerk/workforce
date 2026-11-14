@@ -734,7 +734,9 @@ impl Desk {
             return;
         };
         match engine {
-            Some(Engine::Claude) => l.breaker.steer = Some((reason, text)),
+            // Devin reads words beside a call's result as Claude Code does
+            // (`additionalContext`, [`crate::devin::answer`]).
+            Some(Engine::Claude | Engine::Devin) => l.breaker.steer = Some((reason, text)),
             Some(Engine::Codex) => {
                 if let Some(link) = &l._codex {
                     let _ = link.steers.send(text);
@@ -745,7 +747,6 @@ impl Desk {
                 | Engine::Copilot
                 | Engine::OpenCode
                 | Engine::Cursor
-                | Engine::Devin
                 | Engine::Custom,
             )
             | None => {}

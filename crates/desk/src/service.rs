@@ -39,6 +39,7 @@ use crate::store::DeskStore;
 use crate::transcript;
 use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
+use crate::{devin, devin_config};
 
 mod accounts;
 mod asks;
@@ -61,6 +62,9 @@ mod charge;
 pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
+mod devin_sessions;
+#[cfg(test)]
+mod devin_tests;
 mod grants;
 #[cfg(test)]
 mod grants_tests;
@@ -1744,6 +1748,9 @@ impl Desk {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
         }
         desk.adopt_held(held).await;
+        // Devin sessions that ended while the hub was away: what Devin saved
+        // is written back, and their files (their hook tokens) go.
+        desk.sweep_devin_files().await;
         desk.handoffs_recover().await;
         desk.carry_asks(kept_asks, open_waits);
 
@@ -2516,14 +2523,13 @@ impl Desk {
     /// shell it runs in.
     fn root_of(l: &Live, engine: Engine) -> Option<u32> {
         match engine {
-            Engine::Claude => l.pty.pid(),
+            Engine::Claude | Engine::Devin => l.pty.pid(),
             Engine::Codex => l._codex.as_ref()?.server.pid(),
             // Desk doesn't run these yet ([`engine::views`]).
             Engine::Gemini
             | Engine::Copilot
             | Engine::OpenCode
             | Engine::Cursor
-            | Engine::Devin
             | Engine::Custom => None,
         }
     }
@@ -3370,7 +3376,28 @@ impl Desk {
                     .into(),
             ));
         }
-        if r.cli_session_id.is_none() {
+        // Devin's conversation, as Devin still lists it in its folder; a new
+        // one, the person told why, when it doesn't.
+        let (r, afresh) = match r.engine {
+            Engine::Devin => match self.devin_carries(&r).await {
+                devin_sessions::Carries::On(cli) => (
+                    SessionRecord {
+                        cli_session_id: Some(cli),
+                        ..r
+                    },
+                    None,
+                ),
+                devin_sessions::Carries::Afresh(why) => (
+                    SessionRecord {
+                        cli_session_id: None,
+                        ..r
+                    },
+                    Some(why),
+                ),
+            },
+            _ => (r, None),
+        };
+        if r.cli_session_id.is_none() && afresh.is_none() {
             return Err(DeskError::Conflict(
                 "this session never started a conversation, so there is nothing to resume".into(),
             ));
@@ -3378,7 +3405,11 @@ impl Desk {
         if by.is_some() {
             self.0.state.lock().acted.insert(id);
         }
+        let carried = r.cli_session_id.clone();
         self.change(id, |r, _| {
+            if r.engine == Engine::Devin {
+                r.cli_session_id = carried;
+            }
             r.origin = Origin::Desk;
             r.external_pid = None;
             // Desk runs it now, not the terminal it started in.
@@ -3389,7 +3420,17 @@ impl Desk {
                 r.last_prompt = Some(p);
             }
         });
-        let launched = self.launch(&r, true, prompt.as_deref()).await;
+        let launched = self.launch(&r, afresh.is_none(), prompt.as_deref()).await;
+        if let (Ok(()), Some(why)) = (&launched, &afresh) {
+            if let Ok(view) = self.view(id) {
+                self.note(Event::new(
+                    Kind::Restarted,
+                    Party::desk(),
+                    Some(Party::session(&view)),
+                    why.clone(),
+                ));
+            }
+        }
         if launched.is_ok() {
             self.breaker_launched(id);
             if let Some(p) = &prompt {
@@ -4770,11 +4811,47 @@ impl Desk {
                 fixed_ground = colors.as_ref().map(|c| c.ground);
                 (spec, Some(link))
             }
+            Engine::Devin => {
+                let hook_url = format!("{}/hook/{}/{token}", self.0.hook_base, r.id);
+                let files = self.devin_files(r.id, &env).await?;
+                let person = devin_config::person_path(&env);
+                let person = tokio::task::spawn_blocking(move || {
+                    devin_config::Person::read(person.as_deref())
+                })
+                .await
+                .unwrap_or_else(|e| devin_config::Person::Unreadable(e.to_string()));
+                if let devin_config::Person::Unreadable(why) = &person {
+                    tracing::warn!(session = %r.id, why = %why, "the person's Devin config couldn't be read: the session runs without it, and nothing is written back to it");
+                }
+                files
+                    .write(
+                        &self.0.opts.run_dir,
+                        &hook_url,
+                        self.0.opts.approval_timeout.as_secs(),
+                        false,
+                        &person,
+                    )
+                    .map_err(DeskError::Internal)?;
+                let session_id = r.cli_session_id.as_deref().filter(|_| resume);
+                let spec = devin::spawn(&devin::DevinSpawn {
+                    program: self.program_of(Engine::Devin)?,
+                    cwd,
+                    launch: match session_id {
+                        Some(session_id) => devin::Launch::Resume { session_id },
+                        None => devin::Launch::New,
+                    },
+                    prompt,
+                    mode,
+                    model: None,
+                    config: &files.config,
+                    env: &env,
+                });
+                (spec, None)
+            }
             Engine::Gemini
             | Engine::Copilot
             | Engine::OpenCode
             | Engine::Cursor
-            | Engine::Devin
             | Engine::Custom => {
                 return Err(DeskError::Invalid(format!(
                     "Desk can't start {} sessions yet",
@@ -4814,6 +4891,9 @@ impl Desk {
             Err(e) => {
                 if let Some(codex) = &codex {
                     codex.stop();
+                }
+                if r.engine == Engine::Devin {
+                    self.devin_ended(r.id).await;
                 }
                 return Err(e);
             }
@@ -5031,6 +5111,9 @@ impl Desk {
         let live = self.0.state.lock().live.remove(&id);
         let Some(live) = live else { return };
         tracing::info!(%id, ?code, "desk session exited");
+        if self.engine_of(id) == Some(Engine::Devin) {
+            self.devin_ended(id).await;
+        }
         let clean = live.ended || live.stopping;
         let closing = live.closing;
         live.end();
@@ -5051,6 +5134,20 @@ impl Desk {
     /// Handles one Claude Code hook call. Returns `None` when the URL's token
     /// doesn't match a running session.
     pub async fn hook(&self, id: Uuid, token: &str, body: &[u8]) -> Option<Value> {
+        self.hook_of(id, token, body, None).await
+    }
+
+    /// [`Self::hook`], with the event a Devin hook said it posts for
+    /// ([`devin::EVENT_HEADER`]). A Devin session's hook is put in Claude
+    /// Code's terms on the way in, and Desk's answer in Devin's on the way
+    /// out ([`devin::answer`]): everything between is the same for both.
+    pub async fn hook_of(
+        &self,
+        id: Uuid,
+        token: &str,
+        body: &[u8],
+        event: Option<&str>,
+    ) -> Option<Value> {
         let authorised = self
             .0
             .state
@@ -5060,6 +5157,25 @@ impl Desk {
             .is_some_and(|l| l.token == token);
         if !authorised {
             return None;
+        }
+        if self.engine_of(id) == Some(Engine::Devin) {
+            let body = match devin::normalized(body, event) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(%id, error = %e, "unreadable Devin hook");
+                    return Some(Value::Object(Default::default()));
+                }
+            };
+            let hook = match claude::parse_hook(&body) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(%id, error = %e, "unreadable Devin hook");
+                    return Some(Value::Object(Default::default()));
+                }
+            };
+            self.mode_said(id, &hook, &body);
+            let said = self.apply_hook(id, hook, claude::agent_of(&body)).await;
+            return Some(devin::answer(said));
         }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,

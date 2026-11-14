@@ -127,7 +127,10 @@ pub enum Refusal {
     CrossGroup,
     HubInternal,
     MemoryOff(Engine),
-    NoRecord { source: Engine, target: Engine },
+    NoRecord {
+        source: Engine,
+        target: Engine,
+    },
     NoRedactor,
     AlreadyHanded,
     NothingToHandBack,
@@ -135,6 +138,8 @@ pub enum Refusal {
     StillRunning,
     BackToAnother(Engine),
     InTerminal,
+    /// It has no line tools, so no `brief` to read: only the goal goes.
+    NoBrief(Engine),
 }
 
 impl std::fmt::Display for Refusal {
@@ -153,6 +158,7 @@ impl std::fmt::Display for Refusal {
             Refusal::CantResume => f.write_str("The session this work came from can't be resumed; continue it in a new session instead."),
             Refusal::StillRunning => f.write_str("The session this work came from is still running; stop it first, or continue in a new session."),
             Refusal::BackToAnother(e) => write!(f, "This work came from a {} session; hand it back to that engine, or continue in a new session.", e.title()),
+            Refusal::NoBrief(e) => write!(f, "{} can't read a brief yet. Start it here with only the goal instead.", e.title()),
             Refusal::InTerminal => f.write_str("This session runs in a Desk terminal, so Desk can't stop it: keep it running, or end it there first."),
         }
     }
@@ -209,6 +215,9 @@ pub fn check(f: &Facts, ask: &Ask) -> Result<Content, Refusal> {
     }
     if ask.goal_only {
         return Ok(Content::GoalOnly);
+    }
+    if !engine::reads_brief(f.target) {
+        return Err(Refusal::NoBrief(f.target));
     }
     if !f.record {
         return Err(Refusal::NoRecord {
@@ -429,10 +438,17 @@ mod tests {
             ),
             (
                 Facts {
+                    target: Engine::Gemini,
+                    ..facts()
+                },
+                Refusal::NotStartable(Engine::Gemini),
+            ),
+            (
+                Facts {
                     target: Engine::Devin,
                     ..facts()
                 },
-                Refusal::NotStartable(Engine::Devin),
+                Refusal::NoBrief(Engine::Devin),
             ),
             (
                 Facts {
@@ -534,6 +550,11 @@ mod tests {
             ..Ask::default()
         };
         for f in [
+            // Devin reads no brief yet, but takes the goal.
+            Facts {
+                target: Engine::Devin,
+                ..facts()
+            },
             Facts {
                 record: false,
                 ..facts()
