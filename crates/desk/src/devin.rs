@@ -324,6 +324,10 @@ pub fn curl_config(hook_url: &str) -> Result<String> {
 /// payload not say.
 pub const EVENT_HEADER: &str = "X-Desk-Devin-Event";
 
+/// Why a fail-closed hook refused a call: Desk was down, restarting, or
+/// had no session to answer it for.
+pub const NOT_ANSWERED: &str = "Desk didn't answer for this tool call, so it was refused.";
+
 /// How long its plain hooks may take; Desk answers them at once.
 const PLAIN_SECS: u64 = 10;
 
@@ -348,10 +352,7 @@ pub fn hook_command(
     let curl = quote(curl_program())?;
     let post = format!("{curl} -q -sf --max-time {timeout} -K {file} -H {header} --data-binary @-");
     Ok(match fail_closed {
-        true => format!(
-            "{post} || {{ echo {} >&2; exit 2; }}",
-            quote(claude::UNREACHED)?
-        ),
+        true => format!("{post} || {{ echo {} >&2; exit 2; }}", quote(NOT_ANSWERED)?),
         false => post,
     })
 }
@@ -385,15 +386,25 @@ fn curl_program() -> &'static str {
 /// catch-all would fire both for a question), waiting as long as a
 /// question's start may be held for its boss ([`claude::DIALOG_WAIT_SECS`]):
 /// every other call Desk answers at once.
+///
+/// The `PermissionRequest` hook is always fail-closed by its own exit:
+/// Desk not answering (down, restarting, no session) is exit 2, Devin's
+/// documented block, with the reason on stderr, so Devin refuses the call
+/// and never runs it without Desk asked. Desk always answers before curl
+/// gives up (`{}` at the wait's end, which Devin asks in its terminal
+/// about), and asking in the terminal is an answer too. Not by
+/// `fail_closed: true`: only Devin's changelog names it, from 3000.11.205,
+/// and an older Devin might refuse a config with a key it doesn't know.
 pub fn hooks(
     hook_file: &Path,
     approval_timeout_secs: u64,
     fail_closed: bool,
 ) -> Result<Map<String, Value>> {
     let entry = |event: &str, timeout: u64, fail_closed: bool| -> Result<Value> {
+        let refuses = fail_closed || event == "PermissionRequest";
         let mut hook = json!({
             "type": "command",
-            "command": hook_command(hook_file, event, timeout, fail_closed)?,
+            "command": hook_command(hook_file, event, timeout, refuses)?,
             "timeout": timeout + 5,
         });
         if fail_closed {
@@ -1086,7 +1097,15 @@ mod tests {
             );
             assert!(c.contains("-K '/run dir/0.hook'"), "{c}");
             assert!(c.contains(&format!("{EVENT_HEADER}: {e}")), "{c}");
-            assert!(h.get("fail_closed").is_none());
+            assert!(
+                h.get("fail_closed").is_none(),
+                "{e}: no key an older Devin may refuse"
+            );
+            assert_eq!(
+                c.ends_with("exit 2; }"),
+                e == "PermissionRequest",
+                "only its permission hook refuses on its own: {c}"
+            );
         }
         let timeout = |e: &str| hooks[e][0]["hooks"][0]["timeout"].as_u64().unwrap();
         assert_eq!(timeout("PermissionRequest"), 3605);
@@ -1097,6 +1116,8 @@ mod tests {
         assert_eq!(pre["fail_closed"], true);
         assert!(pre["command"].as_str().unwrap().ends_with("exit 2; }"));
         assert!(closed["Stop"][0]["hooks"][0].get("fail_closed").is_none());
+        let asks = &closed["PermissionRequest"][0]["hooks"][0];
+        assert!(asks["command"].as_str().unwrap().ends_with("exit 2; }"));
     }
 
     /// The pre-tool hook of a session a served boss would run: Desk not
@@ -1128,7 +1149,7 @@ mod tests {
         };
         let out = run("http://127.0.0.1:9/hook/a/b");
         assert_eq!(out.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&out.stderr).contains(claude::UNREACHED));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ANSWERED));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let served = std::thread::spawn(move || {
