@@ -66,6 +66,11 @@ pub struct GrantView {
     pub grant: Grant,
     pub live: bool,
     pub why: Option<String>,
+    /// At Act fully, the real money its sessions here spent today (calls a
+    /// key paid for, never the person's plans), as its budget counts it;
+    /// none below Act fully, or when it can't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent_today_usd: Option<f64>,
 }
 
 /// Every grant here, and the engine's switches.
@@ -215,6 +220,55 @@ impl Desk {
         Ok(g)
     }
 
+    /// The boss `group`'s live grant names, as the party a session handed
+    /// to it is charged to, when the grant holds session `id` (its
+    /// `members` or `born`, and no other grant's first) and its level does
+    /// more than watch. `Err(None)`
+    /// when no grant names a boss for the group; otherwise why not, in
+    /// plain words.
+    pub fn grant_boss_for(
+        &self,
+        group: &str,
+        id: Uuid,
+    ) -> Result<crate::crew::Party, Option<String>> {
+        let g = match self.grant_live(group) {
+            Ok(g) => g,
+            Err(why) => {
+                let named = self
+                    .0
+                    .grants
+                    .lock()
+                    .grants
+                    .get(group)
+                    .is_some_and(|g| g.boss.is_some());
+                return Err(named.then_some(why));
+            }
+        };
+        let Some(boss) = g.boss.as_ref().filter(|b| b.servable()) else {
+            return Err(None);
+        };
+        let name = match boss {
+            grant::BossRef::Local { agent } => agent.clone(),
+            grant::BossRef::Remote { hub, agent } => format!("{agent} ({hub})"),
+        };
+        if g.level == grant::Level::Watch {
+            return Err(Some(format!(
+                "{name} only watches {}; set them to Act to run work.",
+                g.name
+            )));
+        }
+        // The grant that holds it is this one, as letting go of it judges.
+        if self.grant_group_of(id).as_deref() != Some(group) {
+            return Err(Some(format!(
+                "{} isn't one of the sessions {name} may run in {}.",
+                self.view(id)
+                    .map_or_else(|_| "It".into(), |v| v.label().to_string()),
+                g.name
+            )));
+        }
+        Ok(crate::crew::Party::manager(&boss.party_id(), &name))
+    }
+
     /// Every grant here that names a boss, with why it doesn't serve its
     /// boss now, in plain words, when it doesn't.
     pub fn grants_bossed(&self) -> Vec<(Grant, Option<String>)> {
@@ -264,7 +318,50 @@ impl Desk {
             live: why.is_none(),
             why,
             grant: g,
+            spent_today_usd: None,
         }
+    }
+
+    /// What `g`'s sessions here spent today, at Act fully: what its daily
+    /// budget is judged by on this engine.
+    async fn spent_today_of(&self, g: &mut GrantView) {
+        if g.grant.level != grant::Level::Full {
+            return;
+        }
+        let now = Utc::now();
+        let midnight = self.period_start(crate::ledger::Period::Day, now);
+        let scope = match g.grant.group.as_str() {
+            UNGROUPED => crate::scope::Scope::Ungrouped,
+            group => crate::scope::Scope::Group(group.to_string()),
+        };
+        let filter = crate::ledger_store::Filter {
+            seen: Some(self.seen_by(&scope)),
+            ..Default::default()
+        };
+        match self.billed_usd(midnight, now, &filter).await {
+            Ok(usd) => g.spent_today_usd = Some(usd),
+            Err(e) => tracing::warn!(
+                group = %g.grant.group,
+                error = %e,
+                "couldn't read a grant's spend today"
+            ),
+        }
+    }
+
+    /// [`Self::grants_view`], with each Act fully grant's spend today.
+    pub async fn grants_view_spent(&self, n: &Native) -> GrantsView {
+        let mut v = self.grants_view(n);
+        for g in &mut v.grants {
+            self.spent_today_of(g).await;
+        }
+        v
+    }
+
+    /// [`Self::grant_view`], with its spend today at Act fully.
+    pub async fn grant_view_spent(&self, n: &Native, group: &str) -> Option<GrantView> {
+        let mut g = self.grant_view(n, group)?;
+        self.spent_today_of(&mut g).await;
+        Some(g)
     }
 
     /// Every grant here, and the engine's switches.

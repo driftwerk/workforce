@@ -63,6 +63,10 @@ pub(crate) fn copy_credential(
     store: &dyn SecretStore,
     req: &CopyRequest<'_>,
 ) -> Option<Vec<CopyOutcome>> {
+    // A Desk link is never copied, at any tier, whichever caller asks.
+    if workforce_common::vault_scope::is_desk_link(req.path) {
+        return None;
+    }
     let value = read_source_value(store, req)?;
     Some(
         req.to_users
@@ -76,6 +80,15 @@ pub(crate) fn copy_credential(
 }
 
 fn read_source_value(store: &dyn SecretStore, req: &CopyRequest<'_>) -> Option<String> {
+    // Never read from a Desk link, however the source user and path put
+    // together say it.
+    if let Some(from) = req.from_user.filter(|_| req.from_tier.is_per_user()) {
+        if !one_segment(from)
+            || workforce_common::vault_scope::is_desk_link(&format!("users/{from}/{}", req.path))
+        {
+            return None;
+        }
+    }
     let scope = req
         .from_tier
         .is_per_user()
@@ -100,6 +113,13 @@ fn copy_to_user(
     if req.from_tier == req.to_tier && req.from_user == Some(uid) {
         return CopyStatus::Source;
     }
+    // One user, one path segment; and never into a Desk link, however the
+    // id and path put together say it.
+    if !one_segment(uid)
+        || workforce_common::vault_scope::is_desk_link(&format!("users/{uid}/{}", req.path))
+    {
+        return CopyStatus::Error("that can't be copied to this user".into());
+    }
     run_with_optional_identity(Some(uid.to_string()), || {
         let exists = store
             .inspect(req.path)
@@ -113,6 +133,12 @@ fn copy_to_user(
             Err(e) => CopyStatus::Error(e.to_string()),
         }
     })
+}
+
+/// Whether user id `u` is one path segment: none with a separator or `..`
+/// puts a per-user key under another.
+fn one_segment(u: &str) -> bool {
+    !u.is_empty() && u != "." && !u.contains(['/', '\\', '\0']) && !u.contains("..")
 }
 
 /// Drop empty and duplicate destination ids, preserving first-seen order.
@@ -365,6 +391,108 @@ mod tests {
             value_at(&store, None, "p", VaultSource::AgentSpecific).as_deref(),
             Some("SHARED")
         );
+    }
+
+    /// A destination id that is more than one segment can't land the copy
+    /// under another user's key, a Desk link least of all.
+    #[test]
+    fn a_copy_never_lands_in_a_desk_link_by_way_of_the_user_id() {
+        let (_dir, store) = store();
+        seed(&store, None, "hubs/x", "wfr_elsewhere", VaultSource::Global);
+        let dests = vec![
+            "bob/desk".to_string(),
+            "bob\\desk".to_string(),
+            "..".to_string(),
+        ];
+        let outcomes = copy_credential(
+            &store,
+            &req(
+                "hubs/x",
+                VaultSource::Global,
+                VaultSource::GlobalPerUser,
+                None,
+                &dests,
+            ),
+        )
+        .unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o.status, CopyStatus::Error(_))),
+            "{:?}",
+            outcomes.iter().map(|o| &o.status).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            value_at(
+                &store,
+                Some("bob"),
+                "desk/hubs/x",
+                VaultSource::GlobalPerUser
+            ),
+            None
+        );
+    }
+
+    /// Nor is a Desk link read as a copy's source by way of its user id.
+    #[test]
+    fn a_copy_never_reads_a_desk_link_by_way_of_the_user_id() {
+        let (_dir, store) = store();
+        seed(
+            &store,
+            Some("bob"),
+            "desk/hubs/x",
+            "wfr_bobs",
+            VaultSource::GlobalPerUser,
+        );
+        let dests = vec!["carol".to_string()];
+        let got = copy_credential(
+            &store,
+            &req(
+                "hubs/x",
+                VaultSource::GlobalPerUser,
+                VaultSource::GlobalPerUser,
+                Some("bob/desk"),
+                &dests,
+            ),
+        );
+        assert!(got.is_none());
+        assert_eq!(
+            value_at(&store, Some("carol"), "hubs/x", VaultSource::GlobalPerUser),
+            None
+        );
+    }
+
+    /// A Desk link at a shared tier is never copied, whichever caller asks,
+    /// and no user id that isn't one plain segment names a source or a
+    /// destination.
+    #[test]
+    fn a_desk_link_is_never_copied_and_user_ids_are_one_segment() {
+        let (_dir, store) = store();
+        seed(
+            &store,
+            None,
+            "desk/links/x",
+            "wfr_link",
+            VaultSource::Global,
+        );
+        let dests = vec!["carol".to_string()];
+        let got = copy_credential(
+            &store,
+            &req(
+                "desk/links/x",
+                VaultSource::Global,
+                VaultSource::GlobalPerUser,
+                None,
+                &dests,
+            ),
+        );
+        assert!(got.is_none());
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "x/../y"] {
+            assert!(!one_segment(bad), "{bad:?}");
+        }
+        for good in ["bob", "bob@acme.io", "7c9e6679-7425-40de-944b-e07fc1f90ae7"] {
+            assert!(one_segment(good), "{good:?}");
+        }
     }
 
     #[test]

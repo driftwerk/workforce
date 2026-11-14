@@ -65,8 +65,52 @@ async fn hand(
     // Its scope's boss runs it, and no other.
     let group = s.desk.view(id).ok().and_then(|v| v.group.map(|g| g.id));
     let Some(boss) = s.desk.boss_of(&s.desk.scope_of_group(group.as_deref())) else {
-        return DeskError::Conflict("No agent oversees the crew to hand it to.".into())
+        // No agent here oversees its group: the boss its group's live grant
+        // names (one on another hub, or the home's own of a machine's
+        // sessions) runs it, when the grant holds it.
+        let none = || DeskError::Conflict("No agent oversees the crew to hand it to.".into());
+        let Some(g) = group else {
+            return none().into_response();
+        };
+        let party = match s.desk.grant_boss_for(&g, id) {
+            Ok(party) => party,
+            Err(None) => return none().into_response(),
+            Err(Some(why)) => return DeskError::Conflict(why).into_response(),
+        };
+        // `boss`, for one served from a grant, is its whole `<hub>/<agent>`.
+        if b.boss.as_deref().is_some_and(|w| w != party.id) {
+            return DeskError::Conflict(format!(
+                "{} runs the sessions here; hand it to them.",
+                party.name
+            ))
             .into_response();
+        }
+        let charged = s
+            .desk
+            .take_on(
+                id,
+                &party,
+                How::Handed,
+                &crate::scope::Scope::Group(g.clone()),
+                &By::you(),
+            )
+            .await;
+        // A stop or a change of its grant meanwhile: let go of it at once.
+        if charged.is_ok() && s.desk.grant_boss_for(&g, id).is_err() {
+            if let Err(e) = s
+                .desk
+                .release(id, &By::desk("Its grant changed as it was handed over."))
+                .await
+            {
+                // The hub's settle lets go of it on its next tick.
+                tracing::warn!(session = %id, error = %e, "a hand its grant no longer lets wasn't let go of");
+            }
+            return DeskError::Conflict(
+                "Its grant changed as it was handed over, so it isn't; try again.".into(),
+            )
+            .into_response();
+        }
+        return charged.map(Json).into_response();
     };
     if boss.level == "watch" {
         return DeskError::Conflict(format!(

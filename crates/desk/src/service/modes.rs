@@ -336,11 +336,17 @@ impl Desk {
     /// that runs it.
     pub async fn set_mode(&self, id: Uuid, mode: Mode, by: By) -> Result<ModeSet, DeskError> {
         let r = self.record(id)?;
-        if !matches!(r.engine, Engine::Claude | Engine::Codex) {
+        if !matches!(r.engine, Engine::Claude | Engine::Codex | Engine::Devin) {
             return Err(DeskError::Invalid(format!(
                 "Desk can't set {}'s mode",
                 r.engine.title()
             )));
+        }
+        // Devin takes no plan mode at its start ([`Mode::devin_args`]).
+        if r.engine == Engine::Devin && mode.devin_args().is_none() {
+            return Err(DeskError::Invalid(
+                "Devin starts in plan mode only from its terminal".into(),
+            ));
         }
         let view = self.view(id)?;
         if view.terminal_id.is_some() {
@@ -402,6 +408,10 @@ impl Desk {
             view
         };
         let confirmed = match (running && not_started.is_none(), r.engine) {
+            // Claude says the mode it runs in on every hook. Devin is said
+            // to, but whether it does before its turn ends is unverified
+            // until a real hook capture (#307) decides: until then it isn't
+            // waited on, and its mode is left unconfirmed.
             (true, Engine::Claude) => {
                 let until = tokio::time::Instant::now() + READ_BACK;
                 loop {

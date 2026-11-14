@@ -74,12 +74,12 @@ macro_rules! native {
 
 async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     let n = native!(s, h, q);
-    Json(s.desk.grants_view(&n)).into_response()
+    Json(s.desk.grants_view_spent(&n).await).into_response()
 }
 
 async fn one(State(s): S, h: HeaderMap, Query(q): Q, Path(group): Path<String>) -> Response {
     let n = native!(s, h, q);
-    match s.desk.grant_view(&n, &group) {
+    match s.desk.grant_view_spent(&n, &group).await {
         Some(g) => Json(g).into_response(),
         None => DeskError::NotFound.into_response(),
     }

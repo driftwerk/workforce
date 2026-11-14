@@ -81,6 +81,33 @@ pub fn check_hub_id(id: &str) -> Result<(), DeskError> {
     }
 }
 
+/// The id Desk names the hub at `url` by: its host, lowercased, with every
+/// character that isn't a letter or digit made `-`
+/// (`https://hub.example.com:8443/x` is `hub-example-com`), exactly as
+/// Desk's own `hubs::id_for` makes it. Lossy: the port is dropped, and
+/// `a.b-c.example` and `a-b.c.example` share one, so it binds a link to its
+/// hub but is never the whole proof of where a hub is (an origin kept with
+/// the link is, [`crate`]'s sync). `None` for a url with no host.
+pub fn hub_id_for_url(url: &str) -> Option<String> {
+    let host = url
+        .split("://")
+        .nth(1)?
+        .split(['/', ':'])
+        .next()
+        .filter(|h| !h.is_empty())?;
+    Some(
+        host.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect(),
+    )
+}
+
 /// A hub's URL: `https://`, or `http://` to this computer only, with no
 /// credentials, query or fragment in it.
 pub fn check_hub_url(url: &str) -> Result<url::Url, DeskError> {
