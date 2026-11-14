@@ -653,6 +653,10 @@ struct FakeLinear {
     members: Mutex<Vec<(String, String, String)>>,
     /// Whom the person chose to be there: (id, name).
     chosen: Mutex<Option<(String, String)>>,
+    /// Issues whose description is this, at the workspace `acme`'s address.
+    described: Mutex<BTreeMap<u32, String>>,
+    /// Members the hub finds by name, with their profile: (slug, full name).
+    profiles: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeLinear {
@@ -706,12 +710,52 @@ impl Remote for FakeLinear {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        let mut answer = self.answer(tool, args).await?;
+        // A described issue: its description, at a Linear address.
+        let described = self.described.lock().unwrap();
+        let nodes = match answer.get_mut("issues") {
+            Some(Value::Array(a)) => a.iter_mut().collect::<Vec<_>>(),
+            _ => answer.get_mut("issue").into_iter().collect(),
+        };
+        for i in nodes {
+            let n: u32 = i["identifier"]
+                .as_str()
+                .and_then(|k| k.strip_prefix("ENG-"))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if let Some(body) = described.get(&n) {
+                i["description"] = json!(body);
+                i["url"] = json!(format!("https://linear.app/acme/issue/ENG-{n}"));
+            }
+        }
+        Ok(answer)
+    }
+}
+
+impl FakeLinear {
+    async fn answer(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
         self.calls
             .lock()
             .unwrap()
             .push((tool.to_string(), args.clone()));
         let mut issues = self.issues.lock().unwrap();
         match tool {
+            // The hub's own name search, with each member's profile.
+            "identity.linear_members_named" => {
+                let name = args["name"].as_str().unwrap_or_default().to_lowercase();
+                let members: Vec<Value> = self
+                    .profiles
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(slug, _)| slug.contains(&name))
+                    .map(|(slug, full)| {
+                        json!({ "id": slug, "name": slug, "full_name": full,
+                        "url": format!("https://linear.app/acme/profiles/{slug}") })
+                    })
+                    .collect();
+                Ok(json!({ "members": members }))
+            }
             "linear.viewer" => self
                 .viewer
                 .lock()
@@ -801,6 +845,53 @@ impl Remote for FakeLinear {
             other => Err(RemoteError::NotAllowed(other.into())),
         }
     }
+}
+
+/// A description's profile of its own workspace comes in as a mention of
+/// the member the hub finds it is; one the hub doesn't find, or another
+/// workspace's, as it is; and an edit here sends each back as it came.
+#[tokio::test]
+async fn a_linear_profile_comes_in_as_a_mention_and_goes_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, Some(ME)).await;
+        let linear = FakeLinear::default();
+        linear.set(1, "unstarted", 1, None);
+        let said = "Ask [@ann](https://linear.app/acme/profiles/ann), https://linear.app/acme/profiles/zed and https://linear.app/other/profiles/ann.";
+        linear.described.lock().unwrap().insert(1, said.into());
+        linear
+            .profiles
+            .lock()
+            .unwrap()
+            .extend([("ann".to_string(), "Ann Lee".to_string()), ("annie".to_string(), "Annie".to_string())]);
+        d.pull_board(b.id, &linear).await.unwrap();
+        let tickets = d.tickets(b.id, &Default::default()).await.unwrap();
+        let t = &tickets[0].ticket;
+        assert_eq!(
+            t.body,
+            "Ask :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\" text=\"@ann\"}, https://linear.app/acme/profiles/zed and https://linear.app/other/profiles/ann."
+        );
+        // Each of its own workspace's looked up once, by its slug.
+        let asked = linear.calls_of("identity.linear_members_named");
+        assert_eq!(asked, vec![json!({ "name": "ann" }), json!({ "name": "zed" })]);
+        // Edited here: it goes back with the profile as Linear had it.
+        d.edit_ticket(
+            t.id,
+            crate::service::TicketPatch {
+                body: Some(format!("{} More.", t.body)),
+                ..Default::default()
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        let sent = linear.calls_of("linear.issue_update");
+        assert_eq!(sent.last().unwrap()["description"], json!(format!("{said} More.")));
+    })
+    .await;
 }
 
 async fn whole_team(d: &Desk, me: Option<&str>) -> Board {

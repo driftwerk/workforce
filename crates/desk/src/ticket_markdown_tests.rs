@@ -554,3 +554,91 @@ fn hostile_text_is_read_in_a_moment() {
         "the outer fence is the longest"
     );
 }
+
+/// A Linear description's profile of its own workspace, bare, an autolink
+/// or a link, reads as a mention of the member it is, and goes back to
+/// Linear as it came; any other profile, an unknown one, one in code or a
+/// picture, or right after a word, as it is.
+#[test]
+fn a_linear_profile_reads_as_a_mention_and_goes_back() {
+    let url = "https://linear.app/acme/issue/MAN-1/fix-it";
+    let ws = linear_workspace(url).unwrap();
+    assert_eq!(ws, "acme");
+    let names: HashMap<String, String> = [
+        ("ann".to_string(), "Ann Lee".to_string()),
+        ("bo.k".to_string(), "Bo [K]".to_string()),
+    ]
+    .into();
+    let cases = [
+        (
+            "Ask https://linear.app/acme/profiles/ann.",
+            "Ask :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\"}.",
+            "Ask https://linear.app/acme/profiles/ann.",
+        ),
+        (
+            "cc [@Bo](https://linear.app/acme/profiles/bo.k) and <https://linear.app/acme/profiles/ann>",
+            "cc :mention[Bo \\[K\\]]{url=\"https://linear.app/acme/profiles/bo.k\" text=\"@Bo\"} and :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\" form=\"autolink\"}",
+            "cc [@Bo](https://linear.app/acme/profiles/bo.k) and <https://linear.app/acme/profiles/ann>",
+        ),
+    ];
+    for (input, want, back) in cases {
+        let read = linear_mentions(&linear_markdown(input, "MAN-1", url), ws, &names);
+        assert_eq!(read, want, "{input}");
+        assert_eq!(linear_out(&read), back, "back: {input}");
+    }
+    let untouched = [
+        // Another workspace's, an unknown member, in code, a picture,
+        // right after a word, words that can't be held quoted.
+        "https://linear.app/other/profiles/ann",
+        "https://linear.app/acme/profiles/zed",
+        "`https://linear.app/acme/profiles/ann`",
+        "```\nhttps://linear.app/acme/profiles/ann\n```",
+        "![me](https://linear.app/acme/profiles/ann)",
+        "x[Ann](https://linear.app/acme/profiles/ann)",
+        "see:https://linear.app/acme/profiles/ann",
+        "[say \"hi\"](https://linear.app/acme/profiles/ann)",
+        "[a\\\\](https://linear.app/acme/profiles/ann)",
+        "https://linear.app/acme/profiles/ann/activity",
+    ];
+    for input in untouched {
+        let read = linear_mentions(input, ws, &names);
+        assert_eq!(read, input);
+        assert_eq!(linear_out(&read), input);
+    }
+    // No names found: nothing changes.
+    let input = "Ask https://linear.app/acme/profiles/ann";
+    assert_eq!(linear_mentions(input, ws, &HashMap::new()), input);
+    // What is looked up: each member once, outside code, at most `max`.
+    assert_eq!(
+        linear_profile_slugs(
+            "https://linear.app/acme/profiles/ann [A](https://linear.app/acme/profiles/ann) `https://linear.app/acme/profiles/cy` https://linear.app/acme/profiles/bo.k https://linear.app/acme/profiles/dee",
+            ws,
+            2
+        ),
+        vec!["ann".to_string(), "bo.k".to_string()]
+    );
+    // A collapsible's title, however its profile is written.
+    for title in [
+        ":::details[Notes <https://linear.app/acme/profiles/ann>]",
+        ":::details[\\[Ann\\](https://linear.app/acme/profiles/ann)]",
+    ] {
+        assert_eq!(linear_mentions(title, ws, &names), title);
+    }
+    // A collapsible from Linear: its title as it came, its lines read.
+    let input = "+++ [Ann](https://linear.app/acme/profiles/ann)\nAsk https://linear.app/acme/profiles/ann\n+++";
+    let read = linear_mentions(&linear_markdown(input, "MAN-1", url), ws, &names);
+    assert_eq!(
+        read,
+        ":::details[\\[Ann\\](https://linear.app/acme/profiles/ann)]\nAsk :mention[Ann Lee]{url=\"https://linear.app/acme/profiles/ann\"}\n:::"
+    );
+    assert_eq!(linear_out(&read), input);
+    assert_eq!(
+        linear_profile_slugs(":::details[https://linear.app/acme/profiles/bo.k]", ws, 5),
+        Vec::<String>::new()
+    );
+    // A mention typed in Desk, with no profile behind it, goes as typed.
+    assert_eq!(linear_out(":mention[Ann]"), ":mention[Ann]");
+    // Read again, a mention stays one.
+    let once = linear_mentions("https://linear.app/acme/profiles/ann", ws, &names);
+    assert_eq!(linear_mentions(&once, ws, &names), once);
+}
