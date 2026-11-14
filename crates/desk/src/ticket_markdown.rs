@@ -597,8 +597,10 @@ fn marked(items: &[Item], out: &mut String, start: bool, cell: bool, one_line: b
                 // A directive starts a word: right after a letter or digit
                 // Desk reads it as words (`Owner:mention[Ann]`), so a space
                 // goes between.
+                // Only a directive: a picture's alt as words can start `:)`.
+                let directive = [":mention[", ":status[", ":date["].iter().any(|d| m.starts_with(d));
                 let after_word = out.chars().next_back().is_some_and(char::is_alphanumeric);
-                if m.starts_with(':') && after_word {
+                if directive && after_word {
                     out.push(' ');
                 }
                 out.push_str(m)

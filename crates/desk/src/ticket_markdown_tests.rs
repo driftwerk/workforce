@@ -130,6 +130,15 @@ fn each_adf_node_reads_as_its_desk_markdown() {
             "Owner :mention[Ann] is 日本 :status[Done]{tone=success} by v2 :date[2026-11-30] (:mention[Bo])",
         ),
         (
+            "no space after a mark's close or another directive",
+            json!([p(json!([
+                { "type": "text", "text": "Owner", "marks": [{ "type": "strong" }] },
+                { "type": "mention", "attrs": { "id": "x", "text": "@Ann" } },
+                { "type": "mention", "attrs": { "id": "y", "text": "@Bo" } }
+            ]))]),
+            "**Owner**:mention[Ann]:mention[Bo]",
+        ),
+        (
             "a date",
             json!([p(json!([t("Due "), { "type": "date", "attrs": { "timestamp": "1795996800000" } }]))]),
             "Due :date[2026-11-30]",
