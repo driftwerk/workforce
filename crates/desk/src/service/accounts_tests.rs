@@ -735,6 +735,65 @@ fn leaked(text: &str, secret: &str) -> Vec<String> {
         .collect()
 }
 
+/// An engine's own sign-in is the hub holder's alone: anyone else the hub
+/// lets in (another administrator, the hub's own token alone) starts none,
+/// reads none's code, types into none and stops none; and no token is
+/// taken from the address, which logs keep.
+#[tokio::test]
+async fn only_the_hub_holder_signs_an_engine_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Devin, devin(dir.path()));
+        let d = desk(pool, o).await;
+        let holder = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let other = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let start = serde_json::json!({"engine": "devin", "manual": true});
+        let at = format!("/api/desk/engines/sign-ins/{}", Uuid::new_v4());
+        // Refused before anything is looked up or started.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins".to_string(),
+                Some(start.clone()),
+            ),
+            ("GET", at.clone(), None),
+            (
+                "POST",
+                format!("{at}/token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", at.clone(), None),
+        ] {
+            let (code, said) = api(&other, method, &uri, body).await;
+            assert_eq!(code, 403, "{method} {uri}: {said}");
+            assert!(said.get("id").is_none(), "{said}");
+        }
+        // A token in the address is refused, even the holder's.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins?token=hub-token".to_string(),
+                Some(start),
+            ),
+            ("GET", format!("{at}?token=hub-token"), None),
+            (
+                "POST",
+                format!("{at}/token?token=hub-token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", format!("{at}?token=hub-token"), None),
+        ] {
+            let (code, said) = api(&holder, method, &uri, body).await;
+            assert_eq!(code, 400, "{method} {uri}: {said}");
+        }
+        // The holder is let through: a sign-in that isn't there is not found.
+        let (code, _) = api(&holder, "GET", &at, None).await;
+        assert_eq!(code, 404);
+    })
+    .await;
+}
+
 // One thread, so everything the desk spawns logs to the subscriber set here.
 #[tokio::test(flavor = "current_thread")]
 async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {

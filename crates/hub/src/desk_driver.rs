@@ -100,8 +100,10 @@ impl Authorize for SystemAdmins {
 
     /// Only the person who holds the hub, as the floor's decide route reads
     /// them ([`crate::desk_floor::holds_the_hub`]): an administrator's own
-    /// sign-in or the device the Desk app paired with it, never another
-    /// administrator's device or the gateway token alone.
+    /// sign-in or a device paired with them, never someone who isn't an
+    /// administrator, an agent's token or the gateway token alone. Every
+    /// administrator on a hub running Desk holds it (a Desk hub has one
+    /// person).
     async fn authorize_holder(
         &self,
         headers: &HeaderMap,
