@@ -620,7 +620,7 @@ impl Setup {
                     ..now(
                         NowKind::Offer,
                         format!(
-                            "{service} is signed in on this Mac as {}",
+                            "{service} is signed in on this computer as {}",
                             offer.map_or("you", |o| o.account.as_str())
                         ),
                     )
@@ -2377,7 +2377,7 @@ fn steps_for(
         Way::Cli => steps.push(step(
             "use",
             &format!(
-                "Use the GitHub sign-in on this Mac{}",
+                "Use the GitHub sign-in on this computer{}",
                 offer
                     .map(|o| format!(" as {}", o.account))
                     .unwrap_or_default()

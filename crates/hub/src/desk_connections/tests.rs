@@ -2690,7 +2690,7 @@ mod setups {
         assert_eq!(started.now.kind, NowKind::Offer);
         assert_eq!(
             started.now.title,
-            "GitHub is signed in on this Mac as sarah"
+            "GitHub is signed in on this computer as sarah"
         );
         let detail = started.now.detail.clone().unwrap();
         assert!(
