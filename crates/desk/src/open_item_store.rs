@@ -205,6 +205,7 @@ impl DeskStore {
         });
         let changed = text != was.text
             || new.sessions.iter().any(|s| !was.sessions.contains(s))
+            || (was.done_when.is_none() && new.done_when.is_some())
             || (!new.options.is_empty() && new.options != was.options)
             || (new.holding_up.is_some() && new.holding_up != was.holding_up)
             || (new.recommendation.is_some() && new.recommendation != was.recommendation)
@@ -235,7 +236,8 @@ impl DeskStore {
                      points = CASE WHEN $15 = '[]'::jsonb THEN points ELSE $15 END, \
                      recommended = $16, \
                      not_blocking = COALESCE($17, not_blocking), \
-                     cant_decide = COALESCE($18, cant_decide) \
+                     cant_decide = COALESCE($18, cant_decide), \
+                     done_when = COALESCE(done_when, $19) \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
                 &[
@@ -257,6 +259,7 @@ impl DeskStore {
                     &recommended,
                     &new.layout.not_blocking,
                     &new.cant_decide,
+                    &new.done_when,
                 ],
             )
             .await?;
