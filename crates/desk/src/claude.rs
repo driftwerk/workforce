@@ -66,12 +66,27 @@ const PLAIN_EVENTS: [&str; 7] = [
 /// The question tool whose start Desk may hold for its boss to answer.
 pub const DIALOG_TOOL: &str = "AskUserQuestion";
 
+/// The plan a session presents to leave plan mode, whose start Desk may
+/// hold for its boss to review.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
+
+/// The tools whose start has its own hook entry, waiting for its boss.
+const DIALOG_TOOLS: &str = "(AskUserQuestion|ExitPlanMode)";
+
 /// How long its start's hook may take: past it, Claude Code goes on and its
 /// dialog opens. Desk answers well within it ([`DIALOG_HOLD`]).
 pub const DIALOG_WAIT_SECS: u64 = 60;
 
 /// How long Desk holds a question's start for its boss to answer.
 pub const DIALOG_HOLD: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// What approves a plan its boss reviewed, at its permission check: the
+/// dialog that asks the person to approve it doesn't open. The documented
+/// `PermissionRequest` allow; that the plan's check comes as one is not
+/// yet seen on a real session (if it doesn't, the dialog opens as before).
+pub fn plan_approved() -> Value {
+    allow()
+}
 
 /// What answers a question at its start, so its dialog never opens: the
 /// call is refused with the answer as its reason, which the model reads as
@@ -132,8 +147,8 @@ pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed
             hooks.insert(
                 event.into(),
                 json!([
-                    { "matcher": format!("^(?!{DIALOG_TOOL}$).*"), "hooks": [hook] },
-                    { "matcher": DIALOG_TOOL, "hooks": [http_hook(hook_url, DIALOG_WAIT_SECS)] }
+                    { "matcher": format!("^(?!{DIALOG_TOOLS}$).*"), "hooks": [hook] },
+                    { "matcher": format!("^{DIALOG_TOOLS}$"), "hooks": [http_hook(hook_url, DIALOG_WAIT_SECS)] }
                 ]),
             );
             continue;
@@ -374,7 +389,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             id: p.tool_use_id.clone(),
             question: question.unwrap_or_default(),
             asks: (p.hook_event_name == "PreToolUse"
-                && p.tool_name.as_deref() == Some(DIALOG_TOOL))
+                && matches!(p.tool_name.as_deref(), Some(DIALOG_TOOL | PLAN_TOOL)))
             .then(|| p.tool_input.clone())
             .flatten(),
         },
@@ -688,14 +703,17 @@ pub(crate) mod tests {
         // its own entry, waiting for its boss.
         assert_eq!(
             s["hooks"]["PreToolUse"][0]["matcher"],
-            "^(?!AskUserQuestion$).*"
+            "^(?!(AskUserQuestion|ExitPlanMode)$).*"
         );
         assert_eq!(
             (
                 s["hooks"]["PreToolUse"][1]["matcher"].as_str(),
                 s["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"].as_u64()
             ),
-            (Some("AskUserQuestion"), Some(DIALOG_WAIT_SECS))
+            (
+                Some("^(AskUserQuestion|ExitPlanMode)$"),
+                Some(DIALOG_WAIT_SECS)
+            )
         );
         let compact = &s["hooks"]["PreCompact"][0]["hooks"][0];
         assert_eq!(
@@ -831,7 +849,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             s["hooks"]["PreToolUse"][0]["matcher"],
-            "^(?!AskUserQuestion$).*"
+            "^(?!(AskUserQuestion|ExitPlanMode)$).*"
         );
         assert_eq!(
             hook_settings("http://h", 60),

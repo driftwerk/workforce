@@ -47,6 +47,9 @@ pub(crate) struct Before {
     /// A dialog's question its boss answers (by denying its start, with the
     /// answer as its reason): what it asked.
     pub question: Option<String>,
+    /// A plan its boss reviewed at its start (approved, or changes asked
+    /// for): its heading.
+    pub plan: Option<String>,
 }
 
 /// How `action`, done as `done` says, is undone: the kind, and what the
@@ -237,16 +240,27 @@ impl CrewHub {
                     .map(|m| m.as_str().to_string()),
                 ..Before::default()
             },
-            Action::Deny { session, approval } if self.desk.asks_in_dialog(*session) => Before {
-                question: self
+            Action::Deny { session, approval } | Action::Approve { session, approval }
+                if self.desk.asks_in_dialog(*session) =>
+            {
+                let asked = self
                     .desk
                     .view(*session)
                     .ok()
                     .and_then(|v| v.pending)
-                    .filter(|p| p.id == *approval)
-                    .map(|p| p.detail),
-                ..Before::default()
-            },
+                    .filter(|p| p.id == *approval);
+                match asked {
+                    Some(p) if p.tool == "Plan" => Before {
+                        plan: Some(p.detail),
+                        ..Before::default()
+                    },
+                    Some(p) if matches!(action, Action::Deny { .. }) => Before {
+                        question: Some(p.detail),
+                        ..Before::default()
+                    },
+                    _ => Before::default(),
+                }
+            }
             _ => Before::default(),
         }
     }
@@ -297,6 +311,17 @@ impl CrewHub {
                     ),
                 }
             }
+            Action::Approve { session, .. } if before.plan.is_some() => format!(
+                "approved {}'s plan “{}”",
+                self.name_of_session(*session),
+                crew::one_line(before.plan.as_deref().unwrap_or_default(), 160),
+            ),
+            Action::Deny { session, .. } if before.plan.is_some() => format!(
+                "asked {} to change its plan “{}”: “{}”",
+                self.name_of_session(*session),
+                crew::one_line(before.plan.as_deref().unwrap_or_default(), 160),
+                crew::clip(&why_of(by), 200)
+            ),
             Action::Deny { session, .. } if before.question.is_some() => format!(
                 "answered {}'s question “{}” with “{}”",
                 self.name_of_session(*session),

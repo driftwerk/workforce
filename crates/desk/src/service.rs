@@ -283,6 +283,9 @@ pub(crate) struct Live {
     /// an MCP server's request), by its request's id: only the terminal
     /// answers it.
     codex_question: Option<(Value, PendingApproval)>,
+    /// Its boss approved the plan it presents (the call, when known, and
+    /// when): the plan's permission check is allowed in the person's place.
+    plan_approved: Option<(Option<String>, std::time::Instant)>,
     /// The calls each thread (the main thread's, `None`, or a sub-agent's)
     /// started that haven't ended, oldest first: Claude Code runs some side
     /// by side, and a permission request names none of them.
@@ -1951,6 +1954,7 @@ impl Desk {
                     held: None,
                     open_question: None,
                     codex_question: None,
+                    plan_approved: None,
                     flights: HashMap::new(),
                     behind: Vec::new(),
                     own_key: None,
@@ -3677,7 +3681,7 @@ impl Desk {
             .live
             .get(&id)
             .and_then(|l| l.pending.clone());
-        let (answer, seen, question) = {
+        let (answer, seen, question, plan) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
@@ -3706,7 +3710,18 @@ impl Desk {
             let boss_says = by
                 .as_ref()
                 .is_some_and(|b| b.party.kind == crew::PartyKind::Manager && b.reason.is_some());
+            let plan = question && live.pending.as_ref().is_some_and(|p| p.tool == "Plan");
             match decision {
+                // A plan its boss approved: its start goes on, and its
+                // permission check is allowed in the person's place
+                // (`plan_approved`); else its dialog asks them, as before.
+                Decision::Allow if plan && boss_says => {
+                    let call = live.holder().and_then(|h| h.call.clone());
+                    live.plan_approved = Some((call, std::time::Instant::now()));
+                    if let Some(p) = live.pending.as_mut() {
+                        p.answerable = false;
+                    }
+                }
                 // Answered in its place: it is over, its dialog never opens.
                 Decision::Deny if question && boss_says => {
                     live.open_question = None;
@@ -3730,7 +3745,7 @@ impl Desk {
                     st.decided.insert(approval);
                 }
             }
-            (answer, seen, question)
+            (answer, seen, question, plan)
         };
         // A boss's deny says why, and what to do instead, to the session.
         let because = by
@@ -3746,8 +3761,13 @@ impl Desk {
             .as_ref()
             .filter(|b| question && b.party.kind == crew::PartyKind::Manager)
             .and_then(|b| b.reason.as_deref().map(|r| (b.party.name.as_str(), r)))
-            .map(|(name, r)| {
-                format!("{name}, who oversees this session, answered this for the person: {r}")
+            .map(|(name, r)| match plan {
+                true => format!(
+                    "{name}, who oversees this session, reviewed the plan for the person and wants these changes first: {r} Revise the plan and present it again."
+                ),
+                false => {
+                    format!("{name}, who oversees this session, answered this for the person: {r}")
+                }
             });
         let _ = answer.send(match decision {
             Decision::Deny if answered.is_some() => {
@@ -4803,6 +4823,7 @@ impl Desk {
                 held: None,
                 open_question: None,
                 codex_question: None,
+                plan_approved: None,
                 flights: HashMap::new(),
                 behind: Vec::new(),
                 own_key: None,
@@ -5254,7 +5275,28 @@ impl Desk {
                 // that its Act fully boss answers while the person isn't in
                 // control: held for the boss, its dialog opening only if the
                 // boss leaves it to them or doesn't answer in time.
-                let hold = asks.filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
+                let hold = asks
+                    .clone()
+                    .filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
+                // A plan its boss approved at its start: its permission check
+                // (a hook with no start's input) is allowed in the person's
+                // place, once, soon after, for that call.
+                let plan = question.tool == "Plan";
+                if plan && asks.is_none() && inside.is_none() {
+                    let approved = self.0.state.lock().live.get_mut(&id).is_some_and(|l| {
+                        let fresh = l.plan_approved.as_ref().is_some_and(|(c, at)| {
+                            at.elapsed() < claude::DIALOG_HOLD * 2
+                                && (c.is_none() || call.is_none() || *c == call)
+                        });
+                        if fresh {
+                            l.plan_approved = None;
+                        }
+                        fresh
+                    });
+                    if approved {
+                        return claude::plan_approved();
+                    }
+                }
                 let (tx, rx) = oneshot::channel();
                 let mut held = None;
                 self.change(id, |r, l| {
@@ -5283,7 +5325,10 @@ impl Desk {
                         why: question.why,
                         options: question.options,
                         request: hold.clone().map(|input| crate::model::Request {
-                            tool: claude::DIALOG_TOOL.into(),
+                            tool: match plan {
+                                true => claude::PLAN_TOOL.into(),
+                                false => claude::DIALOG_TOOL.into(),
+                            },
                             input,
                             cwd: Some(r.cwd.clone()),
                             read_only: true,
