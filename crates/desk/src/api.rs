@@ -354,10 +354,15 @@ async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 #[derive(Deserialize)]
 struct EngineBody {
     engine: crate::engine::Engine,
+    /// Devin's flow for a computer with no browser: a token pasted back
+    /// from the page. Codex has only the one.
+    #[serde(default)]
+    manual: bool,
 }
 
-/// Signs an engine's own CLI in where it has no browser (Codex's device
-/// sign-in): the page and the code to type there, once it shows them.
+/// Signs an engine's own CLI in on a terminal of the hub's own (Codex's
+/// device sign-in, Devin's login): the page to open, and the code to type
+/// there or whether to paste back the token it gives, once it shows them.
 async fn start_engine_sign_in(
     State(s): S,
     h: HeaderMap,
@@ -365,7 +370,7 @@ async fn start_engine_sign_in(
     Json(b): Json<EngineBody>,
 ) -> Response {
     guarded!(s, h, q);
-    match s.desk.start_engine_sign_in(b.engine) {
+    match s.desk.start_engine_sign_in(b.engine, b.manual) {
         Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
         Err(e) => e.into_response(),
     }
@@ -374,6 +379,28 @@ async fn start_engine_sign_in(
 async fn engine_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
     s.desk.engine_sign_in(id).map(Json).into_response()
+}
+
+/// The token a sign-in's page gave, never kept or logged.
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+/// The token Devin's page gave, typed into the sign-in waiting for it;
+/// 409 when that sign-in isn't waiting for one.
+async fn engine_sign_in_token(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<TokenBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .engine_sign_in_token(id, &b.token)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
 }
 
 async fn cancel_engine_sign_in(
@@ -1877,6 +1904,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/engines/sign-ins/{id}",
             get(engine_sign_in).delete(cancel_engine_sign_in),
         )
+        .route(
+            "/api/desk/engines/sign-ins/{id}/token",
+            post(engine_sign_in_token),
+        )
         .route("/api/desk/accounts", get(accounts).post(add_account))
         .route(
             "/api/desk/accounts/{id}",
@@ -2307,12 +2338,21 @@ pub(crate) fn voice_router(
         }))
 }
 
+/// The event a Devin hook says it posts for, should its payload not: an
+/// event's name only (at most 64 letters and digits), else none.
+fn devin_event(h: &HeaderMap) -> Option<&str> {
+    h.get(crate::devin::EVENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|e| !e.is_empty() && e.len() <= 64 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 async fn hook(
     State(desk): State<Desk>,
     Path((id, token)): Path<(Uuid, String)>,
+    h: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match desk.hook(id, &token, &body).await {
+    match desk.hook_of(id, &token, &body, devin_event(&h)).await {
         Some(answer) => Json(answer).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -2352,6 +2392,33 @@ mod tests {
     use crate::service::NewTerminal;
     use crate::store::{build_pool, DeskStore};
     use crate::testing::{allow_all, options};
+
+    #[test]
+    fn a_devin_hooks_event_header_is_taken_only_as_an_events_name() {
+        let name =
+            || axum::http::HeaderName::from_bytes(crate::devin::EVENT_HEADER.as_bytes()).unwrap();
+        let said = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(name(), axum::http::HeaderValue::from_str(v).unwrap());
+            super::devin_event(&h).map(str::to_string)
+        };
+        assert_eq!(said("PreToolUse").as_deref(), Some("PreToolUse"));
+        assert_eq!(said(&"A".repeat(64)).as_deref(), Some(&*"A".repeat(64)));
+        assert_eq!(said(&"A".repeat(65)), None, "too long");
+        assert_eq!(said(""), None);
+        assert_eq!(said("Pre ToolUse"), None);
+        assert_eq!(said("Stop;rm"), None);
+        assert_eq!(said("../Stop"), None);
+        assert_eq!(said("Stop_1"), None);
+        assert_eq!(super::devin_event(&axum::http::HeaderMap::new()), None);
+        // Not text: none.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            name(),
+            axum::http::HeaderValue::from_bytes(b"St\xffop").unwrap(),
+        );
+        assert_eq!(super::devin_event(&h), None);
+    }
 
     type Client = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

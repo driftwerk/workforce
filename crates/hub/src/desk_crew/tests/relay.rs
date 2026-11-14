@@ -145,7 +145,15 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
             call("local:sarah", "c-4"),
         )
         .await;
-        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = post(
+            &app,
+            &format!("/api/desk/crew/relay/{}", uuid::Uuid::new_v4()),
+            "not-it",
+            json!({"ok": {}}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
         let (code, _) = post(
             &app,
             &format!("/api/desk/crew/served?token={token}"),
@@ -272,6 +280,31 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         assert_eq!(sent.level, workforce_common::oversight::Level::Act);
         assert!(sent.act.interrupt);
         assert_eq!(sent.input["session_id"], json!(remote.to_string()));
+        // It says when the Mac stops waiting for it, about its wait from now.
+        let left = sent.deadline - chrono::Utc::now();
+        assert!(left > chrono::Duration::seconds(20) && left <= chrono::Duration::seconds(30), "{left}");
+        let wire = serde_json::to_value(&sent).unwrap();
+        assert!(wire["deadline"].is_string(), "{wire}");
+
+        // Too large to carry: refused here, nothing queued.
+        let before = seen.lock().len();
+        let r = tool("crew.interrupt")
+            .execute(json!({"session_id": format!("devbox/{remote}"),
+                            "reason": "x".repeat(300 * 1024)}))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.error.as_deref().unwrap_or_default().contains("too large"), "{r:?}");
+        // The whole call is measured, as Desk carries it: an input just under
+        // the most, with the rest of the call, is over it.
+        let r = tool("crew.interrupt")
+            .execute(json!({"session_id": format!("devbox/{remote}"),
+                            "reason": "x".repeat(256 * 1024 - 200)}))
+            .await
+            .unwrap();
+        assert!(r.error.as_deref().unwrap_or_default().contains("too large"), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.lock().len(), before);
 
         // The overview has devbox's part of Acme, said as devbox said it.
         let r = tool("crew.overview").execute(json!({})).await.unwrap();

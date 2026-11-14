@@ -382,6 +382,50 @@ impl DeskStore {
             .collect()
     }
 
+    /// `items` and `bytes` were just sent to `agent`: counted in the hour
+    /// they were sent in, for the day's limit. Rows over two days old go.
+    pub async fn knows_spent_add(
+        &self,
+        agent: &str,
+        at: DateTime<Utc>,
+        items: i64,
+        bytes: i64,
+    ) -> Result<()> {
+        let hour = hour_of(at);
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        tx.execute(
+            "INSERT INTO knows_spent (agent, hour, items, bytes) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (agent, hour) DO UPDATE SET items = knows_spent.items + EXCLUDED.items, \
+               bytes = knows_spent.bytes + EXCLUDED.bytes",
+            &[&agent, &hour, &items, &bytes],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM knows_spent WHERE hour < $1",
+            &[&(hour - chrono::Duration::hours(48))],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The bytes sent to `agent` in the 24 hours up to `now`. Counted by
+    /// the hour, so an hour partly outside the day counts whole: never
+    /// less than was sent.
+    pub async fn knows_spent_day(&self, agent: &str, now: DateTime<Utc>) -> Result<i64> {
+        let client = self.pool().get().await?;
+        let since = hour_of(now - chrono::Duration::hours(24));
+        let row = client
+            .query_one(
+                "SELECT coalesce(sum(bytes), 0)::bigint FROM knows_spent \
+                 WHERE agent = $1 AND hour >= $2",
+                &[&agent, &since],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
+    }
+
     /// What was shared with `agent` since `since`, by kind: items and bytes.
     pub async fn knows_shared_since(
         &self,
@@ -487,6 +531,12 @@ fn log_entry(r: &Row, at: usize) -> Result<LogEntry> {
     })
 }
 
+/// The start of the hour `at` falls in.
+fn hour_of(at: DateTime<Utc>) -> DateTime<Utc> {
+    let secs = at.timestamp().div_euclid(3600) * 3600;
+    DateTime::from_timestamp(secs, 0).unwrap_or(at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +557,68 @@ mod tests {
             bytes: 100,
             hash: None,
         }
+    }
+
+    #[tokio::test]
+    async fn what_was_sent_is_counted_by_the_hour_for_the_day_and_outlives_a_restart() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let store = DeskStore::with_pool(pool.clone()).await.unwrap();
+            let now = DateTime::parse_from_rfc3339("2026-11-14T10:30:00Z")
+                .unwrap()
+                .to_utc();
+            let hours = |h: i64| now - chrono::Duration::hours(h);
+            store
+                .knows_spent_add("hub/allan", hours(30), 5, 1_000_000)
+                .await
+                .unwrap();
+            store
+                .knows_spent_add("hub/allan", hours(3), 2, 300)
+                .await
+                .unwrap();
+            store
+                .knows_spent_add("hub/allan", hours(3), 1, 50)
+                .await
+                .unwrap();
+            store
+                .knows_spent_add("hub/bea", hours(1), 1, 7)
+                .await
+                .unwrap();
+            // Over a day ago doesn't count; the same hour adds up; another
+            // agent's is its own.
+            assert_eq!(store.knows_spent_day("hub/allan", now).await.unwrap(), 350);
+            assert_eq!(store.knows_spent_day("hub/bea", now).await.unwrap(), 7);
+            assert_eq!(store.knows_spent_day("hub/none", now).await.unwrap(), 0);
+            // The hour partly inside the day counts whole: never less than
+            // was sent.
+            store
+                .knows_spent_add("hub/cy", hours(24), 1, 9)
+                .await
+                .unwrap();
+            assert_eq!(store.knows_spent_day("hub/cy", now).await.unwrap(), 9);
+            assert_eq!(
+                store
+                    .knows_spent_day("hub/cy", now + chrono::Duration::hours(1))
+                    .await
+                    .unwrap(),
+                0
+            );
+            // A restart is a new store over the same database.
+            drop(store);
+            let again = DeskStore::with_pool(pool).await.unwrap();
+            assert_eq!(again.knows_spent_day("hub/allan", now).await.unwrap(), 350);
+            // Rows over two days old are dropped as new ones are written.
+            let client = again.pool().get().await.unwrap();
+            let old: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM knows_spent WHERE hour < $1",
+                    &[&hours(48)],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(old, 0);
+        })
+        .await;
     }
 
     #[tokio::test]

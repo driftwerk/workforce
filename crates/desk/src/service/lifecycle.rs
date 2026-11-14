@@ -182,7 +182,12 @@ fn transcript_root(home: &Path, engine: Engine) -> Option<PathBuf> {
     match engine {
         Engine::Claude => Some(home.join(".claude/projects")),
         Engine::Codex => Some(home.join(".codex/sessions")),
-        _ => None,
+        // Its sessions are in a database of its own, which Desk never reads
+        // or deletes: a deleted session stays in Devin's own list.
+        Engine::Devin => None,
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            None
+        }
     }
 }
 
@@ -222,7 +227,12 @@ fn own_transcript(root: &Path, engine: Engine, cli: &str, path: &Path) -> Option
     let named = match engine {
         Engine::Claude => name == format!("{cli}.jsonl"),
         Engine::Codex => name.starts_with("rollout-") && name.ends_with(&format!("-{cli}.jsonl")),
-        _ => false,
+        Engine::Devin
+        | Engine::Gemini
+        | Engine::Copilot
+        | Engine::OpenCode
+        | Engine::Cursor
+        | Engine::Custom => false,
     };
     if !named || !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
@@ -887,6 +897,11 @@ mod tests {
         // Claude Code's transcripts aren't Codex's.
         let claude = h.claude("-Users-k-dev-app", "t5");
         assert!(h.files(Engine::Codex, "t5", Some(&claude)).is_empty());
+        // Devin's sessions are its own database's: never a file Desk deletes,
+        // whatever a stored path names.
+        assert!(h.files(Engine::Devin, "t1", None).is_empty());
+        assert!(h.files(Engine::Devin, "t2", Some(&other)).is_empty());
+        assert!(transcript_root(&h.home(), Engine::Devin).is_none());
     }
 
     #[test]

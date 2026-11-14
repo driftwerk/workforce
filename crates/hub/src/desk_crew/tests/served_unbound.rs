@@ -355,10 +355,15 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             .unwrap();
         let _ = asked.await;
 
-        // Back at Act fully, then Stop: nothing is its to decide.
+        // Back at Act fully, then Stop while its decision call is out: its
+        // ALLOW, come after, isn't done; the request stays the person's, and
+        // nothing is its to decide.
         put(6, "full", "everything", act(Some(50.0))).await;
         crew.read_spent_today(&crew.overseers()).await;
         assert!(crew.served_full(BOSS).is_some());
+        let asked = ask(&url, "git push origin v1");
+        let a6 = pending(&d, started, "git push origin v1").await;
+        let f = decide_frame(&mut rx).await;
         let (code, _) = native(
             &d,
             "POST",
@@ -369,6 +374,44 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         assert_eq!(code, StatusCode::OK);
         assert!(crew.served_full(BOSS).is_none());
         assert!(!d.boss_unbound(BOSS));
+        // Stop let go of the session: no boss runs it, so what it waits on
+        // is the person's.
+        assert!(
+            d.charge_of(started).is_none_or(|c| !c.live()),
+            "Stop let go of it"
+        );
+        crew.decided(&up, &answer(&f, "ALLOW: push the tag"));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a6));
+        assert!(!asked.is_finished(), "nothing was done for it");
+        let rows = d
+            .store()
+            .decisions_since(BOSS, chrono::DateTime::UNIX_EPOCH, 50)
+            .await
+            .unwrap();
+        assert!(
+            !rows.iter().any(|r| r.need_ref == Some(a6.to_string())),
+            "no decision of the boss's for it: {rows:?}"
+        );
+        // Its answer, sent again, finds nothing waiting for it.
+        crew.decided(&up, &answer(&f, "ALLOW: push the tag"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a6));
+        // Nor is anything asked of the boss while stopped, through a whole
+        // sweep (this can't tell Stop from a request asked once only, but
+        // no decide frame of any kind goes up).
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(2500),
+                decide_frame(&mut rx)
+            )
+            .await
+            .is_err(),
+            "asked again while stopped"
+        );
+        d.decide(started, a6, workforce_desk::model::Decision::Deny, None)
+            .unwrap();
+        let _ = asked.await;
 
         // This hub's own boss's model was never asked to decide for Allan.
         let mine = llm

@@ -220,6 +220,55 @@ impl Desk {
         Ok(g)
     }
 
+    /// The boss `group`'s live grant names, as the party a session handed
+    /// to it is charged to, when the grant holds session `id` (its
+    /// `members` or `born`, and no other grant's first) and its level does
+    /// more than watch. `Err(None)`
+    /// when no grant names a boss for the group; otherwise why not, in
+    /// plain words.
+    pub fn grant_boss_for(
+        &self,
+        group: &str,
+        id: Uuid,
+    ) -> Result<crate::crew::Party, Option<String>> {
+        let g = match self.grant_live(group) {
+            Ok(g) => g,
+            Err(why) => {
+                let named = self
+                    .0
+                    .grants
+                    .lock()
+                    .grants
+                    .get(group)
+                    .is_some_and(|g| g.boss.is_some());
+                return Err(named.then_some(why));
+            }
+        };
+        let Some(boss) = g.boss.as_ref().filter(|b| b.servable()) else {
+            return Err(None);
+        };
+        let name = match boss {
+            grant::BossRef::Local { agent } => agent.clone(),
+            grant::BossRef::Remote { hub, agent } => format!("{agent} ({hub})"),
+        };
+        if g.level == grant::Level::Watch {
+            return Err(Some(format!(
+                "{name} only watches {}; set them to Act to run work.",
+                g.name
+            )));
+        }
+        // The grant that holds it is this one, as letting go of it judges.
+        if self.grant_group_of(id).as_deref() != Some(group) {
+            return Err(Some(format!(
+                "{} isn't one of the sessions {name} may run in {}.",
+                self.view(id)
+                    .map_or_else(|_| "It".into(), |v| v.label().to_string()),
+                g.name
+            )));
+        }
+        Ok(crate::crew::Party::manager(&boss.party_id(), &name))
+    }
+
     /// Every grant here that names a boss, with why it doesn't serve its
     /// boss now, in plain words, when it doesn't.
     pub fn grants_bossed(&self) -> Vec<(Grant, Option<String>)> {

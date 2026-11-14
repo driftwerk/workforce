@@ -240,14 +240,18 @@ impl Caps {
 /// has no way to run it yet.
 pub fn views(engine: Engine) -> &'static [View] {
     match engine {
-        Engine::Claude | Engine::Codex => &[View::Terminal],
-        Engine::Gemini
-        | Engine::Copilot
-        | Engine::OpenCode
-        | Engine::Cursor
-        | Engine::Devin
-        | Engine::Custom => &[],
+        Engine::Claude | Engine::Codex | Engine::Devin => &[View::Terminal],
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            &[]
+        }
     }
+}
+
+/// Whether a session of `engine` can read a handoff's brief: it has
+/// Desk's line tools (`brief`). Devin has none yet: its MCP servers are
+/// only in the person's own files, which Desk doesn't write.
+pub fn reads_brief(engine: Engine) -> bool {
+    matches!(engine, Engine::Claude | Engine::Codex)
 }
 
 /// The engines Desk can start sessions of, by name: what a tool that
@@ -264,7 +268,10 @@ pub fn startable() -> Vec<&'static str> {
 /// Whether a boss served from a grant may run `engine`'s sessions: Desk's
 /// pre-tool hook denies every call it doesn't judge safe, and fails closed
 /// when Desk can't be reached ([`crate::claude::hook_settings`]). Claude
-/// Code alone: Codex has no hook that refuses a call before it runs.
+/// Code alone: Codex has no hook that refuses a call before it runs, and
+/// Devin always loads a repository's own `.devin` hooks, which could
+/// approve a call ahead of Desk's (Claude Code's `--setting-sources user`
+/// has no Devin equivalent).
 pub fn boss_safe(engine: Engine) -> bool {
     matches!(engine, Engine::Claude)
 }
@@ -320,12 +327,34 @@ pub fn caps(engine: Engine, view: View) -> Caps {
                 "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
             ],
         },
-        Engine::Gemini
-        | Engine::Copilot
-        | Engine::OpenCode
-        | Engine::Cursor
-        | Engine::Devin
-        | Engine::Custom => Caps::none(),
+        // The person's own `devin` TUI, its hooks reporting to Desk and its
+        // permission checks asked of Desk, as Claude Code's are.
+        Engine::Devin => Caps {
+            state: StateSource::Hooks,
+            approvals: Answerer::Desk,
+            // `-r <id>`, the id its `SessionStart` says.
+            resume: Resume::ById,
+            interrupt: Interrupt::Keys,
+            // Its plan's quota isn't something it reports.
+            usage: UsageSource::None,
+            plan: None,
+            approve_for_me: false,
+            fast: false,
+            // Its one sign-in on the computer.
+            accounts: crate::engine_accounts::AccountsVia::None,
+            line: Deliver::Paste,
+            steer: Steer::None,
+            window: None,
+            // After `--`: a bare word is a path for it to open.
+            first_prompt: FirstPrompt::Arg("--"),
+            notes: vec![
+                "The first time in a folder, Devin asks in its terminal whether to trust it.",
+                "Messages from Desk are typed in when Devin is idle.",
+            ],
+        },
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            Caps::none()
+        }
     }
 }
 
@@ -382,8 +411,8 @@ pub fn session_caps(engine: Engine, view: View, version: Option<&str>, tracked: 
     caps
 }
 
-/// The bytes that end a working turn in `engine`'s terminal: Esc for both
-/// Claude Code and Codex.
+/// The bytes that end a working turn in `engine`'s terminal: Esc for
+/// Claude Code, Codex and Devin.
 pub fn interrupt_keys(engine: Engine) -> Option<&'static [u8]> {
     match caps(engine, View::Terminal).interrupt {
         Interrupt::Keys => Some(b"\x1b"),
@@ -600,6 +629,117 @@ pub fn devin_sign_in(env: &BTreeMap<String, String>, exists: impl Fn(&Path) -> b
     }
 }
 
+/// `devin auth status`, on stdout or stderr. Signed out it says
+/// `Not logged in.` (and where its credentials would be); signed in, a
+/// line saying it is logged in, which may name the account's email. Only
+/// that email is kept: never the credentials path, the servers or the
+/// organization it prints beside it. Anything else is [`SignIn::Unknown`],
+/// for the caller to read the credentials file instead ([`devin_sign_in`]).
+pub fn devin_status_sign_in(status: &str) -> SignIn {
+    let lines: Vec<String> = status.lines().map(plain_line).collect();
+    if lines
+        .iter()
+        .any(|l| l.starts_with("not logged in") || l.starts_with("not signed in"))
+    {
+        return SignIn::Out;
+    }
+    let Some(said) = lines
+        .iter()
+        .find(|l| l.starts_with("logged in") || l.starts_with("signed in"))
+    else {
+        return SignIn::Unknown;
+    };
+    SignIn::In {
+        via: Via::Vendor,
+        who: said
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\'' | '`')
+            })
+            .map(|w| w.trim_end_matches(['.', ':', ';']))
+            .find(|w| email_like(w))
+            .map(str::to_string),
+        plan: None,
+        ids: Vec::new(),
+    }
+}
+
+/// A status line lowercased, without colour codes or a leading mark
+/// (`✓ Logged in`).
+fn plain_line(line: &str) -> String {
+    let plain = crate::pty::plain_text(line.as_bytes());
+    plain
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_lowercase()
+}
+
+/// Whether `word` reads as an email address and nothing else.
+fn email_like(word: &str) -> bool {
+    let Some((local, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let fine = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    word.len() <= 254
+        && !local.is_empty()
+        && local.chars().all(fine)
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+/// The environment Devin's login and `auth status` run in: only what
+/// finds the person's own Devin, its files and the network (home, path,
+/// user, shell, temp, `XDG_*`, locale, terminal, proxies, CA files). No key
+/// or token of any kind reaches it, so Devin signs in by its own login and
+/// never by one ahead of it.
+pub fn devin_login_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| devin_login_var(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Whether `name` is one [`devin_login_env`] keeps.
+fn devin_login_var(name: &str) -> bool {
+    const KEPT: &[&str] = &[
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        // To open the sign-in page in the person's browser.
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "BROWSER",
+    ];
+    const PROXIES: &[&str] = &["http_proxy", "https_proxy", "no_proxy", "all_proxy"];
+    KEPT.contains(&name)
+        || PROXIES.iter().any(|p| name.eq_ignore_ascii_case(p))
+        || name.starts_with("XDG_")
+        || name.starts_with("LC_")
+        || devin_setting(name)
+}
+
+/// A `DEVIN_…` setting of the person's that Devin's sign-in sees: only
+/// those its sessions keep ([`crate::devin::DEVIN_KEPT`]), so a sign-in
+/// is checked where its sessions run, and no credential or address of
+/// the person's outranks Devin's own login.
+fn devin_setting(name: &str) -> bool {
+    crate::devin::DEVIN_KEPT.contains(&name.to_ascii_uppercase().as_str())
+}
+
 /// Copilot CLI signs in with a GitHub token from its environment; with
 /// none set, only it can say.
 pub fn copilot_sign_in(env: &BTreeMap<String, String>) -> SignIn {
@@ -664,16 +804,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_claude_code_and_codex_run_and_each_in_a_terminal() {
+    fn claude_code_codex_and_devin_run_and_each_in_a_terminal() {
         for engine in Engine::ALL {
             let expected: &[View] = match engine {
-                Engine::Claude | Engine::Codex => &[View::Terminal],
+                Engine::Claude | Engine::Codex | Engine::Devin => &[View::Terminal],
                 _ => &[],
             };
             assert_eq!(views(engine), expected, "{engine:?}");
             assert!(!runs(engine, View::Desk));
         }
-        assert_eq!(startable(), ["claude", "codex"]);
+        assert_eq!(startable(), ["claude", "codex", "devin"]);
+        assert!(!reads_brief(Engine::Devin) && reads_brief(Engine::Codex));
         assert_eq!(caps(Engine::Gemini, View::Terminal), Caps::none());
         assert_eq!(caps(Engine::Claude, View::Desk), Caps::none());
     }
@@ -701,7 +842,44 @@ mod tests {
         );
         assert!(!codex.notes.is_empty(), "the card says why");
         assert_eq!(interrupt_keys(Engine::Claude), Some(&b"\x1b"[..]));
-        assert_eq!(interrupt_keys(Engine::Devin), None);
+        assert_eq!(interrupt_keys(Engine::Devin), Some(&b"\x1b"[..]));
+        assert_eq!(interrupt_keys(Engine::Gemini), None);
+    }
+
+    #[test]
+    fn devin_answers_in_desk_and_says_what_differs() {
+        let devin = caps(Engine::Devin, View::Terminal);
+        assert_eq!(
+            (
+                devin.state,
+                devin.approvals,
+                devin.resume,
+                devin.usage,
+                devin.plan
+            ),
+            (
+                StateSource::Hooks,
+                Answerer::Desk,
+                Resume::ById,
+                UsageSource::None,
+                None
+            )
+        );
+        assert!(!devin.approve_for_me && !devin.fast);
+        assert_eq!((devin.line, devin.steer), (Deliver::Paste, Steer::None));
+        assert_eq!(devin.first_prompt, FirstPrompt::Arg("--"));
+        assert_eq!(devin.notes.len(), 2);
+        assert_eq!(window_or_default(Engine::Devin, &devin), 64_000);
+        assert!(
+            !boss_safe(Engine::Devin),
+            "a repository's own hooks always load"
+        );
+        let v = serde_json::to_value(&devin).unwrap();
+        assert_eq!(
+            v["firstPrompt"],
+            serde_json::json!({"via": "arg", "flag": "--"})
+        );
+        assert_eq!(v["approvals"], "desk");
     }
 
     #[test]
@@ -804,6 +982,124 @@ mod tests {
             SignIn::In { .. }
         ));
         assert_eq!(copilot_sign_in(&env(&[("GH_TOKEN", "")])), SignIn::Unknown);
+    }
+
+    /// `devin auth status` signed out, as CLI 3000.12.57 printed it.
+    const DEVIN_OUT: &str = "Not logged in. Run `devin auth login` to authenticate.\n  Credentials path: /home/kim/.local/share/devin/credentials.toml\n";
+    /// Signed in. TO SWAP for the real capture (design §9 Q1): this is
+    /// pieced together from the lines the 3000.12.57 binary holds
+    /// (`Logged in (via `, `File:`, `API server:`, `Devin webapp:`,
+    /// `Devin API:`, `Organization:`), and names no account.
+    const DEVIN_IN: &str = "\x1b[32m✓\x1b[0m Logged in (via browser)\n  File:              /home/kim/.local/share/devin/credentials.toml\n  API server:        https://server.codeium.com\n  Devin webapp:      https://app.devin.ai\n  Devin API:         https://api.devin.ai\n  Organization:      ops@acme.example\n  Credentials path:  /home/kim+x@host.example/credentials.toml\n";
+    /// Signed in, naming the account on its logged-in line (`Logged in as `
+    /// is in the binary too). TO SWAP for the real capture as well.
+    const DEVIN_IN_AS: &str = "Logged in as kim@example.com (via browser)\n  Organization:      Acme\n  Credentials path:  /home/kim/.local/share/devin/credentials.toml\n";
+
+    #[test]
+    fn devins_status_says_out_in_and_only_ever_the_email_it_is_signed_in_as() {
+        assert_eq!(devin_status_sign_in(DEVIN_OUT), SignIn::Out);
+        let SignIn::In {
+            via,
+            who,
+            plan,
+            ids,
+        } = devin_status_sign_in(DEVIN_IN)
+        else {
+            panic!("signed in");
+        };
+        assert_eq!(via, Via::Vendor);
+        assert_eq!(
+            who, None,
+            "an organization or a path is never taken for who"
+        );
+        assert_eq!((plan, ids), (None, Vec::<String>::new()));
+        assert!(matches!(
+            devin_status_sign_in(DEVIN_IN_AS),
+            SignIn::In { via: Via::Vendor, who: Some(w), .. } if w == "kim@example.com"
+        ));
+        for garbage in [
+            "",
+            "error: unrecognized subcommand 'status'\n",
+            "Failed to load credentials: invalid TOML\n",
+            "  Credentials path: /home/kim/.local/share/devin/credentials.toml\n",
+            "Warning: you are logged in as kim@example.com elsewhere\n",
+        ] {
+            assert_eq!(devin_status_sign_in(garbage), SignIn::Unknown, "{garbage}");
+        }
+        // Whatever it said is printed nowhere: the view has no path in it.
+        let view = serde_json::to_string(&devin_status_sign_in(DEVIN_IN_AS)).unwrap();
+        assert!(
+            !view.contains("credentials") && !view.contains("Acme"),
+            "{view}"
+        );
+        assert!(email_like("kim.o+desk@mail.example.co"));
+        for not in [
+            "kim@",
+            "@example.com",
+            "kim@localhost",
+            "/a/b@c.d/e",
+            "a@b..",
+            "kim@ex ample.com",
+        ] {
+            assert!(!email_like(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn devin_runs_without_the_keys_that_would_sign_it_in_ahead_of_its_login() {
+        let env: BTreeMap<String, String> = [
+            "HOME",
+            "WINDSURF_API_KEY",
+            "DEVIN_API_KEY",
+            "DEVIN_SESSION_TOKEN",
+            "DEVIN_THEME",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "XDG_DATA_HOME",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "no_proxy",
+            "PATH",
+            "ALL_PROXY",
+            "DISPLAY",
+            "BROWSER",
+            "DEVIN_AUTH_MODE",
+            "DEVIN_API_BASE",
+            "DEVIN_WEBAPP_URL",
+            "DEVIN_SERVER_HOST",
+            "DEVIN_OTEL_ENDPOINT",
+            "DEVIN_PASSWORD",
+            "DEVIN_URL_OVERRIDE",
+            "DEVIN_GATEWAY",
+            "DEVIN_SESSION_COOKIE",
+            "DEVIN_GH_PAT",
+            "DEVIN_JWT",
+            "DEVIN_BEARER",
+            "DEVIN_ORIGIN_X",
+            "DEVIN_DATA_DIR",
+            "DEVIN_CONFIG_DIR",
+            "DEVIN_INSECURE",
+            "DEVIN_MODEL",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "x".to_string()))
+        .collect();
+        let kept: Vec<String> = devin_login_env(&env).into_keys().collect();
+        assert_eq!(
+            kept,
+            [
+                "ALL_PROXY",
+                "BROWSER",
+                "DEVIN_MODEL",
+                "DISPLAY",
+                "HOME",
+                "HTTPS_PROXY",
+                "LC_ALL",
+                "PATH",
+                "XDG_DATA_HOME",
+                "no_proxy"
+            ]
+        );
     }
 
     #[test]

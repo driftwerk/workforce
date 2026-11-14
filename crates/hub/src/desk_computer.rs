@@ -289,6 +289,19 @@ fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
     let mut out = vec![crate::desk_folder::of(config).unwrap_or(data)];
     out.push(home.join("Library/Keychains"));
+    // The person's Devin config folder, found as Desk finds it for Devin's
+    // sessions: it runs its hooks' commands. Neither read nor written, at
+    // `~/.config/devin` as wherever `XDG_CONFIG_HOME` puts it.
+    let env: std::collections::BTreeMap<String, String> = ["HOME", "XDG_CONFIG_HOME"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect();
+    if let Some(dir) = workforce_desk::devin_person_config(&env)
+        .as_deref()
+        .and_then(Path::parent)
+    {
+        out.push(workforce_agent::tools::paths::resolve_real(dir));
+    }
     out
 }
 
