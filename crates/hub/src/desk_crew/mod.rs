@@ -37,6 +37,7 @@ mod decisions;
 mod deliver;
 mod extras;
 mod handover;
+mod idle;
 mod items;
 mod line;
 mod observe;
@@ -152,6 +153,12 @@ pub struct CrewHub {
     tooled: Mutex<HashMap<String, (Scope, String)>>,
     /// Ask the sync loop to look again now (a config was saved).
     poke: tokio::sync::Notify,
+    /// The plain turn ends its Act fully boss's fast call handed to its
+    /// full turn (`idle`), by session and prompt count: the work turn and
+    /// check-in paths take them as any other turn's end ([`Self::rework`]).
+    to_work: Mutex<std::collections::HashSet<(uuid::Uuid, u64)>>,
+    /// Those turn ends, said again to the loops that wake a full turn.
+    rework: tokio::sync::broadcast::Sender<workforce_desk::crew::Event>,
     /// The words of sessions' questions on Desk's line the overseer may
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
@@ -580,6 +587,8 @@ impl CrewHub {
             spent_today: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
+            to_work: Mutex::default(),
+            rework: tokio::sync::broadcast::channel(64).0,
             questions: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
@@ -624,6 +633,7 @@ impl CrewHub {
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
