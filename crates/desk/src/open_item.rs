@@ -265,6 +265,38 @@ pub fn normalised(text: &str) -> String {
     words.join(" ").chars().take(200).collect()
 }
 
+/// How close in time two of the person's orders are for near-same words
+/// to be one order ([`same_order`]).
+pub const SAME_ORDER_WITHIN: Duration = Duration::minutes(30);
+
+/// Words that change nothing of what an order asks.
+const FILLER: &[&str] = &[
+    "a", "an", "the", "and", "so", "just", "please", "pls", "now", "ok", "okay", "also", "too",
+    "really", "you", "can", "could", "it", "that", "this", "make", "sure", "all", "as", "well",
+];
+
+/// An order's words as a set: lower case, filler left out, a plural's or
+/// "-ing"'s ending taken off ("keeps going" is "keep go").
+fn order_words(text: &str) -> std::collections::BTreeSet<String> {
+    normalised(text)
+        .split(' ')
+        .filter(|w| !w.is_empty() && !FILLER.contains(w))
+        .map(|w| {
+            let stem = |end: &str| w.strip_suffix(end).filter(|s| s.chars().count() >= 3);
+            stem("ing").or_else(|| stem("s")).unwrap_or(w).to_string()
+        })
+        .collect()
+}
+
+/// Whether two of the person's orders say the same thing: the same words
+/// once case, punctuation, word order and filler are set aside. A "not",
+/// a number or any other word of substance that differs keeps them apart,
+/// so an order is never lost into one it doesn't repeat.
+pub fn same_order(a: &str, b: &str) -> bool {
+    let (a, b) = (order_words(a), order_words(b));
+    !a.is_empty() && a == b
+}
+
 /// The key of a session's question on its line.
 pub fn line_key(message: Uuid) -> String {
     format!("line:{message}")
@@ -849,6 +881,30 @@ mod tests {
             NewItem::promise("desk", one, "x", " Merged ").dedupe_key,
             format!("promise:{one}:merged")
         );
+    }
+
+    #[test]
+    fn near_same_orders_are_one_and_others_stay_apart() {
+        assert!(same_order(
+            "Make sure the cufflink migration keeps going.",
+            "the Cufflink migration: keep it going, please"
+        ));
+        assert!(same_order(
+            "Don't start any new work",
+            "don't start any new work now"
+        ));
+        for (a, b) in [
+            ("Merge PR 12", "Don't merge PR 12"),
+            ("Merge PR 12", "Merge PR 13"),
+            ("Deploy the api to staging", "Deploy the api to production"),
+            (
+                "Keep the cufflink migration going",
+                "Keep the cufflink migration going and take over",
+            ),
+            ("", ""),
+        ] {
+            assert!(!same_order(a, b), "{a} / {b}");
+        }
     }
 
     #[test]

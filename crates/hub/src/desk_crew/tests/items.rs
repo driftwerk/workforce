@@ -885,6 +885,64 @@ async fn at_act_fully_what_only_the_person_can_do_is_one_line_with_done() {
     .await;
 }
 
+/// As on 11/14: at Act fully the person had said "make sure the cufflink
+/// migration keeps going" and "take over", yet the boss asked them to run
+/// a converge itself because it touches production. An ask there is first
+/// given the person's standing orders, in their words, to act on; only
+/// asked again, saying why they don't cover it, does it reach the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_an_ask_is_checked_against_the_persons_orders_first() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", FULL, &[]).await;
+        let s = new_session(&d, dir.path(), "cufflink").await;
+        let order = "Make sure the cufflink migration keeps going and gets as much done as it can";
+        d.store()
+            .item_open(&workforce_desk::open_item::NewItem::order("desk", order, vec![s.id], Some("m1")))
+            .await
+            .unwrap();
+        let ask = json!({
+            "text": "Run the converge yourself: a converge run can switch services on or off, and that touches production.",
+            "session_id": s.id.to_string(),
+            "options": ["I'll run it", "Leave it"],
+        });
+        // No reason it can't decide: refused, with their orders quoted.
+        let r = call(&crew, super::super::items::ASK, ask.clone()).await;
+        assert!(!r.success);
+        let error = r.error.unwrap_or_default();
+        assert!(error.contains(&format!("“{order}”")), "{error}");
+        assert!(error.contains("no reason by itself to ask"), "{error}");
+
+        // A reason given: first checked against their orders, not asked.
+        let mut why = ask.clone();
+        why["cant_decide"] = json!("A converge run touches production.");
+        let r = call(&crew, super::super::items::ASK, why.clone()).await;
+        assert!(!r.success, "checked against their orders first");
+        let error = r.error.unwrap_or_default();
+        assert!(error.contains(&format!("“{order}”")), "{error}");
+        assert!(error.contains("act on them"), "{error}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(dm_posts(&overseer, "**Needs you.**").is_empty());
+
+        // Asked again, the same, it truly can't: it goes to the person,
+        // as its buttons alone, with no recommendation essay beside them.
+        why["recommendation"] = json!("I'd say let the session run it: the migration is the order.");
+        why["recommended"] = json!("Leave it");
+        let r = call(&crew, super::super::items::ASK, why).await;
+        assert!(r.success, "{:?}", r.error);
+        let post = eventually("the needs-you post", async || {
+            dm_posts(&overseer, "**Needs you.**").into_iter().next()
+        })
+        .await;
+        assert!(!post.content.contains("I'd say"), "{}", post.content);
+        let extras = d.store().extras(std::slice::from_ref(&post.id)).await.unwrap();
+        let item = extras[&post.id].item.clone().expect("its card");
+        assert_eq!(item.options, vec!["I'll run it".to_string(), "Leave it".to_string()]);
+        assert_eq!(item.recommendation, None, "no essay beside the buttons");
+    })
+    .await;
+}
+
 /// The second screenshot's case: a session's question while the person is
 /// typing in that session is theirs, and nothing is posted; one posted
 /// before they stepped in is settled at the next look, said as `settled`,

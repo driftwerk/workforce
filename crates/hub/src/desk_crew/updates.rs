@@ -205,7 +205,6 @@ impl CrewHub {
             // Without the composer, an answer to a session was said at once.
             .filter(|d| composed || d.need != Need::Question)
             .collect();
-        let tz = self.desk.timezone();
         let kept: Vec<String> = match composed {
             true => store
                 .items_closed_since(boss, last, 200)
@@ -213,7 +212,7 @@ impl CrewHub {
                 .unwrap_or_default()
                 .iter()
                 .filter(|i| i.closed_at.is_some_and(|at| at > last && at <= now))
-                .filter_map(|i| super::items::kept_line(i, tz))
+                .filter_map(super::items::kept_line)
                 .collect(),
             false => Vec::new(),
         };

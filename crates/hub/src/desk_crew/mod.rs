@@ -162,6 +162,9 @@ pub struct CrewHub {
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The asks at Act fully already checked against the person's own
+    /// instructions, by boss and matter, and when.
+    asks_checked: Mutex<HashMap<String, DateTime<Utc>>>,
     /// The sessions boss turns acted on lately (started, told, handed
     /// work), by the turn's session id, and when: what a DM turn did for
     /// the person's order. Another turn's acts are never its own.
@@ -583,6 +586,7 @@ impl CrewHub {
             questions: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
+            asks_checked: Mutex::default(),
             turn_acts: Mutex::default(),
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
