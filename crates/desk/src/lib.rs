@@ -94,6 +94,7 @@ pub mod store;
 #[cfg(test)]
 mod testing;
 pub mod ticket_comments;
+pub mod ticket_dev;
 pub mod ticket_files;
 mod token_pipe;
 mod transcript;
