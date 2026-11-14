@@ -107,7 +107,11 @@ async fn a_removed_engines_tokens_are_ended_by_the_device_that_minted_them_alone
     let (kims, _) = mint(&fx, kim.id, &kim_mac.id, "allan", "devbox");
 
     let call = |headers, engine: &str| {
-        revoke_engine(State(Arc::clone(&fx.state)), headers, Path(engine.to_string()))
+        revoke_engine(
+            State(Arc::clone(&fx.state)),
+            headers,
+            Path(engine.to_string()),
+        )
     };
     let done = call(bearer(&mac_bearer), "devbox").await;
     assert_eq!(done.status(), StatusCode::OK);
@@ -120,7 +124,10 @@ async fn a_removed_engines_tokens_are_ended_by_the_device_that_minted_them_alone
     assert!(live(&fx, sam.id, laptops));
     assert!(live(&fx, kim.id, kims));
     // Kim's device names the same engine and reaches only Kim's.
-    assert_eq!(call(bearer(&kim_bearer), "devbox").await.status(), StatusCode::OK);
+    assert_eq!(
+        call(bearer(&kim_bearer), "devbox").await.status(),
+        StatusCode::OK
+    );
     assert!(!live(&fx, kim.id, kims));
     assert!(live(&fx, sam.id, laptops));
     // Only a paired device asks; an engine is named plainly.

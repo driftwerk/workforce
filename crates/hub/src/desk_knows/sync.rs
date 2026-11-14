@@ -131,7 +131,10 @@ async fn end_token(http: &reqwest::Client, hub: &str, link: &Link) -> Result<(),
     if status.is_success() || status == StatusCode::UNAUTHORIZED {
         return Ok(());
     }
-    if matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) {
+    if matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+    ) {
         // An older hub with no such route: its token ends with its life
         // there, and a retry would only be the same.
         tracing::warn!(target: "sentinel.audit", hub = %hub, "an agent's hub can't end a Desk work token; it ends when it expires");
@@ -240,6 +243,9 @@ pub struct KnowsSync {
     retry_delete: Mutex<HashMap<Uuid, Spent>>,
     /// Each unlinked link's back-off, by its vault path.
     retry_revoke: Mutex<HashMap<String, Spent>>,
+    /// One unlink at a time, so a retry and a person's unlink of the same
+    /// link never race each other.
+    unlinking: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
 }
 
@@ -265,6 +271,7 @@ impl KnowsSync {
             spent: Mutex::new(HashMap::new()),
             retry_delete: Mutex::new(HashMap::new()),
             retry_revoke: Mutex::new(HashMap::new()),
+            unlinking: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
         }
     }
@@ -340,6 +347,7 @@ impl KnowsSync {
     /// the hub can't be reached the link stays, marked revoking, for
     /// [`Self::revokings`]. `true` when it is gone.
     async fn unlink(&self, hub: &str, id: &str, person: &str) -> Result<bool, String> {
+        let _one = self.unlinking.lock().await;
         let Some(vault) = self.state.vault.as_ref() else {
             return Err("This hub has no vault.".into());
         };
@@ -361,6 +369,7 @@ impl KnowsSync {
             return Ok(true);
         };
         if !usable(hub, &link) {
+            tracing::warn!(target: "sentinel.audit", hub = %hub, agent = %id, "an unusable agent's link was forgotten without ending its token: it names another hub's address or isn't a Desk work token");
             forget("unusable")?;
             return Ok(true);
         }
@@ -379,7 +388,14 @@ impl KnowsSync {
         self.deletes_of(Some(&format!("{hub}/{id}"))).await;
         match self.end_token(hub, &link).await {
             Ok(()) => {
-                forget("token ended")?;
+                // Forgotten only if it is still the link whose token was
+                // ended: a link made meanwhile is never taken with it.
+                if self
+                    .raw_link(hub, id)
+                    .is_some_and(|k| k.token == link.token)
+                {
+                    forget("token ended")?;
+                }
                 self.retry_revoke.lock().remove(&key);
                 Ok(true)
             }
@@ -411,7 +427,12 @@ impl KnowsSync {
             let Some(link) = self.raw_link(hub, id).filter(|l| l.revoking) else {
                 continue;
             };
-            if self.retry_revoke.lock().get(&path).is_some_and(|s| s.waiting(now)) {
+            if self
+                .retry_revoke
+                .lock()
+                .get(&path)
+                .is_some_and(|s| s.waiting(now))
+            {
                 continue;
             }
             let person = link.person.clone();
@@ -840,6 +861,14 @@ async fn put_link(
     // A hub that moved is a different hub: unlink it first, so the old
     // token is ended where it was made, not lost here.
     if let Some(kept) = r.raw_link(&hub, &agent) {
+        // Being unlinked: its token is still to be ended, and a new link
+        // over it would lose it.
+        if kept.revoking {
+            return refusal(
+                StatusCode::CONFLICT,
+                "This agent is being unlinked. Try again in a moment.",
+            );
+        }
         if origin(&kept.url) != origin(&link.url) {
             return refusal(
                 StatusCode::CONFLICT,
@@ -870,7 +899,12 @@ async fn put_link(
 /// What unlinking did, for the answer: 204 when every token is ended and
 /// the links gone, 202 when some hub couldn't be reached and its link is
 /// kept, revoking, until it can.
-async fn unlink_all(r: &Arc<KnowsSync>, person: &str, hub: Option<&str>, only: Option<&str>) -> Response {
+async fn unlink_all(
+    r: &Arc<KnowsSync>,
+    person: &str,
+    hub: Option<&str>,
+    only: Option<&str>,
+) -> Response {
     let prefix = match (hub, only) {
         (Some(h), Some(a)) => format!("{LINKS}/{h}/{a}"),
         (Some(h), None) => format!("{LINKS}/{h}/"),
@@ -960,8 +994,14 @@ async fn delete_all_links(
 /// The link routes.
 pub fn router(sync: Arc<KnowsSync>) -> Router {
     Router::new()
-        .route("/api/desk/knows-links", axum::routing::delete(delete_all_links))
-        .route("/api/desk/knows-links/{hub}", axum::routing::delete(delete_hub_links))
+        .route(
+            "/api/desk/knows-links",
+            axum::routing::delete(delete_all_links),
+        )
+        .route(
+            "/api/desk/knows-links/{hub}",
+            axum::routing::delete(delete_hub_links),
+        )
         .route(
             "/api/desk/knows-links/{hub}/{agent}",
             put(put_link).delete(delete_link),
@@ -1065,14 +1105,26 @@ mod tests {
         bad.token = "wfr_".to_string() + &"a".repeat(40);
         assert!(!usable("a-example-com", &bad));
         // An address moved is another place, a port apart included.
-        assert_eq!(origin("https://a.example.com"), origin("https://a.example.com/"));
-        assert_ne!(origin("https://a.example.com"), origin("https://a.example.com:8443"));
-        assert_ne!(origin("https://a.example.com"), origin("http://a.example.com"));
+        assert_eq!(
+            origin("https://a.example.com"),
+            origin("https://a.example.com/")
+        );
+        assert_ne!(
+            origin("https://a.example.com"),
+            origin("https://a.example.com:8443")
+        );
+        assert_ne!(
+            origin("https://a.example.com"),
+            origin("http://a.example.com")
+        );
     }
 
     #[test]
     fn a_link_kept_before_unlinking_could_be_marked_reads_as_not_revoking() {
-        let old = format!(r#"{{"url":"https://a.example.com","token":"wfk_{}","person":"p"}}"#, "a".repeat(40));
+        let old = format!(
+            r#"{{"url":"https://a.example.com","token":"wfk_{}","person":"p"}}"#,
+            "a".repeat(40)
+        );
         let link: Link = serde_json::from_str(&old).unwrap();
         assert!(!link.revoking);
     }
@@ -1105,7 +1157,13 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_ended_on_its_hub_by_itself_and_only_there() {
         let http = reqwest::Client::new();
-        for (status, ended) in [(204, true), (401, true), (404, true), (500, false), (503, false)] {
+        for (status, ended) in [
+            (204, true),
+            (401, true),
+            (404, true),
+            (500, false),
+            (503, false),
+        ] {
             let (url, seen) = hub_answering(status).await;
             let link = link_at(&url);
             let id = workforce_desk::hub_id_for_url(&url).unwrap();
