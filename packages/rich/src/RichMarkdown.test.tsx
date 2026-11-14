@@ -2,7 +2,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import type React from "react";
+import type { ReactNode } from "react";
 import { RichMarkdown } from "./RichMarkdown";
 import { RichHostProvider } from "./host";
 import { ALL_RICH_FEATURES, type RichFeatures } from "./fence";
@@ -122,7 +122,7 @@ describe("RichMarkdown links", () => {
 
   it("lets the host draw a link its own way, and keeps the ordinary link otherwise", () => {
     const seen: string[] = [];
-    const link = (href: string, children: React.ReactNode) => {
+    const link = (href: string, children: ReactNode) => {
       seen.push(href);
       return href.startsWith("desk:") ? <span data-testid="chip">{children}</span> : undefined;
     };
@@ -136,6 +136,15 @@ describe("RichMarkdown links", () => {
     expect(hrefs(container)).toContain("https://example.com");
     // Only an address the scheme policy kept ever reaches the host.
     expect(seen).toEqual(["desk://room/r1/msg/m1", "https://example.com"]);
+  });
+
+  it("draws the ordinary link when the host returns null", () => {
+    const { container } = render(
+      <RichHostProvider host={{ link: () => null, linkSchemes: ["desk"] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(hrefs(container)).toContain("desk://room/r1/msg/m1");
   });
 
   it("never hands the host a scheme it didn't declare", () => {
