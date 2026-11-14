@@ -428,6 +428,7 @@ async fn each_machine_is_to_hold_its_own_sessions_of_the_group_at_the_bosss_own_
 
         let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
         let token = crew.state.auth_token.clone();
+        eventually("the grants", async || crew.machine_grants().map(drop)).await;
         let (code, w) = get(&app, "/api/desk/machine-grants", &token).await;
         assert_eq!(code, StatusCode::OK, "{w}");
         assert_eq!(w["grantVersion"], 1);
@@ -467,7 +468,7 @@ async fn each_machine_is_to_hold_its_own_sessions_of_the_group_at_the_bosss_own_
             "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"watch\"\n",
         );
         eventually("Acme's boss watching", async || {
-            (crew.machine_grants().machines["devbox"].grants[0].grant["level"] == "watch")
+            (crew.machine_grants().unwrap().machines["devbox"].grants[0].grant["level"] == "watch")
                 .then_some(())
         })
         .await;
@@ -475,9 +476,7 @@ async fn each_machine_is_to_hold_its_own_sessions_of_the_group_at_the_bosss_own_
         write_config(&sarah, "[oversight]\nenabled = false\n");
         eventually("Acme without a boss", async || {
             crew.machine_grants()
-                .machines
-                .values()
-                .all(|m| m.grants.is_empty())
+                .is_some_and(|w| w.machines.values().all(|m| m.grants.is_empty()))
                 .then_some(())
         })
         .await;
@@ -511,18 +510,26 @@ async fn a_group_bossed_from_another_hub_is_never_wanted_for_a_boss_here() {
             crew.overseer_named("desk").map(drop)
         })
         .await;
-        assert_eq!(crew.machine_grants().machines["devbox"].grants.len(), 1);
+        eventually("the grants", async || crew.machine_grants().map(drop)).await;
+        assert_eq!(
+            crew.machine_grants().unwrap().machines["devbox"]
+                .grants
+                .len(),
+            1
+        );
         put_grant(&d, "remote:driftwerk/allan", &[]).await;
-        assert!(crew.machine_grants().machines["devbox"].grants.is_empty());
+        assert!(crew.machine_grants().unwrap().machines["devbox"]
+            .grants
+            .is_empty());
     })
     .await;
 }
 
-/// At Act fully in force here, the grant says Act fully, with the boss's
-/// own daily budget and nothing to ship from; while it isn't in force
-/// here, the grant acts within Desk.
+/// Act fully here is never carried to a machine yet: each machine would
+/// count its own spend against the whole budget. The grant acts within
+/// Desk, with no budget and nothing to ship from, in force here or not.
 #[tokio::test(flavor = "multi_thread")]
-async fn act_fully_here_is_act_fully_there_with_the_same_budget_and_no_repositories() {
+async fn act_fully_here_is_act_within_desk_on_a_machine_with_no_budget() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let full = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"full\"\n\
@@ -536,18 +543,41 @@ async fn act_fully_here_is_act_fully_there_with_the_same_budget_and_no_repositor
             crew.overseer_named("desk").map(drop)
         })
         .await;
-        // Until today's spend is read, Act fully isn't in force here, so it
-        // isn't there either.
-        let w = crew.machine_grants();
-        let g = &w.machines["devbox"].grants[0].grant;
-        assert_eq!(g["level"], "act", "{g}");
-        assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
-        crew.read_spent_today(&crew.overseers()).await;
-        let w = crew.machine_grants();
-        let g = &w.machines["devbox"].grants[0].grant;
-        assert_eq!(g["level"], "full", "{g}");
-        assert_eq!(g["act"]["budget_usd_per_day"], json!(25.0));
-        assert_eq!(g["repos"], json!([]));
+        let wanted = async || eventually("the grants", async || crew.machine_grants()).await;
+        for read in [false, true] {
+            if read {
+                crew.read_spent_today(&crew.overseers()).await;
+                assert_eq!(
+                    crew.level_now("desk", &crew.overseer_named("desk").unwrap().1)
+                        .0,
+                    workforce_common::oversight::Level::Full,
+                    "in force here"
+                );
+            }
+            let w = wanted().await;
+            let g = &w.machines["devbox"].grants[0].grant;
+            assert_eq!(g["level"], "act", "{g}");
+            assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
+            assert_eq!(g["repos"], json!([]));
+        }
+    })
+    .await;
+}
+
+/// Before this hub has read its agents, it says nothing of what machines
+/// should hold, so Desk takes nothing off them.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_said_of_machine_grants_before_the_bosses_are_read() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let state = hub(&[]);
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(state, d, FAST, CancellationToken::new());
+        assert!(crew.machine_grants().is_none());
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let (code, _) = get(&app, "/api/desk/machine-grants", &token).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     })
     .await;
 }

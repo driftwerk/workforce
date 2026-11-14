@@ -15,10 +15,12 @@
 //!   holds a grant for whose boss is on another hub get none: one boss per
 //!   group, and the main overseer's calls aren't relayed yet.
 //! - **What it may do:** its level as it runs here now
-//!   ([`CrewHub::level_now`]: Act fully only while it is in force), and
-//!   its own `[oversight.act]` switches and `parallel`. At Act fully its
-//!   daily budget too, when it has one; with none, the machine acts within
-//!   Desk (`FULL_NO_BUDGET`), which is less.
+//!   ([`CrewHub::level_now`]), never above Act, and its own
+//!   `[oversight.act]` switches and `parallel`. Act fully isn't carried
+//!   to machines yet: each machine would count its own spend against the
+//!   whole daily budget, so the boss could spend it once here and again
+//!   on every machine. A boss at Act fully here acts within Desk there,
+//!   and no budget is sent, until spend is counted across them.
 //! - **What it sees:** everything, terminals included, as its
 //!   `crew.history` here shows them; the machine still redacts and caps
 //!   every string.
@@ -78,9 +80,9 @@ pub struct MachineGrants {
 
 /// A boss's own `[oversight.act]` switches that a grant carries: those a
 /// served boss's are read from (`served_oversight`), each as it is here.
-fn act_of(o: &Oversight, level: Level) -> Value {
+fn act_of(o: &Oversight) -> Value {
     let a = &o.act;
-    let mut act = json!({
+    json!({
         "nudge": a.nudge,
         "resume_restart": a.resume_restart,
         "read_only_approvals": a.read_only_approvals,
@@ -88,19 +90,26 @@ fn act_of(o: &Oversight, level: Level) -> Value {
         "interrupt": a.interrupt,
         "answer_sessions": a.answer_sessions,
         "parallel": o.work.parallel,
-    });
-    if level == Level::Full {
-        if let Some(b) = o.full.budget_usd_per_day() {
-            act["budget_usd_per_day"] = json!(b);
-        }
+    })
+}
+
+/// `level`, never above Act: what a machine is given ([module](self)).
+fn at_most_act(level: Level) -> Level {
+    match level {
+        Level::Full => Level::Act,
+        l => l,
     }
-    act
 }
 
 impl CrewHub {
     /// The grants each machine should hold for this hub's group bosses, as
-    /// the module says.
-    pub(crate) fn machine_grants(&self) -> MachineGrants {
+    /// the module says; none while this hub hasn't read its agents or who
+    /// runs which session yet, so nothing is taken off a machine for
+    /// what isn't known.
+    pub(crate) fn machine_grants(&self) -> Option<MachineGrants> {
+        if self.services().is_empty() || !self.desk.charges_loaded() {
+            return None;
+        }
         let layout = self.desk.layout();
         let mut out = MachineGrants {
             grant_version: GRANT_VERSION,
@@ -154,7 +163,7 @@ impl CrewHub {
             if by_machine.is_empty() {
                 continue;
             }
-            let (level, _) = self.level_now(agent, o);
+            let level = at_most_act(self.level_now(agent, o).0);
             let name: String = match g.name.trim() {
                 "" => g.id.clone(),
                 n => n
@@ -175,7 +184,7 @@ impl CrewHub {
                     "folders": [],
                     "repos": [],
                     "members": members,
-                    "act": act_of(o, level),
+                    "act": act_of(o),
                 });
                 out.machines
                     .entry(m.to_string())
@@ -189,6 +198,6 @@ impl CrewHub {
                     });
             }
         }
-        out
+        Some(out)
     }
 }

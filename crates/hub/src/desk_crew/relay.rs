@@ -490,7 +490,15 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// native side to carry to them.
 async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
     native!(s, h, q);
-    Json(s.crew.machine_grants()).into_response()
+    match s.crew.machine_grants() {
+        Some(w) => Json(w).into_response(),
+        // Not known yet: Desk writes nothing, and deletes nothing, until it is.
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "this hub hasn't read its bosses yet"})),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) fn routes(state: Arc<GatewayState>, crew: Arc<CrewHub>) -> Router {
