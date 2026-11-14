@@ -250,7 +250,10 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
             continue;
         }
         let mut l = bare(raw);
-        if l.is_empty() {
+        // Empty, or a rule between sections (`---`, `***`, `•`).
+        if l.chars()
+            .all(|c| matches!(c, '-' | '—' | '–' | '_' | '•' | '=' | '*'))
+        {
             continue;
         }
         // `[name]`, alone or opening its line.
@@ -258,7 +261,10 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
         // link (`[x](…)`), a checkbox or a tag in prose (`[WIP] …`).
         if let Some((name, rest)) = l.strip_prefix('[').and_then(|r| r.split_once(']')) {
             let rest = bare(rest);
-            if !rest.starts_with('(') && (rest.is_empty() || marked(rest)) {
+            let checkbox = matches!(name.trim(), "" | "x" | "X");
+            if checkbox {
+                l = rest;
+            } else if !rest.starts_with('(') && (rest.is_empty() || marked(rest)) {
                 let name = bare(name);
                 label = (!name.is_empty() && !name.eq_ignore_ascii_case(CREW_LABEL))
                     .then(|| clip(name, 60));
@@ -371,6 +377,10 @@ fn bare(s: &str) -> &str {
     loop {
         let before = s.len();
         s = s.trim_matches(['*', '~', '\u{fe0f}']).trim();
+        // Underscores only as emphasis wrapping the whole line.
+        if s.len() > 2 && s.starts_with('_') && s.ends_with('_') && !s.starts_with("__init") {
+            s = s.trim_matches('_').trim();
+        }
         // A list mark is one followed by a space: `-5%` and `3.5x` are
         // the line's own.
         for mark in ["- ", "• ", "[ ] ", "[x] ", "[X] "] {
@@ -404,7 +414,7 @@ fn for_you_of(l: &str) -> Option<&str> {
     ["● for you", "for you", "● needs you", "needs you"]
         .iter()
         .find_map(|p| strip_ci(l, p))
-        .map(str::trim_start)
+        .map(|r| r.trim_start_matches(['*', '_', ' ']))
         .filter(|r| r.starts_with([':', '—', '–', '-']))
         .map(|r| bare(r.trim_start_matches([':', '—', '–', '-'])))
 }
@@ -428,7 +438,6 @@ fn suggests(l: &str) -> bool {
             "i suggest",
             "i'd suggest",
             "i would suggest",
-            "suggest",
             "i recommend",
             "i'd recommend",
             "maybe",
@@ -444,11 +453,10 @@ fn suggests(l: &str) -> bool {
             "i'll",
             "here's",
             "here is",
-            "options",
-            "option",
         ]
         .iter()
         .any(|p| opens(p))
+        || ["options:", "option:"].iter().any(|p| lower.starts_with(p))
 }
 
 /// `s` without `prefix`, matched ignoring ASCII case.
@@ -765,7 +773,11 @@ mod tests {
             ✓ Suggested fix merged — review passed\n\
             ✓ I can rerun it later\n\
             For you the build passed\n\
-            [PR 12](https://x.example) merged";
+            [PR 12](https://x.example) merged\n\
+            ---\n\
+            [x]\n\
+            ✓ Option flag added\n\
+            Options: drop or keep";
         let u = parse_reply(reply, Utc::now());
         assert_eq!(u.headline, "[WIP] Release is unblocked");
         let all: Vec<(String, String)> = u
@@ -781,7 +793,36 @@ mod tests {
                 ("acme-web".to_string(), "Suggested fix merged".to_string()),
             ]
         );
-        assert_eq!(u.more_items, 0);
+        assert_eq!(u.more_items, 1);
+    }
+
+    #[test]
+    fn rules_and_underscored_or_starred_marks_read_as_the_form() {
+        let u = parse_reply(
+            "---\nAll moving.\n__[acme-web]__\n_✓ Merged the fix_\n**For you** — Rotate the key",
+            Utc::now(),
+        );
+        assert_eq!(u.headline, "All moving.");
+        let all: Vec<(String, BriefKind, String)> = u
+            .brief
+            .iter()
+            .flat_map(|g| {
+                g.items
+                    .iter()
+                    .map(|i| (g.label.clone(), i.kind, i.action.clone()))
+            })
+            .collect();
+        assert_eq!(
+            all,
+            [
+                (
+                    "acme-web".into(),
+                    BriefKind::ForYou,
+                    "Rotate the key".into()
+                ),
+                ("acme-web".into(), BriefKind::Done, "Merged the fix".into()),
+            ]
+        );
     }
 
     #[test]
