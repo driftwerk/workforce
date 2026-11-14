@@ -693,6 +693,19 @@ pub enum ServedCheck {
 }
 
 impl Desk {
+    /// Where a boss's answer is judged now: the hub's bounds, every agent's
+    /// settings, and the Devin folders Devin's sessions find
+    /// ([`Desk::devin_withheld`]), which can be other than the hub's and
+    /// change after the hub's bounds were said. None before the hub says
+    /// them.
+    pub(crate) fn judging_bounds(&self) -> Option<charge::Bounds> {
+        let mut bounds = self.0.boss_bounds.lock().clone()?;
+        let settings = self.0.state.lock().charges.agent_settings.clone();
+        bounds.withheld.extend(settings);
+        bounds.withheld.extend(self.devin_withheld());
+        Some(bounds)
+    }
+
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
     /// what Desk reads in full and judges safe.
     fn boss_judges(
@@ -702,11 +715,9 @@ impl Desk {
         boss: &str,
     ) -> Result<(), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
-        let Some(mut bounds) = self.0.boss_bounds.lock().clone() else {
+        let Some(bounds) = self.judging_bounds() else {
             return no("Desk can't judge requests for a boss yet");
         };
-        let settings = self.0.state.lock().charges.agent_settings.clone();
-        bounds.withheld.extend(settings);
         let Ok(view) = self.view(id) else {
             return no("that session isn't there any more");
         };

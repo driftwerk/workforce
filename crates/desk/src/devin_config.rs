@@ -302,6 +302,22 @@ pub fn person_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     Some(base.join("devin/config.json"))
 }
 
+/// Where Devin keeps its data (its sessions, its sign-in):
+/// `$XDG_DATA_HOME/devin`, else `~/.local/share/devin`. None without a
+/// home.
+pub fn data_folder(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let base = env
+        .get("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .or_else(|| {
+            env.get("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| Path::new(h).join(".local/share"))
+        })?;
+    Some(base.join("devin"))
+}
+
 /// The byte order mark an editor may start a file with.
 const BOM: char = '\u{feff}';
 
@@ -916,6 +932,19 @@ mod tests {
             Some(PathBuf::from("/Users/sam/.config/devin/config.json"))
         );
         assert_eq!(person_path(&env(&[])), None);
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam")])),
+            Some(PathBuf::from("/Users/sam/.local/share/devin"))
+        );
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam"), ("XDG_DATA_HOME", "/d")])),
+            Some(PathBuf::from("/d/devin"))
+        );
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam"), ("XDG_DATA_HOME", "rel")])),
+            Some(PathBuf::from("/Users/sam/.local/share/devin"))
+        );
+        assert_eq!(data_folder(&env(&[])), None);
     }
 
     #[test]

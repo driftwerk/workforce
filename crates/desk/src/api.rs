@@ -1065,8 +1065,14 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
 /// asks for it only here: `fresh-worktree` (a separate copy that is always
 /// a new branch), `folder-remotes` (a listing says its repository and where
 /// it comes from), `keep-tickets` (a board with tickets of its own links
-/// keeping them).
-pub const FEATURES: &[&str] = &["fresh-worktree", "folder-remotes", "keep-tickets"];
+/// keeping them), `session-model` (a new session runs the model it is
+/// given, and says it).
+pub const FEATURES: &[&str] = &[
+    "fresh-worktree",
+    "folder-remotes",
+    "keep-tickets",
+    "session-model",
+];
 
 async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);

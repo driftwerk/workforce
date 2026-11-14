@@ -437,7 +437,7 @@ pub fn unreadable(command: &str) -> bool {
 /// What runs on its own later, by a path's parts, lowercased: CI, hooks,
 /// an agent's settings and instructions, an editor's tasks, a build's
 /// config, a shell's start-up files, the machine's schedulers.
-const RUNS_LATER: &[&str] = &[
+pub(crate) const RUNS_LATER: &[&str] = &[
     ".github",
     ".git",
     ".gitlab",
@@ -508,7 +508,7 @@ const RUNS_LATER: &[&str] = &[
 ];
 
 /// Parts that run later only beside the one before them.
-const RUNS_LATER_IN: &[(&str, &str)] = &[
+pub(crate) const RUNS_LATER_IN: &[(&str, &str)] = &[
     (".vscode", "tasks.json"),
     (".vscode", "launch.json"),
     (".vscode", "settings.json"),

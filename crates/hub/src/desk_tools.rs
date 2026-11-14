@@ -253,6 +253,7 @@ impl DeskTool {
                             approvals: None,
                             approve_for_me: false,
                             fast: false,
+                            model: None,
                             account,
                             env: Default::default(),
                             // In the caller's group when that is a boundary.

@@ -118,6 +118,8 @@ pub use conversations::{
     Said, SavedMemory, Speaker, SpeakerKind, Thread, Threads,
 };
 pub use crew_store::CheckIn;
+/// Where Devin keeps its data, from the environment given.
+pub use devin_config::data_folder as devin_data_folder;
 /// Where the person's own Devin config is, from the environment given.
 pub use devin_config::person_path as devin_person_config;
 pub use knows_api::knows_router;

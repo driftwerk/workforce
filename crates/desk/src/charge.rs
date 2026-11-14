@@ -723,6 +723,14 @@ pub fn answerable(
                 if boss::settings(&p, &bounds.home, &bounds.withheld) {
                     return no(boss::SETTINGS.into());
                 }
+                // A change is to a file: one naming the session's folder,
+                // a folder holding it (`/tmp` for a folder in it), or any
+                // folder there is, may delete it whole (Devin's patch).
+                if boss::fold(&own_real).starts_with(boss::fold(&p))
+                    || std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir())
+                {
+                    return no("changes a folder, not a file".into());
+                }
                 if !inside(&p) {
                     return no(format!("changes a file outside {}", facts.folder));
                 }
@@ -771,6 +779,7 @@ mod tests {
             engine_version: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             name: "acme-web".into(),
             goal: String::new(),
@@ -1392,6 +1401,53 @@ mod tests {
         );
     }
 
+    /// A change naming the session's own folder, a folder above it or any
+    /// folder there is is the person's: a patch deleting it may delete it
+    /// whole.
+    #[test]
+    fn a_change_to_a_folder_is_never_a_bosss_to_allow() {
+        let folder = "changes a folder, not a file";
+        let change = |s: &SessionView, paths: Value| {
+            judged(
+                Engine::Codex,
+                &asking("Edit", json!({ "paths": paths }), None),
+                s,
+            )
+        };
+        let s = acme("/Users/sam/dev/acme-web");
+        for p in [".", "./", "/Users/sam/dev/acme-web", "src/.."] {
+            assert_eq!(
+                change(&s, json!(["src/a.ts", p])),
+                Err(folder.into()),
+                "{p}"
+            );
+        }
+        // A folder above it: outside it too, but a folder whatever else.
+        assert_eq!(change(&s, json!(["/Users/sam/dev"])), Err(folder.into()));
+        // In scratch space, `/tmp` itself holds the session's folder.
+        let t = acme("/tmp/work");
+        assert_eq!(change(&t, json!(["/tmp"])), Err(folder.into()));
+        assert_eq!(change(&t, json!(["/tmp/other.txt"])), Ok(()));
+        // A folder that is there, by its name.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let s = acme(real.to_str().unwrap());
+        assert_eq!(change(&s, json!(["src"])), Err(folder.into()));
+        assert_eq!(change(&s, json!(["src/a.ts"])), Ok(()));
+        // Every engine's change: Claude's write too.
+        let write = |s: &SessionView, path: &str| {
+            let input = json!({ "file_path": path, "content": "x" });
+            judged(Engine::Claude, &asking("Write", input, None), s)
+        };
+        assert_eq!(write(&s, "src"), Err(folder.into()));
+        assert_eq!(write(&s, "."), Err(folder.into()));
+        assert_eq!(write(&s, real.to_str().unwrap()), Err(folder.into()));
+        assert_eq!(write(&s, "src/a.ts"), Ok(()));
+        let a = acme("/Users/sam/dev/acme-web");
+        assert_eq!(write(&a, "/Users/sam/dev"), Err(folder.into()));
+    }
+
     #[test]
     fn what_desk_wasnt_sent_in_full_or_cant_place_goes_to_the_person() {
         let s = acme("/Users/sam/dev/acme-web");
@@ -1493,6 +1549,9 @@ mod tests {
         ] {
             assert_eq!(edit(gate), Err(boss::SETTINGS.into()), "{gate}");
         }
-        assert_eq!(edit(".github/CODEOWNERS"), Ok(()));
+        // Who must review what is a protection too: what a boss's own asks
+        // count as running later ([`crate::boss_ask`]) is a setting.
+        assert_eq!(edit(".github/CODEOWNERS"), Err(boss::SETTINGS.into()));
+        assert_eq!(edit("docs/ci.md"), Ok(()));
     }
 }

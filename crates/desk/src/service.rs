@@ -106,6 +106,8 @@ mod memory_line;
 #[cfg(test)]
 mod memory_line_tests;
 mod memory_recall;
+#[cfg(test)]
+mod model_tests;
 mod modes;
 mod moves;
 mod session_account;
@@ -1052,6 +1054,24 @@ fn check_env(env: &BTreeMap<String, String>) -> Result<(), DeskError> {
         }
     }
     Ok(())
+}
+
+/// The model an `engine` session runs: none (blank too) is its engine's
+/// own default; a name that could read as anything but a model's on its
+/// command line is refused ([`engine::model_ok`]).
+fn session_model(engine: Engine, model: Option<&str>) -> Result<Option<String>, DeskError> {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        None => Ok(None),
+        Some(m) if engine::model_ok(engine, m) => Ok(Some(m.to_string())),
+        Some(m) => Err(DeskError::Invalid(format!(
+            "{:?} can't be the name of a {} model",
+            m.chars()
+                .filter(|c| !c.is_control())
+                .take(120)
+                .collect::<String>(),
+            engine.title()
+        ))),
+    }
 }
 
 /// What Desk last asked its sessions' environment to add, as kept; none
@@ -3125,6 +3145,7 @@ impl Desk {
                 "only Codex sessions run in Fast mode".into(),
             ));
         }
+        let model = session_model(new.engine, new.model.as_deref())?;
         let account = self.account_for(new.engine, new.account)?;
         if new.engine == Engine::Claude {
             self.started_on(account);
@@ -3162,6 +3183,7 @@ impl Desk {
             engine_version: self.version_of(new.engine),
             approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
             fast: new.fast && new.engine == Engine::Codex,
+            model,
             account,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
@@ -4783,6 +4805,20 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
+        // Checked again on every start and resume, whatever the record was
+        // read from: only a model's name reaches its CLI's command line. One
+        // kept that isn't (a row edited, a rule since narrowed) never strands
+        // the session: it runs on its engine's default, said so, and its
+        // record says it.
+        let model = match session_model(r.engine, r.model.as_deref()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(session = %r.id, error = %e, "a session's kept model isn't one Desk passes on: it runs on its engine's default");
+                self.change(r.id, |r, _| r.model = None);
+                None
+            }
+        };
+        let model = model.as_deref();
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Read only now; it reaches the CLI on a descriptor, never in an
         // environment ([`crate::token_pipe`]).
@@ -4852,6 +4888,7 @@ impl Desk {
                     env: &env,
                     theme,
                     mode,
+                    model,
                     fail_closed,
                 });
                 (spec, None)
@@ -4876,6 +4913,7 @@ impl Desk {
                     prompt,
                     approve_for_me: r.approve_for_me,
                     fast: r.fast,
+                    model,
                     mode,
                     env: &env,
                 });
@@ -4905,7 +4943,8 @@ impl Desk {
                     &person,
                 ) {
                     // Whatever of them was written goes, its token with it.
-                    self.devin_ended(r.id).await;
+                    self.devin_ended_to(r.id, devin_config::person_path(&env))
+                        .await;
                     return Err(DeskError::Internal(e));
                 }
                 if mode == Some(crate::mode::Mode::Plan) {
@@ -4922,7 +4961,7 @@ impl Desk {
                         },
                         prompt,
                         mode,
-                        model: None,
+                        model,
                         config: &files.config,
                         env: &env,
                     })
@@ -4932,7 +4971,8 @@ impl Desk {
                     Ok(spec) => spec,
                     Err(e) => {
                         // Never left holding its token.
-                        self.devin_ended(r.id).await;
+                        self.devin_ended_to(r.id, devin_config::person_path(&env))
+                            .await;
                         return Err(e);
                     }
                 };
@@ -4983,7 +5023,8 @@ impl Desk {
                     codex.stop();
                 }
                 if r.engine == Engine::Devin {
-                    self.devin_ended(r.id).await;
+                    self.devin_ended_to(r.id, devin_config::person_path(&env))
+                        .await;
                 }
                 return Err(e);
             }
@@ -5029,7 +5070,9 @@ impl Desk {
         // as it is now.
         self.started_afresh(r.id);
         if r.engine == Engine::Devin {
-            self.devin_launched(r.id, started_at);
+            // Its own environment's folders: a start since may have
+            // changed the current one.
+            self.devin_launched_with(r.id, started_at, &env);
         }
         tokio::spawn(self.clone().on_exit(r.id, r.engine, exit));
         // What its line held while it wasn't running is looked at again now
@@ -7187,6 +7230,7 @@ impl Desk {
                         engine_version: None,
                         approve_for_me: false,
                         fast: false,
+                        model: None,
                         account: None,
                         name: ext
                             .name
@@ -7549,6 +7593,7 @@ mod tests {
                 approvals: None,
                 approve_for_me: false,
                 fast: false,
+                model: None,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -8097,6 +8142,7 @@ mod tests {
                 approvals: None,
                 approve_for_me: false,
                 fast: false,
+                model: None,
                 account: None,
                 env: Default::default(),
                 group: None,
@@ -8263,6 +8309,7 @@ mod tests {
                         approvals: None,
                         approve_for_me: false,
                         fast: false,
+                        model: None,
                         account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                         group: None,
@@ -8322,6 +8369,7 @@ mod tests {
                         approvals: None,
                         approve_for_me: false,
                         fast: false,
+                        model: None,
                         account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                         group: None,
@@ -8375,6 +8423,7 @@ mod tests {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
+                    model: None,
                     account: None,
                     env: added.clone(),
                     group: None,
@@ -8811,6 +8860,7 @@ mod tests {
                         approvals: None,
                         approve_for_me: false,
                         fast: false,
+                        model: None,
                         account: None,
                         env: Default::default(),
                         group: None,
