@@ -347,7 +347,14 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         assert!(crew.served_full(BOSS).is_none());
         assert!(!d.boss_unbound(BOSS));
         crew.decided(&up, &answer(&f, "ALLOW: push the tag"));
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eventually("left to the person", async || {
+            d.view(started)
+                .unwrap()
+                .waits_on_you
+                .is_some()
+                .then_some(())
+        })
+        .await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a6));
         assert!(!asked.is_finished(), "nothing was done for it");
         let rows = d
@@ -356,19 +363,25 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             .await
             .unwrap();
         assert!(
-            !rows
-                .iter()
-                .any(|r| r.need_ref == Some(a6.to_string()) && r.why.contains("push the tag")),
-            "{rows:?}"
+            !rows.iter().any(|r| r.need_ref == Some(a6.to_string())),
+            "no decision of the boss's for it: {rows:?}"
         );
         // Its answer, sent again, finds nothing waiting for it.
         crew.decided(&up, &answer(&f, "ALLOW: push the tag"));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a6));
-        // Nor is it asked again while stopped.
-        while let Ok(f) = rx.try_recv() {
-            assert_ne!(f["type"], "decide", "asked again while stopped: {f}");
-        }
+        // Nor is anything asked of the boss while stopped, through a whole
+        // sweep (this can't tell Stop from a request asked once only, but
+        // no decide frame of any kind goes up).
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(2500),
+                decide_frame(&mut rx)
+            )
+            .await
+            .is_err(),
+            "asked again while stopped"
+        );
         d.decide(started, a6, workforce_desk::model::Decision::Deny, None)
             .unwrap();
         let _ = asked.await;
