@@ -177,7 +177,11 @@ pub fn prompt(group: &str, lines: &[String], more: u64) -> String {
 /// no button: nothing in it is answered there.
 pub fn briefed(reply: &str) -> (String, Vec<Value>) {
     use workforce_desk::update_brief as brief;
-    let u = brief::parse_reply(reply, chrono::Utc::now());
+    // Made safe whole before anything is cut: a secret clipped first could
+    // leave a prefix no pattern knows.
+    let reply =
+        crate::slack_manager::sanitize_outbound_logged(&crate::redact::redact_secrets(reply));
+    let u = brief::parse_reply(&reply, chrono::Utc::now());
     let text = workforce_desk::update::render_brief(&u);
     let (_, mut blocks) = brief::slack_blocks(&u, &|_| None);
     for b in &mut blocks {
@@ -541,10 +545,37 @@ mod tests {
 
     #[test]
     fn a_wakes_answer_never_broadcasts() {
-        let (_, blocks) = briefed("All quiet.\n✓ Told <!here> and @channel the run is done");
+        let (_, blocks) = briefed("All quiet.\n✓ Told @here and @channel the run is done");
         let raw = serde_json::to_string(&blocks).unwrap();
-        assert!(!raw.contains("<!here>"), "{raw}");
-        assert!(!raw.contains("@channel"), "{raw}");
+        assert!(
+            raw.contains("Told @\u{2060}here and @\u{2060}channel"),
+            "{raw}"
+        );
+        // Every text of a block is defused, however deep.
+        let mut v = serde_json::json!([{"type": "context", "elements": [{"type": "mrkdwn", "text": "@everyone"}]},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "<!channel>"}}]);
+        defused(&mut v);
+        let raw = v.to_string();
+        assert!(!raw.contains("\"@everyone\""), "{raw}");
+        assert!(!raw.contains("<!channel>"), "{raw}");
+        assert!(raw.contains("\"mrkdwn\""), "the type is kept: {raw}");
+    }
+
+    #[test]
+    fn a_fenced_or_marked_up_answer_still_reads_as_the_brief() {
+        let reply = "```\n**Here's the update:**\nRelease unblocked.\n**[acme-web]**\n1. ✔️ **Merged** the fix — CI green\n[acme-api] - For you — Approve the deploy_key rotation\n```";
+        let (_, blocks) = briefed(reply);
+        let raw = serde_json::to_string(&blocks).unwrap();
+        assert!(raw.contains("*Release unblocked.*"), "{raw}");
+        assert!(
+            raw.contains("*acme-web*\\n✓ Merged the fix — CI green"),
+            "{raw}"
+        );
+        assert!(
+            raw.contains("● For you: Approve the deploy_key rotation"),
+            "{raw}"
+        );
+        assert!(!raw.contains("Here"), "{raw}");
     }
 
     #[test]

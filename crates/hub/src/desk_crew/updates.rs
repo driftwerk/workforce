@@ -804,11 +804,23 @@ impl CrewHub {
         if let Some(log) = crate::floor::turns() {
             let now = Utc::now();
             let hidden = |s: &str| s.parse::<Uuid>().is_ok_and(|s| self.person_in(s, now));
-            let shown = workforce_desk::update_brief::shown(&p.update, &hidden);
-            let (purpose, state) = workforce_desk::update_brief::floor_line(
-                &shown,
-                p.away.as_ref().map(|a| a.headline.as_str()),
-            );
+            use workforce_desk::update_brief as brief;
+            let shown = brief::shown(&p.update, &hidden);
+            // All of it about sessions the person is in: nothing is said.
+            if !brief::says_anything(&shown) && p.away.is_none() {
+                return;
+            }
+            // A catch-up's own headline, unless it was written over what
+            // is no longer said.
+            let away = p
+                .away
+                .as_ref()
+                .map(|a| match brief::hides(&p.update, &shown) {
+                    true => "",
+                    false => a.headline.as_str(),
+                });
+            let (purpose, state) = brief::floor_line(&shown, away);
+            let state = workforce_common::redact::redact_secrets(&state);
             crate::floor::agents::briefed(
                 log.as_ref(),
                 service.agent_id.as_str(),

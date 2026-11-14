@@ -49,7 +49,8 @@ pub fn shown(u: &MentionedUpdate, hidden: &dyn Fn(&str) -> bool) -> MentionedUpd
         .collect();
     let hid = brief.len() != u.brief.iter().filter(|g| !g.items.is_empty()).count()
         || brief.iter().map(|g| g.items.len()).sum::<usize>()
-            != u.brief.iter().map(|g| g.items.len()).sum::<usize>();
+            != u.brief.iter().map(|g| g.items.len()).sum::<usize>()
+        || u.sessions.iter().any(|s| hidden(&s.session_id));
     let mut out = MentionedUpdate {
         sessions: u
             .sessions
@@ -69,6 +70,11 @@ pub fn shown(u: &MentionedUpdate, hidden: &dyn Fn(&str) -> bool) -> MentionedUpd
     // A headline written over lines no longer shown would say them: it is
     // said again from what is.
     let needs_hid = out.needs_you.len() != u.needs_you.len();
+    if hid || needs_hid {
+        // What was left out may be about what is no longer said: not
+        // counted either.
+        out.more_items = 0;
+    }
     if hid || needs_hid || out.headline.trim().is_empty() {
         let for_you = out
             .brief
@@ -81,16 +87,34 @@ pub fn shown(u: &MentionedUpdate, hidden: &dyn Fn(&str) -> bool) -> MentionedUpd
     out
 }
 
+/// Whether [`shown`] left out anything of `u`, so that `shown` is all that
+/// may be said: no headline of `u`'s own over it.
+pub fn hides(u: &MentionedUpdate, shown: &MentionedUpdate) -> bool {
+    u.headline != shown.headline
+}
+
+/// Whether `u` (already [`shown`]) says anything at all.
+pub fn says_anything(u: &MentionedUpdate) -> bool {
+    !u.brief.is_empty() || !u.needs_you.is_empty() || !u.sessions.is_empty() || !u.kept.is_empty()
+}
+
 /// `s` as Slack mrkdwn shows it plainly: `&`, `<` and `>` escaped so no
 /// link, mention or broadcast in it works, and its emphasis marks and
 /// backticks left out, on one line.
 pub fn mrkdwn(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    let chars: Vec<char> = s.chars().collect();
+    let word = |i: Option<usize>| {
+        i.and_then(|i| chars.get(i))
+            .is_some_and(|c| c.is_alphanumeric())
+    };
+    for (n, &c) in chars.iter().enumerate() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            // Inside a word (`snake_case`) an underscore is the name's own.
+            '_' if word(n.checked_sub(1)) && word(Some(n + 1)) => out.push('_'),
             '*' | '_' | '~' | '`' => {}
             '\n' | '\r' => out.push(' '),
             c if c.is_control() => {}
@@ -124,7 +148,10 @@ pub fn slack_blocks(
     done: &dyn Fn(&BriefItem) -> Option<String>,
 ) -> (String, Vec<Value>) {
     let headline = mrkdwn(&u.headline);
-    let mut blocks = vec![section(&format!("*{headline}*"))];
+    let mut blocks = Vec::new();
+    if !headline.is_empty() {
+        blocks.push(section(&format!("*{headline}*")));
+    }
     for g in &u.brief {
         let did: Vec<String> = g
             .items
@@ -183,8 +210,11 @@ pub fn floor_line(u: &MentionedUpdate, away: Option<&str>) -> (String, String) {
     }
     // The Floor reads a question as one waiting on the person: what waits
     // is the update's own card.
-    let state = state.replace('?', ".");
-    let state = match state.ends_with(['.', '!']) {
+    let state = match state.strip_suffix('?') {
+        Some(s) => format!("{}.", s.trim_end_matches('?')),
+        None => state,
+    };
+    let state = match state.ends_with(['.', '!', '…']) {
         true => state,
         false => format!("{state}."),
     };
@@ -211,22 +241,24 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
     let mut headline: Option<String> = None;
     let mut label: Option<String> = None;
     let mut items: Vec<(Option<String>, BriefItem)> = Vec::new();
-    let mut fenced = false;
     for raw in reply.lines() {
-        let l = raw.trim();
-        if l.starts_with("```") {
-            fenced = !fenced;
+        // A fence around the form is no part of it.
+        if raw.trim().starts_with("```") {
             continue;
         }
-        if fenced || l.is_empty() {
+        let mut l = bare(raw);
+        if l.is_empty() {
             continue;
         }
-        let l = l.trim_start_matches(['-', '*', '•', ' ']).trim();
-        if let Some(name) = l.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-            let name = name.trim();
+        // `[name]`, alone or opening its line.
+        if let Some((name, rest)) = l.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            let name = bare(name);
             label = (!name.is_empty() && !name.eq_ignore_ascii_case(CREW_LABEL))
                 .then(|| clip(name, 60));
-            continue;
+            l = bare(rest);
+            if l.is_empty() {
+                continue;
+            }
         }
         let item = |kind: BriefKind, rest: &str| {
             let (action, why) = split_why(rest);
@@ -245,16 +277,22 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
                 at,
             })
         };
-        let done = ["✓", "✔️", "✔", "✅"]
+        let done = ["✔️", "✅", "✓", "✔", "☑️", "☑"]
             .iter()
             .find_map(|m| l.strip_prefix(m))
-            .map(str::trim);
-        let for_you = strip_ci(l, "for you:").or_else(|| strip_ci(l, "● for you:"));
+            .map(bare);
+        let for_you = ["● for you", "for you", "needs you", "● needs you"]
+            .iter()
+            .find_map(|p| strip_ci(l, p))
+            .filter(|r| r.is_empty() || r.starts_with([':', ' ', '—', '–', '-']))
+            .map(|r| bare(r.trim_start_matches([':', ' ', '—', '–', '-'])));
         let parsed = match (done, for_you) {
+            // A suggestion is never something done.
+            (Some(rest), _) if suggests(rest) => None,
             (Some(rest), _) => item(BriefKind::Done, rest),
-            (None, Some(rest)) => item(BriefKind::ForYou, rest.trim()),
+            (None, Some(rest)) => item(BriefKind::ForYou, rest),
             (None, None) => {
-                if headline.is_none() && items.is_empty() && label.is_none() {
+                if headline.is_none() && items.is_empty() && label.is_none() && !suggests(l) {
                     headline = headline_line(l);
                 }
                 None
@@ -326,6 +364,60 @@ fn fit(s: &str, max_words: usize, max_chars: usize) -> String {
     }
 }
 
+/// `s` with its list mark (`-`, `*`, `•`, `1.`, `2)`), emphasis marks
+/// and the variation selector an emoji leaves trimmed from both ends.
+fn bare(s: &str) -> &str {
+    let mut s = s.trim();
+    loop {
+        let before = s.len();
+        s = s
+            .trim_matches(['*', '_', '~', '\u{fe0f}'])
+            .trim_start_matches(['-', '•'])
+            .trim();
+        let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 {
+            if let Some(rest) = s[digits..].strip_prefix(['.', ')']) {
+                s = rest.trim();
+            }
+        }
+        if s.len() == before {
+            return s;
+        }
+    }
+}
+
+/// Whether `l` is a suggestion, a plan or a question, never a fact.
+fn suggests(l: &str) -> bool {
+    let l = l.trim();
+    let lower = l.to_lowercase();
+    l.ends_with('?')
+        || [
+            "i suggest",
+            "i'd suggest",
+            "i would suggest",
+            "suggest",
+            "i recommend",
+            "i'd recommend",
+            "maybe",
+            "perhaps",
+            "you could",
+            "you might",
+            "we could",
+            "we should",
+            "i could",
+            "i can",
+            "next i",
+            "i will",
+            "i'll",
+            "here's",
+            "here is",
+            "options:",
+            "option:",
+        ]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
 /// `s` without `prefix`, matched ignoring ASCII case.
 fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
@@ -335,12 +427,15 @@ fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// A line's action and its why, after its dash.
 fn split_why(rest: &str) -> (&str, Option<&str>) {
-    for sep in [" — ", " – ", " - "] {
-        if let Some((a, w)) = rest.split_once(sep) {
-            return (a.trim(), Some(w.trim()));
-        }
+    let split = rest
+        .split_once(" — ")
+        .or_else(|| rest.split_once(" – "))
+        // A spaced hyphen may be the action's own: its why is after the last.
+        .or_else(|| rest.rsplit_once(" - "));
+    match split {
+        Some((a, w)) => (a.trim(), Some(w.trim())),
+        None => (rest.trim(), None),
     }
-    (rest.trim(), None)
 }
 
 #[cfg(test)]
@@ -524,30 +619,47 @@ mod tests {
         assert!(!all.contains("acme-web"), "{all}");
         assert!(!all.contains("acme-api"), "{all}");
         assert!(!all.contains("orders table"), "{all}");
-        // The headline that named web's release is said again from what is.
-        assert_eq!(u.headline, "1 done, 1 for you.");
+        // The headline that named web's release is said again from what
+        // is, and what was left out (maybe about api) is not counted.
+        assert_eq!(u.headline, "1 for you.");
         assert_eq!(
             lines(&blocks),
             [
-                "*1 done, 1 for you.*",
+                "*1 for you.*",
                 "*acme-docs*",
                 "● For you: Rotate the staging deploy key in your vault — the old one leaked",
-                "+1 more in Desk",
             ]
         );
         no_buttons(&blocks);
+        // Everything about sessions the person is in: nothing to say.
+        let none = shown(&typical(), &|_| true);
+        assert!(!says_anything(&MentionedUpdate {
+            kept: vec![],
+            ..none.clone()
+        }));
+        assert!(hides(&typical(), &none));
+        assert!(!hides(&typical(), &shown(&typical(), &|_| false)));
     }
 
     #[test]
     fn what_slack_shows_is_escaped() {
         let mut u = typical();
-        u.brief[1].items[0].action = "Pinged <!here> & *everyone*".into();
+        u.headline = "Web <b> & `code`".into();
+        u.brief[1].label = "*web* <@U1>".into();
+        u.brief[1].items[0].action = "Pinged <!here> & *everyone* on deploy_key".into();
+        u.brief[1].items[0].why = Some("_urgent_ <x|y>".into());
+        u.needs_you[0].question = "Drop <#C1>?".into();
         let (_, blocks) = slack_blocks(&shown(&u, &|_| false), &|_| None);
         let all = texts(&blocks).join("\n");
+        assert!(all.contains("*Web &lt;b&gt; &amp; code*"), "{all}");
+        assert!(all.contains("*web &lt;@U1&gt;*"), "{all}");
         assert!(
-            all.contains("✓ Pinged &lt;!here&gt; &amp; everyone"),
+            all.contains(
+                "✓ Pinged &lt;!here&gt; &amp; everyone on deploy_key — urgent &lt;x|y&gt;"
+            ),
             "{all}"
         );
+        assert!(all.contains("● Needs you: Drop &lt;#C1&gt;?"), "{all}");
     }
 
     #[test]
@@ -564,11 +676,15 @@ mod tests {
         assert_eq!(state, "Nothing needs you. acme-web finished.");
         // A session the person is in: the line says only what is shown.
         let (_, state) = floor_line(&shown(&typical(), &|s| s == WEB || s == API), None);
-        // What was left out may be any session's: still counted.
-        assert_eq!(state, "1 done, 1 for you.");
+        assert_eq!(state, "1 for you.");
         for id in [WEB, API, DOCS] {
             assert!(!state.contains(id));
         }
+        // Only a closing question mark goes; a link's stays.
+        u.headline = "See https://x.example/?a=1 now?".into();
+        assert_eq!(floor_line(&u, None).1, "See https://x.example/?a=1 now.");
+        u.headline = "Web moved on…".into();
+        assert_eq!(floor_line(&u, None).1, "Web moved on…");
     }
 
     #[test]
