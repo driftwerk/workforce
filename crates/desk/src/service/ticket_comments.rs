@@ -181,6 +181,7 @@ impl Desk {
         if let Some(kept) = s.key_account {
             return Some(kept);
         }
+        let link = s.link;
         let tool = crate::board_sync::identity_tool(system);
         let answer = crate::board_sync::call_quiet(remote, system, tool, json!({}))
             .await
@@ -189,8 +190,8 @@ impl Desk {
         let keep = writer.clone();
         let kept = self
             .change_sync(board, move |s| {
-                // Only for the person it was asked for.
-                if s.me_source == Some(source) && s.key_account.is_none() {
+                // Only on the link, and for the person, it was asked for.
+                if s.link == link && s.me_source == Some(source) && s.key_account.is_none() {
                     s.key_account = Some(keep);
                 }
             })
