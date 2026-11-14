@@ -275,26 +275,34 @@ const FILLER: &[&str] = &[
     "really", "you", "can", "could", "it", "that", "this", "make", "sure", "all", "as", "well",
 ];
 
-/// An order's words as a set: lower case, filler left out, a plural's or
-/// "-ing"'s ending taken off ("keeps going" is "keep go").
-fn order_words(text: &str) -> std::collections::BTreeSet<String> {
-    normalised(text)
-        .split(' ')
-        .filter(|w| !w.is_empty() && !FILLER.contains(w))
+/// An order's words in order: lower case, all of it (never cut short),
+/// filler left out, a plural's or "-ing"'s ending taken off ("keeps
+/// going" is "keep go").
+fn order_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !FILLER.contains(&w.as_str()))
         .map(|w| {
             let stem = |end: &str| w.strip_suffix(end).filter(|s| s.chars().count() >= 3);
-            stem("ing").or_else(|| stem("s")).unwrap_or(w).to_string()
+            stem("ing").or_else(|| stem("s")).unwrap_or(&w).to_string()
         })
         .collect()
 }
 
+/// The fewest words of substance an order has to be merged with another:
+/// "ship it" or "go ahead" means what it is about, never the same twice.
+const SAME_ORDER_WORDS: usize = 3;
+
 /// Whether two of the person's orders say the same thing: the same words
-/// once case, punctuation, word order and filler are set aside. A "not",
-/// a number or any other word of substance that differs keeps them apart,
-/// so an order is never lost into one it doesn't repeat.
+/// in the same order, once case, punctuation and filler are set aside. A
+/// "not", a number, which way round ("staging to prod") or any other word
+/// of substance that differs keeps them apart, as does an order too short
+/// to mean anything alone, so an order is never lost into one it doesn't
+/// repeat.
 pub fn same_order(a: &str, b: &str) -> bool {
     let (a, b) = (order_words(a), order_words(b));
-    !a.is_empty() && a == b
+    a.len() >= SAME_ORDER_WORDS && a == b
 }
 
 /// The key of a session's question on its line.
@@ -887,7 +895,7 @@ mod tests {
     fn near_same_orders_are_one_and_others_stay_apart() {
         assert!(same_order(
             "Make sure the cufflink migration keeps going.",
-            "the Cufflink migration: keep it going, please"
+            "the Cufflink migration, keep it going please"
         ));
         assert!(same_order(
             "Don't start any new work",
@@ -902,6 +910,15 @@ mod tests {
                 "Keep the cufflink migration going and take over",
             ),
             ("", ""),
+            ("Ship it", "ship it"),
+            (
+                "Move the prod data to staging",
+                "Move the staging data to prod",
+            ),
+            (
+                format!("{} then deploy", "x ".repeat(120)).as_str(),
+                format!("{} then stop", "x ".repeat(120)).as_str(),
+            ),
         ] {
             assert!(!same_order(a, b), "{a} / {b}");
         }

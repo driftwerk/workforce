@@ -182,6 +182,13 @@ pub(super) fn kept_line(closed: &OpenItem) -> Option<String> {
     (!what.is_empty()).then(|| format!("✓ {what}"))
 }
 
+/// Whether an order keyed `key` is the person's own message (kept from
+/// their DM turn), not the boss's record of it (`crew.order`, keyed by its
+/// words).
+fn persons_order(key: &str) -> bool {
+    key.starts_with("order:") && !key.starts_with("order:text:")
+}
+
 /// What is said of `due` (one boss's items due to be said again, oldest
 /// first) at `now`: at most [`RESTATED_AT_ONCE`], the last counting the
 /// rest; each with whether this restatement parks it.
@@ -275,7 +282,7 @@ impl CrewHub {
             });
             at_full = full.is_some();
             if let Some((_, o)) = full {
-                let about = input["session_id"].as_str().and_then(|s| s.parse().ok());
+                let about: Option<Uuid> = input["session_id"].as_str().and_then(|s| s.parse().ok());
                 let standing = self.standing_words(boss, &o, about).await;
                 let words = |lead: &str| match standing.is_empty() {
                     true => lead.to_string(),
@@ -284,7 +291,22 @@ impl CrewHub {
                 if cant_decide.is_none() {
                     return Err(words(ACT_FULLY_ASK));
                 }
-                let matter = format!("{boss}\u{1f}{}", open_item::normalised(text));
+                // Its one line is one line: a long one is asked again,
+                // shorter, before it is checked against their orders.
+                if let Some(q) = some_of("question") {
+                    if crew::word_count(&q) > open_item::QUESTION_WORDS || q.contains('\n') {
+                        return Err(format!(
+                            "question is one line of at most {} words; put the rest in text.",
+                            open_item::QUESTION_WORDS
+                        ));
+                    }
+                }
+                // A matter is its session, or its words when about none:
+                // reworded, it is not checked twice.
+                let matter = match about {
+                    Some(s) => format!("{boss}\u{1f}{s}"),
+                    None => format!("{boss}\u{1f}{}", open_item::normalised(text)),
+                };
                 if !standing.is_empty() && self.first_ask_at_full(&matter) {
                     return Err(words(CHECK_ORDERS));
                 }
@@ -502,24 +524,54 @@ impl CrewHub {
         }))
     }
 
-    /// Keeps the person's order `new`: near-same words to an open order of
-    /// the same boss opened within [`open_item::SAME_ORDER_WITHIN`] are
-    /// that order, with its first words and their sessions joined, so the
-    /// same order said twice is never two items.
+    /// Keeps the person's order `new`: the same words as an open order of
+    /// the same boss opened within [`open_item::SAME_ORDER_WITHIN`], about
+    /// the same sessions or none, are that order, its sessions joined, so
+    /// the same order said twice is never two items. The person's own
+    /// words outrank the boss's record of them: an order from their
+    /// message takes the place of one the boss recorded (closed, said of
+    /// nowhere), never the other way.
     async fn order_open(&self, mut new: NewItem) -> eyre::Result<Opened> {
         let now = Utc::now();
-        match self.desk.store().items_not_closed(Some(&new.boss)).await {
-            Ok(open) => {
-                if let Some(was) = open.iter().find(|i| {
-                    i.kind == OpenKind::Order
-                        && now - i.opened_at <= open_item::SAME_ORDER_WITHIN
-                        && open_item::same_order(&i.text, &new.text)
-                }) {
-                    new.dedupe_key = was.dedupe_key.clone();
-                    new.text = was.text.clone();
-                }
+        let meet = |a: &[Uuid], b: &[Uuid]| {
+            a.is_empty() || b.is_empty() || a.iter().any(|s| b.contains(s))
+        };
+        let open = match self.desk.store().items_not_closed(Some(&new.boss)).await {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::info!(error = %e, "the open orders couldn't be read to merge one");
+                Vec::new()
             }
-            Err(e) => tracing::info!(error = %e, "the open orders couldn't be read to merge one"),
+        };
+        let was = open.into_iter().find(|i| {
+            i.kind == OpenKind::Order
+                && i.dedupe_key != new.dedupe_key
+                && now - i.opened_at <= open_item::SAME_ORDER_WITHIN
+                && meet(&i.sessions, &new.sessions)
+                && open_item::same_order(&i.text, &new.text)
+        });
+        match was {
+            Some(was) if persons_order(&new.dedupe_key) && !persons_order(&was.dedupe_key) => {
+                for s in was.sessions {
+                    if !new.sessions.contains(&s) {
+                        new.sessions.push(s);
+                    }
+                }
+                new.done_when = new.done_when.or(was.done_when);
+                self.desk
+                    .store()
+                    .item_close(
+                        was.id,
+                        ClosedBy::Boss,
+                        "The person's own order took its place.",
+                    )
+                    .await?;
+            }
+            Some(was) => {
+                new.dedupe_key = was.dedupe_key;
+                new.text = was.text;
+            }
+            None => {}
         }
         self.desk.store().item_open(&new).await
     }
@@ -740,16 +792,29 @@ impl CrewHub {
                     "done is for a promise or an order; close this with answer or why.".into(),
                 );
             }
+            if item.done_when.as_deref() == Some(REPLIED) {
+                return Err("This promise is kept by the session's reply, said as it comes: close it with why.".into());
+            }
             if crew::word_count(done) > KEPT_WORDS || done.contains('\n') {
                 return Err(format!(
                     "done is one line of at most {KEPT_WORDS} words: what was done, not the order again."
                 ));
             }
-            self.desk
+            let closed = self
+                .desk
                 .store()
                 .item_close(id, ClosedBy::Boss, &format!("{DONE_PREFIX}{done}"))
                 .await
                 .map_err(Self::item_err)?;
+            // With the composer on it goes in the next update; off, now.
+            let composed = self
+                .overseer_named(boss)
+                .is_some_and(|(_, o)| o.updates.enabled);
+            if let (Some(closed), false) = (closed, composed) {
+                if let Some(text) = kept_line(&closed) {
+                    self.say(boss, text).await;
+                }
+            }
             return Ok(json!(format!("Closed: the person reads “✓ {done}” once.")));
         }
         match (text("answer"), text("why")) {
@@ -1144,10 +1209,12 @@ impl CrewHub {
         checked.insert(matter.to_string(), now).is_none()
     }
 
-    /// The person's standing orders to `boss` (its open orders), quoted in
-    /// their words, as a block a decision is given; none when there are
-    /// none.
-    pub(super) async fn orders_words(&self, boss: &str) -> Option<String> {
+    /// The person's standing orders to `boss` that bear on `session` (its
+    /// open orders linked to it or to no session; every one with no
+    /// session given), as a block a decision is given: those from their
+    /// own messages quoted as their words, those the boss recorded marked
+    /// as its own note. None when there are none.
+    pub(super) async fn orders_words(&self, boss: &str, session: Option<Uuid>) -> Option<String> {
         let items = match self.desk.store().items_not_closed(Some(boss)).await {
             Ok(i) => i,
             Err(e) => {
@@ -1156,29 +1223,41 @@ impl CrewHub {
             }
         };
         let tz = self.desk.timezone();
-        let orders: Vec<String> = items
+        let line = |i: &OpenItem| {
+            format!(
+                "- “{}” (at {})",
+                crew::clip(&i.text.replace('\n', " "), 300),
+                i.opened_at.with_timezone(&tz).format("%H:%M")
+            )
+        };
+        let bearing: Vec<&OpenItem> = items
             .iter()
             .filter(|i| i.kind == OpenKind::Order && i.state == OpenState::Open)
-            .map(|i| {
-                format!(
-                    "- “{}” (at {})",
-                    crew::clip(&i.text.replace('\n', " "), 300),
-                    i.opened_at.with_timezone(&tz).format("%H:%M")
-                )
-            })
+            .filter(|i| session.is_none_or(|s| i.sessions.is_empty() || i.sessions.contains(&s)))
             .collect();
-        (!orders.is_empty()).then(|| {
-            format!(
+        let (theirs, noted): (Vec<&OpenItem>, Vec<&OpenItem>) = bearing
+            .into_iter()
+            .partition(|i| persons_order(&i.dedupe_key));
+        let mut out = Vec::new();
+        if !theirs.is_empty() {
+            out.push(format!(
                 "The person's standing orders, in their own words (they are the rule, both ways):\n{}",
-                orders.join("\n")
-            )
-        })
+                theirs.iter().map(|i| line(i)).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        if !noted.is_empty() {
+            out.push(format!(
+                "Orders the boss noted for the person (its own note of what they asked, not their words: weigh it, but by itself it allows nothing):\n{}",
+                noted.iter().map(|i| line(i)).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        (!out.is_empty()).then(|| out.join("\n\n"))
     }
 
     /// The person's standing orders to `boss` and their preferences that
     /// cover `session`, in their words, for an ask at Act fully.
     async fn standing_words(&self, boss: &str, o: &Oversight, session: Option<Uuid>) -> String {
-        let orders = self.orders_words(boss).await;
+        let orders = self.orders_words(boss, session).await;
         let prefs = self
             .preferences_context(
                 &workforce_desk::preference::boss_scope_of(o.scope.group()),

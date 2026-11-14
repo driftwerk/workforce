@@ -589,8 +589,9 @@ impl CrewHub {
         let (level, outward) = match self.ships_in(session, o) {
             true => (
                 Level::Full,
-                "deletes, spends, sends to people, changes scope or touches secrets (merging, pushing to the \
-                 default branch, tagging, promoting and deploying this repository are yours at Act fully)",
+                "deletes, spends, sends to people, changes scope or touches secrets, where the person's own \
+                 orders and preferences don't cover it (merging, pushing to the default branch, tagging, \
+                 promoting and deploying this repository are yours at Act fully)",
             ),
             false => (
                 match o.level {

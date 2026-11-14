@@ -685,7 +685,7 @@ impl CrewHub {
             .map(|p| format!("\n\n{}\n{}", p.listed, p.how))
             .unwrap_or_default();
         let orders = self
-            .orders_words(boss)
+            .orders_words(boss, Some(view.id))
             .await
             .map(|w| format!("\n\n{w}"))
             .unwrap_or_default();

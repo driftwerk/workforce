@@ -311,7 +311,7 @@ async fn orders_that_simply_ended_say_nothing_and_the_same_order_twice_is_one() 
         };
         let r = call(&crew, super::super::items::ORDER, order("Make sure the cufflink migration keeps going", vec![s.id])).await;
         assert!(r.success, "{:?}", r.error);
-        let r = call(&crew, super::super::items::ORDER, order("the cufflink migration: keep it going, please", vec![other.id])).await;
+        let r = call(&crew, super::super::items::ORDER, order("the cufflink migration: keep it going, please", vec![s.id, other.id])).await;
         assert!(r.success, "{:?}", r.error);
         assert!(r.output.to_string().contains("already kept"), "{}", r.output);
         let orders = || async {
@@ -327,6 +327,22 @@ async fn orders_that_simply_ended_say_nothing_and_the_same_order_twice_is_one() 
         assert_eq!(one.len(), 1, "the same order twice is one: {one:?}");
         assert_eq!(one[0].text, "Make sure the cufflink migration keeps going");
         assert!(one[0].sessions.contains(&s.id) && one[0].sessions.contains(&other.id));
+        // About other sessions, the same words are another order.
+        let third = new_session(&d, dir.path(), "billing").await;
+        let r = call(&crew, super::super::items::ORDER, order("the cufflink migration, keep it going please", vec![third.id])).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(!r.output.to_string().contains("already kept"), "{}", r.output);
+        let mut two = orders().await;
+        assert_eq!(two.len(), 2);
+        two.retain(|i| i.sessions == vec![third.id]);
+        let r = call(&crew, super::super::items::CLOSE, json!({ "item_id": two[0].id.to_string(), "why": "Set aside for the test" })).await;
+        assert!(r.success, "{:?}", r.error);
+        // Recorded by the boss, it is its note, never the person's words.
+        let words = crew.orders_words("desk", None).await.unwrap();
+        assert!(
+            words.contains("Orders the boss noted") && !words.contains("in their own words"),
+            "{words}"
+        );
         // Orders that differ stay apart.
         for text in ["Don't start on any new work", "Leave the export alone"] {
             let r = call(&crew, super::super::items::ORDER, order(text, vec![])).await;
@@ -392,6 +408,45 @@ async fn orders_that_simply_ended_say_nothing_and_the_same_order_twice_is_one() 
                 "{waffle} said: {dm:?}\n{update}"
             );
         }
+    })
+    .await;
+}
+
+/// With the composer off, an order closed with what was done is said at
+/// once, as its one "✓" line.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_composer_what_was_done_is_said_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!("{ACT}updates = {{ enabled = false }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &toml, &[]).await;
+        let r = call(
+            &crew,
+            super::super::items::ORDER,
+            json!({ "text": "Leave the export alone tonight" }),
+        )
+        .await;
+        assert!(r.success, "{:?}", r.error);
+        let id = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Order)
+            .unwrap()
+            .id;
+        let r = call(
+            &crew,
+            super::super::items::CLOSE,
+            json!({ "item_id": id.to_string(), "done": "Export left untouched all night" }),
+        )
+        .await;
+        assert!(r.success, "{:?}", r.error);
+        eventually("said at once", async || {
+            said(&overseer, "✓ Export left untouched all night")
+        })
+        .await;
     })
     .await;
 }

@@ -227,11 +227,11 @@ fn who(p: &Party) -> String {
     }
 }
 
-/// What every DM turn of a boss is told before it speaks of a session.
 /// What a boss at Act fully decides by: the person's own instructions,
 /// both ways, with no stance of its own on production.
 pub(crate) const STANDING_RULE: &str = "The person's instructions are the rule, both ways: their open orders (in your open items, in their words), their preferences, and each session's own instructions. Where they forbid a kind of step (\"don't allow anything that would impact production\"), refuse it and say what to do instead. Where they want work shipped (\"getting stuff out to production is vital as long as nothing breaks\"), do it and have the session check nothing broke. Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". Touching production or staging is no reason by itself to ask. Ask the person only when their instructions don't cover the step and you truly can't judge (a destructive or irreversible step outside their orders is such a step), or when only they can physically do it (their credentials, a payment). That is rare: you handle about 99 in 100 yourself. When you must ask, answer buttons are fine, alone: no recommendation essay beside them.";
 
+/// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
 impl CrewHub {

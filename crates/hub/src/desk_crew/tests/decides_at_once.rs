@@ -439,8 +439,9 @@ async fn the_persons_orders_decide_a_production_step_both_ways() {
             let call = calls_about(&llm, "make converge ENV=production").await;
             assert_eq!(call.len(), 1, "one decision call");
             assert!(
-                !call[0].contains("a production or irreversible step you judge they must make"),
-                "no stance of Desk's own on production"
+                call[0].contains("The person's standing orders, in their own words"),
+                "quoted as the person's own words: {}",
+                call[0]
             );
         })
         .await;
