@@ -594,10 +594,10 @@ fn marked(items: &[Item], out: &mut String, start: bool, cell: bool, one_line: b
             Piece::Text(_) => out.push_str(&escape(body, line_start, cell)),
             Piece::Code(c) => out.push_str(&code_span(c, cell)),
             Piece::Made(m) => {
-                // A directive starts a word: right after a letter or digit
-                // Desk reads it as words (`Owner:mention[Ann]`), so a space
-                // goes between.
-                // Only a directive: a picture's alt as words can start `:)`.
+                // A directive needs a word start: right after a letter or
+                // digit Desk reads it as words (`Owner:mention[Ann]`), so a
+                // space goes between. Only a directive: a picture's alt can
+                // start `:)`.
                 let directive = [":mention[", ":status[", ":date["]
                     .iter()
                     .any(|d| m.starts_with(d));
