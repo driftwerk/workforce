@@ -189,11 +189,13 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
     .await;
 }
 
-/// Unbound, a boss's plan is its own to approve: it starts at once, four
-/// of five tickets up to its limit, the fifth when one finishes, and its
-/// changes to the plan apply as they are made.
+/// Unbound, a boss's plan is still a draft for the person until their own
+/// words ask for the work to start: asked only to plan, nothing starts and
+/// the person is asked; told to start it, the boss approves it with their
+/// words and it starts, four of five tickets up to its limit, the fifth
+/// when one finishes, and its changes to the plan apply as they are made.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
+async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) =
@@ -216,7 +218,31 @@ async fn an_unbound_boss_approves_its_own_plan_and_keeps_its_sessions_full() {
             .unwrap()
             .parse()
             .unwrap();
-        assert_ne!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        // Asked only for a plan: a draft, whatever its level.
+        assert_eq!(r.output["proposed"]["state"], "proposed", "{r:?}");
+        assert!(r.output["note"].as_str().unwrap().contains("ready for review"), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(started(&d).is_empty(), "nothing starts unasked");
+        assert_eq!(d.plan_needs().len(), 1, "the person is asked to approve it");
+        // start_now with no words of the person's is refused.
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "start_now": {}, "why": "Go." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(started(&d).is_empty());
+        // The person says to start it: the boss starts it, saying their words.
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "Looks good, start it now" },
+                "why": "The person asked to start it.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["plan"]["state"], "proposed", "{r:?}");
         assert!(d.plan_needs().is_empty(), "nothing waits on the person");
         let four = eventually("four sessions", async || {
             let s = started(&d);

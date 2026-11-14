@@ -81,16 +81,21 @@ const GATHER: Duration = Duration::from_secs(3);
 
 pub const DESCRIPTION: &str = "Propose a plan for a goal the person gave you: tickets on your \
 group's board, each a piece of work a real session (Claude Code, Codex) does in a project folder, \
-with what it needs done first (needs: the places, from 0, of earlier tickets in the list). The \
-person approves it in Desk before anything runs; then Desk starts the ready tickets' sessions for \
-you, up to your limit at once, and you run them. Use it for work of more than one session. \
+with what it needs done first (needs: the places, from 0, of earlier tickets in the list). A plan \
+is a draft: its tickets wait in Backlog for the person to review on the board, change where and \
+how each runs, and approve; nothing runs before they do, at every level, unbound too. Then Desk \
+starts the ready tickets' sessions for you, up to your limit at once, and you run them. Asked to \
+make a plan, make it and say it is ready for review on the board; don't start it. Only when the \
+person's own words ask you to start or run the work now (not just to plan it) may an unbound boss \
+pass start_now with those words quoted, and Desk starts it. Use it for work of more than one session. \
 engine defaults to your default engine; board defaults to your group's.";
 
 pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id): give every ticket \
 it is to have, in order, each by its id or key when it is one it has (leave both out to add one), \
 with needs by place in the list. Reordering, needs, titles and descriptions, and where a ticket \
 not started runs apply at once; adding or dropping a ticket, or changing the goal, waits for the \
-person to approve, while the plan runs on as approved. Say why.";
+person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
+one: unbound, start_now with the person's own words asking to start it approves it. Say why.";
 
 /// The overseer's own conversation for plan `id`.
 pub fn plan_channel(id: Uuid) -> String {
@@ -133,6 +138,32 @@ fn budget_of(input: &Value) -> Result<Option<Option<plan::PlanBudget>>, String> 
     }
 }
 
+fn start_now_schema() -> Value {
+    json!({ "type": "object", "properties": {
+        "person_said": { "type": "string",
+            "description": "The person's own words asking you to start or run the work now, quoted as they wrote them" }
+    }, "required": ["person_said"],
+    "description": "Only when the person explicitly asked you to start or run the work, not only to make a plan, and only when you are unbound: Desk approves it and starts its ready tickets. Leave it out otherwise: the plan waits as a draft for the person to review and approve." })
+}
+
+/// The person's words a tool's input quotes asking to start the work now,
+/// when it does.
+fn start_now_of(input: &Value) -> Result<Option<String>, String> {
+    match input.get("start_now") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .get("person_said")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(|w| Some(crew::one_line(w, 300)))
+            .ok_or_else(|| {
+                "start_now quotes the person's own words asking to start the work (person_said)."
+                    .into()
+            }),
+    }
+}
+
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
         "goal": { "type": "string", "description": "What the plan achieves, in the person's terms" },
@@ -140,6 +171,7 @@ pub fn schema() -> Value {
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12,
             "description": "At most this many of its sessions at once, when fewer than your limit" },
         "budget": budget_schema(),
+        "start_now": start_now_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS }
     }, "required": ["goal", "tickets"] })
 }
@@ -152,6 +184,7 @@ pub fn update_schema() -> Value {
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12 },
         "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS },
+        "start_now": start_now_schema(),
         "why": { "type": "string", "description": "Why, in a sentence the person reads" }
     }, "required": ["plan_id", "why"] })
 }
@@ -268,6 +301,7 @@ impl CrewHub {
             .filter(|g| !g.is_empty())
             .ok_or("Say the goal.")?;
         let tickets = tickets_of(input, &HashMap::new())?;
+        let start_now = start_now_of(input)?;
         if tickets.iter().any(|t| t.id.is_some()) {
             return Err("A new plan's tickets have no ids yet.".into());
         }
@@ -319,32 +353,45 @@ impl CrewHub {
             .await
             .map_err(plain)?;
         let text = format!(
-            "{} proposes a plan: {}\n\n{}",
+            "{} drafted a plan for you to review: {}\n\n{}",
             boss.name,
             p.summary.plan.goal,
             self.plan_lines(&p)
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
-        // Unbound, it approves its own plan, and Desk starts it.
-        if self.unbound_given(b.service.agent_id.as_str(), &b.oversight) {
-            let by = self.by_at_level(
-                self.by_boss(&b.service, "It approved its own plan."),
-                &b.oversight,
-            );
-            let approved = self
-                .desk
-                .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
-                .await
-                .map_err(plain)?;
+        let unbound = self.unbound_given(b.service.agent_id.as_str(), &b.oversight);
+        // Started only when the person said to start it, and only unbound:
+        // otherwise a draft for them to review.
+        if let (Some(said), true) = (&start_now, unbound) {
+            let approved = self.approve_said(b, &p, said).await?;
             return Ok(json!({
                 "proposed": plan_out(&approved),
-                "note": "You are unbound, so it is approved and Desk starts its ready tickets; the person sees it as a plan card in your DM and on the Floor.",
+                "note": "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
             }));
         }
         Ok(json!({
             "proposed": plan_out(&p),
-            "note": "The person sees it as a plan card in your DM and on the Floor, and approves or edits it there. Nothing of it runs until they approve it; say so briefly.",
+            "note": match start_now.is_some() {
+                true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
+                false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
+            },
         }))
+    }
+
+    /// Approves the newest revision of `p`, the boss `b`'s own, on the
+    /// person's words `said` asking for the work to start.
+    async fn approve_said(
+        &self,
+        b: &Bound,
+        p: &PlanDetail,
+        said: &str,
+    ) -> Result<PlanDetail, String> {
+        let reason = format!("The person said: “{said}”");
+        let by = self.by_at_level(self.by_boss(&b.service, &reason), &b.oversight);
+        self.desk
+            .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
+            .await
+            .map_err(plain)
     }
 
     async fn update(&self, b: &Bound, input: &Value) -> Result<Value, String> {
@@ -413,6 +460,27 @@ impl CrewHub {
                 false => format!("{name} proposes a change to the plan: {}", changed.summary),
             };
             self.post_plan(&b.service, p, &text).await;
+        }
+        // A draft started on the person's word, by an unbound boss.
+        if let Some(said) = start_now_of(input)? {
+            let draft = changed.plan.summary.plan.approved_revision.is_none();
+            if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
+                let approved = self.approve_said(b, &changed.plan, &said).await?;
+                return Ok(json!({
+                    "plan": plan_out(&approved),
+                    "change": changed.change.map(|c| c.as_str()),
+                    "applied": true,
+                    "note": "The person asked you to start it, so it is approved and Desk starts its ready tickets.",
+                }));
+            }
+            if draft {
+                return Ok(json!({
+                    "plan": plan_out(&changed.plan),
+                    "change": changed.change.map(|c| c.as_str()),
+                    "applied": changed.applied,
+                    "note": "Only the person approves a plan at your level: it waits for them on its card.",
+                }));
+            }
         }
         Ok(json!({
             "plan": plan_out(&changed.plan),
