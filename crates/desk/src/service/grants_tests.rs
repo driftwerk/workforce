@@ -807,12 +807,21 @@ async fn a_grant_at_act_fully_says_what_its_sessions_spent_today() {
         put(&d, "g-acme", full).await;
         put(&d, "g-docs", body(1, "Docs", &[Uuid::new_v4()])).await;
         let at = Utc::now();
-        for (key, usd, billing) in [("k1", 1.25, "key"), ("k2", 5.0, "plan")] {
+        // Its own key-paid call counts; a plan's, another group's and one
+        // in no group don't.
+        let other = Uuid::new_v4();
+        for (key, usd, billing, group) in [
+            ("k1", 1.25, "key", Some("g-acme")),
+            ("k2", 5.0, "plan", Some("g-acme")),
+            ("k3", 7.0, "key", Some("g-docs")),
+            ("k4", 9.0, "key", None),
+        ] {
+            let session = if group == Some("g-acme") { s } else { other };
             sql(
                 &d,
                 "INSERT INTO ledger (engine, key, session, at, usd, priced, billing, group_id) \
-                 VALUES ('claude', $1, $2, $3, $4, 'reported', $5, 'g-acme')",
-                &[&key, &s, &at, &usd, &billing],
+                 VALUES ('claude', $1, $2, $3, $4, 'reported', $5, $6)",
+                &[&key, &session, &at, &usd, &billing, &group],
             )
             .await;
         }
