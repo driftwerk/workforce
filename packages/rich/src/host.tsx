@@ -72,8 +72,9 @@ export interface RichHost {
    *  text. */
   image?(src: string, alt: string, at: { inLink: boolean }): ReactNode | null | undefined;
   /** Image source schemes of the host's own, kept for `image` to draw. Never
-   *  a link's, and never `javascript`, `vbscript`, `data` or `file`. Matched
-   *  without regard to case, a trailing colon ignored. */
+   *  a link's, and never `javascript`, `vbscript`, `data` or `file`. This list
+   *  is read without regard to case, a trailing colon ignored; a source in
+   *  the markdown must name its scheme in lowercase, as with the web's. */
   imageSchemes?: readonly string[];
   /** Link schemes kept besides the web's (http, https, mailto), opened through
    *  `openUrl`. Every other scheme is stripped from agent markdown. */

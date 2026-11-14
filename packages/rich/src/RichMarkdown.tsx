@@ -136,7 +136,7 @@ function DirectiveElement({ node, children }: { node?: HastNode; children?: Reac
   const content = kind === "container" ? all.filter((c) => !isLabel(c)) : null;
   const own = latest.current.directive?.({
     kind,
-    name: prop(node, "dataName"),
+    name: prop(node, "dataName").toLowerCase(),
     attributes: attrsOf(prop(node, "dataAttrs")),
     label,
     labelText: labelNode && (kind !== "container" || labelNode !== node) ? textOf(labelNode) : "",

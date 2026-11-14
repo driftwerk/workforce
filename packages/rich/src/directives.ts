@@ -25,8 +25,6 @@ const KINDS: Record<string, DirectiveKind> = {
   containerDirective: "container",
 };
 
-const NAME_TOKENS = new Set(["directiveTextName", "directiveLeafName", "directiveContainerName"]);
-
 /** Directive names as a host's list declares them: trimmed, lowercase. */
 export const directiveNameList = (names: string): string[] =>
   names
@@ -48,32 +46,76 @@ interface Construct {
   [k: string]: unknown;
 }
 
-/** `construct`, failing (so its text is read as anything else is) unless the
- *  name it read is one of `names`. */
-const onlyNamed = (construct: Construct, names: ReadonlySet<string>): Construct => ({
-  ...construct,
+/** Whether a code ends a directive's name: nothing, a line end, a space, or
+ *  punctuation other than `-` and `_` (as micromark-extension-directive reads
+ *  a name). */
+const endsName = (code: Code): boolean => {
+  if (code === null || code < 0) return true;
+  if (code === 45 || code === 95) return false;
+  const c = String.fromCodePoint(code);
+  return /\s/u.test(c) || /[\p{P}\p{S}]/u.test(c);
+};
+
+const isWordCode = (code: Code): boolean => code !== null && code >= 0 && /[\p{L}\p{N}]/u.test(String.fromCodePoint(code));
+
+/** A look ahead at a directive's colons and name, failing unless the name is
+ *  one of `names`: so a directive of another name fails on its first line,
+ *  before it reads a thing (a container would otherwise read to its end, and
+ *  only fail there). */
+const nameProbe = (names: ReadonlySet<string>): Construct => ({
+  partial: true,
   tokenize(effects, ok, nok) {
     let name = "";
-    let inName = false;
-    const watched: Effects = {
-      ...effects,
-      enter(type, fields) {
-        if (NAME_TOKENS.has(type)) inName = true;
-        return effects.enter(type, fields);
-      },
-      exit(type) {
-        if (NAME_TOKENS.has(type)) inName = false;
-        return effects.exit(type);
-      },
-      consume(code) {
-        if (inName && code !== null && code >= 0) name += String.fromCharCode(code);
-        effects.consume(code);
-      },
+    const colons: State = (code) => {
+      if (code !== 58) return nok(code);
+      effects.consume(code);
+      return afterColons;
     };
-    const known: State = (code) => (names.has(name.toLowerCase()) ? ok(code) : nok(code));
-    return construct.tokenize.call(this, watched, known, nok);
+    const afterColons: State = (code) => {
+      if (code === 58) {
+        effects.consume(code);
+        return afterColons;
+      }
+      return read(code);
+    };
+    const read: State = (code) => {
+      if (endsName(code)) {
+        effects.exit("wfDirectiveProbe");
+        return names.has(name.toLowerCase()) ? ok(code) : nok(code);
+      }
+      name += String.fromCodePoint(code!);
+      effects.consume(code);
+      return read;
+    };
+    return (code) => {
+      effects.enter("wfDirectiveProbe");
+      return colons(code);
+    };
   },
 });
+
+/** `construct`, failing (so its text is read as anything else is) unless the
+ *  name it reads is one of `names`, which is looked at before anything else.
+ *  A text directive also fails right after a letter or digit (`mailto:x@y`,
+ *  `see:mention[x]`): a directive starts a word. */
+const onlyNamed = (construct: Construct, names: ReadonlySet<string>): Construct => {
+  const probe = nameProbe(names);
+  const previous = construct.previous as ((this: unknown, code: Code) => boolean) | undefined;
+  return {
+    ...construct,
+    ...(previous
+      ? {
+          previous(this: unknown, code: Code) {
+            return previous.call(this, code) && !isWordCode(code);
+          },
+        }
+      : {}),
+    tokenize(effects, ok, nok) {
+      const real = construct.tokenize.call(this, effects, ok, nok);
+      return (code) => (effects as unknown as { check(c: Construct, ok: State, nok: State): State }).check(probe, real, nok)(code);
+    },
+  };
+};
 
 /** The remark plugin that reads directives named `names` and nothing else. */
 export function remarkNamedDirectives(this: { data(): object }, names: readonly string[]) {
@@ -112,7 +154,7 @@ export function remarkWfDirectives() {
       if (kind) {
         const attrs: Record<string, string> = {};
         for (const [k, v] of Object.entries(node.attributes ?? {})) attrs[k] = v ?? "";
-        const props: Record<string, string> = { dataKind: kind, dataName: (node.name ?? "").toLowerCase(), dataAttrs: JSON.stringify(attrs) };
+        const props: Record<string, string> = { dataKind: kind, dataName: node.name ?? "", dataAttrs: JSON.stringify(attrs) };
         if (kind === "container") {
           const start = node.position?.start.offset;
           const end = node.position?.end.offset;
@@ -139,8 +181,8 @@ export const attributesText = (attrs: Readonly<Record<string, string>>): string 
 /** A directive as the host is asked to draw it. */
 export interface Directive {
   kind: DirectiveKind;
-  /** Its name, lowercase as written: `mention` in `:mention[Ann]`. Always one
-   *  of the host's `directiveNames`. */
+  /** Its name, lowercase: `mention` in `:Mention[Ann]`. Always one of the
+   *  host's `directiveNames`. */
   name: string;
   /** Its `{…}` attributes, as written; one with no value is `""`. They are the
    *  author's words: draw only values the host knows. */

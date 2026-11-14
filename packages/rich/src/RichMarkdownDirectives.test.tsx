@@ -71,12 +71,34 @@ describe("directives", () => {
       "word:x[y](https://e.com)",
       "Due 10:30, Note:this, see https://example.com/a:b",
       ":::aside-not{x=1}\nInside **it**\n:::",
+      ":::note\n> quoted\n:::",
+      ":::note\n- a\n- b\n:::",
+      "> :::note\n> lazy",
     ]) {
       const before = plain(text);
       const { container, unmount } = draw(DRAWS, text);
       expect(container.innerHTML, text).toBe(before);
       unmount();
     }
+  });
+
+  it("start a word: a declared name right after a letter or digit is words", () => {
+    for (const text of ["mailto:mention@b.c", "see:mention[x] and a1:status[y]"]) {
+      const before = plain(text);
+      const { container, unmount } = draw(DRAWS, text);
+      expect(container.innerHTML, text).toBe(before);
+      unmount();
+    }
+    draw(DRAWS, "(:mention[Ann]) and :mention[Bo]");
+    expect(screen.getAllByTestId("mention").map((m) => m.textContent)).toEqual(["@Ann", "@Bo"]);
+  });
+
+  it("fail on their first line when undeclared: many unclosed fences render in time", () => {
+    const text = ":::x\n\n".repeat(2000);
+    const t0 = performance.now();
+    const { container } = draw(DRAWS, text);
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(container.querySelectorAll("p")).toHaveLength(2000);
   });
 
   it("read as written, label and content drawn, where the host draws none of a name it declared", () => {
