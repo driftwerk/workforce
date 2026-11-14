@@ -44,6 +44,9 @@ impl DevicePairingService {
             return Err(eyre::eyre!("Too many pending pairing requests"));
         }
 
+        if let Err(e) = self.store.expire_stale_requests(Utc::now()) {
+            tracing::warn!(error = %e, "clearing stale pairing requests failed");
+        }
         let code = generate_pairing_code();
         let now = Utc::now();
         let req = DevicePairingRequest {
@@ -211,6 +214,11 @@ impl DevicePairingService {
             let total_pending = store.count_pending()?;
             if total_pending >= config.max_pending {
                 return Err(eyre::eyre!("Too many pending pairing requests"));
+            }
+            // Tokens nobody collected in time are cleared as requests come in
+            // too, not only as they are approved.
+            if let Err(e) = store.expire_stale_requests(Utc::now()) {
+                tracing::warn!(error = %e, "clearing stale pairing requests failed");
             }
             let code = generate_pairing_code();
             let now = Utc::now();

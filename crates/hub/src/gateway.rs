@@ -8782,8 +8782,10 @@ async fn pair_device_status(
         }
         workforce_pairing::types::PairingStatus::Approved => {
             if req.pending_token.is_some() && req.collectable_token(chrono::Utc::now()).is_none() {
-                // Not collected in time: the copy goes, and the device pairs again.
+                // Not collected in time: the copy goes, and the code is as
+                // good as expired (the device pairs again), not "used".
                 let _ = pairing.clear_pending_token_async(req.id.clone()).await;
+                return Err(StatusCode::NOT_FOUND);
             }
             if let Some(token) = req
                 .collectable_token(chrono::Utc::now())
