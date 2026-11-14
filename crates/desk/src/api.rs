@@ -354,10 +354,15 @@ async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 #[derive(Deserialize)]
 struct EngineBody {
     engine: crate::engine::Engine,
+    /// Devin's flow for a computer with no browser: a token pasted back
+    /// from the page. Codex has only the one.
+    #[serde(default)]
+    manual: bool,
 }
 
-/// Signs an engine's own CLI in where it has no browser (Codex's device
-/// sign-in): the page and the code to type there, once it shows them.
+/// Signs an engine's own CLI in on a terminal of the hub's own (Codex's
+/// device sign-in, Devin's login): the page to open, and the code to type
+/// there or whether to paste back the token it gives, once it shows them.
 async fn start_engine_sign_in(
     State(s): S,
     h: HeaderMap,
@@ -365,7 +370,7 @@ async fn start_engine_sign_in(
     Json(b): Json<EngineBody>,
 ) -> Response {
     guarded!(s, h, q);
-    match s.desk.start_engine_sign_in(b.engine) {
+    match s.desk.start_engine_sign_in(b.engine, b.manual) {
         Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
         Err(e) => e.into_response(),
     }
@@ -374,6 +379,28 @@ async fn start_engine_sign_in(
 async fn engine_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
     s.desk.engine_sign_in(id).map(Json).into_response()
+}
+
+/// The token a sign-in's page gave, never kept or logged.
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+/// The token Devin's page gave, typed into the sign-in waiting for it;
+/// 409 when that sign-in isn't waiting for one.
+async fn engine_sign_in_token(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<TokenBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .engine_sign_in_token(id, &b.token)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
 }
 
 async fn cancel_engine_sign_in(
@@ -1876,6 +1903,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route(
             "/api/desk/engines/sign-ins/{id}",
             get(engine_sign_in).delete(cancel_engine_sign_in),
+        )
+        .route(
+            "/api/desk/engines/sign-ins/{id}/token",
+            post(engine_sign_in_token),
         )
         .route("/api/desk/accounts", get(accounts).post(add_account))
         .route(

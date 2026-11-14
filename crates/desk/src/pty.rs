@@ -108,6 +108,11 @@ impl Core {
 pub(crate) struct Screen {
     core: Mutex<Core>,
     tx: broadcast::Sender<Frame>,
+    /// Output is dropped unread, never parsed or sent on: a terminal that
+    /// may be echoing a secret typed into it ([`Pty::blind`]).
+    blind: std::sync::atomic::AtomicBool,
+    /// The hub's own child has been waited for: its pid may be another's.
+    reaped: Mutex<Option<std::time::Instant>>,
 }
 
 impl Screen {
@@ -127,12 +132,23 @@ impl Screen {
                 exited: false,
             }),
             tx: broadcast::channel(1024).0,
+            blind: Default::default(),
+            reaped: Default::default(),
         })
     }
 
     /// Takes in output. Returns the replies the hub owes the program's
     /// queries when no viewer is active to answer them.
     pub(crate) fn push(&self, chunk: &[u8]) -> Option<Vec<u8>> {
+        if self.blind.load(std::sync::atomic::Ordering::SeqCst) {
+            // Unread, but a program waiting on the terminal's answer to a
+            // cursor or device query isn't left hanging: fixed answers,
+            // nothing of the output taken in.
+            // A viewer never sees blind output, so it can't answer: the
+            // hub always does.
+            let replies = blind_replies(chunk);
+            return (!replies.is_empty()).then_some(replies);
+        }
         let mut core = self.core.lock();
         let replies = core.term.feed(chunk);
         let _ = self.tx.send(Frame::Bytes(Bytes::copy_from_slice(chunk)));
@@ -187,6 +203,29 @@ impl Screen {
     fn text(&self) -> String {
         self.core.lock().term.text()
     }
+}
+
+/// What a blind screen answers in `chunk`: the cursor position (`ESC[6n`,
+/// always the top left) and the device attributes (`ESC[c`, `ESC[0c`, as
+/// [`Term`] answers them), in the order asked. Nothing else is answered.
+fn blind_replies(chunk: &[u8]) -> Vec<u8> {
+    const ASKED: [(&[u8], &[u8]); 3] = [
+        (b"\x1b[6n", b"\x1b[1;1R"),
+        (b"\x1b[c", b"\x1b[?1;2c"),
+        (b"\x1b[0c", b"\x1b[?1;2c"),
+    ];
+    let mut replies = Vec::new();
+    let mut at = 0;
+    while at < chunk.len() {
+        match ASKED.iter().find(|(q, _)| chunk[at..].starts_with(q)) {
+            Some((q, reply)) => {
+                replies.extend_from_slice(reply);
+                at += q.len();
+            }
+            None => at += 1,
+        }
+    }
+    replies
 }
 
 /// One terminal.
@@ -362,6 +401,26 @@ impl Pty {
 
     pub fn kill(&self) {
         self.io.kill();
+    }
+
+    /// From now on its output is dropped unread: nothing it draws reaches
+    /// the screen, its history or a viewer. For a terminal a secret is
+    /// about to be typed into, which it may echo.
+    pub fn blind(&self) {
+        self.screen
+            .blind
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the hub's own child was waited for, so its pid is no longer
+    /// its own to signal.
+    pub fn reaped(&self) -> bool {
+        self.reaped_at().is_some()
+    }
+
+    /// When the hub's own child was waited for, if it was.
+    pub fn reaped_at(&self) -> Option<std::time::Instant> {
+        *self.screen.reaped.lock()
     }
 
     /// The screen as plain text: the history and screen, or the alternate
@@ -564,6 +623,7 @@ impl Local {
                     .wait()
                     .ok()
                     .map(|s: portable_pty::ExitStatus| s.exit_code());
+                *ended.reaped.lock() = Some(std::time::Instant::now());
                 // The child can be reaped before the reader has taken its
                 // last output; announcing the end first would cut that
                 // output off for anyone who stops listening at the end. A
@@ -906,6 +966,26 @@ pub(crate) mod tests {
         assert!(snap.starts_with('\x18'));
         assert!(snap.contains("row 2999") && snap.contains("done\x1b[31mred"));
         assert!(!snap.contains("row 0\r"), "a resync doesn't resend history");
+    }
+
+    #[test]
+    fn a_blind_screen_takes_nothing_in_but_still_answers_cursor_and_device_queries() {
+        let screen = Screen::new(80, 24, 100, None);
+        screen
+            .blind
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let replies =
+            screen.push(b"Token: secret-123\x1b[6n more \x1b[c\x1b[0c\x1b[5n\x1b]10;?\x07");
+        assert_eq!(
+            replies.as_deref(),
+            Some(&b"\x1b[1;1R\x1b[?1;2c\x1b[?1;2c"[..])
+        );
+        assert!(!screen.text().contains("secret"), "{}", screen.text());
+        assert_eq!(screen.push(b"secret-456"), None);
+        assert!(screen.text().trim().is_empty());
+        // A viewer never sees blind output, so the hub answers even then.
+        screen.core.lock().active = Some(1);
+        assert_eq!(screen.push(b"\x1b[6n").as_deref(), Some(&b"\x1b[1;1R"[..]));
     }
 
     #[test]

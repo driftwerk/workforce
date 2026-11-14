@@ -111,7 +111,7 @@ pub fn scrub_env(env: &mut BTreeMap<String, String>) {
 
 /// The `DEVIN_` settings a session keeps: the person's choices, no
 /// credential or address among them.
-const DEVIN_KEPT: [&str; 2] = ["DEVIN_MODEL", "DEVIN_PERMISSION_MODE"];
+pub(crate) const DEVIN_KEPT: [&str; 2] = ["DEVIN_MODEL", "DEVIN_PERMISSION_MODE"];
 
 /// What Desk sets for Claude Code sessions alone, and its own tokens.
 const NOT_FOR_DEVIN: [&str; 6] = [
