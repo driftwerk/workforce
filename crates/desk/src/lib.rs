@@ -120,6 +120,7 @@ pub use conversations::{
 pub use crew_store::CheckIn;
 /// Where the person's own Devin config is, from the environment given.
 pub use devin_config::person_path as devin_person_config;
+pub use knows_api::knows_router;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::KnowsGather;
