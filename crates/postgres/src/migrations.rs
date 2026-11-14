@@ -258,6 +258,12 @@ mod pg_tests {
             // refuses this database, this runs.
             assert!(runner_of(&[1, 2]).run_async(client).await.is_err());
             run_embedded(runner_of(&[1, 2]), client).await.unwrap();
+            // A version whose SQL differs from what was applied still stops it.
+            let edited = refinery::Runner::new(&[
+                refinery::Migration::unapplied("V1__t1", "CREATE TABLE rb_t1 (id int)").unwrap(),
+                refinery::Migration::unapplied("V2__t2", "CREATE TABLE rb_t2 (id bigint)").unwrap(),
+            ]);
+            assert!(run_embedded(edited, client).await.is_err());
             // Nothing was undone, and nothing new ran.
             let tables: i64 = client
                 .query_one(
