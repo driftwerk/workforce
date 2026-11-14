@@ -35,6 +35,9 @@ pub struct ClaudeSpawn<'a> {
     pub theme: Option<&'a str>,
     /// The permission mode to start in ([`crate::mode`]); none, its own.
     pub mode: Option<crate::mode::Mode>,
+    /// The model it runs (`--model`); none, Claude Code's own default. Only
+    /// a name [`crate::plan::model_ok`] passes reaches its command line.
+    pub model: Option<&'a str>,
     /// A boss served from a grant runs it: its pre-tool hook fails closed
     /// ([`hook_settings_for`]).
     pub fail_closed: bool,
@@ -193,6 +196,12 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         settings.to_string(),
     ]);
     args.extend(s.mode.into_iter().flat_map(crate::mode::Mode::claude_args));
+    // Its own argument, never an option: a name that could read as one
+    // (`-…`, a space, a quote) is never passed. Desk refuses such a name
+    // before it gets here ([`crate::engine::model_ok`]).
+    if let Some(m) = s.model.filter(|m| crate::plan::model_ok(m)) {
+        args.extend(["--model".to_string(), m.to_string()]);
+    }
     // A session a boss served from a grant runs reads the person's own
     // settings and Desk's alone: none its repository brings (a pull or a
     // merge can add `.claude/settings.json`), which could switch hooks off
@@ -761,6 +770,7 @@ pub(crate) mod tests {
             env: &env,
             theme: None,
             mode: None,
+            model: None,
             fail_closed: false,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
@@ -773,6 +783,56 @@ pub(crate) mod tests {
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
+    }
+
+    /// The session's model is `--model`'s own argument, before its prompt;
+    /// a name that could read as an option, or as more than one argument,
+    /// never reaches the command line.
+    #[test]
+    fn a_sessions_model_is_its_own_argument_and_never_an_option() {
+        let env = BTreeMap::new();
+        let args = |model| {
+            spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: Some("go"),
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme: None,
+                mode: None,
+                model,
+                fail_closed: false,
+            })
+            .args
+        };
+        for m in [
+            "opus",
+            "claude-opus-5-5[1m]",
+            "us.anthropic.claude-sonnet-4-5:0",
+        ] {
+            let a = args(Some(m));
+            let at = a.iter().position(|x| x == "--model").unwrap();
+            assert_eq!(a[at + 1], m);
+            assert!(at < a.iter().position(|x| x == "--").unwrap(), "{a:?}");
+        }
+        assert!(!args(None).iter().any(|x| x == "--model"));
+        for bad in [
+            "--dangerously-skip-permissions",
+            "-p",
+            "opus --settings={}",
+            "opus\n",
+            "",
+        ] {
+            let a = args(Some(bad));
+            assert!(!a.iter().any(|x| x == "--model"), "{bad:?}: {a:?}");
+            assert!(
+                !a.iter().any(|x| x == bad && !bad.is_empty()),
+                "{bad:?}: {a:?}"
+            );
+        }
     }
 
     /// The pre-tool hook of a session a served boss runs: Desk's answer
@@ -795,6 +855,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme: None,
                 mode: None,
+                model: None,
                 fail_closed,
             })
             .args
@@ -897,6 +958,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme: None,
                 mode: None,
+                model: None,
                 fail_closed,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();
@@ -929,6 +991,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme,
                 mode: None,
+                model: None,
                 fail_closed: false,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();

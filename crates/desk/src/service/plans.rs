@@ -2237,6 +2237,8 @@ impl Desk {
             approve_for_me: false,
             // As its boss runs: an agent's `[llm] fast`.
             fast: self.fast_for(engine, boss),
+            // As the person chose for the ticket; none, its engine's own.
+            model: runs.model.clone(),
             account: None,
             env: BTreeMap::new(),
             group,

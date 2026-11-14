@@ -348,6 +348,73 @@ fn a_ticket_says_its_machine_and_model_and_keeps_them_unless_changed() {
     );
 }
 
+/// A model is its engine's: a ticket moved to another engine without a
+/// model of its own takes that engine's default, and a model its engine
+/// wouldn't take is refused when the plan is made.
+#[test]
+fn a_tickets_model_goes_with_its_engine() {
+    let mut codex = planned(7, "Add the cart API", &[]);
+    codex.engine = Engine::Codex;
+    codex.model = Some("gpt-6.1-sol".into());
+    let before = Snapshot {
+        parallel: None,
+        budget: None,
+        goal: "Ship".into(),
+        tickets: vec![codex],
+    };
+    let mut same = draft_ticket("Add the cart API", &[]);
+    same.id = Some(u(7));
+    let draft = |t: DraftTicket| Draft {
+        goal: "Ship".into(),
+        tickets: vec![t],
+    };
+    let s = snapshot_of(
+        &draft(same.clone()),
+        Some(&before),
+        Engine::Codex,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(
+        s.tickets[0].model.as_deref(),
+        Some("gpt-6.1-sol"),
+        "kept on Codex"
+    );
+    let s = snapshot_of(
+        &draft(same.clone()),
+        Some(&before),
+        Engine::Claude,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(s.tickets[0].engine, Engine::Claude);
+    assert_eq!(
+        s.tickets[0].model, None,
+        "Claude Code's own, not Codex's model"
+    );
+    let mut moved = same.clone();
+    moved.engine = Some("devin".into());
+    let s = snapshot_of(
+        &draft(moved.clone()),
+        Some(&before),
+        Engine::Codex,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(s.tickets[0].model, None);
+
+    moved.model = Some("sonnet[1m]".into());
+    let problems =
+        snapshot_of(&draft(moved), Some(&before), Engine::Codex, &mut counter()).unwrap_err();
+    assert!(
+        problems.contains(&Problem::BadModel {
+            ticket: 1,
+            model: "sonnet[1m]".into()
+        }),
+        "{problems:?}"
+    );
+}
+
 #[test]
 fn a_machine_ticket_is_checked_there_not_on_this_computer() {
     // Its folder isn't on this computer's disk, and its engine needn't be

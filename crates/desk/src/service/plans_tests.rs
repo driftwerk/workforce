@@ -498,6 +498,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
+                    model: None,
                     account: None,
                     env: Default::default(),
                     group: None,
@@ -542,6 +543,7 @@ async fn a_start_cut_off_after_its_session_started_only_links_it() {
             approvals: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             env: Default::default(),
             group: None,
@@ -678,6 +680,41 @@ async fn a_started_ticket_keeps_where_it_runs_and_dropping_the_plan_stops_or_lea
             .change_plan(id, PlanEdit::default(), Engine::Claude, false, &By::you())
             .await
             .is_err());
+    })
+    .await;
+}
+
+/// A ticket's session runs the model the person chose for it.
+#[tokio::test]
+async fn a_tickets_session_runs_the_tickets_model() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let mut plan = new_plan(dir.path(), &[("a", &[]), ("b", &[])]);
+        plan.draft.tickets[0].model = Some("sonnet".into());
+        let p = d.propose_plan(plan, &sarah(), &by_sarah()).await.unwrap();
+        let p = d
+            .approve_plan(p.summary.plan.id, 1, &By::you())
+            .await
+            .unwrap();
+        let plan = p.summary.plan.clone();
+        let start = |i: usize| Start {
+            ticket: p.tickets[i].ticket.ticket.id,
+            engine: Engine::Claude,
+            folder: dir.path().to_string_lossy().into_owned(),
+            view: None,
+            worktree: false,
+        };
+        let a = d
+            .plan_start(&plan, &start(0), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(d.view(a.id).unwrap().model.as_deref(), Some("sonnet"));
+        let b = d
+            .plan_start(&plan, &start(1), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(d.view(b.id).unwrap().model, None, "its engine's own");
     })
     .await;
 }
@@ -1249,6 +1286,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
+                    model: None,
                     account: None,
                     env: Default::default(),
                     group: Some("g-acme".into()),

@@ -51,6 +51,7 @@ fn session(name: &str, cwd: &Path, transcript: &Path) -> SessionRecord {
         engine_version: Some("2.1.300".into()),
         approve_for_me: false,
         fast: false,
+        model: None,
         account: None,
         name: name.into(),
         goal: "fix the login race".into(),

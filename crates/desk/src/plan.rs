@@ -533,10 +533,17 @@ pub fn snapshot_of(
                 None
             }
         };
+        // A model is its engine's: one kept from before stays only while the
+        // ticket keeps that engine, and one given must be a name its engine
+        // takes ([`crate::engine::model_ok`]).
         let model = match t.model.as_deref().map(str::trim) {
-            None => was.and_then(|w| w.model.clone()),
+            None => was
+                .filter(|w| Some(w.engine) == engine)
+                .and_then(|w| w.model.clone()),
             Some("") => None,
-            Some(m) if model_ok(m) => Some(m.to_string()),
+            Some(m) if engine.map_or(model_ok(m), |e| crate::engine::model_ok(e, m)) => {
+                Some(m.to_string())
+            }
             Some(m) => {
                 problems.push(Problem::BadModel {
                     ticket,
