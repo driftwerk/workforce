@@ -201,6 +201,13 @@ impl CrewHub {
         }
     }
 
+    /// Whether Desk's native side relays now: it asked for calls lately.
+    pub(crate) fn relaying(&self) -> bool {
+        self.relay_polled
+            .lock()
+            .is_some_and(|at| at.elapsed() < POLL_FOR * 2)
+    }
+
     /// The calls queued for machines, up to [`MOST_TAKEN`]: each taken
     /// once. Waits up to `wait` for one when none is queued.
     pub(crate) async fn relay_take(&self, wait: Duration) -> Vec<RelayCall> {
@@ -421,24 +428,36 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
-    let out = s
-        .crew
-        .serve_crew(
-            ServedCall {
-                tool: r.tool,
-                input: r.input,
-                boss,
-                link_id: Some(RELAY_LINK.to_string()),
-                call_id: Some(r.id),
-                ceiling: Some(super::served::Ceiling {
-                    level,
-                    act: super::served::act_of(&r.act),
-                }),
-            },
-            &r.group,
-        )
-        .await;
-    Json(json!({ "status": out.status, "body": out.body })).into_response()
+    let ceiling = super::served::Ceiling {
+        level,
+        act: super::served::act_of(&r.act),
+    };
+    // The home taking its boss's decisions at Act fully, and answering
+    // them ([`super::relayed_decide`]): the Mac hub's own calls, never a
+    // crew tool's.
+    use super::relayed_decide::{DECIDED, TAKE};
+    let (status, body) = match r.tool.as_str() {
+        TAKE => s.crew.take_relayed(&boss, &r.group, &r.input, &ceiling),
+        DECIDED => s.crew.relayed_decided(&boss, &r.group, &r.input).await,
+        _ => {
+            let out = s
+                .crew
+                .serve_crew(
+                    ServedCall {
+                        tool: r.tool,
+                        input: r.input,
+                        boss,
+                        link_id: Some(RELAY_LINK.to_string()),
+                        call_id: Some(r.id),
+                        ceiling: Some(ceiling),
+                    },
+                    &r.group,
+                )
+                .await;
+            (out.status, out.body)
+        }
+    };
+    Json(json!({ "status": status, "body": body })).into_response()
 }
 
 pub(crate) fn routes(state: Arc<GatewayState>, crew: Arc<CrewHub>) -> Router {
