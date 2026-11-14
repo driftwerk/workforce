@@ -10,6 +10,9 @@
 //! - **On the machine**, `POST /api/desk/crew/served` hands the call to
 //!   [`CrewHub::serve_crew`], which decides it under the machine's grant
 //!   for the group, as any served boss's call is.
+//! - **That grant** is what the Mac says at `GET /api/desk/machine-grants`
+//!   ([`super::machine_grants`]), which Desk's native side carries to each
+//!   machine.
 //!
 //! Every route here is the hub's own token's alone, from the
 //! `Authorization` header alone (`?token=` is refused), as grants are:
@@ -482,8 +485,25 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     Json(json!({ "status": status, "body": body })).into_response()
 }
 
+/// On the Mac: the grants each of the person's machines should hold for
+/// this hub's own group bosses ([`super::machine_grants`]), for Desk's
+/// native side to carry to them.
+async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    native!(s, h, q);
+    match s.crew.machine_grants() {
+        Some(w) => Json(w).into_response(),
+        // Not known yet: Desk writes nothing, and deletes nothing, until it is.
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "this hub hasn't read its bosses yet"})),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) fn routes(state: Arc<GatewayState>, crew: Arc<CrewHub>) -> Router {
     Router::new()
+        .route("/api/desk/machine-grants", get(machine_grants))
         .route("/api/desk/crew/relay", get(take))
         .route("/api/desk/crew/relay/{id}", post(answer))
         .route("/api/desk/crew/served", post(served))

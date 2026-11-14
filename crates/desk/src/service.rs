@@ -223,6 +223,10 @@ pub enum DeskError {
     CrossesBoss,
     #[error("{0}")]
     Invalid(String),
+    /// A grant asked to last longer than this engine gives, `most` hours.
+    /// Answered as a 400 with its own `code` and `mostHours`.
+    #[error("{why}")]
+    TooLong { most: u32, why: String },
     #[error(transparent)]
     Internal(#[from] eyre::Report),
 }

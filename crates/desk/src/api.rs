@@ -78,6 +78,9 @@ struct TokenQuery {
 
 /// The `code` of a 409 that only a move may get past (`DeskError::CrossesBoss`).
 pub const CROSSES_BOSS: &str = "crosses_boss";
+/// The `code` of a 400 for a grant asking to last longer than the engine
+/// gives (`DeskError::TooLong`), with the most it gives as `mostHours`.
+pub const GRANT_TOO_LONG: &str = "grant_too_long";
 
 impl IntoResponse for DeskError {
     fn into_response(self) -> Response {
@@ -92,6 +95,18 @@ impl IntoResponse for DeskError {
                     .into_response()
             }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
+            DeskError::TooLong { most, .. } => {
+                let most = *most;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": self.to_string(),
+                        "code": GRANT_TOO_LONG,
+                        "mostHours": most,
+                    })),
+                )
+                    .into_response();
+            }
             DeskError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "desk request failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -2503,6 +2518,24 @@ mod tests {
             }
         }
         seen
+    }
+
+    #[tokio::test]
+    async fn a_grant_too_long_for_the_engine_says_so_by_its_code_with_the_most_it_gives() {
+        use super::{DeskError, IntoResponse, StatusCode, GRANT_TOO_LONG};
+        let res = DeskError::TooLong {
+            most: 12,
+            why: "this engine lets a grant last 1 to 12 hours, not 24".into(),
+        }
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], GRANT_TOO_LONG);
+        assert_eq!(body["mostHours"], 12);
+        assert!(body["error"].as_str().unwrap().contains("1 to 12 hours"));
     }
 
     #[tokio::test]

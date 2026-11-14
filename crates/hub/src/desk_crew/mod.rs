@@ -40,6 +40,7 @@ mod handover;
 mod idle;
 mod items;
 mod line;
+pub(crate) mod machine_grants;
 mod observe;
 mod own_settings;
 mod plan;
