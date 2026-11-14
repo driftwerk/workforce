@@ -54,6 +54,9 @@ const MOST_TAKEN: usize = 16;
 const MOST_ANSWER: usize = 256 * 1024;
 /// How long a poll waits for a call when none is queued.
 const POLL_FOR: Duration = Duration::from_secs(25);
+/// The largest input a call is queued with, as JSON: a poll's batch then
+/// always fits what Desk's native side reads of it.
+const MOST_INPUT: usize = 256 * 1024;
 
 /// One call queued for a machine.
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +76,10 @@ pub struct RelayCall {
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
     pub act: workforce_common::oversight::Act,
+    /// When this hub stops waiting for its answer: Desk's native side sends
+    /// nothing it can't carry by then, so a call the boss was told may
+    /// not have been done is never done later. Not sent to the machine.
+    pub deadline: chrono::DateTime<chrono::Utc>,
 }
 
 /// What a machine answered.
@@ -136,11 +143,19 @@ impl CrewHub {
         if !polled {
             return Err(unreached());
         }
+        // Too large to carry: never queued, so nothing of it is done.
+        if input.to_string().len() > MOST_INPUT {
+            return Err(format!(
+                "That call is too large to send to {machine}; send less in it."
+            ));
+        }
         let id = Uuid::new_v4();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let wait = *self.relay_wait.lock();
+        let deadline = chrono::Utc::now()
+            + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30));
         {
             let mut r = self.relays.lock();
-            let wait = *self.relay_wait.lock();
             r.queued.retain(|(_, at)| at.elapsed() < wait);
             if r.queued.len() >= MOST_QUEUED || r.waiting.len() >= MOST_WAITING {
                 return Err(unreached());
@@ -159,6 +174,7 @@ impl CrewHub {
                     link_id: RELAY_LINK,
                     level: ceiling.level,
                     act: ceiling.act,
+                    deadline,
                 },
                 Instant::now(),
             ));
@@ -299,9 +315,11 @@ fn not_native(s: &RelayApi, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
             !s.state.auth_token.is_empty()
                 && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
         });
+    // 401: refused before anything is done, so Desk's native side may read
+    // the hub's token again and send it once more.
     (!ours).then(|| {
         (
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             Json(json!({"error": "only Desk itself relays a boss's calls, with the hub's own token"})),
         )
             .into_response()
