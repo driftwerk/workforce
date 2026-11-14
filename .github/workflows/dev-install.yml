@@ -1,0 +1,74 @@
+name: Dev install
+
+# Builds the hub (`workforce`) for Apple Silicon Macs from every commit on
+# main, so a developer's Mac can download it (~/bin/desk-fetch.sh) instead of
+# compiling it. The binary is unsigned: whoever downloads it signs it. It is
+# a workflow artifact, kept for 14 days, named with the full commit sha:
+#   workforce-aarch64-apple-darwin-<sha>   holding workforce-<sha8>, its
+#   .sha256 and COMMIT (the sha it was built from).
+# Nothing here deploys, publishes or uses a secret. A pull request that
+# changes only this file runs it too, to prove an edit builds; it can't write
+# anything but its own artifact.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: [.github/workflows/dev-install.yml]
+  workflow_dispatch:
+
+concurrency:
+  group: dev-install-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  NODE_OPTIONS: --max-old-space-size=6144
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build the hub for macOS (arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # Its own cache key (not the Linux image's); only main saves it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dev-install
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the UI
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+      - name: Build the hub
+        run: cargo build --release --locked -p workforce-cli --bin workforce
+      - name: Package
+        run: |
+          set -euo pipefail
+          short=${SHA:0:8}
+          mkdir -p out
+          cp target/release/workforce "out/workforce-$short"
+          (cd out && shasum -a 256 "workforce-$short" > "workforce-$short.sha256")
+          echo "$SHA" > out/COMMIT
+          file "out/workforce-$short"
+          cat "out/workforce-$short.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workforce-aarch64-apple-darwin-${{ env.SHA }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
