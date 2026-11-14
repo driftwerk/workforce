@@ -205,13 +205,16 @@ impl CrewHub {
                 return;
             }
             if self.person_in(s, q.at) {
-                if let Err(e) = self.desk.store().held_question_put(q.id).await {
-                    tracing::warn!(error = %format!("{e:#}"), "holding a session's question failed");
+                match self.desk.store().held_question_put(q.id).await {
+                    Ok(()) => return,
+                    // Not kept, it would never be said: said now instead.
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "holding a session's question failed; said now")
+                    }
                 }
-                return;
             }
+            self.let_go(q.id).await;
         }
-        self.let_go(q.id).await;
         let e = q.escalation.clone().unwrap_or(Escalation {
             why: String::new(),
             options: Vec::new(),

@@ -217,6 +217,7 @@ impl CrewHub {
                 .collect(),
             false => Vec::new(),
         };
+        let gap = self.answer_gap(o);
         let open: Vec<OpenItem> = store
             .items_not_closed(Some(boss))
             .await
@@ -226,7 +227,7 @@ impl CrewHub {
             // nor counted as said again.
             .filter(|i| {
                 !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
-                    || i.session.is_none_or(|s| !self.person_in(s, i.opened_at))
+                    || i.session.is_none_or(|s| !self.person_in_for(s, i.opened_at, gap))
             })
             .collect();
         let restated: Vec<(Uuid, bool)> = match composed {
