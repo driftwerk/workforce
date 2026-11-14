@@ -417,3 +417,123 @@ async fn opening_a_ticket_reads_its_issue_once_in_a_while() {
     })
     .await;
 }
+
+/// A ticket's development is read with its issue when it is opened: none
+/// on a hub without the tools, and the read still answers; then its PRs,
+/// branches, commits and links, unwrapped, with only https addresses. A
+/// part whose tool fails later is left as it was.
+#[tokio::test]
+async fn opening_a_ticket_reads_its_development_and_keeps_what_a_failed_read_left() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        let uri = format!("/api/desk/tickets/{}/read?force=1", t.ticket.id);
+        // A hub without the tools: the issue reads, its development is absent.
+        let a = send(&local, &local.jwt, "POST", &uri, vec![]).await;
+        assert_eq!(a.status, StatusCode::OK, "{:?}", a.json());
+        assert!(a.json()["external"].get("dev").is_none(), "{:?}", a.json());
+
+        let wrapped = |s: &str| {
+            workforce_agent::security::external_content::wrap_external_content(s, "test")
+                .wrapped_content
+        };
+        {
+            let mut j = remote.jira.lock().unwrap();
+            j.dev_answer = Some(serde_json::json!({
+                "issue_key": "ACME-1", "issue_id": "11",
+                "prs": [
+                    { "number": 12, "url": "https://github.com/acme/web/pull/12", "status": "OPEN",
+                      "title": wrapped("ACME-1 Fix the login"), "author": wrapped("Ada"),
+                      "repo": wrapped("acme/web"), "source_branch": wrapped("acme-1-login"),
+                      "last_update": "2026-11-12T22:43:26.000+0000", "reviewers": 0 },
+                    { "number": 13, "url": "http://github.com/acme/web/pull/13", "status": "OPEN",
+                      "title": wrapped("Not https") }
+                ],
+                "branches": [{ "name": wrapped("acme-1-login"), "url": "https://github.com/acme/web/tree/acme-1-login",
+                               "repo": wrapped("acme/web") }],
+                "commits": { "count": 3, "latest": "2026-11-12T13:32:28.000+0000" },
+                "builds": [{ "name": wrapped("Build"), "pipeline": "1", "state": "successful",
+                             "branch": wrapped("acme-1-login"), "updated": "2026-11-12T22:51:03Z" }]
+            }));
+            j.links_answer = Some(serde_json::json!({ "issue_key": "ACME-1", "links": [
+                { "url": "https://acme.atlassian.net/wiki/x/1", "title": wrapped("Login spec"),
+                  "app": wrapped("Confluence"), "relationship": wrapped("mentioned in") }
+            ] }));
+        }
+        for name in ["jira.dev_status", "jira.list_remote_links"] {
+            remote
+                .state
+                .registry
+                .default_agent()
+                .unwrap()
+                .tools
+                .register(std::sync::Arc::new(crate::desk_board_sync::tests::FakeJiraTool {
+                    name,
+                    jira: std::sync::Arc::clone(&remote.jira),
+                }));
+        }
+        let a = send(&local, &local.jwt, "POST", &uri, vec![]).await;
+        assert_eq!(a.status, StatusCode::OK, "{:?}", a.json());
+        let dev = a.json()["external"]["dev"].clone();
+        assert_eq!(
+            dev["prs"],
+            serde_json::json!([{ "number": 12, "url": "https://github.com/acme/web/pull/12",
+                "title": "ACME-1 Fix the login", "state": "open",
+                "checks": { "passed": 1, "total": 1, "state": "pass" },
+                "author": "Ada", "repo": "acme/web", "updated": "2026-11-12T22:43:26Z" }]),
+            "the http PR is dropped"
+        );
+        assert_eq!(
+            dev["branches"],
+            serde_json::json!([{ "name": "acme-1-login",
+                "url": "https://github.com/acme/web/tree/acme-1-login", "repo": "acme/web" }])
+        );
+        assert_eq!(dev["commits"], serde_json::json!({ "count": 3, "latest": "2026-11-12T13:32:28Z" }));
+        assert_eq!(
+            dev["links"],
+            serde_json::json!([{ "title": "Login spec", "url": "https://acme.atlassian.net/wiki/x/1",
+                "app": "Confluence", "words": "mentioned in" }])
+        );
+        assert!(dev["readAt"].is_string());
+        let asked = remote
+            .jira
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|(t, _)| t == "jira.dev_status")
+            .map(|(_, args)| args.clone())
+            .unwrap();
+        assert_eq!(asked["issue_key"], "ACME-1");
+        assert_eq!(asked["issue_id"], "11", "the id the pull kept saves a lookup");
+
+        // A pull of a changed issue leaves the development read on open.
+        crate::desk_board_sync::tests::touch(&remote.jira, "ACME-1", |i| {
+            i.summary = "Fix the login page".into();
+        });
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let pulled = desk.ticket_by_key("ACME-1").await.unwrap();
+        assert_eq!(pulled.ticket.title, "Fix the login page", "the pull ran");
+        let kept = serde_json::to_value(&pulled.ticket.external.as_ref().unwrap().dev).unwrap();
+        assert_eq!(kept, dev, "a pull keeps a ticket's development");
+
+        // Its development tool fails now: the PRs stay as read, the links
+        // are read again.
+        {
+            let mut j = remote.jira.lock().unwrap();
+            j.dev_answer = None;
+            j.links_answer = Some(serde_json::json!({ "issue_key": "ACME-1", "links": [] }));
+        }
+        let a = send(&local, &local.jwt, "POST", &uri, vec![]).await;
+        assert_eq!(a.status, StatusCode::OK, "{:?}", a.json());
+        let again = a.json()["external"]["dev"].clone();
+        assert_eq!(again["prs"], dev["prs"]);
+        assert_eq!(again["commits"], dev["commits"]);
+        assert_eq!(again["links"], serde_json::json!([]));
+    })
+    .await;
+}

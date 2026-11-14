@@ -325,6 +325,7 @@ mod tests {
                     boss: None,
                 },
                 bytes: 10,
+                hash: None,
             };
             d.store()
                 .knows_sent_put(

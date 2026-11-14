@@ -1166,12 +1166,20 @@ pub async fn mount(
     )));
     let app = app.merge(crate::gateway::hardened(browser_routes));
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
-    board_sync.start(cancel_sync);
+    board_sync.start(cancel_sync.clone());
     let app = app.merge(crate::gateway::hardened(board_sync_routes));
     let app = app.merge(crate::desk_ticket_files::install(Arc::clone(&board_sync)));
     let app = app.merge(crate::desk_ticket_comments::install(Arc::clone(
         &board_sync,
     )));
+    // What the person's work agents are sent, by each one's rule (Sees).
+    let (knows_sync, knows_routes) =
+        crate::desk_knows::sync::install(state, desk.clone(), config.desk.knows.clone(), {
+            let crew = Arc::clone(&crew);
+            Arc::new(move || crew.person(None))
+        });
+    knows_sync.start(cancel_sync);
+    let app = app.merge(crate::gateway::hardened(knows_routes));
     Ok(app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),
