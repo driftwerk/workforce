@@ -1,0 +1,3 @@
+Not logged in.
+  Credentials path: /Users/kim/.local/share/devin/credentials.toml
+Run `devin auth login` to authenticate.

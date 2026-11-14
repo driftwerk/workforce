@@ -50,6 +50,24 @@ fn rgb(hex: &str) -> Option<[u8; 3]> {
 }
 
 impl Colors {
+    /// White on black, xterm's own 16: what a terminal no one is shown
+    /// answers with ([`crate::pty::Pty::spawn_unseen`]).
+    pub fn white_on_black() -> Self {
+        Self {
+            foreground: "#ffffff".into(),
+            background: "#000000".into(),
+            cursor: "#ffffff".into(),
+            ansi: [
+                "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd",
+                "#e5e5e5", "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff",
+                "#00ffff", "#ffffff",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ground: Ground::Dark,
+        }
+    }
+
     /// Whether every colour is `#RRGGBB` and there are 16 ANSI ones.
     pub fn check(&self) -> Result<(), String> {
         if self.ansi.len() != 16 {
@@ -145,6 +163,14 @@ struct Tracker {
     cwd: Option<String>,
     /// The colours it answers colour queries with; none, it doesn't.
     palette: Option<Palette>,
+    /// It answers the kitty keyboard query (`CSI ? u`), as no flags set: a
+    /// terminal no one is shown, whose program waits for the answer.
+    kitty_query: bool,
+    /// Exact `CSI ? u` queries in the output being parsed, not yet
+    /// answered. The parser reads `CSI ? 0 u` (an answer, echoed back) with
+    /// the same params, so only one counted here, byte for byte, is
+    /// answered: an answer is never answered again.
+    kitty_asked: usize,
 }
 
 impl Tracker {
@@ -321,6 +347,12 @@ impl Callbacks for Tracker {
             (Some(b'>'), None, 'm') if first(params, 0) == Some(4) => {
                 self.modify_other_keys = first(params, 1).filter(|&n| n > 0);
             }
+            // The kitty keyboard query, on a terminal no one is shown: no
+            // flags, so the program reads plain keys from it.
+            (Some(b'?'), None, 'u') if self.kitty_query && self.kitty_asked > 0 => {
+                self.kitty_asked -= 1;
+                self.replies.extend_from_slice(b"\x1b[?0u");
+            }
             // XTVERSION (`CSI > q`), the kitty keyboard query (`CSI ? u`) and
             // the rest go unanswered, as xterm.js leaves them: the DA1 a
             // program sends after them tells it they aren't supported.
@@ -375,6 +407,9 @@ pub struct Term {
     parser: vt100::Parser<Tracker>,
     /// The last output ended in an ESC: a `c` starting the next is a reset.
     esc_pending: bool,
+    /// The last output's last bytes, for a kitty query split across two
+    /// ([`Tracker::kitty_asked`]).
+    kitty_tail: Vec<u8>,
 }
 
 impl Term {
@@ -402,7 +437,16 @@ impl Term {
                 },
             ),
             esc_pending: false,
+            kitty_tail: Vec::new(),
         }
+    }
+
+    /// It answers the kitty keyboard query (`CSI ? u`) with no flags set,
+    /// unlike xterm.js: for a terminal no one is shown, whose program waits
+    /// for every answer (Devin's login).
+    pub fn answering_kitty(mut self) -> Self {
+        self.parser.callbacks_mut().kitty_query = true;
+        self
     }
 
     /// Whether the program asked to be told when the terminal turns light
@@ -422,6 +466,13 @@ impl Term {
     /// A full reset (RIS, `ESC c`) also resets the modes `vt100` leaves to
     /// the tracker, even split across chunks.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.parser.callbacks().kitty_query {
+            const ASKED: &[u8] = b"\x1b[?u";
+            let seen = [std::mem::take(&mut self.kitty_tail).as_slice(), bytes].concat();
+            let asked = seen.windows(ASKED.len()).filter(|w| *w == ASKED).count();
+            self.parser.callbacks_mut().kitty_asked = asked;
+            self.kitty_tail = seen[seen.len().saturating_sub(ASKED.len() - 1)..].to_vec();
+        }
         let mut start = 0;
         if std::mem::take(&mut self.esc_pending) && bytes.first() == Some(&b'c') {
             self.parser.process(&bytes[..1]);
@@ -796,6 +847,22 @@ mod tests {
             MouseProtocolMode::None
         );
         assert_eq!(viewer.screen().contents(), "hello");
+    }
+
+    #[test]
+    fn only_an_unseen_terminal_answers_the_kitty_query_and_never_an_answer() {
+        assert!(
+            Term::new(80, 24, 0).feed(b"\x1b[?u").is_empty(),
+            "as xterm.js"
+        );
+        let mut t = Term::new(80, 24, 0).answering_kitty();
+        assert_eq!(t.feed(b"\x1b[?u\x1b[c"), b"\x1b[?0u\x1b[?1;2c");
+        // Its own answer, echoed back, is no query.
+        assert!(t.feed(b"\x1b[?0u").is_empty());
+        assert!(t.feed(b"\x1b[?1u\x1b[?0u").is_empty());
+        // Split across two chunks, it is answered once whole.
+        assert!(t.feed(b"ab\x1b[").is_empty());
+        assert_eq!(t.feed(b"?u"), b"\x1b[?0u");
     }
 
     #[test]
