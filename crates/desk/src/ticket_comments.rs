@@ -31,8 +31,12 @@ use crate::store::DeskStore;
 
 /// The longest comment kept or posted.
 pub const BODY_MAX: usize = 10_000;
-/// The most of an issue's comments read.
+/// The most of an issue's comments one call reads: all a Linear read asks
+/// for, and a page of Jira's.
 pub const READ_MAX: usize = 100;
+/// The most of a Jira issue's comments read, a page at a time: past it, a
+/// read is never whole.
+pub const JIRA_READ_MAX: usize = 500;
 /// How long comments read from an issue are taken as current.
 pub const FRESH: chrono::Duration = chrono::Duration::seconds(60);
 
@@ -85,12 +89,18 @@ pub struct Comment {
     pub edited_at: Option<DateTime<Utc>>,
     /// On a synced ticket, it stays in Desk: a session's or an agent's note.
     pub only_here: bool,
+    /// The comment it answers (Linear's replies), by its id here: absent
+    /// when it answers none, or one Desk doesn't keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Uuid>,
 }
 
 /// A comment as an issue's answer gives it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteComment {
     pub remote_id: String,
+    /// The id there of the comment it answers.
+    pub parent: Option<String>,
     pub author: Author,
     pub body: String,
     pub flagged: bool,
@@ -161,14 +171,19 @@ enum Entry {
     Unknown,
 }
 
-/// What `entries` (an answer's first [`READ_MAX`]) read as. Whole when each
-/// of `listed` was read or at least named, and the issue has no more: as
+/// What `entries` (an answer's first `max`) read as. Whole when each of
+/// `listed` was read or at least named, and the issue has no more: as
 /// `total` counts them, or, where the answer doesn't count, fewer came back
 /// than the page asked for ([`READ_MAX`]).
-fn read_of(listed: usize, entries: impl Iterator<Item = Entry>, total: Option<u64>) -> RemoteRead {
+fn read_of(
+    listed: usize,
+    entries: impl Iterator<Item = Entry>,
+    total: Option<u64>,
+    max: usize,
+) -> RemoteRead {
     let mut read = RemoteRead::default();
     let mut named = 0;
-    for entry in entries.take(READ_MAX) {
+    for entry in entries.take(max) {
         match entry {
             Entry::Read(c) => read.comments.push(c),
             Entry::Unread(id) => read.unread.push(id),
@@ -180,12 +195,13 @@ fn read_of(listed: usize, entries: impl Iterator<Item = Entry>, total: Option<u6
         Some(total) => total <= listed as u64,
         None => listed < READ_MAX,
     };
-    read.complete = named == listed && all_there;
+    read.complete = named == listed && listed <= max && all_there;
     read
 }
 
-/// The comments of a `jira.list_comments` answer, asked for [`READ_MAX`]
-/// at a time; Jira's `total` says whether that was all of them.
+/// The comments of a `jira.list_comments` answer (or of [`jira_pages`]),
+/// at most [`JIRA_READ_MAX`]; Jira's `total` says whether that was all of
+/// them.
 pub fn jira_comments(answer: &Value) -> Result<RemoteRead, String> {
     let all = listed(answer)?;
     let entries = all.iter().map(|c| {
@@ -203,13 +219,78 @@ pub fn jira_comments(answer: &Value) -> Result<RemoteRead, String> {
         Entry::Read(RemoteComment {
             author: author_of(System::Jira, name_of(&c["author"]), app),
             remote_id: id,
+            // Jira's comments are flat.
+            parent: None,
             flagged,
             at,
             edited_at: crate::board_sync::remote_time(&c["updated"]).filter(|u| *u != at),
             body,
         })
     });
-    Ok(read_of(all.len(), entries, answer["total"].as_u64()))
+    Ok(read_of(
+        all.len(),
+        entries,
+        answer["total"].as_u64(),
+        JIRA_READ_MAX,
+    ))
+}
+
+/// The call for the page of `key`'s Jira comments from `start_at`.
+pub fn jira_page_call(key: &str, start_at: usize) -> (&'static str, Value) {
+    (
+        "jira.list_comments",
+        serde_json::json!({ "issue_key": key, "max_results": READ_MAX, "start_at": start_at }),
+    )
+}
+
+/// Where the next page of Jira's comments starts after `pages`, or none
+/// when there is no more to read: the last listed none, all `total` are
+/// read, or [`JIRA_READ_MAX`] are.
+pub fn jira_next_page(pages: &[Value]) -> Option<usize> {
+    let last = pages.last()?;
+    let listed = last["comments"].as_array().map_or(0, Vec::len);
+    let read: usize = pages
+        .iter()
+        .map(|p| p["comments"].as_array().map_or(0, Vec::len))
+        .sum();
+    let total = last["total"].as_u64().map(|t| t as usize);
+    (listed > 0 && total.is_some_and(|t| read < t) && read < JIRA_READ_MAX).then_some(read)
+}
+
+/// `pages` of `jira.list_comments`, oldest first, as one answer: each
+/// comment once. It is whole only when every page counted the same `total`
+/// and as many comments were found: one added or deleted between pages
+/// shifts them, and a read that missed one never deletes anything. One
+/// page, or a first that lists none (which fails the read), is answered as
+/// it is.
+pub fn jira_pages(pages: &[Value]) -> Value {
+    let Some(first) = pages.first().filter(|p| p["comments"].is_array()) else {
+        return pages.first().cloned().unwrap_or(Value::Null);
+    };
+    if pages.len() == 1 {
+        return first.clone();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let comments: Vec<Value> = pages
+        .iter()
+        .flat_map(|p| p["comments"].as_array().into_iter().flatten())
+        .filter(|c| match &c["id"] {
+            Value::String(s) if !s.is_empty() => seen.insert(s.clone()),
+            Value::Number(n) => seen.insert(n.to_string()),
+            // No id: kept for `read_of` to pass over.
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    let found = comments.len() as u64;
+    let totals: std::collections::HashSet<Option<u64>> =
+        pages.iter().map(|p| p["total"].as_u64()).collect();
+    let whole = totals.len() == 1 && totals.contains(&Some(found));
+    let mut answer = first.clone();
+    answer["comments"] = Value::Array(comments);
+    // Not whole: said as more than were found.
+    answer["total"] = serde_json::json!(if whole { found } else { found + 1 });
+    answer
 }
 
 /// The comments of a `linear.comment_list` answer, asked for at most
@@ -234,13 +315,17 @@ pub fn linear_comments(answer: &Value) -> Result<RemoteRead, String> {
         Entry::Read(RemoteComment {
             author: author_of(System::Linear, name, app),
             remote_id: id.to_string(),
+            parent: c["parent"]["id"]
+                .as_str()
+                .filter(|p| !p.is_empty() && *p != id)
+                .map(str::to_string),
             flagged,
             at,
             edited_at: crate::board_sync::remote_time(&c["editedAt"]),
             body,
         })
     });
-    Ok(read_of(all.len(), entries, None))
+    Ok(read_of(all.len(), entries, None, READ_MAX))
 }
 
 /// The id of the comment a `jira.add_comment` or `linear.comment_add`
@@ -306,7 +391,10 @@ pub fn author_from(party: &Party) -> Author {
 
 // ── In Postgres ──────────────────────────────────────────────────────────
 
-const COMMENT: &str = "id, remote_id, author, posted_by, body, flagged, at, edited_at";
+/// A comment's columns, as `c`, with the id here of the one it answers
+/// (`p`, joined on its id there).
+const COMMENT: &str = "c.id, c.remote_id, c.author, c.posted_by, c.body, c.flagged, c.at, \
+                       c.edited_at, p.id AS parent";
 
 fn comment(row: &Row, synced: bool) -> Result<Comment> {
     let remote_id: Option<String> = row.try_get("remote_id")?;
@@ -340,6 +428,7 @@ fn comment(row: &Row, synced: bool) -> Result<Comment> {
         flagged: row.try_get("flagged")?,
         at: row.try_get("at")?,
         edited_at: row.try_get("edited_at")?,
+        parent: row.try_get("parent")?,
     })
 }
 
@@ -350,7 +439,11 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                &format!("SELECT {COMMENT} FROM ticket_comments WHERE ticket = $1 ORDER BY at, id"),
+                &format!(
+                    "SELECT {COMMENT} FROM ticket_comments c LEFT JOIN ticket_comments p \
+                     ON p.ticket = c.ticket AND p.remote_id = c.parent_remote_id \
+                     WHERE c.ticket = $1 ORDER BY c.at, c.id"
+                ),
                 &[&ticket],
             )
             .await?
@@ -376,11 +469,11 @@ impl DeskStore {
         let tx = client.transaction().await?;
         for c in &read.comments {
             tx.execute(
-                "INSERT INTO ticket_comments (id, ticket, remote_id, author, body, flagged, at, edited_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                "INSERT INTO ticket_comments (id, ticket, remote_id, author, body, flagged, at, edited_at, \
+                 parent_remote_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (ticket, remote_id) DO UPDATE SET author = EXCLUDED.author, \
                  body = EXCLUDED.body, flagged = EXCLUDED.flagged, at = EXCLUDED.at, \
-                 edited_at = EXCLUDED.edited_at",
+                 edited_at = EXCLUDED.edited_at, parent_remote_id = EXCLUDED.parent_remote_id",
                 &[
                     &Uuid::new_v4(),
                     &ticket,
@@ -390,6 +483,7 @@ impl DeskStore {
                     &c.flagged,
                     &c.at,
                     &c.edited_at,
+                    &c.parent,
                 ],
             )
             .await?;

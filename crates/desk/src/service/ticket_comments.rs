@@ -9,6 +9,7 @@ use super::{Desk, DeskError};
 use crate::board_sync::{Remote, RemoteError};
 use crate::crew::{self, By, Kind, PartyKind};
 use crate::ticket_comments::{self as comments, Comment, FRESH};
+use crate::ticket_history::{self as history, HistoryEvent};
 
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
@@ -71,14 +72,18 @@ impl Desk {
         let Some(e) = t.external.clone().filter(|e| e.synced) else {
             return self.ticket_comments(id).await.map_err(fail);
         };
-        let (tool, args) = comments::list_call(e.system, &e.key);
         // Before the call: a comment Desk posts from here on may postdate
         // its answer, so this read never takes it as deleted.
         let asked_at = crate::crew::now();
-        let answer = crate::board_sync::call(remote, e.system, tool, args).await?;
         let read = match e.system {
-            crate::board::System::Jira => comments::jira_comments(&answer),
-            crate::board::System::Linear => comments::linear_comments(&answer),
+            crate::board::System::Jira => {
+                comments::jira_comments(&comments::jira_pages(&jira_pages(remote, &e.key).await?))
+            }
+            crate::board::System::Linear => {
+                let (tool, args) = comments::list_call(e.system, &e.key);
+                let answer = crate::board_sync::call(remote, e.system, tool, args).await?;
+                comments::linear_comments(&answer)
+            }
         }
         .map_err(|why| {
             RemoteError::Failed(format!(
@@ -100,6 +105,101 @@ impl Desk {
             tracing::debug!(ticket = %id, error = %e, "when its comments were read wasn't kept");
         }
         self.ticket_comments(id).await.map_err(fail)
+    }
+
+    /// Ticket `id`'s issue's history, as last read; none when it never
+    /// was, or the ticket isn't synced (any more, or never was).
+    pub async fn remote_history(&self, id: Uuid) -> Result<Option<Vec<HistoryEvent>>, DeskError> {
+        let t = self.ticket_of(id).await?;
+        if !t.external.as_ref().is_some_and(|e| e.synced) {
+            return Ok(None);
+        }
+        Ok(self
+            .0
+            .store
+            .history_of(id)
+            .await
+            .map_err(internal)?
+            .map(|(events, _)| events))
+    }
+
+    /// Reads ticket `id`'s issue's history through `remote` and keeps it,
+    /// when its comments are read and it wasn't in the last
+    /// [`history::FRESH`]. An answer with no history (an older hub) keeps
+    /// what was kept. Never needed: the caller logs a failure and shows the
+    /// comments all the same.
+    pub async fn read_remote_history(
+        &self,
+        id: Uuid,
+        remote: &dyn Remote,
+    ) -> Result<(), RemoteError> {
+        let fail = |e: DeskError| RemoteError::Failed(e.to_string());
+        let t = self.ticket_of(id).await.map_err(fail)?;
+        let Some(e) = t.external.clone().filter(|e| e.synced) else {
+            return Ok(());
+        };
+        let now = crate::crew::now();
+        let kept = self
+            .0
+            .store
+            .history_of(id)
+            .await
+            .map_err(|e| fail(internal(e)))?;
+        if kept.is_some_and(|(_, at)| now - at < history::FRESH) {
+            return Ok(());
+        }
+        let writer = self.writer_of(t.board, e.system, remote).await;
+        let (tool, args) = history::history_call(e.system, &e.key);
+        // Quiet: never needed, so never held for an approval.
+        let answer = crate::board_sync::call_quiet(remote, e.system, tool, args).await?;
+        let events = match e.system {
+            crate::board::System::Jira => history::jira_history(&answer, writer.as_deref()),
+            crate::board::System::Linear => history::linear_history(&answer, writer.as_deref()),
+        };
+        if let Some(events) = events {
+            self.0
+                .store
+                .put_history(id, &events, now)
+                .await
+                .map_err(|e| fail(internal(e)))?;
+        }
+        Ok(())
+    }
+
+    /// The account board `board`'s link writes with, when it is a shared
+    /// key: only then are Desk's changes told apart from the person's own.
+    /// Kept on the link once the hub's identity tool names it (asked
+    /// quietly), and asked again after who the person is is checked.
+    async fn writer_of(
+        &self,
+        board: Uuid,
+        system: crate::board::System,
+        remote: &dyn Remote,
+    ) -> Option<String> {
+        let s = self.board_of(board).await.ok()?.sync?;
+        let source = s.me_source.filter(|m| m.on_a_shared_key())?;
+        if let Some(kept) = s.key_account {
+            return Some(kept);
+        }
+        let link = s.link;
+        let tool = crate::board_sync::identity_tool(system);
+        let answer = crate::board_sync::call_quiet(remote, system, tool, json!({}))
+            .await
+            .ok()?;
+        let writer = history::writer_of(system, &answer)?;
+        let keep = writer.clone();
+        let kept = self
+            .change_sync(board, move |s| {
+                // Only on the link, and for the person, it was asked for.
+                if s.link == link && s.me_source == Some(source) && s.key_account.is_none() {
+                    s.key_account = Some(keep);
+                }
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::debug!(board = %board, error = %e, "the key's account wasn't kept");
+        }
+        Some(writer)
     }
 
     /// Posts `body` on ticket `id` as `by`: on a synced ticket, to its issue
@@ -203,10 +303,33 @@ impl Desk {
             flagged: false,
             at,
             edited_at: None,
+            parent: None,
         };
         match kept_ok {
             true => Ok(comment),
             false => Err(CommentPost::NotKept(Box::new(comment))),
         }
     }
+}
+
+/// `key`'s Jira comments a page at a time, until all are read or
+/// [`comments::JIRA_READ_MAX`] are. A page after the first that fails or
+/// lists none ends the read there: what was read is kept, and, not being
+/// whole, deletes nothing.
+async fn jira_pages(remote: &dyn Remote, key: &str) -> Result<Vec<serde_json::Value>, RemoteError> {
+    let system = crate::board::System::Jira;
+    let (tool, args) = comments::jira_page_call(key, 0);
+    let mut pages = vec![crate::board_sync::call(remote, system, tool, args).await?];
+    while let Some(start) = comments::jira_next_page(&pages) {
+        let (tool, args) = comments::jira_page_call(key, start);
+        match crate::board_sync::call(remote, system, tool, args).await {
+            Ok(page) if page["comments"].is_array() => pages.push(page),
+            Ok(_) => break,
+            Err(e) => {
+                tracing::debug!(issue = key, error = %e, "a page of comments wasn't read");
+                break;
+            }
+        }
+    }
+    Ok(pages)
 }
