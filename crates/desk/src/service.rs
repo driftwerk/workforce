@@ -53,7 +53,7 @@ pub use board::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
     TicketQuery, TicketView,
 };
-pub use board_sync::{check_hub_id, check_hub_url, LinkBoard};
+pub use board_sync::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use ticket_comments::{CommentPost, PostVia};
 pub use ticket_files::{FileBytes, READ_FRESH};
 mod breaker;

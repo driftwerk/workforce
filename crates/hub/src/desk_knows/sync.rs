@@ -12,6 +12,19 @@
 //!   native side hands over (`PUT /api/desk/knows-links/{hub}/{agent}`) and
 //!   which is kept in this hub's vault at `desk/links/knows/<hub>/<agent>`,
 //!   a Desk link no agent tool or secret marker reaches. Never logged.
+//! - **Unlinking** (`DELETE /api/desk/knows-links[/{hub}[/{agent}]]`) first
+//!   gives the deletes the person chose one try, then ends the token on the
+//!   hub that issued it (`POST /api/desk-knows/revoke`, by the token itself),
+//!   and only then forgets it here. A hub out of reach leaves the link kept
+//!   as *revoking*: nothing is sent with it but deletes and the revoke,
+//!   which is retried every pass until the hub answers (a token that hub no
+//!   longer knows is ended). The Mac's own Desk revokes a removed machine's
+//!   tokens on each hub too (`DELETE /api/me/desk-knows-tokens/engines/..`).
+//! - **Bound to its hub**: a link is kept under `<hub>/<agent>`, and its
+//!   address must name that hub (the id Desk derives from an address,
+//!   [`workforce_desk::hub_id_for_url`]) and, once kept, never changes
+//!   place without being unlinked first. The token is never sent to an
+//!   address that doesn't name its hub.
 //! - **Deletes** the person chose, or a session forgotten, go through the
 //!   agent's hub's `forget`, retried until it answers.
 //! - **Limits**: `[desk.knows]` `send_per_minute` and `send_mb_per_day` per
@@ -70,6 +83,10 @@ struct Link {
     url: String,
     token: String,
     person: String,
+    /// Unlinked, but the issuing hub hasn't yet said the token is ended:
+    /// kept to end it, and sent nothing else.
+    #[serde(default)]
+    revoking: bool,
 }
 
 impl std::fmt::Debug for Link {
@@ -77,6 +94,7 @@ impl std::fmt::Debug for Link {
         f.debug_struct("Link")
             .field("url", &self.url)
             .field("token", &"wfk_…redacted")
+            .field("revoking", &self.revoking)
             .finish()
     }
 }
@@ -87,6 +105,55 @@ fn token_ok(token: &str) -> bool {
         && token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whether `link`'s address names hub `hub`: the one thing its token may be
+/// sent to. A link under the wrong hub is never used.
+fn bound(hub: &str, link: &Link) -> bool {
+    workforce_desk::hub_id_for_url(&link.url).as_deref() == Some(hub)
+}
+
+/// Ends `link`'s token on the hub that issued it, by the token itself.
+/// Done when that hub says it is ended, or no longer knows it. A link not
+/// bound to `hub` is never called: its token would go to a stranger.
+async fn end_token(http: &reqwest::Client, hub: &str, link: &Link) -> Result<(), Failed> {
+    if !bound(hub, link) {
+        return Ok(());
+    }
+    let url = format!("{}/api/desk-knows/revoke", link.url.trim_end_matches('/'));
+    let reply = http
+        .post(url)
+        .bearer_auth(&link.token)
+        .send()
+        .await
+        .map_err(|e| Failed::Retry(format!("couldn't reach the hub: {}", e.without_url())))?;
+    let status = reply.status();
+    if status.is_success() || status == StatusCode::UNAUTHORIZED {
+        return Ok(());
+    }
+    if matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+    ) {
+        // An older hub with no such route: its token ends with its life
+        // there, and a retry would only be the same.
+        tracing::warn!(target: "sentinel.audit", hub = %hub, "an agent's hub can't end a Desk work token; it ends when it expires");
+        return Ok(());
+    }
+    Err(Failed::Retry(status.to_string()))
+}
+
+/// Whether `link` can be sent with: a token of the right shape, for the
+/// hub its address names.
+fn usable(hub: &str, link: &Link) -> bool {
+    token_ok(&link.token) && bound(hub, link)
+}
+
+/// The place of an address: its scheme, host and port, for telling a hub
+/// moved from the same one.
+fn origin(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    Some(u.origin().ascii_serialization())
 }
 
 /// Where an agent's copies go.
@@ -174,6 +241,11 @@ pub struct KnowsSync {
     spent: Mutex<HashMap<String, Spent>>,
     /// Each delete's back-off, so one hub out of reach holds up no other.
     retry_delete: Mutex<HashMap<Uuid, Spent>>,
+    /// Each unlinked link's back-off, by its vault path.
+    retry_revoke: Mutex<HashMap<String, Spent>>,
+    /// One unlink at a time, so a retry and a person's unlink of the same
+    /// link never race each other.
+    unlinking: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
 }
 
@@ -198,6 +270,8 @@ impl KnowsSync {
             http,
             spent: Mutex::new(HashMap::new()),
             retry_delete: Mutex::new(HashMap::new()),
+            retry_revoke: Mutex::new(HashMap::new()),
+            unlinking: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
         }
     }
@@ -228,6 +302,7 @@ impl KnowsSync {
     /// One pass: what the person deleted first, then what each rule covers.
     pub async fn pass(&self) {
         self.deletes().await;
+        self.revokings().await;
         let rules = match self.desk.store().knows_rules().await {
             Ok(r) => r,
             Err(e) => {
@@ -238,6 +313,131 @@ impl KnowsSync {
         for kept in rules {
             if let Err(e) = self.send(&kept.agent, &kept.rule).await {
                 tracing::debug!(agent = %kept.agent, error = %e.words(), "an agent's share is waiting");
+            }
+        }
+    }
+
+    /// The link kept for agent `id` on hub `hub`, read as it is: its
+    /// address may not name that hub (see [`Self::link`]).
+    fn raw_link(&self, hub: &str, id: &str) -> Option<Link> {
+        let vault = self.state.vault.as_ref()?;
+        serde_json::from_str(&vault.get(&link_key(hub, id))?).ok()
+    }
+
+    /// The link for agent `id` on hub `hub`, only when it can be used: a
+    /// token of the right shape and an address that names that hub.
+    fn link(&self, hub: &str, id: &str) -> Option<Link> {
+        let link = self.raw_link(hub, id)?;
+        if !usable(hub, &link) {
+            if token_ok(&link.token) {
+                tracing::warn!(target: "sentinel.audit", hub = %hub, agent = %id, "an agent's link names another hub's address; nothing is sent to it");
+            }
+            return None;
+        }
+        Some(link)
+    }
+
+    /// Ends `link`'s token on the hub that issued it ([`end_token`]).
+    async fn end_token(&self, hub: &str, link: &Link) -> Result<(), Failed> {
+        end_token(&self.http, hub, link).await
+    }
+
+    /// Unlinks agent `id` on hub `hub`: the deletes the person chose get a
+    /// try, the token is ended on its hub, then the link is forgotten. When
+    /// the hub can't be reached the link stays, marked revoking, for
+    /// [`Self::revokings`]. `true` when it is gone.
+    async fn unlink(&self, hub: &str, id: &str, person: &str) -> Result<bool, String> {
+        let _one = self.unlinking.lock().await;
+        let Some(vault) = self.state.vault.as_ref() else {
+            return Err("This hub has no vault.".into());
+        };
+        let key = link_key(hub, id);
+        let forget = |why: &str| {
+            vault
+                .delete_with_actor(&key, VaultActor::User(person))
+                .map(|_| {
+                    tracing::info!(target: "sentinel.audit", hub = %hub, agent = %id, person = %person, why, "an agent's link for Desk work was forgotten");
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %format!("{e:#}"), "an agent's link wasn't forgotten");
+                    "Try again.".to_string()
+                })
+        };
+        let Some(mut link) = self.raw_link(hub, id) else {
+            // Nothing readable is kept: whatever is there goes.
+            forget("unreadable or none")?;
+            return Ok(true);
+        };
+        if !usable(hub, &link) {
+            tracing::warn!(target: "sentinel.audit", hub = %hub, agent = %id, "an unusable agent's link was forgotten without ending its token: it names another hub's address or isn't a Desk work token");
+            forget("unusable")?;
+            return Ok(true);
+        }
+        if !link.revoking {
+            link.revoking = true;
+            let value = serde_json::to_string(&link).unwrap_or_default();
+            vault
+                .set_with_actor(&key, &value, VaultActor::User(person))
+                .map_err(|e| {
+                    tracing::error!(error = %format!("{e:#}"), "an agent's link wasn't marked");
+                    "Desk couldn't unlink it. Try again.".to_string()
+                })?;
+        }
+        // The person's deletes for this agent get one try while the token
+        // still works; after it they can't be sent.
+        self.deletes_of(Some(&format!("{hub}/{id}"))).await;
+        match self.end_token(hub, &link).await {
+            Ok(()) => {
+                // Forgotten only if it is still the link whose token was
+                // ended: a link made meanwhile is never taken with it.
+                if self
+                    .raw_link(hub, id)
+                    .is_some_and(|k| k.token == link.token)
+                {
+                    forget("token ended")?;
+                }
+                self.retry_revoke.lock().remove(&key);
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(hub = %hub, agent = %id, error = %e.words(), "an agent's Desk work token isn't ended yet; tried again each pass");
+                self.retry_revoke
+                    .lock()
+                    .entry(key)
+                    .or_default()
+                    .failed(Instant::now(), false);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Every unlinked link whose token isn't yet ended, tried again.
+    async fn revokings(&self) {
+        let Some(vault) = self.state.vault.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        for path in vault.list(Some(LINKS)) {
+            let Some(rest) = path.strip_prefix(&format!("{LINKS}/")) else {
+                continue;
+            };
+            let Some((hub, id)) = rest.split_once('/') else {
+                continue;
+            };
+            let Some(link) = self.raw_link(hub, id).filter(|l| l.revoking) else {
+                continue;
+            };
+            if self
+                .retry_revoke
+                .lock()
+                .get(&path)
+                .is_some_and(|s| s.waiting(now))
+            {
+                continue;
+            }
+            let person = link.person.clone();
+            if let Err(e) = self.unlink(hub, id, &person).await {
+                tracing::warn!(hub = %hub, agent = %id, error = %e, "an unlinked agent's link wasn't forgotten");
             }
         }
     }
@@ -266,9 +466,9 @@ impl KnowsSync {
                 })
             });
         }
-        let vault = self.state.vault.as_ref()?;
-        let link: Link = serde_json::from_str(&vault.get(&link_key(hub, id))?).ok()?;
-        token_ok(&link.token).then_some(Target::Remote(link))
+        let link = self.link(hub, id)?;
+        // An unlinked agent is sent nothing; its person's deletes still go.
+        (taking_back || !link.revoking).then_some(Target::Remote(link))
     }
 
     /// Sends `agent` what `rule` covers that it doesn't hold yet, a batch at
@@ -473,6 +673,12 @@ impl KnowsSync {
 
     /// Every delete waiting on an agent's hub, tried once each pass.
     async fn deletes(&self) {
+        self.deletes_of(None).await;
+    }
+
+    /// The deletes waiting on `only`'s hub (every agent's when none), each
+    /// tried once.
+    async fn deletes_of(&self, only: Option<&str>) {
         let pending = match self.desk.store().knows_pending_deletes().await {
             Ok(p) => p,
             Err(e) => {
@@ -482,6 +688,9 @@ impl KnowsSync {
         };
         let now = Instant::now();
         for (agent, log) in pending {
+            if only.is_some_and(|o| o != agent) {
+                continue;
+            }
             if self
                 .retry_delete
                 .lock()
@@ -640,7 +849,36 @@ async fn put_link(
         url: url.as_str().trim_end_matches('/').to_string(),
         token: token.to_string(),
         person: person.clone(),
+        revoking: false,
     };
+    // Not while an unlink of it is under way: it would be overwritten
+    // after being read as not revoking.
+    let _one = r.unlinking.lock().await;
+    // The token is for the hub the address names, and only that one.
+    if !bound(&hub, &link) {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "That address isn't the hub this link is for.",
+        );
+    }
+    // A hub that moved is a different hub: unlink it first, so the old
+    // token is ended where it was made, not lost here.
+    if let Some(kept) = r.raw_link(&hub, &agent) {
+        // Being unlinked: its token is still to be ended, and a new link
+        // over it would lose it.
+        if kept.revoking {
+            return refusal(
+                StatusCode::CONFLICT,
+                "This agent is being unlinked. Try again in a moment.",
+            );
+        }
+        if origin(&kept.url) != origin(&link.url) {
+            return refusal(
+                StatusCode::CONFLICT,
+                "This agent is linked to that hub at another address. Unlink it first.",
+            );
+        }
+    }
     let value = serde_json::to_string(&link).unwrap_or_default();
     if let Err(e) = vault.set_with_actor(&link_key(&hub, &agent), &value, VaultActor::User(&person))
     {
@@ -661,8 +899,53 @@ async fn put_link(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `DELETE /api/desk/knows-links/{hub}/{agent}`: forgets the link; nothing
-/// more is sent.
+/// What unlinking did, for the answer: 204 when every token is ended and
+/// the links gone, 202 when some hub couldn't be reached and its link is
+/// kept, revoking, until it can.
+async fn unlink_all(
+    r: &Arc<KnowsSync>,
+    person: &str,
+    hub: Option<&str>,
+    only: Option<&str>,
+) -> Response {
+    let prefix = match (hub, only) {
+        (Some(h), Some(a)) => format!("{LINKS}/{h}/{a}"),
+        (Some(h), None) => format!("{LINKS}/{h}/"),
+        _ => format!("{LINKS}/"),
+    };
+    let Some(vault) = r.state.vault.as_ref() else {
+        return refusal(StatusCode::SERVICE_UNAVAILABLE, "This hub has no vault.");
+    };
+    let mut pending = 0u32;
+    let mut failed = false;
+    for path in vault.list(Some(&prefix)) {
+        let Some((h, a)) = path
+            .strip_prefix(&format!("{LINKS}/"))
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        // `desk/links/knows/x/ab` is not the link of `x/a`.
+        if only.is_some_and(|o| o != a) {
+            continue;
+        }
+        match r.unlink(h, a, person).await {
+            Ok(true) => {}
+            Ok(false) => pending += 1,
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Try again.");
+    }
+    if pending > 0 {
+        return (StatusCode::ACCEPTED, Json(json!({ "pending": pending }))).into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DELETE /api/desk/knows-links/{hub}/{agent}`: unlinks the agent, its
+/// token ended on its hub; nothing more is sent.
 async fn delete_link(
     State(r): State<Arc<KnowsSync>>,
     Path((hub, agent)): Path<(String, String)>,
@@ -676,24 +959,52 @@ async fn delete_link(
     if !ids_ok(&hub, &agent) {
         return refusal(StatusCode::BAD_REQUEST, "That isn't an agent on a hub.");
     }
-    let Some(vault) = r.state.vault.as_ref() else {
-        return refusal(StatusCode::SERVICE_UNAVAILABLE, "This hub has no vault.");
+    unlink_all(&r, &person, Some(&hub), Some(&agent)).await
+}
+
+/// `DELETE /api/desk/knows-links/{hub}`: unlinks every agent on a hub (the
+/// hub is removed from Desk).
+async fn delete_hub_links(
+    State(r): State<Arc<KnowsSync>>,
+    Path(hub): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let person = match holder(&r.state, &headers, q.token.as_deref()).await {
+        Ok(p) => p,
+        Err(refused) => return refused,
     };
-    match vault.delete_with_actor(&link_key(&hub, &agent), VaultActor::User(&person)) {
-        Ok(_) => {
-            tracing::info!(target: "sentinel.audit", hub = %hub, agent = %agent, person = %person, "an agent's link for Desk work was forgotten");
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "an agent's link wasn't forgotten");
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, "Try again.")
-        }
+    if hub == workforce_desk::rooms::LOCAL_HUB || workforce_desk::check_hub_id(&hub).is_err() {
+        return refusal(StatusCode::BAD_REQUEST, "That isn't a hub.");
     }
+    unlink_all(&r, &person, Some(&hub), None).await
+}
+
+/// `DELETE /api/desk/knows-links`: unlinks every agent on every hub (this
+/// hub's Desk is taken away: a machine is removed).
+async fn delete_all_links(
+    State(r): State<Arc<KnowsSync>>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let person = match holder(&r.state, &headers, q.token.as_deref()).await {
+        Ok(p) => p,
+        Err(refused) => return refused,
+    };
+    unlink_all(&r, &person, None, None).await
 }
 
 /// The link routes.
 pub fn router(sync: Arc<KnowsSync>) -> Router {
     Router::new()
+        .route(
+            "/api/desk/knows-links",
+            axum::routing::delete(delete_all_links),
+        )
+        .route(
+            "/api/desk/knows-links/{hub}",
+            axum::routing::delete(delete_hub_links),
+        )
         .route(
             "/api/desk/knows-links/{hub}/{agent}",
             put(put_link).delete(delete_link),
@@ -748,6 +1059,7 @@ mod tests {
             url: "https://hub.example".into(),
             token: format!("wfk_{}", "a".repeat(40)),
             person: "p".into(),
+            revoking: false,
         };
         assert!(!format!("{link:?}").contains("aaaa"));
         assert!(token_ok(&link.token));
@@ -762,5 +1074,123 @@ mod tests {
             "driftwerk",
             "allan"
         )));
+    }
+
+    fn link_at(url: &str) -> Link {
+        Link {
+            url: url.into(),
+            token: format!("wfk_{}", "a".repeat(40)),
+            person: "p".into(),
+            revoking: false,
+        }
+    }
+
+    #[test]
+    fn a_link_is_only_for_the_hub_its_address_names() {
+        // The same ids Desk's `hubs::id_for` makes (pinned there alike).
+        for (url, id) in [
+            ("https://workforce.example.com", "workforce-example-com"),
+            ("https://hub.example.com:8443/x", "hub-example-com"),
+            ("https://a.b-c.example", "a-b-c-example"),
+            ("http://127.0.0.1:8080", "127-0-0-1"),
+        ] {
+            assert_eq!(workforce_desk::hub_id_for_url(url).as_deref(), Some(id));
+            assert!(usable(id, &link_at(url)), "{url}");
+        }
+        assert_eq!(workforce_desk::hub_id_for_url("not a url"), None);
+        // A token for hub A is never used for, or sent to, hub B.
+        let a = link_at("https://a.example.com");
+        assert!(!usable("b-example-com", &a));
+        assert!(!usable("a-example-com-evil", &a));
+        assert!(!usable("local", &a));
+        // Nor is a token of the wrong shape.
+        let mut bad = link_at("https://a.example.com");
+        bad.token = "wfr_".to_string() + &"a".repeat(40);
+        assert!(!usable("a-example-com", &bad));
+        // An address moved is another place, a port apart included.
+        assert_eq!(
+            origin("https://a.example.com"),
+            origin("https://a.example.com/")
+        );
+        assert_ne!(
+            origin("https://a.example.com"),
+            origin("https://a.example.com:8443")
+        );
+        assert_ne!(
+            origin("https://a.example.com"),
+            origin("http://a.example.com")
+        );
+    }
+
+    #[test]
+    fn a_link_kept_before_unlinking_could_be_marked_reads_as_not_revoking() {
+        let old = format!(
+            r#"{{"url":"https://a.example.com","token":"wfk_{}","person":"p"}}"#,
+            "a".repeat(40)
+        );
+        let link: Link = serde_json::from_str(&old).unwrap();
+        assert!(!link.revoking);
+    }
+
+    /// A hub that answers `revoke` with `status`, counting what it is sent.
+    async fn hub_answering(status: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/api/desk-knows/revoke",
+            axum::routing::post(move |headers: HeaderMap| {
+                let log = Arc::clone(&log);
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    log.lock().push(auth);
+                    StatusCode::from_u16(status).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn the_token_is_ended_on_its_hub_by_itself_and_only_there() {
+        let http = reqwest::Client::new();
+        for (status, ended) in [
+            (204, true),
+            (401, true),
+            (404, true),
+            (500, false),
+            (503, false),
+        ] {
+            let (url, seen) = hub_answering(status).await;
+            let link = link_at(&url);
+            let id = workforce_desk::hub_id_for_url(&url).unwrap();
+            let done = end_token(&http, &id, &link).await;
+            assert_eq!(done.is_ok(), ended, "{status}");
+            assert_eq!(seen.lock().as_slice(), [format!("Bearer {}", link.token)]);
+            // The hub being unreachable is tried again, never taken as done.
+            drop(seen);
+        }
+        let dead = link_at("http://127.0.0.1:1");
+        assert!(matches!(
+            end_token(&http, "127-0-0-1", &dead).await,
+            Err(Failed::Retry(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_token_is_never_sent_to_an_address_that_isnt_its_hub() {
+        let (url, seen) = hub_answering(204).await;
+        let link = link_at(&url);
+        // Filed under another hub: nothing is called.
+        end_token(&reqwest::Client::new(), "someone-else", &link)
+            .await
+            .unwrap();
+        assert!(seen.lock().is_empty());
     }
 }

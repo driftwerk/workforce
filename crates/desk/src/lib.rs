@@ -35,6 +35,11 @@ mod crew_store;
 mod cwd;
 pub mod decision;
 pub mod decision_store;
+// Devin's engine, its pieces before its sessions start (H2 wires them).
+#[allow(dead_code)]
+mod devin;
+#[allow(dead_code)]
+mod devin_config;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;
@@ -123,7 +128,7 @@ pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
     BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
 };
-pub use service::{check_hub_id, check_hub_url, LinkBoard};
+pub use service::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
     Import, Imported, Layout, LedgerPage, LineError, MemoryHitView, MemorySearch, NewTerminal,
