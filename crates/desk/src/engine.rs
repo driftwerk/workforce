@@ -687,12 +687,36 @@ fn devin_login_var(name: &str) -> bool {
         "TERM",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        // To open the sign-in page in the person's browser.
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "BROWSER",
     ];
-    const PROXIES: &[&str] = &["http_proxy", "https_proxy", "no_proxy"];
+    const PROXIES: &[&str] = &["http_proxy", "https_proxy", "no_proxy", "all_proxy"];
     KEPT.contains(&name)
         || PROXIES.iter().any(|p| name.eq_ignore_ascii_case(p))
         || name.starts_with("XDG_")
         || name.starts_with("LC_")
+        || devin_setting(name)
+}
+
+/// A `DEVIN_…` setting of the person's: none naming a key, token, secret,
+/// credential, password or auth, nor where Devin's API or servers are
+/// (`DEVIN_API_…`, `…_URL`, `…_HOST`, `…_ENDPOINT`), which would point its
+/// sign-in elsewhere.
+fn devin_setting(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("DEVIN_")
+        && !["KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD", "AUTH"]
+            .iter()
+            .any(|w| upper.contains(w))
+        && !upper.starts_with("DEVIN_API_")
+        && !["_URL", "_HOST", "_ENDPOINT"]
+            .iter()
+            .any(|e| upper.ends_with(e))
 }
 
 /// Copilot CLI signs in with a GitHub token from its environment; with
@@ -977,6 +1001,15 @@ mod tests {
             "HTTPS_PROXY",
             "no_proxy",
             "PATH",
+            "ALL_PROXY",
+            "DISPLAY",
+            "BROWSER",
+            "DEVIN_AUTH_MODE",
+            "DEVIN_API_BASE",
+            "DEVIN_WEBAPP_URL",
+            "DEVIN_SERVER_HOST",
+            "DEVIN_OTEL_ENDPOINT",
+            "DEVIN_PASSWORD",
         ]
         .iter()
         .map(|k| (k.to_string(), "x".to_string()))
@@ -985,6 +1018,10 @@ mod tests {
         assert_eq!(
             kept,
             [
+                "ALL_PROXY",
+                "BROWSER",
+                "DEVIN_THEME",
+                "DISPLAY",
                 "HOME",
                 "HTTPS_PROXY",
                 "LC_ALL",

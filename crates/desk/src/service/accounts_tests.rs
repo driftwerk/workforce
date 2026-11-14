@@ -582,7 +582,8 @@ const DEVIN_TOKEN: &str = "devin-pasted-Qm9vbXNoYWthbGFrYQ-7f3a9c";
 /// approve or refuse it; with `--force-manual-token-flow`, it reads the
 /// token (the terminal echoes it), draws it again itself, and signs in
 /// only by [`DEVIN_TOKEN`], ignoring a hang-up meanwhile, as does the
-/// child it starts (both pids in `login-pids`). Its environment is kept in
+/// child it starts (both pids in `login-pids`); with `child-traps` there,
+/// only the child ignores it. Its environment is kept in
 /// `login-env`.
 fn devin(dir: &Path) -> PathBuf {
     let path = dir.join("devin");
@@ -598,7 +599,9 @@ fn devin(dir: &Path) -> PathBuf {
              'auth login') page='{DEVIN_PAGE}'; env > '{d}/login-env'\n\
                [ -e '{d}/devin-host' ] && page=$(echo \"$page\" | sed \"s/app.devin.ai/$(cat '{d}/devin-host')/\")\n\
                if [ \"$3\" = '--force-manual-token-flow' ]; then\n\
-                 trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & echo \"$$ $!\" > '{d}/login-pids'\n\
+                 if [ -e '{d}/child-traps' ]; then (trap '' HUP; exec sleep 30) </dev/null >/dev/null 2>&1 &\n\
+                 else trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & fi\n\
+                 echo \"$$ $!\" > '{d}/login-pids'\n\
                  echo 'Open this page on any computer and sign in:'\n\
                  echo \"   $page\"\n\
                  printf 'Paste the token shown on the page: '\n\
@@ -841,6 +844,29 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
         // SAFETY: signal 0 only asks whether the process is there.
         let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
         until(|| pids.iter().all(|&p| !alive(p)).then_some(())).await;
+
+        // One whose CLI goes at the hang-up, but whose child stays: the
+        // child is killed with it all the same.
+        std::fs::write(dir.path().join("child-traps"), "").unwrap();
+        std::fs::remove_file(dir.path().join("login-pids")).unwrap();
+        let left = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        until(|| {
+            matches!(
+                d.engine_sign_in(left.id).unwrap().state,
+                EngineSignInState::Paste { .. }
+            )
+            .then_some(())
+        })
+        .await;
+        let pids: Vec<libc::pid_t> =
+            until(|| std::fs::read_to_string(dir.path().join("login-pids")).ok())
+                .await
+                .split_whitespace()
+                .map(|p| p.parse().unwrap())
+                .collect();
+        d.cancel_engine_sign_in(left.id).unwrap();
+        until(|| (!alive(pids[0])).then_some(())).await;
+        until(|| (!alive(pids[1])).then_some(())).await;
     })
     .await;
 }

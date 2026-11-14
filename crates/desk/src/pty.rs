@@ -141,7 +141,12 @@ impl Screen {
     /// queries when no viewer is active to answer them.
     pub(crate) fn push(&self, chunk: &[u8]) -> Option<Vec<u8>> {
         if self.blind.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
+            // Unread, but a program waiting on the terminal's answer to a
+            // cursor or device query isn't left hanging: fixed answers,
+            // nothing of the output taken in.
+            let replies = blind_replies(chunk);
+            let unwatched = self.core.lock().active.is_none();
+            return (unwatched && !replies.is_empty()).then_some(replies);
         }
         let mut core = self.core.lock();
         let replies = core.term.feed(chunk);
@@ -197,6 +202,29 @@ impl Screen {
     fn text(&self) -> String {
         self.core.lock().term.text()
     }
+}
+
+/// What a blind screen answers in `chunk`: the cursor position (`ESC[6n`,
+/// always the top left) and the device attributes (`ESC[c`, `ESC[0c`, as
+/// [`Term`] answers them), in the order asked. Nothing else is answered.
+fn blind_replies(chunk: &[u8]) -> Vec<u8> {
+    const ASKED: [(&[u8], &[u8]); 3] = [
+        (b"\x1b[6n", b"\x1b[1;1R"),
+        (b"\x1b[c", b"\x1b[?1;2c"),
+        (b"\x1b[0c", b"\x1b[?1;2c"),
+    ];
+    let mut replies = Vec::new();
+    let mut at = 0;
+    while at < chunk.len() {
+        match ASKED.iter().find(|(q, _)| chunk[at..].starts_with(q)) {
+            Some((q, reply)) => {
+                replies.extend_from_slice(reply);
+                at += q.len();
+            }
+            None => at += 1,
+        }
+    }
+    replies
 }
 
 /// One terminal.
@@ -934,6 +962,23 @@ pub(crate) mod tests {
         assert!(snap.starts_with('\x18'));
         assert!(snap.contains("row 2999") && snap.contains("done\x1b[31mred"));
         assert!(!snap.contains("row 0\r"), "a resync doesn't resend history");
+    }
+
+    #[test]
+    fn a_blind_screen_takes_nothing_in_but_still_answers_cursor_and_device_queries() {
+        let screen = Screen::new(80, 24, 100, None);
+        screen
+            .blind
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let replies =
+            screen.push(b"Token: secret-123\x1b[6n more \x1b[c\x1b[0c\x1b[5n\x1b]10;?\x07");
+        assert_eq!(
+            replies.as_deref(),
+            Some(&b"\x1b[1;1R\x1b[?1;2c\x1b[?1;2c"[..])
+        );
+        assert!(!screen.text().contains("secret"), "{}", screen.text());
+        assert_eq!(screen.push(b"secret-456"), None);
+        assert!(screen.text().trim().is_empty());
     }
 
     #[test]
