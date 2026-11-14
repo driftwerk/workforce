@@ -353,3 +353,201 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
     })
     .await;
 }
+
+async fn get(app: &axum::Router, uri: &str, bearer: &str) -> (StatusCode, Value) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// On the Mac: each machine is to hold, for Acme's boss here, a grant
+/// naming it `local:<agent>` with exactly its level, switches and Sees
+/// here and only that machine's Acme sessions; a group with no boss of
+/// its own gets none, and nothing is ever wider than the boss's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_machine_is_to_hold_its_own_sessions_of_the_group_at_the_bosss_own_settings() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SARAH, &[]).await;
+        let (a, b, c) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let (other, loose) = (uuid::Uuid::from_u128(4), uuid::Uuid::from_u128(5));
+        let here = new_session(&d, dir.path(), "acme-web").await;
+        d.change_layout(|l| {
+            l.create(
+                "acme",
+                "Acme",
+                &[
+                    format!("session:devbox/{b}"),
+                    format!("session:devbox/{a}"),
+                    workforce_desk::session_item(here.id),
+                    format!("session:atlas/{c}"),
+                ],
+                None,
+            )?
+            .create(
+                "globex",
+                "Globex",
+                &[format!("session:devbox/{other}")],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        d.change_layout(|l| {
+            let mut l = l.clone();
+            l.ungrouped.items.push(format!("session:devbox/{loose}"));
+            Ok(l)
+        })
+        .await
+        .unwrap();
+        eventually("Acme's boss", async || {
+            crew.overseer_named("desk").map(drop)
+        })
+        .await;
+
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let (code, w) = get(&app, "/api/desk/machine-grants", &token).await;
+        assert_eq!(code, StatusCode::OK, "{w}");
+        assert_eq!(w["grantVersion"], 1);
+        let devbox = &w["machines"]["devbox"];
+        let grants = devbox["grants"].as_array().unwrap();
+        assert_eq!(grants.len(), 1, "Globex has no boss of its own: {w}");
+        assert_eq!(grants[0]["group"], "acme");
+        assert_eq!(grants[0]["agent"], "desk");
+        let g = &grants[0]["grant"];
+        assert_eq!(g["boss"], "local:desk");
+        assert_eq!(g["level"], "act");
+        assert_eq!(g["sees"], "everything");
+        assert_eq!(g["members"], json!([a, b]), "devbox's Acme sessions alone");
+        assert_eq!(g["act"]["interrupt"], json!(true));
+        assert_eq!(g["act"]["parallel"], json!(4));
+        assert!(g["act"].get("budget_usd_per_day").is_none());
+        assert_eq!(
+            (&g["folders"], &g["repos"], &g["recall"]),
+            (&json!([]), &json!([]), &json!(false))
+        );
+        for never in ["resume", "hours", "revision", "leaving"] {
+            assert!(g.get(never).is_none(), "{never}: {g}");
+        }
+        assert_eq!(devbox["listed"], json!([a, b, other, loose]));
+        assert_eq!(
+            w["machines"]["atlas"]["grants"][0]["grant"]["members"],
+            json!([c])
+        );
+        // What it says is a grant the machine takes, once given a revision.
+        let mut put = g.clone();
+        put["revision"] = json!(1);
+        serde_json::from_value::<workforce_desk::grant::GrantPut>(put).unwrap();
+
+        // The boss's own settings are the grant's: Watch here, Watch there.
+        write_config(
+            &sarah,
+            "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"watch\"\n",
+        );
+        eventually("Acme's boss watching", async || {
+            (crew.machine_grants().machines["devbox"].grants[0].grant["level"] == "watch")
+                .then_some(())
+        })
+        .await;
+        // Taken off the group: no grant is wanted for it anywhere.
+        write_config(&sarah, "[oversight]\nenabled = false\n");
+        eventually("Acme without a boss", async || {
+            crew.machine_grants()
+                .machines
+                .values()
+                .all(|m| m.grants.is_empty())
+                .then_some(())
+        })
+        .await;
+
+        // Only with the hub's own token, from its header.
+        let (code, _) = get(&app, "/api/desk/machine-grants", "not-it").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = get(
+            &app,
+            &format!("/api/desk/machine-grants?token={token}"),
+            &token,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    })
+    .await;
+}
+
+/// A group whose boss is on another hub is that boss's: no grant naming
+/// a boss here is wanted for it, whoever oversees it here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_bossed_from_another_hub_is_never_wanted_for_a_boss_here() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SARAH, &[]).await;
+        let remote = uuid::Uuid::new_v4();
+        d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
+            .await
+            .unwrap();
+        eventually("Acme's boss", async || {
+            crew.overseer_named("desk").map(drop)
+        })
+        .await;
+        assert_eq!(crew.machine_grants().machines["devbox"].grants.len(), 1);
+        put_grant(&d, "remote:driftwerk/allan", &[]).await;
+        assert!(crew.machine_grants().machines["devbox"].grants.is_empty());
+    })
+    .await;
+}
+
+/// At Act fully in force here, the grant says Act fully, with the boss's
+/// own daily budget and nothing to ship from; while it isn't in force
+/// here, the grant acts within Desk.
+#[tokio::test(flavor = "multi_thread")]
+async fn act_fully_here_is_act_fully_there_with_the_same_budget_and_no_repositories() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let full = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"full\"\n\
+                    [oversight.full]\nrepos = [\"acme/acme-web\"]\nbudget_usd_per_day = 25\n";
+        let (_sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", full, &[]).await;
+        let remote = uuid::Uuid::new_v4();
+        d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
+            .await
+            .unwrap();
+        eventually("Acme's boss", async || {
+            crew.overseer_named("desk").map(drop)
+        })
+        .await;
+        // Until today's spend is read, Act fully isn't in force here, so it
+        // isn't there either.
+        let w = crew.machine_grants();
+        let g = &w.machines["devbox"].grants[0].grant;
+        assert_eq!(g["level"], "act", "{g}");
+        assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
+        crew.read_spent_today(&crew.overseers()).await;
+        let w = crew.machine_grants();
+        let g = &w.machines["devbox"].grants[0].grant;
+        assert_eq!(g["level"], "full", "{g}");
+        assert_eq!(g["act"]["budget_usd_per_day"], json!(25.0));
+        assert_eq!(g["repos"], json!([]));
+    })
+    .await;
+}
