@@ -1694,7 +1694,7 @@ async fn chatgpt_advisor_with_no_model_runs_on_the_powerful_tier() {
         matches!(outcome, crate::advisor::AdvisorOutcome::Advice(_)),
         "{outcome:?}"
     );
-    assert_eq!(chatgpt_bodies(&hub).await[0]["model"], json!("gpt-6.1-sol"));
+    assert_eq!(chatgpt_bodies(&hub).await[0]["model"], json!("gpt-6-astra"));
 }
 
 #[tokio::test]
