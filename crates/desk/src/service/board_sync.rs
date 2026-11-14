@@ -275,6 +275,7 @@ impl Desk {
             assignees_swept: true,
             local_before,
             fields: None,
+            children_next: 0,
         };
         self.0
             .store
@@ -419,10 +420,10 @@ pub struct Pulled {
 }
 
 /// The calls one pass may still make.
-struct Budget(usize);
+pub(super) struct Budget(pub(super) usize);
 
 impl Budget {
-    fn take(&mut self) -> Result<(), RemoteError> {
+    pub(super) fn take(&mut self) -> Result<(), RemoteError> {
         match self.0.checked_sub(1) {
             Some(left) => {
                 self.0 = left;
@@ -614,7 +615,15 @@ impl Desk {
             .await
         {
             Ok(end) => {
+                let swept = end.swept;
                 self.sync_ok(id, end, retry).await?;
+                // Its epics' children, on a sweep, with what the pass left:
+                // never the pass's failure. Opening a ticket reads its own.
+                if swept {
+                    if let Err(e) = self.pull_children(&b, &s, remote, &mut budget).await {
+                        tracing::info!(board = %id, error = %e, "the epics' children weren't read")
+                    }
+                }
                 Ok(out)
             }
             Err(e) => {
@@ -623,6 +632,160 @@ impl Desk {
                     skipped: Some(e.to_string()),
                     ..out
                 })
+            }
+        }
+    }
+
+    /// Keeps on each of board `b`'s Jira epics its children there, whatever
+    /// the board's filter: facts on the epic's ticket, never imported. The
+    /// epics are searched [`EPICS_PER_SEARCH`](crate::board_sync::EPICS_PER_SEARCH)
+    /// at a time, at most [`CHILD_PAGES_PER_PASS`](crate::board_sync::CHILD_PAGES_PER_PASS)
+    /// pages a pass, from where the last pass stopped. Each search read to
+    /// its end is kept at once; one cut short changes nothing, and is read
+    /// first next time. One that failed is passed over. An epic's ticket is
+    /// saved and announced only when what it holds changed.
+    async fn pull_children(
+        &self,
+        b: &Board,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+    ) -> Result<(), RemoteError> {
+        if s.system != System::Jira {
+            return Ok(());
+        }
+        let fail = |e: DeskError| RemoteError::Failed(e.to_string());
+        let mut epics: Vec<(Uuid, String)> = self
+            .0
+            .store
+            .board_tickets(b.id)
+            .await
+            .map_err(|e| fail(internal(e)))?
+            .into_iter()
+            .filter_map(|t| {
+                let e = t.external.as_ref()?;
+                let ours = e.link == s.link && e.synced && !e.kept;
+                let key = crate::board_sync::parse_issue_key(&e.key).filter(|k| *k == e.key)?;
+                (ours && crate::board_sync::is_epic(&e.details.facts)).then_some((t.id, key))
+            })
+            .collect();
+        if epics.is_empty() {
+            return Ok(());
+        }
+        epics.sort_by(|a, b| a.1.cmp(&b.1));
+        let chunks: Vec<&[(Uuid, String)]> =
+            epics.chunks(crate::board_sync::EPICS_PER_SEARCH).collect();
+        let start = s.children_next % chunks.len();
+        let mut pages = Budget(crate::board_sync::CHILD_PAGES_PER_PASS);
+        let mut next = start;
+        for i in 0..chunks.len() {
+            let at = (start + i) % chunks.len();
+            let keys: Vec<String> = chunks[at].iter().map(|(_, k)| k.clone()).collect();
+            match self
+                .read_children(s, remote, budget, &mut pages, &keys)
+                .await
+            {
+                Ok(Some(found)) => {
+                    self.keep_epic_children(chunks[at], found)
+                        .await
+                        .map_err(fail)?;
+                    next = at + 1;
+                }
+                // More pages than a pass may read, from its first search:
+                // it never would, so it is passed over.
+                Ok(None) if i == 0 => {
+                    tracing::info!(board = %b.id, epics = ?keys, "the epics' children are too many to read");
+                    next = at + 1;
+                }
+                // Out of pages or calls: this one goes first next time.
+                Ok(None) | Err(RemoteError::Spent) => {
+                    next = at;
+                    break;
+                }
+                // Jira refused this search (an epic gone, say): the others
+                // are still read.
+                Err(RemoteError::Failed(why)) => {
+                    tracing::info!(board = %b.id, epics = ?keys, error = %why, "the epics' children weren't read");
+                    next = at + 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let next = next % chunks.len();
+        if next != s.children_next {
+            self.change_sync(b.id, |s| s.children_next = next)
+                .await
+                .map_err(fail)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps on each of `epics` (ticket, key) the children `found` says it
+    /// has (none, when it lists none), saving and announcing each epic
+    /// whose children changed.
+    async fn keep_epic_children(
+        &self,
+        epics: &[(Uuid, String)],
+        mut found: crate::board_sync::Children,
+    ) -> Result<(), DeskError> {
+        for (id, key) in epics {
+            let children = found.of.remove(key).unwrap_or_default();
+            let mut t = self.ticket_of(*id).await?;
+            let Some(e) = t.external.as_mut() else {
+                continue;
+            };
+            let mut facts = e.details.facts.clone();
+            crate::board_sync::set_children(&mut facts, children, &found.blocked, true);
+            if facts == e.details.facts {
+                continue;
+            }
+            e.details.facts = facts;
+            self.save_ticket(&mut t).await?;
+            if let Ok(v) = self.view_ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The children of the Jira issues `parents` (keys), whatever any
+    /// board's filter says, in one search read through within `budget` (a
+    /// call a page) and `pages`; `None` when `pages` ran out first.
+    pub(super) async fn read_children(
+        &self,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        pages: &mut Budget,
+        parents: &[String],
+    ) -> Result<Option<crate::board_sync::Children>, RemoteError> {
+        let priorities = crate::board_sync::priorities(s);
+        let mut found = crate::board_sync::Children::default();
+        if !parents
+            .iter()
+            .any(|k| crate::board_sync::parse_issue_key(k).is_some())
+        {
+            return Ok(Some(found));
+        }
+        let mut page: Option<String> = None;
+        loop {
+            if pages.take().is_err() {
+                return Ok(None);
+            }
+            budget.take()?;
+            let args =
+                crate::board_sync::children_args(parents, s.fields.as_ref(), page.as_deref());
+            let answer = crate::board_sync::call(remote, System::Jira, "jira.search", args).await?;
+            let (more, next) = crate::board_sync::jira_children(&answer, priorities);
+            found.extend(more);
+            match next {
+                Some(next) if page.as_deref() == Some(next.as_str()) => {
+                    return Err(RemoteError::Failed("Jira gave the same page twice".into()))
+                }
+                Some(next) => page = Some(next),
+                None => return Ok(Some(found)),
             }
         }
     }
@@ -1371,6 +1534,7 @@ impl Desk {
                     None,
                     crate::board_sync::priorities(s),
                 ),
+                dev: None,
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -2304,6 +2468,7 @@ impl Desk {
             // Its body is Desk's own: never read again for an old shape.
             html_read: crate::board_sync::HTML_READ,
             details: Default::default(),
+            dev: None,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

@@ -49,6 +49,8 @@ pub mod holder;
 pub mod identity;
 pub mod knows;
 mod knows_api;
+pub mod knows_collect;
+pub mod knows_items;
 pub mod knows_store;
 pub mod leader;
 pub mod ledger;
@@ -92,6 +94,7 @@ pub mod store;
 #[cfg(test)]
 mod testing;
 pub mod ticket_comments;
+pub mod ticket_dev;
 pub mod ticket_files;
 mod token_pipe;
 mod transcript;
@@ -112,6 +115,7 @@ pub use conversations::{
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
+pub use service::KnowsGather;
 pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
     BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,

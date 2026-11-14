@@ -162,6 +162,8 @@ Use `jira.get_issue` first to discover the field IDs on your tenant, or query
 | `jira.add_attachment` | `POST /rest/api/3/issue/{key}/attachments` | Multipart upload. Sends `X-Atlassian-Token: no-check` automatically. |
 | `jira.list_projects` | `GET /rest/api/3/project/search` | Optional substring `query` filter. |
 | `jira.list_fields` | `GET /rest/api/3/field`, `GET /rest/api/3/priority/search` | The custom field ids for story points, sprint, start date and Development, and the priorities in the site's order. Pass the ids to `jira.search` / `jira.get_issue` as `custom_fields`. |
+| `jira.dev_status` | `GET /rest/dev-status/latest/issue/summary`, then `…/issue/detail` per data type and instance the summary names | Undocumented: the endpoint Jira's own Development panel reads. Takes `issue_key` and, when known, `issue_id` (else one `GET /issue/{key}` finds it). The summary names the instance types holding PRs, branches and builds (the GitHub app's is `oAuth-com.github.integration.production`, builds' `cloud-providers`); one `dataType=branch` read per instance carries its PRs too. Answers `prs`, `branches`, `commits` (count and latest, from the summary) and `builds` (newest first). Builds that can't be read are left out; PRs or branches that can't be read fail the call. |
+| `jira.list_remote_links` | `GET /rest/api/3/issue/{key}/remotelink` | Each link's `url`, `title`, `summary`, `app` and `relationship` (wrapped). |
 | `jira.get_project` | `GET /rest/api/3/project/{keyOrId}` | Includes available issue types. |
 | `jira.search_users` | `GET /rest/api/3/user/search` | Returns `accountId`, `displayName`, `emailAddress`. |
 | `jira.list_boards` | `GET /rest/agile/1.0/board` | Agile API. |

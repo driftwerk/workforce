@@ -90,6 +90,10 @@ impl DecisionKind {
 
 /// The most characters a decision's short line has.
 pub const BRIEF_CHARS: usize = 70;
+/// The most words it has: one line the person takes in at a glance.
+pub const BRIEF_WORDS: usize = 12;
+/// The most words its why has: a few, after a dash.
+pub const WHY_WORDS: usize = 8;
 /// The most characters its one-sentence why has.
 pub const WHY_CHARS: usize = 200;
 
@@ -193,11 +197,14 @@ impl BossDecision {
         serde_json::from_value(self.action.clone()).ok()
     }
 
-    /// The line the person reads in the chat: "I decided: … because …".
+    /// The line the person reads in the chat: "✓ what it did — why", short,
+    /// never quoting the message it sent (that is behind Message).
     pub fn said(&self) -> String {
-        match self.why.trim() {
-            "" => format!("I decided: {}.", self.what.trim_end_matches('.')),
-            why => format!("I decided: {} — {}", self.what.trim_end_matches('.'), why),
+        let action = self.brief();
+        let action = action.trim_end_matches('.');
+        match clause(&self.brief_why()) {
+            None => format!("✓ {action}"),
+            Some(why) => format!("✓ {action} — {why}"),
         }
     }
 
@@ -259,6 +266,31 @@ impl BossDecision {
     }
 }
 
+/// `why` as the clause after a dash: no full stop, its opening word
+/// lowered when it is a common one ("It", "The"), never a name; none
+/// when empty.
+pub fn clause(why: &str) -> Option<String> {
+    const OPENERS: &[&str] = &[
+        "It", "Its", "The", "This", "That", "These", "They", "There", "A", "An", "Nothing", "No",
+        "Both", "You", "Your",
+    ];
+    let t = why.trim().trim_end_matches('.').trim();
+    if t.is_empty() {
+        return None;
+    }
+    let first = t.split_whitespace().next().unwrap_or_default();
+    let bare = first.trim_end_matches(|c: char| !c.is_alphanumeric());
+    Some(match OPENERS.contains(&bare) {
+        true => {
+            let mut c = t.chars();
+            c.next()
+                .map(|f| f.to_lowercase().chain(c).collect())
+                .unwrap_or_default()
+        }
+        false => t.to_string(),
+    })
+}
+
 /// `text` as a sentence: a capital first, a full stop last.
 fn sentence(text: &str) -> String {
     let t = text.trim();
@@ -296,7 +328,8 @@ pub fn quotes(text: &str, message: Option<&str>) -> bool {
 /// `text` as a decision's short line: one line, at most [`BRIEF_CHARS`],
 /// a sentence; none when empty or it quotes `message`.
 pub fn brief_line(text: &str, message: Option<&str>) -> Option<String> {
-    let cut = crate::crew::one_line(text, BRIEF_CHARS);
+    let first = crate::crew::one_line(text, usize::MAX);
+    let cut = crate::crew::clip(&crate::crew::words(&first, BRIEF_WORDS), BRIEF_CHARS);
     // Its full stop only where it fits: a line of exactly 70 stays whole.
     let line = match sentence(&cut) {
         s if s.chars().count() > BRIEF_CHARS => s.chars().take(BRIEF_CHARS).collect(),
@@ -306,13 +339,34 @@ pub fn brief_line(text: &str, message: Option<&str>) -> Option<String> {
 }
 
 /// `why` as one sentence, never quoting `message`: its first sentence
-/// that doesn't, or empty when none is left.
+/// that doesn't, nor is a piece of it ("Then rerun CI." of "Rebase. Then
+/// rerun CI."), or empty when none is left.
 pub fn why_line(why: &str, message: Option<&str>) -> String {
     sentences(why)
         .into_iter()
-        .map(|s| sentence(&crate::crew::clip(s, WHY_CHARS - 1)))
+        .filter(|s| !within(s, message))
+        .map(|s| {
+            sentence(&crate::crew::clip(
+                &crate::crew::words(s, WHY_WORDS),
+                WHY_CHARS - 1,
+            ))
+        })
         .find(|s| !s.is_empty() && !quotes(s, message))
         .unwrap_or_default()
+}
+
+/// Whether all of `text` is a run of `message`'s words: a short piece of
+/// it that [`quotes`]' five-word runs miss.
+fn within(text: &str, message: Option<&str>) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let t = words(text);
+    let m = words(message.unwrap_or_default());
+    !t.is_empty() && m.windows(t.len()).any(|w| w == t.as_slice())
 }
 
 /// `text`'s sentences in order: each line's, split after `.`, `!` or `?`
@@ -521,6 +575,26 @@ mod tests {
     }
 
     #[test]
+    fn a_why_is_never_a_piece_of_a_message_of_several_sentences() {
+        let m = Some("Please rebase onto main now. Then rerun CI.");
+        assert_eq!(
+            why_line("I sent: Please rebase onto main now. Then rerun CI.", m),
+            ""
+        );
+        assert_eq!(
+            why_line(
+                "Please rebase onto main now. Thanks.",
+                Some("Please rebase onto main now. Thanks.")
+            ),
+            ""
+        );
+        assert_eq!(
+            why_line("Then rerun CI. Its branch is a week behind main.", m),
+            "Its branch is a week behind main."
+        );
+    }
+
+    #[test]
     fn each_kind_of_undo_shows_its_own_button() {
         let s = Uuid::new_v4();
         let line = |delivered| UndoPlan::Line {
@@ -570,7 +644,7 @@ mod tests {
         let mut plain = BossDecision::new("desk", Need::Approval, "allowed it", "", How::Own);
         plain.undo = Undo::None;
         assert_eq!(plain.button(), None);
-        assert_eq!(plain.said(), "I decided: allowed it.");
+        assert_eq!(plain.said(), "✓ Allowed it");
     }
 
     #[test]
