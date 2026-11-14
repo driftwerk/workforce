@@ -554,7 +554,15 @@ impl Desk {
 
     /// Where a boss's answers for its sessions are judged, as the hub
     /// running it says.
-    pub fn boss_bounds_with(&self, bounds: charge::Bounds) {
+    /// Desk's own run folder is always withheld: its sessions' sockets and
+    /// token pipes, and each Devin session's hook token and config copy,
+    /// which a boss writing could answer for Desk or launder settings
+    /// through.
+    pub fn boss_bounds_with(&self, mut bounds: charge::Bounds) {
+        let run = &self.0.opts.run_dir;
+        bounds
+            .withheld
+            .push(std::fs::canonicalize(run).unwrap_or_else(|_| run.clone()));
         *self.0.boss_bounds.lock() = Some(bounds);
     }
 

@@ -289,6 +289,16 @@ fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
     let mut out = vec![crate::desk_folder::of(config).unwrap_or(data)];
     out.push(home.join("Library/Keychains"));
+    // The person's Devin config, where `XDG_CONFIG_HOME` puts it (under
+    // `~/.config` it is a start file already): it runs its hooks' commands.
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|x| x.is_absolute())
+    {
+        out.push(workforce_agent::tools::paths::resolve_real(
+            &x.join("devin"),
+        ));
+    }
     out
 }
 

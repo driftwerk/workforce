@@ -5270,11 +5270,15 @@ impl Desk {
             _ => {}
         }
         if let Hook::ToolStart { call, .. } = &hook {
-            let cd = call.tool == "Bash"
-                && call.input.as_deref().is_some_and(|c| {
-                    c.split(|ch: char| ch.is_whitespace() || ";&|(".contains(ch))
-                        .any(|w| matches!(w, "cd" | "pushd" | "popd"))
-                });
+            // What Devin types into a command already running could move
+            // its shell anywhere, unseen.
+            let typed = call.tool == format!("{}write_to_process", devin::UNKNOWN);
+            let cd = typed
+                || call.tool == "Bash"
+                    && call.input.as_deref().is_some_and(|c| {
+                        c.split(|ch: char| ch.is_whitespace() || ";&|(".contains(ch))
+                            .any(|w| matches!(w, "cd" | "pushd" | "popd"))
+                    });
             if cd {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
                     l.moved = true;

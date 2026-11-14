@@ -244,3 +244,33 @@ async fn devin_files_left_by_a_session_that_ended_while_the_hub_was_away_are_end
     })
     .await;
 }
+
+#[tokio::test]
+async fn desks_run_folder_holding_devins_hook_tokens_is_withheld_from_every_boss() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let o = options(dir.path());
+        let run = o.run_dir.clone();
+        std::fs::create_dir_all(&run).unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // The hub's bounds call the temp folder scratch, where it is.
+        d.boss_bounds_with(crate::charge::Bounds {
+            withheld: Vec::new(),
+            scratch: vec![dir.path().to_path_buf()],
+            home: dir.path().join("home"),
+        });
+        let bounds = d.0.boss_bounds.lock().clone().unwrap();
+        assert!(bounds
+            .withheld
+            .contains(&std::fs::canonicalize(&run).unwrap()));
+    })
+    .await;
+}
