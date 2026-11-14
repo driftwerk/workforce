@@ -546,7 +546,11 @@ pub fn facts_of(
         .as_ref()
         .and_then(|r| r.cwd.as_deref())
         .map(PathBuf::from)
-        .filter(|c| c.is_absolute());
+        .filter(|c| c.is_absolute())
+        // Where Devin's own tools read a relative path from, once its
+        // shell has moved, isn't known (its payload's `cwd` may be its
+        // session's folder still): unknown, as the shell's is.
+        .filter(|_| !(engine == Engine::Devin && moved));
     let cwd = match (said, moved) {
         (Some(c), _) => Some(c),
         (None, false) => Some(session_cwd),
@@ -1457,6 +1461,26 @@ mod tests {
         assert!(call("exec", json!({"command": "ls", "workdir": "/"})).is_err());
         assert!(call("Task", json!({"prompt": "anything"})).is_err());
         assert!(call("read", json!({})).is_err());
+        // Devin's own MCP servers and settings are the person's to change.
+        assert_eq!(
+            call("apply_patch", patch(&["src/a.ts", "mcp_config.json"])),
+            Err(boss::SETTINGS.into())
+        );
+        assert_eq!(
+            call("apply_patch", patch(&[".windsurf/rules.md"])),
+            Err(boss::SETTINGS.into())
+        );
+        // Once its shell has moved, the folder its payload says is no
+        // evidence of where a relative path lands; an absolute one still is.
+        let mut p = json!({"hook_event_name": "PermissionRequest", "tool_name": "apply_patch",
+            "tool_input": patch(&["src/a.ts"])});
+        crate::devin::normalize(&mut p, None);
+        let edit = |input: Value| asking("Edit", input, Some("/Users/sam/dev/acme-web"));
+        let relative = edit(p["tool_input"].clone());
+        assert_eq!(judged_moved(Engine::Devin, &relative, &s, false), Ok(()));
+        assert!(judged_moved(Engine::Devin, &relative, &s, true).is_err());
+        let absolute = edit(json!({"paths": ["/Users/sam/dev/acme-web/src/a.ts"]}));
+        assert_eq!(judged_moved(Engine::Devin, &absolute, &s, true), Ok(()));
     }
 
     #[test]

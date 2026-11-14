@@ -202,9 +202,13 @@ impl State {
 
 /// Whether what a session of `engine`'s asks outlives the hub it asked:
 /// a Claude or Devin hook that loses its hub fails, and the engine asks in
-/// its own terminal instead (Devin: past the hook, its TUI's own prompt);
-/// a Codex request is the old hub's connection's, and went with it, and no
-/// other engine's is kept.
+/// its own terminal instead (Devin: past the hook, its TUI's own prompt,
+/// as the design reads; the payload capture is to confirm it); a Codex
+/// request is the old hub's connection's, and went with it, and no other
+/// engine's is kept. Unlike Claude's, Devin's are pruned by no transcript:
+/// one answered in its terminal while the hub was down shows until the
+/// session's next call, prompt or stop. Either way it is shown as its
+/// terminal's to answer, never a boss's.
 pub(super) fn asks_outlive_the_hub(engine: Engine) -> bool {
     matches!(engine, Engine::Claude | Engine::Devin)
 }

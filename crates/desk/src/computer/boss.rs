@@ -542,6 +542,8 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
                 name.as_str(),
                 ".codex"
                     | ".devin"
+                    | ".windsurf"
+                    | "mcp_config.json"
                     | ".git"
                     | ".mcp.json"
                     | ".envrc"
