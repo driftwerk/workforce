@@ -313,6 +313,22 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         take(false, "full").await;
         assert!(crew.served_full(SARAH).is_none());
         assert!(!d.boss_unbound(SARAH));
+        // A take its home sent before that one, come late, says nothing
+        // of now: it doesn't bind it again.
+        let late = post(
+            &app,
+            &token,
+            relayed(
+                TAKE,
+                counted(json!({"inForce": true,
+                               "sentAt": chrono::Utc::now().timestamp_millis() - 1_000})),
+                "local:sarah",
+                "full",
+            ),
+        )
+        .await;
+        assert_eq!(late["body"]["decisions"], json!([]), "{late}");
+        assert!(crew.served_full(SARAH).is_none(), "{late}");
         waits_on_person(&d, started).await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a3));
         d.decide(started, a3, workforce_desk::model::Decision::Deny, None)

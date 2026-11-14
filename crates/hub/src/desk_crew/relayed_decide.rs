@@ -118,6 +118,8 @@ pub(crate) struct Outbox {
     waiting: HashMap<Uuid, (Key, oneshot::Sender<Result<String, Failed>>)>,
     /// What a take handed out: only these are answered.
     taken: HashSet<Uuid>,
+    /// When the Mac sent the latest take heard for each (its `sentAt`).
+    latest: HashMap<Key, i64>,
 }
 
 impl Outbox {
@@ -319,6 +321,10 @@ impl CrewHub {
             .desk
             .grant_live(group)
             .is_ok_and(|g| g.boss.as_ref() == Some(boss));
+        // When it came, before anything is read: its word holds from when
+        // it was sent, never from when its reading ended.
+        let came = Instant::now();
+        let sent_at = input["sentAt"].as_i64();
         // How long ago the Mac sent it; none for one too old, from the
         // future, or that doesn't say.
         let age = input["sentAt"]
@@ -352,13 +358,22 @@ impl CrewHub {
             let mut out = self.relayed.lock();
             // Homes not heard from within FRESH: forgotten.
             out.homes.retain(|_, h| h.at.elapsed() < FRESH);
-            if !in_force {
+            // A take the Mac sent before one already heard (held up on its
+            // way, or while its spend was read) says nothing of now.
+            let latest = out.latest.get(&key).copied();
+            let stale = sent_at.is_some_and(|at| latest.is_some_and(|l| at < l));
+            // Only a take sent lately counts as the latest: one from the future
+            // would hold off every take after it.
+            if let Some(at) = sent_at.filter(|_| !stale && age.is_some()) {
+                out.latest.insert(key.clone(), at);
+            }
+            if stale {
+                Vec::new()
+            } else if !in_force {
                 out.end(&key);
                 Vec::new()
             } else {
-                let sent = age
-                    .and_then(|a| Instant::now().checked_sub(a))
-                    .unwrap_or_else(Instant::now);
+                let sent = age.and_then(|a| came.checked_sub(a)).unwrap_or(came);
                 if let (Some(from), Some(here), Some(elsewhere)) = (from, here, elsewhere) {
                     out.homes.insert(
                         key.clone(),

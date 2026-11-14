@@ -14,8 +14,8 @@
 //!   named for a boss that oversees nothing now, and a group this hub
 //!   holds a grant for whose boss is on another hub get none: one boss per
 //!   group, and the main overseer's calls aren't relayed yet.
-//! - **What it may do:** its level as it runs here now
-//!   ([`CrewHub::level_now`]), and its own `[oversight.act]` switches and
+//! - **What it may do:** its level as chosen here (Act fully as chosen,
+//!   the rest as it runs now, [`CrewHub::level_now`]), and its own `[oversight.act]` switches and
 //!   `parallel`. At Act fully the grant carries its daily budget (with none
 //!   set here, the most Act fully allows), and that budget is one across
 //!   this computer and every machine ([`super::shared_budget`]): each
@@ -57,9 +57,9 @@ pub struct Wanted {
     /// The boss, as this hub's agent id and as the person knows it.
     pub agent: String,
     pub agent_name: String,
-    /// When the agent was made here (its workspace's birth), so an agent
-    /// made again with the same id isn't taken for the one the person said
-    /// yes to. None where this computer can't say.
+    /// Which making of the agent this is ([`crate::agent_generation`]), so
+    /// an agent made again with the same id isn't taken for the one the
+    /// person said yes to. None where this hub can't keep it.
     pub agent_since: Option<String>,
     /// What `PUT /api/desk/grants/{group}` says, but its revision and the
     /// sessions leaving it, which only the machine's copy can tell.
@@ -107,30 +107,6 @@ fn with_budget(mut act: Value, o: &Oversight) -> Value {
         .unwrap_or(workforce_common::oversight::MAX_FULL_BUDGET_USD);
     act["budget_usd_per_day"] = json!(usd);
     act
-}
-
-/// When `workspace` was made, as a mark that changes when an agent is made
-/// again with the same id: its birth time where the file system keeps one,
-/// with its inode on Unix.
-fn made_at(workspace: &std::path::Path) -> Option<String> {
-    let m = std::fs::metadata(workspace).ok()?;
-    let born = m
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos().to_string());
-    #[cfg(unix)]
-    let ino = Some(std::os::unix::fs::MetadataExt::ino(&m).to_string());
-    #[cfg(not(unix))]
-    let ino: Option<String> = None;
-    match (born, ino) {
-        (None, None) => None,
-        (b, i) => Some(format!(
-            "{}-{}",
-            b.unwrap_or_default(),
-            i.unwrap_or_default()
-        )),
-    }
 }
 
 impl CrewHub {
@@ -195,12 +171,22 @@ impl CrewHub {
             if by_machine.is_empty() {
                 continue;
             }
-            let level = self.level_now(agent, o).0;
+            // Act fully as chosen, not as in force this moment: whether it is
+            // in force is said to each machine every second, with the one
+            // budget, so a spent budget, midnight or a restart doesn't
+            // rewrite the grant or ask the person again.
+            let level = match o.level {
+                Level::Full if o.fully().is_ok() => Level::Full,
+                _ => self.level_now(agent, o).0,
+            };
             let act = match level {
                 Level::Full => with_budget(act_of(o), o),
                 _ => act_of(o),
             };
-            let since = made_at(&service.workspace);
+            let since = crate::agent_generation::of(
+                std::path::Path::new(&service.config.hub.data_dir),
+                agent,
+            );
             let name: String = match g.name.trim() {
                 "" => g.id.clone(),
                 n => n

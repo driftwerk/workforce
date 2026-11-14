@@ -12,9 +12,11 @@
 //! - A count is a machine's whole spend since `countFrom`, never a delta,
 //!   so a lost or repeated answer changes nothing; for the same
 //!   `countFrom` the larger is kept, so a late answer never lowers it.
-//! - A machine's count is dropped only when `countFrom` moves on (midnight
-//!   in the person's time, or a clear), never because it went offline or
-//!   left the group: that money was spent.
+//! - Each count is kept for its own `countFrom`, so a count for one start
+//!   never stands in for another's (a clear, midnight, or a change of time
+//!   zone moving the start either way). Counts over [`KEPT_FOR`] old go;
+//!   none goes because its machine went offline or left the group: that
+//!   money was spent.
 //! - Until what was kept has been read back after a start, no boss here
 //!   acts fully ([`CrewHub::machines_spent`] says nothing), so a restart
 //!   never forgets an offline machine's spend.
@@ -31,36 +33,54 @@ use super::CrewHub;
 /// count.
 pub(crate) const MOST_USD: f64 = 1_000_000.0;
 
-/// Each machine's latest count, by boss and machine.
+/// How long a count is kept after its start: a day's count is never needed
+/// once its day is well over.
+pub(crate) const KEPT_FOR: chrono::Duration = chrono::Duration::days(3);
+
+/// A machine's count, by machine and where it starts.
+type Slot = (String, DateTime<Utc>);
+
+/// Each machine's counts, by boss, machine and start.
 #[derive(Debug, Default)]
 pub(crate) struct Machines {
     loaded: bool,
-    counts: HashMap<String, HashMap<String, (DateTime<Utc>, f64)>>,
+    counts: HashMap<String, HashMap<Slot, f64>>,
+    /// Counts not yet kept in the store: written again with the next answer.
+    unsaved: std::collections::HashSet<(String, Slot)>,
 }
 
 impl Machines {
-    /// Takes `s` as the store keeps it: a later `count_from` replaces, the
-    /// same keeps the larger, an earlier changes nothing.
-    fn take(&mut self, s: &MachineSpent) {
+    /// Takes `s` as the store keeps it: for its start, the larger of what
+    /// was kept and what came. Whether it changed what is counted.
+    fn take(&mut self, s: &MachineSpent) -> bool {
         let slot = self
             .counts
             .entry(s.agent.clone())
             .or_default()
-            .entry(s.machine.clone())
-            .or_insert((s.count_from, s.usd));
-        if s.count_from > slot.0 {
-            *slot = (s.count_from, s.usd);
-        } else if s.count_from == slot.0 && s.usd > slot.1 {
-            slot.1 = s.usd;
+            .entry((s.machine.clone(), s.count_from))
+            .or_insert(f64::NEG_INFINITY);
+        let changed = s.usd > *slot;
+        if changed {
+            *slot = s.usd;
         }
+        changed
+    }
+
+    /// Forgets counts that started over [`KEPT_FOR`] before `now`.
+    fn tidy(&mut self, now: DateTime<Utc>) {
+        for c in self.counts.values_mut() {
+            c.retain(|(_, f), _| now - *f <= KEPT_FOR);
+        }
+        self.counts.retain(|_, c| !c.is_empty());
+        self.unsaved.retain(|(_, (_, f))| now - *f <= KEPT_FOR);
     }
 
     /// What `agent`'s machines but `except` spent since `from`.
     fn sum(&self, agent: &str, from: DateTime<Utc>, except: Option<&str>) -> f64 {
         self.counts.get(agent).map_or(0.0, |m| {
             m.iter()
-                .filter(|(machine, (f, _))| Some(machine.as_str()) != except && *f == from)
-                .map(|(_, (_, usd))| *usd)
+                .filter(|((machine, f), _)| Some(machine.as_str()) != except && *f == from)
+                .map(|(_, usd)| *usd)
                 .sum()
         })
     }
@@ -97,6 +117,7 @@ impl CrewHub {
                 for r in &rows {
                     m.take(r);
                 }
+                m.tidy(Utc::now());
                 m.loaded = true;
             }
             Err(e) => tracing::warn!(
@@ -148,21 +169,28 @@ impl CrewHub {
             count_from: from,
             usd,
         };
-        let changed = {
+        let key = (agent.to_string(), (machine.to_string(), from));
+        let write = {
             let mut m = self.machine_spent.lock();
-            let before = m.counts.get(agent).and_then(|c| c.get(machine)).copied();
-            m.take(&s);
-            m.counts.get(agent).and_then(|c| c.get(machine)).copied() != before
+            m.tidy(Utc::now());
+            let changed = m.take(&s);
+            changed || m.unsaved.contains(&key)
         };
-        if !changed {
+        if !write {
             return;
         }
-        if let Err(e) = self.desk.store().machine_spent_put(&s).await {
-            tracing::warn!(
-                %machine,
-                error = format!("{e:#}"),
-                "a machine's Act fully spend wasn't kept; it is counted until the hub restarts"
-            );
+        match self.desk.store().machine_spent_put(&s).await {
+            Ok(()) => {
+                self.machine_spent.lock().unsaved.remove(&key);
+            }
+            Err(e) => {
+                self.machine_spent.lock().unsaved.insert(key);
+                tracing::warn!(
+                    %machine,
+                    error = format!("{e:#}"),
+                    "a machine's Act fully spend wasn't kept yet; it is written again with its next answer"
+                );
+            }
         }
     }
 }
@@ -206,8 +234,14 @@ mod tests {
         assert_eq!(
             m.sum("sarah", at(9), None),
             1.0,
-            "an answer for an earlier count changes nothing"
+            "each start is its own count"
         );
+        // The start moved back (a time zone changed, a clear undone): the
+        // count for it still counts, and grows on its own.
+        assert_eq!(m.sum("sarah", at(0), None), 55.0);
+        m.tidy(at(0) + KEPT_FOR + chrono::Duration::hours(1));
+        assert_eq!(m.sum("sarah", at(0), None), 0.0, "old counts go");
+        assert_eq!(m.sum("sarah", at(9), None), 1.0);
         assert_eq!(m.sum("other", at(9), None), 0.0);
     }
 

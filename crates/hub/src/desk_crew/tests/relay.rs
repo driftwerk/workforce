@@ -529,7 +529,7 @@ async fn a_group_bossed_from_another_hub_is_never_wanted_for_a_boss_here() {
 /// count its own spend against the whole budget. The grant acts within
 /// Desk, with no budget and nothing to ship from, in force here or not.
 #[tokio::test(flavor = "multi_thread")]
-async fn act_fully_here_is_act_fully_on_a_machine_with_its_one_budget_once_its_spend_is_read() {
+async fn act_fully_here_is_act_fully_on_a_machine_with_its_one_budget() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let full = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"full\"\n\
@@ -544,11 +544,13 @@ async fn act_fully_here_is_act_fully_on_a_machine_with_its_one_budget_once_its_s
         })
         .await;
         let wanted = async || eventually("the grants", async || crew.machine_grants()).await;
-        // Today's spend not read yet: acting within Desk, no budget.
+        // Act fully as chosen, even before today's spend is read: whether
+        // it is in force is each take's to say, so the grant isn't
+        // rewritten (and the person asked again) as that changes.
         let w = wanted().await;
         let g = &w.machines["devbox"].grants[0].grant;
-        assert_eq!(g["level"], "act", "{g}");
-        assert!(g["act"].get("budget_usd_per_day").is_none(), "{g}");
+        assert_eq!(g["level"], "full", "{g}");
+        assert_eq!(g["act"]["budget_usd_per_day"], 25.0);
         // Read: Act fully, with its budget, which the machines count once
         // with this computer.
         crew.read_spent_today(&crew.overseers()).await;
