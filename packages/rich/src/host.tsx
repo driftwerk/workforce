@@ -35,6 +35,12 @@ export interface RichHost {
   submitForm?(summary: string, values: Record<string, SubmitValue>): Promise<boolean>;
   /** Open a link from rendered markdown. Absent, links open in a new tab. */
   openUrl?(url: string): void;
+  /** Draw a link from rendered markdown the host's own way, such as a link to
+   *  one of its records drawn as a chip with that record's state. Called with
+   *  the link's address after the scheme policy (so only a kept scheme reaches
+   *  it) and its rendered text. Return `undefined` to draw the ordinary link.
+   *  What it returns stands inside a paragraph, so it must be phrasing content. */
+  link?(href: string, children: ReactNode): ReactNode | undefined;
   /** Link schemes kept besides the web's (http, https, mailto), opened through
    *  `openUrl`. Every other scheme is stripped from agent markdown. */
   linkSchemes?: readonly string[];
