@@ -31,6 +31,7 @@ pub const READ_TOOLS: &[&str] = &[
     "linear.issue_get",
     "linear.issue_search",
     "linear.issue_children",
+    "linear.issue_history",
     "linear.comment_list",
     "linear.states_list",
     "linear.teams_list",
@@ -168,6 +169,11 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
+            Arc::new(tools::LinearIssueHistoryTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                Arc::clone(pm),
+            )),
             Arc::new(tools::LinearCommentListTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -263,6 +269,7 @@ impl LinearSkill {
             "linear.issue_bulk_update",
             "linear.issue_link",
             "linear.issue_children",
+            "linear.issue_history",
             "linear.comment_list",
             "linear.comment_add",
             "linear.states_list",
@@ -408,6 +415,19 @@ impl LinearSkill {
                 SkillTool {
                     name: "linear.issue_children".to_string(),
                     description: "List child (sub) issues of a parent issue".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "identifier": { "type": "string" },
+                            "limit": { "type": "integer" },
+                            "workspace": { "type": "string" }
+                        },
+                        "required": ["identifier"]
+                    }),
+                },
+                SkillTool {
+                    name: "linear.issue_history".to_string(),
+                    description: "What happened to an issue: changes of state, assignee, priority, estimate, cycle, parent, labels and links".to_string(),
                     input_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -657,6 +677,10 @@ impl LinearSkill {
                 },
                 SkillPolicy {
                     tool: "linear.issue_children".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "linear.issue_history".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {

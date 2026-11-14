@@ -1037,7 +1037,8 @@ pub const BOARD_SYNC_IDENTITY_TOOLS: &[&str] = &[
 
 /// What a ticket's view reads of its issue through the board's sync: an
 /// attachment's or an upload's bytes, a chunk at a time, its comments, and
-/// (Jira) its development (PRs, branches, commits, builds) and web links.
+/// (Jira) its development (PRs, branches, commits, builds) and web links,
+/// and (Linear) its history.
 /// Like the identity tools, called when the hub offers them and never
 /// needed: a hub without them still syncs, its tickets' files open in Jira
 /// or Linear instead, and their development isn't shown.
@@ -1048,6 +1049,7 @@ pub const BOARD_SYNC_VIEW_TOOLS: &[&str] = &[
     "jira.list_remote_links",
     "linear.upload_read",
     "linear.comment_list",
+    "linear.issue_history",
 ];
 
 /// The view tools that answer a file's bytes: a program's, never a

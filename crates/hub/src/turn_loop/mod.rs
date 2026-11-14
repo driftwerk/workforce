@@ -986,6 +986,55 @@ pub(crate) async fn build_enhanced_prompt(
         .joined()
 }
 
+/// The `[DESK WORK]` block for `person`'s turn in `session_id`, if it is
+/// their own conversation, the turn is theirs (`private`), and their Desk
+/// asked for one. Never longer than [`READ_WAIT`] to find.
+///
+/// [`READ_WAIT`]: crate::desk_knows::tools::READ_WAIT
+async fn desk_work_digest(
+    service: &AgentService,
+    session_id: Option<&str>,
+    person: Option<&str>,
+    private: bool,
+) -> Option<String> {
+    if !private {
+        return None;
+    }
+    let session = service.sessions.get(session_id?).ok().flatten()?;
+    // The turn runs as the person whose copies these are, and no other.
+    if person? != crate::user_config::current_identity_id()?.as_str() {
+        return None;
+    }
+    let tz = service.identity.read().await.user_timezone;
+    let block = async {
+        let work = tools::desk_work(service, &session).await?;
+        let mode = match work.store.digest(&work.reader).await {
+            Ok(mode) => mode?,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(match mode.as_str() {
+            "live" => work.digest_block(None).await,
+            "daily" => {
+                work.daily(chrono::Utc::now(), &service.config.desk_knows.digest_at, tz)
+                    .await
+            }
+            _ => Ok(None),
+        })
+    };
+    match tokio::time::timeout(crate::desk_knows::tools::READ_WAIT, block).await {
+        Ok(Some(Ok(b))) => b,
+        Ok(None) => None,
+        Ok(Some(Err(e))) => {
+            tracing::warn!(error = %format!("{e:#}"), "the Desk work digest wasn't read");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("the Desk work digest took too long; left out of this turn");
+            None
+        }
+    }
+}
+
 /// Returns the prompt split at the second `CACHE_BREAK_MARKER`: the stable
 /// system prompt, the per-turn context and the injected lessons. The
 /// injected lessons MUST be persisted onto the caller's in-scope
@@ -1715,6 +1764,25 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     drop(identity);
 
     turn_context.push_str(&dynamic);
+
+    // ── [DESK WORK] (Sees K4) ──────────────────────────────────────
+    // What the person's Desk shares with this agent, as a short block, in
+    // their own conversation alone, as they asked for it (live, or once a
+    // day when something changed). Never written to memory.
+    if !mechanical_session {
+        if let Some(block) = desk_work_digest(
+            service,
+            session_id,
+            recall_identity_id.as_deref(),
+            privacy == PromptPrivacy::Private,
+        )
+        .await
+        {
+            turn_context.push('\n');
+            turn_context.push_str(&block);
+            turn_context.push('\n');
+        }
+    }
 
     // ── Context-Aware Memories (Layer 2) ──────────────────────────
     // See `recall_injection_suppressed` for why steps and recap
@@ -3409,7 +3477,13 @@ pub(crate) async fn process_admitted(
     session.add_user_message_with_trust(message, external_id, attachments.clone(), trust_level);
 
     stamp_tool_whitelist(&mut session);
-    let turn_tools = crate::turn_loop::tools::turn_tools(service, &session, None).await;
+    let turn_tools = crate::turn_loop::tools::turn_tools_in(
+        service,
+        &session,
+        None,
+        privacy == PromptPrivacy::Private,
+    )
+    .await;
     let turn_prompt = build_enhanced_prompt_with_context(
         service,
         Some(&current_session_id),
@@ -4997,7 +5071,19 @@ pub(crate) async fn stream_admitted(
 
     turn_claim.unless_cancelled(&cancel_token).await?;
     stamp_tool_whitelist(&mut session);
-    let turn_tools = crate::turn_loop::tools::turn_tools(service, &session, tool_whitelist).await;
+    let privacy = prompt_privacy(
+        user,
+        user,
+        prompt_visibility(&session, channel_id),
+        RunAuthor::Other,
+    );
+    let turn_tools = crate::turn_loop::tools::turn_tools_in(
+        service,
+        &session,
+        tool_whitelist,
+        privacy == PromptPrivacy::Private,
+    )
+    .await;
     let turn_prompt = build_enhanced_prompt_with_context(
         service,
         Some(&current_session_id),
@@ -5005,12 +5091,7 @@ pub(crate) async fn stream_admitted(
         is_new_session,
         Some(message),
         persona_override,
-        prompt_privacy(
-            user,
-            user,
-            prompt_visibility(&session, channel_id),
-            RunAuthor::Other,
-        ),
+        privacy,
         is_workflow_step_session(&session),
         PromptSurface::of(&turn_tools),
     )

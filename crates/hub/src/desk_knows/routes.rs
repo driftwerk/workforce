@@ -421,7 +421,12 @@ struct PushItem {
 
 #[derive(Deserialize)]
 struct PushBody {
+    #[serde(default)]
     items: Vec<PushItem>,
+    /// How the person wants the agent to hear of their work in their own
+    /// conversations: `off | live | daily`.
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 /// Whether any string or key in `v` holds a NUL.
@@ -526,10 +531,24 @@ pub async fn push(
         Ok(i) => i,
         Err(why) => return err(StatusCode::BAD_REQUEST, &why),
     };
+    if let Some(d) = &parsed.digest {
+        if !super::store::DIGESTS.contains(&d.as_str()) {
+            return err(StatusCode::BAD_REQUEST, "A digest is off, live or daily.");
+        }
+    }
     let store = match store() {
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(d) = &parsed.digest {
+        if let Err(e) = store.set_digest(&live.owner, d, Utc::now()).await {
+            warn!(error = %format!("{e:#}"), "keeping how Desk wants its digest failed");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "This hub couldn't keep that; Desk will try again.",
+            );
+        }
+    }
     match store.push(&live.owner, &items, Utc::now()).await {
         Ok(kept) => {
             crate::boss_links::audit(
@@ -537,7 +556,11 @@ pub async fn push(
                 &live.owner.person.to_string(),
                 "desk_knows.push",
                 &live.token,
-                &format!("{kept} items"),
+                &match (&parsed.digest, kept) {
+                    (Some(d), 0) => format!("digest {d}"),
+                    (Some(d), _) => format!("{kept} items, digest {d}"),
+                    (None, _) => format!("{kept} items"),
+                },
             );
             Json(json!({ "kept": kept })).into_response()
         }

@@ -121,6 +121,8 @@ impl Failed {
 struct Spent {
     sent: VecDeque<(Instant, usize, usize)>,
     backoff: Option<(Instant, Duration)>,
+    /// The digest the agent's hub last took; none since this hub started.
+    digest: Option<&'static str>,
 }
 
 impl Spent {
@@ -304,11 +306,13 @@ impl KnowsSync {
             )
             .await
             .map_err(|e| Failed::Retry(e.to_string()))?;
-        if pending.is_empty() {
+        let digest = rule.digest.as_str();
+        let told = self.spent.lock().get(agent).and_then(|s| s.digest) == Some(digest);
+        if pending.is_empty() && told {
             return Ok(());
         }
         let mut size: usize = pending.iter().map(Outgoing::bytes).sum();
-        let mut landed = self.push(&target, &pending).await;
+        let mut landed = self.push(&target, &pending, digest).await;
         let mut count = pending.len();
         let mut done: Vec<Outgoing> = Vec::new();
         // One item the agent's hub won't take must not hold up the rest:
@@ -324,7 +328,7 @@ impl KnowsSync {
             size = 0;
             let mut passed = Vec::new();
             for o in &pending {
-                match self.push(&target, std::slice::from_ref(o)).await {
+                match self.push(&target, std::slice::from_ref(o), digest).await {
                     Ok(()) => {
                         count += 1;
                         size += o.bytes();
@@ -354,6 +358,7 @@ impl KnowsSync {
             match &landed {
                 Ok(()) => {
                     s.backoff = None;
+                    s.digest = Some(digest);
                     s.sent.push_back((now, count, size));
                 }
                 Err(e) => {
@@ -376,7 +381,12 @@ impl KnowsSync {
         Ok(())
     }
 
-    async fn push(&self, target: &Target, pending: &[Outgoing]) -> Result<(), Failed> {
+    async fn push(
+        &self,
+        target: &Target,
+        pending: &[Outgoing],
+        digest: &str,
+    ) -> Result<(), Failed> {
         let items: Vec<Item> = pending
             .iter()
             .map(|o| Item {
@@ -393,6 +403,10 @@ impl KnowsSync {
                 let store = super::installed()
                     .ok_or_else(|| Failed::Refused("this hub keeps no Desk work".into()))?;
                 store
+                    .set_digest(owner, digest, Utc::now())
+                    .await
+                    .map_err(|e| Failed::Retry(format!("{e:#}")))?;
+                store
                     .push(owner, &items, Utc::now())
                     .await
                     .map(|_| ())
@@ -408,6 +422,7 @@ impl KnowsSync {
                         "at": i.at,
                         "body": i.body,
                     })).collect::<Vec<_>>(),
+                    "digest": digest,
                 });
                 self.call(link, "push", &body).await
             }
@@ -629,9 +644,11 @@ async fn put_link(
         );
     }
     tracing::info!(target: "sentinel.audit", hub = %hub, agent = %agent, person = %person, "an agent's link for Desk work was kept");
-    // A token refused before is no reason to wait now.
+    // A token refused before is no reason to wait now, and a hub linked
+    // anew is told the digest again.
     if let Some(s) = r.spent.lock().get_mut(&format!("{hub}/{agent}")) {
         s.backoff = None;
+        s.digest = None;
     }
     r.kick();
     StatusCode::NO_CONTENT.into_response()

@@ -148,6 +148,7 @@ fn remote(id: &str, body: &str) -> RemoteComment {
         flagged: false,
         at: Utc::now(),
         edited_at: None,
+        parent: None,
     }
 }
 
@@ -420,4 +421,130 @@ async fn only_a_whole_read_prunes_and_desk_s_posts_only_once_read_after() {
         assert!(store.comments_of(t, true).await.unwrap().is_empty());
     })
     .await;
+}
+
+/// A Linear reply names the comment it answers; Jira's are flat, and a
+/// comment naming itself answers none.
+#[test]
+fn a_linear_reply_names_its_parent() {
+    let answer = json!({ "comments": [
+        { "id": "c1", "body": "Top", "user": { "name": "Dana" }, "createdAt": "2026-11-10T09:00:00Z", "parent": null },
+        { "id": "c2", "body": "Reply", "user": { "name": "Sam" }, "createdAt": "2026-11-10T09:01:00Z",
+          "parent": { "id": "c1" } },
+        { "id": "c3", "body": "Odd", "user": { "name": "Sam" }, "createdAt": "2026-11-10T09:02:00Z",
+          "parent": { "id": "c3" } },
+    ]});
+    let c = linear_comments(&answer).unwrap().comments;
+    let parents: Vec<Option<&str>> = c.iter().map(|c| c.parent.as_deref()).collect();
+    assert_eq!(parents, [None, Some("c1"), None]);
+    let jira = json!({ "total": 1, "comments": [
+        { "id": "10", "author": "Dana", "body_html": "<p>x</p>", "created": "2026-11-10T09:00:00.000+0000" } ] });
+    assert_eq!(jira_comments(&jira).unwrap().comments[0].parent, None);
+}
+
+/// A reply is answered with its parent's id here, once both are kept; one
+/// whose parent isn't kept answers none, and nothing else is a reply.
+#[tokio::test]
+async fn a_kept_reply_names_its_parent_by_its_id_here() {
+    with_test_pool(build_pool, |pool| async move {
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        let t = a_ticket(&store).await;
+        let reply = |id: &str, parent: &str| RemoteComment {
+            parent: Some(parent.into()),
+            ..remote(id, "a reply")
+        };
+        let mut top = remote("c1", "top");
+        top.at = Utc::now() - chrono::Duration::minutes(5);
+        let r = read(vec![top, reply("c2", "c1"), reply("c3", "gone")], true);
+        store.put_remote_comments(t, &r, Utc::now()).await.unwrap();
+        let all = store.comments_of(t, true).await.unwrap();
+        let by = |rid: &str| {
+            all.iter()
+                .find(|c| c.remote_id.as_deref() == Some(rid))
+                .unwrap()
+        };
+        assert_eq!(by("c1").parent, None);
+        assert_eq!(by("c2").parent, Some(by("c1").id));
+        assert_eq!(by("c3").parent, None, "its parent isn't kept");
+        let json = serde_json::to_value(by("c2")).unwrap();
+        assert_eq!(json["parent"], json!(by("c1").id.to_string()));
+        assert!(serde_json::to_value(by("c1"))
+            .unwrap()
+            .get("parent")
+            .is_none());
+    })
+    .await;
+}
+
+fn page(from: usize, n: usize, total: u64) -> serde_json::Value {
+    let comments: Vec<serde_json::Value> = (from..from + n)
+        .map(|i| {
+            json!({ "id": i.to_string(), "author": "Dana", "body_html": "<p>x</p>",
+            "created": format!("2026-11-10T09:{:02}:{:02}.000+0000", i / 60 % 60, i % 60) })
+        })
+        .collect();
+    json!({ "issue_key": "ACME-1", "total": total, "comments": comments })
+}
+
+/// Jira's comments past a page are read a page at a time, from where the
+/// last left off, until all are, and never past the cap.
+#[test]
+fn jira_s_comments_are_paged_until_all_are_read() {
+    assert_eq!(
+        jira_page_call("ACME-1", 100),
+        (
+            "jira.list_comments",
+            json!({ "issue_key": "ACME-1", "max_results": READ_MAX, "start_at": 100 })
+        )
+    );
+    assert_eq!(jira_next_page(&[page(0, 100, 230)]), Some(100));
+    assert_eq!(
+        jira_next_page(&[page(0, 100, 230), page(100, 100, 230)]),
+        Some(200)
+    );
+    assert_eq!(
+        jira_next_page(&[page(0, 100, 230), page(100, 100, 230), page(200, 30, 230)]),
+        None
+    );
+    assert_eq!(jira_next_page(&[page(0, 40, 40)]), None);
+    assert_eq!(
+        jira_next_page(&[page(0, 100, 230), page(100, 0, 230)]),
+        None,
+        "an empty page ends it"
+    );
+    let capped: Vec<serde_json::Value> = (0..5).map(|n| page(n * 100, 100, 900)).collect();
+    assert_eq!(jira_next_page(&capped), None, "never past the cap");
+
+    let read = jira_comments(&jira_pages(&[
+        page(0, 100, 230),
+        page(100, 100, 230),
+        page(200, 30, 230),
+    ]))
+    .unwrap();
+    assert_eq!(read.comments.len(), 230);
+    assert!(
+        read.complete,
+        "every page counted the same, and all were found"
+    );
+    let read = jira_comments(&jira_pages(&capped)).unwrap();
+    assert_eq!(read.comments.len(), JIRA_READ_MAX);
+    assert!(!read.complete, "past the cap is never whole");
+}
+
+/// Pages that shifted under the read (a comment added or deleted between
+/// them) never make a whole read: each comment is kept once, and none is
+/// taken as deleted.
+#[test]
+fn shifted_pages_are_no_whole_read() {
+    // One added before the second page: its first comment is the first
+    // page's last again, and the total grew.
+    let read = jira_comments(&jira_pages(&[page(0, 100, 150), page(99, 51, 151)])).unwrap();
+    assert_eq!(read.comments.len(), 150, "each once");
+    assert!(!read.complete);
+    // One deleted before the second page: one is never seen.
+    let read = jira_comments(&jira_pages(&[page(0, 100, 150), page(101, 49, 149)])).unwrap();
+    assert!(!read.complete);
+    // A first page that lists none fails the read, whatever follows.
+    assert!(jira_comments(&jira_pages(&[json!({ "total": 3 })])).is_err());
 }

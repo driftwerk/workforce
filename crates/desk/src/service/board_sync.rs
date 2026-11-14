@@ -261,6 +261,7 @@ impl Desk {
             me: link.me,
             me_name: link.me_name,
             me_note: link.me_note,
+            key_account: None,
             states: link.states,
             group: b.group.clone(),
             cursor: None,
@@ -1811,6 +1812,8 @@ impl Desk {
                 }
             }
             s.me_note = note;
+            // The key may have changed with it: asked again when needed.
+            s.key_account = None;
         })
         .await
         .map_err(|e| RemoteError::Failed(e.to_string()))?;

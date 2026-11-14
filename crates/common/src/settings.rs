@@ -9316,6 +9316,7 @@ impl RemoteMcpConfig {
         "jira.list_remote_links",
         "linear.upload_read",
         "linear.comment_list",
+        "linear.issue_history",
         "identity.linear_member_by_my_email",
         "identity.linear_members_named",
         "identity.linear_choose_me",
