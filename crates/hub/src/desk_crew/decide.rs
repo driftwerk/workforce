@@ -529,16 +529,17 @@ impl CrewHub {
                         )
                     }
                 },
-                // Too long to send, or its hub holding it (its pace, its
-                // budget): asking again at once changes nothing.
-                Ok(Err(e)) if super::remote_decide::not_again(&e) => {
-                    failed = e;
+                // Too long to send, no decision, or its hub holding it (its
+                // pace, its budget), as its code says: asking again at once
+                // changes nothing.
+                Ok(Err(e)) if !e.again() => {
+                    failed = e.why;
                     break;
                 }
                 Ok(Err(e)) => {
                     failed = format!(
                         "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
+                        workforce_desk::crew::one_line(&e.why, 160)
                     )
                 }
                 Err(_) => {
