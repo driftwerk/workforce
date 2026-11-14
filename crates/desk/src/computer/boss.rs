@@ -1229,6 +1229,7 @@ const SAME_SHELL: &[&str] = &["eval", "source", "."];
 const REWIRES: &[&str] = &[
     "trap",
     "alias",
+    "autoload",
     "emulate",
     "setopt",
     "unsetopt",
@@ -1286,8 +1287,9 @@ fn value_moves(value: &str) -> bool {
 ///
 /// A shell's script (`bash -c`) runs in a child shell, which can't move
 /// this one. A command Desk can't split is read as plain words, its quotes
-/// and escapes dropped: a move word anywhere is taken as a move, and each
-/// command in it is read as above.
+/// and escapes dropped: `cd` and its kind anywhere are taken as a move,
+/// and each command in it is read as above (so `.` or `trap` counts as
+/// the command it is, never as a word in another's arguments).
 pub fn moves_dir(command: &str) -> bool {
     let Ok(cmds) = split(command) else {
         let bare: String = command
@@ -1296,7 +1298,7 @@ pub fn moves_dir(command: &str) -> bool {
             .collect();
         if bare
             .split(|c: char| c.is_whitespace() || ";&|()`$<>{}".contains(c))
-            .any(moving_word)
+            .any(|w| MOVES_DIR.contains(&w))
         {
             return true;
         }
@@ -1393,7 +1395,9 @@ fn moves_cmd(words: &[Word]) -> bool {
         return false;
     };
     let name = program.text.as_str();
-    if program.glob || name.starts_with(['$', '`']) {
+    // Named by an expansion anywhere in it (`$c`, `c$X`): what it runs
+    // is for the shell to say.
+    if program.glob || name.contains(['$', '`']) {
         return true;
     }
     let base = base_name(name);
@@ -3289,6 +3293,11 @@ pub(crate) mod tests {
             "`printf cd` /tmp",
             "ls; $X /tmp",
             "X=1 $X /tmp",
+            "c$X /tmp",
+            "X=d; c$X /tmp",
+            "c${X} /tmp",
+            "ev$X x",
+            "autoload f",
             // What replaces the shell starts where it pleases.
             "exec bash -c 'cd /tmp; exec bash'",
             // Unsplittable: read as plain words.
@@ -3323,6 +3332,11 @@ pub(crate) mod tests {
             "export PATH=/usr/bin",
             "set -euo pipefail",
             "declare -F",
+            // Unsplittable, and `.` or a rewiring word only an argument.
+            "find . -name \"$X\"",
+            "grep -rn \"foo$\" .",
+            "docker build -t app:$(git rev-parse HEAD) .",
+            "echo $(git log --format=%an) trap",
             "exec 3>out.log",
             "echo ${HOME} $((1 + 2))",
             "X=$HOME/bin ls",
