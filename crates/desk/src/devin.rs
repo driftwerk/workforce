@@ -26,7 +26,7 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use crate::claude::{self, Hook};
+use crate::claude;
 use crate::devin_config::{self, Person};
 use crate::mode::Mode;
 use crate::pty::Spawn;
@@ -230,6 +230,79 @@ pub fn sessions_with_files(run_dir: &Path) -> Vec<Uuid> {
     ids
 }
 
+/// One session `devin list --format json` lists: its id, and when it was
+/// made, when it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub id: String,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What `devin list --format json` printed (in a folder: its sessions
+/// there). Its entries' shape isn't documented (an empty folder's is
+/// `[]`), so an id and a time are looked for under the names they are
+/// likely to have. None: not a list Desk can read, which includes one with
+/// an entry whose id Desk can't find. Read as an empty list, it would say
+/// a conversation Devin still has is gone.
+pub fn listed(printed: &str) -> Option<Vec<Listed>> {
+    let v: Value = serde_json::from_str(printed.trim()).ok()?;
+    let entries = match &v {
+        Value::Array(a) => a,
+        Value::Object(o) => o.get("sessions").and_then(Value::as_array)?,
+        _ => return None,
+    };
+    entries
+        .iter()
+        .map(|e| {
+            let id = text_in(e, &["id", "session_id", "sessionId"])?.to_string();
+            let created = [
+                "created_at",
+                "createdAt",
+                "started_at",
+                "startedAt",
+                "created",
+            ]
+            .iter()
+            .find_map(|k| e.get(*k))
+            .and_then(time_of);
+            Some(Listed { id, created })
+        })
+        .collect()
+}
+
+fn time_of(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    match v {
+        Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc)),
+        // Seconds, or milliseconds, since the epoch.
+        Value::Number(n) => {
+            let n = n.as_i64()?;
+            let secs = if n > 100_000_000_000 { n / 1000 } else { n };
+            chrono::DateTime::from_timestamp(secs, 0)
+        }
+        _ => None,
+    }
+}
+
+/// The one session in `listed` made between `since` and `until` (a Desk
+/// session's launch that never said its id, and its exit): none when none
+/// or several were, as the person's own `devin` or another Desk session
+/// there could otherwise be taken for it.
+pub fn made_after(
+    listed: &[Listed],
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<&str> {
+    let mut after = listed
+        .iter()
+        .filter(|l| l.created.is_some_and(|c| c >= since && c <= until));
+    match (after.next(), after.next()) {
+        (Some(one), None) => Some(one.id.as_str()),
+        _ => None,
+    }
+}
+
 /// The curl config a session's hooks post with. curl reads it with `-K`,
 /// so the token in its URL is never on a command line. It goes to the hub
 /// straight, never through a proxy the environment names, and by plain
@@ -348,10 +421,18 @@ pub fn hooks(
 /// Reads one of Devin's hooks: its payload put in Claude Code's terms
 /// ([`normalize`]), then read as Claude Code's are. `event` is what its
 /// [`EVENT_HEADER`] said, for a payload that doesn't.
-pub fn parse_hook(body: &[u8], event: Option<&str>) -> Result<Hook> {
+#[cfg(test)]
+pub fn parse_hook(body: &[u8], event: Option<&str>) -> Result<claude::Hook> {
+    claude::parse_hook(&normalized(body, event)?)
+}
+
+/// A Devin hook's body put in Claude Code's terms ([`normalize`]): what
+/// Claude Code's readers ([`claude::parse_hook`], [`crate::mode::of_hook`])
+/// read.
+pub fn normalized(body: &[u8], event: Option<&str>) -> Result<Vec<u8>> {
     let mut payload: Value = serde_json::from_slice(body)?;
     normalize(&mut payload, event);
-    claude::parse_hook(&serde_json::to_vec(&payload)?)
+    Ok(serde_json::to_vec(&payload)?)
 }
 
 /// Where Devin's own name and input for a tool call are kept, beside the
@@ -370,6 +451,20 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
         if let Some(e) = event {
             p.insert("hook_event_name".into(), Value::String(e.into()));
         }
+    }
+    // The mode it says it runs in, by Claude Code's name.
+    if let Some(mode) = p.get("permission_mode").and_then(Value::as_str) {
+        let named = match mode {
+            "normal" => Some(Mode::Default),
+            "accept-edits" => Some(Mode::AcceptEdits),
+            "smart" => Some(Mode::Auto),
+            "dangerous" | "autonomous" => Some(Mode::BypassPermissions),
+            _ => None,
+        };
+        match named {
+            Some(m) => p.insert("permission_mode".into(), m.as_str().into()),
+            None => p.remove("permission_mode"),
+        };
     }
     // Devin's call id, should it send one under another name.
     if !p.contains_key("tool_use_id") {
@@ -750,7 +845,7 @@ pub const UNJUDGED: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::Question;
+    use crate::claude::{Hook, Question};
 
     fn files() -> (tempfile::TempDir, SessionFiles) {
         let dir = tempfile::tempdir().unwrap();
@@ -1246,6 +1341,80 @@ mod tests {
                     "devin": {"tool": "exec", "input": {"command": "ls src", "shell_id": "1"}}}),
             }
         );
+    }
+
+    #[test]
+    fn its_sessions_are_read_off_its_list() {
+        assert_eq!(listed("[]"), Some(vec![]));
+        assert_eq!(listed("not json"), None);
+        // An entry whose id Desk can't find (a key it doesn't know): the
+        // list is unread, never read as empty, as that would say the
+        // conversation is gone.
+        assert_eq!(listed(r#"[{"uuid":"ses_a","title":"x"}]"#), None);
+        assert_eq!(listed(r#"[{"id":"ses_a"},{"conversation":"ses_b"}]"#), None);
+        assert_eq!(listed(r#"{"sessions":[{"title":"no id"}]}"#), None);
+        let printed = r#"[{"id":"ses_a","created_at":"2026-11-14T09:00:00Z","title":"x"},
+            {"session_id":"ses_b","createdAt":1794648600000}]"#;
+        let l = listed(printed).unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].id, "ses_a");
+        assert_eq!(l[1].created.unwrap().timestamp(), 1_794_648_600);
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        // Exactly one made since: that one; none or two: neither.
+        let end = at("2026-11-15T00:00:00Z");
+        assert_eq!(made_after(&l, at("2026-11-14T08:59:00Z"), end), None, "two");
+        let one = vec![
+            Listed {
+                id: "ses_a".into(),
+                created: Some(at("2026-11-14T09:00:00Z")),
+            },
+            Listed {
+                id: "old".into(),
+                created: Some(at("2026-11-01T09:00:00Z")),
+            },
+            Listed {
+                id: "untimed".into(),
+                created: None,
+            },
+        ];
+        assert_eq!(
+            made_after(&one, at("2026-11-14T08:59:00Z"), end),
+            Some("ses_a")
+        );
+        assert_eq!(made_after(&one, at("2026-11-14T10:00:00Z"), end), None);
+        // Made after the session ended: not its.
+        assert_eq!(
+            made_after(&one, at("2026-11-14T08:59:00Z"), at("2026-11-14T08:59:30Z")),
+            None
+        );
+        assert_eq!(listed(r#"{"sessions":[{"id":"x"}]}"#).unwrap()[0].id, "x");
+    }
+
+    #[test]
+    fn the_mode_it_says_reads_by_claude_codes_names() {
+        let mode = |m: &str| {
+            let n = normalized(
+                json!({"hook_event_name": "Stop", "permission_mode": m})
+                    .to_string()
+                    .as_bytes(),
+                None,
+            )
+            .unwrap();
+            crate::mode::of_hook(&n)
+        };
+        assert_eq!(mode("normal"), Some(Mode::Default));
+        assert_eq!(mode("accept-edits"), Some(Mode::AcceptEdits));
+        assert_eq!(mode("smart"), Some(Mode::Auto));
+        assert_eq!(mode("dangerous"), Some(Mode::BypassPermissions));
+        assert_eq!(mode("autonomous"), Some(Mode::BypassPermissions));
+        // Only the documented names: any other is unread.
+        assert_eq!(mode("auto"), None);
+        assert_eq!(mode("yolo"), None);
+        assert_eq!(mode("bypass"), None);
     }
 
     #[test]

@@ -2338,12 +2338,21 @@ pub(crate) fn voice_router(
         }))
 }
 
+/// The event a Devin hook says it posts for, should its payload not: an
+/// event's name only (at most 64 letters and digits), else none.
+fn devin_event(h: &HeaderMap) -> Option<&str> {
+    h.get(crate::devin::EVENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|e| !e.is_empty() && e.len() <= 64 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 async fn hook(
     State(desk): State<Desk>,
     Path((id, token)): Path<(Uuid, String)>,
+    h: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match desk.hook(id, &token, &body).await {
+    match desk.hook_of(id, &token, &body, devin_event(&h)).await {
         Some(answer) => Json(answer).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -2383,6 +2392,33 @@ mod tests {
     use crate::service::NewTerminal;
     use crate::store::{build_pool, DeskStore};
     use crate::testing::{allow_all, options};
+
+    #[test]
+    fn a_devin_hooks_event_header_is_taken_only_as_an_events_name() {
+        let name =
+            || axum::http::HeaderName::from_bytes(crate::devin::EVENT_HEADER.as_bytes()).unwrap();
+        let said = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(name(), axum::http::HeaderValue::from_str(v).unwrap());
+            super::devin_event(&h).map(str::to_string)
+        };
+        assert_eq!(said("PreToolUse").as_deref(), Some("PreToolUse"));
+        assert_eq!(said(&"A".repeat(64)).as_deref(), Some(&*"A".repeat(64)));
+        assert_eq!(said(&"A".repeat(65)), None, "too long");
+        assert_eq!(said(""), None);
+        assert_eq!(said("Pre ToolUse"), None);
+        assert_eq!(said("Stop;rm"), None);
+        assert_eq!(said("../Stop"), None);
+        assert_eq!(said("Stop_1"), None);
+        assert_eq!(super::devin_event(&axum::http::HeaderMap::new()), None);
+        // Not text: none.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            name(),
+            axum::http::HeaderValue::from_bytes(b"St\xffop").unwrap(),
+        );
+        assert_eq!(super::devin_event(&h), None);
+    }
 
     type Client = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

@@ -740,6 +740,7 @@ impl Capability {
                 "crew.release",
                 "crew.plan",
                 "crew.plan_update",
+                "crew.board_create",
                 "crew.handover",
                 "wasm_skill.build",
             ],
@@ -1093,7 +1094,9 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         | "crew.overview" | "crew.activity" | "crew.history" | "crew.account" | "crew.decisions" | "crew.ask_person" | "crew.close_item" | "crew.open_items" | "crew.promise" | "crew.order" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.ask_session" | "crew.escalate" | "crew.approve"
         | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
         | "crew.assign" | "crew.assign_ticket" | "crew.move_ticket" | "crew.take_on" | "crew.release"
-        | "crew.plan" | "crew.plan_update" | "crew.handover" => Some(Capability::ShellExec),
+        | "crew.plan" | "crew.plan_update" | "crew.board_create" | "crew.handover" => {
+            Some(Capability::ShellExec)
+        }
         // A language server loads the project the way a build does (build
         // scripts, proc macros, compiler plugins), so every `code.refactor`
         // action it answers is this class too. Only `replace_definition`, a

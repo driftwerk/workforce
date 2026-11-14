@@ -81,16 +81,33 @@ const GATHER: Duration = Duration::from_secs(3);
 
 pub const DESCRIPTION: &str = "Propose a plan for a goal the person gave you: tickets on your \
 group's board, each a piece of work a real session (Claude Code, Codex) does in a project folder, \
-with what it needs done first (needs: the places, from 0, of earlier tickets in the list). The \
-person approves it in Desk before anything runs; then Desk starts the ready tickets' sessions for \
-you, up to your limit at once, and you run them. Use it for work of more than one session. \
-engine defaults to your default engine; board defaults to your group's.";
+with what it needs done first (needs: the places, from 0, of earlier tickets in the list). A plan \
+is a draft: its tickets wait in Backlog for the person to review on the board, change where and \
+how each runs, and approve; nothing runs before they do, at every level, unbound too. Then Desk \
+starts the ready tickets' sessions for you, up to your limit at once, and you run them. Asked to \
+make a plan, make it and say it is ready for review on the board; don't start it. Only when the \
+person's own words ask you to start or run the work now (not just to plan it) may an unbound boss \
+pass start_now with those words quoted, and Desk starts it. Use it for work of more than one session. \
+engine defaults to your default engine. board names a board you have by its prefix; when the person \
+asks for a new board, or the work deserves its own, pass new_board ({name, prefix}) instead and \
+Desk makes it in your group first, so you never ask the person to make one. With neither, it goes \
+on your group's board.";
+
+pub const BOARD_CREATE: &str = "crew.board_create";
+
+pub const BOARD_CREATE_DESCRIPTION: &str = "Make a board of Desk's own for work in your group \
+(name; prefix, like VEL, from the name when not said; group, for the main boss). One you already \
+have with that prefix is given back as it is. Make it yourself when the person asks for a board; \
+then crew.plan with board, or crew.plan_update with board to move a plan onto it. Say why.";
 
 pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id): give every ticket \
 it is to have, in order, each by its id or key when it is one it has (leave both out to add one), \
 with needs by place in the list. Reordering, needs, titles and descriptions, and where a ticket \
 not started runs apply at once; adding or dropping a ticket, or changing the goal, waits for the \
-person to approve, while the plan runs on as approved. Say why.";
+person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
+one: unbound, start_now with the person's own words asking to start it approves it. board (a \
+prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
+a new key; it applies at once. Say why.";
 
 /// The overseer's own conversation for plan `id`.
 pub fn plan_channel(id: Uuid) -> String {
@@ -109,6 +126,24 @@ fn ticket_schema() -> Value {
         "needs": { "type": "array", "items": { "type": "integer", "minimum": 0 },
             "description": "The places (from 0) in this list of the tickets it needs done first" }
     }, "required": ["title", "folder"] })
+}
+
+fn new_board_schema() -> Value {
+    json!({ "type": "object", "properties": {
+        "name": { "type": "string", "description": "The board's name, like Vellev" },
+        "prefix": { "type": "string", "description": "What its keys start with: 2 to 6 capitals or digits, starting with a capital, like VEL; from the name when not said" },
+        "group": { "type": "string", "description": "The sidebar group it is in, by name or id; yours when not said (the main boss may name any group it oversees)" }
+    }, "required": ["name"],
+    "description": "A board of Desk's own to put the plan on, made now: when the person asks for a new board, or the work has none. One you already have with that prefix is used as it is. Not with board." })
+}
+
+pub fn board_create_schema() -> Value {
+    json!({ "type": "object", "properties": {
+        "name": { "type": "string", "description": "The board's name, like Vellev" },
+        "prefix": { "type": "string", "description": "What its keys start with: 2 to 6 capitals or digits, starting with a capital, like VEL; from the name when not said" },
+        "group": { "type": "string", "description": "The sidebar group it is in, by name or id; yours when not said (the main boss may name any group it oversees)" },
+        "reason": { "type": "string", "description": "Why, in a sentence the person reads in Activity" }
+    }, "required": ["name", "reason"] })
 }
 
 fn budget_schema() -> Value {
@@ -133,13 +168,41 @@ fn budget_of(input: &Value) -> Result<Option<Option<plan::PlanBudget>>, String> 
     }
 }
 
+fn start_now_schema() -> Value {
+    json!({ "type": "object", "properties": {
+        "person_said": { "type": "string",
+            "description": "The person's own words asking you to start or run the work now, quoted as they wrote them" }
+    }, "required": ["person_said"],
+    "description": "Only when the person explicitly asked you to start or run the work, not only to make a plan, and only when you are unbound: Desk approves it and starts its ready tickets. Leave it out otherwise: the plan waits as a draft for the person to review and approve." })
+}
+
+/// The person's words a tool's input quotes asking to start the work now,
+/// when it does.
+fn start_now_of(input: &Value) -> Result<Option<String>, String> {
+    match input.get("start_now") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .get("person_said")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(|w| Some(crew::one_line(w, 300)))
+            .ok_or_else(|| {
+                "start_now quotes the person's own words asking to start the work (person_said)."
+                    .into()
+            }),
+    }
+}
+
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
         "goal": { "type": "string", "description": "What the plan achieves, in the person's terms" },
-        "board": { "type": "string", "description": "A board's prefix, like ACM; your group's when not said" },
+        "board": { "type": "string", "description": "A board you have, by its prefix, like ACM; your group's when neither this nor new_board is said" },
+        "new_board": new_board_schema(),
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12,
             "description": "At most this many of its sessions at once, when fewer than your limit" },
         "budget": budget_schema(),
+        "start_now": start_now_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS }
     }, "required": ["goal", "tickets"] })
 }
@@ -148,10 +211,13 @@ pub fn update_schema() -> Value {
     json!({ "type": "object", "properties": {
         "plan_id": { "type": "string" },
         "revision": { "type": "integer", "description": "The revision you read; a newer one refuses the change" },
+        "board": { "type": "string", "description": "Move the plan to this board of yours (its prefix, like ACM): every ticket of it is re-filed there under a new key, with its needs, links and history" },
+        "new_board": new_board_schema(),
         "goal": { "type": "string" },
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12 },
         "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS },
+        "start_now": start_now_schema(),
         "why": { "type": "string", "description": "Why, in a sentence the person reads" }
     }, "required": ["plan_id", "why"] })
 }
@@ -255,24 +321,68 @@ impl CrewHub {
         }
         match name {
             NAME => self.propose(b, input).await,
+            BOARD_CREATE => self.board_create_tool(b, input).await,
             _ => self.update(b, input).await,
         }
     }
 
-    async fn propose(&self, b: &Bound, input: &Value) -> Result<Value, String> {
-        let o = &b.oversight;
-        let goal = input
-            .get("goal")
+    /// The group `named` (by name or id) among the sidebar's, when the
+    /// boss sees it; the boss's own when nothing is named.
+    fn board_group_of(&self, b: &Bound, named: Option<&str>) -> Result<Option<String>, String> {
+        let own = self.boss_group(&b.service, &b.oversight);
+        let Some(named) = named.map(str::trim).filter(|n| !n.is_empty()) else {
+            return Ok(own);
+        };
+        let found = self
+            .desk
+            .layout()
+            .groups
+            .into_iter()
+            .find(|g| g.id == named || g.name.eq_ignore_ascii_case(named))
+            .map(|g| g.id);
+        match found {
+            Some(g) if b.seen.sees(Some(&g)) => Ok(Some(g)),
+            _ => Err(format!(
+                "{} Name one of your groups, or leave group out for your own.",
+                self.not_ours(&b.oversight.scope)
+            )),
+        }
+    }
+
+    /// The board `new` asks for in the boss's sight: its own with that
+    /// prefix, or one made now.
+    async fn board_made(
+        &self,
+        b: &Bound,
+        new: &Value,
+    ) -> Result<(workforce_desk::board::Board, bool), String> {
+        let name = new
+            .get("name")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|g| !g.is_empty())
-            .ok_or("Say the goal.")?;
-        let tickets = tickets_of(input, &HashMap::new())?;
-        if tickets.iter().any(|t| t.id.is_some()) {
-            return Err("A new plan's tickets have no ids yet.".into());
-        }
-        let board = match input.get("board").and_then(Value::as_str).map(str::trim) {
-            Some(named) if !named.is_empty() => {
+            .filter(|n| !n.is_empty())
+            .ok_or("Say the new board's name.")?;
+        let prefix = new.get("prefix").and_then(Value::as_str);
+        let group = self.board_group_of(b, new.get("group").and_then(Value::as_str))?;
+        self.desk
+            .board_in_group(group.as_deref(), name, prefix)
+            .await
+            .map_err(plain)
+    }
+
+    /// The board a plan tool's input names: `board` (a board the boss
+    /// sees, by its id or prefix) or `new_board` (made now), or none.
+    async fn board_named(&self, b: &Bound, input: &Value) -> Result<Option<uuid::Uuid>, String> {
+        let named = input
+            .get("board")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        let new = input.get("new_board").filter(|v| !v.is_null());
+        match (named, new) {
+            (Some(_), Some(_)) => Err("Say board or new_board, not both.".into()),
+            (None, Some(new)) => Ok(Some(self.board_made(b, new).await?.0.id)),
+            (Some(named), None) => {
                 let found = match named.parse::<Uuid>() {
                     Ok(id) => self.desk.store().board(id).await.ok().flatten(),
                     Err(_) => self
@@ -284,12 +394,68 @@ impl CrewHub {
                         .flatten(),
                 };
                 match found {
-                    Some(board) if b.seen.sees(board.group.as_deref()) => Some(board.id),
-                    _ => return Err(self.not_ours(&o.scope)),
+                    Some(board) if b.seen.sees(board.group.as_deref()) => Ok(Some(board.id)),
+                    // The same words whether it is elsewhere or nowhere,
+                    // with the way to a board of its own.
+                    _ => Err(format!(
+                        "{} To put it on a new board, pass new_board with its name and prefix \
+                         instead of board: Desk makes it in your group.",
+                        self.not_ours(&b.oversight.scope)
+                    )),
                 }
             }
-            _ => None,
-        };
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// `crew.board_create`, for the boss `b`.
+    pub(super) async fn board_create_tool(
+        &self,
+        b: &Bound,
+        input: &Value,
+    ) -> Result<Value, String> {
+        if b.oversight.level == Level::Watch {
+            return Err(format!(
+                "{} only watches; set them to Act to run work.",
+                name_of(&b.service)
+            ));
+        }
+        input
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or("Give the reason: the person reads it in Activity.")?;
+        let (board, made) = self.board_made(b, input).await?;
+        Ok(json!({
+            "board": {
+                "id": board.id.to_string(),
+                "name": board.name,
+                "prefix": board.prefix,
+                "group": board.group,
+            },
+            "made": made,
+            "note": match made {
+                true => "It is on Desk's board view now. Put a plan on it with crew.plan (board: its prefix), or move one there with crew.plan_update.",
+                false => "You have this board already; it is used as it is. Put a plan on it with crew.plan (board: its prefix).",
+            },
+        }))
+    }
+
+    async fn propose(&self, b: &Bound, input: &Value) -> Result<Value, String> {
+        let o = &b.oversight;
+        let goal = input
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .ok_or("Say the goal.")?;
+        let tickets = tickets_of(input, &HashMap::new())?;
+        let start_now = start_now_of(input)?;
+        if tickets.iter().any(|t| t.id.is_some()) {
+            return Err("A new plan's tickets have no ids yet.".into());
+        }
+        let board = self.board_named(b, input).await?;
         let parallel = match input.get("parallel").and_then(Value::as_i64) {
             Some(n) => Some(i16::try_from(n).map_err(|_| "parallel is a number from 1 to 12.")?),
             None => None,
@@ -319,32 +485,45 @@ impl CrewHub {
             .await
             .map_err(plain)?;
         let text = format!(
-            "{} proposes a plan: {}\n\n{}",
+            "{} drafted a plan for you to review: {}\n\n{}",
             boss.name,
             p.summary.plan.goal,
             self.plan_lines(&p)
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
-        // Unbound, it approves its own plan, and Desk starts it.
-        if self.unbound_given(b.service.agent_id.as_str(), &b.oversight) {
-            let by = self.by_at_level(
-                self.by_boss(&b.service, "It approved its own plan."),
-                &b.oversight,
-            );
-            let approved = self
-                .desk
-                .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
-                .await
-                .map_err(plain)?;
+        let unbound = self.unbound_given(b.service.agent_id.as_str(), &b.oversight);
+        // Started only when the person said to start it, and only unbound:
+        // otherwise a draft for them to review.
+        if let (Some(said), true) = (&start_now, unbound) {
+            let approved = self.approve_said(b, &p, said).await?;
             return Ok(json!({
                 "proposed": plan_out(&approved),
-                "note": "You are unbound, so it is approved and Desk starts its ready tickets; the person sees it as a plan card in your DM and on the Floor.",
+                "note": "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
             }));
         }
         Ok(json!({
             "proposed": plan_out(&p),
-            "note": "The person sees it as a plan card in your DM and on the Floor, and approves or edits it there. Nothing of it runs until they approve it; say so briefly.",
+            "note": match start_now.is_some() {
+                true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
+                false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
+            },
         }))
+    }
+
+    /// Approves the newest revision of `p`, the boss `b`'s own, on the
+    /// person's words `said` asking for the work to start.
+    async fn approve_said(
+        &self,
+        b: &Bound,
+        p: &PlanDetail,
+        said: &str,
+    ) -> Result<PlanDetail, String> {
+        let reason = format!("The person said: “{said}”");
+        let by = self.by_at_level(self.by_boss(&b.service, &reason), &b.oversight);
+        self.desk
+            .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
+            .await
+            .map_err(plain)
     }
 
     async fn update(&self, b: &Bound, input: &Value) -> Result<Value, String> {
@@ -376,6 +555,8 @@ impl CrewHub {
             .iter()
             .filter_map(|t| t.ticket.key.clone().map(|k| (k, t.ticket.ticket.id)))
             .collect();
+        // Read before anything changes: one that doesn't read changes nothing.
+        let start_now = start_now_of(input)?;
         let tickets = match input.get("tickets") {
             Some(_) => Some(tickets_of(input, &known)?),
             None => None,
@@ -399,29 +580,123 @@ impl CrewHub {
         };
         let engine = Engine::parse(o.work.engine.trim()).unwrap_or(Engine::Claude);
         let by = self.by_boss(&b.service, why);
-        let asks = o.level == Level::Suggest;
-        let changed: Changed = self
-            .desk
-            .change_plan(id, edit, engine, asks, &by)
-            .await
-            .map_err(plain)?;
         let name = name_of(&b.service);
-        let p = &changed.plan.summary.plan;
-        if changed.change.is_some() {
-            let text = match changed.applied {
-                true => format!("{name} changed the plan: {}", changed.summary),
-                false => format!("{name} proposes a change to the plan: {}", changed.summary),
-            };
-            self.post_plan(&b.service, p, &text).await;
+        let to = self
+            .board_named(b, input)
+            .await?
+            .filter(|to| *to != detail.summary.plan.board);
+        let more = edit.goal.is_some()
+            || edit.parallel.is_some()
+            || edit.tickets.is_some()
+            || edit.budget.is_some();
+        // The change first, by the keys the boss read: the move after it
+        // renumbers them.
+        let changed = match (more, to) {
+            (false, Some(_)) => None,
+            _ => {
+                let asks = o.level == Level::Suggest;
+                let changed: Changed = self
+                    .desk
+                    .change_plan(id, edit, engine, asks, &by)
+                    .await
+                    .map_err(plain)?;
+                let p = &changed.plan.summary.plan;
+                if changed.change.is_some() {
+                    let text = match changed.applied {
+                        true => format!("{name} changed the plan: {}", changed.summary),
+                        false => {
+                            format!("{name} proposes a change to the plan: {}", changed.summary)
+                        }
+                    };
+                    self.post_plan(&b.service, p, &text).await;
+                }
+                Some(changed)
+            }
+        };
+        let change_note = |c: &Changed| match c.applied {
+            true => "It applies now.",
+            false => {
+                "It waits for the person to approve; the plan runs on as approved until they do."
+            }
+        };
+        // Onto another board, at once: where its tickets are filed is no
+        // change of what the person approved.
+        let moved = match to {
+            None => None,
+            Some(to) => {
+                let moved = match self.desk.move_plan(id, to, &by).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let why = plain(e);
+                        return Err(match &changed {
+                            Some(c) => format!(
+                                "The change is made ({}), but the plan didn't move: {why}",
+                                change_note(c)
+                            ),
+                            None => why,
+                        });
+                    }
+                };
+                let board = self
+                    .desk
+                    .store()
+                    .board(to)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "another board".to_string(), |x| x.name);
+                let text = format!(
+                    "{name} moved the plan to {board}:\n\n{}",
+                    self.plan_lines(&moved)
+                );
+                self.post_plan(&b.service, &moved.summary.plan, &text).await;
+                Some((moved, board))
+            }
+        };
+        let change = changed
+            .as_ref()
+            .map_or(Some("board"), |c| c.change.map(|c| c.as_str()));
+        let applied = changed.as_ref().is_none_or(|c| c.applied);
+        let mut note = changed
+            .as_ref()
+            .map(change_note)
+            .unwrap_or_default()
+            .to_string();
+        let now = match (moved, changed) {
+            (Some((m, board)), _) => {
+                note = format!(
+                    "{note} Every ticket of it is on {board} now, under new keys; use those keys from here on."
+                )
+                .trim()
+                .to_string();
+                m
+            }
+            (None, Some(c)) => c.plan,
+            (None, None) => return Err("Say what to change, or which board to move it to.".into()),
+        };
+        // A draft started on the person's word, by an unbound boss.
+        if let Some(said) = start_now {
+            let draft = now.summary.plan.approved_revision.is_none();
+            if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
+                let approved = self.approve_said(b, &now, &said).await?;
+                return Ok(json!({
+                    "plan": plan_out(&approved),
+                    "change": change,
+                    "applied": true,
+                    "note": format!("{note} The person asked you to start it, so it is approved and Desk starts its ready tickets.").trim(),
+                }));
+            }
+            if draft {
+                note = format!("{note} Only the person approves a plan at your level: it waits for them on its card.")
+                    .trim()
+                    .to_string();
+            }
         }
         Ok(json!({
-            "plan": plan_out(&changed.plan),
-            "change": changed.change.map(|c| c.as_str()),
-            "applied": changed.applied,
-            "note": match changed.applied {
-                true => "It applies now.",
-                false => "It waits for the person to approve; the plan runs on as approved until they do.",
-            },
+            "plan": plan_out(&now),
+            "change": change,
+            "applied": applied,
+            "note": note,
         }))
     }
 

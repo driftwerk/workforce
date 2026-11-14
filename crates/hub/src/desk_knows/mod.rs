@@ -27,6 +27,9 @@ pub mod store;
 pub mod sync;
 pub mod tools;
 
+#[cfg(test)]
+mod revoke_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -6,6 +6,12 @@
 //!   Answers it once.
 //! - `DELETE /api/me/desk-knows-tokens/{id}` (the device): revokes one it
 //!   minted. Taken even while `[desk_knows]` is off.
+//! - `DELETE /api/me/desk-knows-tokens/engines/{engine}` (the device): revokes
+//!   every one this device minted for that engine, so a Desk that is taken
+//!   away (a machine removed) shares no more even where it can't be reached.
+//! - `POST /api/desk-knows/revoke` (**the `wfk_` token alone**): the token
+//!   ends itself, for the Desk that held it to unlink the agent. Taken
+//!   whatever the settings say or the person's state: it only narrows.
 //! - `POST /api/desk-knows/push` `{items: [{kind, ref, session?, group?, at,
 //!   body}]}` (**the `wfk_` token alone**): keeps them for the person, the
 //!   agent and the device. At most [`MAX_ITEMS`] items and [`MAX_BODY`]
@@ -358,6 +364,117 @@ pub async fn revoke(
                 "desk_knows.revoke",
                 &t,
                 "device",
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "desk knows token store error");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "token store error")
+        }
+    }
+}
+
+/// `DELETE /api/me/desk-knows-tokens/engines/{engine}`: every live Desk
+/// work token this device minted for `engine`, revoked. Only this device's
+/// own: a token of another device or engine is never reached.
+pub async fn revoke_engine(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(engine): Path<String>,
+) -> Response {
+    let (device, person) = match paired_device(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    if !engine_id_ok(&engine) {
+        return err(StatusCode::BAD_REQUEST, "That isn't an engine's id.");
+    }
+    let store = match tokens(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let held = match store.list_tokens_for_identity(person) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(error = %e, "desk knows token store error");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+        }
+    };
+    let now = Utc::now();
+    let mut revoked = 0u32;
+    let mut failed = false;
+    for t in held.iter().filter(|t| {
+        t.is_live(now)
+            && t.scope() == Some(TokenScope::DeskKnows)
+            && t.minted_by_device() == Some(device.id.as_str())
+            && t.desk_link.as_ref().is_some_and(|l| l.engine_id == engine)
+    }) {
+        match store.revoke_token(t.id, Some(person), now) {
+            Ok(true) => {
+                revoked += 1;
+                crate::boss_links::audit(
+                    state.telemetry_store.as_ref(),
+                    &person.to_string(),
+                    "desk_knows.revoke",
+                    t,
+                    "engine removed",
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "desk knows token store error");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "token store error");
+    }
+    Json(json!({ "revoked": revoked })).into_response()
+}
+
+/// `POST /api/desk-knows/revoke`: the bearer `wfk_` token ends itself. A
+/// token this hub doesn't know, or that has ended, is "unauthorized": to
+/// the Desk that held it, the same as done.
+pub async fn revoke_self(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    let unknown = || {
+        err(
+            StatusCode::UNAUTHORIZED,
+            "This hub doesn't know that token, or it has ended.",
+        )
+    };
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| t.starts_with(DESK_KNOWS_TOKEN_PREFIX))
+    else {
+        return unknown();
+    };
+    let store = match tokens(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let now = Utc::now();
+    let token = match store.get_token_by_hash(&remote_mcp_token::hash_token(presented)) {
+        Ok(Some(t)) if t.is_live(now) && t.scope() == Some(TokenScope::DeskKnows) => t,
+        Ok(_) => return unknown(),
+        Err(e) => {
+            warn!(error = %e, "desk knows token lookup failed");
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This hub couldn't check that token; try again.",
+            );
+        }
+    };
+    match store.revoke_token(token.id, Some(token.identity_id), now) {
+        Ok(_) => {
+            crate::boss_links::audit(
+                state.telemetry_store.as_ref(),
+                &token.identity_id.to_string(),
+                "desk_knows.revoke",
+                &token,
+                "unlinked",
             );
             StatusCode::NO_CONTENT.into_response()
         }
