@@ -569,58 +569,119 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
     .await;
 }
 
-/// The page the stand-in Devin's login draws; its host is `devin-host`'s
-/// when the test wrote one (a lookalike).
-const DEVIN_PAGE: &str =
-    "https://app.devin.ai/auth/cli/continue?redirect_uri=chisel-show-auth-token&state=s1&prompt=select_account&code_challenge=c1&code_challenge_method=S256";
-/// The token the stand-in takes: it signs in only when given exactly this.
+/// The page Devin 3000.12.57 shows with no browser, as recorded
+/// (fixtures/devin/3-manual.bin; its state and challenge replaced).
+const DEVIN_PAGE: &str = "https://app.devin.ai/auth/cli/continue?state=Zx8q3V1kQ2&prompt=select_account&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1";
+/// The code the stand-in takes: it signs in only when given exactly this.
 const DEVIN_TOKEN: &str = "devin-pasted-Qm9vbXNoYWthbGFrYQ-7f3a9c";
 
-/// A stand-in Devin: says its version, and its sign-in as `devin auth
-/// status` does (signed in once `devin-in` is there; by a key, if one
-/// reached it). `auth login` draws its page and waits for the test to
-/// approve or refuse it; with `--force-manual-token-flow`, it reads the
-/// token (the terminal echoes it), draws it again itself, and signs in
-/// only by [`DEVIN_TOKEN`], ignoring a hang-up meanwhile, as does the
+/// What Devin 3000.12.57 prints, recorded.
+const DEVIN_PICKER: &[u8] = include_bytes!("../../fixtures/devin/1-picker.bin");
+const DEVIN_BROWSER: &[u8] = include_bytes!("../../fixtures/devin/2-browser.bin");
+const DEVIN_MANUAL: &[u8] = include_bytes!("../../fixtures/devin/3-manual.bin");
+const DEVIN_STATUS_IN: &[u8] = include_bytes!("../../fixtures/devin/4-status-in.txt");
+const DEVIN_STATUS_OUT: &[u8] = include_bytes!("../../fixtures/devin/5-status-out.txt");
+
+/// The terminal's answers to Devin's colour queries (OSC 10, then 11).
+const COLOURS: &[u8] = b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\";
+
+/// A stand-in Devin, printing the recorded bytes of 3000.12.57 (their
+/// files in `dir`, which a test may change) and, like it, waiting for the
+/// terminal's answers to its queries before it goes on: each one checked
+/// byte for byte. Its sign-in reads as `devin auth status` does (signed in
+/// once `devin-in` is there; by a key, if one reached it).
+///
+/// `auth login` asks the kitty flags and DA1, draws its picker, takes one
+/// key (kept in `got-key`; Enter only goes on), then waits in the browser
+/// until the test writes `devin-approved` (it signs in), `devin-refused`
+/// (it ends) or `devin-no-code` (it says it received no authorization
+/// code). With `--force-manual-token-flow` it draws its page and Code
+/// prompt, reads the code in raw mode, drawing each key itself, and signs
+/// in only by [`DEVIN_TOKEN`], ignoring a hang-up meanwhile, as does the
 /// child it starts (both pids in `login-pids`); with `child-traps` there,
-/// only the child ignores it. Its environment is kept in
-/// `login-env`.
+/// only the child ignores it. Its environment is kept in `login-env`.
 fn devin(dir: &Path) -> PathBuf {
+    let files: [(&str, Vec<u8>); 9] = [
+        ("picker.bin", DEVIN_PICKER.to_vec()),
+        (
+            "picker-answers",
+            [b"\x1b[?0u\x1b[?1;2c", COLOURS, COLOURS].concat(),
+        ),
+        ("browser-wait.bin", devin_browser().0.to_vec()),
+        ("browser-done.bin", devin_browser().1.to_vec()),
+        ("colours", COLOURS.to_vec()),
+        ("colours-twice", COLOURS.repeat(2)),
+        ("manual.bin", DEVIN_MANUAL.to_vec()),
+        ("status-in.txt", DEVIN_STATUS_IN.to_vec()),
+        ("status-out.txt", DEVIN_STATUS_OUT.to_vec()),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
     let path = dir.join("devin");
     let d = dir.display();
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\ncase \"$1 $2\" in\n\
-             '--version ') echo 'devin 3000.12.57' ;;\n\
+            "#!/bin/sh\n\
+             answered() {{ dd bs=1 count=$(wc -c < \"$1\") 2>/dev/null > '{d}/got'; cmp -s '{d}/got' \"$1\" || exit 4; }}\n\
+             case \"$1 $2\" in\n\
+             '--version ') echo 'devin 3000.12.57 (96542e930752)' ;;\n\
              'auth status') if [ -n \"$WINDSURF_API_KEY\" ]; then echo 'Logged in with provided API key.'\n\
-               elif [ -e '{d}/devin-in' ]; then echo 'Logged in as kim@example.com (via browser)'; echo '  Credentials path: {d}/credentials.toml'\n\
-               else echo 'Not logged in.'; echo '  Credentials path: {d}/credentials.toml'; fi ;;\n\
-             'auth login') page='{DEVIN_PAGE}'; env > '{d}/login-env'\n\
-               [ -e '{d}/devin-host' ] && page=$(echo \"$page\" | sed \"s/app.devin.ai/$(cat '{d}/devin-host')/\")\n\
+               elif [ -e '{d}/devin-in' ]; then cat '{d}/status-in.txt'\n\
+               else cat '{d}/status-out.txt'; fi ;;\n\
+             'auth login') env > '{d}/login-env'; stty raw -echo\n\
                if [ \"$3\" = '--force-manual-token-flow' ]; then\n\
                  if [ -e '{d}/child-traps' ]; then (trap '' HUP; exec sleep 30) </dev/null >/dev/null 2>&1 &\n\
                  else trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & fi\n\
                  echo \"$$ $!\" > '{d}/login-pids'\n\
-                 echo 'Open this page on any computer and sign in:'\n\
-                 echo \"   $page\"\n\
-                 printf 'Paste the token shown on the page: '\n\
-                 read -r token\n\
-                 echo \"Checking token $token\"\n\
+                 cat '{d}/manual.bin'; answered '{d}/colours-twice'\n\
+                 cr=$(printf '\\r'); token=''\n\
+                 while :; do c=$(dd bs=1 count=1 2>/dev/null); [ -n \"$c\" ] || exit 1\n\
+                   [ \"$c\" = \"$cr\" ] && break; token=\"$token$c\"; printf '%s' \"$c\"; done\n\
+                 printf '\\r\\nChecking code %s\\r\\n' \"$token\"\n\
                  sleep 1\n\
                  [ \"$token\" = '{DEVIN_TOKEN}' ] || exit 1\n\
-                 touch '{d}/devin-in'; exit 0\n\
+                 touch '{d}/devin-in'; printf 'Login successful! Credentials stored.\\r\\n'; exit 0\n\
                fi\n\
-               echo \"Opening $page in your browser...\"\n\
-               while [ ! -e '{d}/devin-approved' ] && [ ! -e '{d}/devin-refused' ]; do sleep 0.05; done\n\
+               printf '\\033[?u\\033[c'; cat '{d}/picker.bin'; answered '{d}/picker-answers'\n\
+               dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' \\n' > '{d}/got-key'\n\
+               [ \"$(cat '{d}/got-key')\" = '\\r' ] || exit 3\n\
+               cat '{d}/browser-wait.bin'; answered '{d}/colours'\n\
+               while [ ! -e '{d}/devin-approved' ] && [ ! -e '{d}/devin-refused' ] && [ ! -e '{d}/devin-no-code' ]; do sleep 0.05; done\n\
+               if [ -e '{d}/devin-no-code' ]; then printf '\\r\\nError: Failed to receive authorization code\\r\\n'; sleep 30; fi\n\
                [ -e '{d}/devin-approved' ] || exit 1\n\
-               touch '{d}/devin-in' ;;\n\
+               touch '{d}/devin-in'; cat '{d}/browser-done.bin'; answered '{d}/colours' ;;\n\
              esac\n"
         ),
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// The recorded browser login, cut where it waits for the person: its
+/// waiting, and its verifying and signing in.
+fn devin_browser() -> (&'static [u8], &'static [u8]) {
+    let at = DEVIN_BROWSER
+        .windows(5)
+        .rposition(|w| w == b"\x1b[<1u")
+        .unwrap();
+    let at = DEVIN_BROWSER[..at]
+        .windows(5)
+        .rposition(|w| w == b"\x1b[<1u")
+        .unwrap();
+    DEVIN_BROWSER.split_at(at)
+}
+
+/// Why Devin's sign-in `id` failed, once it has.
+async fn devin_failed(d: &Desk, id: Uuid) -> String {
+    use super::engine_sign_ins::EngineSignInState;
+    until(|| match d.engine_sign_in(id).unwrap().state {
+        EngineSignInState::Failed { why } => Some(why),
+        _ => None,
+    })
+    .await
 }
 
 /// What Desk says of Devin's sign-in on this computer now.
@@ -670,7 +731,7 @@ fn leaked(text: &str, secret: &str) -> Vec<String> {
 
 // One thread, so everything the desk spawns logs to the subscriber set here.
 #[tokio::test(flavor = "current_thread")]
-async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
+async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
     use super::engine_sign_ins::EngineSignInState;
     let log = Captured::default();
     let _logging = tracing::subscriber::set_default(
@@ -801,6 +862,16 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
             "the log was caught: {seen} events, {logged}"
         );
         assert!(leaked(&logged, DEVIN_TOKEN).is_empty(), "{logged}");
+        // Each step once, its page by scheme, host and path alone; never
+        // its query, nor whom it signed in.
+        assert!(
+            logged.contains("page=\"https://app.devin.ai/auth/cli/continue\""),
+            "{logged}"
+        );
+        assert_eq!(logged.matches("step=\"paste\"").count(), 1, "{logged}");
+        for never in ["state=Zx8", "code_challenge", "kim@example.com", "?state"] {
+            assert!(!logged.contains(never), "{never}: {logged}");
+        }
 
         // One that is turned away says so in plain words.
         let again = d.start_engine_sign_in(Engine::Devin, true).unwrap();
@@ -872,58 +943,105 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
 }
 
 #[tokio::test]
-async fn devin_signs_in_by_its_own_page_and_never_by_a_lookalike() {
-    use super::engine_sign_ins::EngineSignInState;
+async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
+    use super::engine_sign_ins::{self as sign_ins, EngineSignInState};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
         o.programs.insert(Engine::Devin, devin(dir.path()));
-        o.programs.insert(Engine::Codex, codex(dir.path()));
         let d = desk(pool, o).await;
         let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
-        let started = d.start_engine_sign_in(Engine::Devin, false).unwrap();
         let state = |id| d.engine_sign_in(id).unwrap().state;
-        let url = until(|| match state(started.id) {
-            EngineSignInState::Page { url } => Some(url),
-            _ => None,
-        })
+        until(|| (devin_signed_in(&d) == crate::engine::SignIn::Out).then_some(())).await;
+
+        // Its picker answered with Enter, once its queries are: it waits in
+        // the browser it opened, with no page to show.
+        let started = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+        until(|| (state(started.id) == EngineSignInState::browser()).then_some(())).await;
+        let (code, view) = api(
+            &app,
+            "GET",
+            &format!("/api/desk/engines/sign-ins/{}", started.id),
+            None,
+        )
         .await;
-        assert_eq!(url, DEVIN_PAGE);
-        // A page Devin finishes by itself takes no token; nor does Codex's.
+        assert_eq!(code, 200);
+        assert_eq!(
+            view,
+            serde_json::json!({
+                "id": started.id,
+                "engine": "devin",
+                "state": "browser",
+                "say": sign_ins::DEVIN_IN_BROWSER,
+                "instead": sign_ins::DEVIN_PASTE_INSTEAD,
+            })
+        );
+        let key = || std::fs::read_to_string(dir.path().join("got-key")).unwrap_or_default();
+        let pressed = until(|| Some(key()).filter(|k| !k.is_empty())).await;
+        assert_eq!(pressed, "\\r", "Enter, once");
+        // A sign-in in the browser takes no code.
         let (code, _) = api(
             &app,
             "POST",
             &format!("/api/desk/engines/sign-ins/{}/token", started.id),
-            Some(serde_json::json!({"token": DEVIN_TOKEN})),
+            Some(serde_json::json!({"code": DEVIN_TOKEN})),
         )
         .await;
         assert_eq!(code, 409);
-        let codex = d.start_engine_sign_in(Engine::Codex, true).unwrap();
-        until(|| matches!(state(codex.id), EngineSignInState::Device { .. }).then_some(())).await;
-        assert!(matches!(
-            d.engine_sign_in_token(codex.id, DEVIN_TOKEN),
-            Err(DeskError::Conflict(_))
-        ));
-        d.cancel_engine_sign_in(codex.id).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            state(started.id),
+            EngineSignInState::browser(),
+            "still waiting"
+        );
 
+        // Signed in there: done, and read again at once, as who.
         std::fs::write(dir.path().join("devin-approved"), "").unwrap();
         until(|| (state(started.id) == EngineSignInState::Done).then_some(())).await;
-        until(|| matches!(devin_signed_in(&d), crate::engine::SignIn::In { .. }).then_some(()))
-            .await;
+        assert!(matches!(
+            devin_signed_in(&d),
+            crate::engine::SignIn::In { who: Some(w), .. } if w == "kim@example.com"
+        ));
 
-        // A page on another host is never shown, and the sign-in says why it ended.
+        // The browser's answer never came: said in plain words, the CLI ended.
         std::fs::remove_file(dir.path().join("devin-approved")).unwrap();
-        std::fs::write(dir.path().join("devin-host"), "app.devin.ai.evil.example").unwrap();
-        let lookalike = d.start_engine_sign_in(Engine::Devin, false).unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(state(lookalike.id), EngineSignInState::Starting);
-        std::fs::write(dir.path().join("devin-refused"), "").unwrap();
-        let why = until(|| match state(lookalike.id) {
-            EngineSignInState::Failed { why } => Some(why),
-            _ => None,
-        })
-        .await;
-        assert_eq!(why, super::engine_sign_ins::DEVIN_NO_PAGE);
+        std::fs::remove_file(dir.path().join("devin-in")).unwrap();
+        std::fs::write(dir.path().join("devin-no-code"), "").unwrap();
+        let lost = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+        assert_eq!(devin_failed(&d, lost.id).await, sign_ins::DEVIN_NO_ANSWER);
+        std::fs::remove_file(dir.path().join("devin-no-code")).unwrap();
+
+        // A picker Desk doesn't know: never answered, and said plainly.
+        for changed in [
+            String::from_utf8(DEVIN_PICKER.to_vec())
+                .unwrap()
+                .replace("1 Log in with browser", "1 Log in with Windsurf"),
+            String::from_utf8(DEVIN_PICKER.to_vec())
+                .unwrap()
+                .replace(" \u{276d} 1 Log", "   1 Log")
+                .replace("   3 Log", " \u{276d} 3 Log"),
+        ] {
+            std::fs::write(dir.path().join("picker.bin"), changed).unwrap();
+            let _ = std::fs::remove_file(dir.path().join("got-key"));
+            let asked = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+            assert_eq!(
+                devin_failed(&d, asked.id).await,
+                sign_ins::DEVIN_ASKED_UNKNOWN
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(key(), "", "no key was pressed for it");
+        }
+
+        // With no browser, a page on another host is never shown.
+        let lookalike = String::from_utf8(DEVIN_MANUAL.to_vec())
+            .unwrap()
+            .replace("app.devin.ai", "app.devin.ai.evil.example");
+        std::fs::write(dir.path().join("manual.bin"), lookalike).unwrap();
+        let manual = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        assert_eq!(
+            devin_failed(&d, manual.id).await,
+            sign_ins::DEVIN_PAGE_UNKNOWN
+        );
         assert!(
             d.start_engine_sign_in(Engine::Gemini, false).is_err(),
             "Gemini signs in another way"

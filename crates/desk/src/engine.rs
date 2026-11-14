@@ -630,11 +630,14 @@ pub fn devin_sign_in(env: &BTreeMap<String, String>, exists: impl Fn(&Path) -> b
 }
 
 /// `devin auth status`, on stdout or stderr. Signed out it says
-/// `Not logged in.` (and where its credentials would be); signed in, a
-/// line saying it is logged in, which may name the account's email. Only
-/// that email is kept: never the credentials path, the servers or the
-/// organization it prints beside it. Anything else is [`SignIn::Unknown`],
-/// for the caller to read the credentials file instead ([`devin_sign_in`]).
+/// `Not logged in.` (and where its credentials would be); signed in,
+/// 3000.12.57 says `Logged in (via Devin).`, then sections (`Credentials:`,
+/// `User:`, `Account:`, …) of `Key: value` lines, the account's email the
+/// `Email:` of its `User:` section; a line saying it is logged in may name
+/// the email too. Only that email is kept: never the credentials path, the
+/// servers, the team or the organization it prints beside it. Anything
+/// else is [`SignIn::Unknown`], for the caller to read the credentials
+/// file instead ([`devin_sign_in`]).
 pub fn devin_status_sign_in(status: &str) -> SignIn {
     let lines: Vec<String> = status.lines().map(plain_line).collect();
     if lines
@@ -649,18 +652,46 @@ pub fn devin_status_sign_in(status: &str) -> SignIn {
     else {
         return SignIn::Unknown;
     };
+    let on_its_line = said
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\'' | '`')
+        })
+        .map(|w| w.trim_end_matches(['.', ':', ';']))
+        .find(|w| email_like(w))
+        .map(str::to_string);
     SignIn::In {
         via: Via::Vendor,
-        who: said
-            .split(|c: char| {
-                c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\'' | '`')
-            })
-            .map(|w| w.trim_end_matches(['.', ':', ';']))
-            .find(|w| email_like(w))
-            .map(str::to_string),
+        who: on_its_line.or_else(|| devin_user_email(status)),
         plan: None,
         ids: Vec::new(),
     }
+}
+
+/// The `Email:` of `devin auth status`'s `User:` section (a section is
+/// its unindented `Name:` line and the indented lines under it), when it
+/// reads as an email and nothing else.
+fn devin_user_email(status: &str) -> Option<String> {
+    let mut in_user = false;
+    for line in status.lines() {
+        let plain = crate::pty::plain_text(line.as_bytes());
+        if plain.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            in_user = plain.trim().eq_ignore_ascii_case("user:");
+            continue;
+        }
+        if !in_user {
+            continue;
+        }
+        if let Some((key, value)) = plain.trim().split_once(':') {
+            let value = value.trim();
+            if key.trim().eq_ignore_ascii_case("email") && email_like(value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// A status line lowercased, without colour codes or a leading mark
@@ -985,19 +1016,60 @@ mod tests {
     }
 
     /// `devin auth status` signed out, as CLI 3000.12.57 printed it.
-    const DEVIN_OUT: &str = "Not logged in. Run `devin auth login` to authenticate.\n  Credentials path: /home/kim/.local/share/devin/credentials.toml\n";
-    /// Signed in. TO SWAP for the real capture (design §9 Q1): this is
-    /// pieced together from the lines the 3000.12.57 binary holds
-    /// (`Logged in (via `, `File:`, `API server:`, `Devin webapp:`,
-    /// `Devin API:`, `Organization:`), and names no account.
+    const DEVIN_OUT: &str = include_str!("../fixtures/devin/5-status-out.txt");
+    /// Signed in, as CLI 3000.12.57 printed it (personal values replaced).
+    const DEVIN_STATUS_IN: &str = include_str!("../fixtures/devin/4-status-in.txt");
+    /// Signed in, pieced together from the lines the 3000.12.57 binary
+    /// holds (`Logged in (via `, `File:`, `API server:`, `Devin webapp:`,
+    /// `Devin API:`, `Organization:`), naming no account but an
+    /// organization's address.
     const DEVIN_IN: &str = "\x1b[32m✓\x1b[0m Logged in (via browser)\n  File:              /home/kim/.local/share/devin/credentials.toml\n  API server:        https://server.codeium.com\n  Devin webapp:      https://app.devin.ai\n  Devin API:         https://api.devin.ai\n  Organization:      ops@acme.example\n  Credentials path:  /home/kim+x@host.example/credentials.toml\n";
     /// Signed in, naming the account on its logged-in line (`Logged in as `
-    /// is in the binary too). TO SWAP for the real capture as well.
+    /// is in the binary too).
     const DEVIN_IN_AS: &str = "Logged in as kim@example.com (via browser)\n  Organization:      Acme\n  Credentials path:  /home/kim/.local/share/devin/credentials.toml\n";
 
     #[test]
     fn devins_status_says_out_in_and_only_ever_the_email_it_is_signed_in_as() {
         assert_eq!(devin_status_sign_in(DEVIN_OUT), SignIn::Out);
+        assert_eq!(
+            devin_status_sign_in("Not logged in. Run `devin auth login` to authenticate.\n"),
+            SignIn::Out
+        );
+        // As 3000.12.57 says it: the email of its User section, nothing else.
+        assert_eq!(
+            devin_status_sign_in(DEVIN_STATUS_IN),
+            SignIn::In {
+                via: Via::Vendor,
+                who: Some("kim@example.com".into()),
+                plan: None,
+                ids: Vec::new(),
+            }
+        );
+        let elsewhere: String = DEVIN_STATUS_IN
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("Email:"))
+            .map(|l| match l.trim_start().starts_with("Team ID:") {
+                true => format!("  Email:   ops@acme.example\n{l}\n"),
+                false => format!("{l}\n"),
+            })
+            .collect();
+        assert!(
+            matches!(
+                devin_status_sign_in(&elsewhere),
+                SignIn::In { who: None, .. }
+            ),
+            "an email outside its User section is never who"
+        );
+        let view = serde_json::to_string(&devin_status_sign_in(DEVIN_STATUS_IN)).unwrap();
+        for never in [
+            "credentials",
+            "Kim Example",
+            "user-0000",
+            "devin-team",
+            "Free",
+        ] {
+            assert!(!view.contains(never), "{view}");
+        }
         let SignIn::In {
             via,
             who,

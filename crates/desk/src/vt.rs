@@ -50,6 +50,24 @@ fn rgb(hex: &str) -> Option<[u8; 3]> {
 }
 
 impl Colors {
+    /// White on black, xterm's own 16: what a terminal no one is shown
+    /// answers with ([`crate::pty::Pty::spawn_unseen`]).
+    pub fn white_on_black() -> Self {
+        Self {
+            foreground: "#ffffff".into(),
+            background: "#000000".into(),
+            cursor: "#ffffff".into(),
+            ansi: [
+                "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd",
+                "#e5e5e5", "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff",
+                "#00ffff", "#ffffff",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ground: Ground::Dark,
+        }
+    }
+
     /// Whether every colour is `#RRGGBB` and there are 16 ANSI ones.
     pub fn check(&self) -> Result<(), String> {
         if self.ansi.len() != 16 {
@@ -145,6 +163,9 @@ struct Tracker {
     cwd: Option<String>,
     /// The colours it answers colour queries with; none, it doesn't.
     palette: Option<Palette>,
+    /// It answers the kitty keyboard query (`CSI ? u`), as no flags set: a
+    /// terminal no one is shown, whose program waits for the answer.
+    kitty_query: bool,
 }
 
 impl Tracker {
@@ -321,6 +342,11 @@ impl Callbacks for Tracker {
             (Some(b'>'), None, 'm') if first(params, 0) == Some(4) => {
                 self.modify_other_keys = first(params, 1).filter(|&n| n > 0);
             }
+            // The kitty keyboard query, on a terminal no one is shown: no
+            // flags, so the program reads plain keys from it.
+            (Some(b'?'), None, 'u') if self.kitty_query => {
+                self.replies.extend_from_slice(b"\x1b[?0u");
+            }
             // XTVERSION (`CSI > q`), the kitty keyboard query (`CSI ? u`) and
             // the rest go unanswered, as xterm.js leaves them: the DA1 a
             // program sends after them tells it they aren't supported.
@@ -403,6 +429,14 @@ impl Term {
             ),
             esc_pending: false,
         }
+    }
+
+    /// It answers the kitty keyboard query (`CSI ? u`) with no flags set,
+    /// unlike xterm.js: for a terminal no one is shown, whose program waits
+    /// for every answer (Devin's login).
+    pub fn answering_kitty(mut self) -> Self {
+        self.parser.callbacks_mut().kitty_query = true;
+        self
     }
 
     /// Whether the program asked to be told when the terminal turns light

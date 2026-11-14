@@ -354,7 +354,7 @@ async fn engines_read(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 #[derive(Deserialize)]
 struct EngineBody {
     engine: crate::engine::Engine,
-    /// Devin's flow for a computer with no browser: a token pasted back
+    /// Devin's flow for a computer with no browser: a code pasted back
     /// from the page. Codex has only the one.
     #[serde(default)]
     manual: bool,
@@ -362,7 +362,9 @@ struct EngineBody {
 
 /// Signs an engine's own CLI in on a terminal of the hub's own (Codex's
 /// device sign-in, Devin's login): the page to open, and the code to type
-/// there or whether to paste back the token it gives, once it shows them.
+/// there or whether to paste back the code it gives, once it shows them;
+/// or, for Devin's login on this computer, that it waits in the browser it
+/// opened itself (`browser`).
 async fn start_engine_sign_in(
     State(s): S,
     h: HeaderMap,
@@ -381,13 +383,15 @@ async fn engine_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
     s.desk.engine_sign_in(id).map(Json).into_response()
 }
 
-/// The token a sign-in's page gave, never kept or logged.
+/// The code a sign-in's page gave (`token`, or `code`), never kept or
+/// logged.
 #[derive(Deserialize)]
 struct TokenBody {
+    #[serde(alias = "code")]
     token: String,
 }
 
-/// The token Devin's page gave, typed into the sign-in waiting for it;
+/// The code Devin's page gave, typed into the sign-in waiting for it;
 /// 409 when that sign-in isn't waiting for one.
 async fn engine_sign_in_token(
     State(s): S,

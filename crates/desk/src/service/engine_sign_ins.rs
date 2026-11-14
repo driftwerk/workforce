@@ -4,16 +4,28 @@
 //! - Codex's device sign-in (`codex login --device-auth`): the page and
 //!   the one-time code to type there, which Desk shows on the person's own
 //!   computer.
-//! - Devin's login (`devin auth login`): the page, which Devin may open
-//!   itself too; the CLI finishes by itself once the person signs in there.
-//!   On a computer with no browser (`--force-manual-token-flow`) the page
-//!   gives a token, which the person pastes into Desk and Desk types into
-//!   the CLI. That token is kept nowhere: not in a log, an event, this
-//!   sign-in's view, or the screen, which is blinded (its output dropped
-//!   unread) before Desk can be given a token, and wiped besides.
+//! - Devin's login (`devin auth login`): 3000.12.57 first asks how to log
+//!   in. Desk answers its exact picker, and only that, with Enter (its
+//!   first option, the browser); Devin opens the page in the browser
+//!   itself, shows no address, and finishes once the person signs in there
+//!   ([`EngineSignInState::Browser`]). Anything else it asks ends the
+//!   sign-in in plain words. With no browser (`--force-manual-token-flow`)
+//!   it shows its page, which gives a code; the person pastes that into
+//!   Desk and Desk types it into the CLI. That code is kept nowhere: not in
+//!   a log, an event, this sign-in's view, or the screen, which is blinded
+//!   (its output dropped unread) before Desk can be given a code, and wiped
+//!   besides.
+//!
+//! The CLI's terminal is one no one is shown ([`Pty::spawn_unseen`]): the
+//! hub answers every query its CLI waits on (colours, kitty keyboard
+//! flags, cursor, device), or Devin never goes on past its picker.
 //!
 //! The CLI keeps the sign-in where its sessions read it. Nothing it signs
-//! in with passes through Desk but a pasted token, on its way to the CLI.
+//! in with passes through Desk but a pasted code, on its way to the CLI.
+//!
+//! Every step a sign-in takes, and how it ended, is one log line: the
+//! engine, the step, and (ended) why, with a page only ever as its scheme,
+//! host and path; never a code, a token, a query or an email.
 //!
 //! A code is shown to the person, never logged or announced: Desk reads it
 //! by asking for this sign-in.
@@ -29,6 +41,9 @@ use crate::pty::{Pty, Spawn};
 
 /// How long a sign-in may take: Codex's code lasts 15 minutes.
 const SIGN_IN_FOR: Duration = Duration::from_secs(16 * 60);
+/// How long Devin's login may take to show something Desk knows (its
+/// picker, or its page): well inside the 30 s Desk waits for a first step.
+const DEVIN_SHOWS_IN: Duration = Duration::from_secs(20);
 /// How often its screen is read.
 const SIGN_IN_EVERY: Duration = Duration::from_millis(250);
 const SIGN_IN_COLS: u16 = 400;
@@ -49,7 +64,16 @@ pub enum EngineSignInState {
     Page {
         url: String,
     },
-    /// Open `url` on the person's own computer, then paste the token it
+    /// The CLI opened its sign-in page in this computer's browser itself,
+    /// and finishes once the person signs in there: there is no address to
+    /// show. `say` is what to tell the person ([`DEVIN_IN_BROWSER`]),
+    /// `instead` the action beside it ([`DEVIN_PASTE_INSTEAD`]), which
+    /// starts a new sign-in, `manual` (ending this one).
+    Browser {
+        say: String,
+        instead: String,
+    },
+    /// Open `url` on the person's own computer, then paste the code it
     /// gives ([`Desk::engine_sign_in_token`]).
     Paste {
         url: String,
@@ -61,8 +85,66 @@ pub enum EngineSignInState {
 }
 
 impl EngineSignInState {
+    /// Waiting in the browser Devin opened, said as Desk says it.
+    pub fn browser() -> Self {
+        Self::Browser {
+            say: DEVIN_IN_BROWSER.into(),
+            instead: DEVIN_PASTE_INSTEAD.into(),
+        }
+    }
+
     fn is_over(&self) -> bool {
         matches!(self, Self::Done | Self::Failed { .. })
+    }
+
+    /// Its step, as the wire names it.
+    fn step(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Device { .. } => "device",
+            Self::Page { .. } => "page",
+            Self::Browser { .. } => "browser",
+            Self::Paste { .. } => "paste",
+            Self::Done => "done",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The page it shows, as a log may say it: its scheme, host and path,
+    /// never its query (the login's state and challenge).
+    fn page(&self) -> Option<String> {
+        let (Self::Device { url, .. } | Self::Page { url } | Self::Paste { url }) = self else {
+            return None;
+        };
+        let page = url::Url::parse(url).ok()?;
+        Some(format!(
+            "{}://{}{}",
+            page.scheme(),
+            page.host_str().unwrap_or_default(),
+            page.path()
+        ))
+    }
+}
+
+/// How a sign-in ended, and why, for its one log line.
+struct Ended {
+    state: EngineSignInState,
+    reason: &'static str,
+}
+
+impl Ended {
+    fn done(reason: &'static str) -> Self {
+        Self {
+            state: EngineSignInState::Done,
+            reason,
+        }
+    }
+
+    fn failed(why: &str, reason: &'static str) -> Self {
+        Self {
+            state: EngineSignInState::Failed { why: why.into() },
+            reason,
+        }
     }
 }
 
@@ -82,8 +164,13 @@ pub(super) struct EngineSignInRun {
     pty: Option<Arc<Pty>>,
     /// It was asked for the flow with no browser.
     manual: bool,
-    /// A token was typed into it.
+    /// A code was typed into it.
     typed: bool,
+    /// Devin's picker was seen whole at the last look: Enter waits for a
+    /// second, so the answers to the queries it drew it with are sent first.
+    picker_seen: bool,
+    /// Devin's picker was answered (Enter, once): never again.
+    entered: bool,
 }
 
 /// What a person reads when the device sign-in ended without signing in.
@@ -96,12 +183,37 @@ pub const DEVICE_REFUSED: &str =
 /// What a person reads when Devin's login ended without signing in.
 pub const DEVIN_FAILED: &str =
     "Devin's sign-in didn't finish. Start it again, and sign in on the page before it times out.";
-/// What they read when Devin turned the pasted token away.
+/// What they read when Devin turned the pasted code away.
 pub const DEVIN_TOKEN_FAILED: &str =
-    "Devin didn't take that token. Start the sign-in again, and paste the token the page gives you.";
+    "Devin didn't take that code. Start the sign-in again, and paste the code the page gives you.";
 /// What they read when Devin's login ended before showing its page.
 pub const DEVIN_NO_PAGE: &str =
     "Devin's sign-in ended before it showed a page to sign in on. Start it again.";
+/// What they read while Devin waits for them in the browser it opened
+/// ([`EngineSignInState::Browser`]), [`DEVIN_PASTE_INSTEAD`] beside it.
+pub const DEVIN_IN_BROWSER: &str = "Finish signing in in the browser window Devin opened.";
+/// The way out of [`EngineSignInState::Browser`]: a new sign-in, `manual`.
+pub const DEVIN_PASTE_INSTEAD: &str = "Paste a code instead";
+/// What they read when Devin's login asked something Desk doesn't answer
+/// (a changed picker, an enterprise prompt), or showed nothing Desk knows.
+pub const DEVIN_ASKED_UNKNOWN: &str = "Devin's sign-in asked something Desk doesn't know yet. Paste a code instead, or sign in in a terminal with `devin auth login`.";
+/// What they read when Devin, with no browser, showed a prompt but no page
+/// Desk trusts.
+pub const DEVIN_PAGE_UNKNOWN: &str = "Devin's sign-in showed no page Desk knows to sign in on. Sign in in a terminal with `devin auth login`.";
+/// Devin couldn't listen for the browser's answer on this computer.
+pub const DEVIN_NO_CALLBACK: &str = "Devin couldn't start its sign-in on this computer: another app may be using what it needs. Paste a code instead, or sign in in a terminal with `devin auth login`.";
+/// The browser's answer never reached Devin.
+pub const DEVIN_NO_ANSWER: &str =
+    "Devin didn't hear back from the browser. Start the sign-in again, or paste a code instead.";
+/// Devin's servers turned the sign-in away.
+pub const DEVIN_EXCHANGE_FAILED: &str =
+    "Devin's servers didn't finish the sign-in. Start it again in a minute.";
+/// The whole sign-in ran past [`SIGN_IN_FOR`].
+pub const DEVIN_TIMED_OUT: &str =
+    "Devin's sign-in timed out. Start it again, and finish signing in within 15 minutes.";
+/// Devin said it signed in, but `devin auth status` doesn't say so.
+pub const DEVIN_NOT_CONFIRMED: &str =
+    "Devin said it signed in, but it doesn't say so now. Start the sign-in again.";
 
 /// What `codex login --device-auth` shows, read from its screen.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -122,10 +234,12 @@ pub const DEVICE_PAGES: &[crate::engine_accounts::SignInPage] =
         query: false,
     }];
 
-/// Devin's login pages, as the 3000.12.57 binary builds them (not yet seen
-/// signed in; design §9 Q1): its web app's
-/// `https://app.devin.ai/auth/cli/continue?redirect_uri=…&state=…&code_challenge=…`,
-/// and Windsurf's `https://windsurf.com/windsurf/signin?response_type=token&…`.
+/// Devin's login pages: its web app's, as 3000.12.57 shows it with no
+/// browser
+/// (`https://app.devin.ai/auth/cli/continue?state=…&prompt=select_account&code_challenge=…&code_challenge_method=S256&cli_pkce_marker=1`,
+/// no `redirect_uri`), and Windsurf's
+/// `https://windsurf.com/windsurf/signin?response_type=token&…`, which its
+/// binary holds.
 /// The query is the login's own (its state and PKCE challenge); nothing
 /// else on those hosts, and no enterprise or beta host, is ever one.
 pub const DEVIN_PAGES: &[crate::engine_accounts::SignInPage] = &[
@@ -146,17 +260,58 @@ pub const DEVIN_PAGES: &[crate::engine_accounts::SignInPage] = &[
 pub struct DevinSaid {
     /// The page to open, the last it drew: only ever one of [`DEVIN_PAGES`].
     pub url: Option<String>,
-    /// It fell back to waiting for a token pasted from that page, no
+    /// It fell back to waiting for a code pasted from that page, no
     /// browser having opened.
     pub manual: bool,
     /// It was signed in already.
     pub already: bool,
+    /// Its picker, as 3000.12.57 draws it, with the browser chosen: Enter
+    /// signs in in the browser.
+    pub picker: bool,
+    /// It asks something (a prompt's footer is drawn, or a question other
+    /// than its picker's): with no [`Self::picker`], something Desk
+    /// doesn't answer.
+    pub asks: bool,
+    /// It opened the browser and waits for the person there.
+    pub in_browser: bool,
+    /// It said it signed in.
+    pub signed_in: bool,
+    /// It said why it failed, as Desk says it, and that reason's name.
+    pub failed: Option<(&'static str, &'static str)>,
 }
 
-/// Reads a `devin auth login` screen.
+/// Devin's picker (3000.12.57): its question, then its options; the
+/// first, the browser, chosen (`❭`).
+const DEVIN_ASKS_HOW: &str = "How would you like to log in?";
+const DEVIN_BROWSER_CHOSEN: &str = "\u{276d} 1 Log in with browser";
+/// What ends a prompt of Devin's: its keys.
+const DEVIN_FOOTERS: &[&str] = &["esc cancel", "\u{21b5} confirm", "\u{21b5} submit"];
+/// What Devin says when its login fails, as Desk says it.
+const DEVIN_FAILURES: &[(&str, &str, &str)] = &[
+    (
+        "failed to start auth callback server",
+        DEVIN_NO_CALLBACK,
+        "callback server",
+    ),
+    (
+        "failed to receive authorization code",
+        DEVIN_NO_ANSWER,
+        "no authorization code",
+    ),
+    (
+        "token exchange failed",
+        DEVIN_EXCHANGE_FAILED,
+        "token exchange",
+    ),
+];
+
+/// Reads a `devin auth login` screen. Escapes are read as a terminal
+/// shows them: a hyperlink (OSC 8) is its text alone, read once.
 pub fn devin_said(screen: &str) -> DevinSaid {
+    let screen = crate::pty::plain_text(screen.as_bytes());
     let mut said = DevinSaid::default();
-    for line in screen.lines() {
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    for line in &lines {
         let lower = line.to_lowercase();
         for word in screen_words(line) {
             if let Some(page) = devin_page(word) {
@@ -164,7 +319,7 @@ pub fn devin_said(screen: &str) -> DevinSaid {
             }
         }
         // Only its falling back from the browser: a hint that a manual
-        // flow exists is no reason to ask for a token.
+        // flow exists is no reason to ask for a code.
         if [
             "falling back to manual",
             "switched to manual",
@@ -178,7 +333,32 @@ pub fn devin_said(screen: &str) -> DevinSaid {
         if lower.contains("already logged in") || lower.contains("already signed in") {
             said.already = true;
         }
+        if lower.contains("waiting for login in browser") {
+            said.in_browser = true;
+        }
+        if lower.contains("login successful") {
+            said.signed_in = true;
+        }
+        if let Some((_, why, reason)) = DEVIN_FAILURES.iter().find(|(w, ..)| lower.contains(w)) {
+            said.failed = Some((why, reason));
+        }
+        if DEVIN_FOOTERS.iter().any(|f| lower.contains(f))
+            || (line.ends_with('?') && *line != DEVIN_ASKS_HOW)
+        {
+            said.asks = true;
+        }
     }
+    // Exactly its picker: the question, its first option the browser and
+    // chosen, and no other option chosen.
+    let asked = lines.iter().position(|l| *l == DEVIN_ASKS_HOW);
+    said.picker = asked.is_some_and(|at| {
+        let after = &lines[at + 1..];
+        after.iter().find(|l| !l.is_empty()) == Some(&DEVIN_BROWSER_CHOSEN)
+            && after
+                .iter()
+                .filter(|l| l.starts_with('\u{276d}'))
+                .all(|l| *l == DEVIN_BROWSER_CHOSEN)
+    });
     said
 }
 
@@ -279,8 +459,14 @@ impl Desk {
                 .unwrap_or_else(std::env::temp_dir),
             env,
         };
-        let (pty, exit) =
-            Pty::spawn(&spec, SIGN_IN_COLS, crate::pty::DEFAULT_ROWS, 200).map_err(|e| {
+        let (pty, exit) = Pty::spawn_unseen(&spec, SIGN_IN_COLS, crate::pty::DEFAULT_ROWS, 200)
+            .map_err(|e| {
+                tracing::warn!(
+                    engine = engine.title(),
+                    step = "failed",
+                    reason = "the CLI didn't start",
+                    "an engine's own sign-in ended"
+                );
                 DeskError::Internal(e.wrap_err(format!("starting {}'s sign-in", engine.title())))
             })?;
         let view = EngineSignInView {
@@ -308,10 +494,19 @@ impl Desk {
                     pty: Some(Arc::new(pty)),
                     manual: manual && engine == Engine::Devin,
                     typed: false,
+                    picker_seen: false,
+                    entered: false,
                 },
             );
             ended
         };
+        tracing::info!(
+            engine = engine.title(),
+            step = "starting",
+            manual,
+            replaced = ended.len(),
+            "an engine's own sign-in moved"
+        );
         ended.into_iter().for_each(|p| {
             tokio::spawn(end_cli(p));
         });
@@ -330,9 +525,10 @@ impl Desk {
             .ok_or(DeskError::NotFound)
     }
 
-    /// Types the token the sign-in page gave into sign-in `id`, which waits
-    /// for one ([`EngineSignInState::Paste`]); it says whether it took it by
-    /// ending. The token is kept nowhere, and said nowhere.
+    /// Types the code the sign-in page gave (Devin's prompt says "Code")
+    /// into sign-in `id`, which waits for one ([`EngineSignInState::Paste`]),
+    /// then Enter; it says whether it took it by ending. The code is kept
+    /// nowhere, and said nowhere.
     pub fn engine_sign_in_token(&self, id: Uuid, token: &str) -> Result<(), DeskError> {
         let token = token.trim();
         // Printable ASCII alone: a control character, a space or an escape
@@ -341,7 +537,7 @@ impl Desk {
         // (macOS's MAX_CANON is 1024), which the CLI's own read decides.
         if token.is_empty() || token.len() > 4096 || !token.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(DeskError::Invalid(
-                "paste the token the sign-in page gives you".into(),
+                "paste the code the sign-in page gives you".into(),
             ));
         }
         let pty = {
@@ -351,7 +547,7 @@ impl Desk {
                 .get_mut(&id)
                 .filter(|r| matches!(r.view.state, EngineSignInState::Paste { .. }))
                 .ok_or_else(|| {
-                    DeskError::Conflict("that sign-in isn't waiting for a token".into())
+                    DeskError::Conflict("that sign-in isn't waiting for a code".into())
                 })?;
             let pty = run
                 .pty
@@ -370,6 +566,12 @@ impl Desk {
     pub fn cancel_engine_sign_in(&self, id: Uuid) -> Result<(), DeskError> {
         let run = self.0.state.lock().engine_sign_ins.remove(&id);
         let run = run.ok_or_else(|| DeskError::Conflict("that sign-in has ended".into()))?;
+        tracing::info!(
+            engine = run.view.engine.title(),
+            step = "cancelled",
+            from = run.view.state.step(),
+            "an engine's own sign-in moved"
+        );
         if let Some(pty) = run.pty {
             tokio::spawn(end_cli(pty));
         }
@@ -387,53 +589,115 @@ impl Desk {
             .map(|p| p.text())
     }
 
+    /// Sign-in `id` is at `state` now (never over: [`Self::follow_engine_sign_in`]
+    /// ends it), said in one log line when it moved.
     fn engine_sign_in_moved(&self, id: Uuid, state: EngineSignInState) {
-        if let Some(run) = self.0.state.lock().engine_sign_ins.get_mut(&id) {
-            run.view.state = state;
-        }
+        let engine = {
+            let mut st = self.0.state.lock();
+            let Some(run) = st.engine_sign_ins.get_mut(&id) else {
+                return;
+            };
+            if run.view.state == state {
+                return;
+            }
+            run.view.state = state.clone();
+            run.view.engine
+        };
+        tracing::info!(
+            engine = engine.title(),
+            step = state.step(),
+            page = state.page(),
+            "an engine's own sign-in moved"
+        );
     }
 
-    /// Where sign-in `id` is now, from what its CLI draws. A Devin waiting
-    /// for a token is blind from the moment it is, so a token it echoes
-    /// never reaches its screen; the screen is wiped at every look besides.
-    fn engine_sign_in_looked(&self, id: Uuid, engine: Engine, pty: &Pty) {
-        let (state, manual) = {
+    /// Where sign-in `id` is now, from what its CLI draws; how it ended,
+    /// when what it drew ends it (the CLI is then still to be ended). A
+    /// Devin waiting for a code is blind from the moment it is, so a code
+    /// it echoes never reaches its screen; the screen is wiped at every
+    /// look besides.
+    fn engine_sign_in_looked(
+        &self,
+        id: Uuid,
+        engine: Engine,
+        pty: &Pty,
+        since: Duration,
+    ) -> Option<Ended> {
+        let (state, manual, picker_seen, entered) = {
             let st = self.0.state.lock();
-            match st.engine_sign_ins.get(&id) {
-                Some(r) => (r.view.state.clone(), r.manual),
-                None => return,
-            }
+            let r = st.engine_sign_ins.get(&id)?;
+            (r.view.state.clone(), r.manual, r.picker_seen, r.entered)
         };
         if matches!(state, EngineSignInState::Paste { .. }) {
             wipe(pty);
-            return;
+            return None;
         }
-        match engine {
-            Engine::Devin => {
-                let said = devin_said(&pty.text());
-                if let Some(url) = said.url {
-                    let next = match manual || said.manual {
-                        true => {
-                            // Before Desk can be given a token: whatever the
-                            // terminal shows from now on is never taken in.
-                            pty.blind();
-                            wipe(pty);
-                            EngineSignInState::Paste { url }
-                        }
-                        false => EngineSignInState::Page { url },
-                    };
-                    if next != state {
-                        self.engine_sign_in_moved(id, next);
-                    }
-                }
+        if engine != Engine::Devin {
+            let said = device_said(&pty.text());
+            if let (Some(url), Some(code)) = (said.url, said.code) {
+                self.engine_sign_in_moved(id, EngineSignInState::Device { url, code });
             }
-            _ => {
-                let said = device_said(&pty.text());
-                if let (Some(url), Some(code)) = (said.url, said.code) {
-                    self.engine_sign_in_moved(id, EngineSignInState::Device { url, code });
-                }
-            }
+            return None;
         }
+        let said = devin_said(&pty.text());
+        if let Some((why, reason)) = said.failed {
+            return Some(Ended::failed(why, reason));
+        }
+        if let Some(url) = said.url.clone() {
+            let next = match manual || said.manual {
+                true => {
+                    // Before Desk can be given a code: whatever the
+                    // terminal shows from now on is never taken in.
+                    pty.blind();
+                    wipe(pty);
+                    EngineSignInState::Paste { url }
+                }
+                false => EngineSignInState::Page { url },
+            };
+            self.engine_sign_in_moved(id, next);
+            return None;
+        }
+        if entered {
+            if said.in_browser {
+                self.engine_sign_in_moved(id, EngineSignInState::browser());
+            }
+            return None;
+        }
+        if manual {
+            // Its prompt for a code is drawn after its page: a prompt with
+            // no page Desk knows above it has none to show.
+            if said.asks {
+                return Some(Ended::failed(DEVIN_PAGE_UNKNOWN, "no page Desk knows"));
+            }
+        } else if said.picker && said.asks {
+            // Its picker, drawn to its footer, the browser chosen, at two
+            // looks running (the answers its queries were owed are sent):
+            // Enter, once.
+            if let Some(run) = self.0.state.lock().engine_sign_ins.get_mut(&id) {
+                run.entered = picker_seen;
+                run.picker_seen = true;
+            }
+            if !picker_seen {
+                return None;
+            }
+            if pty.write(b"\r").is_err() {
+                return Some(Ended::failed(DEVIN_FAILED, "the CLI went before Enter"));
+            }
+            self.engine_sign_in_moved(id, EngineSignInState::browser());
+            return None;
+        } else if said.asks {
+            return Some(Ended::failed(
+                DEVIN_ASKED_UNKNOWN,
+                "asked something unknown",
+            ));
+        }
+        if since > DEVIN_SHOWS_IN {
+            return Some(match manual {
+                true => Ended::failed(DEVIN_NO_PAGE, "showed no page in time"),
+                false => Ended::failed(DEVIN_ASKED_UNKNOWN, "showed nothing known in time"),
+            });
+        }
+        None
     }
 
     /// How sign-in `id` ended, its CLI having exited with `code`.
@@ -443,7 +707,7 @@ impl Desk {
         engine: Engine,
         pty: &Pty,
         code: Option<u32>,
-    ) -> EngineSignInState {
+    ) -> Ended {
         let (state, typed) = {
             let st = self.0.state.lock();
             st.engine_sign_ins
@@ -453,16 +717,12 @@ impl Desk {
                 })
         };
         if matches!(state, EngineSignInState::Paste { .. }) {
-            // What it left on screen may be the token: never read.
+            // What it left on screen may be the code: never read.
             wipe(pty);
             return match (code, typed) {
-                (Some(0), _) => EngineSignInState::Done,
-                (_, true) => EngineSignInState::Failed {
-                    why: DEVIN_TOKEN_FAILED.into(),
-                },
-                (_, false) => EngineSignInState::Failed {
-                    why: DEVIN_FAILED.into(),
-                },
+                (Some(0), _) => self.devin_confirmed("the CLI took the code").await,
+                (_, true) => Ended::failed(DEVIN_TOKEN_FAILED, "the CLI turned the code away"),
+                (_, false) => Ended::failed(DEVIN_FAILED, "the CLI ended before a code"),
             };
         }
         // Read the screen it left once more.
@@ -471,34 +731,46 @@ impl Desk {
         match engine {
             Engine::Devin => {
                 let said = devin_said(&screen);
+                if let Some((why, reason)) = said.failed {
+                    return Ended::failed(why, reason);
+                }
                 match code {
-                    Some(0) => EngineSignInState::Done,
-                    _ if said.already => EngineSignInState::Done,
-                    _ if said.url.is_none() => EngineSignInState::Failed {
-                        why: DEVIN_NO_PAGE.into(),
-                    },
-                    _ => EngineSignInState::Failed {
-                        why: DEVIN_FAILED.into(),
-                    },
+                    Some(0) => self.devin_confirmed("the CLI ended signed in").await,
+                    _ if said.signed_in => self.devin_confirmed("the CLI said it signed in").await,
+                    _ if said.already => self.devin_confirmed("already signed in").await,
+                    _ if matches!(state, EngineSignInState::Browser { .. }) => {
+                        Ended::failed(DEVIN_FAILED, "the CLI ended in the browser step")
+                    }
+                    _ if said.url.is_none() => {
+                        Ended::failed(DEVIN_NO_PAGE, "the CLI ended before a page")
+                    }
+                    _ => Ended::failed(DEVIN_FAILED, "the CLI ended without signing in"),
                 }
             }
             _ => {
                 let said = device_said(&screen);
                 match code {
-                    Some(0) => EngineSignInState::Done,
-                    _ if said.refused => EngineSignInState::Failed {
-                        why: DEVICE_REFUSED.into(),
-                    },
-                    _ => EngineSignInState::Failed {
-                        why: DEVICE_FAILED.into(),
-                    },
+                    Some(0) => Ended::done("the CLI ended signed in"),
+                    _ if said.refused => Ended::failed(DEVICE_REFUSED, "device sign-in refused"),
+                    _ => Ended::failed(DEVICE_FAILED, "the CLI ended without signing in"),
                 }
             }
         }
     }
 
+    /// Done when `devin auth status` now says Devin is signed in (read again
+    /// now, so Desk says it at once); a plain failure when it doesn't.
+    async fn devin_confirmed(&self, reason: &'static str) -> Ended {
+        self.read_engine_now(Engine::Devin).await;
+        match self.engine_read(Engine::Devin) {
+            Some(crate::engine::SignIn::In { .. }) => Ended::done(reason),
+            _ => Ended::failed(DEVIN_NOT_CONFIRMED, "auth status says signed out"),
+        }
+    }
+
     /// Follows the sign-in's screen until it ends, then reads the engine
-    /// again, so what Desk says of its sign-in is now.
+    /// again, so what Desk says of its sign-in is now. How it ended is one
+    /// log line.
     async fn follow_engine_sign_in(
         self,
         id: Uuid,
@@ -508,14 +780,17 @@ impl Desk {
         let Some(engine) = self.engine_sign_in(id).ok().map(|v| v.engine) else {
             return;
         };
-        let outcome = loop {
+        let ended = loop {
             let Some(pty) = ({
                 let st = self.0.state.lock();
                 st.engine_sign_ins.get(&id).and_then(|r| r.pty.clone())
             }) else {
                 return; // cancelled, or a newer one began
             };
-            self.engine_sign_in_looked(id, engine, &pty);
+            if let Some(ended) = self.engine_sign_in_looked(id, engine, &pty, started.elapsed()) {
+                end_cli(pty).await;
+                break ended;
+            }
             tokio::select! {
                 code = &mut exit => {
                     break self.engine_sign_in_outcome(id, engine, &pty, code.ok().flatten()).await;
@@ -528,31 +803,43 @@ impl Desk {
             }
             if started.elapsed() > SIGN_IN_FOR {
                 end_cli(Arc::clone(&pty)).await;
-                break EngineSignInState::Failed {
-                    why: match engine {
-                        Engine::Devin => DEVIN_FAILED,
-                        _ => DEVICE_FAILED,
-                    }
-                    .into(),
+                break match engine {
+                    Engine::Devin => Ended::failed(DEVIN_TIMED_OUT, "timed out"),
+                    _ => Ended::failed(DEVICE_FAILED, "timed out"),
                 };
             }
         };
-        let done = outcome == EngineSignInState::Done;
-        tracing::info!(
-            engine = engine.title(),
-            done,
-            "an engine's own sign-in ended"
-        );
-        {
+        let Ended { state, reason } = ended;
+        let done = state == EngineSignInState::Done;
+        let from = {
             let mut st = self.0.state.lock();
             let Some(run) = st.engine_sign_ins.get_mut(&id) else {
                 return; // cancelled as it ended
             };
-            run.view.state = outcome;
+            let from = run.view.state.step();
+            run.view.state = state;
             // Its screen goes with it: nothing of it is kept.
             run.pty = None;
+            from
+        };
+        match done {
+            true => tracing::info!(
+                engine = engine.title(),
+                step = "done",
+                from,
+                reason,
+                "an engine's own sign-in ended"
+            ),
+            false => tracing::warn!(
+                engine = engine.title(),
+                step = "failed",
+                from,
+                reason,
+                "an engine's own sign-in ended"
+            ),
         }
-        if done {
+        // Devin's was read already, to say it was done.
+        if done && engine != Engine::Devin {
             self.read_engine_now(engine).await;
         }
         let desk = self.clone();
@@ -743,6 +1030,127 @@ mod tests {
         assert_eq!(device_said(&devin_screen(DEVIN_PAGE)).url, None);
     }
 
+    /// Devin 3000.12.57's own output, recorded (fixtures/devin).
+    const PICKER: &[u8] = include_bytes!("../../fixtures/devin/1-picker.bin");
+    const BROWSER: &[u8] = include_bytes!("../../fixtures/devin/2-browser.bin");
+    const MANUAL: &[u8] = include_bytes!("../../fixtures/devin/3-manual.bin");
+    /// The page [`MANUAL`] shows (its state and challenge replaced).
+    const REAL_PAGE: &str = "https://app.devin.ai/auth/cli/continue?state=Zx8q3V1kQ2&prompt=select_account&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1";
+
+    /// `bytes` on a sign-in's screen, as Desk reads it.
+    fn shown(bytes: &[&[u8]]) -> String {
+        let mut term = crate::vt::Term::new(SIGN_IN_COLS, crate::pty::DEFAULT_ROWS, 200);
+        for b in bytes {
+            term.feed(b);
+        }
+        term.text()
+    }
+
+    #[test]
+    fn devins_real_picker_is_known_and_a_changed_one_or_another_prompt_is_not() {
+        let said = devin_said(&shown(&[PICKER]));
+        assert!(said.picker && said.asks, "{said:?}");
+        assert_eq!(
+            (said.url, said.in_browser, said.failed),
+            (None, false, None)
+        );
+        // Drawn up to its options only: not yet asked.
+        let cut = &PICKER[..PICKER.windows(4).position(|w| w == b"   2").unwrap()];
+        let said = devin_said(&shown(&[cut]));
+        assert!(said.picker && !said.asks, "{said:?}");
+        let picker = String::from_utf8(PICKER.to_vec()).unwrap();
+        for changed in [
+            picker.replace("1 Log in with browser", "1 Log in with Windsurf"),
+            picker
+                .replace(" \u{276d} 1 Log", "   1 Log")
+                .replace("   2 Paste", " \u{276d} 2 Paste"),
+            picker.replace(
+                "How would you like to log in?",
+                "How do you want to log in?",
+            ),
+            picker.replace("   2 Paste a token", " \u{276d} 2 Paste a token"),
+        ] {
+            let said = devin_said(&shown(&[changed.as_bytes()]));
+            assert!(!said.picker && said.asks, "{changed}");
+        }
+        let enterprise = "\x1b]10;?\x07Enter your Windsurf Enterprise subdomain:\r\n \u{276d} \r\n \u{21b5} submit \u{b7} esc cancel";
+        let said = devin_said(&shown(&[enterprise.as_bytes()]));
+        assert!(!said.picker && said.asks);
+        assert!(devin_said("Use your company's SSO instead?").asks);
+        assert!(
+            !devin_said(&shown(&[&PICKER[..PICKER.len() / 4]])).asks,
+            "its logo alone"
+        );
+    }
+
+    #[test]
+    fn devin_waiting_in_the_browser_and_signing_in_or_failing_are_read() {
+        let wait = &BROWSER[..BROWSER
+            .windows(9)
+            .position(|w| w == "Verifying".as_bytes())
+            .unwrap()];
+        let said = devin_said(&shown(&[PICKER, wait]));
+        assert!(said.in_browser && !said.signed_in, "{said:?}");
+        assert_eq!(said.url, None, "Devin opens the page itself: no address");
+        let said = devin_said(&shown(&[PICKER, BROWSER]));
+        assert!(said.in_browser && said.signed_in && said.failed.is_none());
+        for (line, why) in [
+            (
+                "Error: Failed to start auth callback server: address in use",
+                DEVIN_NO_CALLBACK,
+            ),
+            ("Failed to receive authorization code", DEVIN_NO_ANSWER),
+            (
+                "Token exchange failed for host https://server.codeium.com: 400",
+                DEVIN_EXCHANGE_FAILED,
+            ),
+        ] {
+            let said = devin_said(&shown(&[PICKER, wait, b"\r\n", line.as_bytes()]));
+            assert_eq!(said.failed.map(|f| f.0), Some(why), "{line}");
+        }
+    }
+
+    #[test]
+    fn devins_page_is_read_once_through_its_hyperlink() {
+        // As the screen shows it: the hyperlink's text alone.
+        let screen = shown(&[MANUAL]);
+        assert_eq!(screen.matches("https://").count(), 1, "{screen}");
+        let said = devin_said(&screen);
+        assert_eq!(said.url.as_deref(), Some(REAL_PAGE));
+        assert!(said.asks && !said.picker, "its Code prompt");
+        // And from its bytes as they came: OSC 8 is unwrapped, not read twice.
+        let raw = String::from_utf8(MANUAL.to_vec()).unwrap();
+        assert_eq!(devin_said(&raw).url.as_deref(), Some(REAL_PAGE));
+        assert_eq!(
+            crate::pty::plain_text(MANUAL).matches("https://").count(),
+            1
+        );
+        // The real page carries no redirect_uri: its state and challenge are enough.
+        assert!(!REAL_PAGE.contains("redirect_uri"));
+        for cut in [
+            "state=Zx8q3V1kQ2&",
+            "code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&",
+        ] {
+            let page = REAL_PAGE.replace(cut, "");
+            assert_eq!(
+                devin_said(&raw.replace(REAL_PAGE, &page)).url,
+                None,
+                "{cut}"
+            );
+        }
+        let elsewhere = raw.replace("app.devin.ai", "app.devin.ai.evil.example");
+        assert_eq!(devin_said(&elsewhere).url, None);
+        // Logged by its scheme, host and path alone.
+        let page = EngineSignInState::Paste {
+            url: REAL_PAGE.into(),
+        }
+        .page();
+        assert_eq!(
+            page.as_deref(),
+            Some("https://app.devin.ai/auth/cli/continue")
+        );
+    }
+
     #[test]
     fn only_a_code_shaped_word_is_a_code() {
         assert!(device_code("ABCD-12345"));
@@ -790,6 +1198,16 @@ mod tests {
             (
                 EngineSignInState::Starting,
                 serde_json::json!({"id": id, "engine": "devin", "state": "starting"}),
+            ),
+            (
+                EngineSignInState::browser(),
+                serde_json::json!({
+                    "id": id,
+                    "engine": "devin",
+                    "state": "browser",
+                    "say": "Finish signing in in the browser window Devin opened.",
+                    "instead": "Paste a code instead",
+                }),
             ),
             (
                 EngineSignInState::Done,
