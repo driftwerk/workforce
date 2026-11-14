@@ -188,9 +188,9 @@ impl CrewHub {
         };
         // Too large to carry: never queued, so nothing of it is done.
         if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
-            return Err(format!(
+            return Err(MachineRefused::Refused(format!(
                 "That call is too large to send to {machine}; send less in it."
-            ));
+            )));
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
