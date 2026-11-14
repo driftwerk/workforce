@@ -87,6 +87,20 @@ impl Mode {
         }
     }
 
+    /// Devin's arguments to start in it (`--permission-mode`); none for
+    /// plan, which Devin enters only from its terminal. Its `smart` may be
+    /// off for the person's account, and Devin then runs as `normal`.
+    pub fn devin_args(self) -> Option<Vec<String>> {
+        let mode = match self {
+            Self::Default => "normal",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "smart",
+            Self::BypassPermissions => "dangerous",
+            Self::Plan => return None,
+        };
+        Some(vec!["--permission-mode".to_string(), mode.to_string()])
+    }
+
     /// Codex's settings to start in it: its approval policy and sandbox.
     pub fn codex_settings(self) -> [&'static str; 2] {
         match self {

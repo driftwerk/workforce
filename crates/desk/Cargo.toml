@@ -21,6 +21,9 @@ eyre = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
 hex = "0.4"
+# A person's Devin config is JSON with comments: read whole, and what
+# Devin saved to Desk's copy written back with their comments kept.
+jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
 parking_lot = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31", features = ["user"] }

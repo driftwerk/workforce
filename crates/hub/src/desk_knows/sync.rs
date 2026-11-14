@@ -306,8 +306,11 @@ impl KnowsSync {
             )
             .await
             .map_err(|e| Failed::Retry(e.to_string()))?;
-        let digest = rule.digest.as_str();
-        let told = self.spent.lock().get(agent).and_then(|s| s.digest) == Some(digest);
+        // A machine's engine leaves how the agent hears of the work to the
+        // Mac's: two engines would otherwise say it in turn.
+        let digest = (!self.desk.knows_on_machine()).then(|| rule.digest.as_str());
+        let told =
+            digest.is_none() || self.spent.lock().get(agent).and_then(|s| s.digest) == digest;
         if pending.is_empty() && told {
             return Ok(());
         }
@@ -358,7 +361,7 @@ impl KnowsSync {
             match &landed {
                 Ok(()) => {
                     s.backoff = None;
-                    s.digest = Some(digest);
+                    s.digest = digest;
                     s.sent.push_back((now, count, size));
                 }
                 Err(e) => {
@@ -385,7 +388,7 @@ impl KnowsSync {
         &self,
         target: &Target,
         pending: &[Outgoing],
-        digest: &str,
+        digest: Option<&str>,
     ) -> Result<(), Failed> {
         let items: Vec<Item> = pending
             .iter()
@@ -402,10 +405,12 @@ impl KnowsSync {
             Target::Local(owner) => {
                 let store = super::installed()
                     .ok_or_else(|| Failed::Refused("this hub keeps no Desk work".into()))?;
-                store
-                    .set_digest(owner, digest, Utc::now())
-                    .await
-                    .map_err(|e| Failed::Retry(format!("{e:#}")))?;
+                if let Some(digest) = digest {
+                    store
+                        .set_digest(owner, digest, Utc::now())
+                        .await
+                        .map_err(|e| Failed::Retry(format!("{e:#}")))?;
+                }
                 store
                     .push(owner, &items, Utc::now())
                     .await
@@ -413,7 +418,7 @@ impl KnowsSync {
                     .map_err(|e| Failed::Retry(format!("{e:#}")))
             }
             Target::Remote(link) => {
-                let body = json!({
+                let mut body = json!({
                     "items": items.iter().map(|i| json!({
                         "kind": i.kind,
                         "ref": i.reference,
@@ -422,8 +427,10 @@ impl KnowsSync {
                         "at": i.at,
                         "body": i.body,
                     })).collect::<Vec<_>>(),
-                    "digest": digest,
                 });
+                if let Some(digest) = digest {
+                    body["digest"] = json!(digest);
+                }
                 self.call(link, "push", &body).await
             }
         }

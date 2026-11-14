@@ -205,7 +205,6 @@ impl CrewHub {
             // Without the composer, an answer to a session was said at once.
             .filter(|d| composed || d.need != Need::Question)
             .collect();
-        let tz = self.desk.timezone();
         let kept: Vec<String> = match composed {
             true => store
                 .items_closed_since(boss, last, 200)
@@ -213,7 +212,7 @@ impl CrewHub {
                 .unwrap_or_default()
                 .iter()
                 .filter(|i| i.closed_at.is_some_and(|at| at > last && at <= now))
-                .filter_map(|i| super::items::kept_line(i, tz))
+                .filter_map(super::items::kept_line)
                 .collect(),
             false => Vec::new(),
         };
@@ -718,6 +717,11 @@ impl CrewHub {
             .store()
             .update_pend(service.agent_id.as_str(), &p)
             .await?;
+        // The check-in's turn is the crew's housekeeping, never on the
+        // Floor: what it said is, briefly.
+        if let Some(dm) = service.sessions.find(DESK_CHANNEL, owner).ok().flatten() {
+            self.on_floor(service, owner, &dm.id, &p);
+        }
         let missing = update::missing_lines(&p, &decided, reply);
         if !missing.is_empty() {
             let target =
@@ -776,10 +780,11 @@ impl CrewHub {
                 delivery.request_id = Some(id);
                 // Its extras kept first: the update is read whole the
                 // moment it is in the DM.
-                let message = self
+                let delivered = self
                     .deliver_with_extras(service, owner, delivery, &extras)
-                    .await?
-                    .message_id;
+                    .await?;
+                self.on_floor(service, owner, &delivered.session_id, &p);
+                let message = delivered.message_id;
                 // Sent: kept so, before anything else, so a restart from
                 // here on finds it whatever the DM did since.
                 p.sent = Some(message);
@@ -787,6 +792,43 @@ impl CrewHub {
             }
         }
         self.told(service, owner, state, &p).await
+    }
+
+    /// The Floor told of `p` as it went to `owner`'s DM `session_id`: the
+    /// boss's purpose and where things stand, from its brief, in plain
+    /// words and no ids; what was settled since and a session the person
+    /// is in now left out. Never the update's prose.
+    fn on_floor(&self, service: &AgentService, owner: &str, session_id: &str, p: &Pending) {
+        #[cfg(feature = "postgres")]
+        if let Some(log) = crate::floor::turns() {
+            let now = Utc::now();
+            let hidden = |s: &str| s.parse::<Uuid>().is_ok_and(|s| self.person_in(s, now));
+            use workforce_desk::update_brief as brief;
+            let shown = brief::shown(&p.update, &hidden);
+            // All of it about sessions the person is in: nothing is said.
+            let hid = brief::hides(&p.update, &shown);
+            if !brief::says_anything(&shown) && (p.away.is_none() || hid) {
+                return;
+            }
+            // A catch-up's own headline, unless it was written over what
+            // is no longer said.
+            let away = p.away.as_ref().map(|a| match hid {
+                true => "",
+                false => a.headline.as_str(),
+            });
+            let (purpose, state) = brief::floor_line(&shown, away);
+            let state = workforce_common::redact::redact_secrets(&state);
+            crate::floor::agents::briefed(
+                log.as_ref(),
+                service.agent_id.as_str(),
+                owner,
+                session_id,
+                &purpose,
+                &state,
+            );
+        }
+        #[cfg(not(feature = "postgres"))]
+        let _ = (service, owner, session_id, p);
     }
 
     /// The suggestions quiet check-ins made since `p`'s last update, shown

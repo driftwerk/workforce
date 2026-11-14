@@ -22,10 +22,43 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::CrewHub;
+use crate::boss_links::decide::Code;
+
+/// A decision call that made no decision: why, in plain words, and its
+/// code when its boss's hub (or this engine) said one. What is done next
+/// is judged by the code alone ([`Self::again`]), never by the words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Failed {
+    pub(crate) why: String,
+    pub(crate) code: Option<Code>,
+}
+
+impl Failed {
+    fn new(code: Code, why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            code: Some(code),
+        }
+    }
+
+    /// Whether asking again at once could change it: not for what is too
+    /// long, no decision, or held by its hub for its pace or budget. A
+    /// code missing or unknown (an older or odd hub) is asked again, once,
+    /// as any failure is: the worst it costs is one more refused call.
+    pub(crate) fn again(&self) -> bool {
+        self.code.is_none_or(Code::again)
+    }
+}
+
+impl From<String> for Failed {
+    fn from(why: String) -> Self {
+        Self { why, code: None }
+    }
+}
 
 /// The decisions sent up one socket and not answered yet, by their id:
 /// the link each went on, and who waits.
-type Waiting = Arc<Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<Result<String, String>>)>>>;
+type Waiting = Arc<Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<Result<String, Failed>>)>>>;
 
 /// One link a boss's decisions go up, on one socket.
 pub(crate) struct DecideLink {
@@ -55,7 +88,7 @@ impl Drop for DecideUp {
         });
         // Who waits hears the socket went.
         for (_, (_, tx)) in self.waiting.lock().drain() {
-            let _ = tx.send(Err("its hub's link went down".into()));
+            let _ = tx.send(Err(Failed::new(Code::Link, "its hub's link went down")));
         }
     }
 }
@@ -112,8 +145,12 @@ impl CrewHub {
             // As long as its hub sends at most: what it says reaches the
             // session as a deny's reason, and Activity.
             (Some(t), _) => Ok(t.chars().take(MAX_ANSWER).collect()),
-            (None, Some(e)) => Err(workforce_desk::crew::one_line(e, 160)),
-            (None, None) => Err("its hub's answer couldn't be read".into()),
+            (None, Some(e)) => Err(Failed {
+                // Its control characters gone first: what it says is shown.
+                why: workforce_desk::crew::one_line(&workforce_core::desk::one_line(e, 1_000), 160),
+                code: frame["code"].as_str().and_then(Code::parse),
+            }),
+            (None, None) => Err("its hub's answer couldn't be read".to_string().into()),
         };
         let _ = tx.send(answer);
     }
@@ -135,12 +172,12 @@ impl CrewHub {
         boss: &str,
         group: &str,
         prompt: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, Failed> {
         let prompt = crate::redact::hide_secrets(prompt);
         // Longer than its hub takes: never sent (its hub would count it
         // against the socket), so the person decides it.
         if prompt.chars().count() > crate::boss_links::decide::MAX_PROMPT {
-            return Err(TOO_LONG.into());
+            return Err(Failed::new(Code::TooLong, TOO_LONG));
         }
         let id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
@@ -150,7 +187,7 @@ impl CrewHub {
                 .get(&(boss.to_string(), group.to_string()))
                 .and_then(|up| up.last())
             else {
-                return Err("its hub isn't connected".into());
+                return Err(Failed::new(Code::Link, "its hub isn't connected"));
             };
             d.waiting.lock().insert(id, (d.link, tx));
             (d.tx.clone(), d.link, Arc::clone(&d.waiting))
@@ -165,10 +202,13 @@ impl CrewHub {
         // an answer after it is dropped.
         let _forget = Forget { waiting, id };
         if send.try_send(frame).is_err() {
-            return Err("its hub's link has no room just now".into());
+            return Err(Failed::new(
+                Code::Link,
+                "its hub's link has no room just now",
+            ));
         }
         rx.await
-            .unwrap_or_else(|_| Err("its hub's link went down".into()))
+            .unwrap_or_else(|_| Err(Failed::new(Code::Link, "its hub's link went down")))
     }
 }
 
@@ -184,20 +224,11 @@ impl Drop for Forget {
     }
 }
 
-/// Whether a decision that failed so (`why`) is better not asked again at
-/// once: too long to send, or its hub holding it for its pace or budget
-/// ([`crate::boss_links::decide`]).
-pub(crate) fn not_again(why: &str) -> bool {
-    why == TOO_LONG
-        || why.contains("decides no more for it just now")
-        || why.contains("budget for it is spent")
-}
-
 /// The longest answer taken from a boss's hub, in characters.
 const MAX_ANSWER: usize = 4_000;
 
 /// Why a decision too long for its boss's hub isn't asked of it.
-pub(crate) const TOO_LONG: &str = "the request is too long for its hub to decide";
+const TOO_LONG: &str = "the request is too long for its hub to decide";
 
 /// A decision of a boss from the decide loop being done ([`CrewHub::deciding`]).
 pub(crate) struct Deciding<'a> {
@@ -273,12 +304,12 @@ impl CrewHub {
 
     /// One decision call by `d` on `prompt`: its model's text, or why there
     /// is none.
-    pub(crate) async fn decide_by(&self, d: &Decider, prompt: &str) -> Result<String, String> {
+    pub(crate) async fn decide_by(&self, d: &Decider, prompt: &str) -> Result<String, Failed> {
         match &d.how {
-            How::Here(service) => {
-                self.decision_call(service, super::decide::SYSTEM, prompt)
-                    .await
-            }
+            How::Here(service) => self
+                .decision_call(service, super::decide::SYSTEM, prompt)
+                .await
+                .map_err(Failed::from),
             How::Remote { boss, group } => self.remote_decision_call(boss, group, prompt).await,
         }
     }
