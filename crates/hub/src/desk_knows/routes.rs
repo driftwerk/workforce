@@ -172,6 +172,30 @@ fn replaced(
             .is_some_and(|l| l.agent_id == agent && l.engine_id == engine)
 }
 
+/// An engine's id, as its rows are kept by (`<device>/<engine>`): letters,
+/// digits, `-`, `_` and `.`, not dots alone.
+fn engine_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !id.chars().all(|c| c == '.')
+}
+
+/// Whether a push from engine `engine` says how the agent hears of the
+/// person's work: from their own computer's alone.
+fn sets_digest(engine: Option<&str>) -> bool {
+    engine == Some(HOME_ENGINE)
+}
+
+/// `GET /api/me/desk-knows-tokens/engines`: that this hub keeps each of
+/// the person's engines' tokens and rows apart (Sees K7). A Desk links a
+/// machine only with a hub that says so: an older one would replace the
+/// person's computer's token with the machine's.
+pub async fn engines() -> Response {
+    Json(json!({ "engines": true })).into_response()
+}
+
 /// `POST /api/me/desk-knows-tokens`.
 pub async fn mint(
     State(state): State<Arc<GatewayState>>,
@@ -206,7 +230,7 @@ pub async fn mint(
         Err(r) => return r,
     };
     let (Some(engine_id), Some(engine_name)) = (
-        plain(&body.engine.id, MAX_NAME),
+        plain(&body.engine.id, MAX_NAME).filter(|id| engine_id_ok(id)),
         plain(&body.engine.name, MAX_NAME),
     ) else {
         return err(StatusCode::BAD_REQUEST, "Say the engine's id and name.");
@@ -567,11 +591,17 @@ pub async fn push(
             return err(StatusCode::BAD_REQUEST, "A digest is off, live or daily.");
         }
     }
+    // How the agent hears of it is the person's own computer's to say: a
+    // machine's push never sets it (Sees K7).
+    let digest = parsed
+        .digest
+        .as_ref()
+        .filter(|_| sets_digest(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())));
     let store = match store() {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(d) = &parsed.digest {
+    if let Some(d) = digest {
         if let Err(e) = store.set_digest(&live.owner, d, Utc::now()).await {
             warn!(error = %format!("{e:#}"), "keeping how Desk wants its digest failed");
             return err(
@@ -587,7 +617,7 @@ pub async fn push(
                 &live.owner.person.to_string(),
                 "desk_knows.push",
                 &live.token,
-                &match (&parsed.digest, kept) {
+                &match (digest, kept) {
                     (Some(d), 0) => format!("digest {d}"),
                     (Some(d), _) => format!("{kept} items, digest {d}"),
                     (None, _) => format!("{kept} items"),
@@ -745,6 +775,18 @@ mod tests {
     fn a_machines_pushes_are_its_own_and_the_macs_stay_the_devices() {
         assert_eq!(source_of("d1", HOME_ENGINE), "d1");
         assert_eq!(source_of("d1", "devbox"), "d1/devbox");
+    }
+
+    #[test]
+    fn only_the_persons_own_computer_sets_the_digest_and_an_engine_is_named_plainly() {
+        assert!(sets_digest(Some(HOME_ENGINE)));
+        assert!(!sets_digest(Some("devbox")));
+        assert!(!sets_digest(None));
+        assert!(engine_id_ok("local"));
+        assert!(engine_id_ok("devbox-2"));
+        for bad in ["", ".", "..", "a/b", "a b", &"x".repeat(65)] {
+            assert!(!engine_id_ok(bad), "{bad}");
+        }
     }
 
     #[test]

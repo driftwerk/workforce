@@ -69,6 +69,8 @@ fn name_ok(n: &str) -> bool {
         && n.len() <= MAX_ID
         && n.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        // Never a path's `.` or `..`.
+        && !n.chars().all(|c| c == '.')
 }
 
 fn id_ok(n: &str) -> bool {
@@ -755,7 +757,9 @@ mod tests {
     #[test]
     fn agent_keys_are_member_keys() {
         assert!(agent_key_ok("local/sarah") && agent_key_ok("driftwerk/allan"));
-        for bad in ["allan", "/allan", "a/b/c", "a b/c", ""] {
+        for bad in [
+            "allan", "/allan", "a/b/c", "a b/c", "", "../allan", "dw/..", "./x",
+        ] {
             assert!(!agent_key_ok(bad), "{bad}");
         }
         assert_eq!(boss_id_of("local/sarah"), "sarah");
