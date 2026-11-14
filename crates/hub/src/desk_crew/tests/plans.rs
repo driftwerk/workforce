@@ -1585,3 +1585,119 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_machine_start_whose_retry_cant_read_there_keeps_its_link() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        *crew.relay_wait.lock() = Duration::from_millis(400);
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Speed up vellev's recall",
+                "machine": "devbox",
+                "tickets": [{"title": "Profile recall", "folder": "/home/dev/vellev"}],
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // devbox makes the session but its answer is lost, and then its
+        // sessions can't be read for a while.
+        let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let (starts, reads, down): (
+            Arc<parking_lot::Mutex<usize>>,
+            Arc<parking_lot::Mutex<usize>>,
+            Arc<parking_lot::Mutex<bool>>,
+        ) = (Arc::default(), Arc::default(), Arc::default());
+        let poller = {
+            let (crew, there, starts, reads, down) = (
+                Arc::clone(&crew),
+                Arc::clone(&there),
+                Arc::clone(&starts),
+                Arc::clone(&reads),
+                Arc::clone(&down),
+            );
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(100)).await {
+                        match c.tool.as_str() {
+                            "desk.sessions" => {
+                                *reads.lock() += 1;
+                                let answer = if *down.lock() {
+                                    RelayAnswer {
+                                        status: ServedStatus::Refused,
+                                        body: json!("devbox is busy"),
+                                    }
+                                } else {
+                                    RelayAnswer {
+                                        status: ServedStatus::Ok,
+                                        body: Value::Array(there.lock().clone()),
+                                    }
+                                };
+                                crew.relay_answer(c.id, answer);
+                            }
+                            "desk.session_start" => {
+                                *starts.lock() += 1;
+                                *down.lock() = true;
+                                there.lock().push(json!({
+                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                    "createdAt": chrono::Utc::now().to_rfc3339(),
+                                }));
+                            }
+                            other => panic!("{other} relayed"),
+                        }
+                    }
+                }
+            })
+        };
+
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        eventually("retries that can't read devbox", async || {
+            (*reads.lock() >= 3).then_some(())
+        })
+        .await;
+        let t = d.plan(id).await.unwrap().tickets[0].ticket.ticket.clone();
+        assert_eq!(t.state, TicketState::Doing, "still under way");
+        assert!(t.assignee.is_none());
+        assert_eq!(
+            d.store().starting().await.unwrap().len(),
+            1,
+            "its link kept"
+        );
+        assert_eq!(*starts.lock(), 1, "made once");
+
+        *down.lock() = false;
+        let given = eventually("the session it made, taken up", async || {
+            let p = d.plan(id).await.ok()?;
+            p.tickets[0]
+                .ticket
+                .ticket
+                .assignee
+                .as_ref()
+                .map(|a| a.id.clone())
+        })
+        .await;
+        let made = there.lock()[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(given, format!("devbox/{made}"));
+        assert_eq!(*starts.lock(), 1, "made once");
+        poller.abort();
+    })
+    .await;
+}

@@ -1779,7 +1779,7 @@ impl Desk {
                 BeginStart::Other(e) => StartRefused::Failed(DeskError::Internal(e)),
             })?;
         Ok(self
-            .plan_launch(p, t, session, at, &runs, start.worktree, boss, by)
+            .plan_launch(p, t, session, at, false, &runs, start.worktree, boss, by)
             .await?)
     }
 
@@ -1823,6 +1823,28 @@ impl Desk {
             .as_ref()
             .and_then(|p| self.plan_starts_held(p.group.as_deref(), p.id))
             .is_some();
+        // A start on a machine that may have made its session there keeps
+        // its link while it can't be looked for (no boss, paused or held):
+        // undone, it could be made twice.
+        let on_machine = match &p {
+            Some(p) => self
+                .0
+                .store
+                .plan_runs(p.id)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .any(|(id, r)| id == t.id && r.machine.is_some()),
+            None => false,
+        };
+        if on_machine
+            && still
+            && p.as_ref().is_some_and(|p| {
+                p.state == PlanState::Running && (!p.runs() || held || boss.is_none())
+            })
+        {
+            return Ok(None);
+        }
         let (Some(p), Some(boss)) = (p.filter(|p| still && p.runs() && !held), boss) else {
             // Moved, dropped, paused or held meanwhile, or no boss may
             // start it: no session for it now. A ticket left in Doing with
@@ -1848,7 +1870,7 @@ impl Desk {
                 && o.folder == runs.folder
                 && o.machine == runs.machine
         });
-        self.plan_launch(&p, t, s.session, s.at, &runs, worktree, boss, by)
+        self.plan_launch(&p, t, s.session, s.at, true, &runs, worktree, boss, by)
             .await
             .map(Some)
     }
@@ -1937,6 +1959,7 @@ impl Desk {
         t: Ticket,
         session: Uuid,
         since: chrono::DateTime<chrono::Utc>,
+        retry: bool,
         runs: &Runs,
         worktree: bool,
         boss: &Party,
@@ -1960,7 +1983,7 @@ impl Desk {
                     (started, Some(v))
                 }),
             Some(m) => match self
-                .plan_spawn_on(&m, p, &t, since, runs, worktree, boss)
+                .plan_spawn_on(&m, p, &t, since, retry, runs, worktree, boss)
                 .await
             {
                 Ok(started) => Ok((started, None)),
@@ -1996,12 +2019,14 @@ impl Desk {
     /// one is, so a start cut off or never answered is never made twice;
     /// else one started there now in the machine's own folder, its prompt
     /// saying its board is here.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_spawn_on(
         &self,
         machine: &str,
         p: &Plan,
         t: &Ticket,
         since: chrono::DateTime<chrono::Utc>,
+        retry: bool,
         runs: &Runs,
         worktree: bool,
         boss: &Party,
@@ -2019,11 +2044,16 @@ impl Desk {
                 "{machine} can't be reached from this hub."
             )))
         })?;
-        let read_refused = |e: crew::MachineRefused| match e {
-            crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
-                "{machine}'s sessions couldn't be read: {why}"
-            ))),
-            e => sure(DeskError::Invalid(e.to_string())),
+        // A retry of a start that may have reached it stays unsure until
+        // the machine is read.
+        let read_refused = |e: crew::MachineRefused| {
+            let e = match e {
+                crew::MachineRefused::Refused(why) => {
+                    DeskError::Invalid(format!("{machine}'s sessions couldn't be read: {why}"))
+                }
+                e => DeskError::Invalid(e.to_string()),
+            };
+            (e, retry)
         };
         // Only a start that may have reached the machine is unsure.
         let refused = |e: crew::MachineRefused| match e {
@@ -2045,9 +2075,10 @@ impl Desk {
             .await
             .map_err(read_refused)?;
         let listed: Vec<crew::MachineSession> = serde_json::from_value(listed).map_err(|_| {
-            sure(DeskError::Invalid(format!(
-                "{machine}'s sessions couldn't be read."
-            )))
+            (
+                DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")),
+                retry,
+            )
         })?;
         let made_in = |cwd: &str| {
             cwd == folder
@@ -2055,7 +2086,8 @@ impl Desk {
         };
         // Only one made for this start: an older session of the same key
         // (the ticket was sent back and started again) is never taken up.
-        let after = since - chrono::Duration::minutes(2);
+        // Wide enough for the two computers' clocks to differ.
+        let after = since - chrono::Duration::minutes(10);
         if let Some(there) = listed
             .iter()
             .filter(|s| {

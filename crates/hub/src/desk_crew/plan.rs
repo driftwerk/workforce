@@ -1474,8 +1474,10 @@ impl CrewHub {
         if unsure.is_empty() {
             return;
         }
+        // One a pass, the oldest: a machine that doesn't answer holds up
+        // no one's starts for long.
         let _one = self.starting.lock().await;
-        for s in unsure {
+        if let Some(s) = unsure.into_iter().min_by_key(|s| s.at) {
             self.finish_start(s, "Its start on a machine wasn't known; Desk looked there.")
                 .await;
         }
