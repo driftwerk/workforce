@@ -253,7 +253,7 @@ pub fn listed(printed: &str) -> Option<Vec<Listed>> {
         entries
             .iter()
             .filter_map(|e| {
-                let id = text_of(e, &["id", "session_id", "sessionId"])?.to_string();
+                let id = text_in(e, &["id", "session_id", "sessionId"])?.to_string();
                 let created = [
                     "created_at",
                     "createdAt",

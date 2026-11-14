@@ -4833,19 +4833,30 @@ impl Desk {
                     )
                     .map_err(DeskError::Internal)?;
                 let session_id = r.cli_session_id.as_deref().filter(|_| resume);
-                let spec = devin::spawn(&devin::DevinSpawn {
-                    program: self.program_of(Engine::Devin)?,
-                    cwd,
-                    launch: match session_id {
-                        Some(session_id) => devin::Launch::Resume { session_id },
-                        None => devin::Launch::New,
-                    },
-                    prompt,
-                    mode,
-                    model: None,
-                    config: &files.config,
-                    env: &env,
+                let spec = self.program_of(Engine::Devin).and_then(|program| {
+                    devin::spawn(&devin::DevinSpawn {
+                        program,
+                        cwd,
+                        launch: match session_id {
+                            Some(session_id) => devin::Launch::Resume { session_id },
+                            None => devin::Launch::New,
+                        },
+                        prompt,
+                        mode,
+                        model: None,
+                        config: &files.config,
+                        env: &env,
+                    })
+                    .map_err(DeskError::Internal)
                 });
+                let spec = match spec {
+                    Ok(spec) => spec,
+                    Err(e) => {
+                        // Never left holding its token.
+                        self.devin_ended(r.id).await;
+                        return Err(e);
+                    }
+                };
                 (spec, None)
             }
             Engine::Gemini
@@ -5175,7 +5186,9 @@ impl Desk {
             };
             self.mode_said(id, &hook, &body);
             let said = self.apply_hook(id, hook, claude::agent_of(&body)).await;
-            return Some(devin::answer(said));
+            // Desk's own bosses alone judge Devin's calls (a served boss is
+            // never given one, [`crate::engine::boss_safe`]): never closed.
+            return Some(devin::answer(said, false));
         }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,

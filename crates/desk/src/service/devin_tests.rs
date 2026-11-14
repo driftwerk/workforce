@@ -214,7 +214,10 @@ async fn devin_files_left_by_a_session_that_ended_while_the_hub_was_away_are_end
                 "http://127.0.0.1:9/hook/x/y",
                 60,
                 false,
-                &devin_config::Person::Read(serde_json::json!({})),
+                &devin_config::Person::Read {
+                    config: serde_json::json!({}),
+                    real: None,
+                },
             )
             .unwrap();
         // What Devin saved in it before it ended.
