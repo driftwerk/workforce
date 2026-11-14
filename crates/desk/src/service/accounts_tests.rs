@@ -591,8 +591,11 @@ const COLOURS: &[u8] = b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0
 /// byte for byte. Its sign-in reads as `devin auth status` does (signed in
 /// once `devin-in` is there; by a key, if one reached it).
 ///
-/// `auth login` asks the kitty flags and DA1, draws its picker, takes one
-/// key (kept in `got-key`; Enter only goes on), then waits in the browser
+/// `auth login` asks the kitty flags and DA1 (not in the recording: real
+/// Devin asks only its colours there and pushes kitty flags; asked here
+/// for robustness, in case a later Devin does), draws its picker, takes one
+/// key (kept in `got-key`; Enter only goes on); with `devin-silent` it then
+/// shows nothing more, with `devin-other` another prompt; else it waits in the browser
 /// until the test writes `devin-approved` (it signs in), `devin-refused`
 /// (it ends) or `devin-no-code` (it says it received no authorization
 /// code). With `--force-manual-token-flow` it draws its page and Code
@@ -647,6 +650,8 @@ fn devin(dir: &Path) -> PathBuf {
                printf '\\033[?u\\033[c'; cat '{d}/picker.bin'; answered '{d}/picker-answers'\n\
                dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' \\n' > '{d}/got-key'\n\
                [ \"$(cat '{d}/got-key')\" = '\\r' ] || exit 3\n\
+               [ -e '{d}/devin-silent' ] && exec sleep 30\n\
+               [ -e '{d}/devin-other' ] && printf '\\r\\n Enter your Windsurf Enterprise subdomain:\\r\\n \\342\\206\\265 submit \\302\\267 esc cancel\\r\\n' && exec sleep 30\n\
                cat '{d}/browser-wait.bin'; answered '{d}/colours'\n\
                while [ ! -e '{d}/devin-approved' ] && [ ! -e '{d}/devin-refused' ] && [ ! -e '{d}/devin-no-code' ]; do sleep 0.05; done\n\
                if [ -e '{d}/devin-no-code' ]; then printf '\\r\\nError: Failed to receive authorization code\\r\\n'; sleep 30; fi\n\
@@ -796,6 +801,20 @@ async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
         )
         .await;
         assert_eq!(code, 204, "{body}");
+        // A second is refused: the first was typed.
+        let (code, body) = api(
+            &app,
+            "POST",
+            &token_at,
+            Some(serde_json::json!({"code": DEVIN_TOKEN})),
+        )
+        .await;
+        assert_eq!(code, 409, "{body}");
+        assert!(
+            body.to_string()
+                .contains(super::engine_sign_ins::DEVIN_TYPED_ALREADY),
+            "{body}"
+        );
         // The terminal echoes it at once, and the CLI draws it: neither is
         // ever on the screen, from the moment it was typed.
         for _ in 0..8 {
@@ -1010,6 +1029,23 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
         let lost = d.start_engine_sign_in(Engine::Devin, false).unwrap();
         assert_eq!(devin_failed(&d, lost.id).await, sign_ins::DEVIN_NO_ANSWER);
         std::fs::remove_file(dir.path().join("devin-no-code")).unwrap();
+
+        // Enter taken, then nothing, or something else: never in the
+        // browser, and said plainly once it has waited long enough.
+        for after in ["devin-silent", "devin-other"] {
+            std::fs::write(dir.path().join(after), "").unwrap();
+            let _ = std::fs::remove_file(dir.path().join("got-key"));
+            let stalled = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+            let why = until(|| match state(stalled.id) {
+                EngineSignInState::Failed { why } => Some(why),
+                EngineSignInState::Browser { .. } => panic!("{after}: in the browser"),
+                _ => None,
+            })
+            .await;
+            assert_eq!(why, sign_ins::DEVIN_ASKED_UNKNOWN, "{after}");
+            assert_eq!(key(), "\\r", "{after}: Enter was pressed");
+            std::fs::remove_file(dir.path().join(after)).unwrap();
+        }
 
         // A picker Desk doesn't know: never answered, and said plainly.
         for changed in [

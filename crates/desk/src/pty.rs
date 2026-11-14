@@ -120,6 +120,9 @@ pub(crate) struct Screen {
     /// answered once the rest of it comes: never more than a query's own
     /// bytes, none of the program's text.
     blind_tail: Mutex<Vec<u8>>,
+    /// No one is ever shown it ([`Pty::spawn_unseen`]): blind, it answers
+    /// the kitty keyboard query too.
+    unseen: bool,
 }
 
 /// The term a screen draws with.
@@ -169,6 +172,7 @@ impl Screen {
             blind: Default::default(),
             reaped: Default::default(),
             blind_tail: Default::default(),
+            unseen,
         })
     }
 
@@ -181,7 +185,7 @@ impl Screen {
             // nothing of the output taken in.
             // A viewer never sees blind output, so it can't answer: the
             // hub always does.
-            let replies = blind_replies(&mut self.blind_tail.lock(), chunk);
+            let replies = blind_replies(&mut self.blind_tail.lock(), chunk, self.unseen);
             return (!replies.is_empty()).then_some(replies);
         }
         let mut core = self.core.lock();
@@ -244,12 +248,13 @@ impl Screen {
 /// (`ESC[6n`, always the top left), the device attributes (`ESC[c`,
 /// `ESC[0c`, as [`Term`] answers them), the foreground and background
 /// colours (OSC 10 and 11, ended by BEL or ST: white on black) and the kitty
-/// keyboard flags (`ESC[?u`: none). Nothing else is answered.
+/// keyboard flags (`ESC[?u`: none; only on an unseen terminal, as a seen
+/// one leaves it to xterm.js). Nothing else is answered.
 const BLIND_ASKED: [(&[u8], &[u8]); 9] = [
     (b"\x1b[6n", b"\x1b[1;1R"),
     (b"\x1b[c", b"\x1b[?1;2c"),
     (b"\x1b[0c", b"\x1b[?1;2c"),
-    (b"\x1b[?u", b"\x1b[?0u"),
+    (KITTY_ASKED, b"\x1b[?0u"),
     (b"\x1b]10;?\x07", BLIND_FOREGROUND),
     (b"\x1b]10;?\x1b\\", BLIND_FOREGROUND),
     (b"\x1b]11;?\x07", BLIND_BACKGROUND),
@@ -260,13 +265,17 @@ const BLIND_ASKED: [(&[u8], &[u8]); 9] = [
         b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\",
     ),
 ];
+/// The kitty keyboard query, exactly: `ESC[?0u` (an answer) never is one.
+const KITTY_ASKED: &[u8] = b"\x1b[?u";
 const BLIND_FOREGROUND: &[u8] = b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\";
 const BLIND_BACKGROUND: &[u8] = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
 
 /// What a blind screen answers in `chunk` ([`BLIND_ASKED`]), in the order
 /// asked. A query cut off at its end is kept in `tail` (only ever a query's
-/// own first bytes) and answered once the next chunk completes it.
-fn blind_replies(tail: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
+/// own first bytes) and answered once the next chunk completes it. The kitty
+/// query is answered only with `kitty`.
+fn blind_replies(tail: &mut Vec<u8>, chunk: &[u8], kitty: bool) -> Vec<u8> {
+    let asked = |q: &&[u8]| kitty || *q != KITTY_ASKED;
     let joined;
     let bytes = match tail.is_empty() {
         true => chunk,
@@ -279,7 +288,10 @@ fn blind_replies(tail: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
     let mut at = 0;
     while at < bytes.len() {
         let rest = &bytes[at..];
-        match BLIND_ASKED.iter().find(|(q, _)| rest.starts_with(q)) {
+        match BLIND_ASKED
+            .iter()
+            .find(|(q, _)| asked(q) && rest.starts_with(q))
+        {
             Some((q, reply)) => {
                 replies.extend_from_slice(reply);
                 at += q.len();
@@ -287,7 +299,7 @@ fn blind_replies(tail: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
             None if rest[0] == 0x1b
                 && BLIND_ASKED
                     .iter()
-                    .any(|(q, _)| q.len() > rest.len() && q.starts_with(rest)) =>
+                    .any(|(q, _)| asked(q) && q.len() > rest.len() && q.starts_with(rest)) =>
             {
                 *tail = rest.to_vec();
                 break;
@@ -1059,7 +1071,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_blind_screen_takes_nothing_in_but_still_answers_what_its_program_waits_on() {
-        let screen = Screen::new(80, 24, 100, None);
+        // A seen one leaves the kitty query to xterm.js, blind or not.
+        let seen = Screen::new(80, 24, 100, None);
+        seen.blind.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            seen.push(b"\x1b[?u\x1b[c").as_deref(),
+            Some(&b"\x1b[?1;2c"[..])
+        );
+        let screen = Screen::with(80, 24, 100, None, true);
         screen
             .blind
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1092,6 +1111,8 @@ pub(crate) mod tests {
         assert_eq!(screen.blind_tail.lock().as_slice(), b"\x1b");
         assert_eq!(screen.push(b"secret-789"), None);
         assert!(screen.blind_tail.lock().is_empty());
+        // Its own answer, echoed back, is never answered.
+        assert_eq!(screen.push(b"\x1b[?0u"), None);
         assert!(!screen.text().contains("secret"), "{}", screen.text());
         assert_eq!(screen.push(b"secret-456"), None);
         assert!(screen.text().trim().is_empty());
@@ -1102,7 +1123,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_unseen_terminal_answers_colours_and_kitty_flags_and_reads_its_screen() {
-        // Asks what Devin's login asks, and prints what came back.
+        // Asks Devin's colour queries, and (for robustness: the recording
+        // has none) the kitty flags and DA1, and prints what came back.
         let script = "stty raw -echo; printf 'Hi\\033]10;?\\007\\033]11;?\\007\\033[?u\\033[c'; \
              dd bs=1 count=62 2>/dev/null | od -An -c | tr -d ' \\n'; sleep 30";
         let (pty, _exit) = Pty::spawn_unseen(&sh(script), 120, 10, 0).unwrap();

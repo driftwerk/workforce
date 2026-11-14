@@ -17,8 +17,11 @@
 //!   besides.
 //!
 //! The CLI's terminal is one no one is shown ([`Pty::spawn_unseen`]): the
-//! hub answers every query its CLI waits on (colours, kitty keyboard
-//! flags, cursor, device), or Devin never goes on past its picker.
+//! hub answers the queries its CLI waits on. Devin 3000.12.57 asks its
+//! colours (OSC 10/11) and doesn't go on past its picker without the
+//! answers; the kitty keyboard flags, cursor and device are answered too,
+//! for robustness.
+//!
 //!
 //! The CLI keeps the sign-in where its sessions read it. Nothing it signs
 //! in with passes through Desk but a pasted code, on its way to the CLI.
@@ -44,6 +47,15 @@ const SIGN_IN_FOR: Duration = Duration::from_secs(16 * 60);
 /// How long Devin's login may take to show something Desk knows (its
 /// picker, or its page): well inside the 30 s Desk waits for a first step.
 const DEVIN_SHOWS_IN: Duration = Duration::from_secs(20);
+/// How long Devin may take, after Enter on its picker, to say it waits in
+/// the browser; short under test, for a stand-in that never says it.
+const DEVIN_BROWSER_IN: Duration = match cfg!(test) {
+    true => Duration::from_secs(2),
+    false => Duration::from_secs(20),
+};
+/// How long after typing a code Enter follows it, as a key of its own: a
+/// CLI that reads one chunk as one key event never takes the two as one.
+const ENTER_AFTER: Duration = Duration::from_millis(100);
 /// How often its screen is read.
 const SIGN_IN_EVERY: Duration = Duration::from_millis(250);
 const SIGN_IN_COLS: u16 = 400;
@@ -169,8 +181,9 @@ pub(super) struct EngineSignInRun {
     /// Devin's picker was seen whole at the last look: Enter waits for a
     /// second, so the answers to the queries it drew it with are sent first.
     picker_seen: bool,
-    /// Devin's picker was answered (Enter, once): never again.
-    entered: bool,
+    /// When Devin's picker was answered (Enter, once, never again), since
+    /// the sign-in began.
+    entered_at: Option<Duration>,
 }
 
 /// What a person reads when the device sign-in ended without signing in.
@@ -186,6 +199,9 @@ pub const DEVIN_FAILED: &str =
 /// What they read when Devin turned the pasted code away.
 pub const DEVIN_TOKEN_FAILED: &str =
     "Devin didn't take that code. Start the sign-in again, and paste the code the page gives you.";
+/// What they read pasting a second code into a sign-in that took one.
+pub const DEVIN_TYPED_ALREADY: &str =
+    "Desk already typed a code into that sign-in. Start the sign-in again.";
 /// What they read when Devin's login ended before showing its page.
 pub const DEVIN_NO_PAGE: &str =
     "Devin's sign-in ended before it showed a page to sign in on. Start it again.";
@@ -272,6 +288,9 @@ pub struct DevinSaid {
     /// than its picker's): with no [`Self::picker`], something Desk
     /// doesn't answer.
     pub asks: bool,
+    /// Below its page, its prompt for the code the page gives (` Code:`):
+    /// the page is drawn whole, and a code can be typed.
+    pub code_prompt: bool,
     /// It opened the browser and waits for the person there.
     pub in_browser: bool,
     /// It said it signed in.
@@ -284,6 +303,9 @@ pub struct DevinSaid {
 /// first, the browser, chosen (`❭`).
 const DEVIN_ASKS_HOW: &str = "How would you like to log in?";
 const DEVIN_BROWSER_CHOSEN: &str = "\u{276d} 1 Log in with browser";
+/// The picker's footer, the last it draws.
+const DEVIN_PICKER_FOOTER: &str =
+    "\u{2191}\u{2193} select \u{b7} \u{21b5} confirm \u{b7} esc cancel";
 /// What ends a prompt of Devin's: its keys.
 const DEVIN_FOOTERS: &[&str] = &["esc cancel", "\u{21b5} confirm", "\u{21b5} submit"];
 /// What Devin says when its login fails, as Desk says it.
@@ -311,12 +333,22 @@ pub fn devin_said(screen: &str) -> DevinSaid {
     let screen = crate::pty::plain_text(screen.as_bytes());
     let mut said = DevinSaid::default();
     let lines: Vec<&str> = screen.lines().map(str::trim).collect();
-    for line in &lines {
+    let mut page_at = None;
+    for (at, line) in lines.iter().enumerate() {
         let lower = line.to_lowercase();
         for word in screen_words(line) {
             if let Some(page) = devin_page(word) {
                 said.url = Some(page.as_str().to_string());
+                page_at = Some(at);
+                said.code_prompt = false;
             }
+        }
+        if page_at.is_some_and(|p| p < at)
+            && (*line == "Code:"
+                || lower.starts_with("paste the code")
+                || lower.starts_with("paste the token"))
+        {
+            said.code_prompt = true;
         }
         // Only its falling back from the browser: a hint that a manual
         // flow exists is no reason to ask for a code.
@@ -348,17 +380,30 @@ pub fn devin_said(screen: &str) -> DevinSaid {
             said.asks = true;
         }
     }
-    // Exactly its picker: the question, its first option the browser and
-    // chosen, and no other option chosen.
-    let asked = lines.iter().position(|l| *l == DEVIN_ASKS_HOW);
-    said.picker = asked.is_some_and(|at| {
-        let after = &lines[at + 1..];
-        after.iter().find(|l| !l.is_empty()) == Some(&DEVIN_BROWSER_CHOSEN)
-            && after
-                .iter()
-                .filter(|l| l.starts_with('\u{276d}'))
-                .all(|l| *l == DEVIN_BROWSER_CHOSEN)
-    });
+    // Exactly its picker, and the last thing on screen: its question once,
+    // its first option the browser and chosen, no other option chosen and
+    // no other question or prompt below it, and its own footer the last
+    // line, once.
+    let shown: Vec<&str> = lines.iter().copied().filter(|l| !l.is_empty()).collect();
+    let once = |what: &str| shown.iter().filter(|l| **l == what).count() == 1;
+    let asked = shown.iter().position(|l| *l == DEVIN_ASKS_HOW);
+    said.picker = once(DEVIN_ASKS_HOW)
+        && once(DEVIN_PICKER_FOOTER)
+        && shown.last() == Some(&DEVIN_PICKER_FOOTER)
+        && asked.is_some_and(|at| {
+            let options = &shown[at + 1..shown.len() - 1];
+            options.first() == Some(&DEVIN_BROWSER_CHOSEN)
+                && options
+                    .iter()
+                    .filter(|l| l.starts_with('\u{276d}'))
+                    .all(|l| *l == DEVIN_BROWSER_CHOSEN)
+                && !options.iter().any(|l| {
+                    let lower = l.to_lowercase();
+                    l.ends_with('?')
+                        || l.ends_with(':')
+                        || DEVIN_FOOTERS.iter().any(|f| lower.contains(f))
+                })
+        });
     said
 }
 
@@ -495,7 +540,7 @@ impl Desk {
                     manual: manual && engine == Engine::Devin,
                     typed: false,
                     picker_seen: false,
-                    entered: false,
+                    entered_at: None,
                 },
             );
             ended
@@ -549,6 +594,9 @@ impl Desk {
                 .ok_or_else(|| {
                     DeskError::Conflict("that sign-in isn't waiting for a code".into())
                 })?;
+            if run.typed {
+                return Err(DeskError::Conflict(DEVIN_TYPED_ALREADY.into()));
+            }
             let pty = run
                 .pty
                 .clone()
@@ -558,8 +606,14 @@ impl Desk {
         };
         // The bytes pass through the terminal's writer queue on their way
         // and are freed there, not zeroed; nothing keeps or logs them.
-        pty.write(format!("{token}\r").as_bytes())
-            .map_err(|_| DeskError::Conflict("that sign-in has ended".into()))
+        pty.write(token.as_bytes())
+            .map_err(|_| DeskError::Conflict("that sign-in has ended".into()))?;
+        // Enter as a key of its own, a moment later.
+        tokio::spawn(async move {
+            tokio::time::sleep(ENTER_AFTER).await;
+            let _ = pty.write(b"\r");
+        });
+        Ok(())
     }
 
     /// Ends an engine sign-in the person gave up on.
@@ -623,10 +677,10 @@ impl Desk {
         pty: &Pty,
         since: Duration,
     ) -> Option<Ended> {
-        let (state, manual, picker_seen, entered) = {
+        let (state, manual, picker_seen, entered_at) = {
             let st = self.0.state.lock();
             let r = st.engine_sign_ins.get(&id)?;
-            (r.view.state.clone(), r.manual, r.picker_seen, r.entered)
+            (r.view.state.clone(), r.manual, r.picker_seen, r.entered_at)
         };
         if matches!(state, EngineSignInState::Paste { .. }) {
             wipe(pty);
@@ -643,23 +697,34 @@ impl Desk {
         if let Some((why, reason)) = said.failed {
             return Some(Ended::failed(why, reason));
         }
-        if let Some(url) = said.url.clone() {
-            let next = match manual || said.manual {
-                true => {
-                    // Before Desk can be given a code: whatever the
-                    // terminal shows from now on is never taken in.
-                    pty.blind();
-                    wipe(pty);
-                    EngineSignInState::Paste { url }
-                }
-                false => EngineSignInState::Page { url },
-            };
-            self.engine_sign_in_moved(id, next);
-            return None;
+        match said.url.clone() {
+            // Its page, and below it on the same look its prompt for the
+            // code: the page is whole, and the prompt there to type into.
+            Some(url) if (manual || said.manual) && said.code_prompt => {
+                // Before Desk can be given a code: whatever the terminal
+                // shows from now on is never taken in.
+                pty.blind();
+                wipe(pty);
+                self.engine_sign_in_moved(id, EngineSignInState::Paste { url });
+                return None;
+            }
+            Some(_) if manual || said.manual => {} // its prompt is to come
+            Some(url) => {
+                self.engine_sign_in_moved(id, EngineSignInState::Page { url });
+                return None;
+            }
+            None => {}
         }
-        if entered {
+        if let Some(at) = entered_at {
             if said.in_browser {
                 self.engine_sign_in_moved(id, EngineSignInState::browser());
+            } else if state == EngineSignInState::Starting
+                && since.saturating_sub(at) > DEVIN_BROWSER_IN
+            {
+                return Some(Ended::failed(
+                    DEVIN_ASKED_UNKNOWN,
+                    "no browser wait after Enter",
+                ));
             }
             return None;
         }
@@ -667,14 +732,17 @@ impl Desk {
             // Its prompt for a code is drawn after its page: a prompt with
             // no page Desk knows above it has none to show.
             if said.asks {
-                return Some(Ended::failed(DEVIN_PAGE_UNKNOWN, "no page Desk knows"));
+                return Some(match said.url {
+                    Some(_) => Ended::failed(DEVIN_ASKED_UNKNOWN, "asked other than a code"),
+                    None => Ended::failed(DEVIN_PAGE_UNKNOWN, "no page Desk knows"),
+                });
             }
-        } else if said.picker && said.asks {
+        } else if said.picker {
             // Its picker, drawn to its footer, the browser chosen, at two
             // looks running (the answers its queries were owed are sent):
-            // Enter, once.
+            // Enter, once. It is in the browser only once it says so.
             if let Some(run) = self.0.state.lock().engine_sign_ins.get_mut(&id) {
-                run.entered = picker_seen;
+                run.entered_at = picker_seen.then_some(since);
                 run.picker_seen = true;
             }
             if !picker_seen {
@@ -683,7 +751,11 @@ impl Desk {
             if pty.write(b"\r").is_err() {
                 return Some(Ended::failed(DEVIN_FAILED, "the CLI went before Enter"));
             }
-            self.engine_sign_in_moved(id, EngineSignInState::browser());
+            tracing::info!(
+                engine = engine.title(),
+                step = "picker answered",
+                "an engine's own sign-in moved"
+            );
             return None;
         } else if said.asks {
             return Some(Ended::failed(
@@ -708,12 +780,12 @@ impl Desk {
         pty: &Pty,
         code: Option<u32>,
     ) -> Ended {
-        let (state, typed) = {
+        let (state, typed, entered) = {
             let st = self.0.state.lock();
             st.engine_sign_ins
                 .get(&id)
-                .map_or((EngineSignInState::Starting, false), |r| {
-                    (r.view.state.clone(), r.typed)
+                .map_or((EngineSignInState::Starting, false, false), |r| {
+                    (r.view.state.clone(), r.typed, r.entered_at.is_some())
                 })
         };
         if matches!(state, EngineSignInState::Paste { .. }) {
@@ -741,6 +813,7 @@ impl Desk {
                     _ if matches!(state, EngineSignInState::Browser { .. }) => {
                         Ended::failed(DEVIN_FAILED, "the CLI ended in the browser step")
                     }
+                    _ if entered => Ended::failed(DEVIN_FAILED, "the CLI ended after Enter"),
                     _ if said.url.is_none() => {
                         Ended::failed(DEVIN_NO_PAGE, "the CLI ended before a page")
                     }
@@ -1054,10 +1127,29 @@ mod tests {
             (said.url, said.in_browser, said.failed),
             (None, false, None)
         );
-        // Drawn up to its options only: not yet asked.
+        // Drawn up to its options only: not yet asked, not yet answered.
         let cut = &PICKER[..PICKER.windows(4).position(|w| w == b"   2").unwrap()];
         let said = devin_said(&shown(&[cut]));
-        assert!(said.picker && !said.asks, "{said:?}");
+        assert!(!said.picker && !said.asks, "{said:?}");
+        // Its picker must be the last thing on screen, drawn once: never
+        // one with another question or prompt below it, nor a stale one in
+        // the history above a new prompt.
+        let footer = " \u{2191}\u{2193} select \u{b7} \u{21b5} confirm \u{b7} esc cancel";
+        let sso =
+            "\r\n\r\n Use your company's SSO instead? (Y/n)\r\n \u{21b5} confirm \u{b7} esc cancel";
+        let enterprise = "\r\n\r\nEnter your Windsurf Enterprise subdomain:\r\n \u{276d} \r\n \u{21b5} submit \u{b7} esc cancel";
+        for below in [
+            sso.to_string(),
+            format!("\r\n\r\n Use your company's SSO instead? (Y/n)\r\n{footer}"),
+            enterprise.to_string(),
+            format!("\r\n\r\nEnter your Windsurf Enterprise subdomain:\r\n{footer}"),
+            "\r\n\r\n Signing in to Windsurf for Enterprise".to_string(),
+        ] {
+            let said = devin_said(&shown(&[PICKER, below.as_bytes()]));
+            assert!(!said.picker, "{below}");
+        }
+        let said = devin_said(&shown(&[PICKER, b"\r\n\r\n", PICKER]));
+        assert!(!said.picker, "its question twice");
         let picker = String::from_utf8(PICKER.to_vec()).unwrap();
         for changed in [
             picker.replace("1 Log in with browser", "1 Log in with Windsurf"),
@@ -1118,6 +1210,17 @@ mod tests {
         let said = devin_said(&screen);
         assert_eq!(said.url.as_deref(), Some(REAL_PAGE));
         assert!(said.asks && !said.picker, "its Code prompt");
+        assert!(said.code_prompt, "below the page");
+        // Before its Code prompt is drawn, the page isn't taken yet.
+        let before = &MANUAL[..MANUAL.windows(5).position(|w| w == b" Code").unwrap()];
+        let said = devin_said(&shown(&[before]));
+        assert_eq!(said.url.as_deref(), Some(REAL_PAGE));
+        assert!(!said.code_prompt);
+        // A page cut short is no page, prompt or not.
+        let cut = String::from_utf8(MANUAL.to_vec())
+            .unwrap()
+            .replace("&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1", "");
+        assert_eq!(devin_said(&shown(&[cut.as_bytes()])).url, None);
         // And from its bytes as they came: OSC 8 is unwrapped, not read twice.
         let raw = String::from_utf8(MANUAL.to_vec()).unwrap();
         assert_eq!(devin_said(&raw).url.as_deref(), Some(REAL_PAGE));
