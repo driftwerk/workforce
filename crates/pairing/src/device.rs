@@ -432,6 +432,11 @@ fn approve_in(
         return Err(eyre::eyre!("Device pairing request is no longer pending"));
     }
 
+    // An approval is when tokens nobody collected in time are cleared.
+    if let Err(e) = store.expire_stale_requests(Utc::now()) {
+        tracing::warn!(error = %e, "clearing stale pairing requests failed");
+    }
+
     // Generate a bearer token for the device
     let token = format!("wfp_{}", Uuid::new_v4().as_simple());
     let token_hash = blake3::hash(token.as_bytes()).to_hex().to_string();
@@ -707,6 +712,44 @@ mod tests {
         });
         assert!(log.contains("Created device pairing request"), "{log}");
         assert!(!code.is_empty() && !log.contains(&code), "{code} in {log}");
+    }
+
+    /// A token nobody collects is gone after its window: from the status
+    /// endpoint's view, and from the database at the next sweep.
+    #[test]
+    fn a_pending_token_not_collected_in_time_is_cleared() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = DevicePairingService::new(store.clone(), device_config());
+        let req = svc
+            .initiate("test-phone", vec!["chat".into()], None, None, None, None)
+            .unwrap();
+        let (_, token) = svc.approve(&req.code, "admin").unwrap();
+        let held = store
+            .get_device_request_by_code(&req.code)
+            .unwrap()
+            .unwrap();
+        let approved = held.approved_at.unwrap();
+
+        let in_time = approved + Duration::seconds(PENDING_TOKEN_TTL_SECS - 1);
+        assert_eq!(held.collectable_token(in_time), Some(token.as_str()));
+        let late = approved + Duration::seconds(PENDING_TOKEN_TTL_SECS + 1);
+        assert_eq!(held.collectable_token(late), None);
+
+        // A sweep before the window ends leaves it; one after clears it.
+        store.expire_stale_requests(in_time).unwrap();
+        let kept = store
+            .get_device_request_by_code(&req.code)
+            .unwrap()
+            .unwrap();
+        assert!(kept.pending_token.is_some());
+        store.expire_stale_requests(late).unwrap();
+        let gone = store
+            .get_device_request_by_code(&req.code)
+            .unwrap()
+            .unwrap();
+        assert!(gone.pending_token.is_none());
+        // The device's own record still validates its token: only the copy went.
+        assert!(svc.validate_token_with_match(&token).unwrap().is_some());
     }
 
     #[test]
