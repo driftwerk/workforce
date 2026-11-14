@@ -32,6 +32,8 @@ pub struct Services {
     pub google_userinfo: String,
     /// The shortest wait between two polls of a device sign-in.
     pub poll_floor: Duration,
+    /// The GitHub CLI's sign-in on this computer, a GitHub setup offers.
+    pub gh: super::gh::GhCli,
 }
 
 impl Services {
@@ -53,6 +55,7 @@ impl Services {
             google_token: workforce_skills::adapters::google::oauth::TOKEN_URL.into(),
             google_userinfo: workforce_skills::adapters::google::oauth::USERINFO_URL.into(),
             poll_floor: Duration::from_secs(5),
+            gh: super::gh::GhCli::live(),
         }
     }
 }
