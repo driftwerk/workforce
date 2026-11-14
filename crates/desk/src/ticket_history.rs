@@ -25,6 +25,12 @@ use crate::store::DeskStore;
 
 /// The most of an issue's history kept: its newest.
 pub const HISTORY_MAX: usize = 100;
+/// How long an issue's history read is taken as current.
+pub const FRESH: chrono::Duration = chrono::Duration::minutes(5);
+/// Forgets the history of board `$1`'s tickets: read as one person,
+/// through one hub, it is never served for another.
+pub const FORGET_HISTORY: &str =
+    "DELETE FROM ticket_history WHERE ticket IN (SELECT id FROM tickets WHERE board = $1)";
 /// The longest value an event keeps.
 const VALUE_MAX: usize = 120;
 
@@ -343,18 +349,21 @@ fn linear_entry(n: &Value, writer: Option<&str>) -> Vec<HistoryEvent> {
     if let Some((f, t)) = pair("fromDueDate", "toDueDate", text) {
         out.push(e(HistoryKind::Field).field("due date").change(f, t));
     }
-    let names = |k: &str| {
-        let all: Vec<String> = n[k]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(name)
-            .collect();
-        (!all.is_empty()).then(|| all.join(", "))
-    };
-    let (removed, added) = (names("removedLabels"), names("addedLabels"));
-    if removed.is_some() || added.is_some() {
-        out.push(e(HistoryKind::Field).field("labels").change(removed, added));
+    // A label each: added (`to`) or removed (`from`).
+    let labels = |k: &str| n[k].as_array().into_iter().flatten().filter_map(name);
+    for added in labels("addedLabels") {
+        out.push(
+            e(HistoryKind::Field)
+                .field("labels")
+                .change(None, Some(added)),
+        );
+    }
+    for removed in labels("removedLabels") {
+        out.push(
+            e(HistoryKind::Field)
+                .field("labels")
+                .change(Some(removed), None),
+        );
     }
     for r in n["relationChanges"].as_array().into_iter().flatten() {
         if let Some(k) = key(r) {
@@ -398,13 +407,16 @@ pub fn linear_history(answer: &Value, writer: Option<&str>) -> Option<Vec<Histor
 // ── In Postgres ──────────────────────────────────────────────────────────
 
 impl DeskStore {
-    /// `ticket`'s issue's history as last read, oldest first; none when it
-    /// never was.
-    pub async fn history_of(&self, ticket: Uuid) -> Result<Option<Vec<HistoryEvent>>> {
+    /// `ticket`'s issue's history as last read, oldest first, and when it
+    /// was read; none when it never was.
+    pub async fn history_of(
+        &self,
+        ticket: Uuid,
+    ) -> Result<Option<(Vec<HistoryEvent>, DateTime<Utc>)>> {
         let client = self.pool().get().await?;
         let Some(row) = client
             .query_opt(
-                "SELECT events FROM ticket_history WHERE ticket = $1",
+                "SELECT events, read_at FROM ticket_history WHERE ticket = $1",
                 &[&ticket],
             )
             .await?
@@ -412,9 +424,10 @@ impl DeskStore {
             return Ok(None);
         };
         let events: Value = row.try_get("events")?;
-        Ok(Some(
+        Ok(Some((
             serde_json::from_value(events).context("reading a ticket's history")?,
-        ))
+            row.try_get("read_at")?,
+        )))
     }
 
     /// Keeps `events` as `ticket`'s issue's history, read at `read_at`.

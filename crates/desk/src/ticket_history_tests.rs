@@ -188,7 +188,7 @@ fn linear_s_history_says_each_kind_of_change() {
               "fromParent": null, "toParent": { "identifier": "ATL-1" },
               "toTitle": "<<<EXTERNAL_UNTRUSTED_CONTENT_x>>>\n[External content from Linear issue title]\nNew title\n<<</EXTERNAL_UNTRUSTED_CONTENT_x>>>",
               "fromTitle": "Old title",
-              "addedLabels": [{ "name": "web" }], "removedLabels": [],
+              "addedLabels": [{ "name": "web" }, { "name": "bug" }], "removedLabels": [{ "name": "old" }],
               "relationChanges": [{ "identifier": "ATL-3", "type": "blocks" }],
               "updatedDescription": true },
             { "createdAt": "2026-11-03T09:00:00.000Z", "actor": null, "botActor": { "name": "GitHub", "type": "github" },
@@ -224,6 +224,8 @@ fn linear_s_history_says_each_kind_of_change() {
                 json!({ "kind": "field", "field": "title", "from": "Old title", "to": "New title" })
             ),
             dana(json!({ "kind": "field", "field": "labels", "to": "web" })),
+            dana(json!({ "kind": "field", "field": "labels", "to": "bug" })),
+            dana(json!({ "kind": "field", "field": "labels", "from": "old" })),
             dana(json!({ "kind": "link", "to": "ATL-3" })),
             dana(json!({ "kind": "field", "field": "description" })),
             json!({ "at": "2026-11-03T08:00:00Z", "by": "github", "kind": "link", "to": "#248" }),
@@ -314,12 +316,18 @@ async fn history_is_kept_and_replaced() {
             .put_history(ticket, &first, chrono::Utc::now())
             .await
             .unwrap();
-        assert_eq!(store.history_of(ticket).await.unwrap(), Some(first));
+        assert_eq!(
+            store.history_of(ticket).await.unwrap().map(|h| h.0),
+            Some(first)
+        );
         store
             .put_history(ticket, &[], chrono::Utc::now())
             .await
             .unwrap();
-        assert_eq!(store.history_of(ticket).await.unwrap(), Some(vec![]));
+        assert_eq!(
+            store.history_of(ticket).await.unwrap().map(|h| h.0),
+            Some(vec![])
+        );
     })
     .await;
 }

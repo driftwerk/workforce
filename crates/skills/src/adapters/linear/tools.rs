@@ -4156,10 +4156,22 @@ impl LinearIssueHistoryTool {
 }
 
 /// An issue's history entries as `linear.issue_history` answers them:
-/// oldest first, held to the newest `limit`, with the words someone wrote
+/// each once, oldest first, held to the newest `limit`, with the words someone wrote
 /// (titles, an attachment's title) wrapped.
 fn history_entries(nodes: &Value, limit: usize) -> Vec<Value> {
-    let mut nodes: Vec<Value> = nodes.as_array().cloned().unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    // Each once, whichever end of the history it came from.
+    let mut nodes: Vec<Value> = nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|n| {
+            n["id"]
+                .as_str()
+                .is_none_or(|id| seen.insert(id.to_string()))
+        })
+        .cloned()
+        .collect();
     // Linear's order isn't promised: by when, oldest first.
     nodes.sort_by(|a, b| {
         a["createdAt"]
@@ -4248,9 +4260,11 @@ impl Tool for LinearIssueHistoryTool {
 
         let limit = coerce_to_u64(&input["limit"]).unwrap_or(50).clamp(1, 100);
 
-        // As many as Linear gives at once, held to the newest `limit` here.
+        // Linear doesn't say which way it orders a history, so both ends
+        // are asked for, as many as it gives at once, and the newest
+        // `limit` of them kept here.
         let query = r#"
-            query($id: String!, $first: Int) {
+            query($id: String!, $n: Int) {
                 issue(id: $id) {
                     id
                     identifier
@@ -4259,85 +4273,93 @@ impl Tool for LinearIssueHistoryTool {
                         id
                         name
                     }
-                    history(first: $first) {
+                    head: history(first: $n) {
                         nodes {
-                            id
-                            createdAt
-                            actor {
-                                id
-                                name
-                            }
-                            botActor {
-                                name
-                                type
-                            }
-                            fromState {
-                                name
-                                type
-                            }
-                            toState {
-                                name
-                                type
-                            }
-                            fromAssignee {
-                                id
-                                name
-                            }
-                            toAssignee {
-                                id
-                                name
-                            }
-                            fromPriority
-                            toPriority
-                            fromEstimate
-                            toEstimate
-                            fromCycle {
-                                number
-                                name
-                            }
-                            toCycle {
-                                number
-                                name
-                            }
-                            fromParent {
-                                identifier
-                            }
-                            toParent {
-                                identifier
-                            }
-                            fromProject {
-                                name
-                            }
-                            toProject {
-                                name
-                            }
-                            fromTitle
-                            toTitle
-                            fromDueDate
-                            toDueDate
-                            addedLabels {
-                                name
-                            }
-                            removedLabels {
-                                name
-                            }
-                            relationChanges {
-                                identifier
-                                type
-                            }
-                            attachment {
-                                title
-                                url
-                                sourceType
-                            }
-                            updatedDescription
+                            ...Change
+                        }
+                    }
+                    tail: history(last: $n) {
+                        nodes {
+                            ...Change
                         }
                     }
                 }
             }
+            fragment Change on IssueHistory {
+                id
+                createdAt
+                actor {
+                    id
+                    name
+                }
+                botActor {
+                    name
+                    type
+                }
+                fromState {
+                    name
+                    type
+                }
+                toState {
+                    name
+                    type
+                }
+                fromAssignee {
+                    id
+                    name
+                }
+                toAssignee {
+                    id
+                    name
+                }
+                fromPriority
+                toPriority
+                fromEstimate
+                toEstimate
+                fromCycle {
+                    number
+                    name
+                }
+                toCycle {
+                    number
+                    name
+                }
+                fromParent {
+                    identifier
+                }
+                toParent {
+                    identifier
+                }
+                fromProject {
+                    name
+                }
+                toProject {
+                    name
+                }
+                fromTitle
+                toTitle
+                fromDueDate
+                toDueDate
+                addedLabels {
+                    name
+                }
+                removedLabels {
+                    name
+                }
+                relationChanges {
+                    identifier
+                    type
+                }
+                attachment {
+                    title
+                    url
+                    sourceType
+                }
+                updatedDescription
+            }
         "#;
 
-        let variables = serde_json::json!({ "id": identifier, "first": 100 });
+        let variables = serde_json::json!({ "id": identifier, "n": limit });
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match client.query(query, variables).await {
@@ -4349,7 +4371,11 @@ impl Tool for LinearIssueHistoryTool {
                         duration_ms,
                     ));
                 }
-                let history = history_entries(&issue["history"]["nodes"], limit as usize);
+                let both: Vec<Value> = ["head", "tail"]
+                    .iter()
+                    .flat_map(|end| issue[*end]["nodes"].as_array().cloned().unwrap_or_default())
+                    .collect();
+                let history = history_entries(&Value::Array(both), limit as usize);
                 info!(identifier, count = history.len(), "Read an issue's history");
                 Ok(ToolResult::success(
                     serde_json::json!({
@@ -4558,12 +4584,13 @@ mod tests {
         let nodes = serde_json::json!([
             { "id": "h3", "createdAt": "2026-11-10T09:03:00.000Z", "toTitle": "New title", "fromTitle": "" },
             { "id": "h1", "createdAt": "2026-11-10T09:01:00.000Z", "toState": { "name": "Done" } },
+            { "id": "h3", "createdAt": "2026-11-10T09:03:00.000Z", "toTitle": "New title", "fromTitle": "" },
             { "id": "h2", "createdAt": "2026-11-10T09:02:00.000Z",
               "attachment": { "title": "Fix the login", "url": "https://github.com/acme/web/pull/7", "sourceType": "github" } },
         ]);
         let got = super::history_entries(&nodes, 2);
         let ids: Vec<&str> = got.iter().filter_map(|n| n["id"].as_str()).collect();
-        assert_eq!(ids, ["h2", "h3"]);
+        assert_eq!(ids, ["h2", "h3"], "each once, from either end");
         assert!(got[0]["attachment"]["title"]
             .as_str()
             .unwrap()

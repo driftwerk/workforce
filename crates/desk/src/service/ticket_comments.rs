@@ -107,17 +107,27 @@ impl Desk {
         self.ticket_comments(id).await.map_err(fail)
     }
 
-    /// Ticket `id`'s issue's history, as last read; none when it never was
-    /// (or it is a ticket of the person's own).
+    /// Ticket `id`'s issue's history, as last read; none when it never
+    /// was, or the ticket isn't synced (any more, or never was).
     pub async fn remote_history(&self, id: Uuid) -> Result<Option<Vec<HistoryEvent>>, DeskError> {
-        self.0.store.history_of(id).await.map_err(internal)
+        let t = self.ticket_of(id).await?;
+        if !t.external.as_ref().is_some_and(|e| e.synced) {
+            return Ok(None);
+        }
+        Ok(self
+            .0
+            .store
+            .history_of(id)
+            .await
+            .map_err(internal)?
+            .map(|(events, _)| events))
     }
 
     /// Reads ticket `id`'s issue's history through `remote` and keeps it,
-    /// on the same staleness as its comments ([`Desk::comments_stale`]).
-    /// An answer with no history (an older hub) keeps what was kept. Never
-    /// needed: the caller logs a failure and shows the comments all the
-    /// same.
+    /// when its comments are read and it wasn't in the last
+    /// [`history::FRESH`]. An answer with no history (an older hub) keeps
+    /// what was kept. Never needed: the caller logs a failure and shows the
+    /// comments all the same.
     pub async fn read_remote_history(
         &self,
         id: Uuid,
@@ -128,29 +138,19 @@ impl Desk {
         let Some(e) = t.external.clone().filter(|e| e.synced) else {
             return Ok(());
         };
-        let shared = self
-            .board_of(t.board)
+        let now = crate::crew::now();
+        let kept = self
+            .0
+            .store
+            .history_of(id)
             .await
-            .ok()
-            .and_then(|b| b.sync)
-            .and_then(|s| s.me_source)
-            .is_some_and(crate::board::MeSource::on_a_shared_key);
-        // Only on a shared key is the account Desk writes with not the
-        // person's own, so only there are its changes told apart. Both
-        // calls are quiet: never needed, so never held for an approval.
-        let writer = match shared {
-            true => crate::board_sync::call_quiet(
-                remote,
-                e.system,
-                crate::board_sync::identity_tool(e.system),
-                json!({}),
-            )
-            .await
-            .ok()
-            .and_then(|a| history::writer_of(e.system, &a)),
-            false => None,
-        };
+            .map_err(|e| fail(internal(e)))?;
+        if kept.is_some_and(|(_, at)| now - at < history::FRESH) {
+            return Ok(());
+        }
+        let writer = self.writer_of(t.board, e.system, remote).await;
         let (tool, args) = history::history_call(e.system, &e.key);
+        // Quiet: never needed, so never held for an approval.
         let answer = crate::board_sync::call_quiet(remote, e.system, tool, args).await?;
         let events = match e.system {
             crate::board::System::Jira => history::jira_history(&answer, writer.as_deref()),
@@ -159,11 +159,46 @@ impl Desk {
         if let Some(events) = events {
             self.0
                 .store
-                .put_history(id, &events, crate::crew::now())
+                .put_history(id, &events, now)
                 .await
                 .map_err(|e| fail(internal(e)))?;
         }
         Ok(())
+    }
+
+    /// The account board `board`'s link writes with, when it is a shared
+    /// key: only then are Desk's changes told apart from the person's own.
+    /// Kept on the link once the hub's identity tool names it (asked
+    /// quietly), and asked again after who the person is is checked.
+    async fn writer_of(
+        &self,
+        board: Uuid,
+        system: crate::board::System,
+        remote: &dyn Remote,
+    ) -> Option<String> {
+        let s = self.board_of(board).await.ok()?.sync?;
+        let source = s.me_source.filter(|m| m.on_a_shared_key())?;
+        if let Some(kept) = s.key_account {
+            return Some(kept);
+        }
+        let tool = crate::board_sync::identity_tool(system);
+        let answer = crate::board_sync::call_quiet(remote, system, tool, json!({}))
+            .await
+            .ok()?;
+        let writer = history::writer_of(system, &answer)?;
+        let keep = writer.clone();
+        let kept = self
+            .change_sync(board, move |s| {
+                // Only for the person it was asked for.
+                if s.me_source == Some(source) && s.key_account.is_none() {
+                    s.key_account = Some(keep);
+                }
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::debug!(board = %board, error = %e, "the key's account wasn't kept");
+        }
+        Some(writer)
     }
 
     /// Posts `body` on ticket `id` as `by`: on a synced ticket, to its issue

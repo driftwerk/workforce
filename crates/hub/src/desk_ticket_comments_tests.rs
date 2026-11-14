@@ -536,6 +536,27 @@ async fn a_history_that_can_t_be_read_never_stops_the_comments() {
         assert_eq!(got["comments"].as_array().unwrap().len(), 1);
         assert!(got["problem"].is_null(), "{got}");
         assert!(got.get("history").is_none(), "{got}");
+
+        // The history call itself refused: the comments are read all the
+        // same, and nothing is said of it.
+        remote.jira.lock().unwrap().refuse = Some("jira.get_issue");
+        let via = local
+            .sync
+            .remote(
+                workforce_desk::board::System::Jira,
+                &workforce_desk::board::Via::Hub {
+                    hub: "atlas".into(),
+                },
+                &local.person.id.to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(desk.read_remote_history(t.ticket.id, &*via).await.is_err());
+        said(&remote.jira, "ACME-1", "11", "Sam", "On it.", false);
+        let read = desk.read_ticket_comments(t.ticket.id, &*via).await.unwrap();
+        assert_eq!(read.len(), 2);
+        assert!(desk.remote_history(t.ticket.id).await.unwrap().is_none());
     })
     .await;
 }

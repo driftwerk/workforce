@@ -332,6 +332,11 @@ pub struct Sync {
     /// Why the hub can't vouch for who the person is, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub me_note: Option<String>,
+    /// On a shared key, the account it writes with there (the hub's identity
+    /// tool's answer): its changes in an issue's history are Desk's. Asked
+    /// once, and again when who the person is is checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_account: Option<String>,
     /// The remote state each column moves an issue to.
     pub states: BTreeMap<TicketState, String>,
     /// The sidebar group the board was in when it was linked: the link
