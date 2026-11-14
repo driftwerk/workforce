@@ -1115,14 +1115,6 @@ async fn the_person_hands_a_session_to_its_groups_grant_boss() {
         std::fs::create_dir_all(&acme_api).unwrap();
         let held = new_session(&d, dir.path(), "acme-web").await;
         let outside = new_session(&d, dir.path(), "acme-docs").await;
-        // Stopped, so a hand starts it again with Desk's closed check.
-        for id in [held.id, outside.id] {
-            d.stop(id, None).unwrap();
-            eventually("it to stop", async || {
-                (!d.view(id).unwrap().live).then_some(())
-            })
-            .await;
-        }
         let items = [
             workforce_desk::session_item(held.id),
             workforce_desk::session_item(outside.id),
@@ -1165,11 +1157,39 @@ async fn the_person_hands_a_session_to_its_groups_grant_boss() {
         let (code, out) = hand(held.id, json!({"boss": "driftwerk/bob"})).await;
         assert_eq!(code, StatusCode::CONFLICT, "{out}");
         assert!(d.charge_of(held.id).is_none());
+        // Running with the person's own hook: not without Desk's closed check.
+        let (code, out) = hand(held.id, json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(out.to_string().contains("closed check"), "{out}");
+        assert!(d.charge_of(held.id).is_none());
+        // Stopped, a hand starts it again with Desk's closed check.
+        d.stop(held.id, None).unwrap();
+        eventually("it to stop", async || {
+            (!d.view(held.id).unwrap().live).then_some(())
+        })
+        .await;
         let (code, out) = hand(held.id, json!({})).await;
         assert_eq!(code, StatusCode::OK, "{out}");
         let c = d.charge_of(held.id).expect("handed");
         assert_eq!(c.boss, "driftwerk/allan");
         assert!(c.live());
+        // Kept by its grant's own judge of what it still lets.
+        d.served_settle().await;
+        assert!(d.charge_of(held.id).is_some_and(|c| c.live()));
+
+        // Its grant stopped: let go of, and never handed again.
+        let (code, out) = native(
+            &d,
+            "POST",
+            "/api/desk/bosses/stop",
+            json!({"group": "acme", "from": "desk"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        assert!(d.charge_of(held.id).is_none_or(|c| !c.live()));
+        let (code, out) = hand(held.id, json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(d.charge_of(held.id).is_none_or(|c| !c.live()));
     })
     .await;
 }

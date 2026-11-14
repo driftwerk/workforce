@@ -68,34 +68,45 @@ async fn hand(
         // No agent here oversees its group: the boss its group's live grant
         // names (one on another hub, or the home's own of a machine's
         // sessions) runs it, when the grant holds it.
-        if let Some(g) = group.as_deref() {
-            return match s.desk.grant_boss_for(g, id) {
-                Ok(party) if b.boss.as_deref().is_none_or(|w| w == party.id) => s
-                    .desk
-                    .take_on(
-                        id,
-                        &party,
-                        How::Handed,
-                        &crate::scope::Scope::Group(g.to_string()),
-                        &By::you(),
-                    )
-                    .await
-                    .map(Json)
-                    .into_response(),
-                Ok(party) => DeskError::Conflict(format!(
-                    "{} runs the sessions here; hand it to them.",
-                    party.name
-                ))
-                .into_response(),
-                Err(None) => {
-                    DeskError::Conflict("No agent oversees the crew to hand it to.".into())
-                        .into_response()
-                }
-                Err(Some(why)) => DeskError::Conflict(why).into_response(),
-            };
-        }
-        return DeskError::Conflict("No agent oversees the crew to hand it to.".into())
+        let none = || DeskError::Conflict("No agent oversees the crew to hand it to.".into());
+        let Some(g) = group else {
+            return none().into_response();
+        };
+        let party = match s.desk.grant_boss_for(&g, id) {
+            Ok(party) => party,
+            Err(None) => return none().into_response(),
+            Err(Some(why)) => return DeskError::Conflict(why).into_response(),
+        };
+        // `boss`, for one served from a grant, is its whole `<hub>/<agent>`.
+        if b.boss.as_deref().is_some_and(|w| w != party.id) {
+            return DeskError::Conflict(format!(
+                "{} runs the sessions here; hand it to them.",
+                party.name
+            ))
             .into_response();
+        }
+        let charged = s
+            .desk
+            .take_on(
+                id,
+                &party,
+                How::Handed,
+                &crate::scope::Scope::Group(g.clone()),
+                &By::you(),
+            )
+            .await;
+        // A stop or a change of its grant meanwhile: let go of it at once.
+        if charged.is_ok() && s.desk.grant_boss_for(&g, id).is_err() {
+            let _ = s
+                .desk
+                .release(id, &By::desk("Its grant changed as it was handed over."))
+                .await;
+            return DeskError::Conflict(
+                "Its grant changed as it was handed over, so it isn't; try again.".into(),
+            )
+            .into_response();
+        }
+        return charged.map(Json).into_response();
     };
     if boss.level == "watch" {
         return DeskError::Conflict(format!(

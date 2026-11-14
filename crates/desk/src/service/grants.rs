@@ -217,7 +217,8 @@ impl Desk {
 
     /// The boss `group`'s live grant names, as the party a session handed
     /// to it is charged to, when the grant holds session `id` (its
-    /// `members` or `born`) and its level does more than watch. `Err(None)`
+    /// `members` or `born`, and no other grant's first) and its level does
+    /// more than watch. `Err(None)`
     /// when no grant names a boss for the group; otherwise why not, in
     /// plain words.
     pub fn grant_boss_for(
@@ -251,7 +252,8 @@ impl Desk {
                 g.name
             )));
         }
-        if !g.members.contains(&id) && !g.born.contains(&id) {
+        // The grant that holds it is this one, as letting go of it judges.
+        if self.grant_group_of(id).as_deref() != Some(group) {
             return Err(Some(format!(
                 "{} isn't one of the sessions {name} may run in {}.",
                 self.view(id)
