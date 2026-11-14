@@ -19,6 +19,61 @@ pub trait MigrationRun: Send + Sync {
     async fn run(&self, client: &mut tokio_postgres::Client) -> Result<(), PostgresError>;
 }
 
+/// Runs a store's embedded refinery migrations so an older image can still
+/// boot on a database a newer one has migrated.
+///
+/// Refinery's default (`abort_missing`) refuses to run when the database has
+/// applied migrations this binary does not carry, which is exactly what a
+/// rollback (an automatic Swarm/ECS one, or an old node restarting in a
+/// rolling deploy) meets. Those are logged and skipped here instead:
+/// migrations are additive, so an older image runs on the newer schema.
+///
+/// The same setting also quietly skips a migration numbered *below* the newest
+/// applied one that was never applied (two branches taking the same next
+/// number, merged out of order), which refinery by default refuses. That stays
+/// an error here: it is checked first, and is the only thing that is.
+pub async fn run_embedded(
+    runner: refinery::Runner,
+    client: &mut tokio_postgres::Client,
+) -> Result<(), PostgresError> {
+    // The history table is made by the first run, so a new schema has none.
+    let has_history: bool = client
+        .query_one(
+            "SELECT to_regclass('refinery_schema_history') IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    if has_history {
+        let applied = runner.get_applied_migrations_async(client).await?;
+        let applied: std::collections::BTreeSet<u32> =
+            applied.iter().map(refinery::Migration::version).collect();
+        let carried: std::collections::BTreeSet<u32> = runner
+            .get_migrations()
+            .iter()
+            .map(refinery::Migration::version)
+            .collect();
+        if let Some(newest) = applied.iter().next_back() {
+            if let Some(gap) = carried.iter().find(|v| *v < newest && !applied.contains(v)) {
+                return Err(PostgresError::Migration(format!(
+                    "migration V{gap} was never applied but a newer one (V{newest}) was: \
+                     a version number was reused or merged out of order"
+                )));
+            }
+        }
+        let ahead: Vec<u32> = applied.difference(&carried).copied().collect();
+        if !ahead.is_empty() {
+            tracing::warn!(
+                versions = ?ahead,
+                "the database has migrations this build does not carry (a newer build ran here); \
+                 running on its schema"
+            );
+        }
+    }
+    runner.set_abort_missing(false).run_async(client).await?;
+    Ok(())
+}
+
 /// A namespaced bundle of migrations for a single store.
 ///
 /// Each store owns its own `embed_migrations!` expansion in-crate;
@@ -175,6 +230,59 @@ mod pg_tests {
                 .await?;
             Ok(())
         }
+    }
+
+    fn runner_of(versions: &[u32]) -> refinery::Runner {
+        let migrations: Vec<refinery::Migration> = versions
+            .iter()
+            .map(|v| {
+                refinery::Migration::unapplied(
+                    &format!("V{v}__t{v}"),
+                    &format!("CREATE TABLE rb_t{v} (id int)"),
+                )
+                .unwrap()
+            })
+            .collect();
+        refinery::Runner::new(&migrations)
+    }
+
+    /// An older build boots on a database a newer one migrated; a version
+    /// that was skipped under a newer one still stops a boot.
+    #[tokio::test]
+    async fn an_older_build_runs_on_a_newer_schema_but_a_skipped_version_stops() {
+        with_test_pool(PostgresPool::from_config, |pool| async move {
+            let mut conn = pool.get().await.expect("pool connection");
+            let client: &mut tokio_postgres::Client = &mut conn;
+            run_embedded(runner_of(&[1, 2, 3]), client).await.unwrap();
+            // The older image carries V1 and V2 only: refinery's default
+            // refuses this database, this runs.
+            assert!(runner_of(&[1, 2]).run_async(client).await.is_err());
+            run_embedded(runner_of(&[1, 2]), client).await.unwrap();
+            // Nothing was undone, and nothing new ran.
+            let tables: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_schema = current_schema() AND table_name LIKE 'rb_t%'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(tables, 3);
+            // A V2 that was never applied under an applied V3 is refused.
+            let mut fresh = pool.get().await.expect("pool connection");
+            let fresh: &mut tokio_postgres::Client = &mut fresh;
+            fresh
+                .batch_execute("CREATE SCHEMA gapped; SET search_path TO gapped")
+                .await
+                .unwrap();
+            run_embedded(runner_of(&[1, 3]), fresh).await.unwrap();
+            let refused = run_embedded(runner_of(&[1, 2, 3]), fresh)
+                .await
+                .expect_err("V2 is below the newest applied");
+            assert!(refused.to_string().contains("V2"), "{refused}");
+        })
+        .await;
     }
 
     /// A statement that gives up on a lock someone else holds is reported

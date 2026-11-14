@@ -44,7 +44,7 @@ mod pool;
 #[cfg(feature = "postgres")]
 pub use error::PostgresError;
 #[cfg(feature = "postgres")]
-pub use migrations::{MigrationRun, MigrationRunner, MigrationSet};
+pub use migrations::{run_embedded, MigrationRun, MigrationRunner, MigrationSet};
 #[cfg(feature = "postgres")]
 pub use pool::{check_budget, PoolBudget, PoolShare, PostgresPool, IDLE_TIMEOUT};
 
