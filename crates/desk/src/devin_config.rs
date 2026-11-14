@@ -27,54 +27,46 @@ use serde_json::{Map, Value};
 /// back: whatever runs a command, reaches a server, carries a credential,
 /// or widens what Devin may do unasked (its hooks among them: Desk's are in
 /// the copy beside the person's). A name's words are its parts split at
-/// `_`, `-`, `.` and case (`base_url` is `base` and `url`; `keymap` is
-/// one word). A session that could write these could make the person's
-/// next own Devin run, reach or allow what it chose.
-const NOT_WRITTEN_BACK: [&str; 43] = [
-    "command",
-    "commands",
-    "cmd",
-    "exec",
-    "shell",
-    "script",
-    "scripts",
-    "program",
-    "run",
-    "args",
-    "url",
-    "uri",
-    "endpoint",
-    "host",
-    "base",
-    "server",
-    "servers",
-    "proxy",
-    "header",
-    "headers",
-    "token",
-    "key",
-    "keys",
-    "secret",
-    "auth",
-    "permission",
-    "permissions",
-    "allow",
-    "approve",
-    "bypass",
-    "trust",
-    "sandbox",
-    "hook",
-    "hooks",
-    "mcp",
-    "plugin",
-    "plugins",
-    "extension",
-    "extensions",
-    "path",
-    "paths",
-    "env",
-    "otel",
+/// `_`, `-`, `.`, case (`baseURL`, `URLBase`) and digits (`url2`); a word
+/// is one of these, or starts with one of [`NOT_WRITTEN_BACK_ROOTS`], or
+/// has one of [`NOT_WRITTEN_BACK_INSIDE`] in it. A session that could write
+/// these could make the person's next own Devin run, reach or allow what
+/// it chose.
+const NOT_WRITTEN_BACK: [&str; 18] = [
+    "cmd", "shell", "program", "run", "args", "uri", "base", "server", "servers", "header",
+    "headers", "key", "keys", "auth", "mcp", "path", "paths", "env",
 ];
+
+/// The roots a word of a setting's name may not start with.
+const NOT_WRITTEN_BACK_ROOTS: [&str; 24] = [
+    "allow",
+    "approv",
+    "trust",
+    "exec",
+    "host",
+    "endpoint",
+    "prox",
+    "token",
+    "secret",
+    "credential",
+    "passw",
+    "hook",
+    "permission",
+    "plugin",
+    "extension",
+    "script",
+    "command",
+    "sandbox",
+    "bypass",
+    "cert",
+    "tls",
+    "otel",
+    "environ",
+    "auth",
+];
+
+/// What a word of a setting's name may not have anywhere in it.
+const NOT_WRITTEN_BACK_INSIDE: [&str; 4] = ["url", "uri", "hook", "token"];
 
 /// Whole names never written back, whatever their words.
 const NOT_WRITTEN_BACK_NAMED: [&str; 5] = [
@@ -85,33 +77,87 @@ const NOT_WRITTEN_BACK_NAMED: [&str; 5] = [
     "statusline",
 ];
 
-/// Whether a setting named `name` is never written back.
-fn protected_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower.starts_with("mcp") || NOT_WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
-        return true;
-    }
+/// Whole names always written back, whatever their words: `keymap` is no
+/// key.
+const WRITTEN_BACK_NAMED: [&str; 1] = ["keymap"];
+
+/// Permission modes, by any of their names: never a setting's value
+/// written back.
+const MODES: [&str; 9] = [
+    "dangerous",
+    "bypass",
+    "bypasspermissions",
+    "yolo",
+    "smart",
+    "accept-edits",
+    "acceptedits",
+    "autonomous",
+    "auto",
+];
+
+/// A setting's name in words: split at what isn't a letter or digit, from
+/// lower to upper case, before the last capital of a run of them followed
+/// by a small letter (`URLBase` is `url`, `base`), and between letters and
+/// digits.
+fn words_of(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
-    let mut prev_lower = false;
-    for c in name.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         if !c.is_alphanumeric() {
             words.push(std::mem::take(&mut word));
-            prev_lower = false;
             continue;
         }
-        if c.is_uppercase() && prev_lower {
-            words.push(std::mem::take(&mut word));
+        if let Some(&prev) = i.checked_sub(1).and_then(|p| chars.get(p)) {
+            let next = chars.get(i + 1).copied();
+            let split = (prev.is_lowercase() && c.is_uppercase())
+                || (prev.is_uppercase()
+                    && c.is_uppercase()
+                    && next.is_some_and(char::is_lowercase))
+                || (prev.is_alphabetic() && c.is_numeric())
+                || (prev.is_numeric() && c.is_alphabetic());
+            if split && prev.is_alphanumeric() {
+                words.push(std::mem::take(&mut word));
+            }
         }
-        prev_lower = c.is_lowercase() || c.is_ascii_digit();
         word.extend(c.to_lowercase());
     }
     words.push(word);
-    words.iter().any(|w| NOT_WRITTEN_BACK.contains(&w.as_str()))
+    words.retain(|w| !w.is_empty());
+    words
 }
 
-/// Whether `v` reads as somewhere to reach or run: an address, or a path.
-fn protected_text(v: &str) -> bool {
+/// Whether a setting named `name` is never written back.
+fn protected_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
+        return false;
+    }
+    if lower.starts_with("mcp") || NOT_WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
+        return true;
+    }
+    words_of(name).iter().any(|w| {
+        NOT_WRITTEN_BACK.contains(&w.as_str())
+            || NOT_WRITTEN_BACK_ROOTS.iter().any(|r| w.starts_with(r))
+            || NOT_WRITTEN_BACK_INSIDE.iter().any(|r| w.contains(r))
+    })
+}
+
+/// Whether a setting named `key` set to `v` sets a permission mode: a
+/// `…mode…` setting naming one.
+fn sets_mode(key: &str, v: &Value) -> bool {
+    words_of(key).iter().any(|w| w == "mode")
+        && v.as_str()
+            .is_some_and(|v| MODES.contains(&v.trim().to_ascii_lowercase().as_str()))
+}
+
+/// Whether `v`, a setting's text, reads as somewhere to reach or run: an
+/// address, or a path. Under the keymap, a key's slash command is a
+/// binding.
+fn protected_text(v: &str, in_keymap: bool) -> bool {
+    if in_keymap && v.starts_with('/') && !v.starts_with("//") && !v.contains("://") {
+        return false;
+    }
     v.contains("://") || v.starts_with('/') || v.starts_with('~') || v.starts_with('$')
 }
 
@@ -247,29 +293,46 @@ pub struct Change {
 pub fn changes(base: &Value, ended: &Value) -> (Vec<Change>, Vec<String>) {
     let mut all = Vec::new();
     diff(&mut Vec::new(), Some(base), Some(ended), &mut all);
-    let (kept, skipped): (Vec<Change>, Vec<Change>) =
-        all.into_iter().partition(|c| !protected(c, base));
-    (
-        kept,
-        skipped.into_iter().map(|c| c.path.join(".")).collect(),
-    )
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for c in all {
+        // A removal is never written back: a copy rewritten without a
+        // setting, or cut short, would take the person's with it.
+        if c.value.is_none() {
+            skipped.push(format!("{} (removed)", c.path.join(".")));
+        } else if protected(&c, base) {
+            skipped.push(c.path.join("."));
+        } else {
+            kept.push(c);
+        }
+    }
+    (kept, skipped)
 }
 
 /// Whether `change` touches a setting Desk never writes back: by where it
 /// is, or by what it puts there or takes away (a whole object with one
 /// inside).
 fn protected(change: &Change, base: &Value) -> bool {
-    fn holds(v: &Value) -> bool {
+    fn holds(v: &Value, in_keymap: bool) -> bool {
         match v {
-            Value::Object(o) => o.iter().any(|(k, v)| protected_name(k) || holds(v)),
-            Value::Array(a) => a.iter().any(holds),
-            Value::String(s) => protected_text(s),
+            Value::Object(o) => o
+                .iter()
+                .any(|(k, v)| protected_name(k) || sets_mode(k, v) || holds(v, in_keymap)),
+            Value::Array(a) => a.iter().any(|v| holds(v, in_keymap)),
+            Value::String(s) => protected_text(s, in_keymap),
             _ => false,
         }
     }
+    let in_keymap = change
+        .path
+        .first()
+        .is_some_and(|k| k.eq_ignore_ascii_case("keymap"));
+    let mode = |v: &Value| change.path.last().is_some_and(|k| sets_mode(k, v));
     change.path.iter().any(|k| protected_name(k))
-        || change.value.as_ref().is_some_and(holds)
-        || at(base, &change.path).is_some_and(holds)
+        || change.value.as_ref().is_some_and(mode)
+        || at(base, &change.path).is_some_and(mode)
+        || change.value.as_ref().is_some_and(|v| holds(v, in_keymap))
+        || at(base, &change.path).is_some_and(|v| holds(v, in_keymap))
 }
 
 fn diff(path: &mut Vec<String>, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<Change>) {
@@ -550,17 +613,17 @@ pub fn write_back(base: &Path, ended: &Path, person: &Path) -> Result<bool> {
             return Ok(false);
         }
     };
-    // A copy that lost settings the person had is one cut short or
-    // rewritten without them, never what Devin saved: taking it would
-    // delete theirs.
-    let lost: Vec<&String> = copied
+    // A copy with none of the settings the person had but its hooks is
+    // one cut short, never what Devin saved. (Any other setting it lost
+    // is a removal, never written back: [`changes`].)
+    let theirs: Vec<&String> = copied
         .as_object()
         .into_iter()
         .flat_map(|o| o.keys())
-        .filter(|k| ended.get(k.as_str()).is_none())
+        .filter(|k| k.as_str() != "hooks")
         .collect();
-    if !lost.is_empty() {
-        tracing::warn!(settings = ?lost, "a Devin session's config ended without settings the person had: nothing of it is written back");
+    if !theirs.is_empty() && theirs.iter().all(|k| ended.get(k.as_str()).is_none()) {
+        tracing::warn!("a Devin session's config ended without any of the person's settings: nothing of it is written back");
         return Ok(false);
     }
     let _one = WRITING_BACK.lock();
@@ -828,6 +891,69 @@ mod tests {
                 "pinned_models": ["swe-1-6"], "notify": "always"}),
         );
         assert_eq!(kept.len(), 4, "{kept:?}");
+        // Every way of naming one, and a mode by its value.
+        for name in [
+            "URLBase",
+            "APIKey",
+            "OTELEndpoint",
+            "url2",
+            "server1",
+            "hostname",
+            "endpoints",
+            "urls",
+            "tokens",
+            "secrets",
+            "proxies",
+            "allowed",
+            "allowlist",
+            "allowedTools",
+            "trusted",
+            "trustedFolders",
+            "approval",
+            "approvalPolicy",
+            "executable",
+            "webhook",
+            "baseurl",
+            "password",
+            "passwd",
+            "credentials",
+            "cert",
+            "tls",
+            "autoRun",
+            "baseURL",
+            "accessKey",
+        ] {
+            assert!(protected_name(name), "{name}");
+        }
+        for name in [
+            "keymap",
+            "theme",
+            "notify",
+            "pinned_models",
+            "model",
+            "font_size",
+        ] {
+            assert!(!protected_name(name), "{name}");
+        }
+        let (kept, _) = changes(
+            &json!({"notify": "smart"}),
+            &json!({"agent": {"mode": "dangerous"}, "default_mode": "Bypass",
+                "notify": "always", "keymap": {"ctrl+k": "/clear"}}),
+        );
+        let paths: Vec<String> = kept.iter().map(|c| c.path.join(".")).collect();
+        assert_eq!(
+            paths,
+            ["keymap", "notify"],
+            "a mode by its value; a binding kept"
+        );
+        // A removal, at any depth, is never written back.
+        let (kept, removed) = changes(
+            &json!({"agent": {"model": "a", "pinned_models": ["x"]}, "startup": 1}),
+            &json!({"agent": {}, "notify": "always"}),
+        );
+        let paths: Vec<String> = kept.iter().map(|c| c.path.join(".")).collect();
+        assert_eq!(paths, ["notify"]);
+        assert_eq!(removed.len(), 3, "{removed:?}");
         for named in ["permission_mode", "statusline", "mcpServers.x", "theme"] {
             assert!(skipped.iter().any(|s| s == named), "{named}: {skipped:?}");
         }
@@ -889,7 +1015,6 @@ mod tests {
         // Saved by the person while it was written back to: theirs stands.
         let was = std::fs::canonicalize(&fresh).unwrap();
         assert!(replace_person_file(&fresh, "{\"y\": 2}\n", Some(&was), Some("{}")).is_err());
-        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{\"x\": 1}\n");
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{\"x\": 1}\n");
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

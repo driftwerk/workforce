@@ -365,7 +365,12 @@ fn curl_program() -> &'static str {
         ]
         .into_iter()
         .find(|p| Path::new(p).is_file())
-        .unwrap_or("curl")
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "no curl where the system keeps it: Devin's hooks run the one on their PATH"
+            );
+            "curl"
+        })
     })
 }
 
