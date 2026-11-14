@@ -23,26 +23,97 @@ use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
 use jsonc_parser::ParseOptions;
 use serde_json::{Map, Value};
 
-/// The top-level settings Desk never writes back, whatever Devin saved
-/// there: its hooks (Desk's are in the copy beside the person's), and
-/// whatever runs a command, reaches a server, or widens what Devin may do
-/// unasked. Any `mcp…` setting too, and any setting anywhere named in
-/// [`NOT_WRITTEN_BACK_ANYWHERE`]. A session that could write these could
-/// make the person's next own Devin run what it chose.
-const NOT_WRITTEN_BACK: [&str; 9] = [
+/// The words a setting's name may not have, at any depth, to be written
+/// back: whatever runs a command, reaches a server, carries a credential,
+/// or widens what Devin may do unasked (its hooks among them: Desk's are in
+/// the copy beside the person's). A name's words are its parts split at
+/// `_`, `-`, `.` and case (`base_url` is `base` and `url`; `keymap` is
+/// one word). A session that could write these could make the person's
+/// next own Devin run, reach or allow what it chose.
+const NOT_WRITTEN_BACK: [&str; 43] = [
+    "command",
+    "commands",
+    "cmd",
+    "exec",
+    "shell",
+    "script",
+    "scripts",
+    "program",
+    "run",
+    "args",
+    "url",
+    "uri",
+    "endpoint",
+    "host",
+    "base",
+    "server",
+    "servers",
+    "proxy",
+    "header",
+    "headers",
+    "token",
+    "key",
+    "keys",
+    "secret",
+    "auth",
+    "permission",
+    "permissions",
+    "allow",
+    "approve",
+    "bypass",
+    "trust",
+    "sandbox",
+    "hook",
     "hooks",
+    "mcp",
+    "plugin",
+    "plugins",
+    "extension",
+    "extensions",
+    "path",
+    "paths",
+    "env",
+    "otel",
+];
+
+/// Whole names never written back, whatever their words.
+const NOT_WRITTEN_BACK_NAMED: [&str; 5] = [
     "read_config_from",
     "permission_mode",
     "local_tools_bypass_permissions",
-    "permissions",
-    "env",
-    "otel",
-    "proxy",
-    "sandbox",
+    "editor",
+    "statusline",
 ];
 
-/// The settings, at any depth, Desk never writes back.
-const NOT_WRITTEN_BACK_ANYWHERE: [&str; 5] = ["command", "args", "url", "endpoint", "headers"];
+/// Whether a setting named `name` is never written back.
+fn protected_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("mcp") || NOT_WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
+        return true;
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            words.push(std::mem::take(&mut word));
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        word.extend(c.to_lowercase());
+    }
+    words.push(word);
+    words.iter().any(|w| NOT_WRITTEN_BACK.contains(&w.as_str()))
+}
+
+/// Whether `v` reads as somewhere to reach or run: an address, or a path.
+fn protected_text(v: &str) -> bool {
+    v.contains("://") || v.starts_with('/') || v.starts_with('~') || v.starts_with('$')
+}
 
 /// Where the person's own Devin config is: `$XDG_CONFIG_HOME/devin`, else
 /// `~/.config/devin` (Devin's docs; on macOS too). None without a home.
@@ -188,24 +259,17 @@ pub fn changes(base: &Value, ended: &Value) -> (Vec<Change>, Vec<String>) {
 /// is, or by what it puts there or takes away (a whole object with one
 /// inside).
 fn protected(change: &Change, base: &Value) -> bool {
-    let named = |k: &str| {
-        let k = k.to_ascii_lowercase();
-        k.starts_with("mcp") || NOT_WRITTEN_BACK_ANYWHERE.contains(&k.as_str())
-    };
-    fn holds(v: &Value, named: &dyn Fn(&str) -> bool) -> bool {
+    fn holds(v: &Value) -> bool {
         match v {
-            Value::Object(o) => o.iter().any(|(k, v)| named(k) || holds(v, named)),
-            Value::Array(a) => a.iter().any(|v| holds(v, named)),
+            Value::Object(o) => o.iter().any(|(k, v)| protected_name(k) || holds(v)),
+            Value::Array(a) => a.iter().any(holds),
+            Value::String(s) => protected_text(s),
             _ => false,
         }
     }
-    change
-        .path
-        .first()
-        .is_some_and(|k| NOT_WRITTEN_BACK.contains(&k.to_ascii_lowercase().as_str()))
-        || change.path.iter().any(|k| named(k))
-        || change.value.as_ref().is_some_and(|v| holds(v, &named))
-        || at(base, &change.path).is_some_and(|v| holds(v, &named))
+    change.path.iter().any(|k| protected_name(k))
+        || change.value.as_ref().is_some_and(holds)
+        || at(base, &change.path).is_some_and(holds)
 }
 
 fn diff(path: &mut Vec<String>, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<Change>) {
@@ -376,7 +440,16 @@ fn write_private_with(path: &Path, bytes: &[u8], new: bool) -> Result<()> {
 /// now, or isn't a file of this user's, nothing is written. One made
 /// meanwhile is written only when it is a plain file; where there is none,
 /// one is made, never over one that appears at the same moment.
-pub fn replace_person_file(path: &Path, text: &str, real: Option<&Path>) -> Result<()> {
+///
+/// `read` is what it said when the text was made from it (none: there was
+/// none): if it says otherwise just before it is replaced (the person
+/// saved it meanwhile), nothing is written, so their save stands.
+pub fn replace_person_file(
+    path: &Path,
+    text: &str,
+    real: Option<&Path>,
+    read: Option<&str>,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let now = match std::fs::symlink_metadata(path) {
         Ok(m) => Some(m),
@@ -417,6 +490,12 @@ pub fn replace_person_file(path: &Path, text: &str, real: Option<&Path>) -> Resu
     let mode = meta.permissions().mode() & 0o777;
     let tmp = temp_beside(&target)?;
     write_private_with(&tmp, text.as_bytes(), true)?;
+    if std::fs::read_to_string(&target).ok().as_deref() != read {
+        let _ = std::fs::remove_file(&tmp);
+        eyre::bail!(
+            "the person's Devin config changed while it was written back to: theirs stands"
+        );
+    }
     let done = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
         .and_then(|()| std::fs::rename(&tmp, &target));
     if let Err(e) = done {
@@ -471,6 +550,19 @@ pub fn write_back(base: &Path, ended: &Path, person: &Path) -> Result<bool> {
             return Ok(false);
         }
     };
+    // A copy that lost settings the person had is one cut short or
+    // rewritten without them, never what Devin saved: taking it would
+    // delete theirs.
+    let lost: Vec<&String> = copied
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .filter(|k| ended.get(k.as_str()).is_none())
+        .collect();
+    if !lost.is_empty() {
+        tracing::warn!(settings = ?lost, "a Devin session's config ended without settings the person had: nothing of it is written back");
+        return Ok(false);
+    }
     let _one = WRITING_BACK.lock();
     let current = match std::fs::read_to_string(person) {
         Ok(t) => Some(t),
@@ -479,7 +571,7 @@ pub fn write_back(base: &Path, ended: &Path, person: &Path) -> Result<bool> {
     };
     match written_back(copied, &ended, current.as_deref())? {
         Some(text) => {
-            replace_person_file(person, &text, real.as_deref())?;
+            replace_person_file(person, &text, real.as_deref(), current.as_deref())?;
             Ok(true)
         }
         None => Ok(false),
@@ -689,7 +781,7 @@ mod tests {
         let link = dir.path().join("config.json");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let was = std::fs::canonicalize(&link).unwrap();
-        replace_person_file(&link, "{\"notify\": \"never\"}\n", Some(&was)).unwrap();
+        replace_person_file(&link, "{\"notify\": \"never\"}\n", Some(&was), Some("{}")).unwrap();
         assert!(std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
@@ -718,10 +810,24 @@ mod tests {
             "read_config_from": {"claude": true},
             "statusline": {"type": "command", "command": "evil"},
             "theme": {"accent": "blue", "headers": {"x": "y"}},
+            // Nested, under other names, or as a plain string.
+            "agent2": {"permission_mode": "dangerous", "localToolsBypassPermissions": true},
+            "tools": {"allowList": ["exec"], "editor": "vim"},
+            "api": {"base_url": "x"},
+            "editor": "code --wait",
+            "plugins": {"x": {"path": "p"}},
+            "ui": {"theme": "~/evil.sh", "font": "https://evil/font"},
         });
         let (kept, skipped) = changes(&base, &ended);
         let paths: Vec<String> = kept.iter().map(|c| c.path.join(".")).collect();
         assert_eq!(paths, ["agent.model"], "{skipped:?}");
+        // What isn't: a keymap is no key, a theme no host.
+        let (kept, _) = changes(
+            &json!({}),
+            &json!({"keymap": {"chat": {"submit": "ctrl+enter"}}, "theme": "dark",
+                "pinned_models": ["swe-1-6"], "notify": "always"}),
+        );
+        assert_eq!(kept.len(), 4, "{kept:?}");
         for named in ["permission_mode", "statusline", "mcpServers.x", "theme"] {
             assert!(skipped.iter().any(|s| s == named), "{named}: {skipped:?}");
         }
@@ -751,6 +857,8 @@ mod tests {
             // Every setting gone, Desk's hooks with them: not a save.
             "{}".into(),
             no_hooks.to_string(),
+            // Desk's hooks kept, the person's settings gone: not a save.
+            serde_json::json!({"hooks": desk_hooks()}).to_string(),
         ] {
             std::fs::write(&e, &ended).unwrap();
             assert!(!write_back(&b, &e, &person).unwrap(), "{ended:?}");
@@ -771,13 +879,17 @@ mod tests {
         // Repointed while the session ran: nothing written, either file.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
-        assert!(replace_person_file(&link, "{\"x\": 1}\n", Some(&was)).is_err());
+        assert!(replace_person_file(&link, "{\"x\": 1}\n", Some(&was), Some("{}")).is_err());
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "{}");
         // None at the start, a link made meanwhile: nothing.
-        assert!(replace_person_file(&link, "{\"x\": 1}\n", None).is_err());
+        assert!(replace_person_file(&link, "{\"x\": 1}\n", None, Some("{}")).is_err());
         // None at the start, none now: made, the owner's alone.
         let fresh = dir.path().join("devin/config.json");
-        replace_person_file(&fresh, "{\"x\": 1}\n", None).unwrap();
+        replace_person_file(&fresh, "{\"x\": 1}\n", None, None).unwrap();
+        // Saved by the person while it was written back to: theirs stands.
+        let was = std::fs::canonicalize(&fresh).unwrap();
+        assert!(replace_person_file(&fresh, "{\"y\": 2}\n", Some(&was), Some("{}")).is_err());
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{\"x\": 1}\n");
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{\"x\": 1}\n");
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -785,7 +897,7 @@ mod tests {
         let dir_there = dir.path().join("d");
         std::fs::create_dir(&dir_there).unwrap();
         let was = std::fs::canonicalize(&dir_there).unwrap();
-        assert!(replace_person_file(&dir_there, "{}", Some(&was)).is_err());
+        assert!(replace_person_file(&dir_there, "{}", Some(&was), None).is_err());
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
