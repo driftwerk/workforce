@@ -240,14 +240,18 @@ impl Caps {
 /// has no way to run it yet.
 pub fn views(engine: Engine) -> &'static [View] {
     match engine {
-        Engine::Claude | Engine::Codex => &[View::Terminal],
-        Engine::Gemini
-        | Engine::Copilot
-        | Engine::OpenCode
-        | Engine::Cursor
-        | Engine::Devin
-        | Engine::Custom => &[],
+        Engine::Claude | Engine::Codex | Engine::Devin => &[View::Terminal],
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            &[]
+        }
     }
+}
+
+/// Whether a session of `engine` can read a handoff's brief: it has
+/// Desk's line tools (`brief`). Devin has none yet: its MCP servers are
+/// only in the person's own files, which Desk doesn't write.
+pub fn reads_brief(engine: Engine) -> bool {
+    matches!(engine, Engine::Claude | Engine::Codex)
 }
 
 /// The engines Desk can start sessions of, by name: what a tool that
@@ -264,7 +268,10 @@ pub fn startable() -> Vec<&'static str> {
 /// Whether a boss served from a grant may run `engine`'s sessions: Desk's
 /// pre-tool hook denies every call it doesn't judge safe, and fails closed
 /// when Desk can't be reached ([`crate::claude::hook_settings`]). Claude
-/// Code alone: Codex has no hook that refuses a call before it runs.
+/// Code alone: Codex has no hook that refuses a call before it runs, and
+/// Devin always loads a repository's own `.devin` hooks, which could
+/// approve a call ahead of Desk's (Claude Code's `--setting-sources user`
+/// has no Devin equivalent).
 pub fn boss_safe(engine: Engine) -> bool {
     matches!(engine, Engine::Claude)
 }
@@ -320,12 +327,34 @@ pub fn caps(engine: Engine, view: View) -> Caps {
                 "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
             ],
         },
-        Engine::Gemini
-        | Engine::Copilot
-        | Engine::OpenCode
-        | Engine::Cursor
-        | Engine::Devin
-        | Engine::Custom => Caps::none(),
+        // The person's own `devin` TUI, its hooks reporting to Desk and its
+        // permission checks asked of Desk, as Claude Code's are.
+        Engine::Devin => Caps {
+            state: StateSource::Hooks,
+            approvals: Answerer::Desk,
+            // `-r <id>`, the id its `SessionStart` says.
+            resume: Resume::ById,
+            interrupt: Interrupt::Keys,
+            // Its plan's quota isn't something it reports.
+            usage: UsageSource::None,
+            plan: None,
+            approve_for_me: false,
+            fast: false,
+            // Its one sign-in on the computer.
+            accounts: crate::engine_accounts::AccountsVia::None,
+            line: Deliver::Paste,
+            steer: Steer::None,
+            window: None,
+            // After `--`: a bare word is a path for it to open.
+            first_prompt: FirstPrompt::Arg("--"),
+            notes: vec![
+                "The first time in a folder, Devin asks in its terminal whether to trust it.",
+                "Messages from Desk are typed in when Devin is idle.",
+            ],
+        },
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            Caps::none()
+        }
     }
 }
 
@@ -382,8 +411,8 @@ pub fn session_caps(engine: Engine, view: View, version: Option<&str>, tracked: 
     caps
 }
 
-/// The bytes that end a working turn in `engine`'s terminal: Esc for both
-/// Claude Code and Codex.
+/// The bytes that end a working turn in `engine`'s terminal: Esc for
+/// Claude Code, Codex and Devin.
 pub fn interrupt_keys(engine: Engine) -> Option<&'static [u8]> {
     match caps(engine, View::Terminal).interrupt {
         Interrupt::Keys => Some(b"\x1b"),
@@ -664,16 +693,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_claude_code_and_codex_run_and_each_in_a_terminal() {
+    fn claude_code_codex_and_devin_run_and_each_in_a_terminal() {
         for engine in Engine::ALL {
             let expected: &[View] = match engine {
-                Engine::Claude | Engine::Codex => &[View::Terminal],
+                Engine::Claude | Engine::Codex | Engine::Devin => &[View::Terminal],
                 _ => &[],
             };
             assert_eq!(views(engine), expected, "{engine:?}");
             assert!(!runs(engine, View::Desk));
         }
-        assert_eq!(startable(), ["claude", "codex"]);
+        assert_eq!(startable(), ["claude", "codex", "devin"]);
+        assert!(!reads_brief(Engine::Devin) && reads_brief(Engine::Codex));
         assert_eq!(caps(Engine::Gemini, View::Terminal), Caps::none());
         assert_eq!(caps(Engine::Claude, View::Desk), Caps::none());
     }
@@ -701,7 +731,44 @@ mod tests {
         );
         assert!(!codex.notes.is_empty(), "the card says why");
         assert_eq!(interrupt_keys(Engine::Claude), Some(&b"\x1b"[..]));
-        assert_eq!(interrupt_keys(Engine::Devin), None);
+        assert_eq!(interrupt_keys(Engine::Devin), Some(&b"\x1b"[..]));
+        assert_eq!(interrupt_keys(Engine::Gemini), None);
+    }
+
+    #[test]
+    fn devin_answers_in_desk_and_says_what_differs() {
+        let devin = caps(Engine::Devin, View::Terminal);
+        assert_eq!(
+            (
+                devin.state,
+                devin.approvals,
+                devin.resume,
+                devin.usage,
+                devin.plan
+            ),
+            (
+                StateSource::Hooks,
+                Answerer::Desk,
+                Resume::ById,
+                UsageSource::None,
+                None
+            )
+        );
+        assert!(!devin.approve_for_me && !devin.fast);
+        assert_eq!((devin.line, devin.steer), (Deliver::Paste, Steer::None));
+        assert_eq!(devin.first_prompt, FirstPrompt::Arg("--"));
+        assert_eq!(devin.notes.len(), 2);
+        assert_eq!(window_or_default(Engine::Devin, &devin), 64_000);
+        assert!(
+            !boss_safe(Engine::Devin),
+            "a repository's own hooks always load"
+        );
+        let v = serde_json::to_value(&devin).unwrap();
+        assert_eq!(
+            v["firstPrompt"],
+            serde_json::json!({"via": "arg", "flag": "--"})
+        );
+        assert_eq!(v["approvals"], "desk");
     }
 
     #[test]

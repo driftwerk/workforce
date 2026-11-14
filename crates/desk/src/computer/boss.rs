@@ -1216,6 +1216,219 @@ fn reader(name: &str) -> Option<(Spec, &'static [&'static str])> {
     })
 }
 
+/// The programs that change the directory of the shell they run in
+/// (`chdir` is zsh's).
+const MOVES_DIR: &[&str] = &["cd", "pushd", "popd", "chdir"];
+
+/// What runs words or a file in the same shell, so may move it too.
+const SAME_SHELL: &[&str] = &["eval", "source", "."];
+
+/// What changes how the shell runs what comes later, so may move it then,
+/// unseen: a trap, an alias, its options (`autocd` moves to a folder named
+/// alone), a callback run per line read.
+const REWIRES: &[&str] = &[
+    "trap",
+    "alias",
+    "autoload",
+    "emulate",
+    "setopt",
+    "unsetopt",
+    "shopt",
+    "mapfile",
+    "readarray",
+];
+
+/// What sets variables that stay in the shell, from its arguments.
+const SETS_VARS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
+
+/// What runs the command after it as it is, in the same shell (`-`,
+/// `noglob` and `nocorrect` are zsh's).
+const WRAPPERS: &[&str] = &["builtin", "command", "exec", "noglob", "nocorrect", "-"];
+
+/// Whether `word` names what moves the shell, or runs or rewires what may.
+fn moving_word(word: &str) -> bool {
+    MOVES_DIR.contains(&word) || SAME_SHELL.contains(&word) || REWIRES.contains(&word)
+}
+
+/// A program's file name, without the folder it is named in.
+fn base_name(program: &str) -> &str {
+    program.rsplit_once('/').map_or(program, |(_, b)| b)
+}
+
+/// The value `word` assigns, when it is an assignment (`NAME=value`).
+fn assigned(word: &Word) -> Option<&str> {
+    let (name, value) = word.text.split_once('=')?;
+    (!word.glob && !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(value)
+}
+
+/// Whether a variable set to `value` names a move: `$X` run later is it.
+fn value_moves(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| moving_word(base_name(w)))
+}
+
+/// Whether `command` may change the directory its shell works in, read
+/// word by word as [`judge`] reads it. Devin's shell stays from call to
+/// call, so what sets it up to move later counts as well as what moves now:
+/// - `cd`, `pushd`, `popd` or `chdir` however it is quoted or escaped
+///   (`\cd`, `"cd"`, `c''d`), after keywords, assignments and what runs
+///   the next command in the same shell (`builtin`, `command`, `noglob`,
+///   `time`, and their flags);
+/// - what runs words or a file in the same shell (`eval`, `source`, `.`),
+///   or replaces it (`exec` with a program);
+/// - what rewires the shell ([`REWIRES`]), defines functions
+///   (`declare -f`, a function's definition with a move in it), or sets
+///   `set -o`'s `autocd`;
+/// - a command named by an expansion (`$c`, `${c}`, `$(…)`, a backtick),
+///   and a variable set to a move (`c=cd`), which `$c` runs later.
+///
+/// A shell's script (`bash -c`) runs in a child shell, which can't move
+/// this one. A command Desk can't split is read as plain words, its quotes
+/// and escapes dropped: `cd` and its kind anywhere are taken as a move,
+/// and each command in it is read as above (so `.` or `trap` counts as
+/// the command it is, never as a word in another's arguments).
+pub fn moves_dir(command: &str) -> bool {
+    let Ok(cmds) = split(command) else {
+        let bare: String = command
+            .chars()
+            .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+            .collect();
+        if bare
+            .split(|c: char| c.is_whitespace() || ";&|()`$<>{}".contains(c))
+            .any(|w| MOVES_DIR.contains(&w))
+        {
+            return true;
+        }
+        // Each command, each expansion in it one word (`$_`), so a command
+        // named by one is still seen; and the commands inside them.
+        let mut inner = Vec::new();
+        let flat = flatten(&bare, &mut inner);
+        return flat.split(|c: char| ";&|\n(){}".contains(c)).any(|cmd| {
+            let words: Vec<Word> = cmd
+                .split_whitespace()
+                .map(|w| Word {
+                    text: w.to_string(),
+                    glob: false,
+                })
+                .collect();
+            moves_cmd(&words)
+        }) || inner.iter().any(|i| moves_dir(i));
+    };
+    cmds.iter().any(|cmd| moves_cmd(&cmd.words))
+}
+
+/// `text` with each expansion in it (`$(…)`, `${…}`, `$((…))`, a
+/// backtick's) as the one word `$_`, what each holds put in `inner`. An
+/// unclosed one runs to the end.
+fn flatten(text: &str, inner: &mut Vec<String>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let (from, to) = match (chars[i], chars.get(i + 1)) {
+            ('$', Some(&open @ ('(' | '{'))) => {
+                let close = if open == '(' { ')' } else { '}' };
+                let mut depth = 0usize;
+                let mut j = i + 1;
+                while j < chars.len() {
+                    if chars[j] == open {
+                        depth += 1;
+                    } else if chars[j] == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                (i + 2, j)
+            }
+            ('`', _) => {
+                let j = chars[i + 1..]
+                    .iter()
+                    .position(|c| *c == '`')
+                    .map_or(chars.len(), |k| i + 1 + k);
+                (i + 1, j)
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+        };
+        inner.push(
+            chars[from.min(chars.len())..to.min(chars.len())]
+                .iter()
+                .collect(),
+        );
+        out.push_str("$_");
+        i = to + 1;
+    }
+    out
+}
+
+/// [`moves_dir`], of one simple command's words.
+fn moves_cmd(words: &[Word]) -> bool {
+    let mut words = words;
+    let mut wrapped = false;
+    let mut execs = false;
+    while let Some((first, rest)) = words.split_first() {
+        let text = first.text.as_str();
+        let value = assigned(first);
+        if value.is_some_and(value_moves) {
+            return true;
+        }
+        let wrapper = WRAPPERS.contains(&text);
+        let flag = wrapped && text.starts_with('-');
+        if !(value.is_some() || flag || wrapper || KEYWORDS.contains(&text)) {
+            break;
+        }
+        // `time` takes flags of its own, as a wrapper does.
+        wrapped |= wrapper || text == "time";
+        execs |= text == "exec";
+        words = rest;
+    }
+    let Some((program, args)) = words.split_first() else {
+        return false;
+    };
+    let name = program.text.as_str();
+    // Named by an expansion anywhere in it (`$c`, `c$X`): what it runs
+    // is for the shell to say.
+    if program.glob || name.contains(['$', '`']) {
+        return true;
+    }
+    let base = base_name(name);
+    // What replaces the shell starts where it pleases.
+    if execs || moving_word(base) {
+        return true;
+    }
+    let flags = || {
+        args.iter()
+            .map(|a| a.text.as_str())
+            .filter(|a| a.starts_with(['-', '+']))
+    };
+    match base {
+        // A function defined, its body unread.
+        "declare" | "typeset" if flags().any(|f| f.contains('f')) => return true,
+        "functions" => return true,
+        // zsh's `autocd` (`-J`), by name or letter.
+        "set" => {
+            let named = args.iter().any(|a| {
+                let o = a.text.to_ascii_lowercase().replace('_', "");
+                !o.starts_with(['-', '+']) && (o.contains("cd") || o.contains("pushd"))
+            });
+            if named || flags().any(|f| f.contains('J')) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    SETS_VARS.contains(&base) && args.iter().any(|a| assigned(a).is_some_and(value_moves))
+}
+
 /// Whether `command`, run where `here` says, is the boss's to allow:
 /// never anything on [`crate::never`]'s list, at any level, whatever this
 /// allowlist reads, and otherwise only what the allowlist reads in full.
@@ -3024,6 +3237,113 @@ fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_is_read_however_it_is_written() {
+        for moves in [
+            "cd /",
+            "\\cd /",
+            "\"cd\" ~",
+            "c''d /",
+            "ls && cd ..",
+            "X=1 cd /tmp",
+            "pushd /tmp",
+            "popd",
+            "/usr/bin/cd /",
+            "builtin cd /",
+            "command -p cd /",
+            "if true; then cd /; fi",
+            "eval 'cd /'",
+            "source ./env.sh",
+            ". ./env.sh",
+            // zsh's.
+            "chdir /tmp",
+            "noglob cd /tmp",
+            "nocorrect cd /tmp",
+            "- cd /tmp",
+            "emulate sh -c 'cd /tmp'",
+            "setopt autocd",
+            "unsetopt autocd",
+            "set -o autocd",
+            "set -J",
+            "functions -c cd c",
+            // bash's.
+            "time -p cd /tmp",
+            "shopt -s expand_aliases; alias c=cd; c /tmp",
+            "shopt -s autocd",
+            "mapfile -C 'cd /tmp' -c 1 x < f",
+            "readarray -C f x < f",
+            // Either's: what rewires the shell, so a later call moves.
+            "trap 'cd /tmp' DEBUG; true",
+            "alias c=cd",
+            "declare -f",
+            "typeset -fx f",
+            "f() { cd /tmp; }",
+            "function f { cd /tmp; }",
+            "f() { $c /tmp; }",
+            // A command named by an expansion, and a variable set to a move.
+            "c=cd; $c /tmp",
+            "X=cd",
+            "X='cd /tmp'",
+            "export X=cd",
+            "$X /tmp",
+            "\"$X\" /tmp",
+            "${X} /tmp",
+            "$(printf cd) /tmp",
+            "`printf cd` /tmp",
+            "ls; $X /tmp",
+            "X=1 $X /tmp",
+            "c$X /tmp",
+            "X=d; c$X /tmp",
+            "c${X} /tmp",
+            "ev$X x",
+            "autoload f",
+            // What replaces the shell starts where it pleases.
+            "exec bash -c 'cd /tmp; exec bash'",
+            // Unsplittable: read as plain words.
+            "cd $(mktemp -d)",
+            "echo $(c\\d /)",
+        ] {
+            assert!(moves_dir(moves), "{moves}");
+        }
+        for stays in [
+            "ls -la",
+            "git commit -m 'cd later'",
+            "echo cd",
+            "grep -r pushd src",
+            "cargo test -p workforce-desk",
+            "command -v rg",
+            "bash -c 'ls src'",
+            "echo $HOME",
+            // A child shell's script, which can't move this one.
+            "bash -c 'cd / && ls'",
+            "sh -c 'cd x && npm test'",
+            "zsh -c 'cd /tmp'",
+            // What runs a program of its own, never the shell's builtin.
+            "env cd /tmp",
+            "xargs cd",
+            "find . -exec cd {} \\;",
+            "nohup cd /tmp",
+            "sudo cd /tmp",
+            "git -C /tmp status",
+            "make -C /tmp",
+            // Variables and options that say nothing of a move.
+            "X=1",
+            "export PATH=/usr/bin",
+            "set -euo pipefail",
+            "declare -F",
+            // Unsplittable, and `.` or a rewiring word only an argument.
+            "find . -name \"$X\"",
+            "grep -rn \"foo$\" .",
+            "docker build -t app:$(git rev-parse HEAD) .",
+            "echo $(git log --format=%an) trap",
+            "exec 3>out.log",
+            "echo ${HOME} $((1 + 2))",
+            "X=$HOME/bin ls",
+        ] {
+            assert!(!moves_dir(stays), "{stays}");
+        }
+    }
 
     /// What exists on the disk the fakes stand for: these folders and all
     /// above them.

@@ -35,10 +35,7 @@ mod crew_store;
 mod cwd;
 pub mod decision;
 pub mod decision_store;
-// Devin's engine, its pieces before its sessions start (H2 wires them).
-#[allow(dead_code)]
 mod devin;
-#[allow(dead_code)]
 mod devin_config;
 pub mod engine;
 pub mod engine_accounts;
@@ -121,6 +118,8 @@ pub use conversations::{
     Said, SavedMemory, Speaker, SpeakerKind, Thread, Threads,
 };
 pub use crew_store::CheckIn;
+/// Where the person's own Devin config is, from the environment given.
+pub use devin_config::person_path as devin_person_config;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::KnowsGather;
