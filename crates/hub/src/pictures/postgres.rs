@@ -21,10 +21,7 @@ struct Migrations;
 #[async_trait]
 impl MigrationRun for Migrations {
     async fn run(&self, client: &mut tokio_postgres::Client) -> Result<(), PostgresError> {
-        embedded::migrations::runner()
-            .run_async(client)
-            .await
-            .map_err(PostgresError::from)?;
+        workforce_postgres::run_embedded(embedded::migrations::runner(), client).await?;
         Ok(())
     }
 }
