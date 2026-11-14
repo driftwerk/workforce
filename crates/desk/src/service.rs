@@ -668,6 +668,17 @@ struct State {
     /// Sessions forgotten while this hub runs: the registry may still hold
     /// one until the persist queue reaches it, and it is never taken back.
     forgotten: HashSet<Uuid>,
+    /// Devin sessions' last runs while this hub runs: when each launched
+    /// and ended ([`devin_sessions`]).
+    devin_runs: HashMap<Uuid, devin_sessions::Run>,
+    /// Held while a Devin session's files are ended or written, by
+    /// session: a quick resume never has its new files ended by the end of
+    /// the run before ([`devin_sessions`]).
+    devin_ending: HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>,
+    /// How long a Devin run's end takes to end its files, in tests: what
+    /// shows a quick resume waiting for it.
+    #[cfg(test)]
+    devin_end_delay: Option<Duration>,
     /// The person's engine accounts.
     accounts: Vec<crate::engine_accounts::Account>,
     /// Signing in to new accounts, by sign-in.
@@ -1747,10 +1758,18 @@ impl Desk {
         for (id, at) in failed {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
         }
+        let running = held.running();
         desk.adopt_held(held).await;
         // Devin sessions that ended while the hub was away: what Devin saved
-        // is written back, and their files (their hook tokens) go.
-        desk.sweep_devin_files().await;
+        // is written back, and their files (their hook tokens) go. Not when
+        // the holder couldn't say what it still runs: a session it does
+        // would lose its files under it.
+        match running {
+            Some(running) => desk.sweep_devin_files(&running).await,
+            None => tracing::warn!(
+                "the PTY holder couldn't say what it still runs; Devin sessions' files are left for the next start"
+            ),
+        }
         desk.handoffs_recover().await;
         desk.carry_asks(kept_asks, open_waits);
 
@@ -1988,7 +2007,10 @@ impl Desk {
                 },
             );
             drop(st);
-            tokio::spawn(self.clone().on_exit(id, exit));
+            if record.engine == Engine::Devin {
+                self.devin_launched(id, started_at);
+            }
+            tokio::spawn(self.clone().on_exit(id, record.engine, exit));
             if !record.state.is_running() {
                 self.change(id, |r, _| r.state = SessionState::Idle);
             } else {
@@ -3362,6 +3384,12 @@ impl Desk {
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
         let r = self.load(id).await?;
+        // A Devin session's run before ends whole first ([`Self::on_exit`]).
+        let lock = (r.engine == Engine::Devin).then(|| self.devin_lock(id));
+        let _ending = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         if self.0.state.lock().live.contains_key(&id) {
             return Err(DeskError::Conflict("session is already running".into()));
         }
@@ -3589,11 +3617,13 @@ impl Desk {
     ) -> Result<oneshot::Receiver<bool>, DeskError> {
         self.load(id).await?;
         let gone;
+        let devin;
         let live = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let r = st.records.get(&id).ok_or(DeskError::NotFound)?;
             may(st, r)?;
+            devin = r.engine == Engine::Devin;
             let view = Self::view_of(st, r);
             gone = view.clone();
             if let Some(h) = &hide {
@@ -3616,6 +3646,14 @@ impl Desk {
                 live.pty.forget_color_scheme_events();
             }
             live.end();
+        }
+        // A Devin session's files go once it has ended: now, when it wasn't
+        // running; else as it exits ([`Self::on_exit`]).
+        if devin && live.is_none() {
+            let lock = self.devin_lock(id);
+            let _ending = lock.lock().await;
+            self.devin_ended(id).await;
+            self.devin_forgotten(id);
         }
         drop(live);
         // Before its gist goes with it, what it handed on goes too.
@@ -4823,15 +4861,20 @@ impl Desk {
                 if let devin_config::Person::Unreadable(why) = &person {
                     tracing::warn!(session = %r.id, why = %why, "the person's Devin config couldn't be read: the session runs without it, and nothing is written back to it");
                 }
-                files
-                    .write(
-                        &self.0.opts.run_dir,
-                        &hook_url,
-                        self.0.opts.approval_timeout.as_secs(),
-                        false,
-                        &person,
-                    )
-                    .map_err(DeskError::Internal)?;
+                if let Err(e) = files.write(
+                    &self.0.opts.run_dir,
+                    &hook_url,
+                    self.0.opts.approval_timeout.as_secs(),
+                    false,
+                    &person,
+                ) {
+                    // Whatever of them was written goes, its token with it.
+                    self.devin_ended(r.id).await;
+                    return Err(DeskError::Internal(e));
+                }
+                if mode == Some(crate::mode::Mode::Plan) {
+                    tracing::warn!(session = %r.id, "Devin has no flag to start in plan mode: the plan mode Desk kept for it is dropped, and it starts in its default");
+                }
                 let session_id = r.cli_session_id.as_deref().filter(|_| resume);
                 let spec = self.program_of(Engine::Devin).and_then(|program| {
                     devin::spawn(&devin::DevinSpawn {
@@ -4949,7 +4992,10 @@ impl Desk {
         // Started afresh: on its own account again, or on the CLI's sign-in
         // as it is now.
         self.started_afresh(r.id);
-        tokio::spawn(self.clone().on_exit(r.id, exit));
+        if r.engine == Engine::Devin {
+            self.devin_launched(r.id, started_at);
+        }
+        tokio::spawn(self.clone().on_exit(r.id, r.engine, exit));
         // What its line held while it wasn't running is looked at again now
         // it is: its state said Starting before it was (settling its CLI's
         // first run waits on a file), and a pump then still found it stopped.
@@ -5113,16 +5159,41 @@ impl Desk {
         }
     }
 
-    async fn on_exit(self, id: Uuid, exit: oneshot::Receiver<Exit>) {
+    async fn on_exit(self, id: Uuid, engine: Engine, exit: oneshot::Receiver<Exit>) {
         let code = exit.await.ok().flatten();
         if self.0.cancel.is_cancelled() {
             // The hub is stopping: whatever ends now is not the session's doing.
             return;
         }
+        // A Devin session's run ends whole (its files, then its state)
+        // before a resume can start the next: the next's files are never
+        // ended under it, nor its state said over the next's.
+        let lock = (engine == Engine::Devin).then(|| self.devin_lock(id));
+        let _ending = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let live = self.0.state.lock().live.remove(&id);
-        let Some(live) = live else { return };
+        let Some(live) = live else {
+            // Forgotten while it ran: its files go now that it has ended.
+            if engine == Engine::Devin && !self.0.state.lock().records.contains_key(&id) {
+                self.devin_ended(id).await;
+                self.devin_forgotten(id);
+            }
+            return;
+        };
         tracing::info!(%id, ?code, "desk session exited");
-        if self.engine_of(id) == Some(Engine::Devin) {
+        if engine == Engine::Devin {
+            if let Some(run) = self.0.state.lock().devin_runs.get_mut(&id) {
+                run.ended = Some(Utc::now());
+            }
+            #[cfg(test)]
+            {
+                let delay = self.0.state.lock().devin_end_delay;
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+            }
             self.devin_ended(id).await;
         }
         let clean = live.ended || live.stopping;
@@ -5273,12 +5344,14 @@ impl Desk {
             // What Devin types into a command already running could move
             // its shell anywhere, unseen.
             let typed = call.tool == format!("{}write_to_process", devin::UNKNOWN);
+            // A move is read as the boss reads the command, however it is
+            // quoted or escaped.
             let cd = typed
                 || call.tool == "Bash"
-                    && call.input.as_deref().is_some_and(|c| {
-                        c.split(|ch: char| ch.is_whitespace() || ";&|(".contains(ch))
-                            .any(|w| matches!(w, "cd" | "pushd" | "popd"))
-                    });
+                    && call
+                        .input
+                        .as_deref()
+                        .is_some_and(crate::computer::boss::moves_dir);
             if cd {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
                     l.moved = true;
@@ -7153,12 +7226,39 @@ pub(crate) struct HeldSet {
     pub(crate) strays: Vec<Held>,
     /// The port the held sessions' hooks post to.
     hook_port: Option<u16>,
+    /// The holder was to be asked what it keeps and couldn't be: what it
+    /// still runs is unknown, not none.
+    unread: bool,
+    /// The sessions whose processes it still runs, taken back or not.
+    alive: HashSet<Uuid>,
 }
 
 impl HeldSet {
+    /// A holder that was to be asked what it keeps and couldn't be.
+    fn unread() -> Self {
+        Self {
+            unread: true,
+            ..Self::default()
+        }
+    }
+
+    /// The sessions whose processes are still running, or none when the
+    /// holder couldn't say.
+    fn running(&self) -> Option<HashSet<Uuid>> {
+        (!self.unread).then(|| self.alive.clone())
+    }
+
     fn sort(all: Vec<Held>) -> Self {
         let mut set = Self::default();
         for h in all {
+            if !h.exited {
+                if let Some(id) = h.meta["session"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    set.alive.insert(id);
+                }
+            }
             let owner = |key: &str| h.meta[key].as_str().and_then(|s| Uuid::parse_str(s).ok());
             if h.exited {
                 set.strays.push(h);
@@ -7201,7 +7301,7 @@ async fn connect_holder(opts: Option<&HolderOptions>) -> (Option<Holder>, HeldSe
         Err(e) => {
             tracing::warn!(error = %e, socket = %opts.socket.display(),
                 "PTY holder unavailable; terminals run in the hub and end with it");
-            return (None, HeldSet::default());
+            return (None, HeldSet::unread());
         }
     };
     match holder.list().await {
@@ -7211,7 +7311,7 @@ async fn connect_holder(opts: Option<&HolderOptions>) -> (Option<Holder>, HeldSe
         }
         Err(e) => {
             tracing::warn!(error = %e, "PTY holder did not list its terminals");
-            (Some(holder), HeldSet::default())
+            (Some(holder), HeldSet::unread())
         }
     }
 }

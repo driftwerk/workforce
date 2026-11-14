@@ -408,7 +408,8 @@ impl Desk {
             view
         };
         let confirmed = match (running && not_started.is_none(), r.engine) {
-            (true, Engine::Claude) => {
+            // Both say the mode they run in on every hook.
+            (true, Engine::Claude | Engine::Devin) => {
                 let until = tokio::time::Instant::now() + READ_BACK;
                 loop {
                     if let Some(m) = self.mode_seen(id) {

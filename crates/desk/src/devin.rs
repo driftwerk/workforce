@@ -241,7 +241,9 @@ pub struct Listed {
 /// What `devin list --format json` printed (in a folder: its sessions
 /// there). Its entries' shape isn't documented (an empty folder's is
 /// `[]`), so an id and a time are looked for under the names they are
-/// likely to have. None: not a list Desk can read.
+/// likely to have. None: not a list Desk can read, which includes one with
+/// an entry whose id Desk can't find. Read as an empty list, it would say
+/// a conversation Devin still has is gone.
 pub fn listed(printed: &str) -> Option<Vec<Listed>> {
     let v: Value = serde_json::from_str(printed.trim()).ok()?;
     let entries = match &v {
@@ -249,25 +251,23 @@ pub fn listed(printed: &str) -> Option<Vec<Listed>> {
         Value::Object(o) => o.get("sessions").and_then(Value::as_array)?,
         _ => return None,
     };
-    Some(
-        entries
+    entries
+        .iter()
+        .map(|e| {
+            let id = text_in(e, &["id", "session_id", "sessionId"])?.to_string();
+            let created = [
+                "created_at",
+                "createdAt",
+                "started_at",
+                "startedAt",
+                "created",
+            ]
             .iter()
-            .filter_map(|e| {
-                let id = text_in(e, &["id", "session_id", "sessionId"])?.to_string();
-                let created = [
-                    "created_at",
-                    "createdAt",
-                    "started_at",
-                    "startedAt",
-                    "created",
-                ]
-                .iter()
-                .find_map(|k| e.get(*k))
-                .and_then(time_of);
-                Some(Listed { id, created })
-            })
-            .collect(),
-    )
+            .find_map(|k| e.get(*k))
+            .and_then(time_of);
+            Some(Listed { id, created })
+        })
+        .collect()
 }
 
 fn time_of(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -285,14 +285,18 @@ fn time_of(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     }
 }
 
-/// The one session in `listed` made after `since` (a Desk session's start
-/// that never said its id): none when none or several were, as the
-/// person's own `devin` or another Desk session there could otherwise be
-/// taken for it.
-pub fn made_after(listed: &[Listed], since: chrono::DateTime<chrono::Utc>) -> Option<&str> {
+/// The one session in `listed` made between `since` and `until` (a Desk
+/// session's launch that never said its id, and its exit): none when none
+/// or several were, as the person's own `devin` or another Desk session
+/// there could otherwise be taken for it.
+pub fn made_after(
+    listed: &[Listed],
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<&str> {
     let mut after = listed
         .iter()
-        .filter(|l| l.created.is_some_and(|c| c >= since));
+        .filter(|l| l.created.is_some_and(|c| c >= since && c <= until));
     match (after.next(), after.next()) {
         (Some(one), None) => Some(one.id.as_str()),
         _ => None,
@@ -451,10 +455,10 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
     // The mode it says it runs in, by Claude Code's name.
     if let Some(mode) = p.get("permission_mode").and_then(Value::as_str) {
         let named = match mode {
-            "normal" | "auto" => Some(Mode::Default),
+            "normal" => Some(Mode::Default),
             "accept-edits" => Some(Mode::AcceptEdits),
             "smart" => Some(Mode::Auto),
-            "dangerous" | "yolo" | "bypass" => Some(Mode::BypassPermissions),
+            "dangerous" | "autonomous" => Some(Mode::BypassPermissions),
             _ => None,
         };
         match named {
@@ -1344,8 +1348,14 @@ mod tests {
     fn its_sessions_are_read_off_its_list() {
         assert_eq!(listed("[]"), Some(vec![]));
         assert_eq!(listed("not json"), None);
+        // An entry whose id Desk can't find (a key it doesn't know): the
+        // list is unread, never read as empty, as that would say the
+        // conversation is gone.
+        assert_eq!(listed(r#"[{"uuid":"ses_a","title":"x"}]"#), None);
+        assert_eq!(listed(r#"[{"id":"ses_a"},{"conversation":"ses_b"}]"#), None);
+        assert_eq!(listed(r#"{"sessions":[{"title":"no id"}]}"#), None);
         let printed = r#"[{"id":"ses_a","created_at":"2026-11-14T09:00:00Z","title":"x"},
-            {"session_id":"ses_b","createdAt":1794648600000},{"title":"no id"}]"#;
+            {"session_id":"ses_b","createdAt":1794648600000}]"#;
         let l = listed(printed).unwrap();
         assert_eq!(l.len(), 2);
         assert_eq!(l[0].id, "ses_a");
@@ -1356,7 +1366,8 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         };
         // Exactly one made since: that one; none or two: neither.
-        assert_eq!(made_after(&l, at("2026-11-14T08:59:00Z")), None, "two");
+        let end = at("2026-11-15T00:00:00Z");
+        assert_eq!(made_after(&l, at("2026-11-14T08:59:00Z"), end), None, "two");
         let one = vec![
             Listed {
                 id: "ses_a".into(),
@@ -1371,8 +1382,16 @@ mod tests {
                 created: None,
             },
         ];
-        assert_eq!(made_after(&one, at("2026-11-14T08:59:00Z")), Some("ses_a"));
-        assert_eq!(made_after(&one, at("2026-11-14T10:00:00Z")), None);
+        assert_eq!(
+            made_after(&one, at("2026-11-14T08:59:00Z"), end),
+            Some("ses_a")
+        );
+        assert_eq!(made_after(&one, at("2026-11-14T10:00:00Z"), end), None);
+        // Made after the session ended: not its.
+        assert_eq!(
+            made_after(&one, at("2026-11-14T08:59:00Z"), at("2026-11-14T08:59:30Z")),
+            None
+        );
         assert_eq!(listed(r#"{"sessions":[{"id":"x"}]}"#).unwrap()[0].id, "x");
     }
 
@@ -1392,7 +1411,11 @@ mod tests {
         assert_eq!(mode("accept-edits"), Some(Mode::AcceptEdits));
         assert_eq!(mode("smart"), Some(Mode::Auto));
         assert_eq!(mode("dangerous"), Some(Mode::BypassPermissions));
-        assert_eq!(mode("autonomous"), None);
+        assert_eq!(mode("autonomous"), Some(Mode::BypassPermissions));
+        // Only the documented names: any other is unread.
+        assert_eq!(mode("auto"), None);
+        assert_eq!(mode("yolo"), None);
+        assert_eq!(mode("bypass"), None);
     }
 
     #[test]

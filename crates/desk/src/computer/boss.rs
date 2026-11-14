@@ -1216,6 +1216,70 @@ fn reader(name: &str) -> Option<(Spec, &'static [&'static str])> {
     })
 }
 
+/// The programs that change the directory of the shell they run in.
+const MOVES_DIR: &[&str] = &["cd", "pushd", "popd"];
+
+/// What runs words or a file in the same shell, so may move it too.
+const SAME_SHELL: &[&str] = &["eval", "source", "."];
+
+/// What runs the command after it as it is, in the same shell.
+const WRAPPERS: &[&str] = &["builtin", "command", "exec"];
+
+/// Whether `command` may change the directory its shell works in, read
+/// word by word as [`judge`] reads it: `cd`, `pushd` or `popd` however it
+/// is quoted or escaped (`\cd`, `"cd"`, `c''d`), after keywords, in a
+/// shell's script, or through what runs words in the same shell (`eval`,
+/// `source`, `builtin`). A command Desk can't split is read as plain
+/// words, its quotes and escapes dropped: one there is taken as a move.
+pub fn moves_dir(command: &str) -> bool {
+    let Ok(cmds) = split(command) else {
+        let bare: String = command
+            .chars()
+            .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+            .collect();
+        return bare
+            .split(|c: char| c.is_whitespace() || ";&|()`$<>{}".contains(c))
+            .any(|w| MOVES_DIR.contains(&w) || SAME_SHELL.contains(&w));
+    };
+    cmds.iter().any(|cmd| {
+        let mut words = cmd.words.as_slice();
+        let mut wrapped = false;
+        while let Some((first, rest)) = words.split_first() {
+            let text = first.text.as_str();
+            let assigns = text.split_once('=').is_some_and(|(name, _)| {
+                !first.glob
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            let flag = wrapped && text.starts_with('-');
+            let wrapper = WRAPPERS.contains(&text);
+            if !(assigns || flag || wrapper || KEYWORDS.contains(&text)) {
+                break;
+            }
+            wrapped |= wrapper;
+            words = rest;
+        }
+        let Some((program, args)) = words.split_first() else {
+            return false;
+        };
+        if program.glob {
+            return true;
+        }
+        let name = program.text.as_str();
+        let base = name.rsplit_once('/').map_or(name, |(_, b)| b);
+        if MOVES_DIR.contains(&base) || SAME_SHELL.contains(&base) {
+            return true;
+        }
+        // A shell's script: what it says.
+        SHELLS.contains(&base)
+            && args
+                .iter()
+                .skip_while(|a| !(a.text.starts_with('-') && a.text.contains('c')))
+                .nth(1)
+                .is_some_and(|script| moves_dir(&script.text))
+    })
+}
+
 /// Whether `command`, run where `here` says, is the boss's to allow:
 /// never anything on [`crate::never`]'s list, at any level, whatever this
 /// allowlist reads, and otherwise only what the allowlist reads in full.
@@ -3024,6 +3088,45 @@ fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_is_read_however_it_is_written() {
+        for moves in [
+            "cd /",
+            "\\cd /",
+            "\"cd\" ~",
+            "c''d /",
+            "ls && cd ..",
+            "X=1 cd /tmp",
+            "pushd /tmp",
+            "popd",
+            "/usr/bin/cd /",
+            "builtin cd /",
+            "command -p cd /",
+            "if true; then cd /; fi",
+            "eval 'cd /'",
+            "source ./env.sh",
+            ". ./env.sh",
+            "bash -c 'cd / && ls'",
+            // Unsplittable: read as plain words.
+            "cd $(mktemp -d)",
+            "echo $(c\\d /)",
+        ] {
+            assert!(moves_dir(moves), "{moves}");
+        }
+        for stays in [
+            "ls -la",
+            "git commit -m 'cd later'",
+            "echo cd",
+            "grep -r pushd src",
+            "cargo test -p workforce-desk",
+            "command -v rg",
+            "bash -c 'ls src'",
+            "echo $HOME",
+        ] {
+            assert!(!moves_dir(stays), "{stays}");
+        }
+    }
 
     /// What exists on the disk the fakes stand for: these folders and all
     /// above them.
