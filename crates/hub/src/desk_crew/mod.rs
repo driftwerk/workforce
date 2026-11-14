@@ -37,6 +37,7 @@ mod decisions;
 mod deliver;
 mod extras;
 mod handover;
+mod idle;
 mod items;
 mod line;
 mod observe;
@@ -602,6 +603,7 @@ impl CrewHub {
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));

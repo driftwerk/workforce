@@ -421,6 +421,12 @@ impl Desk {
 
     /// When the person last gave `id` input: typed in its terminal,
     /// prompted it, or wrote to it.
+    /// When the person last gave session `id` input: typed in it, or
+    /// prompted it.
+    pub fn last_input_of(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        Self::last_input(&self.0.state.lock(), id)
+    }
+
     pub(super) fn last_input(st: &super::State, id: Uuid) -> Option<DateTime<Utc>> {
         let typed = st.live.get(&id).and_then(|l| l.pty.typed_at());
         typed.max(st.charges.driven.get(&id).copied())

@@ -385,6 +385,11 @@ impl CrewHub {
         }
         let unbound = self.unbound(o);
         let view = || subject.id.parse().ok().and_then(|s| self.desk.view(s).ok());
+        // A plain turn's end its Act fully boss judges at once (`idle`)
+        // wakes nothing else.
+        if event.kind == Kind::Finished && view().is_some_and(|v| self.moves_on_itself(&v)) {
+            return None;
+        }
         // A question the person is in control of is theirs: nothing is said
         // of it (`answer`). One its Act fully boss answers itself wakes
         // nothing else.
