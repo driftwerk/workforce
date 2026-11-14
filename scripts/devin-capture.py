@@ -14,6 +14,12 @@ It starts Devin twice, in a new scratch folder under your home folder:
    don't press anything until it says DONE, then exit as before. If Devin
    asks you anything anyway, approve it Once, and pick Red.
 
+Then it offers two optional steps, each about a minute, each asked first:
+A. the test hook fails on purpose (exit 1) when Devin asks to run a command,
+   to see whether Devin then asks you, runs it, refuses it or hangs;
+B. Devin changes into a subfolder of a scratch folder, then edits a file by
+   a relative path, to see which folder the file lands in.
+
 The hooks are added the way Desk will add them: your own Devin config is
 copied whole into a private file passed with `--config`, and the hooks are
 appended to yours. Your own config and credentials are never written; the
@@ -84,8 +90,24 @@ SECOND_PROMPT = (
     "4) Reply with one sentence naming the colour I picked, then say DONE."
 )
 
+# The optional probes. A: the PermissionRequest hook fails (exit 1, not the
+# blocking 2), to see whether Devin then asks in its own prompt, allows the
+# call, denies it or hangs.
+FAIL_PROMPT = "One more short step: run the shell command `echo probe-a`, then say DONE."
+# B: a relative path after a `cd`, to see which folder an edit lands in.
+RELPATH_PROMPT = (
+    "A short test of paths. Do exactly these steps, one at a time: "
+    "1) Run the shell command `cd sub` on its own. "
+    "2) With your file editing tool (or apply_patch), not the shell, create a file "
+    "at the relative path probe.txt containing the word probe. "
+    "3) Say DONE."
+)
+# How long probe A's person waits before deciding Devin hangs.
+HANG_SECS = 20
+
 # The hook Devin runs, written next to the config: it logs what it was sent
-# and, in the second run, answers as Desk will.
+# and, in the second run, answers as Desk will. In probe A it fails on
+# purpose; in probe B it approves at once.
 HOOK = r'''
 import json, os, sys, time
 run, event, log = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -103,6 +125,11 @@ if run == "decide":
         answer = {"decision": "approve"}
     elif event == "PreToolUse" and tool == "ask_user_question":
         answer = {"decision": "block", "reason": "The person answered: HOOK_ANSWER"}
+elif run == "relpath" and event == "PermissionRequest":
+    answer = {"decision": "approve"}
+fail = run == "fail" and event == "PermissionRequest"
+if fail:
+    answer = {"exit": 1}
 record = {"run": run, "event": event, "start": start, "end": time.time(),
           "answered": answer, "payload": payload}
 # The script makes the log before the runs and removes it after: a hook
@@ -113,6 +140,9 @@ except FileNotFoundError:
     sys.exit(0)
 with os.fdopen(fd, "a") as f:
     f.write(json.dumps(record) + "\n")
+if fail:
+    sys.stderr.write("capture probe A: this hook fails on purpose\n")
+    sys.exit(1)
 sys.stdout.write(json.dumps(answer))
 '''.replace("HOLD_SECS", str(HOLD_SECS)).replace("HOOK_ANSWER", HOOK_ANSWER)
 
@@ -981,6 +1011,95 @@ def findings(records, prompted_again, asked_again):
     }
 
 
+def hook_failure(records, ended, saw_prompt, saw_hang):
+    """Probe A's outcome, read off its records and what the person saw:
+    prompted, allowed, denied or hung, and how long that took after the
+    failed hook."""
+    run = [r for r in records if r.get("run") == "fail" and "start" in r]
+    asked = next((r for r in run if r.get("event") == "PermissionRequest"), None)
+    if asked is None:
+        return {"outcome": "noPermissionRequest", "events": [r.get("event") for r in run]}
+    after = [r for r in run if r["start"] >= asked["end"]]
+    ran = next((r for r in after if r.get("event") == "PostToolUse"), None)
+    if saw_prompt:
+        outcome = "prompted"
+    elif ran:
+        outcome = "allowed"
+    elif saw_hang:
+        outcome = "hung"
+    elif after:
+        outcome = "denied"
+    else:
+        outcome = "unknown"
+    if ran:
+        until = ran["start"]
+    elif after and outcome != "hung":
+        until = after[0]["start"]
+    else:
+        until = ended
+    return {
+        "outcome": outcome,
+        "secs": round(until - asked["end"], 2),
+        "toolRan": ran is not None,
+        "eventsAfter": [r.get("event") for r in after],
+        "personSawPrompt": saw_prompt,
+        "personSawHang": saw_hang,
+    }
+
+
+def relative_to(path, base):
+    """`path` relative to `base` (".", "sub"), or "<outside>": nothing above
+    `base` is ever kept."""
+    if not isinstance(path, str) or not path:
+        return None
+    if not os.path.isabs(path):
+        path = os.path.join(base, path)
+    path, base = os.path.realpath(path), os.path.realpath(base)
+    try:
+        inside = os.path.commonpath([path, base]) == base
+    except ValueError:
+        inside = False
+    return os.path.relpath(path, base) if inside else "<outside>"
+
+
+def relative_path_after_cd(records, scratch, name="probe.txt"):
+    """Probe B: which folder `name` landed in, the payloads' cwd and the
+    edit's path, each relative to the scratch folder alone."""
+    landed = sorted(
+        relative_to(d, scratch) for d, _, files in os.walk(scratch) if name in files
+    )
+    seen, paths = [], []
+    for r in records:
+        if r.get("run") != "relpath":
+            continue
+        p = payload_of(r)
+        seen.append(
+            {
+                "event": r.get("event"),
+                "tool": p.get("tool_name"),
+                "cwd": relative_to(p.get("cwd"), scratch),
+            }
+        )
+        given = p.get("tool_input")
+        if r.get("event") == "PreToolUse" and isinstance(given, dict):
+            for k, v in given.items():
+                if isinstance(v, str) and re.search(r"(?i)path|file", k) and name in v:
+                    paths.append(
+                        {
+                            "tool": p.get("tool_name"),
+                            "field": k,
+                            "absolute": os.path.isabs(v),
+                            "path": relative_to(v, scratch) if os.path.isabs(v) else v,
+                        }
+                    )
+    return {
+        "landedIn": landed or None,
+        "cwds": sorted({e["cwd"] for e in seen if e["cwd"]}),
+        "events": seen,
+        "editPaths": paths,
+    }
+
+
 def own_hooks(mine):
     """The person's own hooks and permission rules, counted, not shown: they
     run in the capture too, and may change what it reads."""
@@ -1004,6 +1123,9 @@ def capture(devin, home, folder):
     log = os.path.join(folder, "hooks.jsonl")
     observe = os.path.join(folder, "observe.json")
     decide = os.path.join(folder, "decide.json")
+    failing = os.path.join(folder, "fail.json")
+    relpath = os.path.join(folder, "relpath.json")
+    scratch = os.path.join(folder, "probe")
     out = os.path.join(folder, "devin-capture.json")
     part = out + ".part"
     try:
@@ -1078,6 +1200,67 @@ def capture(devin, home, folder):
         say("Two questions about run 2:")
         prompted = ask_yes_no("Did Devin show its own approval prompt in run 2?")
         asked = ask_yes_no("Did Devin show you the colour question in run 2?")
+        exits = [first_exit, second_exit]
+
+        probes = {}
+        say(
+            "Optional step A (about a minute): the test hook fails on purpose when Devin "
+            "asks to run a command, to see what Devin does then."
+        )
+        if ask_yes_no("Run step A?"):
+            say(
+                "Step A: don't press anything for %d seconds after Devin asks to run "
+                "`echo probe-a`. If Devin shows its own approval prompt, approve it Once. "
+                "If nothing happens for %d seconds, exit Devin (/exit, or Ctrl+C twice). "
+                "Exit Devin when it says DONE." % (HANG_SECS, HANG_SECS)
+            )
+            private_file(failing, json.dumps(config_for("fail", mine, hook, log)))
+            try:
+                exits.append(
+                    run_devin(
+                        devin,
+                        ["--config", failing, "--permission-mode", "normal"] + resume + ["--", FAIL_PROMPT],
+                        work,
+                    )
+                )
+                ended = time.time()
+                time.sleep(1)
+            finally:
+                remove(failing)
+            saw_prompt = ask_yes_no("Did Devin show its own approval prompt for `echo probe-a`?")
+            saw_hang = None
+            ran = any(
+                r.get("run") == "fail" and r.get("event") == "PostToolUse" for r in read_log(log)
+            )
+            if not saw_prompt and not ran:
+                saw_hang = ask_yes_no("Did Devin sit waiting until you exited it?")
+            probes["hookFailure"] = hook_failure(read_log(log), ended, saw_prompt, saw_hang)
+
+        say(
+            "Optional step B (about a minute): Devin changes into a subfolder, then edits "
+            "a file by a relative path, to see where the file lands."
+        )
+        if ask_yes_no("Run step B?"):
+            os.makedirs(os.path.join(scratch, "sub"), mode=0o700)
+            if shutil.which("git"):
+                subprocess.call(["git", "init", "-q", scratch], stdin=subprocess.DEVNULL)
+            say(
+                "Step B: trust the folder if Devin asks. The test hook approves for Devin; "
+                "if Devin asks you anyway, approve it Once. Exit Devin when it says DONE."
+            )
+            private_file(relpath, json.dumps(config_for("relpath", mine, hook, log)))
+            try:
+                exits.append(
+                    run_devin(
+                        devin,
+                        ["--config", relpath, "--permission-mode", "normal", "--", RELPATH_PROMPT],
+                        scratch,
+                    )
+                )
+                time.sleep(1)
+            finally:
+                remove(relpath)
+            probes["relativePathAfterCd"] = relative_path_after_cd(read_log(log), scratch)
 
         records = read_log(log)
         events, tools = shapes(records)
@@ -1094,8 +1277,9 @@ def capture(devin, home, folder):
             "authStatus": status,
             "list": listed,
             "resumedById": session is not None,
-            "exits": [first_exit, second_exit],
+            "exits": exits,
             "findings": findings(records, prompted, asked),
+            "probes": probes,
             "eventFields": events,
             "toolInputFields": tools,
             "records": records,
@@ -1121,7 +1305,7 @@ def capture(devin, home, folder):
         # Nothing stops the clean-up.
         for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
             signal.signal(s, signal.SIG_IGN)
-        for path in (hook, log, observe, decide, part, work):
+        for path in (hook, log, observe, decide, failing, relpath, part, work, scratch):
             remove(path)
         if not os.path.exists(out):
             remove(folder)
