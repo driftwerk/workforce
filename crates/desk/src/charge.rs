@@ -634,6 +634,19 @@ fn what_of(engine: Engine, r: &Request, cwd: Option<&Path>, home: &Path) -> What
                 .collect();
             paths(raws).map_or_else(unknown, What::Change)
         }
+        // Devin's patch names every file it touches ([`crate::devin`]
+        // read them off it, and gave none it couldn't be sure of).
+        (Engine::Devin, "Edit") if r.input.get("paths").is_some() => {
+            let raws: Vec<&str> = r
+                .input
+                .get("paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            paths(raws).map_or_else(unknown, What::Change)
+        }
         (_, "Edit" | "MultiEdit" | "Write" | "NotebookEdit") => {
             let raws = ["file_path", "notebook_path"]
                 .iter()
@@ -1390,6 +1403,60 @@ mod tests {
             change(json!({ "paths": ["src/a.ts"], "grantRoot": "/Users/sam/dev" })),
             Err("Desk can't tell what a grant to write in a folder for the rest of the session does".into())
         );
+    }
+
+    /// Devin's calls as [`crate::devin::normalize`] leaves them: its patch
+    /// judged on every file it names, its edits on their file, and a tool
+    /// Desk didn't read never one of Claude Code's.
+    #[test]
+    fn devins_calls_are_judged_on_what_desk_read_of_them() {
+        let s = acme("/Users/sam/dev/acme-web");
+        let call = |tool: &str, input: Value| {
+            let mut p = json!({"hook_event_name": "PermissionRequest", "tool_name": tool,
+                "tool_input": input});
+            crate::devin::normalize(&mut p, None);
+            let tool = p["tool_name"].as_str().unwrap().to_string();
+            judged(
+                Engine::Devin,
+                &asking(&tool, p["tool_input"].clone(), None),
+                &s,
+            )
+        };
+        let patch = |files: &[&str]| {
+            let body: String = files
+                .iter()
+                .map(|f| format!("*** Update File: {f}\n@@\n-a\n+b\n"))
+                .collect();
+            json!({ "patch": format!("*** Begin Patch\n{body}*** End Patch\n") })
+        };
+        assert_eq!(
+            call("apply_patch", patch(&["src/a.ts", "src/b.ts"])),
+            Ok(())
+        );
+        assert_eq!(
+            call("apply_patch", patch(&["src/a.ts", "/Users/sam/.zshrc"])),
+            Err(boss::SETTINGS.into())
+        );
+        assert_eq!(
+            call(
+                "apply_patch",
+                patch(&["src/a.ts", "/Users/sam/dev/acme-api/a.ts"])
+            ),
+            Err("changes a file outside acme-web".into())
+        );
+        assert_eq!(
+            call(
+                "edit",
+                json!({"file_path": "src/a.ts", "old_str": "a", "new_str": "b"})
+            ),
+            Ok(())
+        );
+        assert_eq!(call("exec", json!({"command": "cargo test"})), Ok(()));
+        // What Desk couldn't read whole: the person's.
+        assert!(call("apply_patch", json!({"patch": "--- a/x\n+++ b/x\n"})).is_err());
+        assert!(call("exec", json!({"command": "ls", "workdir": "/"})).is_err());
+        assert!(call("Task", json!({"prompt": "anything"})).is_err());
+        assert!(call("read", json!({})).is_err());
     }
 
     #[test]

@@ -385,12 +385,17 @@ impl CrewHub {
         if !self.desk.charges_loaded() || !self.desk.boss_home_known() {
             return Outcome::Soon;
         }
-        // Codex's requests in a session a boss on another hub runs are the
-        // person's (Desk takes no other answer to them).
+        // The requests of an engine a boss on another hub can't be trusted
+        // with (Codex's, Devin's: [`workforce_desk::engine::boss_safe`]) in
+        // a session such a boss runs are the person's (Desk takes no other
+        // answer to them).
         if workforce_desk::grant::is_served(&boss)
-            && view.engine == workforce_desk::engine::Engine::Codex
+            && !workforce_desk::engine::boss_safe(view.engine)
         {
-            return waits("Codex's requests in a session run from another hub are yours".into());
+            return waits(format!(
+                "{}'s requests in a session run from another hub are yours",
+                view.engine.title()
+            ));
         }
         if !p.answerable {
             // A question its dialog asks while the person is in control of
@@ -707,8 +712,17 @@ impl CrewHub {
                     .unwrap_or_default()
             ),
         };
+        // Devin's request is put in Claude Code's terms; what Devin itself
+        // sent is beside it, under `devin`, and is what runs.
+        let devin = match view.engine {
+            workforce_desk::engine::Engine::Devin => {
+                "It is Devin asking. Its request is put in Claude Code's terms; Devin's own call, \
+                 under `devin` in its input, is what runs: decide on that.\n\n"
+            }
+            _ => "",
+        };
         format!(
-            "{MARK} A session you oversee asks to do this. Decide it now.\n\n{codex}{}\n\n{}{prefs}",
+            "{MARK} A session you oversee asks to do this. Decide it now.\n\n{codex}{devin}{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&request.to_string(), "its request, whole"),
         )
