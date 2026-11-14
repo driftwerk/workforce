@@ -541,6 +541,7 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
             || matches!(
                 name.as_str(),
                 ".codex"
+                    | ".devin"
                     | ".git"
                     | ".mcp.json"
                     | ".envrc"
