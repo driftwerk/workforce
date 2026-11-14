@@ -377,11 +377,9 @@ pub fn render_markers_as_preview(text: &str) -> String {
     // A closure, not `"$3"`: `preview` is optional, and the literal expansion
     // renders a bare marker as the empty string — silently deleting the fact
     // that a credential stood there.
-    let auto = MARKER_REGEX.replace_all(text, |c: &regex::Captures<'_>| {
-        c.get(3)
-            .map_or(UNDECORATED_PREVIEW, |m| m.as_str())
-            .to_string()
-    });
+    // Never the marker's own `preview=`: markers made before previews were
+    // stripped of fragments are still in saved sessions, and carry some.
+    let auto = MARKER_REGEX.replace_all(text, UNDECORATED_PREVIEW);
     NAMED_MARKER_REGEX.replace_all(&auto, "$1").into_owned()
 }
 
@@ -724,7 +722,8 @@ mod tests {
         };
         let text = format!("token is {m}, please use it");
         let out = render_markers_as_preview(&text);
-        assert_eq!(out, "token is ghp_...AbCd, please use it");
+        // An older marker's fragment is not shown either.
+        assert_eq!(out, "token is ***, please use it");
     }
 
     #[test]
