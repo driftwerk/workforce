@@ -74,18 +74,29 @@ impl Desk {
         st.devin_ending.remove(&id);
     }
 
-    /// Session `id` launched at `at` (or was taken back, launched then).
+    /// Session `id` was taken back, launched at `at`: what it launched
+    /// with isn't known, so the environment Devin's sessions find now
+    /// stands for it.
     pub(super) fn devin_launched(&self, id: Uuid, at: DateTime<Utc>) {
-        let env = self.devin_env();
-        self.0.state.lock().devin_runs.insert(
-            id,
-            Run {
-                launched: at,
-                ended: None,
-                config: devin_config::person_path(&env),
-                folders: devin_folders(&env),
-            },
-        );
+        self.devin_launched_with(id, at, &self.devin_env());
+    }
+
+    /// Session `id` launched at `at` with `env`: its own environment, not
+    /// what a start since may have made the current one.
+    pub(super) fn devin_launched_with(
+        &self,
+        id: Uuid,
+        at: DateTime<Utc>,
+        env: &std::collections::BTreeMap<String, String>,
+    ) {
+        // Resolved before the lock is taken: it reads the disk.
+        let run = Run {
+            launched: at,
+            ended: None,
+            config: devin_config::person_path(env),
+            folders: devin_folders(env),
+        };
+        self.0.state.lock().devin_runs.insert(id, run);
     }
 
     /// The engine session `id` runs on.
@@ -94,7 +105,7 @@ impl Desk {
     }
 
     /// The environment Devin sessions run with, as Desk adds to it.
-    fn devin_env(&self) -> std::collections::BTreeMap<String, String> {
+    pub(super) fn devin_env(&self) -> std::collections::BTreeMap<String, String> {
         self.with_added(&self.0.state.lock().session_env.clone())
     }
 
@@ -146,7 +157,6 @@ impl Desk {
     /// Its own run's config, where it launched with one; else (it ran while
     /// the hub was away) the one Devin's sessions find now.
     pub(super) async fn devin_ended(&self, id: Uuid) {
-        let files = SessionFiles::of(&self.0.opts.run_dir, id);
         let own = self
             .0
             .state
@@ -155,6 +165,14 @@ impl Desk {
             .get(&id)
             .and_then(|r| r.config.clone());
         let person = own.or_else(|| devin_config::person_path(&self.devin_env()));
+        self.devin_ended_to(id, person).await;
+    }
+
+    /// Session `id`'s launch failed before it ran: what was written of its
+    /// files goes, written back to `person` (the launch's own config, never
+    /// the run's before it).
+    pub(super) async fn devin_ended_to(&self, id: Uuid, person: Option<PathBuf>) {
+        let files = SessionFiles::of(&self.0.opts.run_dir, id);
         self.end_devin_files(id, files, person).await;
     }
 

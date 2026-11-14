@@ -560,7 +560,10 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
 }
 
 /// The agents' instructions [`crate::boss_ask::RUNS_LATER`] names: what a
-/// session's work edits in its own folder, never its settings.
+/// session's work edits in its own folder, never its settings. A boss
+/// judging its own session's change sees the change whole, so editing them
+/// stays its to allow here; a remote boss's ask ([`crate::boss_ask`]) is
+/// read from afar, so there they stay Desk's.
 const INSTRUCTIONS: [&str; 4] = ["claude.md", "claude.local.md", "agents.md", "gemini.md"];
 
 /// Whether `name` (folded), with the one after it, is a part of a path

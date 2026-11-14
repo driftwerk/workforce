@@ -353,6 +353,72 @@ async fn the_devin_folders_devins_sessions_find_are_withheld_from_every_boss() {
     .await;
 }
 
+/// A run keeps the folders and config of the environment it launched
+/// with, though another start changed the current one before Desk said it
+/// launched: what it saved is written back to its own config.
+#[tokio::test]
+async fn a_devin_run_writes_back_to_the_config_it_launched_with() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let o = options(dir.path());
+        let run_dir = o.run_dir.clone();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let mine = |name: &str| {
+            let base = real.join(name);
+            let file = base.join("devin/config.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "{\"agent\": {\"model\": \"swe-1-6\"}}\n").unwrap();
+            (base, file)
+        };
+        let (a, a_file) = mine("a");
+        let (b, b_file) = mine("b");
+        let env_of = |base: &Path| {
+            BTreeMap::from([("XDG_CONFIG_HOME".to_string(), base.display().to_string())])
+        };
+        // Launched on A's environment: its files written from A's config.
+        d.0.state.lock().session_env = env_of(&a);
+        let launch = d.devin_env();
+        let id = Uuid::new_v4();
+        let files = crate::devin::SessionFiles::of(&run_dir, id);
+        let person = devin_config::Person::read(devin_config::person_path(&launch).as_deref());
+        files
+            .write(&run_dir, "http://127.0.0.1:1/hook", 30, false, &person)
+            .unwrap();
+        // Another start makes B's current before this one says it launched.
+        d.0.state.lock().session_env = env_of(&b);
+        d.devin_launched_with(id, Utc::now(), &launch);
+        let run = d.0.state.lock().devin_runs[&id].clone();
+        assert_eq!(run.config, Some(a_file.clone()));
+        assert!(run.folders.contains(&a.join("devin")), "{:?}", run.folders);
+        assert!(!run.folders.contains(&b.join("devin")), "{:?}", run.folders);
+        // What Devin saved in it lands in A's config, not B's.
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&files.config).unwrap()).unwrap();
+        saved["agent"]["model"] = serde_json::json!("swe-1-6-fast");
+        std::fs::write(&files.config, serde_json::to_vec(&saved).unwrap()).unwrap();
+        d.devin_ended(id).await;
+        let model = |f: &Path| {
+            let v: serde_json::Value =
+                devin_config::parse(&std::fs::read_to_string(f).unwrap()).unwrap();
+            v["agent"]["model"].as_str().unwrap().to_string()
+        };
+        assert_eq!(model(&a_file), "swe-1-6-fast");
+        assert_eq!(model(&b_file), "swe-1-6");
+        assert!(!files.config.exists());
+    })
+    .await;
+}
+
 /// A Desk on the fake `devin`, the person's config at `home`, and a
 /// Devin session it started in `work`, its first turn over.
 async fn devin_desk(
