@@ -1082,6 +1082,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/desk-knows-tokens", post(crate::desk_knows::routes::mint))
         .route("/api/me/desk-knows-tokens/engines", get(crate::desk_knows::routes::engines))
         .route("/api/me/desk-knows-tokens/{id}", axum::routing::delete(crate::desk_knows::routes::revoke))
+        .route("/api/me/desk-knows-tokens/engines/{engine}", axum::routing::delete(crate::desk_knows::routes::revoke_engine))
+        .route("/api/desk-knows/revoke", post(crate::desk_knows::routes::revoke_self))
         .route(
             "/api/desk-knows/push",
             post(crate::desk_knows::routes::push).layer(axum::extract::DefaultBodyLimit::max(
