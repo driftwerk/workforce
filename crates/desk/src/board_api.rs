@@ -179,6 +179,27 @@ async fn assign(
 }
 
 #[derive(Deserialize)]
+struct StartTextQuery {
+    machine: String,
+    token: Option<String>,
+}
+
+/// What a session Desk starts on `machine` for the ticket is named and told.
+async fn start_text(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<StartTextQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .ticket_start_text(id, &q.machine)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct LeftFilter {
     keep: bool,
 }
@@ -275,6 +296,7 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             put(add_need).delete(remove_need),
         )
         .route("/api/desk/tickets/{id}/assign", post(assign))
+        .route("/api/desk/tickets/{id}/start-text", get(start_text))
         .route("/api/desk/tickets/{id}/left-filter", post(left_filter))
         .route("/api/desk/tickets/{id}/history", get(ticket_history))
         .route("/api/desk/history", get(history))

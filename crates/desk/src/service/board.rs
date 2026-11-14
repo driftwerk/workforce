@@ -109,14 +109,17 @@ pub struct Move {
     pub after: Option<Uuid>,
 }
 
-/// Whom a ticket is assigned to: `{ "session": id }`, `{ "agent": id }`
-/// or `{ "newSession": { "path", "engine" } }`.
+/// Whom a ticket is assigned to: `{ "session": id }`, `{ "agent": id }`,
+/// `{ "newSession": { "path", "engine", "model"? } }`, or
+/// `{ "machineSession": { "machine", "id", "name" } }`: a session Desk
+/// started on one of the person's machines for the ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AssignTo {
     Session(Uuid),
     Agent(String),
     NewSession(NewSessionFor),
+    MachineSession(MachineSessionFor),
 }
 
 /// A session to start for a ticket.
@@ -124,6 +127,38 @@ pub enum AssignTo {
 pub struct NewSessionFor {
     pub path: String,
     pub engine: Engine,
+    /// The model it runs, as its engine names it; none is the engine's own.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Whether `name` can name a machine: short, no control characters, no `/`,
+/// `:` or space.
+fn machine_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | ':' | ' '))
+}
+
+/// A session the person's Desk started on one of their machines for a
+/// ticket, by its id there.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MachineSessionFor {
+    pub machine: String,
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// What a session started for a ticket on `machine` is given: its name, its
+/// goal, and its first prompt (the ticket, as the board hands it, and that
+/// the board stays on this computer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StartText {
+    pub name: String,
+    pub goal: String,
+    pub prompt: String,
 }
 
 /// The boss a session started for a ticket is in the charge of, and the
@@ -914,7 +949,7 @@ impl Desk {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
-                    model: None,
+                    model: new.model.filter(|m| !m.trim().is_empty()),
                     account: None,
                     env: BTreeMap::new(),
                     group,
@@ -939,7 +974,48 @@ impl Desk {
                 })
             }
             Some(AssignTo::Agent(agent)) => self.assign_agent(t, &key, &agent, by).await,
+            Some(AssignTo::MachineSession(m)) => {
+                if !machine_name_ok(&m.machine)
+                    || m.name.trim().is_empty()
+                    || m.name.chars().count() > 120
+                    || m.name.chars().any(char::is_control)
+                {
+                    return Err(DeskError::Invalid(
+                        "That isn't a session on one of your machines.".into(),
+                    ));
+                }
+                let started = super::plans::Started {
+                    id: m.id,
+                    machine: Some(m.machine),
+                    name: m.name,
+                };
+                self.assign_machine_session(t, &key, &started, by).await
+            }
         }
+    }
+
+    /// What a session started for ticket `id` on `machine` is told: what
+    /// [`Self::assign_ticket`] gives a new session here, and that its board
+    /// is not on `machine`.
+    pub async fn ticket_start_text(&self, id: Uuid, machine: &str) -> Result<StartText, DeskError> {
+        if !machine_name_ok(machine) {
+            return Err(DeskError::Invalid(
+                "That isn't the name of one of your machines.".into(),
+            ));
+        }
+        let t = self.ticket_of(id).await?;
+        let b = self.board_of(t.board).await?;
+        let key = t.key(&b).unwrap_or_else(|| "a ticket".into());
+        let needs = self.need_keys(&t).await?;
+        Ok(StartText {
+            goal: board::goal_of(&key, &t),
+            prompt: format!(
+                "{}\n\n{}",
+                board::handed_text(&key, &t, &needs),
+                super::plans::machine_note(&key, machine)
+            ),
+            name: key,
+        })
     }
 
     /// The ticket `key` names (`ACM-12`).

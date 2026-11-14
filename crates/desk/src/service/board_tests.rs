@@ -460,6 +460,7 @@ async fn a_new_session_is_started_with_the_ticket_as_its_goal_and_prompt() {
                 Some(AssignTo::NewSession(NewSessionFor {
                     path: dir.path().to_string_lossy().into_owned(),
                     engine: Engine::Claude,
+                    model: Some("sonnet".into()),
                 })),
                 &By::you(),
             )
@@ -467,6 +468,7 @@ async fn a_new_session_is_started_with_the_ticket_as_its_goal_and_prompt() {
             .unwrap();
         let s = d.view(v.ticket.session().unwrap()).unwrap();
         assert_eq!(s.name, "ACM-1");
+        assert_eq!(s.model.as_deref(), Some("sonnet"), "the model it was given");
         assert_eq!(
             s.group.map(|g| g.id).as_deref(),
             Some("g-acme"),
@@ -479,6 +481,61 @@ async fn a_new_session_is_started_with_the_ticket_as_its_goal_and_prompt() {
             thread.iter().all(|m| m.kind != LineKind::Tell),
             "its prompt is the ticket"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_machine_session_is_given_the_ticket_and_it_moves_to_doing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: None,
+            })
+            .await
+            .unwrap();
+        let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        assert!(d.ticket_start_text(t.ticket.id, "dev\nbox").await.is_err());
+        let text = d.ticket_start_text(t.ticket.id, "devbox").await.unwrap();
+        assert_eq!(text.name, "ACM-1");
+        assert_eq!(text.goal, "ACM-1 · Fix the login");
+        assert!(text.prompt.starts_with("ACM-1 is yours: Fix the login"));
+        assert!(text.prompt.contains("not on devbox"));
+        let id = Uuid::new_v4();
+        let v = d
+            .assign_ticket(
+                t.ticket.id,
+                Some(AssignTo::MachineSession(MachineSessionFor {
+                    machine: "devbox".into(),
+                    id,
+                    name: "ACM-1".into(),
+                })),
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.ticket.state, TicketState::Doing);
+        assert_eq!(
+            v.ticket.assignee.map(|a| a.id),
+            Some(format!("devbox/{id}"))
+        );
+        // A machine's name has no `/`.
+        let bad = d
+            .assign_ticket(
+                t.ticket.id,
+                Some(AssignTo::MachineSession(MachineSessionFor {
+                    machine: "dev/box".into(),
+                    id,
+                    name: "ACM-1".into(),
+                })),
+                &By::you(),
+            )
+            .await;
+        assert!(matches!(bad, Err(DeskError::Invalid(_))));
     })
     .await;
 }

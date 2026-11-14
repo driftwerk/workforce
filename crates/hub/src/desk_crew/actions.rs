@@ -2007,6 +2007,7 @@ impl CrewHub {
                 let new = AssignTo::NewSession(NewSessionFor {
                     path: folder.clone(),
                     engine,
+                    model: None,
                 });
                 d.assign_ticket_for(id, Some(new), &by, Some(&charged))
                     .await
