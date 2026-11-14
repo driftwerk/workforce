@@ -20,6 +20,11 @@
 //! 7. what it may see ([`workforce_desk::sees`]), every string redacted
 //!    whole and capped.
 //!
+//! At Act fully in force ([`CrewHub::served_full`]) what its sessions ask
+//! doesn't come here: each request is decided by the boss's own decision
+//! call, made on its hub ([`super::remote_decide`]), and `crew.approve` is
+//! refused here.
+//!
 //! The boss here is a value the grant gives, `<hub>/<agent>`, never looked
 //! up by its scope or as one of this hub's agents, so a local overseer of
 //! the same group is never taken for it, nor it for one.
@@ -169,10 +174,20 @@ fn refused(why: impl Into<String>) -> (ServedStatus, Value) {
     (ServedStatus::Refused, json!({ "error": why.into() }))
 }
 
+/// The daily budget `act` gives (`budget_usd_per_day`), in cents: an
+/// amount in dollars above 0 and up to Act fully's most; none for anything
+/// else.
+pub fn budget_of(act: &Value) -> Option<u64> {
+    let usd = act.get("budget_usd_per_day")?.as_f64()?;
+    (usd.is_finite() && usd > 0.0 && usd <= workforce_common::oversight::MAX_FULL_BUDGET_USD)
+        .then(|| ((usd * 100.0).round() as u64).max(1))
+}
+
 /// The oversight a grant gives its boss, and nothing else: its level, its
 /// act switches (each one off unless the grant turns it on), sessions only
-/// as handed or started, Act fully's repositories with no budget (so Act
-/// fully isn't in force until leases give one, RB8). There is no field that
+/// as handed or started, Act fully's repositories, and the daily budget it
+/// gives ([`budget_of`]): with none, Act fully isn't in force for its boss
+/// ([`super::fully_for`]). There is no field that
 /// widens it beyond the grant's group: never Ungrouped for a boss on
 /// another hub, never anywhere.
 pub fn served_oversight(g: &Grant) -> Oversight {
@@ -213,7 +228,9 @@ pub fn served_oversight(g: &Grant) -> Oversight {
         },
         full: Full {
             repos: g.repos.clone(),
-            budget_cents_per_day: None,
+            // Act fully is in force only with a daily budget the grant
+            // gives ([`super::fully_for`]).
+            budget_cents_per_day: budget_of(&g.act),
             workflows: Vec::new(),
             // Never anywhere: a served boss ships only where it is granted.
             anywhere: false,
@@ -398,6 +415,15 @@ impl CrewHub {
                 "{} already has a boss here, so no other is served for it.",
                 grant.name
             ));
+        }
+        // At Act fully each request of its sessions is decided by its own
+        // decision call, at once ([`super::decide`]): not allowed besides
+        // from one of its turns, where Desk wouldn't judge it either.
+        if tool == "crew.approve" && self.desk.boss_unbound(&boss) {
+            return refused(
+                "At Act fully each request is decided by your decision call the moment it is \
+                 asked, so it isn't approved from here.",
+            );
         }
         let result = if SERVED_READ.contains(&tool) {
             self.served_read(tool, &call.input, &grant, &boss)
@@ -606,6 +632,11 @@ impl CrewHub {
             if !p.answerable || p.request.is_none() || c.wheel != Wheel::Boss {
                 continue;
             }
+            // At Act fully its own decision call has it ([`super::decide`]):
+            // no turn of the boss is woken for it as well.
+            if self.desk.boss_unbound(&party) {
+                continue;
+            }
             offered.insert(
                 given,
                 Offered {
@@ -645,6 +676,113 @@ impl CrewHub {
         }
         offered.retain(|(id, _), _| open.contains(id));
         owed
+    }
+
+    /// Where `boss`, a boss on another hub served from a grant here
+    /// (`<hub>/<agent>`), acts fully now, judged afresh each time it is
+    /// asked from its live grants as they are then: only while every grant
+    /// that names it serves it ([`Self::serves_remote`]), shows it what its
+    /// sessions ask and their replies (Sees: replies or everything), and
+    /// puts it at Act fully in force, by the one check every boss goes
+    /// through ([`Self::unbound_given`]: the level, and a daily budget not
+    /// spent). Otherwise none: it acts within Desk.
+    ///
+    /// Unbound, each request of a session it runs is its to decide, by one
+    /// decision call on its own hub ([`super::remote_decide`]); nothing is
+    /// allowed for it by default. It names no repository or workflow to
+    /// ship in, so Desk judges nothing safe on its account that it wouldn't
+    /// for any served boss: the rest is asked, and decided.
+    ///
+    /// A boss relayed from the home (the home's own boss of a machine's
+    /// sessions) is never unbound here: its decisions have no way back to
+    /// its hub yet.
+    pub(crate) fn served_full(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
+        if !grant::is_served(boss) {
+            return None;
+        }
+        let mut any = false;
+        for (g, not_live) in self.desk.grants_bossed() {
+            let Some(b) = g.boss.as_ref().filter(|b| b.party_id() == boss) else {
+                continue;
+            };
+            if not_live.is_some() {
+                continue;
+            }
+            let o = served_oversight(&g);
+            if !self.serves_remote(&g, b)
+                || !sees::shows(g.sees, Part::Question)
+                || !sees::shows(g.sees, Part::Reply)
+                || !self.unbound_given(boss, &o)
+            {
+                return None;
+            }
+            any = true;
+        }
+        any.then(|| workforce_desk::charge::FullGrant {
+            repos: Vec::new(),
+            workflows: Vec::new(),
+            anywhere: false,
+            unbound: true,
+        })
+    }
+
+    /// The live grant here that serves `boss` (`<hub>/<agent>`) and holds
+    /// session `id`: what a decision of its on `id` is judged by.
+    pub(crate) fn served_grant_of(&self, boss: &str, id: Uuid) -> Option<Grant> {
+        self.desk
+            .grants_bossed()
+            .into_iter()
+            .filter(|(_, not_live)| not_live.is_none())
+            .map(|(g, _)| g)
+            .find(|g| {
+                g.boss
+                    .as_ref()
+                    .is_some_and(|b| b.party_id() == boss && self.serves_remote(g, b))
+                    && self.in_grant(g, id)
+            })
+    }
+
+    /// Reads the real money the sessions of `boss`'s live grants at Act
+    /// fully with a budget spent today here (calls a key paid for, never
+    /// the person's plans), for [`Self::fully`]: one that can't be read
+    /// leaves none, so Act fully waits.
+    pub(crate) async fn read_served_spent(&self, boss: &str) {
+        let now = chrono::Utc::now();
+        let midnight = self
+            .desk
+            .period_start(workforce_desk::ledger::Period::Day, now);
+        let mut total = 0.0;
+        let mut any = false;
+        for (g, not_live) in self.desk.grants_bossed() {
+            if not_live.is_some() || g.boss.as_ref().map(BossRef::party_id).as_deref() != Some(boss)
+            {
+                continue;
+            }
+            let o = served_oversight(&g);
+            if o.level != Level::Full || o.full.budget_cents_per_day.is_none() {
+                continue;
+            }
+            let filter = workforce_desk::ledger_store::Filter {
+                seen: Some(self.desk.seen_by(&o.scope)),
+                ..Default::default()
+            };
+            match self.desk.billed_usd(midnight, now, &filter).await {
+                Ok(usd) => {
+                    total += usd;
+                    any = true;
+                }
+                Err(e) => {
+                    tracing::warn!(%boss, error = %e, "couldn't read a served boss's spend today; Act fully waits until it can");
+                    self.spent_today.lock().remove(boss);
+                    return;
+                }
+            }
+        }
+        let mut today = self.spent_today.lock();
+        match any {
+            true => today.insert(boss.to_string(), total),
+            false => today.remove(boss),
+        };
     }
 
     /// Whether `id` is one of this engine's sessions in `g`.
@@ -1013,7 +1151,7 @@ impl CrewHub {
 }
 
 /// What a served boss is called here: its agent, of its hub.
-fn boss_name(g: &Grant) -> String {
+pub(crate) fn boss_name(g: &Grant) -> String {
     match &g.boss {
         Some(BossRef::Remote { hub, agent }) => format!("{agent} ({hub})"),
         Some(BossRef::Local { agent }) => agent.clone(),

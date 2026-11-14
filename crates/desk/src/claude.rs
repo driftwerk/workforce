@@ -683,6 +683,15 @@ pub fn deny_call(reason: &str) -> Value {
         "permissionDecisionReason": reason } })
 }
 
+/// A tool call asked before it runs, with why: Claude raises its own
+/// permission request for it, which Desk is asked (hooks reference,
+/// PreToolUse decision control, `ask`).
+pub fn ask_call(reason: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason } })
+}
+
 /// Words Claude reads beside a tool call's result, in its running turn
 /// (hooks reference, "Add context for Claude": `additionalContext` on
 /// PostToolUse and PostToolUseFailure).

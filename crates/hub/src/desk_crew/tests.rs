@@ -1835,7 +1835,9 @@ mod updates;
 mod away;
 
 mod remote_asks;
+mod remote_decide;
 mod served;
+mod served_unbound;
 mod unbound;
 
 mod uplink_client;

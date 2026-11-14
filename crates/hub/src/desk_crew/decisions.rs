@@ -190,12 +190,23 @@ fn why_of(by: &By) -> String {
 
 impl CrewHub {
     /// The boss a decision by `by` is recorded for: a boss overseeing
-    /// here. The person (saying yes to a suggestion), Desk, and a remote
-    /// boss acting on this machine's sessions through its grant record none
-    /// here: their decisions are kept where they are made.
+    /// here, or a boss on another hub served from a grant while it is at
+    /// Act fully in force here, whose every decision on this engine's
+    /// sessions is then kept here, with its reason and Undo. The person
+    /// (saying yes to a suggestion), Desk, and a served boss short of Act
+    /// fully record none here: theirs are kept where they are made.
     pub(crate) fn deciding_boss(&self, by: &By) -> Option<String> {
-        (by.party.kind == PartyKind::Manager && self.overseer_named(&by.party.id).is_some())
-            .then(|| by.party.id.clone())
+        if by.party.kind != PartyKind::Manager {
+            return None;
+        }
+        let id = &by.party.id;
+        let here = match workforce_desk::grant::is_served(id) {
+            // Its decision from the decide loop, judged just before it was
+            // done, is recorded whatever its grant reads as now.
+            true => self.is_deciding(id) || self.served_full(id).is_some_and(|f| f.unbound),
+            false => self.overseer_named(id).is_some(),
+        };
+        here.then(|| id.clone())
     }
 
     /// How many decisions `boss` has recorded about `session` (and about no
@@ -342,6 +353,15 @@ impl CrewHub {
                 ..
             } => format!("Sent {} a message.", self.name_of_session(*s)),
             _ => said_short(said).to_string(),
+        };
+        // A boss on another hub is named with its hub, in the lines the
+        // person reads.
+        let (what, brief) = match boss.split_once('/') {
+            Some((hub, agent)) => (
+                format!("{what} (by {agent} on {hub})"),
+                format!("{} (by {agent} on {hub})", brief.trim_end_matches('.')),
+            ),
+            None => (what, brief),
         };
         // One made by a preference says so (its why already cites it).
         let how = match by.preference {

@@ -1050,7 +1050,9 @@ impl Desk {
         let kind = change.unwrap_or(Change::Minor);
         let person = by.party.kind == PartyKind::You;
         // An unbound boss's change applies as the person's would.
-        let unbound = by.party.kind == PartyKind::Manager && self.full_of(&by.party.id).unbound;
+        let unbound = by.party.kind == PartyKind::Manager
+            && !crate::grant::is_served(&by.party.id)
+            && self.full_of(&by.party.id).unbound;
         let waits =
             p.approved_revision.is_some() && !person && !unbound && (asks || kind == Change::Scope);
         let n = p.revision + 1;
@@ -1115,7 +1117,9 @@ impl Desk {
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
         // An unbound boss approves its own plans: the person let it.
-        let unbound = by.party.kind == PartyKind::Manager && self.full_of(&by.party.id).unbound;
+        let unbound = by.party.kind == PartyKind::Manager
+            && !crate::grant::is_served(&by.party.id)
+            && self.full_of(&by.party.id).unbound;
         if by.party.kind != PartyKind::You && !unbound {
             return Err(DeskError::Invalid(
                 "Only the person approves a plan.".into(),

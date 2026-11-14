@@ -581,6 +581,7 @@ impl Desk {
             (_, Some(id)) => id,
         };
         let ending = matches!(hook, Hook::SessionEnd);
+        self.mode_said(id, &hook, body);
         let answer = self.apply_hook(id, hook, claude::agent_of(body)).await;
         if ending {
             self.end_terminal_session(id, true);

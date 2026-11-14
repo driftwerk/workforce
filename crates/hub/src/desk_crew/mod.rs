@@ -8,7 +8,7 @@
 //! The activity log and the overview live in `workforce-desk`; this is the
 //! [`Crew`] the desk asks about agents, the overseer and suggestions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
@@ -48,6 +48,7 @@ mod read_only;
 mod reading;
 pub(crate) mod relay;
 pub(crate) mod remote_asks;
+pub(crate) mod remote_decide;
 mod scope;
 pub(crate) mod served;
 mod spend;
@@ -129,6 +130,11 @@ pub struct CrewHub {
     /// How many uplinks carry each remote boss's links now, by its
     /// `<hub>/<agent>`.
     remote_up: Mutex<HashMap<String, usize>>,
+    /// Where each remote boss's decisions at Act fully go up to its own
+    /// hub, by its `<hub>/<agent>` and group ([`remote_decide`]).
+    deciders: remote_decide::Deciders,
+    /// Decisions of bosses being done from the decide loop, by boss.
+    served_deciding: Mutex<HashMap<String, usize>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -520,6 +526,21 @@ pub(crate) fn counted_from(
     cleared_today(midnight, now, full).unwrap_or(midnight)
 }
 
+/// Desk's judge of where a boss served from a grant acts fully
+/// ([`CrewHub::served_full`]).
+struct ServedJudge(Weak<CrewHub>);
+
+impl workforce_desk::charge::ServedFull for ServedJudge {
+    fn full_of(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
+        self.0.upgrade()?.served_full(boss)
+    }
+    fn holds(&self, boss: &str, session: uuid::Uuid) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|c| c.served_grant_of(boss, session).is_some())
+    }
+}
+
 /// When the person cleared today's count, as it counts: today's, and
 /// never after `now`.
 fn cleared_today(
@@ -557,6 +578,8 @@ impl CrewHub {
             wake_hop: Mutex::default(),
             unbossed: Mutex::default(),
             remote_up: Mutex::default(),
+            deciders: Mutex::default(),
+            served_deciding: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
@@ -602,6 +625,10 @@ impl CrewHub {
         crew.overseers();
         crew.desk
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
+        // Desk asks the crew, each time, where a boss served from a grant
+        // acts fully: from its grant as it is then.
+        crew.desk
+            .served_full_with(Arc::new(ServedJudge(Arc::downgrade(&crew))));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
@@ -916,8 +943,24 @@ impl CrewHub {
                 );
             }
         }
-        *self.spent_today.lock() = spent;
+        // Each boss served from a grant here is read too: a budget spent
+        // holds between its decisions, as a local boss's does.
+        let served: HashSet<String> = self
+            .desk
+            .grants_bossed()
+            .into_iter()
+            .filter(|(_, not_live)| not_live.is_none())
+            .filter_map(|(g, _)| g.boss.map(|b| b.party_id()))
+            .collect();
+        {
+            let mut today = self.spent_today.lock();
+            today.retain(|agent, _| served.contains(agent));
+            today.extend(spent);
+        }
         self.desk.set_full_budgets(shown);
+        for boss in served {
+            self.read_served_spent(&boss).await;
+        }
     }
 
     /// What the hub billed as metered to the agents `overseer`'s scope

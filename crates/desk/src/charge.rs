@@ -252,6 +252,16 @@ pub struct FullGrant {
     pub unbound: bool,
 }
 
+/// Where a boss served from a grant (`<hub>/<agent>`) acts fully now, as
+/// the hub judges it each time it is asked, from that boss's grant here as
+/// it is then: none when it doesn't. Never kept, so a grant turned down
+/// holds at the next thing asked.
+pub trait ServedFull: Send + Sync {
+    fn full_of(&self, boss: &str) -> Option<FullGrant>;
+    /// Whether a live grant serving `boss` holds session `session` now.
+    fn holds(&self, boss: &str, session: uuid::Uuid) -> bool;
+}
+
 /// A repository as a remote's address names it: its host, when said, and
 /// its `owner/name`, lowercased, without `.git`.
 #[derive(Debug, Clone, PartialEq, Eq)]
