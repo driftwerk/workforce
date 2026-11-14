@@ -359,7 +359,9 @@ impl CrewHub {
             // Homes not heard from within FRESH: forgotten.
             out.homes.retain(|_, h| h.at.elapsed() < FRESH);
             // A take the Mac sent before one already heard (held up on its
-            // way, or while its spend was read) says nothing of now.
+            // way, or while its spend was read) says nothing of now. A Mac
+            // clock that jumps back makes its takes look late for as long:
+            // Act fully there lapses within FRESH, which fails safe.
             let latest = out.latest.get(&key).copied();
             let stale = sent_at.is_some_and(|at| latest.is_some_and(|l| at < l));
             // Only a take sent lately counts as the latest: one from the future

@@ -330,7 +330,11 @@ async fn upsert_agent_config(ctx: &TransferContext<'_>, config: AgentConfig) -> 
         ctx.def_store,
         ctx.lock_manager,
     )
-    .await
+    .await?;
+    // An imported agent is a new making of its id: nothing said for the
+    // one it replaces holds for it.
+    crate::agent_generation::forget(&ctx.data_dir, config.id.as_str());
+    Ok(())
 }
 
 fn config_to_table(config: &AgentConfig) -> Result<toml::Table> {

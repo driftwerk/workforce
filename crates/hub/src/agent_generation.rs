@@ -10,14 +10,18 @@ use std::path::{Path, PathBuf};
 const FOLDER: &str = "agent-generations";
 
 fn path_of(data_dir: &Path, agent: &str) -> Option<PathBuf> {
+    // A relative data folder (`./data`) is the hub's own, from where it runs.
+    let data_dir = match data_dir.is_absolute() {
+        true => data_dir.to_path_buf(),
+        false => std::fs::canonicalize(data_dir).ok()?,
+    };
     let ok = !agent.is_empty()
         && agent.len() <= 100
         && agent
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         && !agent.starts_with('.');
-    // Never a folder the hub wasn't told of.
-    (ok && data_dir.is_absolute()).then(|| data_dir.join(FOLDER).join(agent))
+    ok.then(|| data_dir.join(FOLDER).join(agent))
 }
 
 /// This making of `agent`: the id kept for it, made now if there is none.
