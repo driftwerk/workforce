@@ -23,7 +23,7 @@ use crate::definition::{SkillDefinition, SkillRequirements};
 pub use address::{host_of, keep_off_ports, origin_of};
 pub use client::{
     close, forget_decision, live, location, page_state, show, sign_in_ended, stop_session,
-    tab_closed, turn_ended, BrowserClient, Live, Which, MAX_UPLOAD_BYTES,
+    tab_closed, turn_ended, BrowserClient, Live, TabAt, Which, MAX_UPLOAD_BYTES,
 };
 pub use config::BrowserSkillConfig;
 pub use extension::{install_link, ExtensionLink, NOT_CONNECTED, NO_BROWSER};

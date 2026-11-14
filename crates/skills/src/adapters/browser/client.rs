@@ -126,10 +126,18 @@ pub async fn show(agent: &str) -> bool {
     false
 }
 
+/// Where an agent's tab is: its address, and whether the page asks for a
+/// password (a sign-in, or a site's check that it's still the person).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabAt {
+    pub url: String,
+    pub password: bool,
+}
+
 /// The address `agent`'s tab for `user` is on now, as Chrome has it: what
 /// a connection setup waiting on the person to sign in watches. Nothing on
 /// the page is read. `None` when it has no tab open.
-pub async fn location(agent: &str, user: &str) -> Option<String> {
+pub async fn location(agent: &str, user: &str) -> Option<TabAt> {
     let mut open: Vec<Arc<ExtensionCell>> = Vec::new();
     for client in clients() {
         let cells = client.cells.lock().await;
@@ -142,8 +150,8 @@ pub async fn location(agent: &str, user: &str) -> Option<String> {
     }
     open.sort_by_key(|c| c.last_used.lock().unwrap().elapsed());
     for cell in open {
-        if let Some(url) = cell.location().await {
-            return Some(url);
+        if let Some(at) = cell.location().await {
+            return Some(at);
         }
     }
     None

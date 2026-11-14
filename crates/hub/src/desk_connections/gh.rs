@@ -9,7 +9,7 @@
 //! is logged. Tokens in the hub's environment are never used: only the
 //! sign-in `gh` keeps.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -39,14 +39,16 @@ impl GhCli {
     /// `gh` from the hub's `PATH`, else where Homebrew and the installers
     /// put it: a hub started from the Dock has no shell `PATH`.
     pub fn live() -> Self {
+        // Whole paths only: never one relative to where the hub runs.
         let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect())
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .filter(|d| d.is_absolute())
+                    .collect()
+            })
             .unwrap_or_default();
         for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
             dirs.push(PathBuf::from(d));
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(Path::new(&home).join(".local/bin"));
         }
         let name = if cfg!(windows) { "gh.exe" } else { "gh" };
         Self {

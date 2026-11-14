@@ -399,14 +399,18 @@ impl ExtensionCell {
 
     /// The address this tab is on now, as Chrome has it, if it is open:
     /// nothing on the page is read.
-    pub(super) async fn location(&self) -> Option<String> {
+    pub(super) async fn location(&self) -> Option<super::client::TabAt> {
         if !*self.open.lock().unwrap() {
             return None;
         }
-        let at = self.ask("where", json!({})).await.ok()?;
+        let at = self.ask("where", json!({ "password": true })).await.ok()?;
         let url = at["url"].as_str()?.to_string();
         untrusted::on(&self.key, &url);
-        Some(url)
+        Some(super::client::TabAt {
+            url,
+            // An extension before it says nothing of it: none asked.
+            password: at["password"].as_bool().unwrap_or(false),
+        })
     }
 
     pub(super) async fn close(&self) -> bool {

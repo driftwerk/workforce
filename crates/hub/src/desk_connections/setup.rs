@@ -67,6 +67,7 @@ use workforce_common::secret::Secret;
 use workforce_core::computer::Effect;
 use workforce_desk::connections::Level;
 use workforce_skills::adapters::browser::keys as browser_keys;
+pub use workforce_skills::adapters::browser::TabAt;
 
 use super::catalog::{self, Connector};
 use super::check::Found;
@@ -189,8 +190,8 @@ pub enum Ended {
 /// Where the agent's tab is, for a setup waiting on the person to sign in.
 #[async_trait]
 pub trait Tabs: Send + Sync {
-    /// The address `agent`'s tab for `person` is on now, if it has one.
-    async fn location(&self, agent: &str, person: &str) -> Option<String>;
+    /// Where `agent`'s tab for `person` is now, if it has one.
+    async fn location(&self, agent: &str, person: &str) -> Option<TabAt>;
     /// Brings `agent`'s tab to the front of the person's Chrome.
     async fn show(&self, agent: &str) -> bool;
 }
@@ -200,7 +201,7 @@ struct LiveTabs;
 
 #[async_trait]
 impl Tabs for LiveTabs {
-    async fn location(&self, agent: &str, person: &str) -> Option<String> {
+    async fn location(&self, agent: &str, person: &str) -> Option<TabAt> {
         workforce_skills::adapters::browser::location(agent, person).await
     }
     async fn show(&self, agent: &str) -> bool {
@@ -548,7 +549,12 @@ impl Setup {
         if self.ended.is_some() {
             return now(NowKind::Ended, format!("This {service} setup was replaced"));
         }
-        if let Some(c) = &self.connected {
+        let failed = self.steps.iter().find(|s| s.state == StepState::Failed);
+        if let Some(c) = self
+            .connected
+            .as_ref()
+            .filter(|c| c.on_for.is_some() || failed.is_none())
+        {
             return match &c.on_for {
                 Some(on_for) => Now {
                     detail: Some(format!(
@@ -569,11 +575,22 @@ impl Setup {
                 ),
             };
         }
-        if let Some(failed) = self.steps.iter().find(|s| s.state == StepState::Failed) {
+        if let Some(failed) = failed {
             let said = failed
                 .note
                 .clone()
                 .unwrap_or_else(|| "It didn't work.".into());
+            if self.connected.is_some() {
+                // Kept, but not turned on.
+                return Now {
+                    detail: Some(format!(
+                        "{said} It's kept: turn it on for {} in Connections.",
+                        self.whose
+                    )),
+                    action: Some("retry"),
+                    ..now(NowKind::Failed, format!("{service} isn't on yet"))
+                };
+            }
             let action = match self.way {
                 Way::Device => "new_code",
                 Way::Cli => "other_way",
@@ -932,7 +949,11 @@ impl Setups {
             setups.retain(|_, s| s.until > now);
             setups
                 .values()
-                .filter(|s| s.person == caller.person && s.ended.is_none())
+                .filter(|s| {
+                    s.person == caller.person
+                        && s.ended.is_none()
+                        && !s.steps.iter().any(|x| x.state == StepState::Failed)
+                })
                 .count()
                 >= MAX_SETUPS
         };
@@ -1004,7 +1025,11 @@ impl Setups {
             setups.retain(|_, s| s.until > now);
             if setups
                 .values()
-                .filter(|s| s.person == caller.person && s.ended.is_none())
+                .filter(|s| {
+                    s.person == caller.person
+                        && s.ended.is_none()
+                        && !s.steps.iter().any(|x| x.state == StepState::Failed)
+                })
                 .count()
                 >= MAX_SETUPS
             {
@@ -1043,12 +1068,20 @@ impl Setups {
                 && s.ended.is_none()
         }) {
             s.sync(&self.connections);
-            let settled = s.connected.as_ref().is_some_and(|c| c.on_for.is_some())
-                || s.steps.iter().any(|x| x.state == StepState::Failed);
-            if settled {
+            if s.connected.as_ref().is_some_and(|c| c.on_for.is_some()) {
                 continue;
             }
-            if same.is_none() && s.name == name && &s.for_agent == for_agent && s.write == write {
+            let failed = s.steps.iter().any(|x| x.state == StepState::Failed);
+            let alike = s.name == name && &s.for_agent == for_agent && s.write == write;
+            // One Desk is checking and turning on is left to finish.
+            if s.finishing && !failed {
+                if same.is_none() && alike {
+                    same = Some(s.view());
+                }
+                continue;
+            }
+            // A failed one is replaced too, so its card goes.
+            if same.is_none() && alike && !failed {
                 s.asked_at = Utc::now();
                 same = Some(s.view());
                 continue;
@@ -1078,11 +1111,25 @@ impl Setups {
             self.connections.cancel(&caller.person, &old);
         }
         let c = catalog::find("github").expect("in the catalog");
-        let started = self
+        let started = match self
             .connections
             .begin_github(&caller.person, c, level, Some(key), Some(name))
             .await
-            .map_err(refused)?;
+        {
+            Ok(started) => started,
+            Err(e) => {
+                let e = refused(e);
+                let note: String = e.chars().take(200).collect();
+                self.with(caller, id, |s| {
+                    s.flow = None;
+                    s.flow_state = None;
+                    s.device = None;
+                    s.mark("check", StepState::Failed, Some(note));
+                    Ok(())
+                })?;
+                return Err(e);
+            }
+        };
         let flow = started.flow.clone();
         self.with(caller, id, |s| {
             s.flow = Some(started.flow.clone());
@@ -1160,6 +1207,7 @@ impl Setups {
         {
             let note: String = e.chars().take(200).collect();
             let _ = self.with(caller, id, |s| {
+                s.finishing = false;
                 s.mark("check", StepState::Failed, Some(note));
                 Ok(())
             });
@@ -1360,7 +1408,7 @@ impl Setups {
                 let open = (recipe(recipe_of).and_then(|r| (r.page)(&BTreeMap::new())))
                     .unwrap_or_else(|| "the service's key page".into());
                 match (page, at) {
-                    (Some(page), Some(url)) => {
+                    (Some(page), Some(TabAt { url, password })) => {
                         let parsed = url::Url::parse(&url).ok();
                         let origin = parsed.as_ref().and_then(|u| {
                             workforce_skills::adapters::browser::origin_of(u.as_str())
@@ -1369,7 +1417,12 @@ impl Setups {
                             .as_ref()
                             .map(|u| u.path().to_string())
                             .unwrap_or_default();
-                        if origin.as_deref() == Some(page.origin.as_str()) && page.holds(&path) {
+                        // GitHub asks for the password again on the key
+                        // page itself: that is the person's to do.
+                        if origin.as_deref() == Some(page.origin.as_str())
+                            && page.holds(&path)
+                            && !password
+                        {
                             self.with(caller, id, |s| {
                                 for step in ["where", "page", "sign_in"] {
                                     if s.steps
@@ -1392,10 +1445,13 @@ impl Setups {
                             if !waiting {
                                 self.with(caller, id, |s| {
                                     // Before the site is known, or once the
-                                    // person said they're in: not asked again.
+                                    // person said they're in (but for a
+                                    // password asked again): not asked again.
                                     if s.steps.iter().any(|x| {
                                         (x.id == "where" && x.state != StepState::Done)
-                                            || (x.id == "sign_in" && x.state == StepState::Done)
+                                            || (x.id == "sign_in"
+                                                && x.state == StepState::Done
+                                                && !password)
                                     }) {
                                         return Ok(());
                                     }
@@ -1451,6 +1507,7 @@ impl Setups {
                     && s.ended.is_none()
                     && s.connected.is_none()
                     && s.until > Instant::now()
+                    && !s.steps.iter().any(|x| x.state == StepState::Failed)
             })
             .find(|s| match s.way {
                 Way::Browser => recipe(s.service)
@@ -1797,21 +1854,47 @@ impl Setups {
     /// Checks what the setup holds and, on a pass, keeps it at its tier.
     pub async fn test(&self, caller: &Caller, id: &str) -> Result<SetupView, String> {
         self.check_caller(caller)?;
-        let (service, level, key, name, fields, flow, read_at) = self.with(caller, id, |s| {
-            let mut fields: BTreeMap<String, String> = s.fields.clone();
-            for (k, v) in &s.secrets {
-                fields.insert(k.clone(), v.expose_secret().clone());
-            }
-            Ok((
-                s.service,
-                s.level.clone(),
-                s.key.clone(),
-                s.name.clone(),
-                fields,
-                s.flow.clone(),
-                s.read_at.clone(),
-            ))
-        })?;
+        let (service, level, key, name, fields, flow, read_at, way) =
+            self.with(caller, id, |s| {
+                let mut fields: BTreeMap<String, String> = s.fields.clone();
+                for (k, v) in &s.secrets {
+                    fields.insert(k.clone(), v.expose_secret().clone());
+                }
+                Ok((
+                    s.service,
+                    s.level.clone(),
+                    s.key.clone(),
+                    s.name.clone(),
+                    fields,
+                    s.flow.clone(),
+                    s.read_at.clone(),
+                    s.way,
+                ))
+            })?;
+        // A token the agent made for GitHub is a fine-grained one, made on
+        // the page Desk filled in; a classic one could carry any scope.
+        if service == "github"
+            && way == Way::Browser
+            && flow.is_none()
+            && fields
+                .get("token")
+                .is_some_and(|t| !t.trim().starts_with("github_pat_"))
+        {
+            self.with(caller, id, |s| {
+                s.secrets.clear();
+                s.read_at = None;
+                s.mark(
+                    "check",
+                    StepState::Failed,
+                    Some(
+                        "The token wasn't a fine-grained one made on the page Desk filled in."
+                            .into(),
+                    ),
+                );
+                Ok(())
+            })?;
+            return Err("Nothing was kept: make a fine-grained token on the page Desk opened, never a classic one.".into());
+        }
         // Where the key goes: the site kept for it, checked again, and
         // Metabase's only where its key was read.
         if flow.is_none() {
@@ -2667,10 +2750,11 @@ impl Tool for SetupTool {
         }
     }
 
-    /// Listing, and marking a card's step, touch nothing, nor does starting
-    /// a setup (but GitHub's, which starts its sign-in). Keeping a field,
-    /// testing and keeping a key, and turning a connection on are
-    /// connection writes to Desk's gate: Allow once or Deny below unbound.
+    /// Listing, marking a card's step and waiting touch nothing. Starting a
+    /// setup is the one connection write the person is asked about: what
+    /// follows from it (its key kept, the connection turned on once it
+    /// works) is the hub's. Keeping a field, testing and turning on by hand
+    /// are writes to Desk's gate too: Allow once or Deny below unbound.
     /// One whose connection is for all the person's agents or another agent
     /// is `connections:other`, as the setup's own record says, not the call.
     fn effect(&self, input: &Value) -> Effect {
@@ -2858,6 +2942,16 @@ impl Tool for SetupTool {
             }),
             "connections.test" => match need() {
                 Err(e) => Err(e),
+                // Desk is already checking it, or has: not twice.
+                Ok(id)
+                    if setups
+                        .with(&caller, &id, |s| Ok(s.finishing || s.connected.is_some()))
+                        .unwrap_or(false) =>
+                {
+                    Ok(
+                        json!({ "next": "Desk is checking it and turning it on itself: call connections.wait." }),
+                    )
+                }
                 Ok(id) => setups.test(&caller, &id).await.map(|v| {
                     json!({
                         "connected": v.connected.as_ref().map(|c| c.account.clone()),

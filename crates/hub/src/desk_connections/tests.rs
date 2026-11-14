@@ -1886,7 +1886,7 @@ fn an_agents_tools_reach_exactly_its_connections() {
 
 mod setups {
     use super::*;
-    use setup::{Caller, Callers, Ended, NowKind, Setups, StepState, Tabs, Way};
+    use setup::{Caller, Callers, Ended, NowKind, Setups, StepState, TabAt, Tabs, Way};
     use workforce_common::secret::Secret;
 
     struct People;
@@ -2534,8 +2534,11 @@ mod setups {
 
     #[async_trait::async_trait]
     impl Tabs for Tab {
-        async fn location(&self, _agent: &str, _person: &str) -> Option<String> {
-            self.at.lock().unwrap().clone()
+        async fn location(&self, _agent: &str, _person: &str) -> Option<TabAt> {
+            self.at.lock().unwrap().clone().map(|url| TabAt {
+                password: url.contains("#password"),
+                url,
+            })
         }
         async fn show(&self, _agent: &str) -> bool {
             self.shown.fetch_add(1, Ordering::SeqCst);
@@ -2786,6 +2789,15 @@ mod setups {
         assert!(s
             .sign_in_owned(&caller("ben"), "https://linear.app/login")
             .is_none());
+        // The key page asking for the password again is still the
+        // person's sign-in.
+        tab.on("https://linear.app/acme/settings/account/security#password");
+        let said = s
+            .wait(&allan, &started.id, Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(said["waiting"], json!(true), "{said}");
+        card_shows(&s, &started.id, NowKind::SignIn).await;
         tab.on("https://linear.app/acme/settings/account/security");
         let said = s
             .wait(&allan, &started.id, Duration::from_secs(1))
@@ -2894,6 +2906,50 @@ mod setups {
                 .count(),
             1
         );
+    }
+
+    /// A token the agent made for GitHub is a fine-grained one: a classic
+    /// one, which could carry any scope, is kept nowhere.
+    #[tokio::test]
+    async fn a_classic_token_the_agent_made_is_refused() {
+        let mut h = hub().await;
+        Arc::get_mut(&mut h.c).unwrap().github_client_id = None;
+        let s = over(&mut h, None, Arc::new(Tab::default()));
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        assert_eq!(started.way, Way::Browser);
+        let kept = s
+            .keep_key(
+                &allan,
+                "github",
+                None,
+                "https://github.com",
+                "/settings/tokens",
+                Secret::new(GH_GOOD.into()),
+            )
+            .unwrap();
+        s.finish(&allan, &kept.setup).await;
+        let card = card_shows(&s, &started.id, NowKind::Failed).await;
+        assert!(card.now.detail.unwrap().contains("fine-grained"));
+        assert!(keys(&h.allan).is_empty());
+    }
+
+    /// GitHub's sign-in that can't start, after the CLI's was turned down:
+    /// the card says so and offers a new code, never a spinner for good.
+    #[tokio::test]
+    async fn a_github_sign_in_that_cant_start_fails_on_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = hub().await;
+        Arc::get_mut(&mut h.c).unwrap().services.github_web = "http://127.0.0.1:9".into();
+        let s = over(&mut h, Some(fake_gh(dir.path())), Arc::new(Tab::default()));
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        assert_eq!(started.way, Way::Cli);
+        assert!(s.other_way(SARAH, &started.id).await.is_err());
+        let card = card_shows(&s, &started.id, NowKind::Failed).await;
+        assert_eq!(card.now.action, Some("new_code"));
+        let said = s.wait(&allan, &started.id, Duration::ZERO).await.unwrap();
+        assert_eq!(said["failed"], json!(true), "{said}");
     }
 
     /// A pasted token GitHub refuses: nothing kept, and the card asks for
