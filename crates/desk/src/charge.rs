@@ -258,6 +258,8 @@ pub struct FullGrant {
 /// holds at the next thing asked.
 pub trait ServedFull: Send + Sync {
     fn full_of(&self, boss: &str) -> Option<FullGrant>;
+    /// Whether a live grant serving `boss` holds session `session` now.
+    fn holds(&self, boss: &str, session: uuid::Uuid) -> bool;
 }
 
 /// A repository as a remote's address names it: its host, when said, and

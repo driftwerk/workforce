@@ -58,6 +58,23 @@ async fn a_decision_goes_up_its_link_and_only_its_own_answer_comes_back() {
         );
         assert_eq!(asking.await.unwrap().unwrap(), "DENY: no\nINSTEAD: ask");
 
+        // Longer than its hub takes: never sent, so its hub's socket isn't
+        // charged with it.
+        let long = format!(
+            "[Desk decision] {}",
+            "x".repeat(crate::boss_links::decide::MAX_PROMPT)
+        );
+        let refused = crew.remote_decision_call(boss, "acme", &long).await;
+        assert_eq!(refused.unwrap_err(), crate::desk_crew::remote_decide::TOO_LONG);
+        assert!(rx.try_recv().is_err(), "nothing went up");
+
+        // A second socket for the same boss and group, dropped, leaves the
+        // first's in place.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(8);
+        let up2 = crew.decide_up(vec![(uuid::Uuid::new_v4(), boss.into(), "acme".into())], tx2);
+        drop(up2);
+        assert!(crew.decides_remotely(boss, "acme"));
+
         // The socket gone: what waits hears so, and nothing goes up.
         let asking = {
             let crew = Arc::clone(&crew);

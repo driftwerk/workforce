@@ -236,7 +236,9 @@ impl CrewHub {
         let Some(boss) = self.boss_over(&view) else {
             return;
         };
-        if !self.desk.boss_unbound(&boss)
+        // A boss on another hub answers questions in its own turns there.
+        if workforce_desk::grant::is_served(&boss)
+            || !self.desk.boss_unbound(&boss)
             || !self.desk.charges_loaded()
             || self.person_has_questions(&view, &boss)
         {

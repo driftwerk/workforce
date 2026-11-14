@@ -3681,9 +3681,12 @@ impl Desk {
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
         // The boss of a session it runs, checked in `decide`; an unbound
-        // boss answers Codex too, wherever it asks.
+        // boss answers Codex too, wherever it asks. A boss served from a
+        // grant never does: Codex's requests in its sessions are the
+        // person's.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
+                && !crate::grant::is_served(&b.party.id)
                 && (self.full_of(&b.party.id).unbound
                     || self
                         .charge_of(id)

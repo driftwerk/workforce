@@ -132,6 +132,8 @@ pub struct CrewHub {
     /// Where each remote boss's decisions at Act fully go up to its own
     /// hub, by its `<hub>/<agent>` and group ([`remote_decide`]).
     deciders: remote_decide::Deciders,
+    /// Decisions of bosses being done from the decide loop, by boss.
+    served_deciding: Mutex<HashMap<String, usize>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -525,6 +527,11 @@ impl workforce_desk::charge::ServedFull for ServedJudge {
     fn full_of(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
         self.0.upgrade()?.served_full(boss)
     }
+    fn holds(&self, boss: &str, session: uuid::Uuid) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|c| c.served_grant_of(boss, session).is_some())
+    }
 }
 
 /// When the person cleared today's count, as it counts: today's, and
@@ -565,6 +572,7 @@ impl CrewHub {
             unbossed: Mutex::default(),
             remote_up: Mutex::default(),
             deciders: Mutex::default(),
+            served_deciding: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),

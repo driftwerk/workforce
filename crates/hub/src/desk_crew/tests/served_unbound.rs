@@ -47,7 +47,12 @@ fn a_grant_gives_a_daily_budget_only_in_dollars_within_act_fullys_most() {
 }
 
 fn pre(command: &str) -> Value {
-    json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+    pre_in("default", command)
+}
+
+/// A PreToolUse hook of a session running in permission `mode`.
+fn pre_in(mode: &str, command: &str) -> Value {
+    json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "permission_mode": mode,
         "tool_use_id": uuid::Uuid::new_v4().to_string(),
         "tool_input": {"command": command}})
 }
@@ -165,6 +170,16 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         let full = crew.served_full(BOSS).expect("unbound");
         assert!(full.unbound && !full.anywhere && full.repos.is_empty());
         assert!(d.boss_unbound(BOSS));
+        let said = hook(&url, pre("git push --force origin main")).await;
+        assert_eq!(decision(&said), "ask", "{said}");
+        let said = hook(&url, pre_in("auto", "git push --force origin main")).await;
+        assert_eq!(decision(&said), "ask", "{said}");
+        // In a mode that asks nothing, an asked call might run unasked: it
+        // is refused there, as below Act fully.
+        for mode in ["bypassPermissions", "acceptEdits"] {
+            let said = hook(&url, pre_in(mode, "git push --force origin main")).await;
+            assert_eq!(decision(&said), "deny", "{mode}: {said}");
+        }
         let said = hook(&url, pre("git push --force origin main")).await;
         assert_eq!(decision(&said), "ask", "{said}");
 

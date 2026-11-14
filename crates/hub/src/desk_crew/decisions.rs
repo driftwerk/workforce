@@ -195,7 +195,9 @@ impl CrewHub {
         }
         let id = &by.party.id;
         let here = match workforce_desk::grant::is_served(id) {
-            true => self.served_full(id).is_some_and(|f| f.unbound),
+            // Its decision from the decide loop, judged just before it was
+            // done, is recorded whatever its grant reads as now.
+            true => self.is_deciding(id) || self.served_full(id).is_some_and(|f| f.unbound),
             false => self.overseer_named(id).is_some(),
         };
         here.then(|| id.clone())

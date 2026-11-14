@@ -151,6 +151,8 @@ struct Said {
     why: String,
     text: String,
     again: Option<(Action, By)>,
+    /// Whether Desk can answer it (not asked in its own terminal).
+    answerable: bool,
 }
 
 /// What was said in the DMs of requests that wait: by request, its boss
@@ -179,10 +181,14 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     asked.remove(&s.approval);
                     continue;
                 }
-                if let Some(a) = s.again.take() {
-                    again.insert(s.approval, a);
-                }
-                crew.say_waits(s, &mut told).await;
+                let refused = match s.again.take() {
+                    Some(a) => {
+                        again.insert(s.approval, a);
+                        true
+                    }
+                    None => false,
+                };
+                crew.say_waits(s, refused, &mut told).await;
                 continue;
             }
             received = events.recv() => match received {
@@ -235,7 +241,10 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     .await;
                     continue;
                 }
-                if crew.perform(action, by.clone()).await.is_ok() {
+                let deciding = crew.deciding(&by.party.id);
+                let performed = crew.perform(action, by.clone()).await;
+                drop(deciding);
+                if performed.is_ok() {
                     taken.push(*approval);
                 }
             }
@@ -346,6 +355,7 @@ impl CrewHub {
                     quoted(&shown(&p))
                 ),
                 again: None,
+                answerable: p.answerable,
             });
             Outcome::Waits(why)
         };
@@ -366,6 +376,13 @@ impl CrewHub {
         // A start not settled: which sessions bosses run, where home is.
         if !self.desk.charges_loaded() || !self.desk.boss_home_known() {
             return Outcome::Soon;
+        }
+        // Codex's requests in a session a boss on another hub runs are the
+        // person's (Desk takes no other answer to them).
+        if workforce_desk::grant::is_served(&boss)
+            && view.engine == workforce_desk::engine::Engine::Codex
+        {
+            return waits("Codex's requests in a session run from another hub are yours".into());
         }
         if !p.answerable {
             // A question its dialog asks while the person is in control of
@@ -407,6 +424,7 @@ impl CrewHub {
                         why: String::new(),
                         text: String::new(),
                         again: None,
+                        answerable: p.answerable,
                     });
                     return;
                 }
@@ -422,6 +440,7 @@ impl CrewHub {
                 ),
                 why,
                 again,
+                answerable: p.answerable,
             });
         });
         Outcome::Deciding
@@ -429,11 +448,15 @@ impl CrewHub {
 
     /// Says `s` in its boss's DM, unless that reason was said already for
     /// a request still open, or for this one.
-    async fn say_waits(&self, s: Said, told: &mut Told) {
-        // A boss on another hub: the person hears it there, as an ask.
-        self.served_waits(&s.boss, s.approval);
+    async fn say_waits(&self, s: Said, refused: bool, told: &mut Told) {
         if told.get(&s.approval).is_some_and(|(_, w)| *w == s.why) {
             return;
+        }
+        // A boss on another hub: the person hears it there, as an ask, once
+        // a reason. Not while what it decided is still to be done again,
+        // nor what asks in its own terminal (no ask can answer that).
+        if !refused && s.answerable {
+            self.served_waits(&s.boss, s.approval);
         }
         let said = told.values().any(|(b, w)| *b == s.boss && *w == s.why);
         told.insert(s.approval, (s.boss.clone(), s.why.clone()));
@@ -447,6 +470,11 @@ impl CrewHub {
         // This hub's own boss, or one on another hub served from a grant
         // here, whose call is made on its own hub ([`super::remote_decide`]).
         let Some(decider) = self.decider_of(boss, view) else {
+            // A boss on another hub whose grant no longer holds the session
+            // while its charge does: nobody decides it, so it's the person's.
+            if workforce_desk::grant::is_served(boss) {
+                self.left_by_served(boss, view.id, p.id);
+            }
             return Outcome::NotOurs;
         };
         let name = decider.name.clone();
@@ -467,6 +495,12 @@ impl CrewHub {
                         )
                     }
                 },
+                // Too long to send, or its hub holding it (its pace, its
+                // budget): asking again at once changes nothing.
+                Ok(Err(e)) if super::remote_decide::not_again(&e) => {
+                    failed = e;
+                    break;
+                }
                 Ok(Err(e)) => {
                     failed = format!(
                         "its model failed: {}",
@@ -481,6 +515,9 @@ impl CrewHub {
                 }
             }
         }
+        // A boss on another hub: its spend today read again before what it
+        // decided is judged, so a budget spent meanwhile holds it now.
+        self.after_decided(&decider).await;
         // Answered meanwhile (in its terminal, by the person): nothing waits.
         let still = || {
             self.desk
@@ -548,7 +585,10 @@ impl CrewHub {
             );
         }
         let by = By::manager(boss, &name, &why);
-        match self.perform(&action, by.clone()).await {
+        let deciding = self.deciding(boss);
+        let performed = self.perform(&action, by.clone()).await;
+        drop(deciding);
+        match performed {
             Ok(done) => {
                 tracing::info!(session = %view.id, %boss, %done, "the boss decided a request at once");
                 Outcome::Done

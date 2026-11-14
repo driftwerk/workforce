@@ -170,14 +170,16 @@ impl Desk {
     /// The request `approval` of `session` was given to its boss, whose
     /// turn left it open: the person's to answer now, as its badge says.
     pub fn leave_to_person(&self, session: Uuid, approval: Uuid) {
-        let open = {
+        // Shown again only when it is newly the person's: leaving it to them
+        // again changes nothing anyone sees.
+        let newly = {
             let mut st = self.0.state.lock();
             let open = st
                 .live
                 .get(&session)
                 .and_then(|l| l.pending.as_ref())
                 .is_some_and(|p| p.id == approval);
-            if open {
+            open && {
                 // Only what is still open anywhere is kept.
                 let pending: std::collections::HashSet<Uuid> = st
                     .live
@@ -185,11 +187,10 @@ impl Desk {
                     .filter_map(|l| l.pending.as_ref().map(|p| p.id))
                     .collect();
                 st.charges.left.retain(|id| pending.contains(id));
-                st.charges.left.insert(approval);
+                st.charges.left.insert(approval)
             }
-            open
         };
-        if open {
+        if newly {
             if let Ok(view) = self.view(session) {
                 self.announce(DeskEvent::Session {
                     session: Box::new(view),
@@ -548,7 +549,7 @@ impl Desk {
             cli_session: None,
         };
         let why = self.boss_judges(id, &pending, &boss).err()?;
-        Some(match self.full_of(&boss).unbound {
+        Some(match self.served_asks(id, &boss) {
             true => ServedCheck::Ask(format!(
                 "A boss on another hub runs this session, and this call {}: its boss decides it.",
                 why.0
@@ -559,6 +560,27 @@ impl Desk {
                 why.0
             )),
         })
+    }
+}
+
+impl Desk {
+    /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
+    /// (served from a grant) to decide: while it is at Act fully in force,
+    /// a live grant of it holds the session, and the session's own mode
+    /// (as its last hook said) is one where an asked call waits for an
+    /// answer. In a mode that asks nothing (bypass, accept edits) an asked
+    /// call might run unasked, so there it is refused.
+    fn served_asks(&self, id: Uuid, boss: &str) -> bool {
+        use crate::mode::Mode;
+        let mode = self.0.state.lock().modes_seen.get(&id).copied();
+        matches!(mode, Some(Mode::Default | Mode::Plan | Mode::Auto))
+            && self.full_of(boss).unbound
+            && self
+                .0
+                .served_full
+                .lock()
+                .clone()
+                .is_some_and(|j| j.holds(boss, id))
     }
 }
 
