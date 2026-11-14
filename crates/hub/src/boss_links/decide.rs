@@ -72,10 +72,13 @@ pub enum Code {
     ModelFailed,
     /// Its model didn't answer in time.
     Timeout,
+    /// Act fully isn't in force for the boss where it decides (a relayed
+    /// boss's home).
+    NotInForce,
 }
 
 impl Code {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::TooLong,
         Self::NotADecision,
         Self::Paced,
@@ -84,6 +87,7 @@ impl Code {
         Self::Gone,
         Self::ModelFailed,
         Self::Timeout,
+        Self::NotInForce,
     ];
 
     /// As the wire says it.
@@ -97,6 +101,7 @@ impl Code {
             Self::Gone => "gone",
             Self::ModelFailed => "model_failed",
             Self::Timeout => "timeout",
+            Self::NotInForce => "not_in_force",
         }
     }
 
@@ -106,11 +111,11 @@ impl Code {
     }
 
     /// Whether asking again at once could change it: not for what is too
-    /// long, no decision, or held for its pace or budget.
+    /// long, no decision, held for its pace or budget, or not in force.
     pub const fn again(self) -> bool {
         !matches!(
             self,
-            Self::TooLong | Self::NotADecision | Self::Paced | Self::Budget
+            Self::TooLong | Self::NotADecision | Self::Paced | Self::Budget | Self::NotInForce
         )
     }
 }
@@ -293,13 +298,14 @@ mod tests {
                 Code::Gone => "gone",
                 Code::ModelFailed => "model_failed",
                 Code::Timeout => "timeout",
+                Code::NotInForce => "not_in_force",
             };
             let v = answered(Uuid::nil(), Uuid::nil(), Err(Refused::new(c, "x")));
             assert_eq!(v["code"], wire);
         }
         assert_eq!(
             Code::ALL.len(),
-            8,
+            9,
             "a new code is in ALL, and in the match above"
         );
         assert_eq!(Code::parse("its hub decides no more for it just now"), None);
@@ -307,7 +313,13 @@ mod tests {
         let not_again: Vec<Code> = Code::ALL.into_iter().filter(|c| !c.again()).collect();
         assert_eq!(
             not_again,
-            [Code::TooLong, Code::NotADecision, Code::Paced, Code::Budget]
+            [
+                Code::TooLong,
+                Code::NotADecision,
+                Code::Paced,
+                Code::Budget,
+                Code::NotInForce
+            ]
         );
     }
 }

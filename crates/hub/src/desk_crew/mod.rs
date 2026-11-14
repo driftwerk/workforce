@@ -47,6 +47,7 @@ mod preferences;
 mod read_only;
 mod reading;
 pub(crate) mod relay;
+pub(crate) mod relayed_decide;
 pub(crate) mod remote_asks;
 pub(crate) mod remote_decide;
 mod scope;
@@ -135,6 +136,9 @@ pub struct CrewHub {
     deciders: remote_decide::Deciders,
     /// Decisions of bosses being done from the decide loop, by boss.
     served_deciding: Mutex<HashMap<String, usize>>,
+    /// On a machine, the decisions of bosses relayed from the home, and
+    /// when the home last held each at Act fully ([`relayed_decide`]).
+    relayed: Mutex<relayed_decide::Outbox>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -589,6 +593,7 @@ impl CrewHub {
             remote_up: Mutex::default(),
             deciders: Mutex::default(),
             served_deciding: Mutex::default(),
+            relayed: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
@@ -645,6 +650,7 @@ impl CrewHub {
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));

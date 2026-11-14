@@ -263,12 +263,18 @@ enum How {
     /// A boss on another hub (`<hub>/<agent>`), for a session of `group`:
     /// its own model, on its hub.
     Remote { boss: String, group: String },
+    /// The home's own boss of a machine's sessions (`home/<agent>`), for a
+    /// session of `group`: its own model, at home, by the relay
+    /// ([`super::relayed_decide`]).
+    Relayed { boss: String, group: String },
 }
 
 /// `what`, naming the boss's hub when it is on another (`<hub>/<agent>`):
-/// "… (by allan on driftwerk)".
+/// "… (by allan on driftwerk)", or "… (by sarah at home)" for the home's
+/// own.
 pub(crate) fn named(boss: &str, what: String) -> String {
     match boss.split_once('/') {
+        Some((workforce_desk::grant::HOME_HUB, agent)) => format!("{what} (by {agent} at home)"),
         Some((hub, agent)) => format!("{what} (by {agent} on {hub})"),
         None => what,
     }
@@ -292,12 +298,14 @@ impl CrewHub {
             });
         }
         let g = self.served_grant_of(boss, view.id)?;
+        let relayed = matches!(g.boss, Some(workforce_desk::grant::BossRef::Local { .. }));
+        let (boss, group) = (boss.to_string(), g.group.clone());
         Some(Decider {
             name: super::served::boss_name(&g),
             oversight: super::served::served_oversight(&g),
-            how: How::Remote {
-                boss: boss.to_string(),
-                group: g.group,
+            how: match relayed {
+                true => How::Relayed { boss, group },
+                false => How::Remote { boss, group },
             },
         })
     }
@@ -311,13 +319,14 @@ impl CrewHub {
                 .await
                 .map_err(Failed::from),
             How::Remote { boss, group } => self.remote_decision_call(boss, group, prompt).await,
+            How::Relayed { boss, group } => self.relayed_decision_call(boss, group, prompt).await,
         }
     }
 
     /// After `d`'s decision calls: a boss on another hub has its spend
     /// today read again, so a budget spent meanwhile holds what it decided.
     pub(crate) async fn after_decided(&self, d: &Decider) {
-        if let How::Remote { boss, .. } = &d.how {
+        if let How::Remote { boss, .. } | How::Relayed { boss, .. } = &d.how {
             self.read_served_spent(boss).await;
         }
     }
