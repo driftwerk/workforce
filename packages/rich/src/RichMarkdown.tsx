@@ -8,14 +8,17 @@
 // and from the web unless the host says remote images are links
 // (`remoteImages: "link"`): then one is a link to it, or what the host draws
 // for it (`remoteImage`), anything else is not drawn, and the page never
-// fetches either.
+// fetches either. A host may draw its own links, images (of schemes it
+// declares) and directives; directives are only read for a host that draws
+// them, and one it doesn't draw reads as it was written.
 
-import { createContext, useContext, useMemo, useRef, type ComponentProps } from "react";
+import { Children, createContext, isValidElement, useContext, useMemo, useRef, type ComponentProps, type ReactNode } from "react";
 import Markdown, { defaultUrlTransform, type Components, type ExtraProps, type Options } from "react-markdown";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import { CodeBlock } from "./CodeBlock";
+import { attributesText, directiveNameList, DIRECTIVE_LABEL_TAG, DIRECTIVE_PROPS, DIRECTIVE_TAG, remarkNamedDirectives, remarkWfDirectives, type DirectiveKind } from "./directives";
 import { ALL_RICH_FEATURES, balanceFences, codeBlockInfo, richKind, type RichFeatures } from "./fence";
 import { useHost } from "./host";
 import { dataImageOk, LOCAL_IMAGE_SCHEMES, localImageSource, remoteImageLabel, remoteImageUrl } from "./images";
@@ -62,8 +65,15 @@ const ImageIcon = () => (
  *  React text, never markup. */
 function Image({ node, src, alt, ...props }: ComponentProps<"img"> & ExtraProps) {
   void node;
-  const { remoteImages, remoteImageSlot, latest } = useHost();
+  const { remoteImages, remoteImageSlot, latest, imageSchemes } = useHost();
   const inLink = useContext(InLink);
+  if (typeof src === "string" && src !== "") {
+    const own = latest.current.image?.(src, alt ?? "", { inLink });
+    if (own !== undefined && own !== null) return <>{own}</>;
+    // One of the host's own that it didn't draw: nothing to fetch it from.
+    const scheme = schemeOf(src);
+    if (scheme && keptSchemes(imageSchemes).includes(scheme)) return <img {...props} alt={alt} />;
+  }
   const held = remoteImages === "link" && typeof src === "string" && src !== "" ? src : null;
   const remote = held === null ? null : remoteImageUrl(held);
   if (!remote) {
@@ -93,6 +103,78 @@ function Image({ node, src, alt, ...props }: ComponentProps<"img"> & ExtraProps)
   );
 }
 
+type HastNode = { type: string; value?: string; tagName?: string; properties?: Record<string, unknown>; children?: HastNode[] };
+
+const textOf = (n: HastNode | undefined): string =>
+  !n ? "" : n.type === "text" ? (n.value ?? "") : (n.children ?? []).map(textOf).join("");
+
+const prop = (n: HastNode | undefined, name: string): string => {
+  const v = n?.properties?.[name];
+  return typeof v === "string" ? v : "";
+};
+
+const attrsOf = (json: string): Record<string, string> => {
+  try {
+    const v: unknown = JSON.parse(json);
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    return Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === "string"));
+  } catch {
+    return {};
+  }
+};
+
+/** A directive: the host's drawing of it, else the text it was written as. */
+function DirectiveElement({ node, children }: { node?: HastNode; children?: ReactNode }) {
+  const { latest } = useHost();
+  const kind = prop(node, "dataKind") as DirectiveKind;
+  // A container's label is its first child; a text or leaf directive's
+  // children are its label.
+  const labelNode = kind === "container" ? node?.children?.find((c) => c.type === "element" && c.tagName === DIRECTIVE_LABEL_TAG) : node;
+  const all = Children.toArray(children);
+  const isLabel = (c: ReactNode) => isValidElement<{ node?: HastNode }>(c) && c.props.node?.tagName === DIRECTIVE_LABEL_TAG;
+  const label = kind === "container" ? (all.find(isLabel) ?? null) : all.length ? children : null;
+  const content = kind === "container" ? all.filter((c) => !isLabel(c)) : null;
+  const own = latest.current.directive?.({
+    kind,
+    name: prop(node, "dataName").toLowerCase(),
+    attributes: attrsOf(prop(node, "dataAttrs")),
+    label,
+    labelText: labelNode && (kind !== "container" || labelNode !== node) ? textOf(labelNode) : "",
+    children: content,
+  });
+  if (own !== undefined && own !== null) return <>{own}</>;
+  // Not drawn: as it was written, its label and content drawn as markdown.
+  const name = prop(node, "dataName");
+  const attrs = attributesText(attrsOf(prop(node, "dataAttrs")));
+  const head = (marker: string) => (
+    <>
+      {marker}
+      {name}
+      {label !== null && (
+        <>
+          [{label}]
+        </>
+      )}
+      {attrs}
+    </>
+  );
+  if (kind === "text") return head(":");
+  if (kind === "leaf") return <p>{head("::")}</p>;
+  const fence = ":".repeat(Number(prop(node, "dataColons")) || 3);
+  return (
+    <>
+      <p>{head(fence)}</p>
+      {content}
+      {prop(node, "dataClosed") && <p>{fence}</p>}
+    </>
+  );
+}
+
+/** A container's label, drawn inline where the host puts it. */
+function DirectiveLabel({ children }: { children?: ReactNode }) {
+  return <>{children}</>;
+}
+
 const MD_COMPONENTS: Components = {
   table: ({ node, ...props }) => {
     void node;
@@ -104,10 +186,20 @@ const MD_COMPONENTS: Components = {
   },
   a: Link,
   img: Image,
+  ...({ [DIRECTIVE_TAG]: DirectiveElement, [DIRECTIVE_LABEL_TAG]: DirectiveLabel } as Components),
 };
 
 /** Schemes that run or embed content: never kept, whatever a host declares. */
 const NEVER = new Set(["javascript", "vbscript", "data", "file"]);
+
+/** Schemes from a host's comma-joined list that may be kept. */
+const keptSchemes = (list: string): string[] =>
+  list
+    ? list
+        .split(",")
+        .map((s) => s.trim().toLowerCase().replace(/:$/, ""))
+        .filter((s) => /^[a-z][a-z0-9+.-]*$/.test(s) && !NEVER.has(s))
+    : [];
 
 const schemeOf = (url: string): string | null => {
   const colon = url.indexOf(":");
@@ -120,22 +212,24 @@ const schemeOf = (url: string): string | null => {
  *  `data:` besides the web's, never a declared link scheme (those are places to
  *  go, not files to fetch); a `data:` image is held to a raster type and a size
  *  by the transform, which sees the whole URL. */
-function linkPolicy(schemes: string): {
+function linkPolicy(
+  schemes: string,
+  imageSchemes: string,
+  directives: boolean,
+): {
   rehypePlugins: NonNullable<Options["rehypePlugins"]>;
   urlTransform: (url: string, key: string) => string;
 } {
-  const kept = schemes
-    ? schemes
-        .split(",")
-        .map((s) => s.trim().toLowerCase().replace(/:$/, ""))
-        .filter((s) => /^[a-z][a-z0-9+.-]*$/.test(s) && !NEVER.has(s))
-    : [];
+  const kept = keptSchemes(schemes);
+  const ownImages = keptSchemes(imageSchemes);
   const schema = {
     ...defaultSchema,
+    tagNames: [...(defaultSchema.tagNames ?? []), ...(directives ? [DIRECTIVE_TAG, DIRECTIVE_LABEL_TAG] : [])],
+    attributes: { ...defaultSchema.attributes, ...(directives ? { [DIRECTIVE_TAG]: [...DIRECTIVE_PROPS] } : {}) },
     protocols: {
       ...defaultSchema.protocols,
       href: [...(defaultSchema.protocols?.href ?? []), ...kept],
-      src: [...(defaultSchema.protocols?.src ?? []), ...LOCAL_IMAGE_SCHEMES, "data"],
+      src: [...(defaultSchema.protocols?.src ?? []), ...LOCAL_IMAGE_SCHEMES, ...ownImages, "data"],
     },
   };
   return {
@@ -144,7 +238,7 @@ function linkPolicy(schemes: string): {
       const scheme = schemeOf(url);
       if (key === "src") {
         if (scheme === "data") return dataImageOk(url) ? url : "";
-        if (scheme && LOCAL_IMAGE_SCHEMES.includes(scheme)) return url;
+        if (scheme && (LOCAL_IMAGE_SCHEMES.includes(scheme) || ownImages.includes(scheme))) return url;
         return defaultUrlTransform(url);
       }
       return scheme && kept.includes(scheme) ? url : defaultUrlTransform(url);
@@ -172,8 +266,12 @@ export function RichMarkdown({
   // from skeleton to its code-block fallback.
   const streamingRef = useRef(streaming);
   streamingRef.current = streaming;
-  const { schemes } = useHost();
-  const links = useMemo(() => linkPolicy(schemes), [schemes]);
+  const { schemes, imageSchemes, directives } = useHost();
+  const links = useMemo(() => linkPolicy(schemes, imageSchemes, directives !== ""), [schemes, imageSchemes, directives]);
+  const remarkPlugins = useMemo<NonNullable<Options["remarkPlugins"]>>(
+    () => (directives ? [remarkGfm, [remarkNamedDirectives, directiveNameList(directives)], remarkWfDirectives] : [remarkGfm]),
+    [directives],
+  );
   const components = useMemo<Components>(
     () => ({
       ...MD_COMPONENTS,
@@ -199,7 +297,7 @@ export function RichMarkdown({
   return (
     <div className="wf-md">
       <Markdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={remarkPlugins}
         rehypePlugins={links.rehypePlugins}
         urlTransform={links.urlTransform}
         components={components}
