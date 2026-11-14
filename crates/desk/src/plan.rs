@@ -191,7 +191,7 @@ pub fn machine_ok(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && name.len() <= 100
-        && name != THIS_COMPUTER
+        && !name.eq_ignore_ascii_case(THIS_COMPUTER)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -523,7 +523,7 @@ pub fn snapshot_of(
         let was = before.and_then(|b| b.ticket(ids[i]));
         let machine = match t.machine.as_deref().map(str::trim) {
             None => was.and_then(|w| w.machine.clone()),
-            Some("") | Some(THIS_COMPUTER) => None,
+            Some(m) if m.is_empty() || m.eq_ignore_ascii_case(THIS_COMPUTER) => None,
             Some(m) if machine_ok(m) => Some(m.to_string()),
             Some(m) => {
                 problems.push(Problem::BadMachine {
@@ -864,10 +864,12 @@ pub fn next_starts(
     let states: HashMap<Uuid, TicketState> = tickets.iter().map(|t| (t.id, t.state)).collect();
     let mut ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &states)).collect();
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
-    let mut in_use: HashSet<&str> = tickets
+    // A folder is in use on its own computer: the same path on a machine is
+    // another folder.
+    let mut in_use: HashSet<(Option<&str>, &str)> = tickets
         .iter()
         .filter(|t| t.state == TicketState::Doing || t.starting)
-        .filter_map(|t| t.folder.as_deref())
+        .filter_map(|t| t.folder.as_deref().map(|f| (t.machine.as_deref(), f)))
         .collect();
     let mut busy = busy;
     let mut out = Vec::new();
@@ -883,7 +885,7 @@ pub fn next_starts(
             engine,
             folder: folder.to_string(),
             view: t.view,
-            worktree: !in_use.insert(folder),
+            worktree: !in_use.insert((t.machine.as_deref(), folder)),
         });
         busy += 1;
     }

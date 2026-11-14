@@ -221,6 +221,8 @@ pub struct CrewHub {
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
+    /// Each machine's plan reads that failed in a row.
+    machine_down: Mutex<HashMap<String, u32>>,
     /// Sessions a start's work was given to, held from other starts until
     /// [`actions::REUSE_CLAIM`] has passed.
     reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
@@ -619,6 +621,7 @@ impl CrewHub {
             plan_failures: Mutex::default(),
             machine_seen: Mutex::default(),
             machine_read: Mutex::default(),
+            machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),

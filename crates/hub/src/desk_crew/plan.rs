@@ -104,6 +104,8 @@ pub(crate) struct MachineSeen {
     /// Its last reply as read there: a new one is a turn more, however
     /// quickly it went by between reads.
     pub reply: Option<String>,
+    /// Reads of the machine that didn't list it while it was starting.
+    pub misses: u8,
 }
 
 impl MachineSeen {
@@ -160,6 +162,9 @@ pub(crate) fn machine_line(
     }
     None
 }
+
+/// Failed reads of a machine before its plans' bosses are told.
+const MACHINE_DOWN_SAID: u32 = 4;
 
 /// How long what happens to a plan is gathered into one turn.
 const GATHER: Duration = Duration::from_secs(3);
@@ -738,14 +743,14 @@ impl CrewHub {
         let tickets = match input.get("tickets") {
             Some(_) => {
                 let mut t = tickets_of(input, &known)?;
-                // Said for the plan: every ticket that doesn't say. Else a
-                // new ticket runs where its group's sessions do; the others
-                // stay where they run.
+                // Said for the plan, or else where its group's sessions run:
+                // each new ticket that doesn't say. The others stay where
+                // they run unless a ticket says otherwise.
                 fill_where(
                     &mut t,
                     str_of(input, "machine"),
                     str_of(input, "model"),
-                    false,
+                    true,
                 );
                 let group = self.group_machine(detail.summary.plan.group.as_deref());
                 fill_where(&mut t, group.as_deref(), None, true);
@@ -944,6 +949,7 @@ impl CrewHub {
             return;
         }
         self.watch_machines().await;
+        self.retry_machine_starts().await;
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
                 for s in paused {
@@ -989,7 +995,9 @@ impl CrewHub {
             }
             read.insert(String::new(), Instant::now());
         }
-        let mut on: HashMap<String, Vec<(String, MachineSeen, Option<String>)>> = HashMap::new();
+        // Each machine's plan sessions: (item, as first seen, group, in Review).
+        type Watched = (String, MachineSeen, Option<String>, bool);
+        let mut on: HashMap<String, Vec<Watched>> = HashMap::new();
         let open = self.desk.plans(None, None).await.unwrap_or_default();
         for s in open
             .iter()
@@ -1019,20 +1027,22 @@ impl CrewHub {
                     key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
                     state: "starting".into(),
                     reply: None,
+                    misses: 0,
                 };
                 on.entry(machine.to_string()).or_default().push((
                     a.id.clone(),
                     seen,
                     s.plan.group.clone(),
+                    row.state == TicketState::Review,
                 ));
             }
         }
         // What is no longer a plan's machine session isn't kept.
         {
-            let ours: HashSet<&String> = on.values().flatten().map(|(k, _, _)| k).collect();
-            self.machine_seen
-                .lock()
-                .retain(|k, s| ours.contains(k) || s.state == "starting");
+            let ours: HashSet<&String> = on.values().flatten().map(|(k, ..)| k).collect();
+            self.machine_seen.lock().retain(|k, _| ours.contains(k));
+            let machines: HashSet<&String> = on.keys().collect();
+            self.machine_down.lock().retain(|m, _| machines.contains(m));
         }
         for (machine, sessions) in on {
             {
@@ -1042,7 +1052,7 @@ impl CrewHub {
                 }
                 read.insert(machine.clone(), Instant::now());
             }
-            let (_, first, group) = &sessions[0];
+            let (_, first, group, _) = &sessions[0];
             let listed = self
                 .machine_call(
                     &machine,
@@ -1053,22 +1063,58 @@ impl CrewHub {
                 )
                 .await;
             let listed: Vec<MachineSession> = match listed {
-                Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+                Ok(v) => {
+                    self.machine_down.lock().remove(&machine);
+                    serde_json::from_value(v).unwrap_or_default()
+                }
                 Err(e) => {
                     tracing::debug!(%machine, error = %e, "a machine's plan sessions weren't read");
+                    // Said once, after a minute or so of reads that failed.
+                    let n = {
+                        let mut down = self.machine_down.lock();
+                        let n = down.entry(machine.clone()).or_default();
+                        *n += 1;
+                        *n
+                    };
+                    if n == MACHINE_DOWN_SAID {
+                        let mut by_plan: HashMap<Uuid, Vec<String>> = HashMap::new();
+                        for (_, seen, ..) in &sessions {
+                            by_plan.entry(seen.plan).or_default().push(seen.key.clone());
+                        }
+                        for (plan, keys) in by_plan {
+                            self.plan_failures.lock().push((
+                                plan,
+                                format!(
+                                    "Desk can't read {machine} just now ({e}), so it can't see the sessions of {} there. \
+                                     They may still be running; if it lasts, tell the person {machine} isn't answering.",
+                                    keys.join(", ")
+                                ),
+                            ));
+                        }
+                    }
                     continue;
                 }
             };
-            for (item, fresh, _) in sessions {
+            for (item, fresh, _, review) in sessions {
                 let id = item.rsplit('/').next().and_then(|i| i.parse::<Uuid>().ok());
                 let now = listed.iter().find(|x| Some(x.id) == id);
                 let was = self.machine_seen.lock().get(&item).cloned();
-                let line = match (now, &was) {
-                    (Some(now), Some(was)) => machine_line(&machine, was, now),
-                    (None, Some(was)) if was.state != "starting" && was.state != "gone" => Some(format!(
+                let gone = |was: &MachineSeen| {
+                    format!(
                         "{}'s session on {machine} is gone from it. Move {} with crew.move_ticket as its work stands.",
                         was.key, was.key
-                    )),
+                    )
+                };
+                let line = match (now, &was) {
+                    // In Review, its turns are the person's to read.
+                    (Some(now), Some(was)) => machine_line(&machine, was, now)
+                        .filter(|l| !(review && l.contains("finished a turn"))),
+                    (None, Some(was)) if was.state == "starting" && was.misses >= 1 => {
+                        Some(gone(was))
+                    }
+                    (None, Some(was)) if was.state != "starting" && was.state != "gone" => {
+                        Some(gone(was))
+                    }
                     _ => None,
                 };
                 if let Some(line) = line {
@@ -1080,8 +1126,10 @@ impl CrewHub {
                         next.state.clone_from(&now.state);
                         next.reply.clone_from(&now.last_reply);
                     }
-                    None if next.state != "starting" => next.state = "gone".into(),
-                    None => {}
+                    None if next.state != "starting" || next.misses >= 1 => {
+                        next.state = "gone".into();
+                    }
+                    None => next.misses += 1,
                 }
                 self.machine_seen.lock().insert(item, next);
             }
@@ -1210,6 +1258,7 @@ impl CrewHub {
                                         key,
                                         state: "starting".into(),
                                         reply: None,
+                                        misses: 0,
                                     },
                                 );
                             }
@@ -1388,6 +1437,50 @@ impl CrewHub {
         }
     }
 
+    /// Finishes the start `s` that was cut off, or whose outcome on a
+    /// machine wasn't known: its session taken up when there is one, else
+    /// started once as `why`, or its ticket back in To do when no boss may
+    /// start it.
+    async fn finish_start(&self, s: workforce_desk::plan_store::Starting, why: &str) {
+        let plan = match self.desk.store().plan_of_ticket(s.ticket).await {
+            Ok(Some(id)) => self.desk.store().plan(id).await.ok().flatten(),
+            _ => None,
+        };
+        let boss = plan
+            .as_ref()
+            .and_then(|p| self.boss_of_plan(p))
+            .filter(|(_, o)| o.level.acts());
+        let Some((service, _)) = boss else {
+            // No boss may start it now: the ticket waits in To do.
+            let by = By::desk("No boss may start it now.");
+            if let Err(e) = self.desk.plan_restart_start(s, None, &by).await {
+                tracing::info!(ticket = %s.ticket, error = %e, "a start cut off wasn't put back");
+            }
+            return;
+        };
+        let party = Party::manager(service.agent_id.as_str(), &name_of(&service));
+        let by = By::manager(&party.id, &party.name, why);
+        if let Err(e) = self.desk.plan_restart_start(s, Some(&party), &by).await {
+            tracing::info!(ticket = %s.ticket, error = %e, "a start cut off wasn't finished");
+        }
+    }
+
+    /// The starts on the person's machines whose outcome wasn't known, a
+    /// while on: each looked for there, and started only if it isn't.
+    async fn retry_machine_starts(&self) {
+        // Long past any start still under way: three ticks, at most 90 s.
+        let older = (self.timing.tick * 3).min(Duration::from_secs(90));
+        let unsure = self.desk.machine_starts_unsure(older).await;
+        if unsure.is_empty() {
+            return;
+        }
+        let _one = self.starting.lock().await;
+        for s in unsure {
+            self.finish_start(s, "Its start on a machine wasn't known; Desk looked there.")
+                .await;
+        }
+    }
+
     /// After a restart: finishes the starts a stop cut off (each starts
     /// once, as the session it named), and what happened to each boss's
     /// running plans while the hub was down, by boss: the sessions of
@@ -1398,27 +1491,7 @@ impl CrewHub {
             let _one = self.starting.lock().await;
             let links = self.desk.store().starting().await.unwrap_or_default();
             for s in links {
-                let plan = match self.desk.store().plan_of_ticket(s.ticket).await {
-                    Ok(Some(id)) => self.desk.store().plan(id).await.ok().flatten(),
-                    _ => None,
-                };
-                let boss = plan
-                    .as_ref()
-                    .and_then(|p| self.boss_of_plan(p))
-                    .filter(|(_, o)| o.level.acts());
-                let Some((service, _)) = boss else {
-                    // No boss may start it now: the ticket waits in To do.
-                    let by = By::desk("No boss may start it now.");
-                    if let Err(e) = self.desk.plan_restart_start(s, None, &by).await {
-                        tracing::info!(ticket = %s.ticket, error = %e, "a start cut off wasn't put back");
-                    }
-                    continue;
-                };
-                let party = Party::manager(service.agent_id.as_str(), &name_of(&service));
-                let by = By::manager(&party.id, &party.name, "Desk restarted mid-start.");
-                if let Err(e) = self.desk.plan_restart_start(s, Some(&party), &by).await {
-                    tracing::info!(ticket = %s.ticket, error = %e, "a start cut off wasn't finished");
-                }
+                self.finish_start(s, "Desk restarted mid-start.").await;
             }
         }
         let plans = self
@@ -1832,6 +1905,7 @@ mod tests {
             key: "VEL-3".into(),
             state: state.into(),
             reply: reply.map(str::to_string),
+            misses: 0,
         };
         let now = |state: &str, reply: Option<&str>| MachineSession {
             id: Uuid::nil(),
@@ -1840,6 +1914,7 @@ mod tests {
             cwd: "/home/dev/vellev".into(),
             state: state.into(),
             last_reply: reply.map(str::to_string),
+            created_at: None,
         };
         // Nothing new: nothing said.
         assert_eq!(

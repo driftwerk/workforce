@@ -1779,7 +1779,7 @@ impl Desk {
                 BeginStart::Other(e) => StartRefused::Failed(DeskError::Internal(e)),
             })?;
         Ok(self
-            .plan_launch(p, t, session, &runs, start.worktree, boss, by)
+            .plan_launch(p, t, session, at, &runs, start.worktree, boss, by)
             .await?)
     }
 
@@ -1848,9 +1848,37 @@ impl Desk {
                 && o.folder == runs.folder
                 && o.machine == runs.machine
         });
-        self.plan_launch(&p, t, s.session, &runs, worktree, boss, by)
+        self.plan_launch(&p, t, s.session, s.at, &runs, worktree, boss, by)
             .await
             .map(Some)
+    }
+
+    /// The starts on the person's machines whose outcome wasn't known, made
+    /// over `older_than` ago: each is looked for there again, and started
+    /// only if it isn't there ([`Desk::plan_restart_start`]).
+    pub async fn machine_starts_unsure(&self, older_than: std::time::Duration) -> Vec<Starting> {
+        let Ok(list) = self.0.store.starting().await else {
+            return Vec::new();
+        };
+        let old = crew::now() - chrono::Duration::from_std(older_than).unwrap_or_default();
+        let mut out = Vec::new();
+        for s in list.into_iter().filter(|s| s.at < old) {
+            let Ok(Some(plan)) = self.0.store.plan_of_ticket(s.ticket).await else {
+                continue;
+            };
+            let on_machine = self
+                .0
+                .store
+                .plan_runs(plan)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .any(|(id, r)| id == s.ticket && r.machine.is_some());
+            if on_machine {
+                out.push(s);
+            }
+        }
+        out
     }
 
     /// How many of `boss`'s plans' starts are under way with no session
@@ -1908,6 +1936,7 @@ impl Desk {
         p: &Plan,
         t: Ticket,
         session: Uuid,
+        since: chrono::DateTime<chrono::Utc>,
         runs: &Runs,
         worktree: bool,
         boss: &Party,
@@ -1916,7 +1945,7 @@ impl Desk {
         let s = Starting {
             ticket: t.id,
             session,
-            at: crew::now(),
+            at: since,
         };
         let launched = match runs.machine.clone() {
             None => self
@@ -1930,10 +1959,20 @@ impl Desk {
                     };
                     (started, Some(v))
                 }),
-            Some(m) => self
-                .plan_spawn_on(&m, p, &t, runs, worktree, boss)
+            Some(m) => match self
+                .plan_spawn_on(&m, p, &t, since, runs, worktree, boss)
                 .await
-                .map(|started| (started, None)),
+            {
+                Ok(started) => Ok((started, None)),
+                // It may have started there: its link stays, and Desk
+                // looks for it there again ([`Desk::machine_starts_unsure`])
+                // before any start of it.
+                Err((e, true)) => {
+                    self.plan_touched(p.id).await;
+                    return Err(e);
+                }
+                Err((e, false)) => Err(e),
+            },
         };
         let (started, view) = match launched {
             Ok(v) => v,
@@ -1962,25 +2001,37 @@ impl Desk {
         machine: &str,
         p: &Plan,
         t: &Ticket,
+        since: chrono::DateTime<chrono::Utc>,
         runs: &Runs,
         worktree: bool,
         boss: &Party,
-    ) -> Result<Started, DeskError> {
-        let key = self.key_of(t).await?;
-        let needs = self.need_keys(t).await?;
+    ) -> Result<Started, (DeskError, bool)> {
+        let sure = |e: DeskError| (e, false);
+        let key = self.key_of(t).await.map_err(sure)?;
+        let needs = self.need_keys(t).await.map_err(sure)?;
         let (Some(engine), Some(folder)) = (runs.engine, runs.folder.clone()) else {
-            return Err(DeskError::Invalid(format!(
+            return Err(sure(DeskError::Invalid(format!(
                 "{key} doesn't say where its session runs."
-            )));
+            ))));
         };
         let crew = self.plan_crew().ok_or_else(|| {
-            DeskError::Invalid(format!("{machine} can't be reached from this hub."))
+            sure(DeskError::Invalid(format!(
+                "{machine} can't be reached from this hub."
+            )))
         })?;
+        let read_refused = |e: crew::MachineRefused| match e {
+            crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
+                "{machine}'s sessions couldn't be read: {why}"
+            ))),
+            e => sure(DeskError::Invalid(e.to_string())),
+        };
+        // Only a start that may have reached the machine is unsure.
         let refused = |e: crew::MachineRefused| match e {
-            crew::MachineRefused::Refused(why) => {
-                DeskError::Invalid(format!("{machine} didn't start {key}: {why}"))
-            }
-            e => DeskError::Invalid(e.to_string()),
+            crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
+                "{machine} didn't start {key}: {why}"
+            ))),
+            e @ crew::MachineRefused::Unknown(_) => (DeskError::Invalid(e.to_string()), true),
+            e => sure(DeskError::Invalid(e.to_string())),
         };
         let group = p.group.as_deref();
         let listed = crew
@@ -1992,16 +2043,28 @@ impl Desk {
                 serde_json::json!({}),
             )
             .await
-            .map_err(refused)?;
-        let listed: Vec<crew::MachineSession> = serde_json::from_value(listed)
-            .map_err(|_| DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")))?;
+            .map_err(read_refused)?;
+        let listed: Vec<crew::MachineSession> = serde_json::from_value(listed).map_err(|_| {
+            sure(DeskError::Invalid(format!(
+                "{machine}'s sessions couldn't be read."
+            )))
+        })?;
         let made_in = |cwd: &str| {
             cwd == folder
                 || cwd.starts_with(&format!("{}/.worktrees/", folder.trim_end_matches('/')))
         };
+        // Only one made for this start: an older session of the same key
+        // (the ticket was sent back and started again) is never taken up.
+        let after = since - chrono::Duration::minutes(2);
         if let Some(there) = listed
             .iter()
-            .find(|s| s.name == key && made_in(&s.cwd) && s.state != SessionState::Closed.as_str())
+            .filter(|s| {
+                s.name == key
+                    && made_in(&s.cwd)
+                    && !matches!(s.state.as_str(), "closed" | "stopped")
+                    && s.created_at.is_none_or(|c| c >= after)
+            })
+            .max_by_key(|s| s.created_at)
         {
             return Ok(Started {
                 id: there.id,
@@ -2037,9 +2100,13 @@ impl Desk {
             .await
             .map_err(refused)?;
         let made: crew::MachineSession = serde_json::from_value(made).map_err(|_| {
-            DeskError::Invalid(format!(
-                "{machine} started {key}, but its answer couldn't be read; Desk finds it there next time."
-            ))
+            // Started there, its answer unread: found there next time.
+            (
+                DeskError::Invalid(format!(
+                    "{machine} started {key}, but its answer couldn't be read; Desk finds it there next time."
+                )),
+                true,
+            )
         })?;
         Ok(Started {
             id: made.id,

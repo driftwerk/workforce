@@ -979,3 +979,17 @@ fn over_the_limit_nothing_starts_until_it_drains() {
     assert!(next_starts(&p, &tickets, 4, 4, None).is_empty());
     assert_eq!(next_starts(&p, &tickets, 3, 4, None).len(), 1);
 }
+
+#[test]
+fn the_same_folder_on_another_computer_needs_no_copy_of_its_own() {
+    let mut here = ticket(1, TicketState::Todo, &[]);
+    here.folder = Some("/work/acme-web".into());
+    let mut there = ticket(2, TicketState::Todo, &[]);
+    there.machine = Some("devbox".into());
+    let mut there_too = ticket(3, TicketState::Todo, &[]);
+    there_too.machine = Some("devbox".into());
+    let p = plan(PlanState::Running);
+    let starts = next_starts(&p, &[here, there, there_too], 0, 4, None);
+    let copies: Vec<bool> = starts.iter().map(|s| s.worktree).collect();
+    assert_eq!(copies, [false, false, true], "only the second on devbox");
+}

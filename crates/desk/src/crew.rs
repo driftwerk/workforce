@@ -725,6 +725,9 @@ pub struct MachineSession {
     pub state: String,
     #[serde(default)]
     pub last_reply: Option<String>,
+    /// When it was made there; none from a Desk that doesn't say.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl MachineSession {
