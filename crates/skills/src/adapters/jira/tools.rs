@@ -634,7 +634,8 @@ impl Tool for JiraGetIssueTool {
             "properties": {
                 "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
-                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." }
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." },
+                "changelog": { "type": "boolean", "description": "Also answer the issue's change history (`changelog`): its newest 100 entries, oldest first." }
             },
             "required": ["issue_key"]
         })
@@ -684,6 +685,9 @@ impl Tool for JiraGetIssueTool {
                     let mut extras = issue_extras(f, None, &custom, "jira.get_issue");
                     extras.remove("reporter");
                     o.extend(extras);
+                    if input["changelog"].as_bool() == Some(true) {
+                        o.insert("changelog".into(), changelog_of(&issue["changelog"]));
+                    }
                 }
                 Ok(ToolResult::success(out, duration_ms))
             }
@@ -693,6 +697,56 @@ impl Tool for JiraGetIssueTool {
             )),
         }
     }
+}
+
+/// The most of an issue's changelog `jira.get_issue` answers.
+const CHANGELOG_MAX: usize = 100;
+
+/// An issue's expanded `changelog`, for `jira.get_issue`'s `changelog`: its
+/// newest [`CHANGELOG_MAX`] entries, oldest first, each by its author, with
+/// what each changed. The values (`fromString`, `toString`) are someone
+/// else's words, so wrapped; `total` says how many the issue has, which
+/// Jira's own expansion may already hold fewer of.
+fn changelog_of(changelog: &Value) -> Value {
+    let mut histories: Vec<&Value> = changelog["histories"]
+        .as_array()
+        .map(|h| h.iter().collect())
+        .unwrap_or_default();
+    // Jira's order isn't promised: by when, oldest first.
+    histories.sort_by(|a, b| {
+        a["created"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["created"].as_str().unwrap_or_default())
+    });
+    let from = histories.len().saturating_sub(CHANGELOG_MAX);
+    let entries: Vec<Value> = histories[from..]
+        .iter()
+        .map(|h| {
+            let items: Vec<Value> = h["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|i| {
+                    json!({
+                        "field": i["field"],
+                        "field_id": i["fieldId"],
+                        "from": wrap_field(&i["fromString"], "jira.get_issue.changelog"),
+                        "to": wrap_field(&i["toString"], "jira.get_issue.changelog"),
+                    })
+                })
+                .collect();
+            json!({
+                "id": h["id"],
+                "created": h["created"],
+                "author": h["author"]["displayName"],
+                "author_account_id": h["author"]["accountId"],
+                "author_account_type": h["author"]["accountType"],
+                "items": items,
+            })
+        })
+        .collect();
+    json!({ "total": changelog["total"], "histories": entries })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2807,6 +2861,34 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
         (Arc::new(clients), Arc::new(prefix))
+    }
+
+    /// The changelog comes back oldest first, held to its newest entries,
+    /// with each value wrapped as someone else's words.
+    #[test]
+    fn changelog_of_keeps_the_newest_entries_oldest_first_and_wraps_values() {
+        let histories: Vec<Value> = (0..105)
+            .rev()
+            .map(|n| {
+                json!({ "id": n.to_string(), "created": format!("2026-11-10T09:{:02}:{:02}.000+0000", n / 60, n % 60),
+                    "author": { "displayName": "Dana Kim", "accountId": "acc-1", "accountType": "atlassian" },
+                    "items": [{ "field": "status", "fieldId": "status", "from": "1", "fromString": "To Do",
+                        "to": "3", "toString": "In Progress" }] })
+            })
+            .collect();
+        let out = changelog_of(&json!({ "total": 105, "histories": histories }));
+        let h = out["histories"].as_array().unwrap();
+        assert_eq!(h.len(), CHANGELOG_MAX);
+        assert_eq!(h[0]["id"], "5", "the oldest five are dropped");
+        assert_eq!(h[99]["id"], "104");
+        assert_eq!(out["total"], 105);
+        assert_eq!(h[0]["author"], "Dana Kim");
+        assert_eq!(h[0]["items"][0]["field"], "status");
+        assert_eq!(
+            h[0]["items"][0]["to"],
+            wrap_field(&json!("In Progress"), "jira.get_issue.changelog")
+        );
+        assert_eq!(changelog_of(&Value::Null)["histories"], json!([]));
     }
 
     #[test]

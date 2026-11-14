@@ -56,6 +56,9 @@ pub(crate) struct Jira {
     pub comments: BTreeMap<String, Vec<(String, String, String, bool)>>,
     /// What `jira.list_comments` answers instead of the comments, when set.
     pub comments_answer: Option<Value>,
+    /// What `jira.get_issue` adds for an issue when its changelog is asked
+    /// for (`changelog`, `created`, `reporter`).
+    pub history: BTreeMap<String, Value>,
     /// What `jira.dev_status` and `jira.list_remote_links` answer, when
     /// registered: a failure while unset.
     pub dev_answer: Option<Value>,
@@ -233,21 +236,26 @@ impl Tool for FakeJiraTool {
                 j.comments_answer.clone().unwrap_or_default()
             }
             "jira.list_comments" => {
+                let total = j.comments.get(&key).map_or(0, Vec::len);
+                let first = input["start_at"].as_u64().unwrap_or(0) as usize;
+                let max = input["max_results"].as_u64().unwrap_or(50) as usize;
                 let comments: Vec<Value> = j
                     .comments
                     .get(&key)
                     .into_iter()
                     .flatten()
                     .enumerate()
+                    .skip(first)
+                    .take(max)
                     .map(|(n, (id, author, body, app))| {
-                        let at = format!("2026-11-10T09:{n:02}:00.000+0000");
+                        let at = format!("2026-11-10T{:02}:{:02}:00.000+0000", 9 + n / 60, n % 60);
                         json!({ "id": id, "author": author, "author_account_id": "acc",
                             "author_account_type": if *app { "app" } else { "atlassian" },
                             "body_html": wrapped(&format!("<p>{body}</p>"), "jira.list_comments.body"),
                             "created": at, "updated": at })
                     })
                     .collect();
-                json!({ "issue_key": key, "count": comments.len(), "total": comments.len(), "comments": comments })
+                json!({ "issue_key": key, "count": comments.len(), "total": total, "comments": comments })
             }
             "jira.myself" => {
                 json!({ "account_id": SAM_ACCOUNT, "display_name": "Sam", "email": "sam@example.com",
@@ -302,6 +310,13 @@ impl Tool for FakeJiraTool {
                         .collect();
                 }
             };
+            if self.name == "jira.get_issue" && input["changelog"] == json!(true) {
+                if let (Some(o), Some(Value::Object(h))) =
+                    (out.as_object_mut(), j.history.get(&key))
+                {
+                    o.extend(h.clone());
+                }
+            }
             match self.name {
                 "jira.get_issue" => attach(&mut out),
                 _ => out["issues"]

@@ -96,6 +96,7 @@ mod testing;
 pub mod ticket_comments;
 pub mod ticket_dev;
 pub mod ticket_files;
+pub mod ticket_history;
 mod token_pipe;
 mod transcript;
 pub mod update;

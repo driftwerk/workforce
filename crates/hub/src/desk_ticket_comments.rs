@@ -5,6 +5,10 @@
 //!   synced ticket's are read from its issue first when they are stale,
 //!   through the route its board syncs by, as the person who linked it;
 //!   when that read fails, what was kept is answered with the `problem`.
+//!   Beside them, `history`: what happened to its issue there, read with
+//!   them, when it ever was (`workforce_desk::ticket_history`). Its read
+//!   is never needed: one that fails keeps what was kept, and says no
+//!   `problem`.
 //! - `POST /api/desk/tickets/{id}/comments` `{body}`: a comment, as the
 //!   person. On a synced ticket it goes to its issue with the sync's own
 //!   comment tool (`jira.add_comment`, `linear.comment_add`), through the
@@ -99,6 +103,9 @@ async fn list(
             .await
         {
             Ok(remote) => {
+                if let Err(e) = desk.read_remote_history(id, &*remote).await {
+                    tracing::info!(ticket = %id, error = %e, "a ticket's history wasn't read");
+                }
                 if let Err(e) = desk.read_ticket_comments(id, &*remote).await {
                     tracing::info!(ticket = %id, error = %e, "a ticket's comments weren't read");
                     problem = Some(match e {
@@ -115,8 +122,21 @@ async fn list(
             Err(p) => problem = Some(paused_words(&hub, s.system, &p)),
         }
     }
+    let history = match desk.remote_history(id).await {
+        Ok(history) => history,
+        Err(e) => {
+            tracing::info!(ticket = %id, error = %e, "a ticket's history wasn't found");
+            None
+        }
+    };
     match desk.ticket_comments(id).await {
-        Ok(comments) => Json(json!({ "comments": comments, "problem": problem })).into_response(),
+        Ok(comments) => {
+            let mut answer = json!({ "comments": comments, "problem": problem });
+            if let Some(history) = history {
+                answer["history"] = json!(history);
+            }
+            Json(answer).into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
