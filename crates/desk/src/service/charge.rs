@@ -524,6 +524,7 @@ impl Desk {
         tool: &str,
         input: &serde_json::Value,
         cwd: Option<String>,
+        mode: Option<crate::mode::Mode>,
     ) -> Option<ServedCheck> {
         let boss = self.charge_of(id).filter(Charge::live)?.boss;
         if !crate::grant::is_served(&boss) {
@@ -549,7 +550,7 @@ impl Desk {
             cli_session: None,
         };
         let why = self.boss_judges(id, &pending, &boss).err()?;
-        Some(match self.served_asks(id, &boss) {
+        Some(match self.served_asks(id, &boss, mode) {
             true => ServedCheck::Ask(format!(
                 "A boss on another hub runs this session, and this call {}: its boss decides it.",
                 why.0
@@ -566,13 +567,13 @@ impl Desk {
 impl Desk {
     /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
     /// (served from a grant) to decide: while it is at Act fully in force,
-    /// a live grant of it holds the session, and the session's own mode
-    /// (as its last hook said) is one where an asked call waits for an
-    /// answer. In a mode that asks nothing (bypass, accept edits) an asked
-    /// call might run unasked, so there it is refused.
-    fn served_asks(&self, id: Uuid, boss: &str) -> bool {
+    /// a live grant of it holds the session, and the session's mode, as
+    /// this call's own hook says it (`mode`), is one where an asked call
+    /// waits for an answer. In a mode that asks nothing (bypass, accept
+    /// edits), or one not said, an asked call might run unasked, so there
+    /// it is refused.
+    fn served_asks(&self, id: Uuid, boss: &str, mode: Option<crate::mode::Mode>) -> bool {
         use crate::mode::Mode;
-        let mode = self.0.state.lock().modes_seen.get(&id).copied();
         matches!(mode, Some(Mode::Default | Mode::Plan | Mode::Auto))
             && self.full_of(boss).unbound
             && self

@@ -74,14 +74,12 @@ impl CrewHub {
         {
             let mut deciders = self.deciders.lock();
             for (link, boss, group) in links {
-                deciders.entry((boss, group)).or_default().push(
-                    DecideLink {
-                        socket,
-                        link,
-                        tx: tx.clone(),
-                        waiting: Arc::clone(&waiting),
-                    },
-                );
+                deciders.entry((boss, group)).or_default().push(DecideLink {
+                    socket,
+                    link,
+                    tx: tx.clone(),
+                    waiting: Arc::clone(&waiting),
+                });
             }
         }
         DecideUp {
@@ -310,7 +308,10 @@ impl CrewHub {
 
     /// Whether a decision of `boss` from the decide loop is being done now.
     pub(crate) fn is_deciding(&self, boss: &str) -> bool {
-        self.served_deciding.lock().get(boss).is_some_and(|n| *n > 0)
+        self.served_deciding
+            .lock()
+            .get(boss)
+            .is_some_and(|n| *n > 0)
     }
 
     /// Whether a decision of `boss` on session `id` may still be done as

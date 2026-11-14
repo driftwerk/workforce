@@ -4798,17 +4798,37 @@ impl Desk {
         if !authorised {
             return None;
         }
-        if let Some(mode) = crate::mode::of_hook(body) {
-            self.0.state.lock().modes_seen.insert(id, mode);
-        }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,
             Err(e) => {
+                if let Some(mode) = crate::mode::of_hook(body) {
+                    self.0.state.lock().modes_seen.insert(id, mode);
+                }
                 tracing::warn!(%id, error = %e, "unreadable Claude Code hook");
                 return Some(Value::Object(Default::default()));
             }
         };
+        self.mode_said(id, &hook, body);
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
+    }
+
+    /// Keeps the mode `hook` (its `body`) says session `id` runs in. A tool
+    /// call's hook that says none, or one Desk doesn't know, leaves none
+    /// kept: what a call of a session a boss served from a grant meets
+    /// is judged by the mode it runs in now, never one said before
+    /// ([`Self::served_refuses`]).
+    pub(crate) fn mode_said(&self, id: Uuid, hook: &Hook, body: &[u8]) {
+        let mode = crate::mode::of_hook(body);
+        let mut st = self.0.state.lock();
+        match (mode, hook) {
+            (Some(mode), _) => {
+                st.modes_seen.insert(id, mode);
+            }
+            (None, Hook::ToolStart { .. }) => {
+                st.modes_seen.remove(&id);
+            }
+            (None, _) => {}
+        }
     }
 
     /// Applies one hook, fired inside the sub-agent `inside` when it says:
@@ -4893,7 +4913,8 @@ impl Desk {
         // Sub-agents' calls too.
         let served = match (&hook, held.is_some() || allowed) {
             (Hook::ToolStart { call, input, .. }, false) => {
-                self.served_refuses(id, &call.tool, input, None)
+                let mode = self.0.state.lock().modes_seen.get(&id).copied();
+                self.served_refuses(id, &call.tool, input, None, mode)
             }
             _ => None,
         };

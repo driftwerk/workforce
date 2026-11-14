@@ -176,10 +176,15 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         assert_eq!(decision(&said), "ask", "{said}");
         // In a mode that asks nothing, an asked call might run unasked: it
         // is refused there, as below Act fully.
-        for mode in ["bypassPermissions", "acceptEdits"] {
+        for mode in ["bypassPermissions", "acceptEdits", "someNewMode"] {
             let said = hook(&url, pre_in(mode, "git push --force origin main")).await;
             assert_eq!(decision(&said), "deny", "{mode}: {said}");
         }
+        // Nor in a hook that says no mode: the one its last said isn't taken.
+        let mut unsaid = pre("git push --force origin main");
+        unsaid.as_object_mut().unwrap().remove("permission_mode");
+        let said = hook(&url, unsaid).await;
+        assert_eq!(decision(&said), "deny", "{said}");
         let said = hook(&url, pre("git push --force origin main")).await;
         assert_eq!(decision(&said), "ask", "{said}");
 
