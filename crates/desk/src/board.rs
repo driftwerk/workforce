@@ -452,7 +452,7 @@ pub struct External {
     /// The version of the HTML reader its body was last read with (Jira):
     /// one held from before [`HTML_READ`](crate::board_sync::HTML_READ) is
     /// read again, once; [`ADF_READ`](crate::board_sync::ADF_READ) when it
-    /// was read as Jira stores it, on open, and is never sent back.
+    /// was read as Jira stores it, on open: sent back only once edited here.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub html_read: u8,
     /// A body read as ADF: the fingerprint of the HTML-read body it took

@@ -1010,7 +1010,7 @@ pub const HTML_READ: u8 = 1;
 
 /// What [`External::html_read`](crate::board::External::html_read) says of
 /// a Jira body read as ADF on open: never read again for an old shape, and
-/// never sent back, since Jira's own document says more than it does.
+/// sent back only once edited here, its directives made plain.
 pub const ADF_READ: u8 = 2;
 
 /// A body's fingerprint (FNV-1a), the same on every build.
@@ -2315,10 +2315,13 @@ pub fn push_of(t: &Ticket, needs: &[String]) -> Push {
     let seen = &e.seen;
     Push {
         title: (t.title != seen.title).then(|| t.title.clone()),
-        // A description Desk holds only part of, or read from Jira's own
-        // document, is never sent back.
-        body: (t.body != seen.body && !e.clipped && e.html_read != ADF_READ)
-            .then(|| t.body.clone()),
+        // A description Desk holds only part of is never sent back; one
+        // read from Jira's own document goes only once edited here, its
+        // directives as plain markdown.
+        body: (t.body != seen.body && !e.clipped).then(|| match e.html_read {
+            ADF_READ => crate::ticket_markdown::jira_out(&t.body),
+            _ => t.body.clone(),
+        }),
         state: (Some(t.state) != seen.state).then_some(t.state),
         needs: needs
             .iter()

@@ -362,3 +362,41 @@ fn a_linear_collapsible_reads_as_details_and_goes_back() {
     let other = ":::panel{tone=info}\nx\n:::\n```\n:::details[a]\n```";
     assert_eq!(linear_out(other), other);
 }
+
+/// A description read as ADF and edited here goes back to Jira with its
+/// directives as plain markdown; code, links and escapes stay as they are.
+#[test]
+fn an_edited_description_goes_back_with_plain_markdown() {
+    let cases = [
+        ("Ask :mention[Dana Lee] now", "Ask @Dana Lee now"),
+        (
+            ":status[Done]{tone=success} on :date[2026-11-30]",
+            "[Done] on 2026-11-30",
+        ),
+        (
+            "![shot.png](desk-file:6f1c3b8e-0000-4000-8000-000000000001)",
+            "shot.png",
+        ),
+        (
+            "[ACME-2](https://acme.example/browse/ACME-2)",
+            "[ACME-2](https://acme.example/browse/ACME-2)",
+        ),
+        (
+            "`:mention[x]` and \\:mention\\[y\\] and a:mention[z]",
+            "`:mention[x]` and \\:mention\\[y\\] and a:mention[z]",
+        ),
+        (
+            ":::panel{tone=info}\nHeads up.\n\nTwo.\n:::\nafter",
+            "> Heads up.\n>\n> Two.\nafter",
+        ),
+        (
+            "::::panel{tone=warning}\n:::details[Logs]\nx\n:::\n::::",
+            "> **Logs**\n> x",
+        ),
+        ("```\n:mention[kept]\n```", "```\n:mention[kept]\n```"),
+        (":::other\nx\n:::", ":::other\nx\n:::"),
+    ];
+    for (md, want) in cases {
+        assert_eq!(jira_out(md), want, "{md}");
+    }
+}

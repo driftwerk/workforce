@@ -1248,11 +1248,18 @@ fn a_body_read_as_adf_stays_until_the_description_changes_there() {
             .as_deref(),
         Some("Now it works.")
     );
-    // Edited here: kept here, never sent over Jira's own document.
-    t.body = "edited here".into();
+    // Unedited, it never goes back; edited here, it goes as plain markdown.
     assert_eq!(push_of(&t, &[]).body, None);
+    t.body = "Ask :mention[Dana], edited here".into();
+    assert_eq!(
+        push_of(&t, &[]).body.as_deref(),
+        Some("Ask @Dana, edited here")
+    );
     t.external.as_mut().unwrap().html_read = HTML_READ;
-    assert_eq!(push_of(&t, &[]).body.as_deref(), Some("edited here"));
+    assert_eq!(
+        push_of(&t, &[]).body.as_deref(),
+        Some("Ask :mention[Dana], edited here")
+    );
 }
 
 /// A Linear description's issue links and collapsibles are read as Desk

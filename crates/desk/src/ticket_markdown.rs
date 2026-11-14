@@ -1239,6 +1239,150 @@ fn unescape_label(s: &str) -> String {
     out
 }
 
+// ── Back to Jira ─────────────────────────────────────────────────────────
+
+/// A description read as ADF and edited here, as Jira's markdown reader
+/// takes it: `:mention[Name]` → `@Name`, `:status[T]{…}` → `[T]`,
+/// `:date[D]` → `D`, a panel → its content quoted, a collapsible → its
+/// title in bold, then its content, a picture of the ticket's → its name.
+/// Links, code and everything else as they are.
+pub fn jira_out(md: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Open {
+        Panel,
+        Details,
+        Other,
+    }
+    let lines = fenced_lines(md);
+    let mut open: Vec<(usize, Open)> = vec![];
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (l, code) in lines {
+        let quote = "> ".repeat(open.iter().filter(|o| o.1 == Open::Panel).count());
+        let say = |out: &mut Vec<String>, text: &str| {
+            out.push(match text.is_empty() {
+                true => quote.trim_end().to_string(),
+                false => format!("{quote}{text}"),
+            })
+        };
+        if code {
+            say(&mut out, l);
+            continue;
+        }
+        let t = l.trim();
+        let colons = t.chars().take_while(|c| *c == ':').count();
+        if colons >= 3 {
+            let rest = &t[colons..];
+            if rest.trim().is_empty() {
+                if let Some((n, kind)) = open.last().copied() {
+                    if colons >= n {
+                        open.pop();
+                        if kind == Open::Other {
+                            out.push(l.to_string());
+                        }
+                        continue;
+                    }
+                }
+            } else if rest.starts_with("panel") {
+                open.push((colons, Open::Panel));
+                continue;
+            } else if let Some(title) = rest.strip_prefix("details") {
+                let title = title
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|x| x.strip_suffix(']'))
+                    .unwrap_or("")
+                    .trim();
+                if !title.is_empty() {
+                    say(&mut out, &format!("**{title}**"));
+                }
+                open.push((colons, Open::Details));
+                continue;
+            } else if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                open.push((colons, Open::Other));
+            }
+        }
+        say(&mut out, &plain_directives(l));
+    }
+    out.join("\n")
+}
+
+/// One line's text directives and pictures of the ticket's as plain
+/// markdown; code spans and escaped characters as they are.
+fn plain_directives(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    // The label from `[` at `at` to its `]`, and where it ends.
+    let label_at = |at: usize| -> Option<(&str, usize)> {
+        let mut j = at + 1;
+        while j < b.len() {
+            match b[j] {
+                b'\\' => j += 1,
+                b']' => return Some((&line[at + 1..j], j + 1)),
+                _ => {}
+            }
+            j += 1;
+        }
+        None
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && i + 1 < b.len() {
+            let n = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&line[i..i + 1 + n]);
+            i += 1 + n;
+            continue;
+        }
+        if c == b'`' {
+            let run = line[i..].bytes().take_while(|x| *x == b'`').count();
+            let fence = &line[i..i + run];
+            let to = line[i + run..]
+                .find(fence)
+                .map_or(i + run, |end| i + run + end + run);
+            out.push_str(&line[i..to]);
+            i = to;
+            continue;
+        }
+        if c == b'!' && b.get(i + 1) == Some(&b'[') {
+            if let Some((name, dest, to)) = md_link(line, i + 1) {
+                if dest.starts_with("desk-file:") {
+                    out.push_str(name);
+                    i = to;
+                    continue;
+                }
+            }
+        }
+        let word_before = i > 0 && b[i - 1].is_ascii_alphanumeric();
+        if c == b':' && !word_before {
+            let rest = &line[i + 1..];
+            let found = ["mention", "status", "date"]
+                .into_iter()
+                .find(|n| rest.starts_with(&format!("{n}[")));
+            if let Some(name) = found {
+                let at = i + 1 + name.len();
+                if let Some((text, mut end)) = label_at(at) {
+                    if b.get(end) == Some(&b'{') {
+                        if let Some(close) = line[end..].find('}') {
+                            end += close + 1;
+                        }
+                    }
+                    match name {
+                        "mention" => out.push_str(&format!("@{text}")),
+                        "status" => out.push_str(&format!("[{text}]")),
+                        _ => out.push_str(text),
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let n = line[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&line[i..i + n]);
+        i += n;
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "ticket_markdown_tests.rs"]
 mod tests;

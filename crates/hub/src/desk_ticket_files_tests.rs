@@ -420,8 +420,8 @@ async fn opening_a_ticket_reads_its_issue_once_in_a_while() {
 
 /// Opening a Jira ticket reads its description as Jira stores it, into
 /// Desk markdown with its picture by its file's id; a pull that reads the
-/// same words again leaves it, it is never sent back, and a body edited
-/// here is kept.
+/// same words again leaves it and it is never sent back unedited; a body
+/// edited here is kept, and sent with its directives as plain markdown.
 #[tokio::test]
 async fn opening_a_ticket_reads_its_description_as_jira_stores_it() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -486,24 +486,29 @@ async fn opening_a_ticket_reads_its_description_as_jira_stores_it() {
                 .filter(|(t, a)| t == "jira.update_issue" && a.get("description").is_some())
                 .count()
         };
-        assert_eq!(updates(&remote.jira), 0, "never sent back");
+        assert_eq!(updates(&remote.jira), 0, "never sent back unedited");
 
-        // Edited here: kept on the next read, and not sent over Jira's own.
+        // Edited here: kept on the next read, then sent as plain markdown.
+        let mine = want.replace("Ask", "Please ask");
         desk.edit_ticket(
             t.ticket.id,
             workforce_desk::TicketPatch {
-                body: Some("Mine now.".into()),
+                body: Some(mine.clone()),
                 ..Default::default()
             },
             &workforce_desk::crew::By::you(),
         )
         .await
         .unwrap();
-        local.sync.pass_board(b.id, false).await.unwrap();
-        assert_eq!(updates(&remote.jira), 0);
         let a = send(&local, &local.jwt, "POST", &format!("{uri}?force=1"), vec![]).await;
         assert_eq!(a.status, StatusCode::OK);
-        assert_eq!(a.json()["body"], "Mine now.");
+        assert_eq!(a.json()["body"], mine.as_str(), "an edit here is kept");
+        local.sync.pass_board(b.id, false).await.unwrap();
+        assert_eq!(updates(&remote.jira), 1, "the edit is sent");
+        assert_eq!(
+            remote.jira.lock().unwrap().issues["ACME-1"].description,
+            "> Please ask @Dana about [ACME-2](https://acme.example/browse/ACME-2)\n\nlogin.png"
+        );
     })
     .await;
 }
