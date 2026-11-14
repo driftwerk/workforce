@@ -105,7 +105,12 @@ if run == "decide":
         answer = {"decision": "block", "reason": "The person answered: HOOK_ANSWER"}
 record = {"run": run, "event": event, "start": start, "end": time.time(),
           "answered": answer, "payload": payload}
-fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+# The script makes the log before the runs and removes it after: a hook
+# that runs once the capture is over finds no log, and leaves none.
+try:
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND)
+except FileNotFoundError:
+    sys.exit(0)
 with os.fdopen(fd, "a") as f:
     f.write(json.dumps(record) + "\n")
 sys.stdout.write(json.dumps(answer))
@@ -248,6 +253,7 @@ def run_devin(devin, args, cwd):
     Devin's (it clears a draft first), never this script's."""
     tty = terminal()
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    child = None
     try:
         child = subprocess.Popen(
             [devin] + args,
@@ -259,6 +265,14 @@ def run_devin(devin, args, cwd):
         )
         return child.wait()
     finally:
+        # Whatever stopped this script stops Devin too.
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
         signal.signal(signal.SIGINT, previous)
         if tty:
             tty.close()
@@ -287,9 +301,10 @@ def read_log(log):
                 line = line.strip()
                 if line:
                     try:
-                        records.append(json.loads(line))
+                        record = json.loads(line)
                     except ValueError:
-                        records.append({"_unreadable": True})
+                        record = None
+                    records.append(record if isinstance(record, dict) else {"_unreadable": True})
     except FileNotFoundError:
         pass
     return records
@@ -313,10 +328,36 @@ def ask_yes_no(question):
     return reply.startswith("y") if reply else None
 
 
+# The only words a label of `devin auth status` is kept with. Anything else
+# could be a name: of the person, their org or their team.
+LABEL_WORDS = set(
+    """
+    a account accounts active an and api are as at auth authenticated by config
+    created credential credentials current default device display email expires
+    expiry false file for full has host id in is key keys keychain logged login
+    method mode name no none not of oauth on org orgs organization organizations
+    out path plan primary provider region role roles scope scopes server session
+    signed source sso status stored subscription team teams the tier to token
+    true type updated url user username using valid verified via webapp with
+    workspace workspaces yes you
+    """.split()
+)
+
+
+def plain_label(label):
+    """Whether `label` is made only of LABEL_WORDS (any case, snake, kebab or
+    camel), so it can say nothing of anyone."""
+    if not re.match(r"^[A-Za-z][A-Za-z _()/-]*$", label):
+        return False
+    words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", label)
+    return bool(words) and all(w.lower() in LABEL_WORDS for w in words)
+
+
 def labels_of(said):
-    """`devin auth status` as its labels alone: each line's label with its
-    value replaced, a sentence by its first words. Its shape is what Desk
-    needs; nothing it says of the person is kept."""
+    """`devin auth status`'s lines as their labels alone. A label is kept
+    only if each of its words is a LABEL_WORD; its value never is. A line
+    that isn't a label and a value is kept only if all its words are
+    LABEL_WORDS, and otherwise counted."""
     lines = []
     for line in said.splitlines():
         line = line.strip()
@@ -326,54 +367,116 @@ def labels_of(said):
             r"^(\S.{0,38}?\S)\s{2,}(\S.*)$", line
         )
         if m:
-            lines.append(m.group(1) + ": <value>" if m.group(2) else m.group(1) + ":")
-            continue
-        words = line.split()
-        kept = words[:3]
-        lines.append(" ".join(kept) + (" <…>" if len(words) > 3 else ""))
+            label = m.group(1) if plain_label(m.group(1)) else "<label>"
+            lines.append(label + (": <value>" if m.group(2) else ":"))
+        elif plain_label(line):
+            lines.append(line)
+        else:
+            n = len(line.split())
+            lines.append("<line: %d word%s>" % (n, "" if n == 1 else "s"))
     return lines
+
+
+def key_paths(value, prefix=""):
+    """A JSON value's key paths (`a.b`, `a[].c`), each key kept only if it is
+    a plain label: a key could be an org's name."""
+    paths = set()
+    if isinstance(value, dict):
+        for k, x in value.items():
+            path = (prefix + "." if prefix else "") + (k if plain_label(k) else "<key>")
+            paths.add(path)
+            paths |= key_paths(x, path)
+    elif isinstance(value, list):
+        for x in value:
+            paths |= key_paths(x, prefix + "[]")
+    return paths
+
+
+SIGNED_IN_KEY = re.compile(r"(?i)^(is_?)?((logged|signed)_?in|authenticated)$")
 
 
 def auth_status(raw):
     out = {k: raw.get(k) for k in ("exit", "error") if k in raw}
-    said = (raw.get("stdout") or "") + "\n" + (raw.get("stderr") or "")
-    lower = said.lower()
+    stdout, stderr = raw.get("stdout") or "", raw.get("stderr") or ""
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        # JSON says itself by its keys; none of its values are kept.
+        out["jsonKeyPaths"] = sorted(key_paths(parsed))
+        flags = [
+            v for k, v in (parsed.items() if isinstance(parsed, dict) else [])
+            if SIGNED_IN_KEY.match(k) and isinstance(v, bool)
+        ]
+        out["signedIn"] = flags[0] if flags else None
+        out["labels"] = labels_of(stderr)
+        return out
+    lower = (stdout + "\n" + stderr).lower()
     out["signedIn"] = (
         False
         if re.search(r"not (logged|signed) in", lower)
         else (True if re.search(r"(logged|signed) in", lower) else None)
     )
-    out["labels"] = labels_of(said)
+    out["labels"] = labels_of(stdout + "\n" + stderr)
     return out
 
 
 SECRET_KEYS = re.compile(
-    r"(token|secret|password|passwd|api[_-]?key|apikey|authori[sz]ation|auth|bearer|cookie|"
-    r"credential|session_key|private|signature|(^|_)(key|pat)$)",
-    re.I,
+    r"(?i)(token|secret|passw(or)?d|api[_-]?key|authori[sz]ation|auth(?!or)|bearer|cookie|"
+    r"credential|session[_-]?key|private|signature|(^|[_-])(key|pat)$)"
 )
-# Whatever is under these is the person's, wholesale.
+# Whatever is under these is the person's: their names are kept, not their
+# values.
 WHOLE_KEYS = re.compile(r"^(env|headers)$", re.I)
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# Starting only where a run starts: linear on a long run with no `@`.
+EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 JWT = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-BEARER = re.compile(r"(?i)\b(bearer|token|basic)(\s*[:=]?\s*)[A-Za-z0-9._~+/=-]{8,}")
+# `token: x`, `Bearer x`: a separator, then a value with a digit in it (so
+# `token_count` and `token budget` stay as they are).
+BEARER = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(bearer|token|basic)(\s+|\s*[:=]\s*)"
+    r"((?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{8,})"
+)
+# The vendors' key shapes, exactly: case, separator and length.
 VENDOR_KEY = re.compile(
-    r"(?i)\b(sk|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr]|glpat|dvn|cog|akia|asia)[-_A-Za-z0-9]{6,}"
+    r"\b(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abpr]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}\b)"
 )
 QUERY_SECRET = re.compile(
-    r"(?i)([?&;](?:[a-z_]*(?:token|key|secret|sig|code|password|auth)[a-z_]*)=)[^&\s\"']+"
+    r"(?i)([?&;](?:[a-z_]*(?:token|key|secret|sig|code|password|auth)[a-z_]*)=)([^&\s\"']+)"
 )
-# Long runs with a digit in them: keys, tokens, hashes. A path's segments
-# are split by `/`; a base64 run with `/` in it is caught by the second.
-LONG = re.compile(r"(?=[A-Za-z0-9_+=-]*[0-9])[A-Za-z0-9_+=-]{32,}")
-LONG_B64 = re.compile(r"(?<![\w~/.])(?=[A-Za-z0-9+/_=-]*[0-9])(?=[A-Za-z0-9+/_=-]*[a-z])(?=[A-Za-z0-9+/_=-]*[A-Z])[A-Za-z0-9+/_=-]{32,}")
-MCP = re.compile(r"\bmcp__(.+?)__")
+# Long runs: whether one is a key, token or hash is decided by `long_run`.
+LONG = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+MCP = re.compile(r"\bmcp__([A-Za-z0-9_-]+?)__")
+
+
+def looks_random(run):
+    """Whether a run with no `/` in it reads as a key, token or hash rather
+    than a name: a digit and both cases in fair share, or mostly digits and
+    hex."""
+    letters = [c for c in run if c.isalpha()]
+    digits = sum(c.isdigit() for c in run)
+    if not digits:
+        return False
+    upper = sum(c.isupper() for c in letters)
+    lower = len(letters) - upper
+    if letters and upper >= 0.2 * len(letters) and lower >= 0.2 * len(letters):
+        return True
+    hexish = sum(c in "0123456789abcdefABCDEF" for c in run)
+    return hexish >= 0.9 * len(run) or digits >= 0.25 * len(run)
+
+
+# Things a computer's name is made of that name no one, and that model names
+# (`gemini-2.5-pro`) are made of too.
+MACHINE_WORDS = {"macbook", "pro", "air", "mini", "imac", "studio", "max", "ultra", "mac"}
 
 
 def own_words():
     """The person's user, full and computer names: never in what is sent."""
-    words = {getpass.getuser(), socket.gethostname().split(".")[0]}
+    words = {getpass.getuser()}
+    machine = {socket.gethostname().split(".")[0]}
     try:
         import pwd
 
@@ -395,10 +498,16 @@ def own_words():
             except Exception:  # noqa: BLE001
                 name = ""
             if name:
-                words.add(name)
-                words.update(name.replace("-", " ").split())
+                machine.add(name)
+    for name in list(machine):
+        words.add(name)
+        # "Alice's MacBook Pro": Alice, not MacBook or Pro.
+        for part in re.split(r"[\s_-]+", name):
+            part = re.sub(r"['’]s$", "", part)
+            if part.lower() not in MACHINE_WORDS:
+                words.add(part)
     # Longest first, so a full name goes before its parts.
-    return sorted((w for w in words if w and len(w) > 2), key=len, reverse=True)
+    return sorted((w for w in words if w and len(w) >= 3), key=len, reverse=True)
 
 
 class Scrubber:
@@ -409,47 +518,68 @@ class Scrubber:
         self.words = own_words()
         self.seen = {}
 
-    def mark(self, kind):
-        # Each one numbered, so the same id reads the same everywhere.
-        def replace(m):
-            key = (kind, m.group(0).lower())
-            if key not in self.seen:
-                self.seen[key] = "<%s-%d>" % (kind, len(self.seen) + 1)
-            return self.seen[key]
+    def place(self, kind, found, fold=False):
+        # Each one numbered, so the same value reads the same everywhere and
+        # two never read the same.
+        key = (kind, found.lower() if fold else found)
+        if key not in self.seen:
+            self.seen[key] = "<%s-%d>" % (kind, len(self.seen) + 1)
+        return self.seen[key]
 
-        return replace
+    def mark(self, kind, fold=False):
+        return lambda m: self.place(kind, m.group(0), fold)
+
+    def long_run(self, m):
+        run = m.group(0)
+        if "/" not in run:
+            return self.place("long", run) if looks_random(run) else run
+        # A path, unless it reads as base64: not rooted, no empty segment,
+        # no extension after it, and random as a whole.
+        rooted = run.startswith("/") or m.start() > 0 and m.string[m.start() - 1] in "~."
+        extension = m.string[m.end() : m.end() + 1] == "."
+        if not rooted and "//" not in run and not run.endswith("/") and not extension:
+            if looks_random(run.replace("/", "")):
+                return self.place("long", run)
+        return "/".join(
+            self.place("long", seg) if len(seg) >= 32 and looks_random(seg) else seg
+            for seg in run.split("/")
+        )
 
     def text(self, s):
         if self.home and len(self.home) > 1:
-            s = s.replace(self.home, "~")
-        s = MCP.sub(lambda m: "mcp__" + self.mark("server")(m) + "__", s)
-        s = UUID.sub(self.mark("uuid"), s)
-        s = JWT.sub("<token>", s)
-        s = BEARER.sub(lambda m: m.group(1) + m.group(2) + "<token>", s)
-        s = QUERY_SECRET.sub(lambda m: m.group(1) + "<redacted>", s)
-        s = VENDOR_KEY.sub("<key>", s)
-        s = EMAIL.sub("<email>", s)
-        s = LONG.sub(self.mark("long"), s)
-        s = LONG_B64.sub(self.mark("long"), s)
+            s = re.sub(re.escape(self.home) + r"(?=/|$|[\s\"'])", "~", s)
+        s = MCP.sub(lambda m: "mcp__" + self.place("server", m.group(1)) + "__", s)
+        s = UUID.sub(self.mark("uuid", fold=True), s)
+        s = JWT.sub(self.mark("token"), s)
+        s = BEARER.sub(lambda m: m.group(1) + m.group(2) + self.place("token", m.group(3)), s)
+        s = QUERY_SECRET.sub(lambda m: m.group(1) + self.place("redacted", m.group(2)), s)
+        s = VENDOR_KEY.sub(self.mark("key"), s)
+        s = EMAIL.sub(self.mark("email", fold=True), s)
+        s = LONG.sub(self.long_run, s)
         for word in self.words:
-            s = re.sub(r"(?<!\w)" + re.escape(word) + r"(?!\w)", "<name>", s, flags=re.I)
+            s = re.sub(
+                r"(?<!\w)" + re.escape(word) + r"(?!\w)",
+                lambda m: self.place("name", m.group(0), fold=True),
+                s,
+                flags=re.I,
+            )
         return s
 
-    def value(self, v):
+    def value(self, v, secret=False):
+        """`v` scrubbed. Under a key that names a secret, every string is
+        replaced; keys, numbers, booleans and the shape are kept."""
         if isinstance(v, str):
-            return self.text(v)
+            return "<redacted>" if secret and v else self.text(v)
         if isinstance(v, list):
-            return [self.value(x) for x in v]
+            return [self.value(x, secret) for x in v]
         if isinstance(v, dict):
             out = {}
             for k, x in v.items():
-                k2 = self.text(k)
-                if WHOLE_KEYS.search(k) and isinstance(x, dict):
-                    out[k2] = {self.text(name): "<redacted>" for name in x}
-                elif SECRET_KEYS.search(k) and not isinstance(x, bool) and x not in (None, ""):
-                    out[k2] = "<redacted>"
-                else:
-                    out[k2] = self.value(x)
+                k2 = self.text(k) if isinstance(k, str) else k
+                while k2 in out:  # never merge two keys into one
+                    k2 = "%s#" % k2
+                hidden = secret or bool(WHOLE_KEYS.search(k) or SECRET_KEYS.search(k))
+                out[k2] = self.value(x, hidden)
             return out
         return v
 
@@ -474,6 +604,11 @@ def shapes(records):
 CALL_ID = re.compile(r"(?i)(call|use).?id$")
 
 
+def payload_of(record):
+    p = record.get("payload")
+    return p if isinstance(p, dict) else {}
+
+
 def findings(records, prompted_again, asked_again):
     """What the capture was for, read off the records."""
     ids = set()
@@ -490,11 +625,11 @@ def findings(records, prompted_again, asked_again):
     for i, r in enumerate(decide):
         if r.get("event") != "PermissionRequest":
             continue
-        p = r.get("payload") or {}
+        p = payload_of(r)
         tool, cid = p.get("tool_name"), call_id(p)
 
         def same(x):
-            q = x.get("payload") or {}
+            q = payload_of(x)
             if cid is not None:
                 return call_id(q) == cid
             return q.get("tool_name") == tool
@@ -512,7 +647,7 @@ def findings(records, prompted_again, asked_again):
             }
         )
     stops = [
-        (r.get("payload") or {}).get("last_assistant_message")
+        payload_of(r).get("last_assistant_message")
         for r in decide
         if r.get("event") == "Stop"
     ]
@@ -531,7 +666,7 @@ def findings(records, prompted_again, asked_again):
         "secondRunReplyNamesHookAnswer": HOOK_ANSWER.lower() in said.lower() if said else None,
         "secondRunReplyNamesPersonAnswer": PERSON_ANSWER.lower() in said.lower() if said else None,
         "sessionStartSources": [
-            {"run": r.get("run"), "source": (r.get("payload") or {}).get("source")}
+            {"run": r.get("run"), "source": payload_of(r).get("source")}
             for r in records
             if r.get("event") == "SessionStart"
         ],
@@ -562,6 +697,7 @@ def capture(devin, home, folder):
     observe = os.path.join(folder, "observe.json")
     decide = os.path.join(folder, "decide.json")
     out = os.path.join(folder, "devin-capture.json")
+    part = out + ".part"
     try:
         os.makedirs(work, mode=0o700)
         if shutil.which("git"):
@@ -569,6 +705,8 @@ def capture(devin, home, folder):
                 ["git", "init", "-q", work], stdin=subprocess.DEVNULL
             )
         private_file(hook, HOOK)
+        # The hooks only append to it: once it is removed, none can make it again.
+        private_file(log, "")
         mine, had_config = person_config(home)
         before = fingerprint(home)
 
@@ -586,6 +724,7 @@ def capture(devin, home, folder):
                 ["--config", observe, "--permission-mode", "normal", "--", FIRST_PROMPT],
                 work,
             )
+            time.sleep(1)  # for a hook still writing
         finally:
             remove(observe)
 
@@ -598,7 +737,7 @@ def capture(devin, home, folder):
             return 1
 
         started = [
-            (r.get("payload") or {}).get("session_id")
+            payload_of(r).get("session_id")
             for r in read_log(log)
             if r.get("event") == "SessionStart"
         ]
@@ -628,6 +767,7 @@ def capture(devin, home, folder):
                 ["--config", decide, "--permission-mode", "normal"] + resume + ["--", SECOND_PROMPT],
                 work,
             )
+            time.sleep(1)
         finally:
             remove(decide)
 
@@ -657,13 +797,18 @@ def capture(devin, home, folder):
         # everything under them is scrubbed.
         scrub = Scrubber(home)
         result = {k: scrub.value(v) for k, v in result.items()}
-        private_file(out, json.dumps(result, indent=2))
+        # Written whole or not at all: an interrupt never leaves half of it.
+        private_file(part, json.dumps(result, indent=2))
+        os.replace(part, out)
         if not session:
             say("Note: run 1 said no session id, so run 2 was a new session, not a resume.")
         say("Done. Send this one file (look it over first if you like):\n  " + out)
         return 0
     finally:
-        for path in (hook, log, observe, decide, work):
+        # Nothing stops the clean-up.
+        for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            signal.signal(s, signal.SIG_IGN)
+        for path in (hook, log, observe, decide, part, work):
             remove(path)
         if not os.path.exists(out):
             remove(folder)
@@ -682,10 +827,14 @@ def main():
     )
     os.makedirs(folder, mode=0o700)
     os.chmod(folder, stat.S_IRWXU)
+    out = os.path.join(folder, "devin-capture.json")
     try:
         return capture(devin, home, folder)
     except KeyboardInterrupt:
-        say("Stopped; nothing was kept.")
+        if os.path.exists(out):
+            say("Stopped after the capture was written. Send this one file:\n  " + out)
+        else:
+            say("Stopped; nothing was kept.")
         return 130
 
 
