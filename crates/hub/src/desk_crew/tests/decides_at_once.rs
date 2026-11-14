@@ -377,3 +377,76 @@ async fn a_decision_desk_refused_is_dropped_once_act_fully_isnt_in_force() {
     })
     .await;
 }
+
+/// The person's standing orders are the rule, both ways, and reach the
+/// decision call in their own words: an order that forbids production
+/// gets a converge run denied, with what to do instead; one that wants
+/// work shipped gets it allowed. Desk holds no stance of its own on
+/// production.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_orders_decide_a_production_step_both_ways() {
+    for (order, verdict, behaves) in [
+        (
+            "Do not let anything touch production tonight",
+            "DENY: the person said nothing may touch production tonight\nINSTEAD: run the converge against staging",
+            "deny",
+        ),
+        (
+            "Shipping the cufflink converge to production tonight is vital, as long as nothing breaks",
+            "ALLOW: the person wants it shipped; the session checks nothing broke",
+            "allow",
+        ),
+    ] {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(dir.path()).unwrap();
+            let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
+            d.boss_bounds_with(workforce_desk::charge::Bounds {
+                home: base.clone(),
+                ..Default::default()
+            });
+            // It decides only what the person's own words, quoted, say.
+            decides(&llm, &format!("“{order}”"), verdict).await;
+            let (_, o) = crew.overseer_service().unwrap();
+            assert!(crew.unbound(&o));
+            eventually("Desk to know it is unbound", async || {
+                d.boss_unbound("desk").then_some(())
+            })
+            .await;
+            // Said in a turn that acted on another session, as the person's
+            // orders are kept: it still rules this one.
+            let earlier = new_session(&d, &base, "Cufflink Docs").await;
+            d.store()
+                .item_open(&workforce_desk::open_item::NewItem::order(
+                    "desk",
+                    order,
+                    vec![earlier.id],
+                    Some("m1"),
+                ))
+                .await
+                .unwrap();
+            let s = new_session(&d, &base, "Cufflink Migration").await;
+            let url = hook_url(&base, s.id).await;
+            let answer = tokio::time::timeout(
+                Duration::from_secs(10),
+                asked(&url, "make converge ENV=production"),
+            )
+            .await
+            .expect("decided within seconds")
+            .unwrap();
+            assert_eq!(behavior(&answer), behaves, "{order}: {answer}");
+            if behaves == "deny" {
+                let message = answer["hookSpecificOutput"]["decision"]["message"].to_string();
+                assert!(message.contains("against staging"), "{message}");
+            }
+            let call = calls_about(&llm, "make converge ENV=production").await;
+            assert_eq!(call.len(), 1, "one decision call");
+            assert!(
+                call[0].contains("The person's standing orders, in their own words"),
+                "quoted as the person's own words: {}",
+                call[0]
+            );
+        })
+        .await;
+    }
+}

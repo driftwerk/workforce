@@ -589,8 +589,9 @@ impl CrewHub {
         let (level, outward) = match self.ships_in(session, o) {
             true => (
                 Level::Full,
-                "deletes, spends, sends to people, changes scope or touches secrets (merging, pushing to the \
-                 default branch, tagging, promoting and deploying this repository are yours at Act fully)",
+                "deletes, spends, sends to people, changes scope or touches secrets, where the person's own \
+                 orders and preferences don't cover it (merging, pushing to the default branch, tagging, \
+                 promoting and deploying this repository are yours at Act fully)",
             ),
             false => (
                 match o.level {
@@ -604,7 +605,17 @@ impl CrewHub {
         let unbound = self.unbound(o);
         let (outward, level_line) = match unbound {
             true => ("you truly can't decide, and say why", Self::boss_hint(o)),
-            false => (outward, Self::level_line(level).to_string()),
+            false => (
+                outward,
+                match level {
+                    Level::Full => format!(
+                        "{} {}",
+                        Self::level_line(level),
+                        super::watcher::STANDING_RULE
+                    ),
+                    _ => Self::level_line(level).to_string(),
+                },
+            ),
         };
         if !ended.is_empty() {
             let said = match lines.is_empty() {

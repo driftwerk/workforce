@@ -593,7 +593,20 @@ fn marked(items: &[Item], out: &mut String, start: bool, cell: bool, one_line: b
         match &it.piece {
             Piece::Text(_) => out.push_str(&escape(body, line_start, cell)),
             Piece::Code(c) => out.push_str(&code_span(c, cell)),
-            Piece::Made(m) => out.push_str(m),
+            Piece::Made(m) => {
+                // A directive needs a word start: right after a letter or
+                // digit Desk reads it as words (`Owner:mention[Ann]`), so a
+                // space goes between. Only a directive: a picture's alt can
+                // start `:)`.
+                let directive = [":mention[", ":status[", ":date["]
+                    .iter()
+                    .any(|d| m.starts_with(d));
+                let after_word = out.chars().next_back().is_some_and(char::is_alphanumeric);
+                if directive && after_word {
+                    out.push(' ');
+                }
+                out.push_str(m)
+            }
             Piece::Break => {}
         }
     }
@@ -1355,9 +1368,277 @@ pub fn linear_out(md: &str) -> String {
                 open.push((colons, false));
             }
         }
-        out.push(l.to_string());
+        out.push(linear_mentions_out(l));
     }
     out.join("\n")
+}
+
+/// The workspace of a Linear issue's address
+/// (`https://linear.app/<workspace>/issue/KEY[/slug]`).
+pub fn linear_workspace(issue_url: &str) -> Option<&str> {
+    linear_issue_key(issue_url)?;
+    let rest = issue_url.strip_prefix("https://linear.app/")?;
+    rest.split_once('/').map(|(ws, _)| ws)
+}
+
+/// The slug of `url` when it is a Linear profile's address in workspace
+/// `ws` (`https://linear.app/<ws>/profiles/<slug>`).
+fn linear_profile<'a>(url: &'a str, ws: &str) -> Option<&'a str> {
+    let rest = url
+        .strip_prefix("https://linear.app/")?
+        .strip_prefix(ws)?
+        .strip_prefix("/profiles/")?;
+    let slug = rest.strip_suffix('/').unwrap_or(rest);
+    let ok = (2..=64).contains(&slug.len())
+        && slug
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+    (ok && !ws.is_empty()).then_some(slug)
+}
+
+/// A Linear profile's address in a line: where it is, what it is, and a
+/// link's words when it is one.
+struct Profile<'a> {
+    at: usize,
+    to: usize,
+    url: &'a str,
+    slug: &'a str,
+    text: Option<&'a str>,
+    /// Written `<address>`.
+    angled: bool,
+}
+
+/// The addresses of workspace `ws`'s Linear profiles in `line`, bare, as
+/// autolinks or as links; never in code, a picture or right after a word
+/// (where a mention couldn't start).
+fn linear_profiles_in<'a>(line: &'a str, ws: &str) -> Vec<Profile<'a>> {
+    let b = line.as_bytes();
+    let mut found = vec![];
+    let mut spans = CodeSpans::of(line);
+    let after_word = |i: usize| i > 0 && b[i - 1].is_ascii_alphanumeric();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && i + 1 < b.len() {
+            i += 1 + line[i + 1..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        if c == b'`' {
+            i = spans.skip(line, i);
+            continue;
+        }
+        if c == b'[' {
+            if let Some((text, dest, to)) = md_link(line, i) {
+                let picture = i > 0 && b[i - 1] == b'!';
+                if let Some(slug) = linear_profile(dest, ws).filter(|_| !picture && !after_word(i))
+                {
+                    found.push(Profile {
+                        at: i,
+                        to,
+                        url: dest,
+                        slug,
+                        text: Some(text),
+                        angled: false,
+                    });
+                }
+                i = to;
+                continue;
+            }
+        }
+        if c == b'<' {
+            let end = line[i + 1..]
+                .bytes()
+                .take(LOOK_MAX)
+                .position(|x| x == b'>' || x == b'<' || x.is_ascii_whitespace())
+                .map(|p| i + 1 + p)
+                .filter(|p| b[*p] == b'>');
+            if let Some(end) = end {
+                let inner = &line[i + 1..end];
+                if inner.contains("://") {
+                    if let Some(slug) = linear_profile(inner, ws).filter(|_| !after_word(i)) {
+                        found.push(Profile {
+                            at: i,
+                            to: end + 1,
+                            url: inner,
+                            slug,
+                            text: None,
+                            angled: true,
+                        });
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        // A bare address starts a word: not inside another, nor a quoted
+        // attribute's (`{url="…"}`).
+        let starts = i == 0
+            || !(b[i - 1].is_ascii_alphanumeric()
+                || matches!(
+                    b[i - 1],
+                    b'-' | b'_' | b'/' | b'.' | b'@' | b':' | b'"' | b'='
+                ));
+        if c == b'h' && starts && line[i..].starts_with("https://") {
+            let len = line[i..]
+                .find(|ch: char| ch.is_whitespace() || ch == '<')
+                .unwrap_or(line.len() - i);
+            let url =
+                line[i..i + len].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'', '"']);
+            if let Some(slug) = linear_profile(url, ws) {
+                found.push(Profile {
+                    at: i,
+                    to: i + url.len(),
+                    url,
+                    slug,
+                    text: None,
+                    angled: false,
+                });
+            }
+            i += url.len().max(1);
+            continue;
+        }
+        i += line[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    found
+}
+
+/// The slugs of workspace `ws`'s Linear profiles `md` names (outside
+/// code), each once, at most `max`: the members a description mentions.
+pub fn linear_profile_slugs(md: &str, ws: &str, max: usize) -> Vec<String> {
+    let mut slugs: Vec<String> = vec![];
+    for (l, code) in fenced_lines(md) {
+        if code || l.trim_start().starts_with(":::") {
+            continue;
+        }
+        for p in linear_profiles_in(l, ws) {
+            if slugs.len() >= max {
+                return slugs;
+            }
+            if !slugs.iter().any(|s| s == p.slug) {
+                slugs.push(p.slug.to_string());
+            }
+        }
+    }
+    slugs
+}
+
+/// `md` (a Linear description, as Desk markdown) with each of workspace
+/// `ws`'s profiles that `names` has (by slug) as a mention of that member,
+/// `:mention[Name]{url="…"}`, a link's words kept as `text="…"` (an
+/// autolink as `form="autolink"`) so it goes back as it came
+/// ([`linear_out`]). Never in a collapsible's title. Anything else as it is.
+pub fn linear_mentions(md: &str, ws: &str, names: &HashMap<String, String>) -> String {
+    if names.is_empty() {
+        return md.to_string();
+    }
+    let lines: Vec<String> = fenced_lines(md)
+        .into_iter()
+        .map(|(l, code)| {
+            // A collapsible's title goes back as a title: left as it is.
+            if code || l.trim_start().starts_with(":::") {
+                return l.to_string();
+            }
+            let mut out = String::with_capacity(l.len());
+            let mut last = 0;
+            for p in linear_profiles_in(l, ws) {
+                let Some(name) = names.get(p.slug).filter(|n| !n.trim().is_empty()) else {
+                    continue;
+                };
+                let text = match p.text {
+                    Some(t) if t.contains(['"', '\\']) => continue,
+                    Some(t) => format!(" text=\"{t}\""),
+                    None if p.angled => " form=\"autolink\"".to_string(),
+                    None => String::new(),
+                };
+                out.push_str(&l[last..p.at]);
+                out.push_str(&format!(
+                    ":mention[{}]{{url=\"{}\"{text}}}",
+                    label(name, false),
+                    p.url
+                ));
+                last = p.to;
+            }
+            out.push_str(&l[last..]);
+            out
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// One line's Linear mentions ([`linear_mentions`]) back as Linear had
+/// them: the profile's address, or its link; anything else as it is.
+fn linear_mentions_out(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut spans = CodeSpans::of(line);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && i + 1 < b.len() {
+            let n = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&line[i..i + 1 + n]);
+            i += 1 + n;
+            continue;
+        }
+        if c == b'`' {
+            let to = spans.skip(line, i);
+            out.push_str(&line[i..to]);
+            i = to;
+            continue;
+        }
+        if c == b':' && line[i..].starts_with(":mention[") {
+            if let Some((back, to)) = linear_mention_at(line, i) {
+                out.push_str(&back);
+                i = to;
+                continue;
+            }
+        }
+        let n = line[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&line[i..i + n]);
+        i += n;
+    }
+    out
+}
+
+/// The Linear mention [`linear_mentions`] wrote at `at` in `line`, as
+/// Linear had it, and where it ends.
+fn linear_mention_at(line: &str, at: usize) -> Option<(String, usize)> {
+    let b = line.as_bytes();
+    // Its label, to its `]`.
+    let mut j = at + ":mention[".len();
+    loop {
+        match b.get(j)? {
+            b'\\' => j += 2,
+            b']' => break,
+            b'[' => return None,
+            _ => j += 1,
+        }
+        if j > at + LOOK_MAX {
+            return None;
+        }
+    }
+    let rest = line.get(j + 1..)?.strip_prefix("{url=\"")?;
+    let (url, rest) = rest.split_once('"')?;
+    let ws = url.strip_prefix("https://linear.app/")?.split_once('/')?.0;
+    linear_profile(url, ws)?;
+    let (text, rest) = match rest.strip_prefix(" text=\"") {
+        Some(r) => {
+            let (t, r) = r.split_once('"')?;
+            (Some(t), r)
+        }
+        None => (None, rest),
+    };
+    let (angled, rest) = match rest.strip_prefix(" form=\"autolink\"") {
+        Some(r) if text.is_none() => (true, r),
+        _ => (false, rest),
+    };
+    let rest = rest.strip_prefix('}')?;
+    let back = match (text, angled) {
+        (Some(t), _) => format!("[{t}]({url})"),
+        (None, true) => format!("<{url}>"),
+        (None, false) => url.to_string(),
+    };
+    Some((back, line.len() - rest.len()))
 }
 
 fn unescape_label(s: &str) -> String {

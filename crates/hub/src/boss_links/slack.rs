@@ -184,19 +184,31 @@ pub async fn thread_is_theirs(service: &AgentService, person: &str, key: &str) -
     )
 }
 
-/// Posts `text`, an agent's answer, into the Slack DM thread `key`: made
-/// safe to send first (no secret, no tool output).
-pub async fn post_in_thread(service: &AgentService, key: &str, text: &str) -> Result<(), String> {
-    post(
-        service,
-        key,
-        &crate::slack_manager::sanitize_outbound_logged(text),
-    )
-    .await
+/// Posts `blocks`, an agent's answer laid out, into the Slack DM thread
+/// `key`, `text` its notification: made safe to send first (no secret, no
+/// tool output).
+pub async fn post_blocks_in_thread(
+    service: &AgentService,
+    key: &str,
+    text: &str,
+    blocks: Vec<Value>,
+) -> Result<(), String> {
+    let text = crate::slack_manager::sanitize_outbound_logged(text);
+    // No blocks at all: the text alone.
+    send(service, key, &text, (!blocks.is_empty()).then_some(blocks)).await
 }
 
 /// Posts `text` as it is into the Slack DM thread `key`.
 async fn post(service: &AgentService, key: &str, text: &str) -> Result<(), String> {
+    send(service, key, text, None).await
+}
+
+async fn send(
+    service: &AgentService,
+    key: &str,
+    text: &str,
+    blocks: Option<Vec<Value>>,
+) -> Result<(), String> {
     let (workspace, channel, thread) = dm_thread(key).ok_or("not a Slack DM thread")?;
     let hint = workforce_common::channels::ChannelHint::from_parts(
         Some(workspace.to_string()),
@@ -213,6 +225,7 @@ async fn post(service: &AgentService, key: &str, text: &str) -> Result<(), Strin
     surface
         .send_message(&OutboundMessage {
             thread_id: Some(thread.to_string()),
+            blocks,
             ..OutboundMessage::text(channel, text)
         })
         .await

@@ -435,6 +435,9 @@ impl Budget {
     }
 }
 
+/// The most members one Linear description's mentions are looked up for.
+const MENTIONS_MAX: usize = 5;
+
 /// How far before the latest change a read-through Linear listing saw its
 /// cursor goes.
 const LINEAR_LOOKBACK: chrono::Duration = chrono::Duration::minutes(2);
@@ -1202,7 +1205,10 @@ impl Desk {
         issue: &Issue,
     ) -> Result<Issue, RemoteError> {
         if issue.body.is_some() {
-            return Ok(issue.clone());
+            return Ok(match s.system {
+                System::Linear => Self::with_mentions(remote, budget, issue.clone()).await,
+                System::Jira => issue.clone(),
+            });
         }
         budget.take()?;
         let (tool, args) =
@@ -1215,6 +1221,44 @@ impl Desk {
             url: issue.url.clone(),
             ..read
         })
+    }
+
+    /// `issue` (a Linear one) with the profiles of its own workspace its
+    /// description names as mentions of the members they are, found by the
+    /// hub one by one within `budget`: any not found, or not found for
+    /// sure (no hub lookup, a failed one, two that match), is left as it is.
+    async fn with_mentions(remote: &dyn Remote, budget: &mut Budget, mut issue: Issue) -> Issue {
+        let (Some(body), Some(ws)) = (
+            issue.body.as_deref(),
+            crate::ticket_markdown::linear_workspace(&issue.url),
+        ) else {
+            return issue;
+        };
+        let mut names = std::collections::HashMap::new();
+        for slug in crate::ticket_markdown::linear_profile_slugs(body, ws, MENTIONS_MAX) {
+            if budget.take().is_err() {
+                break;
+            }
+            let lookup = crate::board_sync::call_quiet(
+                remote,
+                System::Linear,
+                crate::board_sync::members_tool(System::Linear),
+                json!({ "name": slug }),
+            )
+            .await;
+            if let Some(name) = lookup
+                .ok()
+                .and_then(|a| crate::board_sync::profile_member(&a, ws, &slug))
+            {
+                names.insert(slug, name);
+            }
+        }
+        let made = crate::ticket_markdown::linear_mentions(body, ws, &names);
+        // Only what is still held whole: a mention is longer than its address.
+        if made.chars().count() <= crate::board::BODY_MAX {
+            issue.body = Some(made);
+        }
+        issue
     }
 
     /// Whether `issue`, not on the board, comes onto it: anything the

@@ -2392,7 +2392,30 @@ mod uplink_tests {
         let v = decided(&mut a).await.expect("refused, said so");
         assert_eq!(v["decideId"], json!(id));
         assert!(v.get("text").is_none() && v["error"].is_string(), "{v}");
+        assert_eq!(v["code"], "not_a_decision", "{v}");
         let calls = llms[0].received_requests().await.unwrap().len();
+        // Past its room at once: refused for its pace, said so by its code.
+        let held: Vec<_> = (0..crate::boss_links::decide::DECIDES_AT_ONCE)
+            .map(|_| {
+                hub.fx
+                    .state
+                    .uplinks
+                    .decide_room(acme.link.link_id)
+                    .expect("room")
+            })
+            .collect();
+        let id = Uuid::new_v4();
+        send(
+            &mut a,
+            json!({"type": "decide", "linkId": acme.link.link_id, "decideId": id,
+                   "prompt": "[Desk decision] z"}),
+        )
+        .await;
+        let v = decided(&mut a).await.expect("paced, said so");
+        assert_eq!(v["decideId"], json!(id));
+        assert_eq!(v["code"], "paced", "{v}");
+        drop(held);
+        assert_eq!(llms[0].received_requests().await.unwrap().len(), calls);
 
         // A revoked link's decision makes no call: it is refused, or its
         // socket, with no link left, closes.
@@ -2405,6 +2428,7 @@ mod uplink_tests {
         .await;
         if let Some(v) = decided(&mut a).await {
             assert!(v.get("text").is_none() && v["error"].is_string(), "{v}");
+            assert_eq!(v["code"], "link", "{v}");
         }
         assert_eq!(llms[0].received_requests().await.unwrap().len(), calls);
     }
