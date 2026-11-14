@@ -341,13 +341,31 @@ pub fn hook_command(
     };
     let file = quote(&hook_file.display().to_string())?;
     let header = quote(&format!("{EVENT_HEADER}: {event}"))?;
-    let post = format!("curl -q -sf --max-time {timeout} -K {file} -H {header} --data-binary @-");
+    let curl = quote(curl_program())?;
+    let post = format!("{curl} -q -sf --max-time {timeout} -K {file} -H {header} --data-binary @-");
     Ok(match fail_closed {
         true => format!(
             "{post} || {{ echo {} >&2; exit 2; }}",
             quote(claude::UNREACHED)?
         ),
         false => post,
+    })
+}
+
+/// The `curl` hooks run: the system's own, by its path, never one a
+/// folder early on the session's `PATH` puts first.
+fn curl_program() -> &'static str {
+    static CURL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CURL.get_or_init(|| {
+        [
+            "/usr/bin/curl",
+            "/bin/curl",
+            "/opt/homebrew/bin/curl",
+            "/usr/local/bin/curl",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("curl")
     })
 }
 
@@ -474,17 +492,31 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
     };
     let raw = p.get("tool_input").cloned().unwrap_or(Value::Null);
     let Some(read) = tool_of(&name, &raw) else {
+        // Never one of Claude Code's names, which Desk would judge as that
+        // tool on input it never read: Devin's own, marked as Devin's. An
+        // MCP server's tool keeps its name, which says whose it is.
+        if !name.starts_with("mcp__") {
+            p.insert(
+                "tool_name".into(),
+                Value::String(format!("{UNKNOWN}{name}")),
+            );
+        }
         return;
     };
     let mut input = read.input;
     input.insert(RAW.into(), json!({ "tool": name, "input": raw }));
     p.insert("tool_name".into(), Value::String(read.tool.into()));
     p.insert("tool_input".into(), Value::Object(input));
-    // Where a command runs, when it says: what its paths are read against.
-    if let Some(cwd) = read.cwd {
-        p.insert("cwd".into(), Value::String(cwd));
+    // Devin's commands run in a shell that stays, wherever it was moved
+    // to: never judged where its payload says Devin started, but where
+    // Desk saw the session go.
+    if read.tool == "Bash" {
+        p.remove("cwd");
     }
 }
+
+/// What a tool Desk doesn't read is named by: Devin's name after it.
+pub const UNKNOWN: &str = "devin.";
 
 /// A field Desk reads of a tool's input: its name in Claude Code's terms,
 /// the names Devin may give it, and whether the tool can't run without it.
@@ -494,8 +526,6 @@ type Field<'a> = (&'a str, &'a [&'a str], bool);
 struct Read {
     tool: &'static str,
     input: Map<String, Value>,
-    /// Where it runs, when its input says (an absolute path).
-    cwd: Option<String>,
 }
 
 /// The one text `input` has under any of `keys`. `Err`: it has one that
@@ -543,8 +573,6 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
                 "description",
                 "run_in_background",
                 "background",
-                "cwd",
-                "workdir",
             ],
         ),
         "edit" => (
@@ -631,7 +659,6 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
             return Some(Read {
                 tool: claude::DIALOG_TOOL,
                 input: out,
-                cwd: None,
             });
         }
         "exit_plan_mode" => (
@@ -659,17 +686,7 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
             None => {}
         }
     }
-    let mut cwd = None;
     match name {
-        "exec" => {
-            if let Some(dir) = text_of(input, &["cwd", "workdir"]).ok()? {
-                // Relative to what Desk can't be sure: none.
-                if !Path::new(dir).is_absolute() {
-                    return None;
-                }
-                cwd = Some(dir.to_string());
-            }
-        }
         // A search without a place searches where the session runs.
         "grep" | "glob" if !out.contains_key("path") => {
             out.insert("path".into(), Value::String(".".into()));
@@ -681,11 +698,7 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
         }
         _ => {}
     }
-    Some(Read {
-        tool,
-        input: out,
-        cwd,
-    })
+    Some(Read { tool, input: out })
 }
 
 /// The files a patch in `*** Begin Patch` form names: each it adds,
@@ -1059,7 +1072,7 @@ mod tests {
             assert_eq!(h["type"], "command");
             let c = h["command"].as_str().unwrap();
             assert!(
-                c.starts_with("curl -q -sf --max-time "),
+                c.starts_with(&format!("{} -q -sf --max-time ", curl_program())),
                 "no ~/.curlrc: {c}"
             );
             assert!(c.contains("-K '/run dir/0.hook'"), "{c}");
@@ -1233,19 +1246,28 @@ mod tests {
         }
         // A search without a place searches where the session runs.
         assert_eq!(start("grep", json!({"pattern": "x"})).1["path"], ".");
-        // Unknown to Desk, or what it can't read the effect of: its own
-        // name, its input untouched.
+        // Unknown to Desk, or what it can't read the effect of: Devin's
+        // name, marked as Devin's, its input untouched; never one of Claude
+        // Code's, which Desk would judge as that tool.
         for devin in [
             "request_scope",
-            "mcp__github__create_issue",
             "kill_shell",
             "write_to_process",
             "run_subagent",
             "read_subagent",
+            "Task",
+            "Read",
+            "WebSearch",
         ] {
             let (tool, input) = start(devin, json!({"a": 1}));
-            assert_eq!((tool.as_str(), input), (devin, json!({"a": 1})));
+            assert_eq!(tool, format!("devin.{devin}"));
+            assert_eq!(input, json!({"a": 1}));
         }
+        // An MCP server's keeps its name.
+        assert_eq!(
+            start("mcp__github__create_issue", json!({"a": 1})).0,
+            "mcp__github__create_issue"
+        );
         // An input Desk can't be sure it reads whole: Devin's own name.
         for (devin, input) in [
             // What it can't run without, missing.
@@ -1268,21 +1290,34 @@ mod tests {
             ("read", json!({"file_path": "a", "path": "/etc/shadow"})),
             ("exec", json!({"command": "ls", "cmd": "rm -rf /"})),
             // Run where Desk can't be sure.
+            // Run elsewhere than its shell: Desk can't be sure where.
             ("exec", json!({"command": "ls", "cwd": "../elsewhere"})),
+            (
+                "exec",
+                json!({"command": "rm -rf build", "workdir": "/Users/sam"}),
+            ),
         ] {
-            assert_eq!(start(devin, input.clone()).0, devin, "{input}");
+            assert_eq!(
+                start(devin, input.clone()).0,
+                format!("devin.{devin}"),
+                "{input}"
+            );
         }
         // Said the same way twice is one.
         assert_eq!(
             start("read", json!({"file_path": "a", "path": "a"})).1["file_path"],
             "a"
         );
-        // Where its command runs, when it says, is the call's own.
+        // A command is judged where Desk saw its shell go, never where
+        // the payload says Devin started.
         let mut p = json!({"hook_event_name": "PreToolUse", "cwd": "/repo", "tool_name": "exec",
-            "tool_input": {"command": "rm -rf build", "workdir": "/elsewhere"}});
+            "tool_input": {"command": "rm -rf build", "shell_id": "1"}});
         normalize(&mut p, None);
         assert_eq!(p["tool_name"], "Bash");
-        assert_eq!(p["cwd"], "/elsewhere");
+        assert!(p.get("cwd").is_none());
+        let mut p = json!({"cwd": "/repo", "tool_name": "read", "tool_input": {"file_path": "a"}});
+        normalize(&mut p, None);
+        assert_eq!(p["cwd"], "/repo");
         // And it reads on as Claude Code's do.
         assert_eq!(
             parsed(json!({"hook_event_name": "PreToolUse", "tool_name": "exec",
@@ -1386,7 +1421,7 @@ mod tests {
         // None named: Devin's own name, which a boss can't judge.
         let mut p = json!({"tool_name": "apply_patch", "tool_input": {"patch": "x"}});
         normalize(&mut p, None);
-        assert_eq!(p["tool_name"], "apply_patch");
+        assert_eq!(p["tool_name"], "devin.apply_patch");
     }
 
     #[test]
