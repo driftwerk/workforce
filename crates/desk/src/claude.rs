@@ -142,7 +142,9 @@ pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed
         // A question's start has its own entry, waiting long enough for its
         // boss to answer it; every other call's, the catch-all (a matcher
         // is a regular expression: verified on 2.1.325 that it leaves the
-        // question out).
+        // question out). A dialog's start is never fail-closed: it allows
+        // nothing (a question's answer, a plan's approval, goes through its
+        // own permission check, which keeps the fail-closed hook).
         if event == "PreToolUse" {
             hooks.insert(
                 event.into(),
@@ -296,6 +298,11 @@ pub enum Hook {
         /// input, every question and its options. Its boss may answer it
         /// there, before its dialog opens ([`answered_for`]).
         asks: Option<Value>,
+        /// Its permission check (`PermissionRequest`), not its start.
+        check: bool,
+        /// The plan it presents in full (`ExitPlanMode`'s input), when sent:
+        /// what a boss's approval is matched to.
+        plan: Option<String>,
     },
     /// Auto mode refused a tool call: the call's id, when the CLI says.
     Denied {
@@ -392,6 +399,10 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                 && matches!(p.tool_name.as_deref(), Some(DIALOG_TOOL | PLAN_TOOL)))
             .then(|| p.tool_input.clone())
             .flatten(),
+            check: p.hook_event_name == "PermissionRequest",
+            plan: (p.tool_name.as_deref() == Some(PLAN_TOOL))
+                .then(|| plan_of(p.tool_input.as_ref()))
+                .flatten(),
         },
         "PreToolUse" => Hook::ToolStart {
             tool: tool().0,
@@ -588,6 +599,11 @@ pub fn question_of(tool: &str, input: Option<&Value>) -> Option<Question> {
         }
         _ => None,
     }
+}
+
+/// The plan an `ExitPlanMode` call presents, in full.
+pub fn plan_of(input: Option<&Value>) -> Option<String> {
+    input?.get("plan")?.as_str().map(str::to_string)
 }
 
 /// The sub-agent a hook fired inside, if it fired inside one.

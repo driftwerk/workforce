@@ -90,7 +90,7 @@ pub(crate) enum Review {
 pub(super) fn review(text: &str) -> Option<Review> {
     text.lines().map(str::trim).find_map(|l| {
         let (w, rest) = l.split_once(':')?;
-        let rest = rest.trim();
+        let rest = rest.trim().trim_start_matches('*').trim();
         if rest.is_empty() {
             return None;
         }

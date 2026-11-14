@@ -385,14 +385,22 @@ async fn act_fully_reviews_a_sessions_plan_in_its_place() {
         decides(&llm, "Plan: migrate the invites table", "CHANGES: run it on staging first.").await;
         decides(&llm, "Plan: migrate on staging, then production", "APPROVE: staging goes first now").await;
         decides(&llm, "Plan: drop the legacy invites table", "ASK: drop the legacy table in production tonight?").await;
+        decides(&llm, "Plan: shadow the writes", "**APPROVE:** it is the same plan").await;
+        decides(&llm, "Plan: read from the replica", "APPROVE: reads go to the replica").await;
         eventually("Desk to know it is unbound", async || {
             d.boss_unbound("desk").then_some(())
         })
         .await;
         let since = chrono::Utc::now();
+        let whole = |plan: &str| format!("# {plan}\n\n1. Write the migration.\n2. Run it.");
         let start = |plan: &str, call: &str| {
             json!({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode", "tool_use_id": call,
-                "tool_input": {"plan": format!("# {plan}\n\n1. Write the migration.\n2. Run it.")}})
+                "tool_input": {"plan": whole(plan)}})
+        };
+        // Its permission check, which names no call.
+        let check_of = |plan: &str| {
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": whole(plan)}})
         };
         let s = new_session(&d, &base, "Cufflink Migration").await;
         let url = hook_url(&base, s.id).await;
@@ -422,9 +430,10 @@ async fn act_fully_reviews_a_sessions_plan_in_its_place() {
         .await
         .expect("reviewed within its hold");
         assert_eq!(out, json!({}), "its start goes on");
-        let check = hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "ExitPlanMode",
-            "tool_input": {"plan": "# Plan: migrate on staging, then production"}})).await;
+        let check = hook(&url, check_of("Plan: migrate on staging, then production")).await;
         assert_eq!(check["hookSpecificOutput"]["decision"]["behavior"], "allow", "{check}");
+        // Allowed once: the same check again is the person's.
+        assert_eq!(hook(&url, check_of("Plan: migrate on staging, then production")).await, json!({}));
         hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_p2"})).await;
         let rows = eventually("both reviews", async || {
             let rows = d.store().decisions_since("desk", since, 50).await.unwrap();
@@ -449,14 +458,38 @@ async fn act_fully_reviews_a_sessions_plan_in_its_place() {
         .await
         .expect("let go within its hold");
         assert_eq!(out, json!({}));
-        let check = hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "ExitPlanMode",
-            "tool_input": {"plan": "# Plan: drop the legacy invites table"}})).await;
+        let check = hook(&url, check_of("Plan: drop the legacy invites table")).await;
         assert_eq!(check, json!({}), "the person approves it");
         eventually("the DM to ask the person", async || {
             (said(&overseer, &["Cufflink Migration's plan", "waits for you: drop the legacy table in production tonight?"]) == 1)
                 .then_some(())
         })
         .await;
+        hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_p3"})).await;
+
+        // An approval is for its plan alone: approved, with no permission
+        // check after (the session's mode skips it), another plan's check
+        // is the person's, and so is that plan's once the person drives.
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook(&url, start("Plan: read from the replica", "toolu_p4")),
+        )
+        .await
+        .expect("reviewed within its hold");
+        assert_eq!(out, json!({}));
+        let other = hook(&url, check_of("Plan: drop the legacy invites table")).await;
+        assert_eq!(other, json!({}), "not the plan its boss approved: {other}");
+        hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_p4"})).await;
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook(&url, start("Plan: shadow the writes", "toolu_p5")),
+        )
+        .await
+        .expect("reviewed within its hold");
+        assert_eq!(out, json!({}));
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "hold on, let me look"})).await;
+        let theirs = hook(&url, check_of("Plan: shadow the writes")).await;
+        assert_eq!(theirs, json!({}), "the person drives it now: {theirs}");
     })
     .await;
 }

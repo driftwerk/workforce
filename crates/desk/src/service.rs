@@ -283,9 +283,11 @@ pub(crate) struct Live {
     /// an MCP server's request), by its request's id: only the terminal
     /// answers it.
     codex_question: Option<(Value, PendingApproval)>,
-    /// Its boss approved the plan it presents (the call, when known, and
-    /// when): the plan's permission check is allowed in the person's place.
-    plan_approved: Option<(Option<String>, std::time::Instant)>,
+    /// Its boss approved the plan it presents (that plan, in full, and
+    /// when): that plan's permission check is allowed in the person's
+    /// place, once, while they aren't in control. Gone when the person
+    /// drives it, or its main thread goes on or presents another plan.
+    plan_approved: Option<(String, std::time::Instant)>,
     /// The calls each thread (the main thread's, `None`, or a sub-agent's)
     /// started that haven't ended, oldest first: Claude Code runs some side
     /// by side, and a permission request names none of them.
@@ -1277,6 +1279,18 @@ fn decided_note(
     };
     let me = Some(Party::session(view));
     let label = view.label();
+    if p.tool == "Plan" {
+        let plan = crew::clip(&p.detail, 120);
+        let (kind, text) = match decision {
+            Decision::Allow => (Kind::Approved, format!("approved {label}'s plan “{plan}”")),
+            Decision::Deny | Decision::Cancel => (
+                Kind::Denied,
+                format!("asked {label} to change its plan “{plan}”"),
+            ),
+            Decision::AllowForSession | Decision::Terminal => return None,
+        };
+        return Some(by.event(kind, me, text).approval(p.id));
+    }
     let (kind, text) = match decision {
         Decision::Allow => (Kind::Approved, format!("allowed {label} to {what}")),
         Decision::Deny => (Kind::Denied, format!("denied {label} to {what}")),
@@ -3716,8 +3730,11 @@ impl Desk {
                 // permission check is allowed in the person's place
                 // (`plan_approved`); else its dialog asks them, as before.
                 Decision::Allow if plan && boss_says => {
-                    let call = live.holder().and_then(|h| h.call.clone());
-                    live.plan_approved = Some((call, std::time::Instant::now()));
+                    live.plan_approved = live
+                        .pending
+                        .as_ref()
+                        .and_then(|p| claude::plan_of(p.request.as_ref().map(|r| &r.input)))
+                        .map(|plan| (plan, std::time::Instant::now()));
                     if let Some(p) = live.pending.as_mut() {
                         p.answerable = false;
                     }
@@ -5231,9 +5248,11 @@ impl Desk {
                         asking::went_on(&mut l.denials, false);
                     }
                     // The main thread went on: the question it asked is over
-                    // (its own hook turned it down, or it was answered).
+                    // (its own hook turned it down, or it was answered), and
+                    // a plan approved before is spent.
                     if inside.is_none() {
                         l.end_question();
+                        l.plan_approved = None;
                     }
                     // What still asks (a call run beside this one, or
                     // the main thread's question shown again) waits on.
@@ -5270,6 +5289,8 @@ impl Desk {
                 id: call,
                 question,
                 asks,
+                check,
+                plan: presented,
             } => {
                 // An AskUserQuestion at its start, in the session's own thread,
                 // that its Act fully boss answers while the person isn't in
@@ -5278,20 +5299,22 @@ impl Desk {
                 let hold = asks
                     .clone()
                     .filter(|_| inside.is_none() && self.holds_dialog_for_boss(id));
-                // A plan its boss approved at its start: its permission check
-                // (a hook with no start's input) is allowed in the person's
-                // place, once, soon after, for that call.
+                // A plan its boss approved at its start: that plan's
+                // permission check (which names no call) is allowed in the
+                // person's place, once, soon after, while they still aren't
+                // in control. Another plan, or one presented after, is the
+                // person's (or its boss's again).
                 let plan = question.tool == "Plan";
-                if plan && asks.is_none() && inside.is_none() {
+                if plan && inside.is_none() {
+                    let theirs = !self.holds_dialog_for_boss(id);
                     let approved = self.0.state.lock().live.get_mut(&id).is_some_and(|l| {
-                        let fresh = l.plan_approved.as_ref().is_some_and(|(c, at)| {
-                            at.elapsed() < claude::DIALOG_HOLD * 2
-                                && (c.is_none() || call.is_none() || *c == call)
-                        });
-                        if fresh {
-                            l.plan_approved = None;
-                        }
-                        fresh
+                        let approval = l.plan_approved.take();
+                        check
+                            && !theirs
+                            && approval.is_some_and(|(p, at)| {
+                                at.elapsed() < claude::DIALOG_HOLD * 2
+                                    && presented.as_ref() == Some(&p)
+                            })
                     });
                     if approved {
                         return claude::plan_approved();
