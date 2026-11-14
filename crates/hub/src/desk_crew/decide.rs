@@ -388,6 +388,7 @@ impl CrewHub {
         // unseen or cut) is the person's: the boss can't judge what runs.
         let unseen = p.request.as_ref().is_none_or(|r| {
             r.input.get("clipped").and_then(serde_json::Value::as_bool) == Some(true)
+                || r.input.get("grantRoot").is_some_and(|g| !g.is_null())
         });
         if !p.choices.is_empty() && unseen {
             return waits(

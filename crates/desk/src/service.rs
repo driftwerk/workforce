@@ -3832,11 +3832,11 @@ impl Desk {
             // A boss allows only what Desk saw whole: a request whose
             // command or changes it didn't see, or saw only in part, is the
             // person's to allow.
-            let seen_whole = asked
-                .pending
-                .request
-                .as_ref()
-                .is_some_and(|r| r.input.get("clipped").and_then(Value::as_bool) != Some(true));
+            let seen_whole = asked.pending.request.as_ref().is_some_and(|r| {
+                r.input.get("clipped").and_then(Value::as_bool) != Some(true)
+                        // A whole folder for the rest of the session: the person's.
+                        && r.input.get("grantRoot").is_none_or(Value::is_null)
+            });
             if by.party.kind == crew::PartyKind::Manager
                 && matches!(decision, Decision::Allow | Decision::AllowForSession)
                 && !seen_whole
