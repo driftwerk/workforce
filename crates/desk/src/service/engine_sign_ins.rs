@@ -183,12 +183,114 @@ pub fn devin_said(screen: &str) -> DevinSaid {
 }
 
 /// `word` as Devin's login page, read as a browser reads it: on
-/// [`DEVIN_PAGES`], and carrying the login's own `state` and PKCE
-/// `code_challenge` (a page cut short, or one without them, is none).
+/// [`DEVIN_PAGES`], carrying the login's own `state` and PKCE
+/// `code_challenge` (a page cut short, or one without them, is none), and
+/// sending the browser on to nowhere but this computer
+/// ([`sends_away`] finds nothing).
 fn devin_page(word: &str) -> Option<url::Url> {
     let page = crate::engine_accounts::page_on(word, DEVIN_PAGES)?;
     let carries = |key: &str| page.query_pairs().any(|(k, v)| k == key && !v.is_empty());
-    (carries("state") && carries("code_challenge")).then_some(page)
+    if !(carries("state") && carries("code_challenge")) {
+        return None;
+    }
+    if let Some(name) = sends_away(&page) {
+        // By its shape: the query is the login's own state and challenge.
+        let shown: String = format!(
+            "{}://{}{}",
+            page.scheme(),
+            page.host_str().unwrap_or(""),
+            page.path()
+        )
+        .chars()
+        .take(200)
+        .collect();
+        tracing::warn!(page = %shown, sent_away_by = %name, "Devin's sign-in page would send the browser on to somewhere other than this computer: not opened");
+        return None;
+    }
+    Some(page)
+}
+
+/// The schemes of the apps on this computer a sign-in page may hand its
+/// result to.
+const APP_SCHEMES: &[&str] = &["windsurf", "devin", "codeium"];
+
+/// Whether `page` sends the browser on to nowhere but this computer
+/// ([`sends_away`] finds nothing).
+#[cfg(test)]
+fn returns_here_only(page: &url::Url) -> bool {
+    sends_away(page).is_none()
+}
+
+/// The first of `page`'s query parameters, split at `&` and at `;` (as
+/// some servers split it), whose name or value could send the browser
+/// somewhere but this computer, by its name (`?` when that is no plain
+/// name); none when no parameter does.
+///
+/// Every name and value is checked, whatever it is called: one with a
+/// scheme is allowed only as `http(s)://` on `127.0.0.1`, `localhost` or
+/// `[::1]`, or as one of [`APP_SCHEMES`]; one starting with two of `/` and
+/// `\` (a host by the page's own scheme) is refused, and so is any other
+/// scheme (`javascript:`, `data:`, `file:`, `blob:`, …). One that isn't a
+/// URL (a path, a word, Windsurf's `chisel-show-auth-token`) is allowed:
+/// the real shapes are still to be seen. One still holding a `%` once
+/// decoded (encoded twice, `%253A%252F%252F`) is refused: a reader that
+/// decodes again could find a scheme in it. Desk's machines check the same
+/// before opening a page: the workforce-desk repository's
+/// `crates/desk-machine/src/callback.rs` (`sign_in_page`).
+fn sends_away(page: &url::Url) -> Option<String> {
+    page.query()?
+        .split(['&', ';'])
+        .flat_map(|piece| url::form_urlencoded::parse(piece.as_bytes()))
+        .find(|(name, value)| !returns_here(name) || !returns_here(value))
+        .map(|(name, _)| {
+            let plain = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-.[]".contains(c));
+            match plain {
+                true => name.into_owned(),
+                false => "?".to_string(),
+            }
+        })
+}
+
+/// One query name or value, read as a browser reads it.
+fn returns_here(value: &str) -> bool {
+    // Browsers drop leading and trailing spaces and controls, and tabs and
+    // newlines anywhere, and read `\` as `/`.
+    let value: String = value
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if value.contains('%') {
+        return false;
+    }
+    if value.starts_with(['/', '\\']) && value[1..].starts_with(['/', '\\']) {
+        return false;
+    }
+    let scheme = value.split_once(':').map(|(s, _)| s).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    if scheme.is_none() {
+        return true;
+    }
+    let Ok(back) = url::Url::parse(&value) else {
+        return false;
+    };
+    if APP_SCHEMES.contains(&back.scheme()) {
+        return true;
+    }
+    matches!(back.scheme(), "http" | "https")
+        && match back.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            None => false,
+        }
 }
 
 /// The words of a screen line a page or code may be.
@@ -741,6 +843,90 @@ mod tests {
         assert_eq!(devin_said(&devin_screen(&empty)).url, None);
         // Codex's device page is never taken for Devin's, nor Devin's for Codex's.
         assert_eq!(device_said(&devin_screen(DEVIN_PAGE)).url, None);
+    }
+
+    #[test]
+    fn a_devin_page_sending_the_browser_anywhere_but_here_is_never_opened() {
+        let devin = |query: &str| {
+            format!("https://app.devin.ai/auth/cli/continue?state=s&code_challenge=c{query}")
+        };
+        for here in [
+            "",
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A4321%2Fcallback",
+            "&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback",
+            "&redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A4321%2Fcallback",
+            "&redirect_uri=https%3A%2F%2FLOCALHOST%2Fcb",
+            "&redirect_uri=chisel-show-auth-token",
+            "&next=%2Fdashboard",
+            "&return_to=settings",
+            "&callback=",
+            "&redirect_uri=windsurf%3A%2F%2Fcodeium.windsurf%2Fauth",
+            "&redirect_uri=DEVIN%3A%2F%2Fauth%2Fcallback",
+            "&redirect_uri=codeium%3A%2F%2Fauth",
+            "&prompt=select_account&code_challenge_method=S256",
+            "&when=12%3A30;page=2",
+        ] {
+            let page = devin(here);
+            assert_eq!(
+                devin_said(&devin_screen(&page)).url.as_deref(),
+                Some(page.as_str()),
+                "{here}"
+            );
+        }
+        for away in [
+            "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb",
+            "&redirect_uri=%2F%2Fevil",
+            "&redirect=http%3A%2F%2Fevil.example%2F",
+            "&redirect_url=https%3A%2F%2F127.0.0.1.evil.example%2F",
+            "&return_to=https%3A%2F%2Flocalhost.evil.example%2F",
+            "&callback=https%3A%2F%2Flocalhost%40evil.example%2F",
+            "&next=javascript%3Aalert(1)",
+            "&next=data%3Atext%2Fhtml%2C%3Cscript%3E",
+            "&next=%5C%5Cevil",
+            "&next=%2F%5Cevil",
+            "&next=%20%2F%2Fevil",
+            "&next=%2F%09%2Fevil",
+            "&next=https%3Aevil.example",
+            "&next=localhost%3A4321%2Fx",
+            "&next=file%3A%2F%2F%2Fetc%2Fpasswd",
+            "&next=blob%3Ahttps%3A%2F%2Flocalhost%2Fx",
+            "&Redirect_URI=https%3A%2F%2Fevil.example%2Fcb",
+            // Whatever the parameter is called, and however it is split.
+            "&returnTo=https%3A%2F%2Fevil.example",
+            "&redirectUrl=https%3A%2F%2Fevil.example",
+            "&continue=%2F%2Fevil",
+            "&redirect_uri%5B%5D=https%3A%2F%2Fevil.example",
+            "&redirect_uri[]=https%3A%2F%2Fevil.example",
+            "&x=1;redirect_uri=https%3A%2F%2Fevil.example",
+            "&https%3A%2F%2Fevil.example",
+            "&next=vscode%3A%2F%2Fx",
+            // Encoded twice: a reader decoding again finds a scheme.
+            "&redirect_uri=https%253A%252F%252Fevil.example",
+            "&redirect_uri=%252F%252Fevil",
+            "&https%253A%252F%252Fevil.example=1",
+            "&x=100%25",
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A4321%2Fcallback&next=https%3A%2F%2Fevil.example",
+        ] {
+            assert_eq!(devin_said(&devin_screen(&devin(away))).url, None, "{away}");
+        }
+        let windsurf = "https://windsurf.com/windsurf/signin?state=s&code_challenge=c&redirect_uri=https%3A%2F%2Fevil.example%2Fcb";
+        assert_eq!(devin_said(&devin_screen(windsurf)).url, None);
+        // Which parameter sent it away, by a plain name only.
+        let named = url::Url::parse(&devin("&returnTo=https%3A%2F%2Fevil.example")).unwrap();
+        assert_eq!(sends_away(&named).as_deref(), Some("returnTo"));
+        let bare = url::Url::parse(&devin("&https%3A%2F%2Fevil.example%2Fsecret")).unwrap();
+        assert_eq!(sends_away(&bare).as_deref(), Some("?"));
+        // The page Devin 3000.12.57 prints for a pasted code: no redirect_uri.
+        let pasted = "https://app.devin.ai/auth/cli/continue?state=Zx8q3V1kQ2&prompt=select_account&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1";
+        assert_eq!(
+            devin_said(&devin_screen(pasted)).url.as_deref(),
+            Some(pasted)
+        );
+        // Both pages as the binary builds them still pass.
+        assert!(returns_here_only(&url::Url::parse(DEVIN_PAGE).unwrap()));
+        assert!(returns_here_only(
+            &url::Url::parse(DEVIN_MANUAL_PAGE).unwrap()
+        ));
     }
 
     #[test]

@@ -730,21 +730,63 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
 /// The files a patch in `*** Begin Patch` form names: each it adds,
 /// updates, deletes or moves to. None: it names none, or has a line Desk
 /// can't be sure of (a `***` line it doesn't know, a unified diff's file
-/// header), which could touch a file Desk didn't read.
+/// header, a mark further along a line that isn't a file's own text, a
+/// line split by anything but `\n` or `\r\n`, a mark behind a character
+/// that shows as nothing), which could touch a file Desk didn't read; a
+/// path with such a character or a control in it, which Devin may read
+/// otherwise; or a delete of a folder by its name alone (`.`, `a/..`),
+/// which Devin might delete whole.
 pub fn patch_paths(patch: &str) -> Option<Vec<String>> {
-    const MARKS: [&str; 4] = [
-        "*** Add File:",
-        "*** Update File:",
-        "*** Delete File:",
-        "*** Move to:",
-    ];
+    const DELETE: &str = "*** Delete File:";
+    const MARKS: [&str; 4] = ["*** Add File:", "*** Update File:", DELETE, "*** Move to:"];
     const PLAIN: [&str; 3] = ["*** Begin Patch", "*** End Patch", "*** End of File"];
+    // What another reader may split a line at that `lines` doesn't: its
+    // marks could be on lines Desk never reads as such.
+    let split = |(i, c): (usize, char)| match c {
+        '\r' => patch.as_bytes().get(i + 1) != Some(&b'\n'),
+        '\x0b' | '\x0c' | '\x1c'..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}' => true,
+        _ => false,
+    };
+    if patch.char_indices().any(split) {
+        return None;
+    }
+    // An editor's byte order mark, at the very start.
+    let patch = patch.strip_prefix('\u{feff}').unwrap_or(patch);
     let mut paths: Vec<String> = Vec::new();
-    for line in patch.lines() {
-        let line = line.trim();
-        if let Some(p) = MARKS.iter().find_map(|m| line.strip_prefix(m)) {
+    for raw in patch.lines() {
+        let line = raw.trim_start();
+        // A mark behind what shows as nothing: which reader sees it isn't
+        // known.
+        if line.starts_with(invisible) {
+            return None;
+        }
+        let line = line.trim_end();
+        // A mark further along a line (`… *** Delete File: /x`): Devin's
+        // reading of it isn't known. A line of a file's own text (`+`, `-`)
+        // can say anything: with no other split, it is never a mark's.
+        // (The first such `*** ` has every later one's mark after it.)
+        let text = raw.starts_with(['+', '-']);
+        let after_start = line.char_indices().nth(1).map_or("", |(i, _)| &line[i..]);
+        if !text
+            && after_start.find("*** ").is_some_and(|i| {
+                let rest = &after_start[i..];
+                rest.contains("File:") || MARKS.iter().any(|m| rest.contains(m))
+            })
+        {
+            return None;
+        }
+        if let Some((mark, p)) = MARKS
+            .iter()
+            .find_map(|m| line.strip_prefix(m).map(|p| (*m, p)))
+        {
             let p = p.trim().to_string();
-            if p.is_empty() {
+            // A path with what shows as nothing, or a control, in it: Devin
+            // may read it without them (`/etc/x`), Desk with (a file in the
+            // folder).
+            if p.is_empty()
+                || p.chars().any(|c| c.is_control() || invisible(c))
+                || (mark == DELETE && names_a_folder(&p))
+            {
                 return None;
             }
             if !paths.contains(&p) {
@@ -758,6 +800,60 @@ pub fn patch_paths(patch: &str) -> Option<Vec<String>> {
         }
     }
     (!paths.is_empty()).then_some(paths)
+}
+
+/// Whether `c` shows as nothing: a format character (Unicode's `Cf`:
+/// marks of direction, joiners, the soft hyphen, the byte order mark, the
+/// invisible operators) or one Unicode says is ignored by default (the
+/// variation selectors, the Hangul fillers, the tags).
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{34f}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// Whether `path` names a folder by its spelling alone: it ends in `.` or
+/// `..` or a `/`, or is nothing once its `.`s are taken out (`.`, `./`).
+/// Which folders exist is the judging's to see ([`crate::charge`]).
+fn names_a_folder(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    path.ends_with('/')
+        || path.ends_with('\\')
+        || matches!(
+            p.components().next_back(),
+            None | Some(
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        )
+        || path.ends_with("/.")
 }
 
 /// `ask_user_question`'s questions as Claude Code's `AskUserQuestion` has
@@ -1476,6 +1572,116 @@ mod tests {
         let mut p = json!({"tool_name": "apply_patch", "tool_input": {"patch": "x"}});
         normalize(&mut p, None);
         assert_eq!(p["tool_name"], "devin.apply_patch");
+    }
+
+    /// A delete of a folder by its name alone is never read as a file's:
+    /// Devin might delete it whole.
+    #[test]
+    fn a_patch_deleting_a_folder_by_its_name_is_unread() {
+        let delete = |p: &str| {
+            patch_paths(&format!(
+                "*** Begin Patch\n*** Delete File: {p}\n*** End Patch"
+            ))
+        };
+        for folder in [
+            ".", "./", "./.", "src/..", "..", "src/", "src/.", "/", "a/b/..",
+        ] {
+            assert_eq!(delete(folder), None, "{folder}");
+        }
+        assert_eq!(delete("old.rs").unwrap(), ["old.rs"]);
+        assert_eq!(delete("./src/old.rs").unwrap(), ["./src/old.rs"]);
+        // Only a delete: an update of `.` would fail, and is judged as any path.
+        assert!(patch_paths("*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch").is_some());
+    }
+
+    /// What shows as nothing ahead of a mark doesn't hide it, and a mark
+    /// further along a line is one Desk can't read.
+    #[test]
+    fn an_unseen_character_or_a_mark_mid_line_never_hides_a_file() {
+        // An editor's byte order mark at the very start is read past.
+        assert_eq!(
+            patch_paths("\u{feff}*** Begin Patch\n*** Update File: /x\n*** End Patch").unwrap(),
+            ["/x"]
+        );
+        // Anything that shows as nothing ahead of a mark makes it unread:
+        // direction marks and overrides, joiners, the soft hyphen, the
+        // invisible operators, variation selectors, tags.
+        for unseen in [
+            '\u{feff}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2060}',
+            '\u{202a}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{ad}',
+            '\u{180e}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{fe0f}',
+            '\u{e0001}',
+            '\u{3164}',
+        ] {
+            for p in [
+                format!("*** Begin Patch\n{unseen}*** Update File: /x\n*** End Patch"),
+                format!("*** Begin Patch\n*** Update File: a\n {unseen} *** Delete File: /etc/x\n*** End Patch"),
+                format!("*** Begin Patch\n*** Update File: a\n{unseen}*** Move to: /x\n*** End Patch"),
+            ] {
+                assert_eq!(patch_paths(&p), None, "{p:?}");
+            }
+            // In a path, they make it one Desk can't place.
+            for path in [format!("{unseen}/etc/x"), format!("src/{unseen}a.rs")] {
+                let p = format!("*** Begin Patch\n*** Update File: {path}\n*** End Patch");
+                assert_eq!(patch_paths(&p), None, "{path:?}");
+            }
+        }
+        assert_eq!(patch_paths("\u{200e}*** Move to: /x"), None);
+        // A control in a path too.
+        for c in ['\x07', '\x1b', '\u{7f}', '\u{9b}'] {
+            let p = format!("*** Begin Patch\n*** Update File: src/{c}a.rs\n*** End Patch");
+            assert_eq!(patch_paths(&p), None, "{c:?}");
+        }
+        // A unified header behind one is still one.
+        assert_eq!(patch_paths("\u{feff}--- a/x\n+++ b/x\n"), None);
+        // Split by anything but `\n` or `\r\n`, its lines aren't Desk's to read.
+        for sep in [
+            "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\u{85}", "\u{2028}", "\u{2029}",
+        ] {
+            let p = format!(
+                "*** Begin Patch\n*** Update File: a\n+x{sep}*** Move to: /x\n*** End Patch"
+            );
+            assert_eq!(patch_paths(&p), None, "{sep:?}");
+        }
+        assert_eq!(
+            patch_paths("*** Begin Patch\r\n*** Update File: a\r\n+x\r\n*** End Patch\r\n")
+                .unwrap(),
+            ["a"]
+        );
+        // A mark further along a line that isn't a file's text.
+        for p in [
+            "*** Begin Patch\n*** Update File: a *** Delete File: /etc/x\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a *** Move to: /etc/x\n*** End Patch",
+            "*** Begin Patch\nx*** Update File: /etc/x\n*** End Patch",
+            "*** Begin Patch\n x *** Move to: /etc/x\n*** End Patch",
+            "*** Begin Patch\n@@ *** Add File: /etc/x\n*** End Patch",
+        ] {
+            assert_eq!(patch_paths(p), None, "{p}");
+        }
+        // A file's own text may say the format: it is read as the text it is.
+        assert_eq!(
+            patch_paths("*** Begin Patch\n*** Update File: a\n+x *** Update File: y\n-*** Move to: z\n*** End Patch")
+                .unwrap(),
+            ["a"]
+        );
+        assert_eq!(
+            patch_paths("*** Begin Patch\n*** Update File: a\n+/*** docs ***/\n*** End Patch")
+                .unwrap(),
+            ["a"]
+        );
     }
 
     #[test]

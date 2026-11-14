@@ -27,10 +27,27 @@ const LIST_WAIT: Duration = Duration::from_secs(10);
 const MADE_SLACK: chrono::Duration = chrono::Duration::seconds(5);
 
 /// A Devin session's last run while this hub runs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct Run {
     pub(super) launched: DateTime<Utc>,
     pub(super) ended: Option<DateTime<Utc>>,
+    /// The person's Devin config its environment found as it launched:
+    /// where what it saved is written back.
+    pub(super) config: Option<PathBuf>,
+    /// The Devin folders its environment found as it launched
+    /// ([`devin_folders`]), withheld while it runs.
+    pub(super) folders: Vec<PathBuf>,
+}
+
+/// The Devin folders `env` finds, real: its config folder (it runs its
+/// hooks' commands) and its data folder (its sessions and sign-in).
+fn devin_folders(env: &std::collections::BTreeMap<String, String>) -> Vec<PathBuf> {
+    let config = devin_config::person_path(env).and_then(|f| f.parent().map(Path::to_path_buf));
+    [config, devin_config::data_folder(env)]
+        .into_iter()
+        .flatten()
+        .map(|d| crate::computer::boss::resolve_real(&d).unwrap_or(d))
+        .collect()
 }
 
 /// What a resume of a Devin session carries on.
@@ -57,15 +74,29 @@ impl Desk {
         st.devin_ending.remove(&id);
     }
 
-    /// Session `id` launched at `at` (or was taken back, launched then).
+    /// Session `id` was taken back, launched at `at`: what it launched
+    /// with isn't known, so the environment Devin's sessions find now
+    /// stands for it.
     pub(super) fn devin_launched(&self, id: Uuid, at: DateTime<Utc>) {
-        self.0.state.lock().devin_runs.insert(
-            id,
-            Run {
-                launched: at,
-                ended: None,
-            },
-        );
+        self.devin_launched_with(id, at, &self.devin_env());
+    }
+
+    /// Session `id` launched at `at` with `env`: its own environment, not
+    /// what a start since may have made the current one.
+    pub(super) fn devin_launched_with(
+        &self,
+        id: Uuid,
+        at: DateTime<Utc>,
+        env: &std::collections::BTreeMap<String, String>,
+    ) {
+        // Resolved before the lock is taken: it reads the disk.
+        let run = Run {
+            launched: at,
+            ended: None,
+            config: devin_config::person_path(env),
+            folders: devin_folders(env),
+        };
+        self.0.state.lock().devin_runs.insert(id, run);
     }
 
     /// The engine session `id` runs on.
@@ -74,8 +105,32 @@ impl Desk {
     }
 
     /// The environment Devin sessions run with, as Desk adds to it.
-    fn devin_env(&self) -> std::collections::BTreeMap<String, String> {
+    pub(super) fn devin_env(&self) -> std::collections::BTreeMap<String, String> {
         self.with_added(&self.0.state.lock().session_env.clone())
+    }
+
+    /// The Devin folders no boss or agent reaches ([`devin_folders`]): as
+    /// Devin's sessions find them now, and as each still running found
+    /// them when it launched. Their environment is the hub's with what a
+    /// session's start added, which may set `HOME`, `XDG_CONFIG_HOME` or
+    /// `XDG_DATA_HOME` apart from the hub's own, and change while it runs.
+    pub fn devin_withheld(&self) -> Vec<PathBuf> {
+        let mut out = devin_folders(&self.devin_env());
+        let running: Vec<PathBuf> = self
+            .0
+            .state
+            .lock()
+            .devin_runs
+            .values()
+            .filter(|r| r.ended.is_none())
+            .flat_map(|r| r.folders.iter().cloned())
+            .collect();
+        for dir in running {
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+        out
     }
 
     /// Session `id`'s files, about to be written for its start. Any its run
@@ -99,9 +154,25 @@ impl Desk {
 
     /// Session `id` ended: what Devin saved to its config is written back to
     /// the person's, and its files go.
+    /// Its own run's config, where it launched with one; else (it ran while
+    /// the hub was away) the one Devin's sessions find now.
     pub(super) async fn devin_ended(&self, id: Uuid) {
+        let own = self
+            .0
+            .state
+            .lock()
+            .devin_runs
+            .get(&id)
+            .and_then(|r| r.config.clone());
+        let person = own.or_else(|| devin_config::person_path(&self.devin_env()));
+        self.devin_ended_to(id, person).await;
+    }
+
+    /// Session `id`'s launch failed before it ran: what was written of its
+    /// files goes, written back to `person` (the launch's own config, never
+    /// the run's before it).
+    pub(super) async fn devin_ended_to(&self, id: Uuid, person: Option<PathBuf>) {
         let files = SessionFiles::of(&self.0.opts.run_dir, id);
-        let person = devin_config::person_path(&self.devin_env());
         self.end_devin_files(id, files, person).await;
     }
 
@@ -196,12 +267,15 @@ impl Desk {
                 .filter(|o| o.id != r.id && o.engine == Engine::Devin)
                 .filter_map(|o| o.cli_session_id.clone())
                 .collect();
-            (st.devin_runs.get(&r.id).copied(), bound)
+            (st.devin_runs.get(&r.id).cloned(), bound)
         };
         // Its last launch, while this hub knows it; else as old as the
         // session itself.
-        let since = run.map_or(r.created_at, |run| run.launched) - MADE_SLACK;
-        let until = run.and_then(|run| run.ended).unwrap_or_else(Utc::now);
+        let since = run.as_ref().map_or(r.created_at, |run| run.launched) - MADE_SLACK;
+        let until = run
+            .as_ref()
+            .and_then(|run| run.ended)
+            .unwrap_or_else(Utc::now);
         carries(
             r.cli_session_id.as_deref(),
             listed.as_deref(),

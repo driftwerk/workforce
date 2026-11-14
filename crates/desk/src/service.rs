@@ -4943,7 +4943,8 @@ impl Desk {
                     &person,
                 ) {
                     // Whatever of them was written goes, its token with it.
-                    self.devin_ended(r.id).await;
+                    self.devin_ended_to(r.id, devin_config::person_path(&env))
+                        .await;
                     return Err(DeskError::Internal(e));
                 }
                 if mode == Some(crate::mode::Mode::Plan) {
@@ -4970,7 +4971,8 @@ impl Desk {
                     Ok(spec) => spec,
                     Err(e) => {
                         // Never left holding its token.
-                        self.devin_ended(r.id).await;
+                        self.devin_ended_to(r.id, devin_config::person_path(&env))
+                            .await;
                         return Err(e);
                     }
                 };
@@ -5021,7 +5023,8 @@ impl Desk {
                     codex.stop();
                 }
                 if r.engine == Engine::Devin {
-                    self.devin_ended(r.id).await;
+                    self.devin_ended_to(r.id, devin_config::person_path(&env))
+                        .await;
                 }
                 return Err(e);
             }
@@ -5067,7 +5070,9 @@ impl Desk {
         // as it is now.
         self.started_afresh(r.id);
         if r.engine == Engine::Devin {
-            self.devin_launched(r.id, started_at);
+            // Its own environment's folders: a start since may have
+            // changed the current one.
+            self.devin_launched_with(r.id, started_at, &env);
         }
         tokio::spawn(self.clone().on_exit(r.id, r.engine, exit));
         // What its line held while it wasn't running is looked at again now
