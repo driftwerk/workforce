@@ -723,6 +723,14 @@ pub fn answerable(
                 if boss::settings(&p, &bounds.home, &bounds.withheld) {
                     return no(boss::SETTINGS.into());
                 }
+                // A change is to a file: one naming the session's folder,
+                // a folder holding it (`/tmp` for a folder in it), or any
+                // folder there is, may delete it whole (Devin's patch).
+                if boss::fold(&own_real).starts_with(boss::fold(&p))
+                    || std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir())
+                {
+                    return no("changes a folder, not a file".into());
+                }
                 if !inside(&p) {
                     return no(format!("changes a file outside {}", facts.folder));
                 }
@@ -1390,6 +1398,42 @@ mod tests {
             change(json!({ "paths": ["src/a.ts"], "grantRoot": "/Users/sam/dev" })),
             Err("Desk can't tell what a grant to write in a folder for the rest of the session does".into())
         );
+    }
+
+    /// A change naming the session's own folder, a folder above it or any
+    /// folder there is is the person's: a patch deleting it may delete it
+    /// whole.
+    #[test]
+    fn a_change_to_a_folder_is_never_a_bosss_to_allow() {
+        let folder = "changes a folder, not a file";
+        let change = |s: &SessionView, paths: Value| {
+            judged(
+                Engine::Codex,
+                &asking("Edit", json!({ "paths": paths }), None),
+                s,
+            )
+        };
+        let s = acme("/Users/sam/dev/acme-web");
+        for p in [".", "./", "/Users/sam/dev/acme-web", "src/.."] {
+            assert_eq!(
+                change(&s, json!(["src/a.ts", p])),
+                Err(folder.into()),
+                "{p}"
+            );
+        }
+        // A folder above it: outside it too, but a folder whatever else.
+        assert_eq!(change(&s, json!(["/Users/sam/dev"])), Err(folder.into()));
+        // In scratch space, `/tmp` itself holds the session's folder.
+        let t = acme("/tmp/work");
+        assert_eq!(change(&t, json!(["/tmp"])), Err(folder.into()));
+        assert_eq!(change(&t, json!(["/tmp/other.txt"])), Ok(()));
+        // A folder that is there, by its name.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let s = acme(real.to_str().unwrap());
+        assert_eq!(change(&s, json!(["src"])), Err(folder.into()));
+        assert_eq!(change(&s, json!(["src/a.ts"])), Ok(()));
     }
 
     #[test]

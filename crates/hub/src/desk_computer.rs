@@ -302,6 +302,18 @@ fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     {
         out.push(workforce_agent::tools::paths::resolve_real(dir));
     }
+    // And where Devin's sessions find it: their environment is the hub's
+    // with what a session's start added over it, which may set `HOME` or
+    // `XDG_CONFIG_HOME` apart from the hub's own, and change while the hub
+    // runs. Both are withheld. (A boss's bounds are said once, so Desk adds
+    // this one again each time it judges.)
+    if let Some(dir) =
+        crate::desk_driver::desk().and_then(workforce_desk::Desk::devin_config_folder)
+    {
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
     out
 }
 

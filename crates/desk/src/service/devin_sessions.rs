@@ -78,6 +78,16 @@ impl Desk {
         self.with_added(&self.0.state.lock().session_env.clone())
     }
 
+    /// The person's Devin config folder as Devin's sessions find it now,
+    /// real: from their environment, whose `HOME` and `XDG_CONFIG_HOME`
+    /// what a session's start adds may set apart from the hub's own. It
+    /// runs its hooks' commands, so no boss or agent reaches it.
+    pub fn devin_config_folder(&self) -> Option<PathBuf> {
+        let file = devin_config::person_path(&self.devin_env())?;
+        let dir = file.parent()?;
+        Some(crate::computer::boss::resolve_real(dir).unwrap_or_else(|| dir.to_path_buf()))
+    }
+
     /// Session `id`'s files, about to be written for its start. Any its run
     /// before left (it ended while the hub was away) are ended first, so
     /// what Devin saved then is written back, never lost under the new copy.

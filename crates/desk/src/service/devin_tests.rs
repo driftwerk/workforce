@@ -282,6 +282,52 @@ async fn desks_run_folder_holding_devins_hook_tokens_is_withheld_from_every_boss
     .await;
 }
 
+/// The Devin config folder Devin's sessions find is withheld from a boss
+/// where their environment puts it, even where what a session's start
+/// added sets it apart from the hub's, and after the hub said its bounds.
+#[tokio::test]
+async fn the_devin_config_folder_devins_sessions_find_is_withheld_from_every_boss() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let o = options(dir.path());
+        std::fs::create_dir_all(&o.run_dir).unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        d.boss_bounds_with(crate::charge::Bounds {
+            withheld: Vec::new(),
+            scratch: Vec::new(),
+            home: dir.path().join("home"),
+        });
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("devin")).unwrap();
+        d.0.state.lock().session_env = BTreeMap::from([(
+            "XDG_CONFIG_HOME".to_string(),
+            elsewhere.display().to_string(),
+        )]);
+        let folder = std::fs::canonicalize(elsewhere.join("devin")).unwrap();
+        assert_eq!(d.devin_config_folder(), Some(folder.clone()));
+        let bounds = d.judging_bounds().unwrap();
+        assert!(bounds.withheld.contains(&folder), "{:?}", bounds.withheld);
+        let home = dir.path().join("other-home");
+        d.0.state.lock().session_env =
+            BTreeMap::from([("HOME".to_string(), home.display().to_string())]);
+        assert!(d
+            .judging_bounds()
+            .unwrap()
+            .withheld
+            .iter()
+            .any(|w| w.ends_with("other-home/.config/devin")));
+    })
+    .await;
+}
+
 /// A Desk on the fake `devin`, the person's config at `home`, and a
 /// Devin session it started in `work`, its first turn over.
 async fn devin_desk(

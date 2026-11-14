@@ -554,7 +554,18 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
             )
             || (name == ".cargo" && next.is_some_and(|n| n.starts_with("config")))
             || (name == ".github" && matches!(next, Some("workflows" | "actions")))
+            || mcp_config(name)
     })
+}
+
+/// Whether `name` (folded) is an MCP config by any spelling an engine
+/// reads, wherever it sits: Devin's and Windsurf's `mcp_config.json`, and
+/// `mcp.json`, each as JSON or JSONC. Its servers are commands it runs.
+fn mcp_config(name: &str) -> bool {
+    ["mcp_config.", "mcp."]
+        .iter()
+        .filter_map(|p| name.strip_prefix(p))
+        .any(|ext| matches!(ext, "json" | "jsonc"))
 }
 
 /// `path` as the kernel resolves it: component by component, each symlink
@@ -4450,5 +4461,35 @@ pub(crate) mod tests {
             home,
             &w
         ));
+    }
+
+    /// An MCP config is a setting by every spelling an engine reads,
+    /// folded as the disk compares names, and nothing merely like one.
+    #[test]
+    fn every_spelling_of_an_mcp_config_is_a_setting() {
+        let home = Path::new("/Users/sam");
+        let w = [PathBuf::from("/Users/sam/Library/Application Support/Desk")];
+        for p in [
+            "/Users/sam/dev/acme-web/mcp_config.json",
+            "/Users/sam/dev/acme-web/mcp_config.jsonc",
+            "/Users/sam/dev/acme-web/mcp.json",
+            "/Users/sam/dev/acme-web/mcp.jsonc",
+            "/Users/sam/dev/acme-web/MCP_Config.JSONC",
+            "/Users/sam/dev/acme-web/\u{ff4d}\u{ff43}\u{ff50}.json",
+            "/Users/sam/.codeium/windsurf/mcp_config.json",
+            "/Users/sam/dev/acme-web/.cursor/mcp.json",
+        ] {
+            assert!(settings(Path::new(p), home, &w), "{p}");
+        }
+        for p in [
+            "/Users/sam/dev/acme-web/mcp.yaml",
+            "/Users/sam/dev/acme-web/mcp_configs.json",
+            "/Users/sam/dev/acme-web/mymcp.json",
+            "/Users/sam/dev/acme-web/mcp.json.bak",
+            "/Users/sam/dev/acme-web/mcp_config.json5",
+            "/Users/sam/dev/acme-web/src/mcp.rs",
+        ] {
+            assert!(!settings(Path::new(p), home, &w), "{p}");
+        }
     }
 }
