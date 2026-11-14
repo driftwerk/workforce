@@ -180,6 +180,35 @@ impl CrewHub {
         let Some((service, _)) = boss.and_then(|b| self.dm(&b)) else {
             return;
         };
+        // The person is in that session themselves, answering it or
+        // typing there: theirs, and nothing is posted about it. At it only
+        // a moment before it asked, it waits for them to leave it a hold's
+        // time ([`CrewHub::post_held_questions`]).
+        if let Some(s) = q.from_session() {
+            // Theirs for good: input since it asked, or the wheel pinned or
+            // taken by a click since. A wheel that is theirs only from
+            // input a moment before holds it, as that input does.
+            use workforce_desk::charge::Wheel;
+            let taken = self
+                .desk
+                .charge_of(s)
+                .filter(|c| c.live())
+                .is_some_and(|c| match c.wheel {
+                    Wheel::PersonPinned => true,
+                    Wheel::Person => c.wheel_since.unwrap_or(c.since) > q.at,
+                    Wheel::Boss => false,
+                });
+            let since_asked = taken || self.desk.person_input_at(s).is_some_and(|at| at > q.at);
+            if since_asked {
+                self.held_questions.lock().remove(&q.id);
+                return;
+            }
+            if self.person_in(s, q.at) {
+                self.held_questions.lock().insert(q.id);
+                return;
+            }
+        }
+        self.held_questions.lock().remove(&q.id);
         let e = q.escalation.clone().unwrap_or(Escalation {
             why: String::new(),
             options: Vec::new(),
@@ -201,6 +230,17 @@ impl CrewHub {
         item.line_message = Some(q.id);
         item.options = e.options.clone();
         item.recommendation = e.draft.clone();
+        // Given to the person is what the boss couldn't decide.
+        item.cant_decide = Some(match e.why.trim() {
+            "" => "It gave the person the session's question.".to_string(),
+            why => why.to_string(),
+        });
+        let full = self
+            .overseer_named(service.agent_id.as_str())
+            .is_some_and(|(_, o)| {
+                self.level_now(service.agent_id.as_str(), &o).0
+                    == workforce_common::oversight::Level::Full
+            });
         let item_id = match self.desk.store().item_open(&item).await {
             Ok(Opened::New(i)) => Some(i.id),
             Ok(Opened::Again(_)) => return,
@@ -210,21 +250,42 @@ impl CrewHub {
                 None
             }
         };
-        let text = format!(
-            "{} asks: “{}”\n\n{}",
-            q.from.name,
-            crew::one_line(q.headline(), 400),
-            e.why
+        // One line: the question and why in a few words; the rest is
+        // behind "more".
+        let asked = crew::words(
+            &crew::one_line(q.headline(), 400),
+            workforce_desk::open_item::QUESTION_WORDS,
         );
+        let why = workforce_desk::decision::clause(&crew::words(
+            &crew::one_line(&e.why, 400),
+            workforce_desk::open_item::POINT_WORDS,
+        ));
+        let text = match &why {
+            Some(w) => format!("{} asks: “{asked}” — {w}", q.from.name),
+            None => format!("{} asks: “{asked}”", q.from.name),
+        };
+        // What the line leaves out of either is behind "more".
+        let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut detail: Vec<String> = Vec::new();
+        if flat(q.headline()) != flat(&asked) {
+            detail.push(q.headline().trim().to_string());
+        }
+        if !e.why.trim().is_empty()
+            && why.as_deref().map(flat) != workforce_desk::decision::clause(&flat(&e.why))
+        {
+            detail.push(e.why.trim().to_string());
+        }
         let extras = Extras {
             questions: vec![MentionedQuestion {
                 message_id: q.id.to_string(),
                 session_id: q.from.id.clone(),
                 session: q.from.name.clone(),
-                ask: q.headline().to_string(),
-                why: e.why,
+                ask: asked.clone(),
+                why: why.clone().unwrap_or_default(),
                 options: e.options,
-                draft: e.draft,
+                // At Act fully the boss recommends nothing.
+                draft: e.draft.filter(|_| !full),
+                detail: (!detail.is_empty()).then(|| detail.join("\n\n")),
             }],
             ..Default::default()
         };
@@ -232,6 +293,27 @@ impl CrewHub {
         // at most three minutes, without holding up the caller.
         self.card(service.agent_id.as_str(), item_id, text, extras)
             .await;
+    }
+
+    /// Says each held session question ([`Self::post_question`]) still
+    /// waiting on the person, once they have left its session a hold's
+    /// time; one they answered there, or that stopped waiting, is dropped.
+    pub(crate) async fn post_held_questions(&self) {
+        let held: Vec<Uuid> = self.held_questions.lock().iter().copied().collect();
+        for id in held {
+            let q = match self.desk.store().line_message(id).await {
+                Ok(Some(q)) if q.asked == Some(workforce_desk::line::Asked::Escalated) => q,
+                Ok(_) => {
+                    self.held_questions.lock().remove(&id);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "a held question couldn't be read");
+                    continue;
+                }
+            };
+            self.post_question(&q).await;
+        }
     }
 
     /// Gives every question in `asks` (of `session`) to the person, saying

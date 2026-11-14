@@ -448,7 +448,53 @@ impl DeskStore {
             })
             .collect::<Result<_>>()?;
         self.decisions_now(&mut out).await;
+        self.items_now(&mut out).await;
         Ok(out)
+    }
+
+    /// What an update says waits on the person (`needsYou`, the brief's
+    /// "for you"), as its items are now: one settled in its session since
+    /// says so (`settledBy`). Kept as posted when the items can't be read.
+    async fn items_now(&self, extras: &mut HashMap<String, Extras>) {
+        use crate::update::BriefKind;
+        let ids: Vec<uuid::Uuid> = extras
+            .values()
+            .filter_map(|e| e.update.as_ref())
+            .flat_map(|u| {
+                u.needs_you.iter().map(|n| n.item_id.as_str()).chain(
+                    u.brief
+                        .iter()
+                        .flat_map(|g| &g.items)
+                        .filter(|i| i.kind == BriefKind::ForYou)
+                        .map(|i| i.id.as_str()),
+                )
+            })
+            .filter_map(|id| id.parse().ok())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let items = match self.open_items_of(&ids).await {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!(error = %e, "an update's items couldn't be read for how they stand");
+                return;
+            }
+        };
+        let settled: HashMap<String, crate::update::SettledBy> = items
+            .iter()
+            .filter_map(|i| crate::open_item::settled_by(i).map(|s| (i.id.to_string(), s)))
+            .collect();
+        for u in extras.values_mut().filter_map(|e| e.update.as_mut()) {
+            for n in u.needs_you.iter_mut() {
+                n.settled_by = settled.get(&n.item_id).copied();
+            }
+            for i in u.brief.iter_mut().flat_map(|g| g.items.iter_mut()) {
+                if i.kind == BriefKind::ForYou {
+                    i.settled_by = settled.get(&i.id).copied();
+                }
+            }
+        }
     }
 
     /// The decision lines in `extras` as their rows are now: undone ones
@@ -493,6 +539,18 @@ impl DeskStore {
             for l in e.update.iter_mut().flat_map(|u| u.decisions.iter_mut()) {
                 if let Some(d) = rows.iter().find(|d| d.id.to_string() == l.id) {
                     l.laid_out_from(d);
+                }
+            }
+            // The brief's lines of what it did: their undo as their rows'
+            // now (none once undone).
+            for u in e.update.iter_mut() {
+                for i in u.brief.iter_mut().flat_map(|g| g.items.iter_mut()) {
+                    if i.kind != crate::update::BriefKind::Done {
+                        continue;
+                    }
+                    if let Some(d) = rows.iter().find(|d| d.id.to_string() == i.id) {
+                        i.undo = d.line_now(delivery.get(&d.id).copied()).undo;
+                    }
                 }
             }
         }

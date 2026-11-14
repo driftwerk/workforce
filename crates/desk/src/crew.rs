@@ -161,6 +161,9 @@ kinds! {
     Moved => "moved",
     HandedOver => "handed_over",
     HandedOff => "handed_off",
+    // A boss's ask the person settled in its session themselves: Desk
+    // folds what still lists it (`detail`: itemId, by).
+    Settled => "settled",
 }
 
 /// One thing that happened on the crew.
@@ -645,6 +648,10 @@ pub struct MentionedQuestion {
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// What it says beyond its one line (the full question, the full why),
+    /// behind "more".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,6 +736,11 @@ pub trait Crew: Send + Sync {
     }
     /// Drops the boss's open item `id` unanswered, as you.
     async fn drop_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
+        Err(ItemRefused::Cant("There is no boss here.".into()))
+    }
+    /// The person did what the boss's open item `id` left to them only (a
+    /// "for you" line): it closes, as theirs.
+    async fn done_item(&self, _id: uuid::Uuid) -> Result<String, ItemRefused> {
         Err(ItemRefused::Cant("There is no boss here.".into()))
     }
     /// "Always": the person's answer to the boss's open item `id` becomes
@@ -878,6 +890,29 @@ pub fn one_line(text: &str, max: usize) -> String {
         .map(|(i, c)| &line[..i + c.len_utf8()])
         .unwrap_or(line);
     clip(sentence, max)
+}
+
+/// `text`'s first line cut to `max` words, with an ellipsis when cut.
+pub fn words(text: &str, max: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let all: Vec<&str> = line.split_whitespace().collect();
+    if all.len() <= max {
+        return all.join(" ");
+    }
+    let cut = all[..max].join(" ");
+    format!(
+        "{}…",
+        cut.trim_end_matches([',', ';', ':', '.', '—', '-', ' '])
+    )
+}
+
+/// How many words `text` has.
+pub fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
 }
 
 /// `text` cut to `max` characters, with an ellipsis when cut.

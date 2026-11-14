@@ -56,6 +56,9 @@ pub(crate) struct Charges {
     unanswering: HashMap<String, String>,
     /// The requests a boss was given and left open: the person's now.
     left: std::collections::HashSet<Uuid>,
+    /// The sessions whose dialog questions an Act fully boss answers, and
+    /// how long the person's input keeps them theirs, as the hub last said.
+    dialogs: HashMap<Uuid, chrono::Duration>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -359,7 +362,56 @@ impl Desk {
 
     /// The person gave `id` a prompt or wrote to it: they take its wheel.
     pub(super) fn person_drove(&self, id: Uuid) {
-        self.0.state.lock().charges.driven.insert(id, Utc::now());
+        let held = {
+            let mut st = self.0.state.lock();
+            st.charges.driven.insert(id, Utc::now());
+            st.live.get(&id).and_then(|l| {
+                l.pending
+                    .as_ref()
+                    .filter(|p| p.answerable && l.holder().is_some_and(|h| h.question))
+                    .map(|p| p.id)
+            })
+        };
+        // A question held for its boss is theirs now: its dialog opens.
+        if let Some(p) = held {
+            self.release_dialog(id, p);
+        }
+    }
+
+    /// The questions sessions' dialogs ask that wait behind another ask:
+    /// still open, though not what their sessions wait on now.
+    pub fn questions_behind(&self) -> Vec<Uuid> {
+        self.0
+            .state
+            .lock()
+            .live
+            .values()
+            .filter_map(|l| l.open_question.as_ref().map(|(q, _)| q.id))
+            .collect()
+    }
+
+    /// Lets session `id`'s question `pending`, held at its start for its
+    /// boss, go to its dialog: the person answers it there.
+    pub fn release_dialog(&self, id: Uuid, pending: Uuid) {
+        let answer = {
+            let mut st = self.0.state.lock();
+            let Some(l) = st.live.get_mut(&id) else {
+                return;
+            };
+            let Some(p) = l
+                .pending
+                .as_mut()
+                .filter(|p| p.id == pending && p.answerable)
+            else {
+                return;
+            };
+            p.answerable = false;
+            l.answer.take()
+        };
+        if let Some(a) = answer {
+            let _ = a.send(crate::claude::ask_in_terminal());
+        }
+        self.change(id, |_, _| {});
     }
 
     /// When the person last gave `id` input: typed in its terminal,
@@ -438,6 +490,21 @@ impl Desk {
             Some(c) => charge::wheel(c, input, gap, Utc::now()).person(),
             None => input.is_some_and(|t| Utc::now() - t < gap),
         }
+    }
+
+    /// The sessions whose dialog questions an Act fully boss answers itself,
+    /// and how long the person's input there keeps them theirs: said by the
+    /// hub as it sweeps.
+    pub fn set_dialog_answerers(&self, dialogs: HashMap<Uuid, chrono::Duration>) {
+        self.0.state.lock().charges.dialogs = dialogs;
+    }
+
+    /// Whether `id`'s next dialog question is held for its boss to answer:
+    /// an Act fully boss answers its questions, and the person isn't in
+    /// control of it.
+    pub(super) fn holds_dialog_for_boss(&self, id: Uuid) -> bool {
+        let gap = self.0.state.lock().charges.dialogs.get(&id).copied();
+        gap.is_some_and(|gap| !self.person_in_control(id, gap))
     }
 
     /// Whether what `id` waits on is a question its dialog asks the person

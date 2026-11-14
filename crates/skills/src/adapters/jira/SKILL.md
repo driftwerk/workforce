@@ -67,6 +67,8 @@ reload.
 | `jira.search_users` | Find users by name/email; returns `accountId`. |
 | `jira.myself` | Who you are on Jira: your `accountId`, display name and email. |
 | `jira.list_fields` | This site's custom fields by role (story points, sprint, start date, Development) and its priorities, highest first. |
+| `jira.dev_status` | An issue's development: its pull requests (state, author, repo, branches), branches, commit count and builds. |
+| `jira.list_remote_links` | The web links on an issue (Confluence pages, designs, other trackers): title, address, app and relation. |
 | `jira.list_boards` | List Jira Software boards (Agile API). |
 | `jira.list_sprints` | List sprints on a board, optionally filtered by state. |
 | `jira.add_worklog` | Log time on an issue. |

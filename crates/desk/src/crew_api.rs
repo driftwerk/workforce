@@ -3,6 +3,7 @@
 //! the overseer's suggestions; `/decisions/{id}/undo`, the person undoing
 //! one of its decisions; `/items/{id}/answer`, `/drop` and `/always`, the
 //! person settling what the boss asked them (and keeping the answer);
+//! `/items/{id}/done`, the person saying they did what only they could;
 //! `/handled`, what the boss handled and how; `/dm/{agent}/typing` and
 //! `/presence`, the person typing to a boss and whether its DM is on
 //! screen. `/preferences`: the person's preferences for their bosses,
@@ -328,6 +329,22 @@ async fn item_drop(
         return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
     };
     item_result(s.crew.drop_item(id).await)
+}
+
+/// The person did what only they could (a "for you" line's Done).
+async fn item_done(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<uuid::Uuid>() else {
+        return error(StatusCode::NOT_FOUND, "That isn’t open any more.");
+    };
+    item_result(s.crew.done_item(id).await)
 }
 
 /// The person is typing in the boss `agent`'s DM: Desk sends it every few
@@ -690,6 +707,7 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/decisions/{id}/undo", post(undo))
         .route("/api/desk/items/{id}/answer", post(item_answer))
         .route("/api/desk/items/{id}/drop", post(item_drop))
+        .route("/api/desk/items/{id}/done", post(item_done))
         .route("/api/desk/items/{id}/always", post(item_always))
         .route("/api/desk/handled", get(handled))
         .route("/api/desk/dm/{agent}/typing", post(dm_typing))
@@ -791,6 +809,13 @@ mod tests {
         async fn drop_item(&self, id: uuid::Uuid) -> Result<String, ItemRefused> {
             match id.as_u128() {
                 1 => Ok("Dropped.".into()),
+                _ => Err(ItemRefused::NotFound),
+            }
+        }
+        async fn done_item(&self, id: uuid::Uuid) -> Result<String, ItemRefused> {
+            match id.as_u128() {
+                1 => Ok("Done.".into()),
+                2 => Err(ItemRefused::Closed),
                 _ => Err(ItemRefused::NotFound),
             }
         }

@@ -376,6 +376,10 @@ pub struct Sync {
     /// The Jira site's own fields, once read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<JiraFields>,
+    /// Which of its epics' children's searches (by place, in key order) a
+    /// sweep reads first: one that ran out of calls goes on from there.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub children_next: usize,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.
@@ -454,6 +458,11 @@ pub struct External {
     /// shown beside it, never pushed.
     #[serde(default)]
     pub details: Details,
+    /// Its development there (PRs, branches, commits) and its web links,
+    /// read when the ticket is opened, with its issue: absent until read, or
+    /// on a hub without the tools. Never pushed, and the pull leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<Dev>,
 }
 
 /// What a synced ticket's issue says of itself: its priority, labels,
@@ -536,6 +545,56 @@ pub struct Facts {
     /// Its pull requests, as a summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prs: Option<PrSummary>,
+    /// Its children there: a Jira story's sub-tasks, a Jira epic's issues
+    /// (whatever the board's filter), or a Linear issue's sub-issues. At
+    /// most [`CHILDREN_MAX`]; the counts below are of them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Child>,
+    /// An epic's children's points: those done, of all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_points: Option<Progress>,
+    /// How many of an epic's children are blocked there by an issue not
+    /// yet done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_blocked: Option<u32>,
+}
+
+/// The most children a ticket keeps.
+pub const CHILDREN_MAX: usize = 200;
+
+/// One of a ticket's issue's children, kept small: never its words.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Child {
+    pub key: String,
+    #[serde(default)]
+    pub title: String,
+    /// Its type there (Jira), and the type's level (-1 a sub-task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_level: Option<i8>,
+    /// Its state's name there, and the state's kind: Linear's state type
+    /// (`started`), or Jira's status category (`new`, `indeterminate`,
+    /// `done`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_kind: Option<String>,
+    /// Done (or cancelled) there, or under way and not done.
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub started: bool,
+    /// Who has it there, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_rank: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prs: Option<PrSummary>,
 }
 
 /// Another issue a ticket's issue points at: its key, title, type and
@@ -597,6 +656,9 @@ pub struct Sprint {
 pub struct Progress {
     pub done: u32,
     pub total: u32,
+    /// Under way (in progress or in review) and not done.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub started: u32,
 }
 
 /// A ticket's issue's pull requests: how many, their overall state there
@@ -611,6 +673,91 @@ pub struct PrSummary {
     pub number: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// A ticket's issue's development, read when the ticket is opened: its
+/// pull requests, branches, commits and web links, and when they were read.
+/// Each part is the last that was read of it: a part a hub couldn't read is
+/// left as it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dev {
+    #[serde(default)]
+    pub prs: Vec<DevPr>,
+    #[serde(default)]
+    pub branches: Vec<DevBranch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<Commits>,
+    #[serde(default)]
+    pub links: Vec<RemoteLink>,
+    pub read_at: DateTime<Utc>,
+}
+
+/// A pull request on a ticket's issue. `state`: `open`, `review`,
+/// `changes`, `merged`, `declined` or `draft`. `checks` only when the
+/// remote says how they went, never guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevPr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u32>,
+    /// Always https.
+    pub url: String,
+    pub title: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Checks>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<DateTime<Utc>>,
+}
+
+/// How a PR's checks went: how many passed of how many, and overall
+/// (`pass`, `run` while any is running, `fail` when any failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checks {
+    pub passed: u32,
+    pub total: u32,
+    pub state: String,
+}
+
+/// A branch on a ticket's issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevBranch {
+    pub name: String,
+    /// Always https.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// How many commits a ticket's issue has, and when the latest was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commits {
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<DateTime<Utc>>,
+}
+
+/// A web link on a ticket's issue (a Confluence page, a design): its
+/// title, address (always https), the app it is in (else its host), and
+/// how it relates (`words`: "mentioned in", "page").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLink {
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<String>,
 }
 
 /// A Jira site's own fields a board reads (`jira.list_fields`): the custom
@@ -631,6 +778,14 @@ pub struct JiraFields {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priorities: Vec<String>,
     pub read_at: DateTime<Utc>,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 fn is_zero(n: &u8) -> bool {
