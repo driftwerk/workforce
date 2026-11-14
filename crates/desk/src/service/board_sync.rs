@@ -1434,7 +1434,7 @@ impl Desk {
             e.clipped = issue.clipped;
             // Read with today's reader: never read again for its old shape.
             e.html_read = crate::board_sync::HTML_READ;
-            e.html_print = None;
+            e.html_prints.clear();
         }
         let was = crate::board_sync::blockers(&e.details.facts);
         e.details = crate::board_sync::details_of(
@@ -1536,7 +1536,7 @@ impl Desk {
                 assignee: issue.assignee.clone(),
                 clipped: issue.clipped,
                 html_read: crate::board_sync::HTML_READ,
-                html_print: None,
+                html_prints: vec![],
                 details: crate::board_sync::details_of(
                     issue,
                     None,
@@ -2478,7 +2478,7 @@ impl Desk {
             clipped: false,
             // Its body is Desk's own: never read again for an old shape.
             html_read: crate::board_sync::HTML_READ,
-            html_print: None,
+            html_prints: vec![],
             details: Default::default(),
             dev: None,
         });

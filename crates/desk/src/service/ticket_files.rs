@@ -172,9 +172,10 @@ impl Desk {
             ext.details = details;
             // Held as the body is, while it isn't one edited here.
             if let Some(adf) = adf.filter(|_| t.body == ext.seen.body) {
-                // The HTML a pull reads of it, built from the same answer as
-                // a pull builds it: while a pull reads that, this stays.
-                ext.html_print = issue.body.as_deref().map(crate::board_sync::body_print);
+                // The HTML a pull reads of it, from the same answer, whole
+                // and cut as a search cuts it: while a pull reads that, this
+                // stays.
+                ext.html_prints = crate::board_sync::html_prints(&v);
                 ext.html_read = crate::board_sync::ADF_READ;
                 ext.clipped = adf.clipped;
                 ext.flagged = ext.flagged || adf.flagged;

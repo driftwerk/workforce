@@ -34,7 +34,7 @@ use super::markdown::markdown_to_adf;
 
 /// Wrap a JSON string field with security boundary markers if it contains content.
 /// The most of an issue's rendered description one `jira.search` row carries.
-const SEARCH_DESCRIPTION_MAX: usize = 8_000;
+pub const SEARCH_DESCRIPTION_MAX: usize = 8_000;
 
 /// `value`'s text cut to `max` characters, marked where it was cut; anything
 /// else as it is.

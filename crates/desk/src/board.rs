@@ -455,10 +455,11 @@ pub struct External {
     /// was read as Jira stores it, on open: sent back only once edited here.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub html_read: u8,
-    /// A body read as ADF: the fingerprint of the HTML-read body it took
-    /// the place of, so a pull that reads the same HTML again leaves it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub html_print: Option<String>,
+    /// A body read as ADF: the fingerprints of the HTML-read bodies it
+    /// stands for (as a read and as a search give it), so a pull that reads
+    /// the same HTML again leaves it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_prints: Vec<String>,
     /// What its issue says of itself besides its words, as last pulled:
     /// shown beside it, never pushed.
     #[serde(default)]

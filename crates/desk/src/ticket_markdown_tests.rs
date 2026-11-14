@@ -495,6 +495,8 @@ fn hostile_text_is_read_in_a_moment() {
         "`".repeat(n),
         "`a``a```a````".repeat(n / 13),
         "ab ".repeat(n / 3),
+        "a+".repeat(n / 2),
+        "a.b-".repeat(n / 4),
         "MAN-1 ".repeat(n / 6),
         "https://linear.app/acme/issue/MAN-2 ".repeat(n / 37),
         ":mention[".repeat(n / 9),

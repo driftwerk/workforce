@@ -56,7 +56,8 @@ struct Cx<'a> {
 
 impl Cx<'_> {
     /// The issue key a link to `href` makes a chip of: one on the ticket's
-    /// own site.
+    /// own site. Only an `https` site has one, so an `http`-only Jira
+    /// Server's links stay links: it fails closed.
     fn chip(&self, href: &str) -> Option<String> {
         browse_key(href).filter(|_| {
             !self.site.is_empty()
@@ -1065,6 +1066,9 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
     let mut i = 0;
     let word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.' | b'@');
     let mut spans = CodeSpans::of(line);
+    // Where the last run read as a scheme, and not one, ends: a word inside
+    // it (`a+a+a`) is never read as a scheme again.
+    let mut no_scheme_until = 0;
     while i < b.len() {
         let c = b[i];
         // An escaped character stays escaped.
@@ -1113,11 +1117,17 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
         let at_word = i == 0 || !word(b[i - 1]);
         if at_word && c.is_ascii_alphabetic() {
             // An address: a link when it is a Linear issue's, else as it is.
-            let scheme = line[i..]
-                .bytes()
-                .take_while(|x| x.is_ascii_alphanumeric() || matches!(x, b'+' | b'.' | b'-'))
-                .count();
-            if line[i + scheme..].starts_with("://") {
+            let scheme = match i < no_scheme_until {
+                true => 0,
+                false => line[i..]
+                    .bytes()
+                    .take_while(|x| x.is_ascii_alphanumeric() || matches!(x, b'+' | b'.' | b'-'))
+                    .count(),
+            };
+            if scheme > 0 && !line[i + scheme..].starts_with("://") {
+                no_scheme_until = i + scheme;
+            }
+            if scheme > 0 && line[i + scheme..].starts_with("://") {
                 let len = line[i..]
                     .find(|ch: char| ch.is_whitespace() || ch == '<')
                     .unwrap_or(line.len() - i);
@@ -1383,16 +1393,17 @@ pub fn jira_out(md: &str) -> String {
     let lines = fenced_lines(md);
     let mut open: Vec<(usize, Open)> = vec![];
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // A `> ` for each panel open.
+    let mut quote = String::new();
     for (l, code) in lines {
-        let quote = "> ".repeat(open.iter().filter(|o| o.1 == Open::Panel).count());
-        let say = |out: &mut Vec<String>, text: &str| {
+        let say = |out: &mut Vec<String>, quote: &str, text: &str| {
             out.push(match text.is_empty() {
                 true => quote.trim_end().to_string(),
                 false => format!("{quote}{text}"),
             })
         };
         if code {
-            say(&mut out, l);
+            say(&mut out, &quote, l);
             continue;
         }
         let t = l.trim();
@@ -1403,6 +1414,9 @@ pub fn jira_out(md: &str) -> String {
                 if let Some((n, kind)) = open.last().copied() {
                     if colons >= n {
                         open.pop();
+                        if kind == Open::Panel {
+                            quote.truncate(quote.len() - 2);
+                        }
                         if kind == Open::Other {
                             out.push(l.to_string());
                         }
@@ -1411,6 +1425,7 @@ pub fn jira_out(md: &str) -> String {
                 }
             } else if rest.starts_with("panel") {
                 open.push((colons, Open::Panel));
+                quote.push_str("> ");
                 continue;
             } else if let Some(title) = rest.strip_prefix("details") {
                 let title = title
@@ -1420,7 +1435,7 @@ pub fn jira_out(md: &str) -> String {
                     .unwrap_or("")
                     .trim();
                 if !title.is_empty() {
-                    say(&mut out, &format!("**{title}**"));
+                    say(&mut out, &quote, &format!("**{title}**"));
                 }
                 open.push((colons, Open::Details));
                 continue;
@@ -1428,7 +1443,7 @@ pub fn jira_out(md: &str) -> String {
                 open.push((colons, Open::Other));
             }
         }
-        say(&mut out, &plain_directives(l));
+        say(&mut out, &quote, &plain_directives(l));
     }
     out.join("\n")
 }

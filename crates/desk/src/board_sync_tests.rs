@@ -51,7 +51,7 @@ fn synced(state: TicketState) -> Ticket {
         assignee: None,
         clipped: false,
         html_read: 0,
-        html_print: None,
+        html_prints: vec![],
         details: Default::default(),
         dev: None,
     });
@@ -1216,7 +1216,7 @@ fn a_body_read_as_adf_stays_until_the_description_changes_there() {
     let mut t = synced(TicketState::Todo);
     let e = t.external.as_mut().unwrap();
     e.html_read = ADF_READ;
-    e.html_print = Some(body_print(html_body));
+    e.html_prints = vec![body_print(html_body)];
     t.body = ":::panel{tone=info}\nIt **times** out.\n:::".into();
     t.external.as_mut().unwrap().seen.body = t.body.clone();
     let issue = |body: &str, newer: bool| Issue {

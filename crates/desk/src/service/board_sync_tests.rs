@@ -2388,7 +2388,18 @@ impl Remote for AdfJira {
             "updated": *self.updated.lock().unwrap(), "labels": ["web"],
             "description_html": *self.html.lock().unwrap() });
         match tool {
-            "jira.search" => Ok(json!({ "issues": [v], "is_last": true })),
+            // As the adapter gives it: its description cut at 8 000.
+            "jira.search" => {
+                let html = self.html.lock().unwrap().clone();
+                if html.chars().count() > crate::board_sync::JIRA_SEARCH_HTML_MAX {
+                    let cut: String = html
+                        .chars()
+                        .take(crate::board_sync::JIRA_SEARCH_HTML_MAX)
+                        .collect();
+                    v["description_html"] = json!(format!("{cut}…"));
+                }
+                Ok(json!({ "issues": [v], "is_last": true }))
+            }
             "jira.get_issue" => {
                 if args["description_adf"] == true {
                     v["description_adf"] = json!(self.adf.lock().unwrap().to_string());
@@ -2462,11 +2473,41 @@ async fn a_body_read_as_adf_stays_through_pulls_until_its_description_changes() 
         assert!(t.updated_at > at, "the edit is said");
         let e = t.external.as_ref().unwrap();
         assert_eq!(e.html_read, crate::board_sync::HTML_READ);
-        assert_eq!(e.html_print, None);
+        assert!(e.html_prints.is_empty());
 
         // Opened again: ADF again.
         let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
         assert_eq!(v.ticket.body, ":::panel{tone=info}\nIt works.\n:::");
+
+        // A long one, which a search gives cut: a change there that isn't
+        // its words leaves it too.
+        let long = "word ".repeat(2_000);
+        jira.says(
+            &format!("<p>{long}</p>"),
+            &long,
+            "2026-11-09T13:00:00.000+0000",
+        );
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d.ticket_of(id).await.unwrap();
+        assert!(t.body.ends_with('…'), "the search's cut body");
+        let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
+        assert!(v.ticket.body.starts_with(":::panel{tone=info}\nword word"));
+        let at = v.ticket.updated_at;
+        jira.says(
+            &format!("<p>{long}</p>"),
+            &long,
+            "2026-11-09T14:00:00.000+0000",
+        );
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d.ticket_of(id).await.unwrap();
+        assert_eq!(t.body, v.ticket.body, "kept");
+        assert_eq!(t.updated_at, at, "no edit is said");
+        assert_eq!(
+            t.external.as_ref().unwrap().html_read,
+            crate::board_sync::ADF_READ
+        );
+        let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
+        assert_eq!(v.ticket.body, t.body, "and opened again, the same");
     })
     .await;
 }

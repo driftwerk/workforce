@@ -632,3 +632,13 @@ async fn opening_a_ticket_reads_its_description_as_jira_stores_it() {
     })
     .await;
 }
+
+/// Desk cuts a description's HTML where a Jira search does, so a body
+/// read as ADF knows the search's HTML of it.
+#[test]
+fn desk_cuts_a_description_where_a_jira_search_does() {
+    assert_eq!(
+        workforce_desk::board_sync::JIRA_SEARCH_HTML_MAX,
+        workforce_skills::adapters::jira::tools::SEARCH_DESCRIPTION_MAX
+    );
+}

@@ -1027,7 +1027,31 @@ pub fn body_print(body: &str) -> String {
 /// as ADF took the place of: the description is unchanged there, and the
 /// richer read stays.
 pub fn stands_for(e: &crate::board::External, body: &str) -> bool {
-    e.html_read == ADF_READ && e.html_print.as_deref() == Some(body_print(body).as_str())
+    e.html_read == ADF_READ && e.html_prints.contains(&body_print(body))
+}
+
+/// The most of an issue's rendered description one `jira.search` row
+/// carries, cut there with a `…`: the Jira adapter's own
+/// `SEARCH_DESCRIPTION_MAX`, which a hub test holds them to.
+pub const JIRA_SEARCH_HTML_MAX: usize = 8_000;
+
+/// The fingerprints of the body a pull reads of a `jira.get_issue` answer's
+/// description: as the read gives it whole, and as a search gives it, cut
+/// at [`JIRA_SEARCH_HTML_MAX`].
+pub fn html_prints(answer: &Value) -> Vec<String> {
+    let Some((html, _)) = answer.get("description_html").map(text_field) else {
+        return vec![];
+    };
+    let print = |html: &str| body_print(&held_body(html_text(html)).0);
+    let mut prints = vec![print(&html)];
+    if html.chars().count() > JIRA_SEARCH_HTML_MAX {
+        let cut: String = html.chars().take(JIRA_SEARCH_HTML_MAX).collect();
+        let cut = print(&format!("{cut}…"));
+        if cut != prints[0] {
+            prints.push(cut);
+        }
+    }
+    prints
 }
 
 /// The character an HTML entity (`amp`, `#39`, `#x27`) stands for, when it
