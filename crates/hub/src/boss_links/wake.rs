@@ -162,11 +162,41 @@ pub fn prompt(group: &str, lines: &[String], more: u64) -> String {
     }
     format!(
         "[Desk boss wake] What happened in {group} on its engines since you last looked:\n{}\n\n\
-         Tell the person briefly, in plain words, what needs them first, and what you did or suggest. \
          Use the crew tools where something needs doing. They may not be here now: anything else you'd \
-         use is asked of them, and runs only if they allow it.",
+         use is asked of them, and runs only if they allow it.\n\n\
+         Then tell the person only the critical facts. {}",
         crate::desk_crew::reported(&said, "the group's engines"),
+        workforce_desk::update_brief::REPLY_FORM,
     )
+}
+
+/// A wake turn's answer as it is posted: read into the brief's shape, its
+/// lengths held ([`workforce_desk::update_brief::parse_reply`]), whatever
+/// it said past that (a suggestion, a plan, a question) left out. Its plain
+/// text (Desk, and Slack's notification) and its Slack blocks, which carry
+/// no button: nothing in it is answered there.
+pub fn briefed(reply: &str) -> (String, Vec<Value>) {
+    use workforce_desk::update_brief as brief;
+    let u = brief::parse_reply(reply, chrono::Utc::now());
+    let text = workforce_desk::update::render_brief(&u);
+    let (_, mut blocks) = brief::slack_blocks(&u, &|_| None);
+    for b in &mut blocks {
+        defused(b);
+    }
+    (crate::slack_blocks::card_text(&text), blocks)
+}
+
+/// Every text in a block, its secrets redacted and broadcasts defused.
+fn defused(v: &mut Value) {
+    match v {
+        Value::String(s) => *s = crate::slack_blocks::card_text(s),
+        Value::Array(a) => a.iter_mut().for_each(defused),
+        Value::Object(o) => o
+            .iter_mut()
+            .filter(|(k, _)| k.as_str() == "text" || k.as_str() == "elements")
+            .for_each(|(_, v)| defused(v)),
+        _ => {}
+    }
 }
 
 static STARTED: OnceLock<()> = OnceLock::new();
@@ -362,12 +392,13 @@ pub(crate) async fn run(
             place = Place::Desk(boss_channel(&key.2));
         }
     }
+    let (text, blocks) = briefed(&reply);
     match place {
-        Place::Thread(k) => super::slack::post_in_thread(&service, &k, &reply).await,
+        Place::Thread(k) => super::slack::post_blocks_in_thread(&service, &k, &text, blocks).await,
         Place::Desk(c) => {
             let session = service.sessions.find(&c, &person).ok().flatten();
             if let (Some(push), Some(session)) = (crate::session_push::installed(), session) {
-                push.deliver(&session.id, &reply).await;
+                push.deliver(&session.id, &text).await;
             }
             Ok(())
         }
@@ -448,6 +479,81 @@ mod tests {
         let said = prompt("Acme", &lines, more);
         assert!(said.contains("(and 13 more since)"), "{said}");
         assert!(said.contains("Acme"));
+    }
+
+    /// What a boss at Act fully might answer a wake over three sessions,
+    /// past the form: a suggestion, a question, a long line.
+    const TYPICAL: &str = "Web's release is unblocked; one thing for you.\n\
+        [acme-web]\n\
+        ✓ Lifted my hold on tonight's release — CI is green again\n\
+        I'd suggest we also bump the version. Want me to?\n\
+        [acme-api]\n\
+        ✓ Restarted the stuck test run — it hung on a lock\n\
+        [acme-docs]\n\
+        For you: Rotate the staging deploy key in your vault — the old one leaked\n\
+        Options: rotate now, or wait until Monday.";
+
+    #[test]
+    fn a_wakes_answer_is_posted_as_the_brief_one_line_an_item_and_no_buttons() {
+        let (text, blocks) = briefed(TYPICAL);
+        let lines: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| {
+                let mut t = vec![b["text"]["text"].as_str().unwrap_or_default().to_string()];
+                for e in b["elements"].as_array().into_iter().flatten() {
+                    t.push(e["text"].as_str().unwrap_or_default().to_string());
+                }
+                t
+            })
+            .filter(|t| !t.is_empty())
+            .flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "*Web's release is unblocked; one thing for you.*",
+                "*acme-docs*",
+                "● For you: Rotate the staging deploy key in your vault — the old one leaked",
+                "*acme-web*",
+                "✓ Lifted my hold on tonight's release — CI is green again",
+                "*acme-api*",
+                "✓ Restarted the stuck test run — it hung on a lock",
+            ]
+        );
+        let raw = serde_json::to_string(&blocks).unwrap();
+        for gone in [
+            "\"actions\"",
+            "\"button\"",
+            "\"accessory\"",
+            "suggest",
+            "Options",
+            "Monday",
+        ] {
+            assert!(!raw.contains(gone), "{gone} in {raw}");
+        }
+        assert!(!text.contains("suggest"), "{text}");
+        assert_eq!(
+            text.lines().filter(|l| !l.trim().is_empty()).count(),
+            4,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_wakes_answer_never_broadcasts() {
+        let (_, blocks) = briefed("All quiet.\n✓ Told <!here> and @channel the run is done");
+        let raw = serde_json::to_string(&blocks).unwrap();
+        assert!(!raw.contains("<!here>"), "{raw}");
+        assert!(!raw.contains("@channel"), "{raw}");
+    }
+
+    #[test]
+    fn a_wakes_prompt_holds_it_to_the_brief() {
+        let said = prompt("Acme", &["devbox: acme-web finished".into()], 0);
+        assert!(
+            said.contains(workforce_desk::update_brief::REPLY_FORM),
+            "{said}"
+        );
     }
 
     #[test]

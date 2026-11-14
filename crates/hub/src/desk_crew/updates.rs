@@ -718,6 +718,11 @@ impl CrewHub {
             .store()
             .update_pend(service.agent_id.as_str(), &p)
             .await?;
+        // The check-in's turn is the crew's housekeeping, never on the
+        // Floor: what it said is, briefly.
+        if let Some(dm) = service.sessions.find(DESK_CHANNEL, owner).ok().flatten() {
+            self.on_floor(service, owner, &dm.id, &p);
+        }
         let missing = update::missing_lines(&p, &decided, reply);
         if !missing.is_empty() {
             let target =
@@ -776,10 +781,11 @@ impl CrewHub {
                 delivery.request_id = Some(id);
                 // Its extras kept first: the update is read whole the
                 // moment it is in the DM.
-                let message = self
+                let delivered = self
                     .deliver_with_extras(service, owner, delivery, &extras)
-                    .await?
-                    .message_id;
+                    .await?;
+                self.on_floor(service, owner, &delivered.session_id, &p);
+                let message = delivered.message_id;
                 // Sent: kept so, before anything else, so a restart from
                 // here on finds it whatever the DM did since.
                 p.sent = Some(message);
@@ -787,6 +793,33 @@ impl CrewHub {
             }
         }
         self.told(service, owner, state, &p).await
+    }
+
+    /// The Floor told of `p` as it went to `owner`'s DM `session_id`: the
+    /// boss's purpose and where things stand, from its brief, in plain
+    /// words and no ids; what was settled since and a session the person
+    /// is in now left out. Never the update's prose.
+    fn on_floor(&self, service: &AgentService, owner: &str, session_id: &str, p: &Pending) {
+        #[cfg(feature = "postgres")]
+        if let Some(log) = crate::floor::turns() {
+            let now = Utc::now();
+            let hidden = |s: &str| s.parse::<Uuid>().is_ok_and(|s| self.person_in(s, now));
+            let shown = workforce_desk::update_brief::shown(&p.update, &hidden);
+            let (purpose, state) = workforce_desk::update_brief::floor_line(
+                &shown,
+                p.away.as_ref().map(|a| a.headline.as_str()),
+            );
+            crate::floor::agents::briefed(
+                log.as_ref(),
+                service.agent_id.as_str(),
+                owner,
+                session_id,
+                &purpose,
+                &state,
+            );
+        }
+        #[cfg(not(feature = "postgres"))]
+        let _ = (service, owner, session_id, p);
     }
 
     /// The suggestions quiet check-ins made since `p`'s last update, shown
