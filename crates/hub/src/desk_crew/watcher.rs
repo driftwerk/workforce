@@ -1030,6 +1030,7 @@ struct Waking {
 /// no other; each overseer's check-ins are gathered and spent apart.
 pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
+    let mut rework = crew.rework.subscribe();
     let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut waking: HashMap<String, Waking> = HashMap::new();
@@ -1067,6 +1068,17 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
+            // A turn's end the boss's fast call handed to its full turn.
+            Ok(event) = rework.recv() => {
+                if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
+                    if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
+                        if let Some(session) = finished_session(&event) {
+                            t.line = crew.with_doing(session, t.line).await;
+                        }
+                        found.push((s.agent_id.as_str().to_string(), t));
+                    }
+                }
+            }
             Some((id, again)) = retried.recv() => {
                 tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
                 // Held again as it was: what it asks was raised already.

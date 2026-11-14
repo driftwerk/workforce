@@ -6,7 +6,8 @@
 //!   and its reason; no work turn woken for it.
 //! - Done: a decision that it waits, and nothing sent.
 //! - Only the person can say: the DM asks it in one line.
-//! - A call that fails is tried once more, then the DM says so.
+//! - Its next step needs the boss's own tools: its full turn takes it.
+//! - A call that fails is tried once more, then its full turn takes it.
 //! - While the person is in control of it, nothing is said.
 
 use super::decides_at_once::{calls_about, decides, said, THEIRS};
@@ -29,6 +30,25 @@ async fn told(d: &Desk, id: uuid::Uuid) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .map(|m| m.text)
+        .collect()
+}
+
+/// The boss's full turns woken with `about` in what they were given.
+async fn woken(llm: &wiremock::MockServer, about: &str) -> Vec<String> {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .filter(|c| {
+            !c.contains(super::super::decide::MARK)
+                && c.rsplit("END SYSTEM CONTEXT")
+                    .next()
+                    .is_some_and(|given| given.contains(about))
+        })
         .collect()
 }
 
@@ -59,6 +79,12 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         )
         .await;
         decides(&llm, "the release is out", "DONE: the release is out").await;
+        decides(
+            &llm,
+            "Drafted the quarterly report",
+            "WORK: hand the sign-off to the finance agent",
+        )
+        .await;
         decides(
             &llm,
             "Staged the invites",
@@ -107,24 +133,9 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         tokio::time::sleep(Duration::from_millis(3000)).await;
         assert_eq!(calls_about(&llm, "the tests aren't run yet").await.len(), 1, "one call");
         assert_eq!(told(&d, s.id).await.len(), 1, "told once");
-        // No work turn was woken for it.
-        let woken: Vec<String> = llm
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
-            .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
-            .filter(|m| m["role"] == "user")
-            .map(|m| m["content"].to_string())
-            .filter(|c| {
-                !c.contains(super::super::decide::MARK)
-                    && c.rsplit("END SYSTEM CONTEXT")
-                        .next()
-                        .is_some_and(|asked| asked.contains("the tests aren't run yet"))
-            })
-            .collect();
-        assert!(woken.is_empty(), "woken for a judged turn: {woken:?}");
+        // No full turn was woken for it.
+        let full = woken(&llm, "the tests aren't run yet").await;
+        assert!(full.is_empty(), "woken for a judged turn: {full:?}");
 
         // Done: it waits, recorded, and nothing is sent.
         let s2 = new_session(&d, &base, "acme-web").await;
@@ -158,17 +169,29 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
         .await;
         assert!(told(&d, s3.id).await.is_empty(), "nothing sent to it");
 
-        // Its model's answer is none of them: tried once more, then the DM.
+        // Its next step needs the boss's own tools: its full turn takes the
+        // turn's end, as before the fast call.
+        let s5 = new_session(&d, &base, "reports").await;
+        let url5 = hook_url(&base, s5.id).await;
+        ends(&url5, "Drafted the quarterly report; finance must sign it off.").await;
+        eventually("its full turn", async || {
+            (!woken(&llm, "Drafted the quarterly report").await.is_empty()).then_some(())
+        })
+        .await;
+        assert_eq!(calls_about(&llm, "Drafted the quarterly report").await.len(), 1, "one fast call");
+        assert!(told(&d, s5.id).await.is_empty(), "the fast call sent it nothing");
+
+        // Its model's answer is none of them: tried once more, then its full
+        // turn takes it, never silence.
         let s4 = new_session(&d, &base, "billing").await;
         let url4 = hook_url(&base, s4.id).await;
         ends(&url4, "Refactored the billing module.").await;
-        eventually("the DM to say it couldn't decide", async || {
-            (said(&overseer, &["billing finished its turn. I couldn't decide what's next"]) == 1)
-                .then_some(())
+        eventually("its full turn", async || {
+            (!woken(&llm, "Refactored the billing module").await.is_empty()).then_some(())
         })
         .await;
-        assert_eq!(calls_about(&llm, "Refactored the billing module").await.len(), 2);
-        assert!(told(&d, s4.id).await.is_empty());
+        assert_eq!(calls_about(&llm, "Refactored the billing module").await.len(), 2, "tried twice");
+        assert_eq!(said(&overseer, &["billing", "couldn't decide"]), 0);
     })
     .await;
 }

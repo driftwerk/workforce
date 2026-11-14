@@ -878,6 +878,17 @@ impl Desk {
 
     /// Whether any boss is unbound now: else no request is Desk's to allow
     /// at once, and nothing need be looked at.
+    /// The bosses unbound now.
+    pub fn unbound_bosses(&self) -> Vec<String> {
+        let st = self.0.state.lock();
+        st.charges
+            .full
+            .iter()
+            .filter(|(_, g)| g.unbound)
+            .map(|(b, _)| b.clone())
+            .collect()
+    }
+
     pub fn any_boss_unbound(&self) -> bool {
         self.0.state.lock().charges.full.values().any(|g| g.unbound)
     }
