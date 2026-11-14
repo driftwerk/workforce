@@ -137,6 +137,54 @@ impl DeskStore {
         put_plan_in(&**client, p).await
     }
 
+    /// Re-files plan `p` on board `to`, in one step: `p` written as it
+    /// says (its board `to`), and each of its tickets numbered on `to` in
+    /// the order they were numbered, still in the plan, with what they
+    /// need, their links, history and assignment kept. The tickets as they
+    /// are now, in that order.
+    pub async fn move_plan_board(&self, p: &Plan, to: Uuid) -> Result<Vec<Ticket>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let ids: Vec<Uuid> = tx
+            .query(
+                "SELECT id FROM tickets WHERE plan = $1 AND board <> $2 ORDER BY number",
+                &[&p.id, &to],
+            )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        for id in &ids {
+            let number: i32 = tx
+                .query_one(
+                    "UPDATE boards SET next_number = next_number + 1 WHERE id = $1 \
+                     RETURNING next_number - 1",
+                    &[&to],
+                )
+                .await
+                .context("numbering a re-filed plan's ticket")?
+                .try_get(0)?;
+            tx.execute(
+                "UPDATE tickets SET board = $2, number = $3, updated_at = now(), \
+                 version = version + 1 WHERE id = $1",
+                &[id, &to, &number],
+            )
+            .await?;
+        }
+        put_plan_in(&*tx, p).await?;
+        tx.commit()
+            .await
+            .context("re-filing a plan on another board")?;
+        drop(client);
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = self.ticket(id).await? {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn plan(&self, id: Uuid) -> Result<Option<Plan>> {
         let client = self.pool().get().await?;
         client
