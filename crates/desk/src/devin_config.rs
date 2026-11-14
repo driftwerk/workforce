@@ -81,7 +81,7 @@ const NOT_WRITTEN_BACK_INSIDE: [&str; 4] = ["url", "uri", "hook", "token"];
 /// Whole names never written back, whatever their words, at any depth
 /// (but under the keymap). A name is compared by its words run together
 /// (`readConfigFrom` is `read_config_from`, `status_line` `statusline`).
-const NOT_WRITTEN_BACK_NAMED: [&str; 8] = [
+const NOT_WRITTEN_BACK_NAMED: [&str; 12] = [
     "read_config_from",
     "permission_mode",
     "local_tools_bypass_permissions",
@@ -90,27 +90,49 @@ const NOT_WRITTEN_BACK_NAMED: [&str; 8] = [
     "skip_verify",
     "verify_ssl",
     "auto_accept",
+    "ssl_verify",
+    "strict_ssl",
+    "reject_unauthorized",
+    "no_verify",
 ];
 
-/// Top-level names always written back, whatever their words: `keymap` is
-/// no key, `show_path` no path (it shows the folder or doesn't).
+/// Top-level names always written back, whatever their words, spelled
+/// exactly so (Devin reads no other spelling): `keymap` is no key,
+/// `show_path` no path (it shows the folder or doesn't).
 const WRITTEN_BACK_NAMED: [&str; 2] = ["keymap", "show_path"];
+
+/// The roots a word of a keymap context's or action's name may not start
+/// with: a key that answers a permission prompt or changes the mode would
+/// turn the person's next keypress into a grant (Devin's prompt answers
+/// Once and Always on number keys).
+const KEYMAP_NOT_WRITTEN_BACK_ROOTS: [&str; 10] = [
+    "allow",
+    "approv",
+    "permission",
+    "trust",
+    "bypass",
+    "deny",
+    "reject",
+    "yolo",
+    "danger",
+    "autonom",
+];
 
 /// The words of a mode setting's name, besides `mode`, that make it the
 /// permission mode's: Devin's is `permission_mode` (docs.devin.ai, config
 /// file); `unicode_mode` and `theme_mode` are no permission's.
 const MODE_WORDS: [&str; 4] = ["permission", "approval", "agent", "default"];
 
-/// Permission modes, by any of their names: never a setting's value
-/// written back.
-const MODES: [&str; 9] = [
+/// Permission modes, by any of their names (compared by their words run
+/// together: `accept_edits`, `Accept Edits`, `acceptedits`): never a
+/// setting's value written back.
+const MODES: [&str; 8] = [
     "dangerous",
     "bypass",
-    "bypasspermissions",
+    "bypass_permissions",
     "yolo",
     "smart",
-    "accept-edits",
-    "acceptedits",
+    "accept_edits",
     "autonomous",
     "auto",
 ];
@@ -161,7 +183,7 @@ fn named(name: &str, names: &[&str]) -> bool {
 /// Whether a setting named `name` is never written back; `top`: it is a
 /// setting of the config's own, not one inside another.
 fn protected_name(name: &str, top: bool) -> bool {
-    if top && named(name, &WRITTEN_BACK_NAMED) {
+    if top && WRITTEN_BACK_NAMED.contains(&name) {
         return false;
     }
     if name.to_ascii_lowercase().starts_with("mcp") || named(name, &NOT_WRITTEN_BACK_NAMED) {
@@ -183,27 +205,61 @@ fn sets_mode(key: &str, v: &Value) -> bool {
         && words
             .iter()
             .all(|w| w == "mode" || MODE_WORDS.contains(&w.as_str()))
-        && v.as_str()
-            .is_some_and(|v| MODES.contains(&v.trim().to_ascii_lowercase().as_str()))
+        && v.as_str().is_some_and(|v| named(v, &MODES))
 }
 
 /// Whether `v`, a setting's text, reads as somewhere to reach or run: an
-/// address, or a path. Under the keymap, a slash command (`/word`) or a
-/// single key (`/`, `~`) is a binding.
-fn protected_text(v: &str, in_keymap: bool) -> bool {
-    if in_keymap && (v.chars().count() == 1 || slash_command(v)) {
-        return false;
-    }
+/// address, or a path.
+fn protected_text(v: &str) -> bool {
     v.contains("://") || v.starts_with('/') || v.starts_with('~') || v.starts_with('$')
 }
 
-/// Whether `v` is a slash command: `/`, a letter, then letters, digits,
-/// `_` or `-` alone.
-fn slash_command(v: &str) -> bool {
+/// Whether a keymap context or action named `name` is never written back:
+/// one that answers a permission prompt or changes the mode.
+fn protected_keymap_name(name: &str) -> bool {
+    words_of(name).iter().any(|w| {
+        w == "mode"
+            || KEYMAP_NOT_WRITTEN_BACK_ROOTS
+                .iter()
+                .any(|r| w.starts_with(r))
+    })
+}
+
+/// Whether `v` is a key spec (`ctrl-shift-k`, `K`, `ctrl--`): one key, or
+/// modifiers and a key, with no space in it, and nothing that reads as
+/// somewhere to reach or run (a single `/`, `~` or `$` is that key).
+fn key_spec(v: &str) -> bool {
     let mut chars = v.chars();
-    chars.next() == Some('/')
-        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    match (chars.next(), chars.next()) {
+        (None, _) => false,
+        (Some(c), None) => !c.is_whitespace() && !c.is_control(),
+        _ => !v.chars().any(|c| c.is_whitespace() || c.is_control()) && !protected_text(v),
+    }
+}
+
+/// Whether `v`, at `depth` under the keymap (1: the keymap, 2: a context,
+/// 3: an action), is only what Devin binds there: contexts of actions, each
+/// bound to a key spec or a list of them, none named as a permission's.
+fn keymap_shaped(depth: usize, v: &Value) -> bool {
+    match (depth, v) {
+        (1 | 2, Value::Object(o)) => o
+            .iter()
+            .all(|(k, v)| !protected_keymap_name(k) && keymap_shaped(depth + 1, v)),
+        (3, Value::String(s)) => key_spec(s),
+        (3, Value::Array(a)) => a.iter().all(|v| v.as_str().is_some_and(key_spec)),
+        _ => false,
+    }
+}
+
+/// Whether `v`, at `depth` under the keymap, names a context or action
+/// never written back.
+fn keymap_names_one(depth: usize, v: &Value) -> bool {
+    match (depth, v) {
+        (1 | 2, Value::Object(o)) => o
+            .iter()
+            .any(|(k, v)| protected_keymap_name(k) || keymap_names_one(depth + 1, v)),
+        _ => false,
+    }
 }
 
 /// Where the person's own Devin config is: `$XDG_CONFIG_HOME/devin`, else
@@ -382,32 +438,44 @@ pub fn changes(base: &Value, ended: &Value) -> (Vec<Change>, Vec<String>) {
 /// is, or by what it puts there or takes away (a whole object with one
 /// inside).
 fn protected(change: &Change, base: &Value) -> bool {
-    // Under the keymap, names are contexts and actions (`editor`,
-    // `command_palette`), never settings: only its values are read.
-    fn holds(v: &Value, in_keymap: bool) -> bool {
+    fn holds(v: &Value) -> bool {
         match v {
-            Value::Object(o) => o.iter().any(|(k, v)| {
-                (!in_keymap && protected_name(k, false)) || sets_mode(k, v) || holds(v, in_keymap)
-            }),
-            Value::Array(a) => a.iter().any(|v| holds(v, in_keymap)),
-            Value::String(s) => protected_text(s, in_keymap),
+            Value::Object(o) => o
+                .iter()
+                .any(|(k, v)| protected_name(k, false) || sets_mode(k, v) || holds(v)),
+            Value::Array(a) => a.iter().any(holds),
+            Value::String(s) => protected_text(s),
             _ => false,
         }
     }
-    let in_keymap = change.path.first().is_some_and(|k| k == "keymap");
+    if change.path.first().is_some_and(|k| k == "keymap") {
+        return protected_in_keymap(change, base);
+    }
     let mode = |v: &Value| change.path.last().is_some_and(|k| sets_mode(k, v));
-    let names = match in_keymap {
-        true => &change.path[..1],
-        false => &change.path[..],
-    };
-    names
+    change
+        .path
         .iter()
         .enumerate()
         .any(|(i, k)| protected_name(k, i == 0))
         || change.value.as_ref().is_some_and(mode)
         || at(base, &change.path).is_some_and(mode)
-        || change.value.as_ref().is_some_and(|v| holds(v, in_keymap))
-        || at(base, &change.path).is_some_and(|v| holds(v, in_keymap))
+        || change.value.as_ref().is_some_and(holds)
+        || at(base, &change.path).is_some_and(holds)
+}
+
+/// [`protected`], under the keymap: its names are contexts and actions
+/// (`editor`, `command_palette`), never settings, so only a permission's
+/// or a mode's is protected; and what it puts there must be bindings
+/// alone (`keymap.<context>.<action>`: a key spec, or a list of them).
+fn protected_in_keymap(change: &Change, base: &Value) -> bool {
+    let depth = change.path.len();
+    depth > 3
+        || change.path[1..].iter().any(|k| protected_keymap_name(k))
+        || change
+            .value
+            .as_ref()
+            .is_some_and(|v| !keymap_shaped(depth, v))
+        || at(base, &change.path).is_some_and(|v| keymap_names_one(depth, v))
 }
 
 fn diff(path: &mut Vec<String>, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<Change>) {
@@ -1028,6 +1096,12 @@ mod tests {
             "yolo_mode",
             "auto_accept",
             "autoAccept",
+            "ssl_verify",
+            "strictSSL",
+            "strict_ssl",
+            "reject_unauthorized",
+            "rejectUnauthorized",
+            "no_verify",
         ] {
             assert!(protected_name(name, true), "{name}");
             assert!(protected_name(name, false), "{name} nested");
@@ -1048,7 +1122,7 @@ mod tests {
         let (kept, _) = changes(
             &json!({"notify": "smart"}),
             &json!({"agent": {"mode": "dangerous"}, "default_mode": "Bypass",
-                "notify": "always", "keymap": {"ctrl+k": "/clear"}}),
+                "notify": "always", "keymap": {"global": {"clear_screen": "ctrl-k"}}}),
         );
         let paths: Vec<String> = kept.iter().map(|c| c.path.join(".")).collect();
         assert_eq!(
@@ -1175,6 +1249,12 @@ mod tests {
             ("agent_mode", "dangerous"),
             ("approval_mode", "auto"),
             ("defaultPermissionMode", "bypass"),
+            // A mode by any spelling of its name.
+            ("mode", "accept_edits"),
+            ("mode", "Accept Edits"),
+            ("mode", "acceptedits"),
+            ("default_mode", "Bypass Permissions"),
+            ("agent_mode", "YOLO"),
         ] {
             let (kept, _) = changes(&json!({}), &json!({ name: v }));
             assert!(kept.is_empty(), "{name}");
@@ -1207,19 +1287,86 @@ mod tests {
                 assert!(kept.is_empty(), "{ended} into a context");
             }
         }
-        for v in ["/clear", "/model", "/accept-edits", "/", "~", "$"] {
-            let ended = json!({"keymap": {"global": {"x": v}}});
+        // A binding is a key spec, or a list of them, and nothing else: no
+        // slash command, no object, nothing deeper.
+        for v in [
+            json!("/clear"),
+            json!("/yolo"),
+            json!("ctrl k"),
+            json!(""),
+            json!(1),
+            json!(null),
+            json!(true),
+            json!([["ctrl-k"]]),
+            json!([{"key": "ctrl-k"}]),
+        ] {
+            let ended = json!({"keymap": {"global": {"clear_screen": v.clone()}}});
+            assert!(changes(&json!({}), &ended).0.is_empty(), "{v}");
+        }
+        for ended in [
+            json!({"keymap": "/bypass"}),
+            json!({"keymap": {"x": "/yolo"}}),
+            json!({"keymap": {"global": {"x": {"command": "sh -c evil"}}}}),
+            json!({"keymap": {"global": {"hooks": {"Stop": "x"}}}}),
+            json!({"keymap": {"global": {"permission_mode": "dangerous"}}}),
+            json!({"keymap": {"global": {"mode": "dangerous"}}}),
+        ] {
+            assert!(changes(&json!({}), &ended).0.is_empty(), "{ended}");
+        }
+        let deep = json!({"keymap": {"global": {"x": {"y": "ctrl-k"}}}});
+        let (kept, _) = changes(&json!({"keymap": {"global": {"x": {}}}}), &deep);
+        assert!(kept.is_empty(), "deeper than an action: {kept:?}");
+        for v in [
+            json!("/"),
+            json!("~"),
+            json!("$"),
+            json!("ctrl-/"),
+            json!("ctrl--"),
+            json!(["/", "~", "$"]),
+            json!([]),
+        ] {
+            let ended = json!({"keymap": {"global": {"clear_screen": v.clone()}}});
             assert_eq!(changes(&json!({}), &ended).0.len(), 1, "{v}");
         }
+        // No key that answers a permission prompt or changes the mode:
+        // Once and Always swapped would make the next `1` a lasting allow.
+        for ended in [
+            json!({"keymap": {"permission_prompt": {"allow_always": "1", "allow_once": "4"}}}),
+            json!({"keymap": {"approval": {"approve_always": "enter"}}}),
+            json!({"keymap": {"input": {"cycle_mode": "space"}}}),
+            json!({"keymap": {"global": {"deny": "n", "reject_edit": "r", "trust_folder": "t"}}}),
+            json!({"keymap": {"global": {"toggle_bypass": "b", "yolo": "y", "go_autonomous": "a"}}}),
+            json!({"keymap": {"global": {"dangerous": "d"}}}),
+        ] {
+            assert!(changes(&json!({}), &ended).0.is_empty(), "{ended}");
+            let base = json!({"keymap": {"permission_prompt": {}, "approval": {}, "input": {}, "global": {}}});
+            assert!(
+                changes(&base, &ended).0.is_empty(),
+                "{ended} into a context"
+            );
+        }
+        // Nor one of the person's taken away under a context replaced whole.
+        let (kept, _) = changes(
+            &json!({"keymap": {"permission_prompt": {"allow_once": "1"}}}),
+            &json!({"keymap": {"permission_prompt": "x"}}),
+        );
+        assert!(kept.is_empty(), "{kept:?}");
         // A keymap anywhere but the top is no keymap.
         let (kept, _) = changes(
             &json!({}),
             &json!({"tools": {"keymap": {"command": "evil"}}, "x": {"keymap": {"editor": "e"}}}),
         );
         assert!(kept.is_empty(), "{kept:?}");
-        // Nor is `KeyMap`, which Devin doesn't read.
-        let (kept, _) = changes(&json!({}), &json!({"KeyMap": {"global": {"command": "x"}}}));
-        assert!(kept.is_empty(), "{kept:?}");
+        // Nor is a keymap spelled any other way (Devin reads none): read by
+        // its words, as any setting is.
+        for ended in [
+            json!({"KeyMap": {"global": {"clear_screen": "ctrl-k"}}}),
+            json!({"key_map": {"global": {"clear_screen": "ctrl-k"}}}),
+            json!({"showPath": false, "show-path": false, "SHOW_PATH": false}),
+        ] {
+            let (kept, _) = changes(&json!({}), &ended);
+            assert!(kept.is_empty(), "{ended}: {kept:?}");
+        }
     }
 
     #[test]
