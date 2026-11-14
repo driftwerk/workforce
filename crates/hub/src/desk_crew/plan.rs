@@ -672,7 +672,7 @@ impl CrewHub {
                 m
             }
             (None, Some(c)) => c.plan,
-            (None, None) => unreachable!("a call that neither moves nor changes is a change"),
+            (None, None) => return Err("Say what to change, or which board to move it to.".into()),
         };
         // A draft started on the person's word, by an unbound boss.
         if let Some(said) = start_now {

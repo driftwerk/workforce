@@ -1944,3 +1944,69 @@ async fn a_change_of_cap_keeps_the_hold_until_counted_and_only_a_loosening_forge
     })
     .await;
 }
+
+/// A plan stays on its board while a ticket of it is starting, or while one
+/// is filed in another tracker: nothing of it moves.
+#[tokio::test]
+async fn a_plan_isnt_moved_while_a_ticket_starts_or_one_is_filed_elsewhere() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a", &[]), ("b", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let from = p.summary.plan.board;
+        let (to, made) = d.board_in_group(None, "Vellev", Some("VEL")).await.unwrap();
+        assert!(made);
+        let keys = |p: &PlanDetail| -> Vec<String> {
+            p.tickets.iter().map(|t| t.ticket.key.clone().unwrap()).collect()
+        };
+        let before = keys(&d.plan(id).await.unwrap());
+
+        // Starting.
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let a = p.tickets[0].ticket.ticket.id;
+        let mut t = d.ticket_of(a).await.unwrap();
+        let session = Uuid::new_v4();
+        d.0.store
+            .begin_start(&mut t, id, 9_000.0, session, crew::now())
+            .await
+            .unwrap();
+        let e = d.move_plan(id, to.id, &by_sarah()).await.unwrap_err();
+        assert!(e.to_string().contains("try the move again"), "{e}");
+        let still = d.plan(id).await.unwrap();
+        assert_eq!(still.summary.plan.board, from);
+        assert_eq!(keys(&still), before);
+        d.0.store.end_start(a, session).await.unwrap();
+
+        // Filed in another tracker.
+        let client = d.0.store.pool().get().await.unwrap();
+        let ext = serde_json::json!({"system": "linear", "key": "ENG-9", "url": "https://linear.app/x/ENG-9",
+                                     "remoteUpdatedAt": "2026-11-14T00:00:00Z", "synced": true,
+                                     "link": Uuid::new_v4()});
+        client
+            .execute("UPDATE tickets SET external = $2 WHERE id = $1", &[&a, &ext])
+            .await
+            .unwrap();
+        let e = d.move_plan(id, to.id, &by_sarah()).await.unwrap_err();
+        assert!(e.to_string().contains("another tracker"), "{e}");
+        let still = d.plan(id).await.unwrap();
+        assert_eq!(still.summary.plan.board, from);
+        assert!(still.tickets.iter().all(|t| t.ticket.ticket.board == from));
+
+        // Neither: it moves, renumbered there.
+        client
+            .execute("UPDATE tickets SET external = NULL WHERE id = $1", &[&a])
+            .await
+            .unwrap();
+        let moved = d.move_plan(id, to.id, &by_sarah()).await.unwrap();
+        assert_eq!(keys(&moved), ["VEL-1", "VEL-2"]);
+    })
+    .await;
+}
