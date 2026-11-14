@@ -9113,9 +9113,17 @@ fn caller_actor(caller: &CallerContext) -> workforce_common::settings::VaultActo
         .unwrap_or(workforce_common::settings::VaultActor::RestOwner)
 }
 
-/// The response to a failed vault write: 503 while the vault is frozen for a
-/// migration (retry shortly), otherwise 500 carrying the cause.
+/// The response to a failed vault write: 403 for a Desk link, which no vault
+/// route changes; 503 while the vault is frozen for a migration (retry
+/// shortly); otherwise 500 carrying the cause.
 pub(crate) fn vault_write_rejection(error: &eyre::Report) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refused) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::hub_core::logins::store::DeskLinkRefused>())
+    {
+        warn!("A vault route was asked to change a Desk link; refused");
+        return reject_json(StatusCode::FORBIDDEN, &refused.to_string());
+    }
     let frozen = error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<crate::vault::VaultError>(),
@@ -12646,6 +12654,21 @@ async fn agent_vault_copy(
     }
     validate_logical_path(&body.path)?;
     crate::hub_core::logins::store::refuse_copy(&body.path).map_err(login_refusal)?;
+    if crate::vault_policy::is_desk_link(&body.path) {
+        let refused = crate::hub_core::logins::store::DeskLinkRefused;
+        return Err(reject_json(StatusCode::FORBIDDEN, &refused.to_string()));
+    }
+    // A user id is one path segment: one with a separator or `..` would
+    // put the copy under another key (`users/bob/desk/...`, a Desk link).
+    let one_segment = |u: &str| !u.contains(['/', '\\']) && !u.contains("..");
+    if !body.user_id.as_deref().is_none_or(one_segment)
+        || !body.to_user_ids.iter().all(|u| one_segment(u))
+    {
+        return Err(reject_json(
+            StatusCode::BAD_REQUEST,
+            "a user id can't hold '/', '\\' or '..'",
+        ));
+    }
     let from_user = resolve_source_user(from, body.user_id.as_deref())?;
     let to_users = dedup_destinations(&body.to_user_ids);
     if to_users.is_empty() {
@@ -17809,6 +17832,90 @@ mod desk_link_vault_tests {
         let said = listed.0.to_string();
         assert!(said.contains("skills/jira/site"), "{said}");
         assert!(!said.contains("desk/hubs"), "{said}");
+    }
+
+    /// No vault route writes, renames or deletes a Desk link, however it is
+    /// spelt and whoever asks: a page, a script or the owner can't point an
+    /// engine's boss link at another hub or swap a board-sync token.
+    #[tokio::test]
+    async fn no_vault_route_changes_a_desk_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::open(&dir.path().join("v"), "test-key").unwrap());
+        let link = workforce_common::vault_scope::desk_boss_link_path("l1");
+        vault.set(&link, "the-link").unwrap();
+        vault.set("skills/jira/site", "acme").unwrap();
+        let fx = crate::remote_mcp::testing::fixture(false);
+        let state = Arc::try_unwrap(fx.state)
+            .ok()
+            .expect("the fixture's only handle");
+        let state = Arc::new(GatewayState {
+            vault: Some(Arc::clone(&vault)),
+            ..state
+        });
+        let headers = crate::remote_mcp::testing::bearer("gateway-token");
+        let q = || Query(serde_json::from_value::<WsQuery>(serde_json::json!({})).unwrap());
+        let forbidden =
+            |r: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>| {
+                let (status, said) = r.expect_err("refused");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{}", said.0);
+                assert!(said.0.to_string().contains("Desk link"), "{}", said.0);
+            };
+        for path in [
+            link.clone(),
+            "Desk//Links/bosses/l2/".to_string(),
+            "desk/hubs/atlas/remote_mcp".to_string(),
+            "users/sam/desk/hubs/atlas/remote_mcp".to_string(),
+            workforce_common::vault_scope::DESK_ENGINE_KEY.to_string(),
+        ] {
+            forbidden(
+                vault_set(
+                    Path(path.clone()),
+                    q(),
+                    headers.clone(),
+                    State(Arc::clone(&state)),
+                    Json(VaultSetBody {
+                        value: "wfr_elsewhere".into(),
+                    }),
+                )
+                .await,
+            );
+            forbidden(
+                vault_delete(Path(path), q(), headers.clone(), State(Arc::clone(&state))).await,
+            );
+        }
+        for (from, to) in [
+            (link.as_str(), "skills/stolen"),
+            ("skills/jira/site", link.as_str()),
+            ("skills/jira/site", "desk/links/bosses/l9"),
+        ] {
+            forbidden(
+                vault_rename(
+                    q(),
+                    headers.clone(),
+                    State(Arc::clone(&state)),
+                    Json(VaultRenameBody {
+                        from: from.into(),
+                        to: to.into(),
+                        overwrite: true,
+                    }),
+                )
+                .await,
+            );
+        }
+        assert_eq!(vault.get(&link).as_deref(), Some("the-link"));
+        assert_eq!(vault.get("skills/jira/site").as_deref(), Some("acme"));
+        assert_eq!(vault.get("skills/stolen"), None);
+        // Any other path is written as before.
+        let _ = vault_set(
+            Path("skills/jira/token".into()),
+            q(),
+            headers,
+            State(state),
+            Json(VaultSetBody { value: "t".into() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(vault.get("skills/jira/token").as_deref(), Some("t"));
     }
 }
 
