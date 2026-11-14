@@ -232,12 +232,12 @@ impl NewItem {
 
     /// The person's order, in their words, with the sessions working on it;
     /// keyed by their message (`message`) when it came from one, else by its
-    /// words.
+    /// sessions and all of its words ([`order_text_key`]).
     pub fn order(boss: &str, text: &str, sessions: Vec<Uuid>, message: Option<&str>) -> Self {
         Self {
             dedupe_key: match message {
                 Some(m) => format!("order:{m}"),
-                None => format!("order:text:{}", normalised(text)),
+                None => order_text_key(text, &sessions),
             },
             sessions,
             ..Self::ask(boss, OpenKind::Order, None, text)
@@ -303,6 +303,25 @@ const SAME_ORDER_WORDS: usize = 3;
 pub fn same_order(a: &str, b: &str) -> bool {
     let (a, b) = (order_words(a), order_words(b));
     a.len() >= SAME_ORDER_WORDS && a == b
+}
+
+/// The key of an order kept by its words (the boss's record of it): its
+/// sessions, sorted, and a digest of all its words, never cut short, so
+/// "ship it" about two sessions, or two long orders that differ only at
+/// the end, are two.
+pub fn order_text_key(text: &str, sessions: &[Uuid]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut ids: Vec<String> = sessions.iter().map(Uuid::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let digest = Sha256::digest(words.join(" ").as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("order:text:{}:{hex}", ids.join(","))
 }
 
 /// The key of a session's question on its line.
@@ -885,6 +904,15 @@ mod tests {
             "an ask never lapses"
         );
         assert!(NewItem::order("desk", "Ship it", vec![], Some("m1")).dedupe_key == "order:m1");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let key = |t: &str, s: Vec<Uuid>| NewItem::order("desk", t, s, None).dedupe_key;
+        assert_eq!(key("Ship it!", vec![a, b]), key("ship  it", vec![b, a]));
+        assert_ne!(key("Ship it", vec![a]), key("Ship it", vec![b]));
+        let long = "x ".repeat(150);
+        assert_ne!(
+            key(&format!("{long} deploy"), vec![]),
+            key(&format!("{long} stop"), vec![])
+        );
         assert_eq!(
             NewItem::promise("desk", one, "x", " Merged ").dedupe_key,
             format!("promise:{one}:merged")

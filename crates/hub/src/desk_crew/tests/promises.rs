@@ -343,6 +343,18 @@ async fn orders_that_simply_ended_say_nothing_and_the_same_order_twice_is_one() 
             words.contains("Orders the boss noted") && !words.contains("in their own words"),
             "{words}"
         );
+        // "Ship it" about two sessions is two orders.
+        for to in [s.id, other.id] {
+            let r = call(&crew, super::super::items::ORDER, order("Ship it", vec![to])).await;
+            assert!(r.success, "{:?}", r.error);
+            assert!(!r.output.to_string().contains("already kept"), "{}", r.output);
+        }
+        let ships: Vec<_> = orders().await.into_iter().filter(|i| i.text == "Ship it").collect();
+        assert_eq!(ships.len(), 2, "{ships:?}");
+        for i in ships {
+            let r = call(&crew, super::super::items::CLOSE, json!({ "item_id": i.id.to_string(), "why": "Set aside for the test" })).await;
+            assert!(r.success, "{:?}", r.error);
+        }
         // Orders that differ stay apart.
         for text in ["Don't start on any new work", "Leave the export alone"] {
             let r = call(&crew, super::super::items::ORDER, order(text, vec![])).await;

@@ -558,14 +558,21 @@ impl CrewHub {
                     }
                 }
                 new.done_when = new.done_when.or(was.done_when);
-                self.desk
+                // Kept first: a failure never loses the order.
+                let opened = self.desk.store().item_open(&new).await?;
+                if let Err(e) = self
+                    .desk
                     .store()
                     .item_close(
                         was.id,
                         ClosedBy::Boss,
                         "The person's own order took its place.",
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(error = %e, "the boss's record of an order wasn't closed");
+                }
+                return Ok(opened);
             }
             Some(was) => {
                 new.dedupe_key = was.dedupe_key;
@@ -792,7 +799,7 @@ impl CrewHub {
                     "done is for a promise or an order; close this with answer or why.".into(),
                 );
             }
-            if item.done_when.as_deref() == Some(REPLIED) {
+            if item.kind == OpenKind::Promise && item.done_when.as_deref() == Some(REPLIED) {
                 return Err("This promise is kept by the session's reply, said as it comes: close it with why.".into());
             }
             if crew::word_count(done) > KEPT_WORDS || done.contains('\n') {
@@ -1199,7 +1206,8 @@ impl CrewHub {
         ))
     }
 
-    /// Whether `matter` (a boss's ask, by its words) is asked at Act fully
+    /// Whether `matter` (a boss's ask, by its session, or by its words when
+    /// about none) is asked at Act fully
     /// for the first time in [`CHECKED_FOR`]: then it is noted, and checked
     /// against the person's instructions before it may be asked.
     fn first_ask_at_full(&self, matter: &str) -> bool {
@@ -1209,11 +1217,11 @@ impl CrewHub {
         checked.insert(matter.to_string(), now).is_none()
     }
 
-    /// The person's standing orders to `boss` that bear on `session` (its
-    /// open orders linked to it or to no session; every one with no
-    /// session given), as a block a decision is given: those from their
-    /// own messages quoted as their words, those the boss recorded marked
-    /// as its own note. None when there are none.
+    /// The person's standing orders to `boss` that bear on `session`, as a
+    /// block a decision is given: those from their own messages, all of
+    /// them, quoted as their words; those the boss recorded, linked to the
+    /// session or to none, marked as its own note. None when there are
+    /// none.
     pub(super) async fn orders_words(&self, boss: &str, session: Option<Uuid>) -> Option<String> {
         let items = match self.desk.store().items_not_closed(Some(boss)).await {
             Ok(i) => i,
@@ -1230,14 +1238,17 @@ impl CrewHub {
                 i.opened_at.with_timezone(&tz).format("%H:%M")
             )
         };
-        let bearing: Vec<&OpenItem> = items
+        // The person's own orders bear on every session (a turn's sessions
+        // are what it acted on, never the order's scope); the boss's notes
+        // only on the sessions they name, or on all when they name none.
+        let (theirs, noted): (Vec<&OpenItem>, Vec<&OpenItem>) = items
             .iter()
             .filter(|i| i.kind == OpenKind::Order && i.state == OpenState::Open)
+            .partition(|i| persons_order(&i.dedupe_key));
+        let noted: Vec<&OpenItem> = noted
+            .into_iter()
             .filter(|i| session.is_none_or(|s| i.sessions.is_empty() || i.sessions.contains(&s)))
             .collect();
-        let (theirs, noted): (Vec<&OpenItem>, Vec<&OpenItem>) = bearing
-            .into_iter()
-            .partition(|i| persons_order(&i.dedupe_key));
         let mut out = Vec::new();
         if !theirs.is_empty() {
             out.push(format!(

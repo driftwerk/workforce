@@ -413,11 +413,14 @@ async fn the_persons_orders_decide_a_production_step_both_ways() {
                 d.boss_unbound("desk").then_some(())
             })
             .await;
+            // Said in a turn that acted on another session, as the person's
+            // orders are kept: it still rules this one.
+            let earlier = new_session(&d, &base, "Cufflink Docs").await;
             d.store()
                 .item_open(&workforce_desk::open_item::NewItem::order(
                     "desk",
                     order,
-                    vec![],
+                    vec![earlier.id],
                     Some("m1"),
                 ))
                 .await
