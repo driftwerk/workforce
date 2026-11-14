@@ -1203,7 +1203,6 @@ mod tests {
             // One field said two ways.
             ("read", json!({"file_path": "a", "path": "/etc/shadow"})),
             ("exec", json!({"command": "ls", "cmd": "rm -rf /"})),
-            // Run where Desk can't be sure.
             // Run elsewhere than its shell: Desk can't be sure where.
             ("exec", json!({"command": "ls", "cwd": "../elsewhere"})),
             (

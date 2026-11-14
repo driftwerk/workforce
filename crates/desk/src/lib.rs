@@ -33,9 +33,9 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
-// Devin's engine, its pieces before its sessions start (H2 wires them).
 pub mod decision;
 pub mod decision_store;
+// Devin's engine, its pieces before its sessions start (H2 wires them).
 #[allow(dead_code)]
 mod devin;
 #[allow(dead_code)]

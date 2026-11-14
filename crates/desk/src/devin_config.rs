@@ -32,13 +32,13 @@ use serde_json::{Map, Value};
 /// has one of [`NOT_WRITTEN_BACK_INSIDE`] in it. A session that could write
 /// these could make the person's next own Devin run, reach or allow what
 /// it chose.
-const NOT_WRITTEN_BACK: [&str; 18] = [
+const NOT_WRITTEN_BACK: [&str; 20] = [
     "cmd", "shell", "program", "run", "args", "uri", "base", "server", "servers", "header",
-    "headers", "key", "keys", "auth", "mcp", "path", "paths", "env",
+    "headers", "key", "keys", "auth", "mcp", "path", "paths", "env", "insecure", "yolo",
 ];
 
 /// The roots a word of a setting's name may not start with.
-const NOT_WRITTEN_BACK_ROOTS: [&str; 24] = [
+const NOT_WRITTEN_BACK_ROOTS: [&str; 33] = [
     "allow",
     "approv",
     "trust",
@@ -63,23 +63,43 @@ const NOT_WRITTEN_BACK_ROOTS: [&str; 24] = [
     "otel",
     "environ",
     "auth",
+    // The same, as one word.
+    "apikey",
+    "accesskey",
+    "apiserver",
+    "customheader",
+    "envvar",
+    "shellcommand",
+    "runcmd",
+    "startcmd",
+    "binarypath",
 ];
 
 /// What a word of a setting's name may not have anywhere in it.
 const NOT_WRITTEN_BACK_INSIDE: [&str; 4] = ["url", "uri", "hook", "token"];
 
-/// Whole names never written back, whatever their words.
-const NOT_WRITTEN_BACK_NAMED: [&str; 5] = [
+/// Whole names never written back, whatever their words, at any depth
+/// (but under the keymap). A name is compared by its words run together
+/// (`readConfigFrom` is `read_config_from`, `status_line` `statusline`).
+const NOT_WRITTEN_BACK_NAMED: [&str; 8] = [
     "read_config_from",
     "permission_mode",
     "local_tools_bypass_permissions",
     "editor",
     "statusline",
+    "skip_verify",
+    "verify_ssl",
+    "auto_accept",
 ];
 
-/// Whole names always written back, whatever their words: `keymap` is no
-/// key.
-const WRITTEN_BACK_NAMED: [&str; 1] = ["keymap"];
+/// Top-level names always written back, whatever their words: `keymap` is
+/// no key, `show_path` no path (it shows the folder or doesn't).
+const WRITTEN_BACK_NAMED: [&str; 2] = ["keymap", "show_path"];
+
+/// The words of a mode setting's name, besides `mode`, that make it the
+/// permission mode's: Devin's is `permission_mode` (docs.devin.ai, config
+/// file); `unicode_mode` and `theme_mode` are no permission's.
+const MODE_WORDS: [&str; 4] = ["permission", "approval", "agent", "default"];
 
 /// Permission modes, by any of their names: never a setting's value
 /// written back.
@@ -127,13 +147,24 @@ fn words_of(name: &str) -> Vec<String> {
     words
 }
 
-/// Whether a setting named `name` is never written back.
-fn protected_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
+/// A name as its words run together: how names are compared whole.
+fn joined(name: &str) -> String {
+    words_of(name).concat()
+}
+
+/// Whether `name` is one of `names`, compared by their words run together.
+fn named(name: &str, names: &[&str]) -> bool {
+    let name = joined(name);
+    names.iter().any(|n| joined(n) == name)
+}
+
+/// Whether a setting named `name` is never written back; `top`: it is a
+/// setting of the config's own, not one inside another.
+fn protected_name(name: &str, top: bool) -> bool {
+    if top && named(name, &WRITTEN_BACK_NAMED) {
         return false;
     }
-    if lower.starts_with("mcp") || NOT_WRITTEN_BACK_NAMED.contains(&lower.as_str()) {
+    if name.to_ascii_lowercase().starts_with("mcp") || named(name, &NOT_WRITTEN_BACK_NAMED) {
         return true;
     }
     words_of(name).iter().any(|w| {
@@ -144,21 +175,35 @@ fn protected_name(name: &str) -> bool {
 }
 
 /// Whether a setting named `key` set to `v` sets a permission mode: a
-/// `…mode…` setting naming one.
+/// `mode`, or a permission's mode (`permission_mode`, `default_mode`: its
+/// other words [`MODE_WORDS`]), naming one.
 fn sets_mode(key: &str, v: &Value) -> bool {
-    words_of(key).iter().any(|w| w == "mode")
+    let words = words_of(key);
+    words.iter().any(|w| w == "mode")
+        && words
+            .iter()
+            .all(|w| w == "mode" || MODE_WORDS.contains(&w.as_str()))
         && v.as_str()
             .is_some_and(|v| MODES.contains(&v.trim().to_ascii_lowercase().as_str()))
 }
 
 /// Whether `v`, a setting's text, reads as somewhere to reach or run: an
-/// address, or a path. Under the keymap, a key's slash command is a
-/// binding.
+/// address, or a path. Under the keymap, a slash command (`/word`) or a
+/// single key (`/`, `~`) is a binding.
 fn protected_text(v: &str, in_keymap: bool) -> bool {
-    if in_keymap && v.starts_with('/') && !v.starts_with("//") && !v.contains("://") {
+    if in_keymap && (v.chars().count() == 1 || slash_command(v)) {
         return false;
     }
     v.contains("://") || v.starts_with('/') || v.starts_with('~') || v.starts_with('$')
+}
+
+/// Whether `v` is a slash command: `/`, a letter, then letters, digits,
+/// `_` or `-` alone.
+fn slash_command(v: &str) -> bool {
+    let mut chars = v.chars();
+    chars.next() == Some('/')
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Where the person's own Devin config is: `$XDG_CONFIG_HOME/devin`, else
@@ -176,15 +221,37 @@ pub fn person_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     Some(base.join("devin/config.json"))
 }
 
-/// Reads JSON with comments and trailing commas. Empty text is none.
+/// The byte order mark an editor may start a file with.
+const BOM: char = '\u{feff}';
+
+/// Reads JSON with comments and trailing commas, after any byte order
+/// mark. Text without a value (empty, or only comments) is none.
 pub fn parse(text: &str) -> Result<Value> {
-    let value: Option<Value> = jsonc_parser::parse_to_serde_value(text, &ParseOptions::default())
-        .map_err(|e| eyre::eyre!("not JSON: {e}"))?;
+    let value: Option<Value> =
+        jsonc_parser::parse_to_serde_value(without_bom(text), &ParseOptions::default())
+            .map_err(|e| eyre::eyre!("not JSON: {e}"))?;
     value.ok_or_else(|| eyre::eyre!("empty"))
 }
 
-/// A file's text as a config: empty (a file just made) is `{}`.
+/// Reads the person's own file: text without a value (empty, only
+/// whitespace or only comments: a file just made, or all of it commented
+/// out) is `{}`.
+fn parse_persons(text: &str) -> Result<Value> {
+    let value: Option<Value> =
+        jsonc_parser::parse_to_serde_value(without_bom(text), &ParseOptions::default())
+            .map_err(|e| eyre::eyre!("not JSON: {e}"))?;
+    Ok(value.unwrap_or_else(|| Value::Object(Map::new())))
+}
+
+fn without_bom(text: &str) -> &str {
+    text.strip_prefix(BOM).unwrap_or(text)
+}
+
+/// A file's text as the CST is to read it: without its byte order mark,
+/// and `{}` when it is only whitespace (a file just made). Text with only
+/// comments is kept: the CST adds the object beside them.
 fn text_or_empty(text: &str) -> &str {
+    let text = without_bom(text);
     match text.trim().is_empty() {
         true => "{}\n",
         false => text,
@@ -215,7 +282,7 @@ impl Person {
             return empty();
         };
         match std::fs::read_to_string(path) {
-            Ok(text) => match parse(text_or_empty(&text)) {
+            Ok(text) => match parse_persons(&text) {
                 Ok(config @ Value::Object(_)) => match std::fs::canonicalize(path) {
                     Ok(real) => Self::Read {
                         config,
@@ -289,7 +356,9 @@ pub struct Change {
 /// What differs between `base` (the person's config as copied) and `ended`
 /// (the session's copy at its end), setting by setting: objects compared
 /// key by key, anything else whole. Settings Desk never writes back are
-/// left out, and named in the second list.
+/// left out, and named in the second list. A value replaced whole (not an
+/// object, or one new) is written whole: comments inside the person's
+/// old one go with it.
 pub fn changes(base: &Value, ended: &Value) -> (Vec<Change>, Vec<String>) {
     let mut all = Vec::new();
     diff(&mut Vec::new(), Some(base), Some(ended), &mut all);
@@ -313,22 +382,28 @@ pub fn changes(base: &Value, ended: &Value) -> (Vec<Change>, Vec<String>) {
 /// is, or by what it puts there or takes away (a whole object with one
 /// inside).
 fn protected(change: &Change, base: &Value) -> bool {
+    // Under the keymap, names are contexts and actions (`editor`,
+    // `command_palette`), never settings: only its values are read.
     fn holds(v: &Value, in_keymap: bool) -> bool {
         match v {
-            Value::Object(o) => o
-                .iter()
-                .any(|(k, v)| protected_name(k) || sets_mode(k, v) || holds(v, in_keymap)),
+            Value::Object(o) => o.iter().any(|(k, v)| {
+                (!in_keymap && protected_name(k, false)) || sets_mode(k, v) || holds(v, in_keymap)
+            }),
             Value::Array(a) => a.iter().any(|v| holds(v, in_keymap)),
             Value::String(s) => protected_text(s, in_keymap),
             _ => false,
         }
     }
-    let in_keymap = change
-        .path
-        .first()
-        .is_some_and(|k| k.eq_ignore_ascii_case("keymap"));
+    let in_keymap = change.path.first().is_some_and(|k| k == "keymap");
     let mode = |v: &Value| change.path.last().is_some_and(|k| sets_mode(k, v));
-    change.path.iter().any(|k| protected_name(k))
+    let names = match in_keymap {
+        true => &change.path[..1],
+        false => &change.path[..],
+    };
+    names
+        .iter()
+        .enumerate()
+        .any(|(i, k)| protected_name(k, i == 0))
         || change.value.as_ref().is_some_and(mode)
         || at(base, &change.path).is_some_and(mode)
         || change.value.as_ref().is_some_and(|v| holds(v, in_keymap))
@@ -410,8 +485,10 @@ pub fn written_back(base: &Value, ended: &Value, current: Option<&str>) -> Resul
     if wanted.is_empty() {
         return Ok(None);
     }
-    let text = text_or_empty(current.unwrap_or(""));
-    let mut expected = parse(text).context("reading the person's Devin config")?;
+    let raw = current.unwrap_or("");
+    let bom = raw.starts_with(BOM);
+    let text = text_or_empty(raw);
+    let mut expected = parse_persons(text).context("reading the person's Devin config")?;
     if !expected.is_object() {
         eyre::bail!("the person's Devin config isn't an object");
     }
@@ -429,7 +506,10 @@ pub fn written_back(base: &Value, ended: &Value, current: Option<&str>) -> Resul
         edit(&top, &change.path, change.value.as_ref());
         set(&mut expected, &change.path, change.value.clone());
     }
-    let edited = root.to_string();
+    let edited = match bom {
+        true => format!("{BOM}{root}"),
+        false => root.to_string(),
+    };
     // What the edit says must be exactly what was meant; if it isn't,
     // nothing is written: never their file rewritten without its comments.
     match parse(&edited) {
@@ -745,7 +825,7 @@ mod tests {
         let base = parse(THEIRS).unwrap();
         let mut ended = session_config(&read(base.clone()), &desk_hooks());
         ended["agent"]["pinned_models"] = json!(["swe-1-6"]);
-        ended["keymap"] = json!({"chat": {"submit": "ctrl+enter"}});
+        ended["keymap"] = json!({"global": {"clear_screen": "ctrl-shift-k"}});
         ended["startup_messages_remaining"] = json!(2);
         ended["otel"]["endpoint"] = json!("http://elsewhere:4318");
         let text = written_back(&base, &ended, Some(THEIRS)).unwrap().unwrap();
@@ -759,7 +839,7 @@ mod tests {
             v["otel"]["endpoint"], "http://127.0.0.1:4318",
             "never written back"
         );
-        assert_eq!(v["keymap"]["chat"]["submit"], "ctrl+enter");
+        assert_eq!(v["keymap"]["global"]["clear_screen"], "ctrl-shift-k");
         assert_eq!(v["startup_messages_remaining"], 2);
         // Desk's hooks never reach the person's file.
         assert_eq!(v["hooks"], base["hooks"]);
@@ -887,7 +967,7 @@ mod tests {
         // What isn't: a keymap is no key, a theme no host.
         let (kept, _) = changes(
             &json!({}),
-            &json!({"keymap": {"chat": {"submit": "ctrl+enter"}}, "theme": "dark",
+            &json!({"keymap": {"global": {"clear_screen": "ctrl-shift-k"}}, "theme": "dark",
                 "pinned_models": ["swe-1-6"], "notify": "always"}),
         );
         assert_eq!(kept.len(), 4, "{kept:?}");
@@ -922,9 +1002,39 @@ mod tests {
             "autoRun",
             "baseURL",
             "accessKey",
+            // Run together, or as one word.
+            "readConfigFrom",
+            "ReadConfigFrom",
+            "status_line",
+            "statusLine",
+            "permissionMode",
+            "apikey",
+            "apikeys",
+            "accesskey",
+            "apiserver",
+            "customheaders",
+            "envvars",
+            "shellcommand",
+            "runcmd",
+            "startcmd",
+            "binarypath",
+            // What turns a check off, or approves unasked.
+            "insecure",
+            "allow_insecure",
+            "skip_verify",
+            "skipVerify",
+            "verify_ssl",
+            "yolo",
+            "yolo_mode",
+            "auto_accept",
+            "autoAccept",
         ] {
-            assert!(protected_name(name), "{name}");
+            assert!(protected_name(name, true), "{name}");
+            assert!(protected_name(name, false), "{name} nested");
         }
+        // Written back by name at the top only.
+        assert!(!protected_name("show_path", true));
+        assert!(protected_name("show_path", false));
         for name in [
             "keymap",
             "theme",
@@ -933,7 +1043,7 @@ mod tests {
             "model",
             "font_size",
         ] {
-            assert!(!protected_name(name), "{name}");
+            assert!(!protected_name(name, true), "{name}");
         }
         let (kept, _) = changes(
             &json!({"notify": "smart"}),
@@ -957,6 +1067,243 @@ mod tests {
         for named in ["permission_mode", "statusline", "mcpServers.x", "theme"] {
             assert!(skipped.iter().any(|s| s == named), "{named}: {skipped:?}");
         }
+    }
+
+    /// Every setting Devin documents as one it saves to the user's config
+    /// (docs.devin.ai, config file) that reaches nothing and widens nothing.
+    fn documented() -> Value {
+        json!({
+            "agent": {
+                "model": "swe-1-6",
+                "subagent_model": "swe-1-6-fast",
+                "pinned_models": ["swe-1-6", "swe-1-6-fast"],
+                "show_history_on_continue": false,
+            },
+            "theme_mode": "terminal-dark",
+            "unicode_mode": "ascii",
+            "show_path": false,
+            "show_hints": false,
+            "notify": "always",
+            "auto_update": false,
+            "attribution": false,
+            "subagents_enabled": false,
+            "include_gitignored_files": true,
+            "respect_gitignore": true,
+            "keymap": {
+                "global": {
+                    "clear_screen": "ctrl-shift-k",
+                    "history_search": ["ctrl-r", "f3"],
+                    "command_palette": "ctrl-shift-p",
+                    "feedback_up": [],
+                },
+                "editor": {
+                    "beginning_of_line": "home",
+                    "insert_newline": ["shift-enter", "alt-enter", "ctrl-j"],
+                },
+                "input": {"accept_line": "K", "zoom_out": "ctrl--"},
+                "list": {"page_down": "page-down"},
+                "readbox_input": {"open_external_editor": "ctrl-g"},
+            },
+        })
+    }
+
+    #[test]
+    fn every_documented_setting_devin_saves_is_written_back() {
+        let ended = documented();
+        let paths = |base: &Value| -> (Vec<String>, Vec<String>) {
+            let (kept, skipped) = changes(base, &ended);
+            (kept.iter().map(|c| c.path.join(".")).collect(), skipped)
+        };
+        // Each where it was before, set anew.
+        let mut base = ended.clone();
+        for v in base.as_object_mut().unwrap().values_mut() {
+            match v {
+                Value::Object(o) => o.values_mut().for_each(|v| *v = json!(null)),
+                v => *v = json!(null),
+            }
+        }
+        let (kept, skipped) = paths(&base);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        for want in [
+            "agent.model",
+            "agent.subagent_model",
+            "agent.pinned_models",
+            "theme_mode",
+            "unicode_mode",
+            "show_path",
+            "show_hints",
+            "notify",
+            "auto_update",
+            "attribution",
+            "subagents_enabled",
+            "include_gitignored_files",
+            "respect_gitignore",
+            "keymap.global",
+            "keymap.editor",
+            "keymap.input",
+            "keymap.list",
+        ] {
+            assert!(kept.iter().any(|k| k == want), "{want}: {kept:?}");
+        }
+        // Each new to the person's config, keymap contexts made whole.
+        let (kept, skipped) = paths(&json!({}));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(kept.len(), ended.as_object().unwrap().len(), "{kept:?}");
+        // One binding at a time, into a context there already.
+        let base = json!({"keymap": {"global": {}, "editor": {}, "input": {}, "list": {}}});
+        let ended = json!({"keymap": {
+            "global": {"command_palette": "ctrl-shift-p"},
+            "editor": {"beginning_of_line": "home"},
+            "input": {"accept_line": ["enter", "ctrl-m"]},
+            "list": {"page_down": "/"},
+        }});
+        let (kept, skipped) = changes(&base, &ended);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(kept.len(), 4);
+        // A display mode set to or from auto, or smart: no permission's.
+        for name in ["unicode_mode", "theme_mode", "color_mode", "vim_mode"] {
+            for (from, to) in [("ascii", "auto"), ("auto", "unicode"), ("x", "smart")] {
+                let (kept, _) = changes(&json!({ name: from }), &json!({ name: to }));
+                assert_eq!(kept.len(), 1, "{name}: {from} to {to}");
+            }
+        }
+        // The permission's mode, by any name, stays the person's.
+        for (name, v) in [
+            ("permission_mode", "accept-edits"),
+            ("mode", "auto"),
+            ("default_mode", "smart"),
+            ("agent_mode", "dangerous"),
+            ("approval_mode", "auto"),
+            ("defaultPermissionMode", "bypass"),
+        ] {
+            let (kept, _) = changes(&json!({}), &json!({ name: v }));
+            assert!(kept.is_empty(), "{name}");
+            let (kept, _) = changes(&json!({ name: v }), &json!({ name: "normal" }));
+            assert!(kept.is_empty(), "{name} from {v}");
+        }
+    }
+
+    #[test]
+    fn under_the_keymap_only_a_binding_is_written_back() {
+        for v in [
+            json!("/../../bin/sh"),
+            json!("//evil"),
+            json!("/clear; rm -rf ~"),
+            json!("/a/b"),
+            json!("~/evil.sh"),
+            json!("$HOME/x"),
+            json!("http://evil"),
+            json!(["ctrl-r", "/../../bin/sh"]),
+            json!({"command": "/bin/sh"}),
+        ] {
+            for ended in [
+                json!({"keymap": {"global": {"command_palette": v.clone()}}}),
+                json!({"keymap": {"global": {"history_search": v.clone()}}}),
+            ] {
+                let (kept, _) = changes(&json!({}), &ended);
+                assert!(kept.is_empty(), "{ended}");
+                let base = json!({"keymap": {"global": {}}});
+                let (kept, _) = changes(&base, &ended);
+                assert!(kept.is_empty(), "{ended} into a context");
+            }
+        }
+        for v in ["/clear", "/model", "/accept-edits", "/", "~", "$"] {
+            let ended = json!({"keymap": {"global": {"x": v}}});
+            assert_eq!(changes(&json!({}), &ended).0.len(), 1, "{v}");
+        }
+        // A keymap anywhere but the top is no keymap.
+        let (kept, _) = changes(
+            &json!({}),
+            &json!({"tools": {"keymap": {"command": "evil"}}, "x": {"keymap": {"editor": "e"}}}),
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+        // Nor is `KeyMap`, which Devin doesn't read.
+        let (kept, _) = changes(&json!({}), &json!({"KeyMap": {"global": {"command": "x"}}}));
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    #[test]
+    fn the_persons_file_is_edited_in_place_however_its_written() {
+        let base = json!({"agent": {"model": "a"}});
+        let ended = json!({"agent": {"model": "b"}, "keymap": {"global": {"clear_screen": "ctrl-shift-k"}}});
+        let check = |now: &str| -> String {
+            let text = written_back(&base, &ended, Some(now))
+                .unwrap()
+                .unwrap_or_else(|| panic!("written: {now:?}"));
+            let v = parse(&text).unwrap();
+            assert_eq!(v["agent"]["model"], "b", "{text:?}");
+            assert_eq!(
+                v["keymap"]["global"]["clear_screen"], "ctrl-shift-k",
+                "{text:?}"
+            );
+            text
+        };
+        // CRLF.
+        let text =
+            check("{\r\n  // mine\r\n  \"agent\": {\r\n    \"model\": \"a\"\r\n  }\r\n}\r\n");
+        assert!(text.contains("// mine\r\n"), "{text:?}");
+        // A byte order mark: kept, once.
+        let text = check("\u{feff}{\"agent\": {\"model\": \"a\"}} // mine\n");
+        assert!(text.starts_with('\u{feff}') && !text[3..].contains('\u{feff}'));
+        assert!(text.contains("// mine"), "{text:?}");
+        // Trailing commas.
+        let text =
+            check("{\n  \"agent\": {\"model\": \"a\",},\n  \"notify\": \"smart\", // mine\n}\n");
+        assert!(text.contains("// mine"), "{text:?}");
+        assert_eq!(parse(&text).unwrap()["notify"], "smart");
+        // Its objects made anew where they weren't.
+        let base = json!({});
+        let ended = json!({"agent": {"model": "b"}, "keymap": {"global": {"clear_screen": "ctrl-shift-k"}}});
+        let check = |now: &str| -> String {
+            let text = written_back(&base, &ended, Some(now))
+                .unwrap()
+                .unwrap_or_else(|| panic!("written: {now:?}"));
+            let v = parse(&text).unwrap();
+            assert_eq!(v["agent"], ended["agent"], "{text:?}");
+            assert_eq!(v["keymap"], ended["keymap"], "{text:?}");
+            text
+        };
+        // On one line.
+        check("{}");
+        check("{}\n");
+        // A trailing comma before them.
+        let text = check("{\n  // mine\n  \"notify\": \"smart\",\n}\n");
+        assert!(text.contains("// mine"), "{text:?}");
+        assert_eq!(parse(&text).unwrap()["notify"], "smart");
+        // Only comments: all of it commented out.
+        let text = check("// my Devin\n// {\"agent\": {\"model\": \"x\"}}\n");
+        assert!(text.contains("// my Devin"), "{text:?}");
+        let text = check("\u{feff}/* mine */\n");
+        assert!(
+            text.starts_with('\u{feff}') && text.contains("/* mine */"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_persons_file_with_a_mark_or_only_comments_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        for (text, want) in [
+            (
+                "\u{feff}{\"permissions\": {\"deny\": [\"Exec(sudo)\"]}}",
+                json!({"permissions": {"deny": ["Exec(sudo)"]}}),
+            ),
+            ("// all of it, for now\n/* {} */\n", json!({})),
+            ("\u{feff}", json!({})),
+            ("  \n", json!({})),
+        ] {
+            std::fs::write(&p, text).unwrap();
+            match Person::read(Some(&p)) {
+                Person::Read { config, real } => {
+                    assert_eq!(config, want, "{text:?}");
+                    assert!(real.is_some());
+                }
+                other => panic!("{text:?}: {other:?}"),
+            }
+        }
+        std::fs::write(&p, "{ nope").unwrap();
+        assert!(matches!(Person::read(Some(&p)), Person::Unreadable(_)));
     }
 
     #[test]
