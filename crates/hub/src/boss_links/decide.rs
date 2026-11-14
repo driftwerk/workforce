@@ -298,13 +298,14 @@ mod tests {
                 Code::Gone => "gone",
                 Code::ModelFailed => "model_failed",
                 Code::Timeout => "timeout",
+                Code::NotInForce => "not_in_force",
             };
             let v = answered(Uuid::nil(), Uuid::nil(), Err(Refused::new(c, "x")));
             assert_eq!(v["code"], wire);
         }
         assert_eq!(
             Code::ALL.len(),
-            8,
+            9,
             "a new code is in ALL, and in the match above"
         );
         assert_eq!(Code::parse("its hub decides no more for it just now"), None);
