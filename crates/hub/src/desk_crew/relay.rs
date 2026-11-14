@@ -54,9 +54,10 @@ const MOST_TAKEN: usize = 16;
 const MOST_ANSWER: usize = 256 * 1024;
 /// How long a poll waits for a call when none is queued.
 const POLL_FOR: Duration = Duration::from_secs(25);
-/// The largest input a call is queued with, as JSON: a poll's batch then
-/// always fits what Desk's native side reads of it.
-const MOST_INPUT: usize = 256 * 1024;
+/// The largest call queued, as JSON, its input and all: what Desk's native
+/// side carries of one (its `MOST_BODY`), so a poll's batch of
+/// [`MOST_TAKEN`] also fits what it reads of a poll (`MOST_POLL`).
+const MOST_CALL: usize = 256 * 1024;
 
 /// One call queued for a machine.
 #[derive(Debug, Clone, Serialize)]
@@ -78,7 +79,9 @@ pub struct RelayCall {
     pub act: workforce_common::oversight::Act,
     /// When this hub stops waiting for its answer: Desk's native side sends
     /// nothing it can't carry by then, so a call the boss was told may
-    /// not have been done is never done later. Not sent to the machine.
+    /// not have been done is never done later. Desk leaves it out of what
+    /// it sends the machine, whose `served` route refuses a field it
+    /// doesn't know.
     pub deadline: chrono::DateTime<chrono::Utc>,
 }
 
@@ -143,45 +146,41 @@ impl CrewHub {
         if !polled {
             return Err(unreached());
         }
+        let id = Uuid::new_v4();
+        let wait = *self.relay_wait.lock();
+        let call = RelayCall {
+            id,
+            machine: machine.to_string(),
+            group: group.to_string(),
+            tool: tool.to_string(),
+            input,
+            boss: BossRef::Local {
+                agent: agent.to_string(),
+            }
+            .key(),
+            link_id: RELAY_LINK,
+            level: ceiling.level,
+            act: ceiling.act,
+            deadline: chrono::Utc::now()
+                + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30)),
+        };
         // Too large to carry: never queued, so nothing of it is done.
-        if input.to_string().len() > MOST_INPUT {
+        if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
             return Err(format!(
                 "That call is too large to send to {machine}; send less in it."
             ));
         }
-        let id = Uuid::new_v4();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let wait = *self.relay_wait.lock();
-        let deadline = chrono::Utc::now()
-            + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30));
         {
             let mut r = self.relays.lock();
             r.queued.retain(|(_, at)| at.elapsed() < wait);
             if r.queued.len() >= MOST_QUEUED || r.waiting.len() >= MOST_WAITING {
                 return Err(unreached());
             }
-            r.queued.push_back((
-                RelayCall {
-                    id,
-                    machine: machine.to_string(),
-                    group: group.to_string(),
-                    tool: tool.to_string(),
-                    input,
-                    boss: BossRef::Local {
-                        agent: agent.to_string(),
-                    }
-                    .key(),
-                    link_id: RELAY_LINK,
-                    level: ceiling.level,
-                    act: ceiling.act,
-                    deadline,
-                },
-                Instant::now(),
-            ));
+            r.queued.push_back((call, Instant::now()));
             r.waiting.insert(id, tx);
         }
         self.relay_queued.notify_waiters();
-        let wait = *self.relay_wait.lock();
         let got = tokio::time::timeout(wait, rx).await;
         // Whatever came of it, nothing waits for it any more, and a call
         // no one took goes.

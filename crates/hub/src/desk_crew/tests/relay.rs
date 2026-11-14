@@ -148,6 +148,14 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         let (code, _) = post(
             &app,
+            &format!("/api/desk/crew/relay/{}", uuid::Uuid::new_v4()),
+            "not-it",
+            json!({"ok": {}}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = post(
+            &app,
             &format!("/api/desk/crew/served?token={token}"),
             &token,
             call("local:sarah", "c-5"),
@@ -286,6 +294,14 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
             .await
             .unwrap();
         assert!(!r.success);
+        assert!(r.error.as_deref().unwrap_or_default().contains("too large"), "{r:?}");
+        // The whole call is measured, as Desk carries it: an input just under
+        // the most, with the rest of the call, is over it.
+        let r = tool("crew.interrupt")
+            .execute(json!({"session_id": format!("devbox/{remote}"),
+                            "reason": "x".repeat(256 * 1024 - 64)}))
+            .await
+            .unwrap();
         assert!(r.error.as_deref().unwrap_or_default().contains("too large"), "{r:?}");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(seen.lock().len(), before);
