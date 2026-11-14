@@ -23,6 +23,9 @@ fn li(content: Value) -> Value {
     json!({ "type": "listItem", "content": content })
 }
 
+/// The ticket's own address: its site's issues are chips.
+const OWN: &str = "https://acme.example/browse/ACME-1";
+
 const FILE: &str = "6f1c3b8e-0000-4000-8000-000000000001";
 
 fn md(content: Value) -> String {
@@ -30,9 +33,8 @@ fn md(content: Value) -> String {
     let files = [AdfFile {
         id,
         name: "shot.png",
-        remote_id: Some("10001"),
     }];
-    adf_markdown(&doc(content), &files)
+    adf_markdown(&doc(content), &files, OWN)
 }
 
 /// Every row of the ADF → Desk markdown table, as written.
@@ -234,8 +236,8 @@ fn each_adf_node_reads_as_its_desk_markdown() {
 #[test]
 fn words_never_open_markdown_of_their_own() {
     let cases = [
-        (":::panel{tone=danger}", "\\:\\:\\:panel{tone=danger}"),
-        ("see :x[boom]{a=b}", "see \\:x\\[boom\\]{a=b}"),
+        (":::panel{tone=danger}", "\\:\\:\\:panel\\{tone=danger}"),
+        ("see :x[boom]{a=b}", "see \\:x\\[boom\\]\\{a=b}"),
         ("```js", "\\`\\`\\`js"),
         ("~~~", "\\~\\~\\~"),
         ("*not bold*", "\\*not bold\\*"),
@@ -399,4 +401,127 @@ fn an_edited_description_goes_back_with_plain_markdown() {
     for (md, want) in cases {
         assert_eq!(jira_out(md), want, "{md}");
     }
+}
+
+/// Words right after a mention or a date never become its attributes.
+#[test]
+fn words_after_a_directive_never_become_its_attributes() {
+    assert_eq!(
+        md(json!([p(json!([
+            { "type": "mention", "attrs": { "text": "@Bob" } },
+            t("{href=javascript:x}")
+        ]))])),
+        ":mention[Bob]\\{href=javascript\\:x}"
+    );
+    assert_eq!(
+        md(json!([p(json!([
+            { "type": "date", "attrs": { "timestamp": "1795996800000" } },
+            t("{x}")
+        ]))])),
+        ":date[2026-11-30]\\{x}"
+    );
+}
+
+/// Only an issue on the ticket's own site is a chip; any other is its
+/// link as it is.
+#[test]
+fn only_the_ticket_s_own_site_s_issues_are_chips() {
+    let card = |url: &str| {
+        md(json!([p(
+            json!([{ "type": "inlineCard", "attrs": { "url": url } }])
+        )]))
+    };
+    assert_eq!(
+        card("https://ACME.example/browse/ACME-9"),
+        "[ACME-9](https://ACME.example/browse/ACME-9)"
+    );
+    assert_eq!(
+        card("https://other.example/browse/ACME-9"),
+        "<https://other.example/browse/ACME-9>"
+    );
+    let link = md(json!([p(json!([tm(
+        "https://other.example/browse/ACME-9",
+        json!([{ "type": "link", "attrs": { "href": "https://other.example/browse/ACME-9" } }])
+    )]))]));
+    assert_eq!(
+        link,
+        "[https://other.example/browse/ACME-9](https://other.example/browse/ACME-9)"
+    );
+}
+
+/// In a table cell, a `|` in an address is encoded so it can't end the
+/// cell.
+#[test]
+fn an_address_in_a_cell_never_ends_it() {
+    let got = md(json!([{ "type": "table", "content": [
+        { "type": "tableRow", "content": [
+            { "type": "tableHeader", "content": [p(json!([
+                tm("q", json!([{ "type": "link", "attrs": { "href": "https://x.test/?a|b" } }])),
+                t(" "),
+                { "type": "inlineCard", "attrs": { "url": "https://x.test/c|d" } }
+            ]))] }
+        ] }
+    ] }]));
+    assert_eq!(
+        got,
+        "| [q](https://x.test/?a%7Cb) <https://x.test/c%7Cd> |\n| --- |"
+    );
+}
+
+/// A picture's caption keeps its words, under it.
+#[test]
+fn a_picture_keeps_its_caption() {
+    let got = md(json!([{ "type": "mediaSingle", "content": [
+        { "type": "media", "attrs": { "type": "file", "alt": "shot.png" } },
+        { "type": "caption", "content": [t("The *login* page")] }
+    ] }]));
+    assert_eq!(
+        got,
+        format!("![shot.png](desk-file:{FILE})\n\nThe \\*login\\* page")
+    );
+}
+
+/// Hostile lines (100 000 characters of what each reader looks ahead on)
+/// are read in a moment, and deep nesting is read whole.
+#[test]
+fn hostile_text_is_read_in_a_moment() {
+    let n = 100_000;
+    let lines = [
+        "[".repeat(n),
+        "[a".repeat(n / 2),
+        "[a](x".repeat(n / 5),
+        "<".repeat(n),
+        "<a".repeat(n / 2),
+        "`".repeat(n),
+        "`a``a```a````".repeat(n / 13),
+        "ab ".repeat(n / 3),
+        "MAN-1 ".repeat(n / 6),
+        "https://linear.app/acme/issue/MAN-2 ".repeat(n / 37),
+        ":mention[".repeat(n / 9),
+        "![a](desk-file:".repeat(n / 15),
+        ":status[a]{".repeat(n / 11),
+    ];
+    let started = std::time::Instant::now();
+    for l in &lines {
+        let _ = linear_markdown(l, "MAN-1", "https://linear.app/acme/issue/MAN-1");
+        let _ = jira_out(l);
+        let _ = md(json!([p(json!([t(l)]))]));
+    }
+    let many = "+++ x\n".repeat(n / 6) + &"+++\n".repeat(n / 6);
+    let _ = linear_markdown(&many, "MAN-1", "");
+    let _ = jira_out(&":::panel{tone=info}\n".repeat(n / 20));
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+
+    // Panels inside panels, 100 deep: every word is kept.
+    let mut node = p(json!([t("deep")]));
+    for _ in 0..100 {
+        node = json!({ "type": "panel", "attrs": { "panelType": "info" }, "content": [node] });
+    }
+    let got = md(json!([node]));
+    assert!(got.contains("\ndeep\n"), "{got}");
+    assert!(
+        got.starts_with(&":".repeat(102)),
+        "the outer fence is the longest"
+    );
 }

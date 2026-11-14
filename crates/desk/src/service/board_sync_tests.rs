@@ -2353,3 +2353,120 @@ async fn each_search_of_epics_read_through_is_kept_though_the_next_runs_out() {
     })
     .await;
 }
+
+// ── A description read as ADF ────────────────────────────────────────────
+
+/// A Jira whose one issue's description is both HTML (as a search and a
+/// read give it) and ADF (as a read gives it when asked).
+struct AdfJira {
+    html: Mutex<String>,
+    adf: Mutex<Value>,
+    updated: Mutex<String>,
+}
+
+impl AdfJira {
+    fn says(&self, html: &str, words: &str, updated: &str) {
+        *self.html.lock().unwrap() = html.into();
+        *self.adf.lock().unwrap() = json!({ "type": "doc", "version": 1, "content": [
+            { "type": "panel", "attrs": { "panelType": "info" }, "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": words }] } ] } ] });
+        *self.updated.lock().unwrap() = updated.into();
+    }
+}
+
+#[async_trait]
+impl Remote for AdfJira {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::JIRA_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        let mut v = json!({ "key": "ACME-1", "summary": "Fix the login", "status": "To Do",
+            "updated": *self.updated.lock().unwrap(), "labels": ["web"],
+            "description_html": *self.html.lock().unwrap() });
+        match tool {
+            "jira.search" => Ok(json!({ "issues": [v], "is_last": true })),
+            "jira.get_issue" => {
+                if args["description_adf"] == true {
+                    v["description_adf"] = json!(self.adf.lock().unwrap().to_string());
+                }
+                Ok(v)
+            }
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+/// Opened, a ticket's description is read as ADF; a pull that reads the
+/// same HTML again leaves it and says nothing; one whose description
+/// changed there replaces it with the HTML; opened again, it is ADF again.
+#[tokio::test]
+async fn a_body_read_as_adf_stays_through_pulls_until_its_description_changes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = AdfJira {
+            html: Mutex::new(String::new()),
+            adf: Mutex::new(Value::Null),
+            updated: Mutex::new(String::new()),
+        };
+        jira.says(
+            "<p>It fails.</p>",
+            "It fails.",
+            "2026-11-09T10:00:00.000+0000",
+        );
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d
+            .tickets(b.id, &Default::default())
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(t.ticket.body, "It fails.");
+        let id = t.ticket.id;
+
+        let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
+        assert_eq!(v.ticket.body, ":::panel{tone=info}\nIt fails.\n:::");
+        let e = v.ticket.external.clone().unwrap();
+        assert_eq!(e.html_read, crate::board_sync::ADF_READ);
+        assert_eq!(e.seen.body, v.ticket.body, "never sent back unedited");
+        let at = v.ticket.updated_at;
+
+        // Changed there, not its words.
+        jira.says(
+            "<p>It fails.</p>",
+            "It fails.",
+            "2026-11-09T11:00:00.000+0000",
+        );
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d.ticket_of(id).await.unwrap();
+        assert_eq!(t.body, ":::panel{tone=info}\nIt fails.\n:::");
+        assert_eq!(t.updated_at, at, "no edit is said");
+        assert_eq!(
+            t.external.as_ref().unwrap().html_read,
+            crate::board_sync::ADF_READ
+        );
+
+        // Its words changed there: the pull's HTML stands, read as HTML.
+        jira.says(
+            "<p>It works.</p>",
+            "It works.",
+            "2026-11-09T12:00:00.000+0000",
+        );
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d.ticket_of(id).await.unwrap();
+        assert_eq!(t.body, "It works.");
+        assert!(t.updated_at > at, "the edit is said");
+        let e = t.external.as_ref().unwrap();
+        assert_eq!(e.html_read, crate::board_sync::HTML_READ);
+        assert_eq!(e.html_print, None);
+
+        // Opened again: ADF again.
+        let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
+        assert_eq!(v.ticket.body, ":::panel{tone=info}\nIt works.\n:::");
+    })
+    .await;
+}

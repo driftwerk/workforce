@@ -688,6 +688,8 @@ impl Tool for JiraGetIssueTool {
                         &Value::String(f["description"].to_string()),
                         "jira.get_issue.description",
                     );
+                    // Jira's own address of it, which names its site.
+                    out["self"] = issue["self"].clone();
                 }
                 if let Value::Object(o) = &mut out {
                     // Its labels and reporter are said above, as before.
@@ -2851,7 +2853,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/rest/api/3/issue/ENG-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "key": "ENG-1", "id": "1",
+                "key": "ENG-1", "id": "1", "self": "https://acme.example/rest/api/3/issue/1",
                 "fields": { "summary": "x", "description": doc },
                 "renderedFields": { "description": "<p>It fails.</p>" }
             })))
@@ -2875,6 +2877,7 @@ mod tests {
         assert!(text.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{text}");
         let inner = text.lines().nth(2).unwrap();
         assert_eq!(serde_json::from_str::<Value>(inner).unwrap(), doc);
+        assert_eq!(r.output["self"], "https://acme.example/rest/api/3/issue/1");
     }
 
     /// A page of an issue's comments as asked for, with how many it has.

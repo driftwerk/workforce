@@ -1256,6 +1256,10 @@ fn a_body_read_as_adf_stays_until_the_description_changes_there() {
         push_of(&t, &[]).body.as_deref(),
         Some("Ask @Dana, edited here")
     );
+    // Held only in part: never sent, read as ADF or not.
+    t.external.as_mut().unwrap().clipped = true;
+    assert_eq!(push_of(&t, &[]).body, None);
+    t.external.as_mut().unwrap().clipped = false;
     t.external.as_mut().unwrap().html_read = HTML_READ;
     assert_eq!(
         push_of(&t, &[]).body.as_deref(),

@@ -160,6 +160,7 @@ impl Tool for FakeJiraTool {
                     {
                         v["description_adf"] =
                             wrapped(&doc.to_string(), "jira.get_issue.description");
+                        v["self"] = json!("https://acme.example/rest/api/3/issue/1");
                     }
                     v
                 }

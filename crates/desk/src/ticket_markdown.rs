@@ -15,25 +15,32 @@
 //! Someone else's words are escaped, so none of them opens a directive, a
 //! fence, a list or a link by accident.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::board_sync::{parse_issue_key, safe_href};
 
-/// A file of the ticket's, which an ADF picture can stand for.
+/// A file of the ticket's, which an ADF picture can stand for: found by
+/// its name, since an ADF `media` node's id is the Media API's, never the
+/// attachment's.
 #[derive(Debug, Clone, Copy)]
 pub struct AdfFile<'a> {
     /// Its row's id, which the page reads it by.
     pub id: Uuid,
     pub name: &'a str,
-    /// The Jira attachment's id.
-    pub remote_id: Option<&'a str>,
 }
 
 /// An ADF document (`{"type":"doc",…}`) as Desk markdown, its pictures
-/// found among `files`.
-pub fn adf_markdown(doc: &Value, files: &[AdfFile<'_>]) -> String {
-    let cx = Cx { files, cell: false };
+/// found among `files`; a link to an issue on the site of `own` (the
+/// ticket's own address) a ticket chip.
+pub fn adf_markdown(doc: &Value, files: &[AdfFile<'_>], own: &str) -> String {
+    let cx = Cx {
+        files,
+        cell: false,
+        site: host_of(own).unwrap_or_default(),
+    };
     join_blocks(&blocks(children(doc), &cx)).trim().to_string()
 }
 
@@ -42,6 +49,36 @@ struct Cx<'a> {
     files: &'a [AdfFile<'a>],
     /// Inside a table cell: one line, no containers.
     cell: bool,
+    /// The ticket's own site's host, lowercase: links to its issues are
+    /// chips.
+    site: &'a str,
+}
+
+impl Cx<'_> {
+    /// The issue key a link to `href` makes a chip of: one on the ticket's
+    /// own site.
+    fn chip(&self, href: &str) -> Option<String> {
+        browse_key(href).filter(|_| {
+            !self.site.is_empty()
+                && host_of(href).is_some_and(|h| h.eq_ignore_ascii_case(self.site))
+        })
+    }
+
+    /// `href` as a link writes it here: in a cell, a `|` would end the
+    /// cell, so it is percent-encoded.
+    fn href(&self, href: &str) -> String {
+        match self.cell {
+            true => href.replace('|', "%7C"),
+            false => href.to_string(),
+        }
+    }
+}
+
+/// An `https` address's host.
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then_some(host)
 }
 
 fn children(v: &Value) -> &[Value] {
@@ -103,7 +140,8 @@ fn escape(text: &str, line_start: bool, cell: bool) -> String {
         let prev = i.checked_sub(1).map(|p| chars[p]);
         let next = chars.get(i + 1).copied();
         let escaped = match c {
-            '\\' | '`' | '*' | '[' | ']' | '<' | '~' => true,
+            // `{` after a directive would be read as its attributes.
+            '\\' | '`' | '*' | '[' | ']' | '<' | '~' | '{' => true,
             '|' => cell,
             // Inside a word it is only a word's; at its edge, emphasis.
             '_' => {
@@ -301,24 +339,22 @@ fn tone_of_panel(panel: &str) -> &'static str {
 }
 
 /// A picture or file of the ticket's: by its row's id when it is one of
-/// `files` (by the attachment's id, else its name), else its name.
+/// `files` (by its name), else its name.
 fn media(v: &Value, cx: &Cx<'_>) -> String {
     let alt = attr_str(v, "alt").trim();
     if attr_str(v, "type") == "external" {
         return match https(attr_str(v, "url")) {
             Some(url) => format!(
-                "[{}]({url})",
-                label(if alt.is_empty() { url } else { alt }, cx.cell)
+                "[{}]({})",
+                label(if alt.is_empty() { url } else { alt }, cx.cell),
+                cx.href(url)
             ),
             None => escape(alt, false, cx.cell),
         };
     }
-    let id = attr_str(v, "id");
-    let found = cx
-        .files
-        .iter()
-        .find(|f| !id.is_empty() && f.remote_id == Some(id))
-        .or_else(|| cx.files.iter().find(|f| !alt.is_empty() && f.name == alt));
+    // Its `id` is the Media API's, never the attachment's: it is found by
+    // its name.
+    let found = cx.files.iter().find(|f| !alt.is_empty() && f.name == alt);
     match found {
         Some(f) => {
             let name = if alt.is_empty() { f.name } else { alt };
@@ -387,9 +423,9 @@ fn flatten(nodes: &[Value], cx: &Cx<'_>, out: &mut Vec<Item>) {
             },
             "inlineCard" => {
                 let url = attr_str(v, "url");
-                match (https(url), browse_key(url)) {
-                    (Some(url), Some(key)) => Piece::Made(format!("[{key}]({url})")),
-                    (Some(url), None) => Piece::Made(format!("<{url}>")),
+                match (https(url), cx.chip(url)) {
+                    (Some(url), Some(key)) => Piece::Made(format!("[{key}]({})", cx.href(url))),
+                    (Some(url), None) => Piece::Made(format!("<{}>", cx.href(url))),
                     _ => {
                         let t = v["attrs"]["data"]["name"]
                             .as_str()
@@ -463,17 +499,18 @@ fn inlines(nodes: &[Value], cx: &Cx<'_>, one_line: bool) -> String {
                     })
                     .collect();
                 let words = words.trim();
-                match browse_key(&href) {
+                let dest = cx.href(&href);
+                match cx.chip(&href) {
                     // A link to an issue, its words its address or key: the key.
                     Some(key) if words == href || words.eq_ignore_ascii_case(&key) => {
-                        out.push_str(&format!("[{key}]({href})"))
+                        out.push_str(&format!("[{key}]({dest})"))
                     }
                     _ => {
                         let mut inner = String::new();
                         marked(group, &mut inner, false, cx.cell, one_line);
                         match inner.trim().is_empty() {
                             true => {}
-                            false => out.push_str(&format!("[{}]({href})", inner.trim())),
+                            false => out.push_str(&format!("[{}]({dest})", inner.trim())),
                         }
                     }
                 }
@@ -797,10 +834,15 @@ fn block(v: &Value, cx: &Cx<'_>) -> Option<Block> {
         "rule" if !cx.cell => plain("---".into()),
         "rule" => None,
         "mediaSingle" | "mediaGroup" => {
+            // Each picture, then its caption's words.
             let parts: Vec<String> = children(v)
                 .iter()
-                .filter(|m| kind(m) == "media")
-                .map(|m| media(m, cx))
+                .filter_map(|m| match kind(m) {
+                    "media" => Some(media(m, cx)),
+                    "caption" => Some(inlines(children(m), cx, true)),
+                    _ => None,
+                })
+                .filter(|p| !p.is_empty())
                 .collect();
             plain(parts.join(if cx.cell { " " } else { "\n\n" }))
         }
@@ -808,9 +850,9 @@ fn block(v: &Value, cx: &Cx<'_>) -> Option<Block> {
         "table" => table(v, cx),
         "blockCard" | "embedCard" => {
             let url = attr_str(v, "url");
-            match (https(url), browse_key(url)) {
-                (Some(url), Some(key)) => plain(format!("[{key}]({url})")),
-                (Some(url), None) => plain(format!("<{url}>")),
+            match (https(url), cx.chip(url)) {
+                (Some(url), Some(key)) => plain(format!("[{key}]({})", cx.href(url))),
+                (Some(url), None) => plain(format!("<{}>", cx.href(url))),
                 _ => plain(escape(url, !cx.cell, cx.cell)),
             }
         }
@@ -860,10 +902,7 @@ fn list(v: &Value, cx: &Cx<'_>, marker: impl Fn(usize) -> String) -> Option<Bloc
 /// A table as a GFM table: its first row the header, each cell's content
 /// on one line, short rows filled out.
 fn table(v: &Value, cx: &Cx<'_>) -> Option<Block> {
-    let cell_cx = Cx {
-        files: cx.files,
-        cell: true,
-    };
+    let cell_cx = Cx { cell: true, ..*cx };
     let rows: Vec<Vec<String>> = children(v)
         .iter()
         .filter(|r| kind(r) == "tableRow")
@@ -996,16 +1035,18 @@ pub fn linear_markdown(md: &str, key: &str, url: &str) -> String {
             }
         }
     }
+    let opening: HashMap<usize, usize> = pairs.iter().map(|p| (p.0, p.2)).collect();
+    let closing: HashMap<usize, usize> = pairs.iter().map(|p| (p.1, p.2)).collect();
     let mut out = Vec::with_capacity(lines.len());
     for (n, (l, code)) in lines.iter().enumerate() {
-        if let Some((_, _, colons)) = pairs.iter().find(|p| p.0 == n) {
+        if let Some(colons) = opening.get(&n) {
             let title = l.trim().trim_start_matches("+++").trim();
             let title = title
                 .replace('\\', "\\\\")
                 .replace('[', "\\[")
                 .replace(']', "\\]");
             out.push(format!("{}details[{title}]", ":".repeat(*colons)));
-        } else if let Some((_, _, colons)) = pairs.iter().find(|p| p.1 == n) {
+        } else if let Some(colons) = closing.get(&n) {
             out.push(":".repeat(*colons));
         } else if *code {
             out.push(l.to_string());
@@ -1023,6 +1064,7 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     let word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.' | b'@');
+    let mut spans = CodeSpans::of(line);
     while i < b.len() {
         let c = b[i];
         // An escaped character stays escaped.
@@ -1033,19 +1075,9 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
             continue;
         }
         if c == b'`' {
-            let run = line[i..].bytes().take_while(|x| *x == b'`').count();
-            let fence = &line[i..i + run];
-            match line[i + run..].find(fence) {
-                Some(end) => {
-                    let to = i + run + end + run;
-                    out.push_str(&line[i..to]);
-                    i = to;
-                }
-                None => {
-                    out.push_str(fence);
-                    i += run;
-                }
-            }
+            let to = spans.skip(line, i);
+            out.push_str(&line[i..to]);
+            i = to;
             continue;
         }
         if c == b'[' {
@@ -1059,9 +1091,16 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
             }
         }
         if c == b'<' {
-            if let Some(end) = line[i..].find('>') {
+            // An autolink holds no space and no `<`: the look stops there.
+            let end = line[i + 1..]
+                .bytes()
+                .take(LOOK_MAX)
+                .position(|x| x == b'>' || x == b'<' || x.is_ascii_whitespace())
+                .map(|p| p + 1)
+                .filter(|p| b[i + p] == b'>');
+            if let Some(end) = end {
                 let inner = &line[i + 1..i + end];
-                if inner.contains("://") && !inner.contains(char::is_whitespace) {
+                if inner.contains("://") {
                     match linear_issue_key(inner) {
                         Some(key) => out.push_str(&format!("[{key}]({inner})")),
                         None => out.push_str(&line[i..=i + end]),
@@ -1074,11 +1113,11 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
         let at_word = i == 0 || !word(b[i - 1]);
         if at_word && c.is_ascii_alphabetic() {
             // An address: a link when it is a Linear issue's, else as it is.
-            if line[i..].find("://").is_some_and(|s| {
-                line[i..i + s]
-                    .bytes()
-                    .all(|x| x.is_ascii_alphanumeric() || x == b'+')
-            }) {
+            let scheme = line[i..]
+                .bytes()
+                .take_while(|x| x.is_ascii_alphanumeric() || matches!(x, b'+' | b'.' | b'-'))
+                .count();
+            if line[i + scheme..].starts_with("://") {
                 let len = line[i..]
                     .find(|ch: char| ch.is_whitespace() || ch == '<')
                     .unwrap_or(line.len() - i);
@@ -1128,16 +1167,34 @@ fn linear_links(line: &str, team: Option<&str>, base: Option<&str>) -> String {
     out
 }
 
+/// How far a link's words, its address or an autolink are looked for:
+/// past it, the `[` or `<` is only a character, so a line is read once.
+const LOOK_MAX: usize = 2048;
+
+/// How deep brackets nest in a link's words or address before it is taken
+/// as no link.
+const NEST_MAX: usize = 32;
+
 /// The markdown link (or picture's) at `at` (its `[`): its words, its
-/// address, and where it ends.
+/// address, and where it ends. Looked for only so far ([`LOOK_MAX`]) and so
+/// deep ([`NEST_MAX`]), and an address never holds a `[`.
 fn md_link(line: &str, at: usize) -> Option<(&str, &str, usize)> {
     let b = line.as_bytes();
+    let limit = b.len().min(at + LOOK_MAX);
     let mut depth = 0;
     let mut i = at;
     let close = loop {
-        match b.get(i)? {
+        if i >= limit {
+            return None;
+        }
+        match b[i] {
             b'\\' => i += 1,
-            b'[' => depth += 1,
+            b'[' => {
+                depth += 1;
+                if depth > NEST_MAX {
+                    return None;
+                }
+            }
             b']' => {
                 depth -= 1;
                 if depth == 0 {
@@ -1151,12 +1208,22 @@ fn md_link(line: &str, at: usize) -> Option<(&str, &str, usize)> {
     if b.get(close + 1) != Some(&b'(') {
         return None;
     }
+    let limit = b.len().min(close + 1 + LOOK_MAX);
     let mut depth = 0;
     let mut j = close + 1;
     let end = loop {
-        match b.get(j)? {
+        if j >= limit {
+            return None;
+        }
+        match b[j] {
             b'\\' => j += 1,
-            b'(' => depth += 1,
+            b'[' => return None,
+            b'(' => {
+                depth += 1;
+                if depth > NEST_MAX {
+                    return None;
+                }
+            }
             b')' => {
                 depth -= 1;
                 if depth == 0 {
@@ -1168,6 +1235,66 @@ fn md_link(line: &str, at: usize) -> Option<(&str, &str, usize)> {
         j += 1;
     };
     Some((&line[at + 1..close], &line[close + 2..end], end + 1))
+}
+
+/// A line's code spans: each run of backticks closed by the next run as
+/// long, found in one read of the line.
+struct CodeSpans {
+    spans: Vec<(usize, usize)>,
+    next: usize,
+}
+
+impl CodeSpans {
+    fn of(line: &str) -> Self {
+        let b = line.as_bytes();
+        let mut runs: Vec<(usize, usize)> = vec![];
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'`' {
+                let start = i;
+                while i < b.len() && b[i] == b'`' {
+                    i += 1;
+                }
+                runs.push((start, i - start));
+            } else {
+                i += 1;
+            }
+        }
+        // The next run as long as each, from the end.
+        let mut later: HashMap<usize, usize> = HashMap::new();
+        let mut closer = vec![None; runs.len()];
+        for k in (0..runs.len()).rev() {
+            closer[k] = later.get(&runs[k].1).copied();
+            later.insert(runs[k].1, k);
+        }
+        let mut spans = vec![];
+        let mut k = 0;
+        while k < runs.len() {
+            match closer[k] {
+                Some(m) => {
+                    spans.push((runs[k].0, runs[m].0 + runs[m].1));
+                    k = m + 1;
+                }
+                None => k += 1,
+            }
+        }
+        Self { spans, next: 0 }
+    }
+
+    /// Where what starts with the backtick at `at` ends: past its code
+    /// span, or past its run when it opens none.
+    fn skip(&mut self, line: &str, at: usize) -> usize {
+        while self.spans.get(self.next).is_some_and(|s| s.0 < at) {
+            self.next += 1;
+        }
+        match self.spans.get(self.next) {
+            Some(&(start, end)) if start == at => {
+                self.next += 1;
+                end
+            }
+            _ => at + line[at..].bytes().take_while(|x| *x == b'`').count(),
+        }
+    }
 }
 
 /// A description written here as Linear reads it: `:::details[Title]` …
@@ -1312,13 +1439,16 @@ fn plain_directives(line: &str) -> String {
     let b = line.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
+    let mut spans = CodeSpans::of(line);
     // The label from `[` at `at` to its `]`, and where it ends.
     let label_at = |at: usize| -> Option<(&str, usize)> {
         let mut j = at + 1;
-        while j < b.len() {
+        while j < b.len().min(at + LOOK_MAX) {
             match b[j] {
                 b'\\' => j += 1,
                 b']' => return Some((&line[at + 1..j], j + 1)),
+                // A label Desk wrote holds no bare `[`.
+                b'[' => return None,
                 _ => {}
             }
             j += 1;
@@ -1334,11 +1464,7 @@ fn plain_directives(line: &str) -> String {
             continue;
         }
         if c == b'`' {
-            let run = line[i..].bytes().take_while(|x| *x == b'`').count();
-            let fence = &line[i..i + run];
-            let to = line[i + run..]
-                .find(fence)
-                .map_or(i + run, |end| i + run + end + run);
+            let to = spans.skip(line, i);
             out.push_str(&line[i..to]);
             i = to;
             continue;
@@ -1362,7 +1488,9 @@ fn plain_directives(line: &str) -> String {
                 let at = i + 1 + name.len();
                 if let Some((text, mut end)) = label_at(at) {
                     if b.get(end) == Some(&b'{') {
-                        if let Some(close) = line[end..].find('}') {
+                        if let Some(close) =
+                            line[end..].bytes().take(LOOK_MAX).position(|x| x == b'}')
+                        {
                             end += close + 1;
                         }
                     }

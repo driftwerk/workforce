@@ -1466,11 +1466,14 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
     let key = parse_issue_key(i.get("identifier")?.as_str()?)?;
     let (title, f1) = text_field(&i["title"]);
     let (body, f2) = text_field(&i["description"]);
-    let body = crate::ticket_markdown::linear_markdown(
-        &unescape_newlines(&body),
-        &key,
-        i["url"].as_str().unwrap_or_default(),
-    );
+    // Read only as far as could be held: its links only lengthen it, so
+    // what is cut here is still said to be cut.
+    let body: String = unescape_newlines(&body)
+        .chars()
+        .take(2 * crate::board::BODY_MAX)
+        .collect();
+    let body =
+        crate::ticket_markdown::linear_markdown(&body, &key, i["url"].as_str().unwrap_or_default());
     let (body, clipped) = held_body(body);
     let files = crate::ticket_files::linear_files(i, &body);
     let facts = linear_facts(i);

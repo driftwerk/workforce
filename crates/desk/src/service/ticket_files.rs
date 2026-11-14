@@ -157,7 +157,11 @@ impl Desk {
         // The rest of what it says comes in by the pull, as it always does;
         // here only what the view shows beside it, and when it was read.
         let adf = match e.system {
-            System::Jira => self.adf_body(id, &v).await,
+            // Its site, by Jira's own address of it, else the ticket's.
+            System::Jira => {
+                let own = v["self"].as_str().unwrap_or(&e.url);
+                self.adf_body(id, &v, own).await
+            }
             System::Linear => None,
         };
         let mut t = self.ticket_of(id).await.map_err(fail)?;
@@ -168,9 +172,9 @@ impl Desk {
             ext.details = details;
             // Held as the body is, while it isn't one edited here.
             if let Some(adf) = adf.filter(|_| t.body == ext.seen.body) {
-                if ext.html_read != crate::board_sync::ADF_READ {
-                    ext.html_print = Some(crate::board_sync::body_print(&t.body));
-                }
+                // The HTML a pull reads of it, built from the same answer as
+                // a pull builds it: while a pull reads that, this stays.
+                ext.html_print = issue.body.as_deref().map(crate::board_sync::body_print);
                 ext.html_read = crate::board_sync::ADF_READ;
                 ext.clipped = adf.clipped;
                 ext.flagged = ext.flagged || adf.flagged;
@@ -221,10 +225,15 @@ impl Desk {
 
     /// The description `answer` (a `jira.get_issue` one) gives as Jira
     /// stores it, as Desk markdown, its pictures found among ticket `id`'s
-    /// files; none when the hub doesn't give it, or it doesn't read as a
-    /// document.
-    async fn adf_body(&self, id: Uuid, answer: &serde_json::Value) -> Option<AdfBody> {
-        let (text, flagged) = crate::board_sync::unfence(answer.get("description_adf")?.as_str()?);
+    /// files and its issue links on the site of `own` (the ticket's
+    /// address) chips; none when the hub doesn't give it, it is larger than
+    /// [`ADF_MAX`], or it doesn't read as a document.
+    async fn adf_body(&self, id: Uuid, answer: &serde_json::Value, own: &str) -> Option<AdfBody> {
+        let text = answer.get("description_adf")?.as_str()?;
+        if text.len() > ADF_MAX {
+            return None;
+        }
+        let (text, flagged) = crate::board_sync::unfence(text);
         let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
         if doc["type"] != "doc" {
             return None;
@@ -242,10 +251,9 @@ impl Desk {
             .map(|f| AdfFile {
                 id: f.id,
                 name: &f.name,
-                remote_id: f.remote_id.as_deref(),
             })
             .collect();
-        let md = crate::ticket_markdown::adf_markdown(&doc, &files);
+        let md = crate::ticket_markdown::adf_markdown(&doc, &files, own);
         let (body, clipped) = crate::board_sync::held_body(md);
         Some(AdfBody {
             body,
@@ -383,6 +391,9 @@ impl Desk {
         Ok(())
     }
 }
+
+/// The most of a description's ADF read: a larger one is read as its HTML.
+const ADF_MAX: usize = 2 * 1024 * 1024;
 
 /// A Jira description read as ADF, as Desk holds it.
 struct AdfBody {
