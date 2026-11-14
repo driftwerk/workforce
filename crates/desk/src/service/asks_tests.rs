@@ -645,3 +645,11 @@ async fn another_threads_call_never_ends_a_sub_agents_ask_whose_call_isnt_known(
     })
     .await;
 }
+
+#[test]
+fn claudes_and_devins_asks_outlive_the_hub_and_codexs_do_not() {
+    use super::asks::asks_outlive_the_hub;
+    assert!(asks_outlive_the_hub(Engine::Claude));
+    assert!(asks_outlive_the_hub(Engine::Devin));
+    assert!(!asks_outlive_the_hub(Engine::Codex));
+}

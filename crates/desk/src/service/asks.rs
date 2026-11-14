@@ -200,6 +200,15 @@ impl State {
     }
 }
 
+/// Whether what a session of `engine`'s asks outlives the hub it asked:
+/// a Claude or Devin hook that loses its hub fails, and the engine asks in
+/// its own terminal instead (Devin: past the hook, its TUI's own prompt);
+/// a Codex request is the old hub's connection's, and went with it, and no
+/// other engine's is kept.
+pub(super) fn asks_outlive_the_hub(engine: Engine) -> bool {
+    matches!(engine, Engine::Claude | Engine::Devin)
+}
+
 impl Desk {
     /// Keeps what session `id` asks now, if it changed since last kept, and
     /// closes the floor's wait of every ask that ended, in the turn it was
@@ -293,7 +302,7 @@ impl Desk {
                 };
                 // A Codex request was the old hub's connection's: it went.
                 // Kept, but each one's call has ended since: it asks nothing.
-                let kept_here = kept.remove(&id).filter(|_| engine == Engine::Claude);
+                let kept_here = kept.remove(&id).filter(|_| asks_outlive_the_hub(engine));
                 let answered = kept_here.as_ref().is_some_and(Vec::is_empty);
                 let asks = kept_here.unwrap_or_default();
                 if answered {

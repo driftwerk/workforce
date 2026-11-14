@@ -389,13 +389,8 @@ impl CrewHub {
         // with (Codex's, Devin's: [`workforce_desk::engine::boss_safe`]) in
         // a session such a boss runs are the person's (Desk takes no other
         // answer to them).
-        if workforce_desk::grant::is_served(&boss)
-            && !workforce_desk::engine::boss_safe(view.engine)
-        {
-            return waits(format!(
-                "{}'s requests in a session run from another hub are yours",
-                view.engine.title()
-            ));
+        if let Some(why) = kept_from(workforce_desk::grant::is_served(&boss), view.engine) {
+            return waits(why);
         }
         if !p.answerable {
             // A question its dialog asks while the person is in control of
@@ -714,13 +709,7 @@ impl CrewHub {
         };
         // Devin's request is put in Claude Code's terms; what Devin itself
         // sent is beside it, under `devin`, and is what runs.
-        let devin = match view.engine {
-            workforce_desk::engine::Engine::Devin => {
-                "It is Devin asking. Its request is put in Claude Code's terms; Devin's own call, \
-                 under `devin` in its input, is what runs: decide on that.\n\n"
-            }
-            _ => "",
-        };
+        let devin = asking(view.engine);
         format!(
             "{MARK} A session you oversee asks to do this. Decide it now.\n\n{codex}{devin}{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
@@ -828,9 +817,57 @@ pub(crate) async fn decision_call(
         .collect())
 }
 
+/// Why a request of `engine`'s, in a session a boss runs, is the person's
+/// when that boss is on another hub (`served`): an engine such a boss
+/// can't be trusted with ([`workforce_desk::engine::boss_safe`]).
+fn kept_from(served: bool, engine: workforce_desk::engine::Engine) -> Option<String> {
+    (served && !workforce_desk::engine::boss_safe(engine)).then(|| {
+        format!(
+            "{}'s requests in a session run from another hub are yours",
+            engine.title()
+        )
+    })
+}
+
+/// What the boss is told of who asks, for an engine whose requests Desk
+/// puts in Claude Code's terms.
+fn asking(engine: workforce_desk::engine::Engine) -> &'static str {
+    match engine {
+        workforce_desk::engine::Engine::Devin => {
+            "It is Devin asking. Its request is put in Claude Code's terms; Devin's own call, \
+             under `devin` in its input, is what runs: decide on that.\n\n"
+        }
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{verdict, Verdict};
+    use super::{asking, kept_from, verdict, Verdict};
+    use workforce_desk::engine::Engine;
+
+    #[test]
+    fn a_boss_on_another_hub_decides_claudes_requests_only() {
+        assert_eq!(kept_from(true, Engine::Claude), None);
+        assert_eq!(
+            kept_from(true, Engine::Codex).as_deref(),
+            Some("Codex's requests in a session run from another hub are yours")
+        );
+        assert_eq!(
+            kept_from(true, Engine::Devin).as_deref(),
+            Some("Devin's requests in a session run from another hub are yours")
+        );
+        for engine in [Engine::Claude, Engine::Codex, Engine::Devin] {
+            assert_eq!(kept_from(false, engine), None, "{engine:?}, a boss here");
+        }
+    }
+
+    #[test]
+    fn the_boss_is_told_devins_own_call_is_what_runs() {
+        assert!(asking(Engine::Devin).contains("under `devin` in its input"));
+        assert_eq!(asking(Engine::Claude), "");
+        assert_eq!(asking(Engine::Codex), "");
+    }
 
     #[test]
     fn a_decision_is_allow_deny_with_instead_or_ask_and_nothing_else() {
