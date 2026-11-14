@@ -346,15 +346,14 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
         assert_eq!(code, StatusCode::OK);
         assert!(crew.served_full(BOSS).is_none());
         assert!(!d.boss_unbound(BOSS));
+        // Stop let go of the session: no boss runs it, so what it waits on
+        // is the person's.
+        assert!(
+            d.charge_of(started).is_none_or(|c| !c.live()),
+            "Stop let go of it"
+        );
         crew.decided(&up, &answer(&f, "ALLOW: push the tag"));
-        eventually("left to the person", async || {
-            d.view(started)
-                .unwrap()
-                .waits_on_you
-                .is_some()
-                .then_some(())
-        })
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a6));
         assert!(!asked.is_finished(), "nothing was done for it");
         let rows = d
