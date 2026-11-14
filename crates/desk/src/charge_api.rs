@@ -65,6 +65,35 @@ async fn hand(
     // Its scope's boss runs it, and no other.
     let group = s.desk.view(id).ok().and_then(|v| v.group.map(|g| g.id));
     let Some(boss) = s.desk.boss_of(&s.desk.scope_of_group(group.as_deref())) else {
+        // No agent here oversees its group: the boss its group's live grant
+        // names (one on another hub, or the home's own of a machine's
+        // sessions) runs it, when the grant holds it.
+        if let Some(g) = group.as_deref() {
+            return match s.desk.grant_boss_for(g, id) {
+                Ok(party) if b.boss.as_deref().is_none_or(|w| w == party.id) => s
+                    .desk
+                    .take_on(
+                        id,
+                        &party,
+                        How::Handed,
+                        &crate::scope::Scope::Group(g.to_string()),
+                        &By::you(),
+                    )
+                    .await
+                    .map(Json)
+                    .into_response(),
+                Ok(party) => DeskError::Conflict(format!(
+                    "{} runs the sessions here; hand it to them.",
+                    party.name
+                ))
+                .into_response(),
+                Err(None) => {
+                    DeskError::Conflict("No agent oversees the crew to hand it to.".into())
+                        .into_response()
+                }
+                Err(Some(why)) => DeskError::Conflict(why).into_response(),
+            };
+        }
         return DeskError::Conflict("No agent oversees the crew to hand it to.".into())
             .into_response();
     };

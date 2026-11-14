@@ -1095,3 +1095,81 @@ async fn a_request_left_to_the_person_is_answered_once_whoever_answers_first() {
     })
     .await;
 }
+
+/// A session in a group no agent here oversees is handed to the boss its
+/// group's live grant names, as the person hands one to a local boss: only
+/// one the grant holds, never at Watch, never to another boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_person_hands_a_session_to_its_groups_grant_boss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\ngroup = \"other\"\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let held = new_session(&d, dir.path(), "acme-web").await;
+        let outside = new_session(&d, dir.path(), "acme-docs").await;
+        // Stopped, so a hand starts it again with Desk's closed check.
+        for id in [held.id, outside.id] {
+            d.stop(id, None).unwrap();
+            eventually("it to stop", async || {
+                (!d.view(id).unwrap().live).then_some(())
+            })
+            .await;
+        }
+        let items = [
+            workforce_desk::session_item(held.id),
+            workforce_desk::session_item(outside.id),
+        ];
+        d.change_layout(|l| l.create("acme", "Acme", &items, None))
+            .await
+            .unwrap();
+        let hand = |id: uuid::Uuid, body: Value| {
+            let d = d.clone();
+            async move { native(&d, "POST", &format!("/api/desk/sessions/{id}/charge"), body).await }
+        };
+        // This hub's boss oversees another group, and no grant names one
+        // for Acme: no one to hand it to.
+        let (code, out) = hand(held.id, json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(out.to_string().contains("No agent oversees"), "{out}");
+
+        // At Watch: it only watches.
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(&[held.id], &acme_api, "watch", "status"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let (code, out) = hand(held.id, json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(out.to_string().contains("only watches"), "{out}");
+
+        // At Act: one the grant holds is Allan's; one it doesn't hold, and
+        // a hand to another boss, are refused.
+        let mut g = grant(&[held.id], &acme_api, "act", "status");
+        g["revision"] = json!(2);
+        let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", g).await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let (code, out) = hand(outside.id, json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(out.to_string().contains("isn't one of the sessions"), "{out}");
+        let (code, out) = hand(held.id, json!({"boss": "driftwerk/bob"})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert!(d.charge_of(held.id).is_none());
+        let (code, out) = hand(held.id, json!({})).await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let c = d.charge_of(held.id).expect("handed");
+        assert_eq!(c.boss, "driftwerk/allan");
+        assert!(c.live());
+    })
+    .await;
+}
