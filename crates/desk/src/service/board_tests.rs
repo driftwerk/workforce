@@ -499,6 +499,7 @@ async fn a_machine_session_is_given_the_ticket_and_it_moves_to_doing() {
             .await
             .unwrap();
         let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        assert!(d.ticket_start_text(t.ticket.id, "dev\nbox").await.is_err());
         let text = d.ticket_start_text(t.ticket.id, "devbox").await.unwrap();
         assert_eq!(text.name, "ACM-1");
         assert_eq!(text.goal, "ACM-1 · Fix the login");

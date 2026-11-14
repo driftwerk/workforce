@@ -132,6 +132,16 @@ pub struct NewSessionFor {
     pub model: Option<String>,
 }
 
+/// Whether `name` can name a machine: short, no control characters, no `/`,
+/// `:` or space.
+fn machine_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | ':' | ' '))
+}
+
 /// A session the person's Desk started on one of their machines for a
 /// ticket, by its id there.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -965,10 +975,11 @@ impl Desk {
             }
             Some(AssignTo::Agent(agent)) => self.assign_agent(t, &key, &agent, by).await,
             Some(AssignTo::MachineSession(m)) => {
-                let machine_ok = !m.machine.is_empty()
-                    && !m.machine.contains(['/', ':', ' '])
-                    && !m.name.trim().is_empty();
-                if !machine_ok {
+                if !machine_name_ok(&m.machine)
+                    || m.name.trim().is_empty()
+                    || m.name.chars().count() > 120
+                    || m.name.chars().any(char::is_control)
+                {
                     return Err(DeskError::Invalid(
                         "That isn't a session on one of your machines.".into(),
                     ));
@@ -987,6 +998,11 @@ impl Desk {
     /// [`Self::assign_ticket`] gives a new session here, and that its board
     /// is not on `machine`.
     pub async fn ticket_start_text(&self, id: Uuid, machine: &str) -> Result<StartText, DeskError> {
+        if !machine_name_ok(machine) {
+            return Err(DeskError::Invalid(
+                "That isn't the name of one of your machines.".into(),
+            ));
+        }
         let t = self.ticket_of(id).await?;
         let b = self.board_of(t.board).await?;
         let key = t.key(&b).unwrap_or_else(|| "a ticket".into());
