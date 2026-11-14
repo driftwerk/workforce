@@ -2432,7 +2432,8 @@ impl Desk {
             // Asked as a session of it runs, without a key ahead of its
             // login; what it says nothing readable of, its file says.
             (Engine::Devin, Some(_)) => {
-                let env = engine::without_devin_keys(&self.0.env);
+                let added = self.0.state.lock().session_env.clone();
+                let env = engine::without_devin_keys(&self.with_added(&added));
                 let said =
                     self.cli_says_in(program, &["auth", "status"], &env)
                         .await

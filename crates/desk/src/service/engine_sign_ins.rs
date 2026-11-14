@@ -146,8 +146,8 @@ pub const DEVIN_PAGES: &[crate::engine_accounts::SignInPage] = &[
 pub struct DevinSaid {
     /// The page to open, the last it drew: only ever one of [`DEVIN_PAGES`].
     pub url: Option<String>,
-    /// It is waiting for a token pasted from that page: asked for, or
-    /// fallen back to when no browser opened.
+    /// It fell back to waiting for a token pasted from that page, no
+    /// browser having opened.
     pub manual: bool,
     /// It was signed in already.
     pub already: bool,
@@ -163,9 +163,15 @@ pub fn devin_said(screen: &str) -> DevinSaid {
                 said.url = Some(word.to_string());
             }
         }
-        if lower.contains("manual token flow")
-            || lower.contains("manual flow")
-            || (lower.contains("paste") && lower.contains("token"))
+        // Only its falling back from the browser: a hint that a manual
+        // flow exists is no reason to ask for a token.
+        if [
+            "falling back to manual",
+            "switched to manual",
+            "chose manual",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
         {
             said.manual = true;
         }
@@ -622,6 +628,11 @@ mod tests {
             "the last page it drew"
         );
         assert!(said.manual);
+        let hint = format!(
+            "{}Press m to use the manual token flow instead, or paste a token\n",
+            devin_screen(DEVIN_PAGE)
+        );
+        assert!(!devin_said(&hint).manual, "a hint is no fallback");
         assert!(
             devin_said(
                 "You are already logged in. Use `devin auth logout` first to re-authenticate."
