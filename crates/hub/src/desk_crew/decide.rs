@@ -36,7 +36,7 @@ use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::Action;
 use super::watcher::tracked;
-use super::{name_of, CrewHub, FULL_SPEND_UNREAD};
+use super::{CrewHub, FULL_SPEND_UNREAD};
 
 /// How often every waiting request is looked at again, whatever events
 /// were missed.
@@ -151,6 +151,8 @@ struct Said {
     why: String,
     text: String,
     again: Option<(Action, By)>,
+    /// Whether Desk can answer it (not asked in its own terminal).
+    answerable: bool,
 }
 
 /// What was said in the DMs of requests that wait: by request, its boss
@@ -179,10 +181,14 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     asked.remove(&s.approval);
                     continue;
                 }
-                if let Some(a) = s.again.take() {
-                    again.insert(s.approval, a);
-                }
-                crew.say_waits(s, &mut told).await;
+                let refused = match s.again.take() {
+                    Some(a) => {
+                        again.insert(s.approval, a);
+                        true
+                    }
+                    None => false,
+                };
+                crew.say_waits(s, refused, &mut told).await;
                 continue;
             }
             received = events.recv() => match received {
@@ -230,6 +236,7 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 };
                 if !crew.still_decides(view, &by.party.id) {
                     taken.push(*approval);
+                    crew.left_by_served(&by.party.id, view.id, *approval);
                     crew.tell_dm(
                         &by.party.id,
                         &format!(
@@ -240,7 +247,10 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     .await;
                     continue;
                 }
-                if crew.perform(action, by.clone()).await.is_ok() {
+                let deciding = crew.deciding(&by.party.id);
+                let performed = crew.perform(action, by.clone()).await;
+                drop(deciding);
+                if performed.is_ok() {
                     taken.push(*approval);
                 }
             }
@@ -309,7 +319,9 @@ impl CrewHub {
     /// Whether `boss` still decides `view`'s request: it is over the
     /// session, and at Act fully in force.
     pub(super) fn still_decides(&self, view: &SessionView, boss: &str) -> bool {
-        self.desk.boss_unbound(boss) && self.boss_over(view).as_deref() == Some(boss)
+        self.desk.boss_unbound(boss)
+            && self.boss_over(view).as_deref() == Some(boss)
+            && self.served_still_holds(boss, view.id)
     }
 
     /// Whether `view`'s waiting request is its Act fully boss's to decide
@@ -351,6 +363,7 @@ impl CrewHub {
                     quoted(&shown(&p))
                 ),
                 again: None,
+                answerable: p.answerable,
             });
             Outcome::Waits(why)
         };
@@ -371,6 +384,13 @@ impl CrewHub {
         // A start not settled: which sessions bosses run, where home is.
         if !self.desk.charges_loaded() || !self.desk.boss_home_known() {
             return Outcome::Soon;
+        }
+        // Codex's requests in a session a boss on another hub runs are the
+        // person's (Desk takes no other answer to them).
+        if workforce_desk::grant::is_served(&boss)
+            && view.engine == workforce_desk::engine::Engine::Codex
+        {
+            return waits("Codex's requests in a session run from another hub are yours".into());
         }
         if !p.answerable {
             // A question its dialog asks while the person is in control of
@@ -438,6 +458,7 @@ impl CrewHub {
                         why: String::new(),
                         text: String::new(),
                         again: None,
+                        answerable: p.answerable,
                     });
                     return;
                 }
@@ -453,6 +474,7 @@ impl CrewHub {
                 ),
                 why,
                 again,
+                answerable: p.answerable,
             });
         });
         Outcome::Deciding
@@ -460,9 +482,15 @@ impl CrewHub {
 
     /// Says `s` in its boss's DM, unless that reason was said already for
     /// a request still open, or for this one.
-    async fn say_waits(&self, s: Said, told: &mut Told) {
+    async fn say_waits(&self, s: Said, refused: bool, told: &mut Told) {
         if told.get(&s.approval).is_some_and(|(_, w)| *w == s.why) {
             return;
+        }
+        // A boss on another hub: the person hears it there, as an ask, once
+        // a reason. Not while what it decided is still to be done again,
+        // nor what asks in its own terminal (no ask can answer that).
+        if !refused && s.answerable {
+            self.served_waits(&s.boss, s.approval);
         }
         let said = told.values().any(|(b, w)| *b == s.boss && *w == s.why);
         told.insert(s.approval, (s.boss.clone(), s.why.clone()));
@@ -473,16 +501,22 @@ impl CrewHub {
 
     /// The boss's decision on `view`'s request `p`, done.
     async fn decide_request(&self, view: &SessionView, p: &PendingApproval, boss: &str) -> Outcome {
-        let Some((service, o)) = self.overseer_named(boss) else {
+        // This hub's own boss, or one on another hub served from a grant
+        // here, whose call is made on its own hub ([`super::remote_decide`]).
+        let Some(decider) = self.decider_of(boss, view) else {
+            // A boss on another hub whose grant no longer holds the session
+            // while its charge does: nobody decides it, so it's the person's.
+            if workforce_desk::grant::is_served(boss) {
+                self.left_by_served(boss, view.id, p.id);
+            }
             return Outcome::NotOurs;
         };
-        let name = name_of(&service);
-        let prompt = self.decision_prompt(view, p, &o).await;
+        let name = decider.name.clone();
+        let prompt = self.decision_prompt(view, p, &decider.oversight).await;
         let mut failed = String::new();
         let mut decided = None;
         for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decision_call(&service, SYSTEM, &prompt)).await
-            {
+            match tokio::time::timeout(WITHIN, self.decide_by(&decider, &prompt)).await {
                 Ok(Ok(text)) => match verdict(&text) {
                     Some(v) => {
                         decided = Some(v);
@@ -495,6 +529,12 @@ impl CrewHub {
                         )
                     }
                 },
+                // Too long to send, or its hub holding it (its pace, its
+                // budget): asking again at once changes nothing.
+                Ok(Err(e)) if super::remote_decide::not_again(&e) => {
+                    failed = e;
+                    break;
+                }
                 Ok(Err(e)) => {
                     failed = format!(
                         "its model failed: {}",
@@ -509,6 +549,9 @@ impl CrewHub {
                 }
             }
         }
+        // A boss on another hub: its spend today read again before what it
+        // decided is judged, so a budget spent meanwhile holds it now.
+        self.after_decided(&decider).await;
         // Answered meanwhile (in its terminal, by the person): nothing waits.
         let still = || {
             self.desk
@@ -576,7 +619,10 @@ impl CrewHub {
             );
         }
         let by = By::manager(boss, &name, &why);
-        match self.perform(&action, by.clone()).await {
+        let deciding = self.deciding(boss);
+        let performed = self.perform(&action, by.clone()).await;
+        drop(deciding);
+        match performed {
             Ok(done) => {
                 tracing::info!(session = %view.id, %boss, %done, "the boss decided a request at once");
                 Outcome::Done
@@ -684,7 +730,10 @@ impl CrewHub {
     /// Records that `boss` left `view`'s request `p` to the person, saying
     /// `why`.
     async fn record_left(&self, boss: &str, view: &SessionView, p: &PendingApproval, why: &str) {
-        let what = format!("left {} to you: {}", view.label(), shown(p));
+        let what = super::remote_decide::named(
+            boss,
+            format!("left {} to you: {}", view.label(), shown(p)),
+        );
         let mut d = BossDecision::new(boss, Need::Approval, &what, why, How::Escalated);
         d.need_ref = Some(p.id.to_string());
         d.session = Some(view.id);
@@ -693,6 +742,12 @@ impl CrewHub {
 
     /// Says `text` in `boss`'s DM, as a notice.
     pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
+        // A boss on another hub: its conversation is there, where what it
+        // leaves to the person goes up as an ask ([`Self::left_by_served`]).
+        if workforce_desk::grant::is_served(boss) {
+            tracing::info!(%boss, text, "a remote boss's request waits on the person");
+            return;
+        }
         let Some((service, _)) = self.overseer_named(boss) else {
             tracing::warn!(%boss, text, "no DM to say a waiting request in");
             return;

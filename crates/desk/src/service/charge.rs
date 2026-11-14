@@ -11,7 +11,7 @@
 //! ([`charge::HOLD`], or what its boss's settings say). A loop of its own writes each change of hands down and
 //! lets what waited go once the wheel is back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -173,14 +173,16 @@ impl Desk {
     /// The request `approval` of `session` was given to its boss, whose
     /// turn left it open: the person's to answer now, as its badge says.
     pub fn leave_to_person(&self, session: Uuid, approval: Uuid) {
-        let open = {
+        // Shown again only when it is newly the person's: leaving it to them
+        // again changes nothing anyone sees.
+        let newly = {
             let mut st = self.0.state.lock();
             let open = st
                 .live
                 .get(&session)
                 .and_then(|l| l.pending.as_ref())
                 .is_some_and(|p| p.id == approval);
-            if open {
+            open && {
                 // Only what is still open anywhere is kept.
                 let pending: std::collections::HashSet<Uuid> = st
                     .live
@@ -188,11 +190,10 @@ impl Desk {
                     .filter_map(|l| l.pending.as_ref().map(|p| p.id))
                     .collect();
                 st.charges.left.retain(|id| pending.contains(id));
-                st.charges.left.insert(approval);
+                st.charges.left.insert(approval)
             }
-            open
         };
-        if open {
+        if newly {
             if let Ok(view) = self.view(session) {
                 self.announce(DeskEvent::Session {
                     session: Box::new(view),
@@ -277,8 +278,19 @@ impl Desk {
         self.0.state.lock().charges.full_budgets.get(boss).cloned()
     }
 
-    /// Where `boss` acts fully now; nowhere when it doesn't.
+    /// Who judges where each boss served from a grant acts fully: the
+    /// hub's crew. Without one, none does.
+    pub fn served_full_with(&self, judge: std::sync::Arc<dyn charge::ServedFull>) {
+        *self.0.served_full.lock() = Some(judge);
+    }
+
+    /// Where `boss` acts fully now; nowhere when it doesn't. A boss served
+    /// from a grant is judged afresh, each time ([`charge::ServedFull`]).
     pub(crate) fn full_of(&self, boss: &str) -> charge::FullGrant {
+        if crate::grant::is_served(boss) {
+            let judge = self.0.served_full.lock().clone();
+            return judge.and_then(|j| j.full_of(boss)).unwrap_or_default();
+        }
         self.0
             .state
             .lock()
@@ -582,18 +594,22 @@ impl Desk {
             .is_some_and(|c| crate::grant::is_served(&c.boss))
     }
 
-    /// Why a tool call of `id`, a session a boss served from a grant runs,
-    /// is refused before it runs; none when Desk judges it safe, as it
+    /// What becomes of a tool call of `id`, a session a boss served from a
+    /// grant runs, before it runs: none when Desk judges it safe, as it
     /// would for that boss's answer to it ([`Self::boss_judges`]). Every
     /// call is judged so, sub-agents' too, whatever the person's own allow
-    /// rules say: their rules are for the person, not for the boss.
+    /// rules say: their rules are for the person, not for the boss. One
+    /// Desk doesn't judge safe is refused, or, while that boss is at Act
+    /// fully in force, asked, so its boss decides it as any request
+    /// (never allowed by this).
     pub fn served_refuses(
         &self,
         id: Uuid,
         tool: &str,
         input: &serde_json::Value,
         cwd: Option<String>,
-    ) -> Option<String> {
+        mode: Option<crate::mode::Mode>,
+    ) -> Option<ServedCheck> {
         let boss = self.charge_of(id).filter(Charge::live)?.boss;
         if !crate::grant::is_served(&boss) {
             return None;
@@ -617,15 +633,53 @@ impl Desk {
             agent: None,
             cli_session: None,
         };
-        self.boss_judges(id, &pending, &boss).err().map(|why| {
-            format!(
+        let why = self.boss_judges(id, &pending, &boss).err()?;
+        Some(match self.served_asks(id, &boss, mode) {
+            true => ServedCheck::Ask(format!(
+                "A boss on another hub runs this session, and this call {}: its boss decides it.",
+                why.0
+            )),
+            false => ServedCheck::Deny(format!(
                 "A boss on another hub runs this session, and this call {}: it needs the person, \
                  in Desk.",
                 why.0
-            )
+            )),
         })
     }
+}
 
+impl Desk {
+    /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
+    /// (served from a grant) to decide: while it is at Act fully in force,
+    /// a live grant of it holds the session, and the session's mode, as
+    /// this call's own hook says it (`mode`), is one where an asked call
+    /// waits for an answer. In a mode that asks nothing (bypass, accept
+    /// edits), or one not said, an asked call might run unasked, so there
+    /// it is refused.
+    fn served_asks(&self, id: Uuid, boss: &str, mode: Option<crate::mode::Mode>) -> bool {
+        use crate::mode::Mode;
+        matches!(mode, Some(Mode::Default | Mode::Plan | Mode::Auto))
+            && self.full_of(boss).unbound
+            && self
+                .0
+                .served_full
+                .lock()
+                .clone()
+                .is_some_and(|j| j.holds(boss, id))
+    }
+}
+
+/// What a served session's tool call Desk doesn't judge safe meets
+/// ([`Desk::served_refuses`]), with why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedCheck {
+    /// Refused before it runs.
+    Deny(String),
+    /// Asked, as a request its boss decides.
+    Ask(String),
+}
+
+impl Desk {
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
     /// what Desk reads in full and judges safe.
     fn boss_judges(
@@ -873,7 +927,22 @@ impl Desk {
     /// Whether any boss is unbound now: else no request is Desk's to allow
     /// at once, and nothing need be looked at.
     pub fn any_boss_unbound(&self) -> bool {
-        self.0.state.lock().charges.full.values().any(|g| g.unbound)
+        if self.0.state.lock().charges.full.values().any(|g| g.unbound) {
+            return true;
+        }
+        // A boss served from a grant, judged now, for each that runs a
+        // session here.
+        let served: HashSet<String> = self
+            .0
+            .state
+            .lock()
+            .charges
+            .rows
+            .values()
+            .filter(|c| c.live() && crate::grant::is_served(&c.boss))
+            .map(|c| c.boss.clone())
+            .collect();
+        served.into_iter().any(|b| self.full_of(&b).unbound)
     }
 
     /// `id`'s open request `approval`: the one it waits on, or another of

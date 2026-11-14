@@ -932,6 +932,9 @@ struct Inner {
     breakers: Mutex<breaker::BreakerRun>,
     /// Reads the local agents' spend for budgets: the hub's telemetry.
     agent_spend: Mutex<Option<Arc<dyn breaker::AgentSpend>>>,
+    /// Judges where each boss served from a grant acts fully, each time it
+    /// is asked: the hub's crew, from the grant as it is then.
+    served_full: Mutex<Option<Arc<dyn crate::charge::ServedFull>>>,
     /// The person's timezone, which budgets' periods are in.
     budget_tz: Mutex<Option<chrono_tz::Tz>>,
     /// Held while a session's line messages are delivered: one typed in
@@ -1694,6 +1697,7 @@ impl Desk {
             standing_kept: Mutex::new(Some(kept_standing.clone())),
             breakers: Mutex::new(breaker::BreakerRun::default()),
             agent_spend: Mutex::new(None),
+            served_full: Mutex::new(None),
             budget_tz: Mutex::new(None),
             line_pump: tokio::sync::Mutex::new(()),
             line_mcp: std::sync::OnceLock::new(),
@@ -3830,9 +3834,12 @@ impl Desk {
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
         // The boss of a session it runs, checked in `decide`; an unbound
-        // boss answers Codex too, wherever it asks.
+        // boss answers Codex too, wherever it asks. A boss served from a
+        // grant never does: Codex's requests in its sessions are the
+        // person's.
         let charged = |b: &By| {
             b.party.kind == crew::PartyKind::Manager
+                && !crate::grant::is_served(&b.party.id)
                 && (self.full_of(&b.party.id).unbound
                     || self
                         .charge_of(id)
@@ -5054,17 +5061,37 @@ impl Desk {
         if !authorised {
             return None;
         }
-        if let Some(mode) = crate::mode::of_hook(body) {
-            self.0.state.lock().modes_seen.insert(id, mode);
-        }
         let hook = match claude::parse_hook(body) {
             Ok(h) => h,
             Err(e) => {
+                if let Some(mode) = crate::mode::of_hook(body) {
+                    self.0.state.lock().modes_seen.insert(id, mode);
+                }
                 tracing::warn!(%id, error = %e, "unreadable Claude Code hook");
                 return Some(Value::Object(Default::default()));
             }
         };
+        self.mode_said(id, &hook, body);
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
+    }
+
+    /// Keeps the mode `hook` (its `body`) says session `id` runs in. A tool
+    /// call's hook that says none, or one Desk doesn't know, leaves none
+    /// kept: what a call of a session a boss served from a grant meets
+    /// is judged by the mode it runs in now, never one said before
+    /// ([`Self::served_refuses`]).
+    pub(crate) fn mode_said(&self, id: Uuid, hook: &Hook, body: &[u8]) {
+        let mode = crate::mode::of_hook(body);
+        let mut st = self.0.state.lock();
+        match (mode, hook) {
+            (Some(mode), _) => {
+                st.modes_seen.insert(id, mode);
+            }
+            (None, Hook::ToolStart { .. }) => {
+                st.modes_seen.remove(&id);
+            }
+            (None, _) => {}
+        }
     }
 
     /// Applies one hook, fired inside the sub-agent `inside` when it says:
@@ -5143,19 +5170,22 @@ impl Desk {
             _ => None,
         };
         // A session a boss served from a grant runs: every call Desk doesn't
-        // judge safe for that boss is refused before it runs, the person's
-        // own allow rules notwithstanding, unless the person allowed it in
-        // Desk. Sub-agents' calls too.
+        // judge safe for that boss is refused before it runs (asked, while
+        // that boss is at Act fully: it decides it), the person's own allow
+        // rules notwithstanding, unless the person allowed it in Desk.
+        // Sub-agents' calls too.
         let served = match (&hook, held.is_some() || allowed) {
             (Hook::ToolStart { call, input, .. }, false) => {
-                self.served_refuses(id, &call.tool, input, None)
+                let mode = self.0.state.lock().modes_seen.get(&id).copied();
+                self.served_refuses(id, &call.tool, input, None, mode)
             }
             _ => None,
         };
         let answer = move || match (held, allowed, served) {
             (Some(why), ..) => claude::deny_call(&why),
             (None, true, _) => claude::allow_call(),
-            (None, false, Some(why)) => claude::deny_call(&why),
+            (None, false, Some(charge::ServedCheck::Deny(why))) => claude::deny_call(&why),
+            (None, false, Some(charge::ServedCheck::Ask(why))) => claude::ask_call(&why),
             (None, false, None) => empty(),
         };
         // A steer waiting for this tool call's result goes with it.
