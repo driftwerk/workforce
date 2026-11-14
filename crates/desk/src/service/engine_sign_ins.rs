@@ -576,17 +576,26 @@ const HANG_UP_FOR: Duration = Duration::from_secs(1);
 /// Ends a sign-in's CLI and everything it started: its screen is wiped and
 /// blinded, its process group (it leads its own session) is told to hang
 /// up, and killed a second later (or as soon as the CLI itself has gone).
-/// The group is signalled even once the CLI was waited for: what it started
-/// may be ignoring the hang-up, and a group id isn't given to another while
-/// one of its members lives (with none left, the signal finds no one). Only
-/// the CLI's own pid is never signalled once it was waited for.
+/// The group is signalled even just after the CLI was waited for: what it
+/// started may be ignoring the hang-up, and a group id isn't given to
+/// another while one of its members lives. Once the group is empty its id
+/// can be given out again, so a CLI waited for longer than [`HANG_UP_FOR`]
+/// before this began is not signalled at all, and the CLI's own pid is never
+/// signalled once it was waited for.
 async fn end_cli(pty: Arc<Pty>) {
+    let began = std::time::Instant::now();
     pty.blind();
     wipe(&pty);
     let Some(pid) = pty.pid().and_then(|p| libc::pid_t::try_from(p).ok()) else {
         pty.kill();
         return;
     };
+    if pty
+        .reaped_at()
+        .is_some_and(|at| began.saturating_duration_since(at) > HANG_UP_FOR)
+    {
+        return; // long gone: its group id may be another's by now
+    }
     // SAFETY: killpg only sends a signal, to the CLI's own process group.
     let signal = |sig| unsafe { libc::killpg(pid, sig) };
     signal(libc::SIGHUP);

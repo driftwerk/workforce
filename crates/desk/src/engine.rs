@@ -703,20 +703,30 @@ fn devin_login_var(name: &str) -> bool {
         || devin_setting(name)
 }
 
-/// A `DEVIN_…` setting of the person's: none naming a key, token, secret,
-/// credential, password or auth, nor where Devin's API or servers are
-/// (`DEVIN_API_…`, `…_URL`, `…_HOST`, `…_ENDPOINT`), which would point its
-/// sign-in elsewhere.
+/// A `DEVIN_…` setting of the person's: none naming a secret of any kind,
+/// nor where Devin's API or servers are, which would point its sign-in
+/// elsewhere. The words are matched anywhere in the name, so a setting
+/// that merely contains one (`DEVIN_PATH`, for `PAT`) is left out too.
 fn devin_setting(name: &str) -> bool {
+    const SECRET: &[&str] = &[
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "CREDENTIAL",
+        "PASSWORD",
+        "AUTH",
+        "PAT",
+        "COOKIE",
+        "JWT",
+        "BEARER",
+    ];
+    const WHERE: &[&str] = &[
+        "URL", "URI", "HOST", "ENDPOINT", "BASE", "SERVER", "DOMAIN", "ORIGIN", "GATEWAY", "PROXY",
+    ];
     let upper = name.to_ascii_uppercase();
     upper.starts_with("DEVIN_")
-        && !["KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD", "AUTH"]
-            .iter()
-            .any(|w| upper.contains(w))
         && !upper.starts_with("DEVIN_API_")
-        && !["_URL", "_HOST", "_ENDPOINT"]
-            .iter()
-            .any(|e| upper.ends_with(e))
+        && !SECRET.iter().chain(WHERE).any(|w| upper.contains(w))
 }
 
 /// Copilot CLI signs in with a GitHub token from its environment; with
@@ -1010,6 +1020,13 @@ mod tests {
             "DEVIN_SERVER_HOST",
             "DEVIN_OTEL_ENDPOINT",
             "DEVIN_PASSWORD",
+            "DEVIN_URL_OVERRIDE",
+            "DEVIN_GATEWAY",
+            "DEVIN_SESSION_COOKIE",
+            "DEVIN_GH_PAT",
+            "DEVIN_JWT",
+            "DEVIN_BEARER",
+            "DEVIN_ORIGIN_X",
         ]
         .iter()
         .map(|k| (k.to_string(), "x".to_string()))

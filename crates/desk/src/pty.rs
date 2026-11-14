@@ -112,7 +112,7 @@ pub(crate) struct Screen {
     /// may be echoing a secret typed into it ([`Pty::blind`]).
     blind: std::sync::atomic::AtomicBool,
     /// The hub's own child has been waited for: its pid may be another's.
-    reaped: std::sync::atomic::AtomicBool,
+    reaped: Mutex<Option<std::time::Instant>>,
 }
 
 impl Screen {
@@ -144,9 +144,10 @@ impl Screen {
             // Unread, but a program waiting on the terminal's answer to a
             // cursor or device query isn't left hanging: fixed answers,
             // nothing of the output taken in.
+            // A viewer never sees blind output, so it can't answer: the
+            // hub always does.
             let replies = blind_replies(chunk);
-            let unwatched = self.core.lock().active.is_none();
-            return (unwatched && !replies.is_empty()).then_some(replies);
+            return (!replies.is_empty()).then_some(replies);
         }
         let mut core = self.core.lock();
         let replies = core.term.feed(chunk);
@@ -414,7 +415,12 @@ impl Pty {
     /// Whether the hub's own child was waited for, so its pid is no longer
     /// its own to signal.
     pub fn reaped(&self) -> bool {
-        self.screen.reaped.load(std::sync::atomic::Ordering::SeqCst)
+        self.reaped_at().is_some()
+    }
+
+    /// When the hub's own child was waited for, if it was.
+    pub fn reaped_at(&self) -> Option<std::time::Instant> {
+        *self.screen.reaped.lock()
     }
 
     /// The screen as plain text: the history and screen, or the alternate
@@ -617,9 +623,7 @@ impl Local {
                     .wait()
                     .ok()
                     .map(|s: portable_pty::ExitStatus| s.exit_code());
-                ended
-                    .reaped
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                *ended.reaped.lock() = Some(std::time::Instant::now());
                 // The child can be reaped before the reader has taken its
                 // last output; announcing the end first would cut that
                 // output off for anyone who stops listening at the end. A
@@ -979,6 +983,9 @@ pub(crate) mod tests {
         assert!(!screen.text().contains("secret"), "{}", screen.text());
         assert_eq!(screen.push(b"secret-456"), None);
         assert!(screen.text().trim().is_empty());
+        // A viewer never sees blind output, so the hub answers even then.
+        screen.core.lock().active = Some(1);
+        assert_eq!(screen.push(b"\x1b[6n").as_deref(), Some(&b"\x1b[1;1R"[..]));
     }
 
     #[test]
