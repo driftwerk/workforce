@@ -600,6 +600,91 @@ pub fn devin_sign_in(env: &BTreeMap<String, String>, exists: impl Fn(&Path) -> b
     }
 }
 
+/// `devin auth status`, on stdout or stderr. Signed out it says
+/// `Not logged in.` (and where its credentials would be); signed in, a
+/// line saying it is logged in, which may name the account's email. Only
+/// that email is kept: never the credentials path, the servers or the
+/// organization it prints beside it. Anything else is [`SignIn::Unknown`],
+/// for the caller to read the credentials file instead ([`devin_sign_in`]).
+pub fn devin_status_sign_in(status: &str) -> SignIn {
+    let lines: Vec<String> = status.lines().map(plain_line).collect();
+    if lines
+        .iter()
+        .any(|l| l.starts_with("not logged in") || l.starts_with("not signed in"))
+    {
+        return SignIn::Out;
+    }
+    let Some(said) = lines.iter().find(|l| {
+        (l.starts_with("logged in") || l.starts_with("signed in"))
+            || ((l.contains(" logged in") || l.contains(" signed in"))
+                && !l.contains("not logged in")
+                && !l.contains("not signed in"))
+    }) else {
+        return SignIn::Unknown;
+    };
+    SignIn::In {
+        via: Via::Vendor,
+        who: said
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\'' | '`')
+            })
+            .map(|w| w.trim_end_matches(['.', ':', ';']))
+            .find(|w| email_like(w))
+            .map(str::to_string),
+        plan: None,
+        ids: Vec::new(),
+    }
+}
+
+/// A status line lowercased, without colour codes or a leading mark
+/// (`✓ Logged in`).
+fn plain_line(line: &str) -> String {
+    let plain = crate::pty::plain_text(line.as_bytes());
+    plain
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_lowercase()
+}
+
+/// Whether `word` reads as an email address and nothing else.
+fn email_like(word: &str) -> bool {
+    let Some((local, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let fine = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    word.len() <= 254
+        && !local.is_empty()
+        && local.chars().all(fine)
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+/// The person's environment as a Devin of theirs runs in it, without the
+/// keys that would sign Devin in ahead of its own login: Desk never signs
+/// Devin in by a key in its environment.
+pub fn without_devin_keys(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| !devin_key_name(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// `WINDSURF_API_KEY`, and any `DEVIN_…` variable that names a key, token
+/// or secret.
+fn devin_key_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "WINDSURF_API_KEY"
+        || (upper.starts_with("DEVIN_")
+            && ["KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD"]
+                .iter()
+                .any(|w| upper.contains(w)))
+}
+
 /// Copilot CLI signs in with a GitHub token from its environment; with
 /// none set, only it can say.
 pub fn copilot_sign_in(env: &BTreeMap<String, String>) -> SignIn {
@@ -804,6 +889,82 @@ mod tests {
             SignIn::In { .. }
         ));
         assert_eq!(copilot_sign_in(&env(&[("GH_TOKEN", "")])), SignIn::Unknown);
+    }
+
+    /// `devin auth status` signed out, as CLI 3000.12.57 printed it.
+    const DEVIN_OUT: &str = "Not logged in. Run `devin auth login` to authenticate.\n  Credentials path: /home/kim/.local/share/devin/credentials.toml\n";
+    /// Signed in. TO SWAP for the real capture (design §9 Q1): this is
+    /// pieced together from the lines the 3000.12.57 binary holds
+    /// (`Logged in (via `, `File:`, `API server:`, `Devin webapp:`,
+    /// `Devin API:`, `Organization:`), and names no account.
+    const DEVIN_IN: &str = "\x1b[32m✓\x1b[0m Logged in (via browser)\n  File:              /home/kim/.local/share/devin/credentials.toml\n  API server:        https://server.codeium.com\n  Devin webapp:      https://app.devin.ai\n  Devin API:         https://api.devin.ai\n  Organization:      ops@acme.example\n  Credentials path:  /home/kim+x@host.example/credentials.toml\n";
+    /// Signed in, naming the account on its logged-in line (`Logged in as `
+    /// is in the binary too). TO SWAP for the real capture as well.
+    const DEVIN_IN_AS: &str = "Logged in as kim@example.com (via browser)\n  Organization:      Acme\n  Credentials path:  /home/kim/.local/share/devin/credentials.toml\n";
+
+    #[test]
+    fn devins_status_says_out_in_and_only_ever_the_email_it_is_signed_in_as() {
+        assert_eq!(devin_status_sign_in(DEVIN_OUT), SignIn::Out);
+        let SignIn::In {
+            via,
+            who,
+            plan,
+            ids,
+        } = devin_status_sign_in(DEVIN_IN)
+        else {
+            panic!("signed in");
+        };
+        assert_eq!(via, Via::Vendor);
+        assert_eq!(
+            who, None,
+            "an organization or a path is never taken for who"
+        );
+        assert_eq!((plan, ids), (None, Vec::<String>::new()));
+        assert!(matches!(
+            devin_status_sign_in(DEVIN_IN_AS),
+            SignIn::In { via: Via::Vendor, who: Some(w), .. } if w == "kim@example.com"
+        ));
+        for garbage in [
+            "",
+            "error: unrecognized subcommand 'status'\n",
+            "Failed to load credentials: invalid TOML\n",
+            "  Credentials path: /home/kim/.local/share/devin/credentials.toml\n",
+        ] {
+            assert_eq!(devin_status_sign_in(garbage), SignIn::Unknown, "{garbage}");
+        }
+        // Whatever it said is printed nowhere: the view has no path in it.
+        let view = serde_json::to_string(&devin_status_sign_in(DEVIN_IN_AS)).unwrap();
+        assert!(
+            !view.contains("credentials") && !view.contains("Acme"),
+            "{view}"
+        );
+        assert!(email_like("kim.o+desk@mail.example.co"));
+        for not in [
+            "kim@",
+            "@example.com",
+            "kim@localhost",
+            "/a/b@c.d/e",
+            "a@b..",
+            "kim@ex ample.com",
+        ] {
+            assert!(!email_like(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn devin_runs_without_the_keys_that_would_sign_it_in_ahead_of_its_login() {
+        let env: BTreeMap<String, String> = [
+            "HOME",
+            "WINDSURF_API_KEY",
+            "DEVIN_API_KEY",
+            "DEVIN_SESSION_TOKEN",
+            "DEVIN_THEME",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "x".to_string()))
+        .collect();
+        let kept: Vec<String> = without_devin_keys(&env).into_keys().collect();
+        assert_eq!(kept, ["DEVIN_THEME", "HOME"]);
     }
 
     #[test]

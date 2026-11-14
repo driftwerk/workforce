@@ -2429,7 +2429,24 @@ impl Desk {
                     known => known,
                 },
             ),
-            (Engine::Devin, Some(_)) => engine::devin_sign_in(&self.0.env, Path::is_file),
+            // Asked as a session of it runs, without a key ahead of its
+            // login; what it says nothing readable of, its file says.
+            (Engine::Devin, Some(_)) => {
+                let env = engine::without_devin_keys(&self.0.env);
+                let said =
+                    self.cli_says_in(program, &["auth", "status"], &env)
+                        .await
+                        .map_or(engine::SignIn::Unknown, |(out, err)| {
+                            match engine::devin_status_sign_in(&out) {
+                                engine::SignIn::Unknown => engine::devin_status_sign_in(&err),
+                                known => known,
+                            }
+                        });
+                match said {
+                    engine::SignIn::Unknown => engine::devin_sign_in(&env, Path::is_file),
+                    known => known,
+                }
+            }
             (Engine::Copilot, Some(_)) => engine::copilot_sign_in(&self.0.env),
             (Engine::Gemini | Engine::OpenCode | Engine::Cursor | Engine::Custom, Some(_)) => {
                 engine::SignIn::Unknown
@@ -2442,10 +2459,20 @@ impl Desk {
     /// person's sessions are; `None` when it can't be run or doesn't answer
     /// in time.
     async fn cli_says(&self, program: &Path, args: &[&str]) -> Option<(String, String)> {
+        self.cli_says_in(program, args, &self.0.env).await
+    }
+
+    /// [`Self::cli_says`], run in `env`.
+    async fn cli_says_in(
+        &self,
+        program: &Path,
+        args: &[&str],
+        env: &BTreeMap<String, String>,
+    ) -> Option<(String, String)> {
         let run = tokio::process::Command::new(program)
             .args(args)
             .env_clear()
-            .envs(&self.0.env)
+            .envs(env)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();

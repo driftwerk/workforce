@@ -55,5 +55,6 @@ workforce-build-support = { path = "../build-support" }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 workforce-postgres = { path = "../postgres", features = ["test-support"] }
