@@ -32,6 +32,8 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.get_attachment",
     "jira.attachment_read",
     "jira.list_fields",
+    "jira.dev_status",
+    "jira.list_remote_links",
     "jira.list_comments",
     "jira.list_transitions",
     "jira.list_projects",
@@ -142,6 +144,8 @@ impl JiraSkill {
             Arc::new(tools::JiraSearchUsersTool::new(c(), w(), p())),
             Arc::new(tools::JiraMyselfTool::new(c(), w(), p())),
             Arc::new(tools::JiraListFieldsTool::new(c(), w(), p())),
+            Arc::new(tools::JiraDevStatusTool::new(c(), w(), p())),
+            Arc::new(tools::JiraListRemoteLinksTool::new(c(), w(), p())),
             Arc::new(tools::JiraListBoardsTool::new(c(), w(), p())),
             Arc::new(tools::JiraListSprintsTool::new(c(), w(), p())),
             Arc::new(tools::JiraAddWorklogTool::new(c(), w(), p())),
@@ -170,6 +174,8 @@ impl JiraSkill {
             "jira.search_users",
             "jira.myself",
             "jira.list_fields",
+            "jira.dev_status",
+            "jira.list_remote_links",
             "jira.list_boards",
             "jira.list_sprints",
             "jira.add_worklog",
@@ -435,6 +441,31 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.dev_status",
+                    "A Jira issue's development: its pull requests, branches, commit count and builds. Read-only",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" },
+                            "issue_key": { "type": "string" },
+                            "issue_id": { "type": "string" }
+                        },
+                        "required": ["issue_key"]
+                    }),
+                ),
+                mk_tool(
+                    "jira.list_remote_links",
+                    "The web links on a Jira issue (Confluence pages, designs, other trackers). Read-only",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" },
+                            "issue_key": { "type": "string" }
+                        },
+                        "required": ["issue_key"]
+                    }),
+                ),
+                mk_tool(
                     "jira.list_boards",
                     "List Jira Software (Agile) boards",
                     serde_json::json!({
@@ -513,6 +544,8 @@ impl JiraSkill {
                 allow("jira.search_users"),
                 allow("jira.myself"),
                 allow("jira.list_fields"),
+                allow("jira.dev_status"),
+                allow("jira.list_remote_links"),
                 allow("jira.list_boards"),
                 allow("jira.list_sprints"),
                 allow("jira.add_worklog"),
@@ -561,7 +594,7 @@ mod tests {
         };
         let skill = JiraSkill::new(cfg).unwrap();
         let tools = skill.tools();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 24);
         // Sanity check: all tool names start with "jira."
         for t in &tools {
             assert!(t.name().starts_with("jira."));
@@ -631,10 +664,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_lists_all_22_tools() {
+    fn definition_lists_all_24_tools() {
         let def = JiraSkill::definition();
-        assert_eq!(def.tools.len(), 22);
-        assert_eq!(def.default_policies.len(), 22);
+        assert_eq!(def.tools.len(), 24);
+        assert_eq!(def.default_policies.len(), 24);
         assert_eq!(def.requirements.credentials.len(), 3);
         assert!(def.validate().is_ok());
     }
