@@ -431,6 +431,11 @@ impl Desk {
         self.change(id, |_, _| {});
     }
 
+    /// When the person last gave session `id` input ([`Self::last_input`]).
+    pub fn last_input_of(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        Self::last_input(&self.0.state.lock(), id)
+    }
+
     /// When the person last gave `id` input: typed in its terminal,
     /// prompted it, or wrote to it.
     pub(super) fn last_input(st: &super::State, id: Uuid) -> Option<DateTime<Utc>> {
@@ -922,6 +927,17 @@ impl Desk {
     /// boss allows nothing, as what a request reaches can't be told.
     pub fn boss_home_known(&self) -> bool {
         self.0.boss_bounds.lock().is_some()
+    }
+
+    /// The bosses unbound now.
+    pub fn unbound_bosses(&self) -> Vec<String> {
+        let st = self.0.state.lock();
+        st.charges
+            .full
+            .iter()
+            .filter(|(_, g)| g.unbound)
+            .map(|(b, _)| b.clone())
+            .collect()
     }
 
     /// Whether any boss is unbound now: else no request is Desk's to allow

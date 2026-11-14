@@ -1823,6 +1823,8 @@ mod decides_at_once;
 
 mod answers_questions;
 
+mod idle;
+
 mod decisions;
 mod items;
 mod learning;

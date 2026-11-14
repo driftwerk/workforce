@@ -749,6 +749,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         );
     }
     let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut rework = crew.rework.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
@@ -801,6 +802,17 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return,
             },
+            // A turn's end the boss's fast call handed to its full turn.
+            Ok(event) = rework.recv() => {
+                if let Some((session, line)) = crew.work_line(&event) {
+                    let line = crew.with_doing(session, line).await;
+                    gathering
+                        .entry(session)
+                        .or_insert_with(Gathered::new)
+                        .ended
+                        .push(line);
+                }
+            }
             _ = tick.tick() => {}
         }
         // What the sessions a boss runs ask Desk to allow, at most twice a

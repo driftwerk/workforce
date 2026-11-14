@@ -87,6 +87,15 @@ impl CrewHub {
         }
         match event.kind {
             Kind::Finished if event.actor.kind == PartyKind::Session => {
+                // A plain turn's end its Act fully boss judges at once
+                // (`idle`) wakes no work turn.
+                if self
+                    .desk
+                    .view(session)
+                    .is_ok_and(|v| self.moves_on_itself(&v))
+                {
+                    return None;
+                }
                 // The person drives it: its turns are theirs.
                 (self.desk.wheel_of(session) == Some(Wheel::Boss))
                     .then(|| (session, format!("{} {}", subject.name, event.text)))
