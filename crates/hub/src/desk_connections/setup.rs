@@ -1,45 +1,50 @@
 //! An agent sets a connection up itself, on this computer: `connections.*`.
 //!
-//! Desk runs locally, so an agent can make a service's key the way the
-//! person would, in the person's Chrome (through Desk's extension), and
-//! keep it where Connections keeps one. The person signs in to the service;
-//! the agent does the rest:
+//! Desk runs locally, so an agent can connect a service the way the person
+//! would, and keep it where Connections keeps one. The person sees one card
+//! for it in the conversation, which changes in place and says the one
+//! thing to do now ([`Now`]); the agent and the hub do the rest:
 //!
-//! 1. `connections.setup {service, name?, for?}` starts a setup. The hub
-//!    makes it, and from it alone come the vault tier, the agent the
-//!    connection is for, and its instance: no later call names any of them.
-//! 2. `connections.keep {setup, field, value}` keeps a field that isn't a
-//!    secret: a site (`https://<name>.atlassian.net` for Jira, a public
-//!    `https` origin for Metabase, a region for Datadog), an email. Once a
-//!    key is held, nothing more is kept: the key goes nowhere else.
-//! 3. The key itself is read by the browser's `browser.capture_key`, in
-//!    the extension, off the setup's key page ([`Setups::key_page`]), and
-//!    handed straight to [`Setups::keep_key`]: it never passes through the
-//!    model. It is held in memory for the setup, and taken into the
-//!    session's secret cache, so should it show up again it reaches the
-//!    model as a marker. Once every key is held the connection is tested
-//!    with the service, at the address kept for it (Metabase's only at the
-//!    origin the key was read on), and kept only on a pass.
-//! 4. `connections.test {setup}` tests again, and finishes GitHub's device
-//!    sign-in.
-//! 5. `connections.use {setup | service + connection, agent?, write?,
-//!    default?}` turns a connection on for an agent, through the hub's one
-//!    write of its `config.toml`.
+//! 1. `connections.setup {service, name?, for?, write?}` starts a setup, the
+//!    person's one word for it below an unbound overseer: its key is kept,
+//!    and it is turned on for whom it is for, once it works. The hub makes
+//!    it, and from it alone come the vault tier, the agent, and its
+//!    instance. Asked again in the conversation for the same connection, it
+//!    is the same setup; another of the service there replaces it.
+//! 2. How it gets its key ([`Way`]). GitHub: the GitHub CLI's sign-in on
+//!    this computer, at the person's word on the card; else GitHub's device
+//!    sign-in, a code the card shows, where Desk's GitHub app is set up;
+//!    else, like every other service, a key the agent makes in the person's
+//!    Chrome (through Desk's extension).
+//! 3. In the browser: `connections.keep {setup, field, value}` keeps a field
+//!    that isn't a secret (a site, an email). The key itself is read by
+//!    `browser.capture_key` off the setup's key page ([`Setups::key_page`])
+//!    and handed straight to [`Setups::keep_key`]: it never passes through
+//!    the model. Signing in is the person's: the card asks them, and
+//!    [`Setups::wait`] sees from the agent's tab when they have.
+//! 4. Once every key is held, or GitHub's sign-in is approved, the hub
+//!    tests it with the service (at the address kept for it; Metabase's
+//!    only at the origin the key was read on), keeps it only on a pass, and
+//!    turns it on ([`Setups::finish`]).
+//! 5. `connections.wait {setup}` keeps the agent in its turn while the
+//!    person does their part, and says what comes next. `connections.test`
+//!    and `connections.use` test again and turn connections on by hand.
 //!
-//! `connections.list` and `connections.step` (which marks a step of the
-//! card: current, waiting on the person, done) touch nothing.
+//! `connections.list`, `connections.wait` and `connections.step` change
+//! nothing.
 //!
 //! **Who may do what.** A setup is the person's (the one whose Desk this
 //! is), the agent's that made it and the conversation's: no other agent,
 //! person or session can use it, and a call without a conversation is
 //! refused. An agent sets up a connection just for itself; one for all the
 //! person's agents, or for another agent, and turning one on for another
-//! agent, are the person's overseer's alone. Keeping a field, starting
-//! GitHub's sign-in, testing and turning on are connection writes to Desk's
-//! gate: freely for an unbound overseer, asking first below, Allow once or
-//! Deny, its question naming where the key goes and for whom. The person's
-//! password is never read or typed: signing in is a step that waits on
-//! them.
+//! agent, are the person's overseer's alone. Starting a setup, keeping a
+//! field, testing and turning on are connection writes to Desk's gate:
+//! freely for an unbound overseer, asking first below. What the person
+//! chooses on the card (`POST /api/desk/connection-setups/{id}/{choice}`)
+//! is theirs alone: no tool reaches it. The person's password is never read
+//! or typed, and a token is only ever held as a [`Secret`], kept in the
+//! vault, never logged or shown.
 //!
 //! The card the chat shows (`GET /api/desk/connection-setups?agent=`) is
 //! the hub's record of the setup, never what the model wrote.
@@ -67,14 +72,17 @@ use super::catalog::{self, Connector};
 use super::check::Found;
 use super::{Conn, Connections, Refusal};
 
+/// The longest one `connections.wait` waits: under an engine's tool limit.
+const WAIT_MOST: Duration = Duration::from_secs(120);
 /// How long a setup is kept.
 const SETUP_TTL: Duration = Duration::from_secs(60 * 60);
 /// The most setups one person keeps at once.
 const MAX_SETUPS: usize = 16;
 /// The tools, the ones that change nothing first.
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 7] = [
     "connections.list",
     "connections.step",
+    "connections.wait",
     "connections.setup",
     "connections.keep",
     "connections.test",
@@ -104,6 +112,100 @@ pub struct Step {
     pub label: String,
     pub state: StepState,
     pub note: Option<String>,
+}
+
+/// How a setup gets its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Way {
+    /// The GitHub CLI's sign-in on this computer, once the person says so.
+    Cli,
+    /// GitHub's device sign-in: the person approves a code.
+    Device,
+    /// A key the agent makes on the service's page in the browser.
+    Browser,
+    /// A token the person pasted on the card themselves.
+    Token,
+}
+
+/// What a setup's card asks of the person, or tells them, now: the one
+/// thing on it. The hub's words, never the agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NowKind {
+    /// The agent is on it; nothing for the person to do.
+    Working,
+    /// A sign-in on this computer to use, at the person's word.
+    Offer,
+    /// A code to approve at the service.
+    Code,
+    /// The person signs in, in Desk's window.
+    SignIn,
+    Connected,
+    Failed,
+    /// Replaced by a newer setup of the same service, or cancelled.
+    Ended,
+}
+
+/// The one thing a setup's card shows now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Now {
+    pub kind: NowKind,
+    pub title: String,
+    pub detail: Option<String>,
+    /// GitHub's code to approve, on the person's card alone.
+    pub code: Option<String>,
+    /// Where the code is approved.
+    pub url: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The card's one button: `use_cli`, `open_code`, `show_page`,
+    /// `new_code`, `other_way` or `retry`.
+    pub action: Option<&'static str>,
+    /// A quiet second choice beside it: `other_way`.
+    pub other: Option<&'static str>,
+    /// GitHub: the person may paste a token they make themselves, on this
+    /// page (GitHub's new fine-grained token, filled in with the least it
+    /// needs). The token goes from the card straight to the hub.
+    pub paste: Option<String>,
+}
+
+/// GitHub's device sign-in, as the card shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Device {
+    user_code: String,
+    verification_uri: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// How a setup ended without connecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ended {
+    /// A newer setup of the same service in the conversation took over.
+    Replaced,
+}
+
+/// Where the agent's tab is, for a setup waiting on the person to sign in.
+#[async_trait]
+pub trait Tabs: Send + Sync {
+    /// The address `agent`'s tab for `person` is on now, if it has one.
+    async fn location(&self, agent: &str, person: &str) -> Option<String>;
+    /// Brings `agent`'s tab to the front of the person's Chrome.
+    async fn show(&self, agent: &str) -> bool;
+}
+
+/// Desk's browser.
+struct LiveTabs;
+
+#[async_trait]
+impl Tabs for LiveTabs {
+    async fn location(&self, agent: &str, person: &str) -> Option<String> {
+        workforce_skills::adapters::browser::location(agent, person).await
+    }
+    async fn show(&self, agent: &str) -> bool {
+        workforce_skills::adapters::browser::show(agent).await
+    }
 }
 
 /// How a service is set up in the browser.
@@ -343,8 +445,29 @@ struct Setup {
     steps: Vec<Step>,
     fields: BTreeMap<String, String>,
     secrets: BTreeMap<String, Secret<String>>,
+    /// How it gets its key.
+    way: Way,
     /// GitHub's device sign-in, where it signs in that way.
     flow: Option<String>,
+    /// Where that sign-in is, as last seen.
+    flow_state: Option<super::FlowState>,
+    device: Option<Device>,
+    /// The GitHub CLI's sign-in it offers: whose, and its scopes.
+    offer: Option<super::gh::Login>,
+    /// Whether the agent it is for takes writes with it.
+    write: bool,
+    /// Whether the agent running it is the person's overseer.
+    overseer: bool,
+    /// Whom it is for, in the person's words.
+    whose: String,
+    /// Its check and turning on are under way, or done.
+    finishing: bool,
+    /// The person said on its card they're signed in, where Desk didn't
+    /// see it.
+    said_signed_in: bool,
+    ended: Option<Ended>,
+    /// When the agent last asked for it: its start, or its asking again.
+    asked_at: DateTime<Utc>,
     /// The origin its key was read on: the only one it is tested at.
     read_at: Option<String>,
     started_at: DateTime<Utc>,
@@ -377,10 +500,152 @@ pub struct SetupView {
     pub site: Option<String>,
     pub steps: Vec<Step>,
     pub started_at: DateTime<Utc>,
+    /// When the agent last asked for it: the message that did shows its
+    /// card.
+    pub asked_at: DateTime<Utc>,
     pub connected: Option<Connected>,
+    pub way: Way,
+    /// The one thing its card shows now.
+    pub now: Now,
+    pub ended: Option<Ended>,
+    pub write: bool,
+    /// Whom it is for, in the person's words.
+    pub for_whom: String,
 }
 
 impl Setup {
+    /// The one thing its card shows now, from its own record.
+    fn now(&self, service: &str) -> Now {
+        let mut now = self.now_of(service);
+        // GitHub: a token of the person's own, beside whatever else the
+        // card asks, until it is connected.
+        if self.service == "github"
+            && self.connected.is_none()
+            && !self.finishing
+            && !matches!(now.kind, NowKind::Ended | NowKind::Connected)
+        {
+            now.paste = Some(github_token_page(&self.name, self.write));
+        }
+        now
+    }
+
+    fn now_of(&self, service: &str) -> Now {
+        let now = |kind, title: String| Now {
+            kind,
+            title,
+            detail: None,
+            code: None,
+            url: None,
+            expires_at: None,
+            action: None,
+            other: None,
+            paste: None,
+        };
+        let access = match self.write {
+            true => "read and write",
+            false => "read only",
+        };
+        if self.ended.is_some() {
+            return now(NowKind::Ended, format!("This {service} setup was replaced"));
+        }
+        if let Some(c) = &self.connected {
+            return match &c.on_for {
+                Some(on_for) => Now {
+                    detail: Some(format!(
+                        "{on_for} uses it · {} · kept in the vault on this computer",
+                        match c.write {
+                            Some(true) => "read and write",
+                            _ => "read only",
+                        }
+                    )),
+                    ..now(
+                        NowKind::Connected,
+                        format!("{service} connected as {}", c.account),
+                    )
+                },
+                None => now(
+                    NowKind::Working,
+                    format!("Turning {service} on for {}", self.whose),
+                ),
+            };
+        }
+        if let Some(failed) = self.steps.iter().find(|s| s.state == StepState::Failed) {
+            let said = failed
+                .note
+                .clone()
+                .unwrap_or_else(|| "It didn't work.".into());
+            let action = match self.way {
+                Way::Device => "new_code",
+                Way::Cli => "other_way",
+                Way::Browser => "retry",
+                Way::Token => "paste_token",
+            };
+            return Now {
+                detail: Some(format!("{said} Nothing was kept.")),
+                action: Some(action),
+                ..now(NowKind::Failed, format!("{service} didn't connect"))
+            };
+        }
+        match self.way {
+            Way::Cli if !self.finishing => {
+                let offer = self.offer.as_ref();
+                let scopes = offer
+                    .map(|o| o.scopes.join(", "))
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| "the same access".to_string(), |s| format!("the same access ({s})"));
+                Now {
+                    detail: Some(format!(
+                        "Through GitHub CLI. {} gets {scopes}, {access}. Desk keeps a copy in the vault on this computer.",
+                        self.whose
+                    )),
+                    action: Some("use_cli"),
+                    other: Some("other_way"),
+                    ..now(
+                        NowKind::Offer,
+                        format!(
+                            "{service} is signed in on this Mac as {}",
+                            offer.map_or("you", |o| o.account.as_str())
+                        ),
+                    )
+                }
+            }
+            Way::Device => match (&self.device, &self.flow_state) {
+                (Some(d), None | Some(super::FlowState::Waiting)) => Now {
+                    detail: Some(
+                        "Desk carries on as soon as you approve it on GitHub.".into(),
+                    ),
+                    code: Some(d.user_code.clone()),
+                    url: Some(d.verification_uri.clone()),
+                    expires_at: Some(d.expires_at),
+                    action: Some("open_code"),
+                    ..now(NowKind::Code, format!("Enter this code on {service}"))
+                },
+                _ => now(
+                    NowKind::Working,
+                    format!("Checking {service} and turning it on for {}", self.whose),
+                ),
+            },
+            _ => match self.steps.iter().find(|s| s.state == StepState::Waiting) {
+                Some(_) => Now {
+                    detail: Some("Your password stays with you: Desk never reads or types it. It carries on by itself once you're in.".into()),
+                    action: Some("show_page"),
+                    ..now(NowKind::SignIn, format!("Sign in to {service} in Desk's window"))
+                },
+                None => Now {
+                    detail: self
+                        .steps
+                        .iter()
+                        .find(|s| s.state != StepState::Done)
+                        .map(|s| s.label.clone()),
+                    ..now(
+                        NowKind::Working,
+                        format!("Setting up {service} for {}", self.whose),
+                    )
+                },
+            },
+        }
+    }
+
     fn view(&self) -> SetupView {
         let c = catalog::find(self.service).expect("a setup's service is in the catalog");
         SetupView {
@@ -393,8 +658,40 @@ impl Setup {
             site: c.site.and_then(|s| self.fields.get(s).cloned()),
             steps: self.steps.clone(),
             started_at: self.started_at,
+            asked_at: self.asked_at,
             connected: self.connected.clone(),
+            way: self.way,
+            now: self.now(c.name),
+            ended: self.ended,
+            write: self.write,
+            for_whom: self.whose.clone(),
         }
+    }
+
+    /// Takes in where its device sign-in is: a code turned down, expired or
+    /// failed is its check failed, in plain words.
+    fn sync(&mut self, connections: &Connections) {
+        let Some(flow) = &self.flow else { return };
+        let state = connections.flow(&self.person, flow);
+        if self.connected.is_none() {
+            let said = match &state {
+                Some(super::FlowState::Expired) => {
+                    Some("The code expired before it was approved.".to_string())
+                }
+                Some(super::FlowState::Cancelled) => {
+                    Some("The sign-in was turned down on GitHub.".to_string())
+                }
+                Some(super::FlowState::Failed { error }) => Some(format!("{error}.")),
+                None => Some("The sign-in ended.".to_string()),
+                _ => None,
+            };
+            if let Some(said) = said {
+                if !self.steps.iter().any(|s| s.state == StepState::Failed) {
+                    self.mark("check", StepState::Failed, Some(said));
+                }
+            }
+        }
+        self.flow_state = state;
     }
 
     fn mark(&mut self, id: &str, state: StepState, note: Option<String>) {
@@ -484,9 +781,15 @@ pub struct KeptKey {
     pub connector: &'static str,
     pub field: &'static str,
     pub length: usize,
-    /// `ready`: every key is held, for the agent to check with
-    /// `connections.test`; or `still needs <field>`.
+    /// `kept`: every key is held, and Desk checks it and turns it on
+    /// itself; or `still needs <field>`.
     pub test: String,
+    /// Every key is held: [`Setups::finish`] is next.
+    #[serde(skip)]
+    pub ready: bool,
+    /// The setup it was kept for.
+    #[serde(skip)]
+    pub setup: String,
 }
 
 /// What the gate's question says of what the hub couldn't resolve.
@@ -506,6 +809,7 @@ pub trait Callers: Send + Sync {
 pub struct Setups {
     pub connections: Arc<Connections>,
     pub callers: Arc<dyn Callers>,
+    tabs: Arc<dyn Tabs>,
     setups: Mutex<HashMap<String, Setup>>,
 }
 
@@ -517,8 +821,15 @@ impl Setups {
         Self {
             connections,
             callers,
+            tabs: Arc::new(LiveTabs),
             setups: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// These setups, over `tabs` instead of Desk's browser: a test's.
+    pub fn with_tabs(mut self, tabs: Arc<dyn Tabs>) -> Self {
+        self.tabs = tabs;
+        self
     }
 
     fn with<T>(
@@ -540,6 +851,7 @@ impl Setups {
         {
             return Err(gone());
         }
+        setup.sync(&self.connections);
         f(setup)
     }
 
@@ -556,13 +868,16 @@ impl Setups {
     }
 
     /// Starts a setup of `service`, named `name`, for `whom` (`me`, `all`,
-    /// or an agent).
+    /// or an agent), that turns it on for them with writes or not. The
+    /// same setup again, while it runs in this conversation, is the one
+    /// already under way: its card stays the one card.
     pub async fn start(
-        &self,
+        self: &Arc<Self>,
         caller: &Caller,
         service: &str,
         name: Option<&str>,
         whom: Option<&str>,
+        write: bool,
     ) -> Result<SetupView, String> {
         self.check_caller(caller)?;
         let c = catalog::find(service)
@@ -605,6 +920,11 @@ impl Setups {
         let name = Connections::name(c, name.as_deref())
             .map_err(refused)?
             .unwrap_or_else(|| c.name.to_string());
+        // The one under way here already, for the same connection: the
+        // same card. Another of the service here is replaced by this one.
+        if let Some(view) = self.again(caller, c.id, &name, &for_agent, write) {
+            return Ok(view);
+        }
         // Room for it, before anything starts (GitHub's sign-in).
         let full = || {
             let mut setups = self.setups.lock().expect("setups poisoned");
@@ -612,7 +932,7 @@ impl Setups {
             setups.retain(|_, s| s.until > now);
             setups
                 .values()
-                .filter(|s| s.person == caller.person)
+                .filter(|s| s.person == caller.person && s.ended.is_none())
                 .count()
                 >= MAX_SETUPS
         };
@@ -635,53 +955,21 @@ impl Setups {
                 .map_or_else(|| a.clone(), |a| a.name),
             None => "all your agents".into(),
         };
-        let mut steps = Vec::new();
-        if let Some(label) = recipe.where_label {
-            steps.push(step("where", label));
-        }
-        // GitHub's own sign-in, where Desk's GitHub app is set up: the
-        // person approves a code, and nothing is captured.
-        let device = c.id == "github" && self.connections.github_client_id.is_some();
-        let mut flow = None;
-        if device {
-            let started = self
-                .connections
-                .begin_github(
-                    &caller.person,
-                    c,
-                    level.clone(),
-                    Some(key.clone()),
-                    Some(name.clone()),
-                )
-                .await
-                .map_err(refused)?;
-            steps.push(step(
-                "page",
-                &format!(
-                    "Open GitHub's device sign-in: {}",
-                    started.verification_uri.clone().unwrap_or_default()
-                ),
-            ));
-            steps.push(step(
-                "sign_in",
-                &format!(
-                    "Sign in to GitHub and enter the code {}",
-                    started.user_code.clone().unwrap_or_default()
-                ),
-            ));
-            flow = Some(started.flow);
-        } else {
-            steps.push(step("page", recipe.page_label));
-            steps.push(step("sign_in", recipe.sign_in_label));
-            steps.push(step("key", recipe.key_label));
-        }
-        steps.push(step(
-            "check",
-            &format!("Check it works, then turn it on for {whose}"),
-        ));
-        steps[0].state = StepState::Current;
+        // GitHub: the CLI's sign-in on this computer where there is one,
+        // else GitHub's own sign-in where Desk's GitHub app is set up, else
+        // a token made in the browser.
+        let offer = match c.id {
+            "github" => self.connections.services.gh.login().await,
+            _ => None,
+        };
+        let way = match (c.id, &offer) {
+            ("github", Some(_)) => Way::Cli,
+            ("github", None) if self.connections.github_client_id.is_some() => Way::Device,
+            _ => Way::Browser,
+        };
+        let id = uuid::Uuid::new_v4().simple().to_string();
         let setup = Setup {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: id.clone(),
             person: caller.person.clone(),
             by: caller.agent.clone(),
             session: caller.session.clone(),
@@ -690,35 +978,494 @@ impl Setups {
             key,
             level,
             for_agent,
-            steps,
+            steps: steps_for(way, &recipe, &whose, offer.as_ref()),
             fields: BTreeMap::new(),
             secrets: BTreeMap::new(),
-            flow,
+            way,
+            flow: None,
+            flow_state: None,
+            device: None,
+            offer,
+            write,
+            overseer: caller.overseer,
+            whose,
+            finishing: false,
+            said_signed_in: false,
+            ended: None,
+            asked_at: Utc::now(),
             read_at: None,
             started_at: Utc::now(),
             until: Instant::now() + SETUP_TTL,
             connected: None,
         };
-        let view = setup.view();
+        {
+            let mut setups = self.setups.lock().expect("setups poisoned");
+            let now = Instant::now();
+            setups.retain(|_, s| s.until > now);
+            if setups
+                .values()
+                .filter(|s| s.person == caller.person && s.ended.is_none())
+                .count()
+                >= MAX_SETUPS
+            {
+                return Err("Too many setups are under way. Finish one first.".into());
+            }
+            setups.insert(id.clone(), setup);
+        }
+        if way == Way::Device {
+            if let Err(e) = self.begin_device(caller, &id).await {
+                self.setups.lock().expect("setups poisoned").remove(&id);
+                return Err(e);
+            }
+        }
+        self.with(caller, &id, |s| Ok(s.view()))
+    }
+
+    /// The setup of `service` under way in `caller`'s conversation, when
+    /// it is for the same connection; any other of it there is replaced.
+    fn again(
+        &self,
+        caller: &Caller,
+        service: &str,
+        name: &str,
+        for_agent: &Option<String>,
+        write: bool,
+    ) -> Option<SetupView> {
         let mut setups = self.setups.lock().expect("setups poisoned");
         let now = Instant::now();
         setups.retain(|_, s| s.until > now);
-        if setups
-            .values()
-            .filter(|s| s.person == caller.person)
-            .count()
-            >= MAX_SETUPS
-        {
-            return Err("Too many setups are under way. Finish one first.".into());
+        let mut same = None;
+        for s in setups.values_mut().filter(|s| {
+            s.person == caller.person
+                && s.by == caller.agent
+                && s.session == caller.session
+                && s.service == service
+                && s.ended.is_none()
+        }) {
+            s.sync(&self.connections);
+            let settled = s.connected.as_ref().is_some_and(|c| c.on_for.is_some())
+                || s.steps.iter().any(|x| x.state == StepState::Failed);
+            if settled {
+                continue;
+            }
+            if same.is_none() && s.name == name && &s.for_agent == for_agent && s.write == write {
+                s.asked_at = Utc::now();
+                same = Some(s.view());
+                continue;
+            }
+            s.ended = Some(Ended::Replaced);
+            s.secrets.clear();
+            if let Some(flow) = &s.flow {
+                self.connections.cancel(&s.person, flow);
+            }
         }
-        setups.insert(setup.id.clone(), setup);
-        Ok(view)
+        same
+    }
+
+    /// Starts GitHub's device sign-in for setup `id`, a new code each
+    /// time, and watches it: once the person approves it, the hub checks
+    /// the connection and turns it on itself.
+    async fn begin_device(self: &Arc<Self>, caller: &Caller, id: &str) -> Result<(), String> {
+        let (level, key, name, old) = self.with(caller, id, |s| {
+            Ok((
+                s.level.clone(),
+                s.key.clone(),
+                s.name.clone(),
+                s.flow.clone(),
+            ))
+        })?;
+        if let Some(old) = old {
+            self.connections.cancel(&caller.person, &old);
+        }
+        let c = catalog::find("github").expect("in the catalog");
+        let started = self
+            .connections
+            .begin_github(&caller.person, c, level, Some(key), Some(name))
+            .await
+            .map_err(refused)?;
+        let flow = started.flow.clone();
+        self.with(caller, id, |s| {
+            s.flow = Some(started.flow.clone());
+            s.flow_state = Some(super::FlowState::Waiting);
+            s.device = Some(Device {
+                user_code: started.user_code.clone().unwrap_or_default(),
+                verification_uri: started
+                    .verification_uri
+                    .clone()
+                    .unwrap_or_else(|| "https://github.com/login/device".into()),
+                expires_at: Utc::now()
+                    + chrono::Duration::seconds(started.expires_in.min(3600) as i64),
+            });
+            for step in s.steps.iter_mut() {
+                step.state = StepState::Todo;
+                step.note = None;
+            }
+            s.steps[0].state = StepState::Waiting;
+            Ok(())
+        })?;
+        let this = Arc::clone(self);
+        let caller = caller.clone();
+        let id = id.to_string();
+        let every = self
+            .connections
+            .services
+            .poll_floor
+            .min(Duration::from_secs(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let state = this.with(&caller, &id, |s| {
+                    Ok((s.flow.clone(), s.flow_state.clone(), s.ended))
+                });
+                match state {
+                    // A newer code, or a newer setup, took over.
+                    Ok((Some(f), _, None)) if f != flow => return,
+                    Ok((_, Some(super::FlowState::Waiting), None)) => continue,
+                    Ok((_, Some(super::FlowState::Connected { .. }), None)) => {
+                        this.finish(&caller, &id).await;
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Checks setup `id`'s connection, keeps it on a pass and turns it on
+    /// for whom it is for: what the person's word on the card, or the key
+    /// read off the page, starts. Once.
+    pub async fn finish(&self, caller: &Caller, id: &str) {
+        let Ok((false, write)) = self.with(caller, id, |s| {
+            let was = s.finishing;
+            s.finishing = true;
+            Ok((was, s.write))
+        }) else {
+            return;
+        };
+        if let Err(e) = self.test(caller, id).await {
+            let _ = self.with(caller, id, |s| {
+                s.finishing = false;
+                if !s.steps.iter().any(|x| x.state == StepState::Failed) {
+                    let note: String = e.chars().take(200).collect();
+                    s.mark("check", StepState::Failed, Some(note));
+                }
+                Ok(())
+            });
+            return;
+        }
+        if let Err(e) = self
+            .use_it(caller, Some(id), None, None, None, write, false)
+            .await
+        {
+            let note: String = e.chars().take(200).collect();
+            let _ = self.with(caller, id, |s| {
+                s.mark("check", StepState::Failed, Some(note));
+                Ok(())
+            });
+        }
+    }
+
+    /// The caller setup `id` was started by, for what the person does on
+    /// its card: `None` for no such setup of theirs.
+    fn caller_of(&self, person: &str, id: &str) -> Option<Caller> {
+        let setups = self.setups.lock().expect("setups poisoned");
+        let s = setups
+            .get(id)
+            .filter(|s| s.person == person && s.until > Instant::now() && s.ended.is_none())?;
+        Some(Caller {
+            person: s.person.clone(),
+            agent: s.by.clone(),
+            session: s.session.clone(),
+            session_key: None,
+            overseer: s.overseer,
+        })
+    }
+
+    /// The person said, on the card, to use the GitHub CLI's sign-in: its
+    /// token is read now, checked, kept and turned on.
+    pub async fn use_cli(&self, person: &str, id: &str) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let offered = self.with(&caller, id, |s| {
+            Ok(s.way == Way::Cli && s.connected.is_none() && !s.finishing)
+        })?;
+        if !offered {
+            return self.with(&caller, id, |s| Ok(s.view()));
+        }
+        let token = self.connections.services.gh.token().await;
+        let kept = self.with(&caller, id, |s| match token {
+            Some(token) => {
+                s.secrets.insert("token".into(), token);
+                for step in ["use", "sign_in", "page", "key"] {
+                    s.mark(step, StepState::Done, None);
+                }
+                Ok(true)
+            }
+            None => {
+                s.mark(
+                    "check",
+                    StepState::Failed,
+                    Some("GitHub CLI didn't give Desk its sign-in.".into()),
+                );
+                Ok(false)
+            }
+        })?;
+        if kept {
+            self.finish(&caller, id).await;
+        }
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// The person wants to sign in another way than the one offered: with
+    /// GitHub's own sign-in where Desk has it, else a token made in the
+    /// browser, which the agent goes on to make.
+    pub async fn other_way(self: &Arc<Self>, person: &str, id: &str) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let way = self.with(&caller, id, |s| {
+            if s.connected.is_some() || s.finishing || s.way == Way::Browser {
+                return Ok(None);
+            }
+            let way = match (s.way, self.connections.github_client_id.is_some()) {
+                (Way::Cli, true) => Way::Device,
+                _ => Way::Browser,
+            };
+            let recipe = recipe(s.service).expect("a setup's service has a recipe");
+            s.way = way;
+            s.offer = None;
+            s.secrets.clear();
+            s.steps = steps_for(way, &recipe, &s.whose, None);
+            Ok(Some(way))
+        })?;
+        if way == Some(Way::Device) {
+            self.begin_device(&caller, id).await?;
+        }
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// The person asked for a new code, on the card of a device sign-in
+    /// that didn't connect.
+    pub async fn new_code(self: &Arc<Self>, person: &str, id: &str) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let again = self.with(&caller, id, |s| {
+            Ok(s.way == Way::Device && s.connected.is_none() && !s.finishing)
+        })?;
+        if again {
+            self.begin_device(&caller, id).await?;
+        }
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// The person pasted a GitHub token of their own on setup `id`'s card:
+    /// it goes no further than this, the vault and GitHub. Any other way
+    /// under way stops; the token is checked, kept and turned on.
+    pub async fn paste_token(
+        &self,
+        person: &str,
+        id: &str,
+        token: Secret<String>,
+    ) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let recipe = recipe("github").expect("GitHub has a recipe");
+        let value = token.expose_secret().trim().to_string();
+        if !(recipe.shaped)("token", &value) {
+            return Err(
+                "That doesn't look like a GitHub token: it starts github_pat_ or ghp_.".into(),
+            );
+        }
+        let ok = self.with(&caller, id, |s| {
+            if s.service != "github" || s.connected.is_some() || s.finishing {
+                return Ok(false);
+            }
+            if let Some(flow) = s.flow.take() {
+                self.connections.cancel(&s.person, &flow);
+            }
+            s.flow_state = None;
+            s.device = None;
+            s.offer = None;
+            s.way = Way::Token;
+            s.read_at = None;
+            s.steps = steps_for(Way::Token, &recipe, &s.whose, None);
+            s.secrets.clear();
+            s.secrets.insert("token".into(), Secret::new(value));
+            s.mark("key", StepState::Done, None);
+            Ok(true)
+        })?;
+        drop(token);
+        if ok {
+            self.finish(&caller, id).await;
+        }
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// Waits, at most `most`, while setup `id` waits on the person: their
+    /// word on its card, GitHub's code approved, or their signing in on the
+    /// key page in the agent's tab, which is watched here. What the agent
+    /// does next.
+    pub async fn wait(&self, caller: &Caller, id: &str, most: Duration) -> Result<Value, String> {
+        self.check_caller(caller)?;
+        let until = Instant::now() + most;
+        let every = self
+            .connections
+            .services
+            .poll_floor
+            .clamp(Duration::from_millis(5), Duration::from_secs(1));
+        let mut shown = false;
+        loop {
+            let (view, held, recipe_of, said) = self.with(caller, id, |s| {
+                let c = catalog::find(s.service).expect("in the catalog");
+                let held = c
+                    .fields
+                    .iter()
+                    .filter(|f| f.secret)
+                    .all(|f| s.secrets.contains_key(f.name));
+                Ok((
+                    s.view(),
+                    held || s.finishing,
+                    s.service,
+                    std::mem::take(&mut s.said_signed_in),
+                ))
+            })?;
+            match view.now.kind {
+                NowKind::Ended => {
+                    return Ok(
+                        json!({ "ended": true, "next": "A newer setup of this service took over. Say nothing more about this one." }),
+                    )
+                }
+                NowKind::Connected => {
+                    let c = view.connected.as_ref();
+                    return Ok(json!({
+                        "connected": c.map(|c| c.account.clone()),
+                        "onFor": c.and_then(|c| c.on_for.clone()),
+                        "write": view.write,
+                        "next": "It's connected and on. The card shows it: tell the person in one short line, no more.",
+                    }));
+                }
+                NowKind::Failed => {
+                    return Ok(json!({
+                        "failed": true,
+                        "next": "It didn't connect. The card tells the person what happened and what to do: say so in one line and stop. Don't try another way unless they ask.",
+                    }))
+                }
+                _ => {}
+            }
+            if view.way == Way::Browser && !held && said {
+                return Ok(json!({
+                    "signedIn": true,
+                    "next": "The person says they're signed in. Open the key page with browser.navigate if it isn't open, make the key, read it with browser.capture_key {connector} (no selector), then call connections.wait again.",
+                }));
+            }
+            if view.way == Way::Browser && !held {
+                let page = self.page_of(caller, id, recipe_of);
+                let at = self.tabs.location(&caller.agent, &caller.person).await;
+                let open = (recipe(recipe_of).and_then(|r| (r.page)(&BTreeMap::new())))
+                    .unwrap_or_else(|| "the service's key page".into());
+                match (page, at) {
+                    (Some(page), Some(url)) => {
+                        let parsed = url::Url::parse(&url).ok();
+                        let origin = parsed.as_ref().and_then(|u| {
+                            workforce_skills::adapters::browser::origin_of(u.as_str())
+                        });
+                        let path = parsed
+                            .as_ref()
+                            .map(|u| u.path().to_string())
+                            .unwrap_or_default();
+                        if origin.as_deref() == Some(page.origin.as_str()) && page.holds(&path) {
+                            self.with(caller, id, |s| {
+                                for step in ["where", "page", "sign_in"] {
+                                    if s.steps
+                                        .iter()
+                                        .any(|x| x.id == step && x.state != StepState::Done)
+                                    {
+                                        s.mark(step, StepState::Done, None);
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                            return Ok(json!({
+                                "signedIn": true,
+                                "next": "The person is signed in and the key page is open. Make the key there, then read it with browser.capture_key {connector} (no selector: Desk finds it), then call connections.wait again: Desk checks it and turns it on itself.",
+                            }));
+                        }
+                        let waiting = view.steps.iter().any(|x| x.state == StepState::Waiting);
+                        if origin.as_deref() == Some(page.origin.as_str()) {
+                            // On the service, not its key page: its sign-in.
+                            if !waiting {
+                                self.with(caller, id, |s| {
+                                    // Before the site is known, or once the
+                                    // person said they're in: not asked again.
+                                    if s.steps.iter().any(|x| {
+                                        (x.id == "where" && x.state != StepState::Done)
+                                            || (x.id == "sign_in" && x.state == StepState::Done)
+                                    }) {
+                                        return Ok(());
+                                    }
+                                    s.mark("page", StepState::Done, None);
+                                    s.mark("sign_in", StepState::Waiting, None);
+                                    Ok(())
+                                })?;
+                            }
+                            if !shown {
+                                shown = true;
+                                self.tabs.show(&caller.agent).await;
+                            }
+                        } else if !waiting {
+                            return Ok(
+                                json!({ "next": format!("Open {open} with browser.navigate first, then call connections.wait.") }),
+                            );
+                        }
+                    }
+                    (None, _) => {
+                        return Ok(
+                            json!({ "next": "Keep what the setup still needs with connections.keep first." }),
+                        )
+                    }
+                    (_, None) => {
+                        return Ok(
+                            json!({ "next": format!("Desk's browser has no page open: open {open} with browser.navigate, then call connections.wait.") }),
+                        )
+                    }
+                }
+            }
+            if Instant::now() >= until {
+                return Ok(json!({
+                    "waiting": true,
+                    "on": view.now.title,
+                    "next": "Still waiting on the person. Call connections.wait again. Don't message them: the card says what to do.",
+                }));
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// Why `caller` mustn't open a sign-in at `url`: a browser setup in its
+    /// conversation is for that site, and its card asks the person.
+    pub fn sign_in_owned(&self, caller: &Caller, url: &str) -> Option<String> {
+        let origin = workforce_skills::adapters::browser::origin_of(url)?;
+        let setups = self.setups.lock().expect("setups poisoned");
+        setups
+            .values()
+            .filter(|s| {
+                s.person == caller.person
+                    && s.by == caller.agent
+                    && s.session == caller.session
+                    && s.ended.is_none()
+                    && s.connected.is_none()
+                    && s.until > Instant::now()
+            })
+            .find(|s| match s.way {
+                Way::Browser => recipe(s.service)
+                    .is_some_and(|r| (r.origins)(&s.fields).contains(&origin)),
+                // GitHub's own sign-in, or the CLI's: no browser at all.
+                Way::Cli | Way::Device | Way::Token => origin == "https://github.com",
+            })
+            .map(|_| {
+                "The setup's card in this conversation asks the person to sign in, and Desk sees when they have: don't open a sign-in. Open the key page with browser.navigate and call connections.wait.".to_string()
+            })
     }
 
     /// What the agent does next, as `connections.setup` tells it.
     pub fn next(&self, view: &SetupView) -> String {
         let c = catalog::find(view.service).expect("in the catalog");
-        let page = recipe(view.service).and_then(|r| (r.page)(&BTreeMap::new()));
         let secrets: Vec<&str> = c
             .fields
             .iter()
@@ -731,22 +1478,32 @@ impl Setups {
             .filter(|f| !f.secret)
             .map(|f| f.name)
             .collect();
-        if view
-            .steps
-            .iter()
-            .any(|s| s.label.contains("device sign-in"))
-        {
-            return "Open the device sign-in page in your browser and tell the person the code; they sign in and approve it. Call connections.test once they say they have. Never type their password.".into();
+        match view.way {
+            Way::Cli => return "GitHub's CLI is signed in on this computer: the setup's card asks the person to use that sign-in. Call connections.wait now, and nothing else: Desk checks it and turns it on itself. Don't open a browser or message the person.".into(),
+            Way::Device => return "The setup's card shows the person a code to approve on GitHub. Call connections.wait now, and nothing else: Desk finishes by itself once they approve. Don't open a browser, read the code out or message the person.".into(),
+            Way::Browser => {}
+            Way::Token => return "The person is pasting a token of their own on the setup's card. Call connections.wait now, and nothing else.".into(),
         }
+        let page = match view.service {
+            "github" => github_token_page(&view.name, view.write),
+            _ => recipe(view.service)
+                .and_then(|r| (r.page)(&BTreeMap::new()))
+                .unwrap_or_else(|| "the service's key page".into()),
+        };
+        let github = match view.service {
+            "github" => " The page comes filled in: choose \"All repositories\" under Repository access, then Generate token and confirm.",
+            _ => "",
+        };
         format!(
             "1. Keep {} with connections.keep (ask the person if you can't tell).\n\
-             2. Open {} in your browser. If it asks to sign in, mark step sign_in waiting with connections.step and tell the person: they sign in themselves. Never type or read a password.\n\
-             3. Once signed in, make the key (name it like \"Desk · {}\") with browser.click. The page hides keys from you: read {} with browser.capture_key (the element that shows it, and this service), which keeps it for this setup. The key never comes back to you.\n\
-             4. Check it with connections.test (the person allows it), then connections.use to turn it on.",
+             2. Open {} with browser.navigate, then call connections.wait. If the person must sign in, the card asks them and Desk sees when they have: never call browser.sign_in, never type or read a password.\n\
+             3. Once signed in, make the key (name it like \"Desk · {}\").{github} The page hides keys from you: read {} with browser.capture_key {{connector: \"{}\"}}, with no selector: Desk finds it. The key never comes back to you.\n\
+             4. Call connections.wait: Desk checks it with the service and turns it on itself.",
             if plain.is_empty() { "nothing".to_string() } else { plain.join(", ") },
-            page.unwrap_or_else(|| "the service's key page".into()),
+            page,
             view.name,
             secrets.join(" and "),
+            view.service,
         )
     }
 
@@ -853,7 +1610,8 @@ impl Setups {
                     && s.session == caller.session
                     && s.service == connector
                     && s.connected.is_none()
-                    && s.flow.is_none()
+                    && s.way == Way::Browser
+                    && s.ended.is_none()
             })
             .max_by_key(|s| s.started_at)
             .map(|s| s.id.clone())
@@ -1023,7 +1781,7 @@ impl Setups {
                     .unwrap_or_default();
                 format!("still needs {}", left.join(" and "))
             }
-            true => format!("ready: check it with connections.test (setup {id})"),
+            true => "kept: Desk checks it with the service and turns it on itself. Call connections.wait.".to_string(),
         };
         Ok(KeptKey {
             kept: true,
@@ -1031,6 +1789,8 @@ impl Setups {
             field,
             length,
             test,
+            ready: all,
+            setup: id,
         })
     }
 
@@ -1448,9 +2208,12 @@ impl Setups {
         let now = Instant::now();
         setups.retain(|_, s| s.until > now);
         let mut views: Vec<SetupView> = setups
-            .values()
+            .values_mut()
             .filter(|s| s.person == person && agent.is_none_or(|a| s.by == a))
-            .map(Setup::view)
+            .map(|s| {
+                s.sync(&self.connections);
+                s.view()
+            })
             .collect();
         views.sort_by_key(|v| v.started_at);
         views
@@ -1471,6 +2234,7 @@ impl Setups {
                 StepState::Done,
                 Some("You said you're signed in".into()),
             );
+            s.said_signed_in = true;
         }
         Some(s.view())
     }
@@ -1512,6 +2276,71 @@ struct Described {
     whom: String,
     /// `None`: for all the person's agents.
     for_agent: Option<String>,
+}
+
+/// What a card says of a setup that has gone.
+const GONE: &str = "That setup has ended. Ask the agent to start again.";
+
+/// A setup's steps, the way it gets its key.
+fn steps_for(
+    way: Way,
+    recipe: &Recipe,
+    whose: &str,
+    offer: Option<&super::gh::Login>,
+) -> Vec<Step> {
+    let mut steps = Vec::new();
+    match way {
+        Way::Cli => steps.push(step(
+            "use",
+            &format!(
+                "Use the GitHub sign-in on this Mac{}",
+                offer
+                    .map(|o| format!(" as {}", o.account))
+                    .unwrap_or_default()
+            ),
+        )),
+        Way::Device => steps.push(step("sign_in", "Approve Desk on GitHub")),
+        Way::Token => steps.push(step("key", "Paste a token you made on GitHub")),
+        Way::Browser => {
+            if let Some(label) = recipe.where_label {
+                steps.push(step("where", label));
+            }
+            steps.push(step("page", recipe.page_label));
+            steps.push(step("sign_in", recipe.sign_in_label));
+            steps.push(step("key", recipe.key_label));
+        }
+    }
+    steps.push(step(
+        "check",
+        &format!("Check it works, then turn it on for {whose}"),
+    ));
+    steps[0].state = StepState::Current;
+    steps
+}
+
+/// GitHub's page for a new fine-grained token, filled in through the
+/// parameters GitHub documents: its name, 90 days, and the least the
+/// agent's GitHub tools need (read, or write where it takes writes).
+fn github_token_page(name: &str, write: bool) -> String {
+    let level = match write {
+        true => "write",
+        false => "read",
+    };
+    let token_name: String = format!("Desk · {name}").chars().take(40).collect();
+    let mut u = url::Url::parse("https://github.com/settings/personal-access-tokens/new")
+        .expect("GitHub's token page parses");
+    u.query_pairs_mut()
+        .append_pair("name", &token_name)
+        .append_pair(
+            "description",
+            "Made by Desk for its agents. Kept in the vault on this computer.",
+        )
+        .append_pair("expires_in", "90")
+        .append_pair("contents", level)
+        .append_pair("pull_requests", level)
+        .append_pair("issues", level)
+        .append_pair("metadata", "read");
+    u.to_string()
 }
 
 fn step(id: &'static str, label: &str) -> Step {
@@ -1581,6 +2410,11 @@ pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Conne
         .route(
             "/api/desk/connection-setups/{id}/signed-in",
             post(signed_in_route),
+        )
+        .route("/api/desk/connection-setups/{id}/token", post(token_route))
+        .route(
+            "/api/desk/connection-setups/{id}/{choice}",
+            post(choice_route),
         )
         .with_state(Arc::new(Routes {
             state: Arc::clone(state),
@@ -1652,6 +2486,62 @@ async fn signed_in_route(
     }
 }
 
+/// What the person chose on a setup's card: `use-cli` (the GitHub CLI's
+/// sign-in), `other-way`, or `new-code`. Theirs alone: no tool reaches it.
+async fn choice_route(
+    State(r): State<Arc<Routes>>,
+    h: HeaderMap,
+    Query(q): Query<ListQuery>,
+    Path((id, choice)): Path<(String, String)>,
+) -> Response {
+    let person = match holder(&r, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(refused) => return refused,
+    };
+    let done = match choice.as_str() {
+        "use-cli" => r.setups.use_cli(&person, &id).await,
+        "other-way" => r.setups.other_way(&person, &id).await,
+        "new-code" => r.setups.new_code(&person, &id).await,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "There's no such choice." })),
+            )
+                .into_response()
+        }
+    };
+    match done {
+        Ok(view) => Json(json!({ "setup": view })).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+/// A GitHub token the person pasted on a setup's card: theirs alone, from
+/// the card straight to the vault. Never logged, never in an answer.
+async fn token_route(
+    State(r): State<Arc<Routes>>,
+    h: HeaderMap,
+    Query(q): Query<ListQuery>,
+    Path(id): Path<String>,
+    Json(body): Json<TokenBody>,
+) -> Response {
+    let token = Secret::new(body.token);
+    let person = match holder(&r, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(refused) => return refused,
+    };
+    match r.setups.paste_token(&person, &id, token).await {
+        Ok(view) => Json(json!({ "setup": view })).into_response(),
+        Err(e) if e == GONE => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
 /// One `connections.*` tool, for the agent `agent`.
 pub struct SetupTool {
     name: &'static str,
@@ -1708,8 +2598,9 @@ impl Tool for SetupTool {
     fn description(&self) -> &str {
         match self.name {
             "connections.list" => "The person's connections to services (Jira, Linear, GitHub, Datadog, Metabase, Email, Google, Slack) you can use: each by the name the person gave it, its site and account, whether it is for all their agents or just you, whether you use it, take writes with it, and which is your default. Never a key.",
-            "connections.step" => "Mark a step of a setup's card: `current` (you're on it), `waiting` (on the person: signing in, approving a code), or `done`. The person sees the card in this conversation.",
-            "connections.setup" => "Start setting up a connection to a service yourself, in your browser: Jira, Linear, Datadog, Metabase or GitHub. `name` is what the person calls it (Acme, Work). `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. Returns the setup's id, its steps, and what to do next. Google, Email and Slack the person connects themselves.",
+            "connections.step" => "Rarely needed: the setup's card follows the setup by itself. Marks a step `current`, `waiting` or `done`.",
+            "connections.wait" => "Wait while a setup waits on the person (using a sign-in on this computer, approving GitHub's code, signing in to the service in your browser): Desk sees when they have, and checks and turns the connection on itself. Returns what to do next. Call it again while it says it's still waiting; never message the person meanwhile, the card says what to do.",
+            "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase or GitHub. `name` is what the person calls it (Acme, Work). `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Google, Email and Slack the person connects themselves.",
             "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), an email. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
             "connections.test" => "Check the setup's keys with the service again, or finish GitHub's sign-in once the person approved its code. Only if it works are they kept, in the vault, for whom the setup is for. A failed check keeps nothing.",
             "connections.use" => "Turn a connection on for an agent: the setup's (`setup`), or one by `service` and `connection` (its name). `agent` is you by default; another agent only for the person's overseer. `write` (default false) lets it make changes; `default` makes it the one used when a request doesn't say.",
@@ -1737,9 +2628,15 @@ impl Tool for SetupTool {
                 "properties": {
                     "service": { "type": "string", "enum": ["jira", "linear", "datadog", "metabase", "github"] },
                     "name": { "type": "string" },
-                    "for": { "type": "string", "description": "me (default), all, or an agent's name" }
+                    "for": { "type": "string", "description": "me (default), all, or an agent's name" },
+                    "write": { "type": "boolean", "description": "Whether whom it is for makes changes with it (default false)" }
                 },
                 "required": ["service"]
+            }),
+            "connections.wait" => json!({
+                "type": "object",
+                "properties": { "setup": setup },
+                "required": ["setup"]
             }),
             "connections.keep" => json!({
                 "type": "object",
@@ -1790,13 +2687,12 @@ impl Tool for SetupTool {
             .as_ref()
             .is_some_and(|d| d.for_agent.as_deref() != Some(self.agent.as_str()));
         match self.name {
-            "connections.list" | "connections.step" => Effect::None,
-            "connections.setup" => match text(input, "service").as_deref() {
-                Some("github") => {
-                    write(text(input, "for").is_some_and(|f| f != "me" && f != self.agent))
-                }
-                _ => Effect::None,
-            },
+            "connections.list" | "connections.step" | "connections.wait" => Effect::None,
+            // Starting a setup is the person's one word for it: its key is
+            // kept, and it is turned on for whom it is for, once it works.
+            "connections.setup" => {
+                write(text(input, "for").is_some_and(|f| f != "me" && f != self.agent))
+            }
             "connections.keep" | "connections.test" => write(for_other),
             "connections.use" => write(
                 for_other || text(input, "agent").is_some_and(|a| a != "me" && a != self.agent),
@@ -1857,8 +2753,31 @@ impl Tool for SetupTool {
                     }
                 )
             }
-            ("connections.setup", _) if text(input, "service").as_deref() == Some("github") => {
-                "Start GitHub's sign-in for a new connection".into()
+            ("connections.setup", _) => {
+                let service = text(input, "service")
+                    .and_then(|s| catalog::find(&s))
+                    .map_or(UNKNOWN, |c| c.name);
+                let whom = match text(input, "for").as_deref() {
+                    None | Some("me") => setups
+                        .as_ref()
+                        .map_or_else(|| UNKNOWN.to_string(), |s| s.agent_name(&self.agent)),
+                    Some("all") => "all the person's agents".into(),
+                    Some(other) => setups.as_ref().map_or_else(
+                        || UNKNOWN.to_string(),
+                        |s| {
+                            s.callers
+                                .agent_named(other)
+                                .map_or_else(|| UNKNOWN.to_string(), |id| s.agent_name(&id))
+                        },
+                    ),
+                };
+                format!(
+                    "Set up {service} for {whom}: keep its key in the vault and turn it on, {}",
+                    match input.get("write").and_then(Value::as_bool) {
+                        Some(true) => "read and write",
+                        _ => "read only",
+                    }
+                )
             }
             _ => return None,
         })
@@ -1895,12 +2814,17 @@ impl Tool for SetupTool {
                         &service,
                         text(&input, "name").as_deref(),
                         text(&input, "for").as_deref(),
+                        input.get("write").and_then(Value::as_bool).unwrap_or(false),
                     )
                     .await
                     .map(|view| {
                         let next = setups.next(&view);
-                        json!({ "setup": view.id, "steps": view.steps, "next": next })
+                        json!({ "setup": view.id, "next": next })
                     }),
+            },
+            "connections.wait" => match need() {
+                Err(e) => Err(e),
+                Ok(id) => setups.wait(&caller, &id, WAIT_MOST).await,
             },
             "connections.step" => need().and_then(|id| {
                 let state = match text(&input, "state").as_deref() {

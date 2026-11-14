@@ -399,18 +399,22 @@ fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: super::keys::CAPTURE_KEY,
             description:
-                "While setting up a connection the person asked for: on the service's own key page, right after it shows a new API key, keep that key for the connection. You never see the key: pass the CSS selector of the element showing it, and the connector. Never screenshot, read out or type the key.",
+                "While setting up a connection the person asked for: on the service's own key page, right after it shows a new API key, keep that key for the connection. You never see the key: pass the connector, and leave `selector` out, so Desk finds the key on the page itself (give one only if Desk says it found none or several). Never screenshot, read out or type the key.",
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "CSS selector of the element showing the new key" },
+                    "selector": { "type": "string", "description": "Only if Desk didn't find the key itself: CSS selector of the element showing it" },
                     "connector": { "type": "string", "description": "The connection being set up: linear, github, …" }
                 },
-                "required": ["selector", "connector"]
+                "required": ["connector"]
             }),
             handler: handler(|c, input| {
                 async move {
-                    let selector = require_str(&input, "selector")?;
+                    let selector = input
+                        .get("selector")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
                     let connector = require_str(&input, "connector")?;
                     c.capture_key(selector, connector).await
                 }

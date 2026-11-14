@@ -32,6 +32,7 @@
 
 pub mod catalog;
 pub mod check;
+pub mod gh;
 #[cfg(test)]
 mod tests;
 

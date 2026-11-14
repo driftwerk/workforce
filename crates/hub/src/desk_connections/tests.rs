@@ -226,6 +226,7 @@ async fn services(github: Arc<Github>) -> Services {
         google_token: format!("{base}/token"),
         google_userinfo: format!("{base}/userinfo"),
         poll_floor: Duration::from_millis(10),
+        gh: super::gh::GhCli::none(),
     }
 }
 
@@ -1885,7 +1886,7 @@ fn an_agents_tools_reach_exactly_its_connections() {
 
 mod setups {
     use super::*;
-    use setup::{Caller, Callers, Setups, StepState};
+    use setup::{Caller, Callers, Ended, NowKind, Setups, StepState, Tabs, Way};
     use workforce_common::secret::Secret;
 
     struct People;
@@ -1915,9 +1916,9 @@ mod setups {
         }
     }
 
-    async fn setups() -> (Hub, Setups) {
+    async fn setups() -> (Hub, Arc<Setups>) {
         let h = hub().await;
-        let s = Setups::new(Arc::clone(&h.c), Arc::new(People));
+        let s = Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)));
         (h, s)
     }
 
@@ -1935,7 +1936,9 @@ mod setups {
         setup::register_key_pages();
         let (_h, s) = setups().await;
         let allan = caller("allan");
-        s.start(&allan, "linear", Some("Acme"), None).await.unwrap();
+        s.start(&allan, "linear", Some("Acme"), None, false)
+            .await
+            .unwrap();
         let in_turn = |person: &'static str, key: &'static str, f: Box<dyn FnOnce() + Send>| {
             CURRENT_USER_ID.sync_scope(person.to_string(), || {
                 CURRENT_AGENT_ID.sync_scope("allan".to_string(), || {
@@ -1948,7 +1951,6 @@ mod setups {
         // Outside a turn, or when the browser's word disagrees with the
         // turn's, there is no caller and so no page.
         assert!(s.turn_caller(SARAH, "allan", "desk:allan").is_none());
-        let s = Arc::new(s);
         let s2 = Arc::clone(&s);
         in_turn(
             SARAH,
@@ -1996,7 +1998,7 @@ mod setups {
                         Secret::new(GOOD.into()),
                     )
                     .unwrap();
-                assert!(kept.test.starts_with("ready"), "{}", kept.test);
+                assert!(kept.ready && kept.test.starts_with("kept"), "{}", kept.test);
                 assert!(!format!("{kept:?}").contains(GOOD));
             }),
         );
@@ -2036,7 +2038,10 @@ mod setups {
         let _cache = crate::secret_cache::testing::GlobalCache::install(cache.clone());
         let (h, s) = setups().await;
         let allan = caller("allan");
-        let started = s.start(&allan, "linear", Some("Acme"), None).await.unwrap();
+        let started = s
+            .start(&allan, "linear", Some("Acme"), None, false)
+            .await
+            .unwrap();
         assert_eq!(
             started.steps.iter().map(|x| x.id).collect::<Vec<_>>(),
             ["page", "sign_in", "key", "check"]
@@ -2067,7 +2072,7 @@ mod setups {
             )
             .unwrap();
         // Held, not sent: the check is connections.test's, which asks.
-        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+        assert!(kept.ready && kept.test.starts_with("kept"), "{}", kept.test);
         assert_eq!(kept.length, GOOD.len());
         assert!(keys(&h.allan).is_empty(), "nothing kept before the check");
         s.test(&allan, &started.id).await.unwrap();
@@ -2115,7 +2120,10 @@ mod setups {
     async fn the_gates_question_says_only_what_the_hub_resolved() {
         let (_h, s) = setups().await;
         let allan = caller("allan");
-        let jira = s.start(&allan, "jira", Some("Acme"), None).await.unwrap();
+        let jira = s
+            .start(&allan, "jira", Some("Acme"), None, false)
+            .await
+            .unwrap();
         let keep = |field: &str, value: &str| s.keep_described(&jira.id, Some(field), Some(value));
         assert!(keep("site", "ACME.atlassian.net").ends_with(": acme.atlassian.net"));
         assert!(keep("site", "acme.atlassian.net (checked by Desk)").ends_with(": unknown"));
@@ -2185,7 +2193,7 @@ mod setups {
     async fn linears_key_is_read_off_its_workspaces_own_settings_page() {
         let (_h, s) = setups().await;
         let allan = caller("allan");
-        s.start(&allan, "linear", None, None).await.unwrap();
+        s.start(&allan, "linear", None, None, false).await.unwrap();
         let kept = s
             .keep_key(
                 &allan,
@@ -2196,14 +2204,14 @@ mod setups {
                 Secret::new(GOOD.into()),
             )
             .unwrap();
-        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+        assert!(kept.ready && kept.test.starts_with("kept"), "{}", kept.test);
     }
 
     #[tokio::test]
     async fn a_key_off_another_page_not_shaped_as_a_key_or_refused_keeps_nothing() {
         let (h, s) = setups().await;
         let allan = caller("allan");
-        let started = s.start(&allan, "linear", None, None).await.unwrap();
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
         for (origin, path, value, want) in [
             ("https://evil.example", LINEAR_PAGE.1, GOOD, "key page"),
             (LINEAR_PAGE.0, "/settings/profile", GOOD, "key page"),
@@ -2244,7 +2252,7 @@ mod setups {
                 Secret::new(BAD.into()),
             )
             .unwrap();
-        assert!(kept.test.starts_with("ready"), "{}", kept.test);
+        assert!(kept.ready && kept.test.starts_with("kept"), "{}", kept.test);
         s.test(&allan, &started.id).await.unwrap_err();
         let e = s.test(&allan, &started.id).await.unwrap_err();
         assert!(e.contains("Read the key"), "the key was dropped: {e}");
@@ -2273,12 +2281,12 @@ mod setups {
         let allan = caller("allan");
         for whom in ["all", "ben"] {
             let e = s
-                .start(&allan, "linear", None, Some(whom))
+                .start(&allan, "linear", None, Some(whom), false)
                 .await
                 .unwrap_err();
             assert!(e.contains("overseer"), "{whom}: {e}");
         }
-        let started = s.start(&allan, "linear", None, None).await.unwrap();
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
         let other = Caller {
             session: Some("elsewhere".into()),
             ..caller("allan")
@@ -2302,17 +2310,20 @@ mod setups {
             ..caller("allan")
         };
         for who in [stranger, sessionless] {
-            assert!(s.start(&who, "linear", None, None).await.is_err());
+            assert!(s.start(&who, "linear", None, None, false).await.is_err());
             assert!(s.key_page(&who, "linear").is_none());
         }
         for by_hand in ["google", "email", "slack"] {
-            let e = s.start(&allan, by_hand, None, None).await.unwrap_err();
+            let e = s
+                .start(&allan, by_hand, None, None, false)
+                .await
+                .unwrap_err();
             assert!(e.contains("Settings → Connections"), "{by_hand}: {e}");
         }
         // The overseer may set one up for all, and turn one on for Allan.
         let ben = caller("ben");
         let for_all = s
-            .start(&ben, "linear", Some("Acme"), Some("all"))
+            .start(&ben, "linear", Some("Acme"), Some("all"), false)
             .await
             .unwrap();
         s.keep_key(
@@ -2361,7 +2372,10 @@ mod setups {
     async fn a_key_goes_only_to_the_site_it_was_read_for() {
         let (_h, s) = setups().await;
         let allan = caller("allan");
-        let jira = s.start(&allan, "jira", Some("Acme"), None).await.unwrap();
+        let jira = s
+            .start(&allan, "jira", Some("Acme"), None, false)
+            .await
+            .unwrap();
         for bad in [
             "http://acme.atlassian.net",
             "acme.evil.example",
@@ -2394,7 +2408,10 @@ mod setups {
         )
         .unwrap();
 
-        let mb = s.start(&allan, "metabase", None, None).await.unwrap();
+        let mb = s
+            .start(&allan, "metabase", None, None, false)
+            .await
+            .unwrap();
         assert!(s
             .keep(&allan, &mb.id, "site_url", "http://metabase.acme.example")
             .is_err());
@@ -2414,7 +2431,7 @@ mod setups {
             .unwrap_err()
             .contains("key page"));
         // Datadog's site is a region.
-        let dd = s.start(&allan, "datadog", None, None).await.unwrap();
+        let dd = s.start(&allan, "datadog", None, None, false).await.unwrap();
         assert!(s.keep(&allan, &dd.id, "site", "evil.example").is_err());
         s.keep(&allan, &dd.id, "site", "eu1").unwrap();
         assert_eq!(
@@ -2443,11 +2460,17 @@ mod setups {
     async fn too_many_setups_start_nothing() {
         let (_h, s) = setups().await;
         let allan = caller("allan");
-        for _ in 0..16 {
-            s.start(&allan, "linear", None, None).await.unwrap();
+        for n in 0..16 {
+            // Each in its own conversation: one conversation's again is
+            // the same setup.
+            let here = Caller {
+                session: Some(format!("s-{n}")),
+                ..allan.clone()
+            };
+            s.start(&here, "linear", None, None, false).await.unwrap();
         }
         assert!(s
-            .start(&allan, "github", None, None)
+            .start(&allan, "github", None, None, false)
             .await
             .unwrap_err()
             .contains("Too many"));
@@ -2467,11 +2490,12 @@ mod setups {
         for tool in setup::SetupTool::all("allan") {
             let effect = write(tool.effect(&json!({ "service": "linear" })));
             match tool.name() {
-                "connections.list" | "connections.step" | "connections.setup" => {
+                "connections.list" | "connections.step" | "connections.wait" => {
                     assert_eq!(effect, None, "{}", tool.name())
                 }
-                // A connection write: asks below unbound.
-                "connections.keep" | "connections.test" => {
+                // A connection write: asks below unbound. Starting a setup
+                // is the person's one word for keeping and turning it on.
+                "connections.keep" | "connections.test" | "connections.setup" => {
                     assert_eq!(effect.as_deref(), Some("connections"), "{}", tool.name())
                 }
                 _ => assert!(effect.is_some(), "{}", tool.name()),
@@ -2486,6 +2510,10 @@ mod setups {
             Some("connections"),
             "GitHub's sign-in is gated"
         );
+        assert_eq!(
+            write(setup.effect(&json!({ "service": "linear", "for": "ben" }))).as_deref(),
+            Some("connections:other")
+        );
         let use_it = setup::SetupTool::all("allan")
             .into_iter()
             .find(|t| t.name() == "connections.use")
@@ -2494,5 +2522,407 @@ mod setups {
             write(use_it.effect(&json!({ "agent": "ben" }))).as_deref(),
             Some("connections:other")
         );
+    }
+
+    /// Desk's browser, as a test has it: the agent's tab's address, and
+    /// how often it was put in front.
+    #[derive(Default)]
+    struct Tab {
+        at: Mutex<Option<String>>,
+        shown: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Tabs for Tab {
+        async fn location(&self, _agent: &str, _person: &str) -> Option<String> {
+            self.at.lock().unwrap().clone()
+        }
+        async fn show(&self, _agent: &str) -> bool {
+            self.shown.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    impl Tab {
+        fn on(&self, url: &str) {
+            *self.at.lock().unwrap() = Some(url.to_string());
+        }
+    }
+
+    /// Setups over `h`, with GitHub's CLI at `gh` and the tab `tab`.
+    fn over(h: &mut Hub, gh: Option<super::gh::GhCli>, tab: Arc<Tab>) -> Arc<Setups> {
+        if let Some(gh) = gh {
+            Arc::get_mut(&mut h.c).unwrap().services.gh = gh;
+        }
+        Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)).with_tabs(tab))
+    }
+
+    /// A stand-in `gh`, signed in as Sarah: it never reaches the real one.
+    fn fake_gh(dir: &std::path::Path) -> super::gh::GhCli {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("gh");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  api) printf 'HTTP/2.0 200 OK\\nX-Oauth-Scopes: repo, read:org\\n\\n{{\"login\":\"sarah\"}}' ;;\n  auth) printf '%s\\n' '{GH_GOOD}' ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::gh::GhCli::at(bin)
+    }
+
+    /// Waits for setup `id`'s card to show `kind`.
+    async fn card_shows(s: &Setups, id: &str, kind: NowKind) -> setup::SetupView {
+        for _ in 0..400 {
+            if let Some(v) = s.views(SARAH, None).into_iter().find(|v| v.id == id) {
+                if v.now.kind == kind {
+                    return v;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{id} never showed {kind:?}: {:?}", s.views(SARAH, None));
+    }
+
+    /// One setup is one card: asked again in the conversation it is the
+    /// same; another connection of the service there replaces it.
+    #[tokio::test]
+    async fn the_same_setup_again_is_the_same_card_and_a_new_one_replaces_it() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let first = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let again = s.start(&allan, "linear", None, None, false).await.unwrap();
+        assert_eq!(first.id, again.id);
+        assert_eq!(s.views(SARAH, None).len(), 1);
+        // Another conversation's is its own.
+        let elsewhere = Caller {
+            session: Some("elsewhere".into()),
+            ..caller("allan")
+        };
+        let other = s
+            .start(&elsewhere, "linear", None, None, false)
+            .await
+            .unwrap();
+        assert_ne!(other.id, first.id);
+        // Another connection of Linear here takes over its card.
+        let acme = s
+            .start(&allan, "linear", Some("Acme"), None, false)
+            .await
+            .unwrap();
+        assert_ne!(acme.id, first.id);
+        let views = s.views(SARAH, None);
+        let old = views.iter().find(|v| v.id == first.id).unwrap();
+        assert_eq!(old.ended, Some(Ended::Replaced));
+        assert_eq!(old.now.kind, NowKind::Ended);
+        assert!(
+            s.key_page(&allan, "linear").is_some(),
+            "the new one reads its key"
+        );
+        let said = s.wait(&allan, &first.id, Duration::ZERO).await.unwrap();
+        assert_eq!(said["ended"], json!(true));
+    }
+
+    /// GitHub's own sign-in: the card shows the code, the agent never sees
+    /// it, and once it is approved the hub keeps it and turns it on itself.
+    #[tokio::test]
+    async fn githubs_code_is_the_persons_and_the_hub_finishes_by_itself() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, true).await.unwrap();
+        assert_eq!(started.way, Way::Device);
+        assert_eq!(started.now.kind, NowKind::Code);
+        assert_eq!(started.now.code.as_deref(), Some("ABCD-1234"));
+        assert_eq!(started.now.action, Some("open_code"));
+        let next = s.next(&started);
+        assert!(!next.contains("ABCD-1234"), "{next}");
+        assert!(next.contains("connections.wait"), "{next}");
+        assert!(!format!("{:?}", started.steps).contains("ABCD-1234"));
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(said["connected"], json!("sarah"), "{said}");
+        assert_eq!(said["onFor"], json!("Allan"));
+        let card = card_shows(&s, &started.id, NowKind::Connected).await;
+        assert_eq!(card.now.title, "GitHub connected as sarah");
+        assert!(card.now.action.is_none() && card.now.other.is_none());
+        assert!(card.now.detail.unwrap().contains("read and write"));
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/token")));
+        let everything = serde_json::to_string(&s.views(SARAH, None)).unwrap();
+        assert!(!everything.contains(GH_GOOD) && !everything.contains("dev-code-secret"));
+    }
+
+    /// A code turned down is the card's to start again: a new code, on the
+    /// same card.
+    #[tokio::test]
+    async fn a_code_turned_down_gets_a_new_one_on_the_same_card() {
+        let (h, s) = setups().await;
+        *h.github.outcome.lock().unwrap() = "denied";
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        let failed = card_shows(&s, &started.id, NowKind::Failed).await;
+        assert_eq!(failed.now.action, Some("new_code"));
+        assert!(failed.now.detail.unwrap().contains("Nothing was kept"));
+        assert!(keys(&h.allan).is_empty());
+        // Only the person, never another.
+        assert!(s.new_code("someone-else", &started.id).await.is_err());
+        *h.github.outcome.lock().unwrap() = "token";
+        let again = s.new_code(SARAH, &started.id).await.unwrap();
+        assert_eq!(again.id, started.id);
+        assert_eq!(again.now.kind, NowKind::Code);
+        card_shows(&s, &started.id, NowKind::Connected).await;
+    }
+
+    /// The GitHub CLI signed in on this computer: one word on the card
+    /// connects it, and nothing is read of it before that word.
+    #[tokio::test]
+    async fn the_github_cli_sign_in_is_used_at_the_persons_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = hub().await;
+        let s = over(&mut h, Some(fake_gh(dir.path())), Arc::new(Tab::default()));
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        assert_eq!(started.way, Way::Cli);
+        assert_eq!(started.now.kind, NowKind::Offer);
+        assert_eq!(
+            started.now.title,
+            "GitHub is signed in on this Mac as sarah"
+        );
+        let detail = started.now.detail.clone().unwrap();
+        assert!(
+            detail.contains("repo, read:org") && detail.contains("read only"),
+            "{detail}"
+        );
+        assert_eq!(started.now.action, Some("use_cli"));
+        assert_eq!(started.now.other, Some("other_way"));
+        assert!(
+            keys(&h.allan).is_empty(),
+            "nothing kept before the person's word"
+        );
+        assert!(s.use_cli("someone-else", &started.id).await.is_err());
+        let done = s.use_cli(SARAH, &started.id).await.unwrap();
+        assert_eq!(done.now.kind, NowKind::Connected, "{:?}", done.now);
+        assert_eq!(done.now.title, "GitHub connected as sarah");
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/token")));
+        assert!(!serde_json::to_string(&done).unwrap().contains(GH_GOOD));
+    }
+
+    /// Turning the CLI's sign-in down: GitHub's own sign-in on the same card.
+    #[tokio::test]
+    async fn another_way_than_the_cli_is_githubs_own_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = hub().await;
+        let s = over(&mut h, Some(fake_gh(dir.path())), Arc::new(Tab::default()));
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        let other = s.other_way(SARAH, &started.id).await.unwrap();
+        assert_eq!(other.id, started.id);
+        assert_eq!(other.way, Way::Device);
+        assert_eq!(other.now.kind, NowKind::Code);
+    }
+
+    /// Without the CLI or Desk's GitHub app, a token made in the browser, on
+    /// GitHub's page filled in with the least it needs.
+    #[tokio::test]
+    async fn githubs_token_page_comes_filled_in() {
+        let mut h = hub().await;
+        Arc::get_mut(&mut h.c).unwrap().github_client_id = None;
+        let s = over(&mut h, None, Arc::new(Tab::default()));
+        let started = s
+            .start(&caller("allan"), "github", None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(started.way, Way::Browser);
+        let next = s.next(&started);
+        for want in [
+            "settings/personal-access-tokens/new?",
+            "expires_in=90",
+            "contents=read",
+            "metadata=read",
+            "no selector",
+        ] {
+            assert!(next.contains(want), "{want}: {next}");
+        }
+        assert!(next.contains("never call browser.sign_in"), "{next}");
+    }
+
+    /// Signing in is seen from the tab: on the service's sign-in, the card
+    /// asks the person and the tab comes to the front; on its key page, the
+    /// agent goes on. Once the key is read, the hub checks it and turns it on.
+    #[tokio::test]
+    async fn signing_in_is_seen_and_the_hub_turns_it_on() {
+        let mut h = hub().await;
+        let tab = Arc::new(Tab::default());
+        let s = over(&mut h, None, Arc::clone(&tab));
+        let allan = caller("allan");
+        let started = s
+            .start(&allan, "linear", Some("Acme"), None, false)
+            .await
+            .unwrap();
+        // No page open yet: the agent is told to open it.
+        let said = s.wait(&allan, &started.id, Duration::ZERO).await.unwrap();
+        assert!(
+            said["next"].as_str().unwrap().contains("browser.navigate"),
+            "{said}"
+        );
+        tab.on("https://linear.app/login");
+        let said = s
+            .wait(&allan, &started.id, Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(said["waiting"], json!(true), "{said}");
+        let card = card_shows(&s, &started.id, NowKind::SignIn).await;
+        assert_eq!(card.now.title, "Sign in to Linear in Desk's window");
+        assert_eq!(card.now.action, Some("show_page"));
+        assert_eq!(tab.shown.load(Ordering::SeqCst), 1, "put in front once");
+        // While its card asks, the agent opens no sign-in of its own.
+        assert!(s
+            .sign_in_owned(&allan, "https://linear.app/login")
+            .is_some());
+        assert!(s
+            .sign_in_owned(&allan, "https://example.com/login")
+            .is_none());
+        assert!(s
+            .sign_in_owned(&caller("ben"), "https://linear.app/login")
+            .is_none());
+        tab.on("https://linear.app/acme/settings/account/security");
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(said["signedIn"], json!(true), "{said}");
+        let kept = s
+            .keep_key(
+                &allan,
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(GOOD.into()),
+            )
+            .unwrap();
+        assert!(kept.ready);
+        s.finish(&allan, &kept.setup).await;
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(said["onFor"], json!("Allan"), "{said}");
+        let card = card_shows(&s, &started.id, NowKind::Connected).await;
+        assert!(card.now.title.starts_with("Linear connected as"));
+        assert!(s
+            .sign_in_owned(&allan, "https://linear.app/login")
+            .is_none());
+    }
+
+    /// A key the service refuses is the card's failure, and its words never
+    /// reach the agent.
+    #[tokio::test]
+    async fn a_refused_key_fails_on_the_card_alone() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let kept = s
+            .keep_key(
+                &allan,
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(BAD.into()),
+            )
+            .unwrap();
+        s.finish(&allan, &kept.setup).await;
+        let card = card_shows(&s, &started.id, NowKind::Failed).await;
+        assert_eq!(card.now.action, Some("retry"));
+        assert!(!format!("{card:?}").contains(BAD));
+        let said = s.wait(&allan, &started.id, Duration::ZERO).await.unwrap();
+        assert_eq!(said["failed"], json!(true));
+        assert!(!said.to_string().contains(BAD));
+        assert!(keys(&h.allan).is_empty());
+    }
+
+    /// A token of the person's own, pasted on the card: offered from the
+    /// start beside whatever else the card asks, checked, kept, turned on;
+    /// a device sign-in under way stops.
+    #[tokio::test]
+    async fn a_pasted_token_connects_from_the_card_alone() {
+        let (h, s) = setups().await;
+        *h.github.outcome.lock().unwrap() = "pending";
+        let allan = caller("allan");
+        let started = s.start(&allan, "github", None, None, false).await.unwrap();
+        assert_eq!(started.now.kind, NowKind::Code);
+        let page = started.now.paste.clone().unwrap();
+        assert!(
+            page.starts_with("https://github.com/settings/personal-access-tokens/new?"),
+            "{page}"
+        );
+        assert!(
+            page.contains("contents=read") && page.contains("expires_in=90"),
+            "{page}"
+        );
+        // Only the person, and only a token shaped like GitHub's.
+        assert!(s
+            .paste_token("someone-else", &started.id, Secret::new(GH_GOOD.into()))
+            .await
+            .is_err());
+        assert!(s
+            .paste_token(SARAH, &started.id, Secret::new("hunter2".into()))
+            .await
+            .unwrap_err()
+            .contains("doesn't look like"));
+        let done = s
+            .paste_token(SARAH, &started.id, Secret::new(format!(" {GH_GOOD}\n")))
+            .await
+            .unwrap();
+        assert_eq!(done.way, Way::Token);
+        assert_eq!(done.now.kind, NowKind::Connected, "{:?}", done.now);
+        assert_eq!(done.now.title, "GitHub connected as sarah");
+        assert!(done.now.paste.is_none());
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/token")));
+        assert!(!serde_json::to_string(&s.views(SARAH, None))
+            .unwrap()
+            .contains(GH_GOOD));
+        // The device sign-in it replaced keeps nothing more.
+        *h.github.outcome.lock().unwrap() = "token";
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            keys(&h.allan)
+                .iter()
+                .filter(|k| k.ends_with("/token"))
+                .count(),
+            1
+        );
+    }
+
+    /// A pasted token GitHub refuses: nothing kept, and the card asks for
+    /// another.
+    #[tokio::test]
+    async fn a_pasted_token_github_refuses_keeps_nothing() {
+        let mut h = hub().await;
+        Arc::get_mut(&mut h.c).unwrap().github_client_id = None;
+        let s = over(&mut h, None, Arc::new(Tab::default()));
+        let started = s
+            .start(&caller("allan"), "github", None, None, false)
+            .await
+            .unwrap();
+        assert!(
+            started.now.paste.is_some(),
+            "offered with no GitHub app too"
+        );
+        let failed = s
+            .paste_token(
+                SARAH,
+                &started.id,
+                Secret::new("ghp_badtoken0123456789abcdef".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.now.kind, NowKind::Failed);
+        assert_eq!(failed.now.action, Some("paste_token"));
+        assert!(failed.now.paste.is_some());
+        assert!(!format!("{failed:?}").contains("ghp_badtoken"));
+        assert!(keys(&h.allan).is_empty());
     }
 }

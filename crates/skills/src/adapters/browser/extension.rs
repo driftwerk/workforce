@@ -397,6 +397,18 @@ impl ExtensionCell {
         *self.open.lock().unwrap() && self.ask("front", json!({})).await.is_ok()
     }
 
+    /// The address this tab is on now, as Chrome has it, if it is open:
+    /// nothing on the page is read.
+    pub(super) async fn location(&self) -> Option<String> {
+        if !*self.open.lock().unwrap() {
+            return None;
+        }
+        let at = self.ask("where", json!({})).await.ok()?;
+        let url = at["url"].as_str()?.to_string();
+        untrusted::on(&self.key, &url);
+        Some(url)
+    }
+
     pub(super) async fn close(&self) -> bool {
         let was = std::mem::replace(&mut *self.open.lock().unwrap(), false);
         if was {
@@ -544,6 +556,16 @@ impl ExtensionCell {
     pub(super) async fn sign_in(&self, url: &str) -> Result<Value> {
         if !matches!(super::address::kind(url), super::address::Kind::Web) {
             return Err(eyre!("A sign-in page is a web page (https://…)."));
+        }
+        // A connection setup's card asks for this sign-in itself.
+        let conversation = CURRENT_SESSION_KEY
+            .try_with(|k| k.clone())
+            .ok()
+            .filter(|k| !k.is_empty());
+        if let (Some(hooks), Some(conversation)) = (hooks::hooks(), conversation) {
+            if let Some(why) = hooks.sign_in_owned(&self.user, &self.agent, &conversation, url) {
+                return Err(eyre!(why));
+            }
         }
         *self.handed.lock().unwrap() = false;
         let id = SessionId(self.key.clone());
@@ -806,12 +828,16 @@ impl ExtensionCell {
 
     /// Reads a new key off a key page and hands it to the hub's secret path,
     /// never to the model: what [`keys`] describes.
-    pub(super) async fn capture_key(&self, selector: &str, connector: &str) -> Result<Value> {
+    pub(super) async fn capture_key(
+        &self,
+        selector: Option<&str>,
+        connector: &str,
+    ) -> Result<Value> {
         let Some(hooks) = hooks::hooks() else {
             return Err(eyre!(NO_BROWSER));
         };
         self.with(async |url| {
-            selector_ok(url, Some(selector))?;
+            selector_ok(url, selector)?;
             // A key is kept for the conversation whose setup asked for it.
             let conversation = CURRENT_SESSION_KEY
                 .try_with(|k| k.clone())
@@ -838,7 +864,9 @@ impl ExtensionCell {
             let read = self
                 .ask(
                     "capture_key",
-                    json!({ "selector": selector, "origin": page.origin, "paths": keys::paths_at(&page, url) }),
+                    // No selector: the extension finds the one element
+                    // showing a whole key of this shape itself.
+                    json!({ "selector": selector, "shape": page.shape.as_str(), "origin": page.origin, "paths": keys::paths_at(&page, url) }),
                 )
                 .await?;
             let value = read["value"].as_str().unwrap_or_default().to_string();
