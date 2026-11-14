@@ -462,7 +462,11 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     // crew tool's.
     use super::relayed_decide::{DECIDED, TAKE};
     let (status, body) = match r.tool.as_str() {
-        TAKE => s.crew.take_relayed(&boss, &r.group, &r.input, &ceiling),
+        TAKE => {
+            s.crew
+                .take_relayed(&boss, &r.group, &r.input, &ceiling)
+                .await
+        }
         DECIDED => s.crew.relayed_decided(&boss, &r.group, &r.input).await,
         _ => {
             let out = s

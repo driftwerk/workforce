@@ -767,6 +767,13 @@ impl CrewHub {
     /// the person's plans), for [`Self::fully`]: one that can't be read
     /// leaves none, so Act fully waits.
     pub(crate) async fn read_served_spent(&self, boss: &str) {
+        // A boss relayed from the home counts one budget with its home: only
+        // from the home's fresh word ([`super::shared_budget`]).
+        if super::relayed_decide::relayed_party(boss) {
+            self.spent_today.lock().remove(boss);
+            self.refresh_relayed_spent(boss).await;
+            return;
+        }
         let now = chrono::Utc::now();
         let midnight = self
             .desk
