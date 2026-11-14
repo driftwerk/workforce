@@ -1102,12 +1102,14 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
 /// a new branch), `folder-remotes` (a listing says its repository and where
 /// it comes from), `keep-tickets` (a board with tickets of its own links
 /// keeping them), `session-model` (a new session runs the model it is
-/// given, and says it).
+/// given, and says it), `ticket-start-on` (a ticket's new session takes a
+/// model, and a ticket is given to a session started on a machine).
 pub const FEATURES: &[&str] = &[
     "fresh-worktree",
     "folder-remotes",
     "keep-tickets",
     "session-model",
+    "ticket-start-on",
 ];
 
 async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {

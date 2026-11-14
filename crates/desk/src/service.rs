@@ -51,7 +51,7 @@ mod board_sync;
 mod ticket_comments;
 mod ticket_files;
 pub use board::{
-    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
+    AssignTo, BoardPatch, ChargedTo, Move, MachineSessionFor, NewBoard, NewSessionFor, NewTicket, StartText, TicketPatch,
     TicketQuery, TicketView,
 };
 pub use board_sync::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};

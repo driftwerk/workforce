@@ -139,7 +139,7 @@ pub use service::{
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
-    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
+    AssignTo, BoardPatch, ChargedTo, Move, MachineSessionFor, NewBoard, NewSessionFor, NewTicket, StartText, TicketPatch,
     TicketQuery, TicketView,
 };
 pub use service::{
