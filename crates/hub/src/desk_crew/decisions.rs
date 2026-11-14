@@ -44,6 +44,9 @@ pub(crate) struct Done {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Before {
     pub mode: Option<String>,
+    /// A dialog's question its boss answers (by denying its start, with the
+    /// answer as its reason): what it asked.
+    pub question: Option<String>,
 }
 
 /// How `action`, done as `done` says, is undone: the kind, and what the
@@ -232,6 +235,17 @@ impl CrewHub {
                     .ok()
                     .and_then(|v| v.mode)
                     .map(|m| m.as_str().to_string()),
+                ..Before::default()
+            },
+            Action::Deny { session, approval } if self.desk.asks_in_dialog(*session) => Before {
+                question: self
+                    .desk
+                    .view(*session)
+                    .ok()
+                    .and_then(|v| v.pending)
+                    .filter(|p| p.id == *approval)
+                    .map(|p| p.detail),
+                ..Before::default()
             },
             _ => Before::default(),
         }
@@ -283,6 +297,12 @@ impl CrewHub {
                     ),
                 }
             }
+            Action::Deny { session, .. } if before.question.is_some() => format!(
+                "answered {}'s question “{}” with “{}”",
+                self.name_of_session(*session),
+                crew::one_line(before.question.as_deref().unwrap_or_default(), 160),
+                crew::clip(&why_of(by), 200)
+            ),
             _ => crew::clip(said, 240),
         };
         // The short line never quotes what was sent: that is its message.
@@ -780,6 +800,7 @@ mod tests {
         // The reverse call.
         let mode = Before {
             mode: Some("default".into()),
+            ..Before::default()
         };
         let set = Action::SetMode {
             session: s,

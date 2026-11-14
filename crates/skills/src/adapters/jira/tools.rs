@@ -2309,6 +2309,427 @@ impl Tool for JiraApiTool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// jira.dev_status — an issue's PRs, branches, commits and builds
+// ──────────────────────────────────────────────────────────────────────
+
+/// Jira's development panel, read the way its own page reads it. This is
+/// an undocumented internal endpoint: everything that knows its shape is in
+/// [`dev_status_plan`] and [`dev_status_answer`], so a change there breaks
+/// one place.
+const DEV_STATUS: &str = "/rest/dev-status/latest/issue";
+
+/// The most PRs, branches and builds one answer carries.
+const DEV_LISTED_MAX: usize = 50;
+
+/// Whether `id` can be a Jira issue's numeric id.
+fn issue_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 20 && id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether `t` can be an instance type the summary names
+/// (`oAuth-com.github.integration.production`, `cloud-providers`).
+fn instance_type_ok(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 100
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// The detail reads an issue's development summary calls for, as
+/// `(dataType, applicationType)`: the summary names, per data type, the
+/// instance types that hold some (the GitHub app's is
+/// `oAuth-com.github.integration.production`; `GitHub` itself answers
+/// nothing for it). A `branch` read carries its PRs too, so a PR read is
+/// only made for an instance with PRs and no branches. Builds come from
+/// their own instances (`cloud-providers`).
+fn dev_status_plan(summary: &Value) -> Vec<(&'static str, String)> {
+    let instances = |data_type: &str| -> Vec<String> {
+        summary["summary"][data_type]["byInstanceType"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| v["count"].as_u64().unwrap_or(0) > 0)
+            .map(|(k, _)| k.clone())
+            .filter(|k| instance_type_ok(k))
+            .take(3)
+            .collect()
+    };
+    let branches = instances("branch");
+    let mut plan: Vec<(&'static str, String)> =
+        branches.iter().map(|t| ("branch", t.clone())).collect();
+    for t in instances("pullrequest") {
+        if !branches.contains(&t) {
+            plan.push(("pullrequest", t));
+        }
+    }
+    for t in instances("build") {
+        plan.push(("build", t));
+    }
+    plan
+}
+
+/// The PR reads still wanted once the branch reads are in: an instance
+/// whose branches carried fewer PRs than the summary counts for it (a PR
+/// whose branch is gone) is read for its PRs too.
+fn dev_status_more_prs(summary: &Value, details: &[Value]) -> Vec<String> {
+    let entries: Vec<&Value> = details
+        .iter()
+        .flat_map(|d| d["detail"].as_array().into_iter().flatten())
+        .collect();
+    let read_by_branch = |t: &str| entries.iter().any(|d| d["_instance"]["type"] == t);
+    summary["summary"]["pullrequest"]["byInstanceType"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(t, _)| instance_type_ok(t) && read_by_branch(t))
+        .filter(|(t, v)| {
+            let counted = v["count"].as_u64().unwrap_or(0);
+            let carried: usize = entries
+                .iter()
+                .filter(|d| d["_instance"]["type"] == t.as_str())
+                .map(|d| d["pullRequests"].as_array().map_or(0, Vec::len))
+                .sum();
+            (carried as u64) < counted
+        })
+        .map(|(t, _)| t.clone())
+        .take(3)
+        .collect()
+}
+
+/// The PR number in a dev-status id (`#94`), else in its address.
+fn dev_pr_number(pr: &Value) -> Value {
+    let from_id = pr["id"]
+        .as_str()
+        .and_then(|s| s.trim().strip_prefix('#'))
+        .and_then(|n| n.parse::<u64>().ok());
+    let from_url = || {
+        let url = pr["url"].as_str()?;
+        let (_, rest) = url
+            .split_once("/pull/")
+            .or_else(|| url.split_once("/merge_requests/"))?;
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse::<u64>()
+            .ok()
+    };
+    from_id.or_else(from_url).map_or(Value::Null, Value::from)
+}
+
+/// A name as dev-status gives it, wrapped; null when blank.
+fn dev_name(v: &Value, source: &str) -> Value {
+    match v.as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => wrap_field(&Value::String(s.to_string()), source),
+        _ => Value::Null,
+    }
+}
+
+/// A PR's author, wrapped; null for the `"User "` Jira writes for one it
+/// can't name.
+fn dev_author(v: &Value) -> Value {
+    match v.as_str().map(str::trim) {
+        Some("User") => Value::Null,
+        _ => dev_name(v, "jira.dev_status.author"),
+    }
+}
+
+/// The issue's development as `jira.dev_status` answers it, from its
+/// summary and the detail reads [`dev_status_plan`] asked for: its PRs
+/// (each once), branches, commits (how many, and the latest's time, from
+/// the summary) and builds (newest first). Every name is wrapped; addresses
+/// are passed as they are.
+fn dev_status_answer(summary: &Value, details: &[Value]) -> Value {
+    let mut prs: Vec<Value> = vec![];
+    let mut branches: Vec<Value> = vec![];
+    let mut builds: Vec<Value> = vec![];
+    let entries = details
+        .iter()
+        .flat_map(|d| d["detail"].as_array().into_iter().flatten());
+    for d in entries {
+        for p in d["pullRequests"].as_array().into_iter().flatten() {
+            let url = p["url"].clone();
+            if prs.len() >= DEV_LISTED_MAX || prs.iter().any(|x| x["url"] == url) {
+                continue;
+            }
+            let reviewers = p["reviewers"].as_array().map_or(&[][..], Vec::as_slice);
+            prs.push(json!({
+                "id": p["id"],
+                "number": dev_pr_number(p),
+                "url": url,
+                "title": wrap_field(&p["name"], "jira.dev_status.pr_title"),
+                "status": p["status"],
+                "author": dev_author(&p["author"]["name"]),
+                "repo": dev_name(&p["repositoryName"], "jira.dev_status.repo"),
+                "source_branch": dev_name(&p["source"]["branch"], "jira.dev_status.branch"),
+                "destination_branch": dev_name(&p["destination"]["branch"], "jira.dev_status.branch"),
+                "last_update": p["lastUpdate"],
+                "reviewers": reviewers.len(),
+                "approvals": reviewers.iter().filter(|r| r["approved"].as_bool() == Some(true)).count(),
+            }));
+        }
+        for b in d["branches"].as_array().into_iter().flatten() {
+            let url = b["url"].clone();
+            if branches.len() >= DEV_LISTED_MAX || branches.iter().any(|x| x["url"] == url) {
+                continue;
+            }
+            branches.push(json!({
+                "name": dev_name(&b["name"], "jira.dev_status.branch"),
+                "url": url,
+                "repo": dev_name(&b["repository"]["name"], "jira.dev_status.repo"),
+                "last_commit": b["lastCommit"]["authorTimestamp"],
+            }));
+        }
+        for group in d["jswddBuildsData"].as_array().into_iter().flatten() {
+            for b in group["builds"].as_array().into_iter().flatten() {
+                let reference = b["references"].as_array().and_then(|r| r.first());
+                let branch = reference.and_then(|r| r["ref"]["name"].as_str());
+                // `https://api.github.com/repos/acme/app` names `acme/app`.
+                let repo = reference
+                    .and_then(|r| r["commit"]["repositoryUri"].as_str())
+                    .and_then(|u| u.split_once("/repos/"))
+                    .map(|(_, r)| r.trim_end_matches('/'));
+                builds.push(json!({
+                    "name": dev_name(&b["displayName"], "jira.dev_status.build"),
+                    "pipeline": b["pipelineId"],
+                    "state": b["state"],
+                    "url": b["url"],
+                    "branch": dev_name(&branch.map_or(Value::Null, Value::from), "jira.dev_status.branch"),
+                    "repo": dev_name(&repo.map_or(Value::Null, Value::from), "jira.dev_status.repo"),
+                    "updated": b["lastUpdated"],
+                }));
+            }
+        }
+    }
+    // Newest first, so the latest run of each pipeline comes first.
+    builds.sort_by(|a, b| {
+        b["updated"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(a["updated"].as_str().unwrap_or_default())
+    });
+    builds.truncate(DEV_LISTED_MAX);
+    let repository = &summary["summary"]["repository"]["overall"];
+    let commits = match repository["count"].as_u64() {
+        Some(count) => json!({ "count": count, "latest": repository["lastUpdated"] }),
+        None => Value::Null,
+    };
+    json!({
+        "prs": prs,
+        "branches": branches,
+        "commits": commits,
+        "builds": builds,
+    })
+}
+
+jira_tool_struct!(JiraDevStatusTool);
+
+#[async_trait]
+impl Tool for JiraDevStatusTool {
+    fn name(&self) -> &str {
+        "jira.dev_status"
+    }
+    fn description(&self) -> &str {
+        "A Jira issue's development: its pull requests (state, author, repo, branches), branches, commit count and builds, as the issue's Development panel shows them. Read-only."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
+                "issue_id": { "type": "string", "description": "The issue's numeric id, when known: saves looking it up by its key" }
+            },
+            "required": ["issue_key"]
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = resolve_or_fail!(self, input, start);
+        let key = match required_str(&input, "issue_key") {
+            Ok(s) if issue_key_ok(s) => s.to_string(),
+            Ok(s) => {
+                return Ok(ToolResult::failure(
+                    format!("'{s}' isn't an issue key"),
+                    ms(),
+                ))
+            }
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        let given = match &input["issue_id"] {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        };
+        let id = match given {
+            Some(id) if issue_id_ok(&id) => id,
+            Some(id) => {
+                return Ok(ToolResult::failure(
+                    format!("'{id}' isn't an issue id"),
+                    ms(),
+                ))
+            }
+            None => match client
+                .get(&format!("{REST}/issue/{key}?fields=summary"))
+                .await
+            {
+                Ok(v) => match v["id"].as_str().filter(|id| issue_id_ok(id)) {
+                    Some(id) => id.to_string(),
+                    None => return Ok(ToolResult::failure(format!("{key} has no id"), ms())),
+                },
+                Err(e) => {
+                    return Ok(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {key}")),
+                        ms(),
+                    ))
+                }
+            },
+        };
+        let summary = match client
+            .get_with_query(
+                &format!("{DEV_STATUS}/summary"),
+                &[("issueId", id.as_str())],
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ToolResult::from_report(
+                    &e.wrap_err(format!("Failed to read {key}'s development")),
+                    ms(),
+                ))
+            }
+        };
+        let mut details: Vec<Value> = vec![];
+        let mut reads: std::collections::VecDeque<_> = dev_status_plan(&summary).into();
+        let mut more_asked = false;
+        while let Some((data_type, app)) = reads.pop_front() {
+            let query = [
+                ("issueId", id.as_str()),
+                ("applicationType", app.as_str()),
+                ("dataType", data_type),
+            ];
+            match client
+                .get_with_query(&format!("{DEV_STATUS}/detail"), &query)
+                .await
+            {
+                Ok(v) => details.push(v),
+                // Builds are a nicety: without them the PRs still stand.
+                Err(e) if data_type == "build" => {
+                    warn!(error = %e, issue = %key, "an issue's builds weren't read");
+                }
+                // A PR list missing one instance's would read as complete.
+                Err(e) => {
+                    let what = match data_type {
+                        "branch" => "branches",
+                        _ => "pull requests",
+                    };
+                    return Ok(ToolResult::from_report(
+                        &e.wrap_err(format!("Failed to read {key}'s {what}")),
+                        ms(),
+                    ));
+                }
+            }
+            // Once the branches are in, the PRs they didn't carry.
+            if !more_asked && !reads.iter().any(|(t, _)| *t == "branch") {
+                more_asked = true;
+                for t in dev_status_more_prs(&summary, &details) {
+                    reads.push_back(("pullrequest", t));
+                }
+            }
+        }
+        let mut out = dev_status_answer(&summary, &details);
+        out["issue_key"] = json!(key);
+        out["issue_id"] = json!(id);
+        info!(issue = %key, "Read a Jira issue's development");
+        Ok(ToolResult::success(out, ms()))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// jira.list_remote_links — the pages, designs and tickets an issue links
+// ──────────────────────────────────────────────────────────────────────
+
+/// An issue's remote links (`/issue/{key}/remotelink`): each one's title,
+/// summary, app and relation wrapped, and its address as it is when it is
+/// https, else wrapped too (anyone can write one).
+fn remote_links_of(answer: &Value) -> Vec<Value> {
+    answer
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(DEV_LISTED_MAX)
+        .map(|l| {
+            let o = &l["object"];
+            let https = o["url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("https://") && !u.contains(char::is_whitespace));
+            json!({
+                "id": l["id"],
+                "url": match https {
+                    true => o["url"].clone(),
+                    false => wrap_field(&o["url"], "jira.list_remote_links.url"),
+                },
+                "title": wrap_field(&o["title"], "jira.list_remote_links.title"),
+                "summary": wrap_field(&o["summary"], "jira.list_remote_links.summary"),
+                "app": wrap_field(&l["application"]["name"], "jira.list_remote_links.app"),
+                "relationship": wrap_field(&l["relationship"], "jira.list_remote_links.relationship"),
+                "resolved": o["status"]["resolved"],
+            })
+        })
+        .collect()
+}
+
+jira_tool_struct!(JiraListRemoteLinksTool);
+
+#[async_trait]
+impl Tool for JiraListRemoteLinksTool {
+    fn name(&self) -> &str {
+        "jira.list_remote_links"
+    }
+    fn description(&self) -> &str {
+        "The web links on a Jira issue (Confluence pages, designs, other trackers): each one's title, address, app and relation. Read-only."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" }
+            },
+            "required": ["issue_key"]
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = resolve_or_fail!(self, input, start);
+        let key = match required_str(&input, "issue_key") {
+            Ok(s) if issue_key_ok(s) => s.to_string(),
+            Ok(s) => {
+                return Ok(ToolResult::failure(
+                    format!("'{s}' isn't an issue key"),
+                    ms(),
+                ))
+            }
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        match client.get(&format!("{REST}/issue/{key}/remotelink")).await {
+            Ok(v) => {
+                let links = remote_links_of(&v);
+                Ok(ToolResult::success(
+                    json!({ "issue_key": key, "count": links.len(), "links": links }),
+                    ms(),
+                ))
+            }
+            Err(e) => Ok(ToolResult::from_report(
+                &e.wrap_err(format!("Failed to list {key}'s links")),
+                ms(),
+            )),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -2828,6 +3249,264 @@ mod tests {
     fn required_str_rejects_missing_key() {
         let input = json!({});
         assert!(required_str(&input, "summary").is_err());
+    }
+
+    /// An issue's development summary, as a site with the GitHub app and
+    /// GitHub Actions builds answers it (scrubbed).
+    const DEV_SUMMARY: &str = r##"{"configErrors":[],"errors":[],"summary":{
+        "branch":{"byInstanceType":{"oAuth-com.github.integration.production":{"count":1,"name":"GitHub"}},"overall":{"count":1,"dataType":"branch","lastUpdated":"2026-11-12T13:32:28.000+0000"}},
+        "build":{"byInstanceType":{"cloud-providers":{"count":2,"name":"Other providers"}},"overall":{"count":2,"dataType":"build","failedBuildCount":0,"lastUpdated":"2026-11-12T22:51:03.000+0000","successfulBuildCount":2,"unknownBuildCount":0}},
+        "deployment-environment":{"byInstanceType":{},"overall":{"count":0,"dataType":"deployment-environment","lastUpdated":null}},
+        "pullrequest":{"byInstanceType":{"oAuth-com.github.integration.production":{"count":1,"name":"GitHub"}},"overall":{"count":2,"dataType":"pullrequest","lastUpdated":"2026-11-12T22:43:26.000+0000","open":true,"state":"OPEN","stateCount":1}},
+        "repository":{"byInstanceType":{"oAuth-com.github.integration.production":{"count":3,"name":"GitHub"}},"overall":{"count":3,"dataType":"repository","lastUpdated":"2026-11-12T13:32:28.000+0000"}},
+        "review":{"byInstanceType":{},"overall":{"count":0,"dataType":"review","lastUpdated":null}}}}"##;
+
+    /// Its `dataType=branch` detail, which carries the branches' PRs too.
+    const DEV_BRANCHES: &str = r##"{"errors":[],"detail":[{
+        "_instance":{"baseUrl":"https://github.com","id":"com.github.integration.production","name":"GitHub","singleInstance":true,"type":"oAuth-com.github.integration.production","typeName":"GitHub"},
+        "branches":[{"createPullRequestUrl":"https://github.com/acme/app/compare/eng-1-retry","name":"eng-1-retry",
+            "lastCommit":{"author":{"name":"User "},"authorTimestamp":"2026-11-12T13:32:28.000+0000","displayId":"baa4907","id":"baa4907b03f5","message":"Retry the upload","url":"https://github.com/acme/app/commit/baa4907b03f5"},
+            "repository":{"id":"203360739","name":"acme/app","url":"https://github.com/acme/app"},
+            "url":"https://github.com/acme/app/tree/eng-1-retry"}],
+        "pullRequests":[
+            {"author":{"avatar":"https://example.com/a.png","name":"User "},"commentCount":3,
+             "destination":{"branch":"main","url":"https://github.com/acme/app/tree/main"},
+             "id":"#15688","lastUpdate":"2026-11-12T22:43:26.000+0000","name":"ENG-1 Retry the upload",
+             "repositoryId":"203360739","repositoryName":"acme/app","repositoryUrl":"https://github.com/acme/app","reviewers":[],
+             "source":{"branch":"eng-1-retry","url":"https://github.com/acme/app/tree/eng-1-retry"},
+             "status":"OPEN","url":"https://github.com/acme/app/pull/15688"},
+            {"author":{"name":"Ada Example"},"commentCount":1,
+             "destination":{"branch":"main","url":"https://github.com/acme/app/tree/main"},
+             "id":"#16041","lastUpdate":"2026-10-22T13:09:52.000+0000","name":"ENG-1 Check the worked times",
+             "repositoryName":"acme/app","reviewers":[{"approved":false,"name":"Bo"},{"approved":true,"name":"Cy"}],
+             "source":{"branch":"fix/eng-1-times","url":"https://github.com/acme/app/tree/fix%2Feng-1-times"},
+             "status":"MERGED","url":"https://github.com/acme/app/pull/16041"}],
+        "repositories":[]}]}"##;
+
+    /// Its `dataType=build` detail: every run, oldest last.
+    const DEV_BUILDS: &str = r##"{"errors":[],"detail":[{
+        "_instance":{"id":"cloud-providers","name":"cloud-providers","type":"cloud-providers","typeName":"Other providers"},
+        "jswddBuildsData":[{"builds":[
+            {"buildNumber":56440,"displayName":"Build + Test","id":"pipelineId/17957/buildId/56440","lastUpdated":"2026-10-01T12:20:13Z","pipelineId":"17957",
+             "references":[{"commit":{"id":"f5ced","repositoryUri":"https://api.github.com/repos/acme/app"},"ref":{"name":"eng-1-retry","uri":"https://api.github.com/repos/acme/app/tree/eng-1-retry"}}],
+             "state":"failed","url":"https://github.com/acme/app/actions/runs/1"},
+            {"buildNumber":58671,"displayName":"Build + Test","id":"pipelineId/17957/buildId/58671","lastUpdated":"2026-11-12T22:51:03Z","pipelineId":"17957",
+             "references":[{"commit":{"id":"baa49","repositoryUri":"https://api.github.com/repos/acme/app"},"ref":{"name":"eng-1-retry","uri":"https://api.github.com/repos/acme/app/tree/eng-1-retry"}}],
+             "state":"successful","url":"https://github.com/acme/app/actions/runs/2"},
+            {"buildNumber":10117,"displayName":"Lint","id":"pipelineId/9/buildId/10117","lastUpdated":"2026-11-12T22:42:57Z","pipelineId":"9",
+             "references":[{"commit":{"id":"baa49","repositoryUri":"https://api.github.com/repos/acme/app"},"ref":{"name":"eng-1-retry","uri":"https://api.github.com/repos/acme/app/tree/eng-1-retry"}}],
+             "state":"successful","url":"https://github.com/acme/app/actions/runs/3"}]}]}]}"##;
+
+    fn unwrapped(v: &Value) -> String {
+        let s = v.as_str().unwrap_or_default();
+        assert!(s.contains("EXTERNAL_UNTRUSTED_CONTENT"), "{s} is wrapped");
+        s.to_string()
+    }
+
+    #[test]
+    fn the_development_summary_asks_for_each_instance_that_holds_some() {
+        let summary: Value = serde_json::from_str(DEV_SUMMARY).unwrap();
+        assert_eq!(
+            dev_status_plan(&summary),
+            vec![
+                (
+                    "branch",
+                    "oAuth-com.github.integration.production".to_string()
+                ),
+                ("build", "cloud-providers".to_string()),
+            ],
+            "a branch read carries its PRs, so no PR read is made for the same instance"
+        );
+        let only_prs = json!({ "summary": { "pullrequest": { "byInstanceType": {
+            "oAuth-com.github.integration.production": { "count": 2 },
+            "bad type?": { "count": 1 } } } } });
+        assert_eq!(
+            dev_status_plan(&only_prs),
+            vec![(
+                "pullrequest",
+                "oAuth-com.github.integration.production".to_string()
+            )]
+        );
+        assert!(dev_status_plan(&json!({ "summary": {} })).is_empty());
+        assert!(dev_status_plan(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn prs_a_branch_read_didn_t_carry_are_read_on_their_own() {
+        let branches: Value = serde_json::from_str(DEV_BRANCHES).unwrap();
+        let app = "oAuth-com.github.integration.production";
+        let summary = |count: u64| json!({ "summary": { "pullrequest": { "byInstanceType": { app: { "count": count } } } } });
+        // The branches carried both PRs it counts: nothing more to read.
+        assert!(dev_status_more_prs(&summary(2), std::slice::from_ref(&branches)).is_empty());
+        // It counts three: the PRs are read too.
+        assert_eq!(
+            dev_status_more_prs(&summary(3), std::slice::from_ref(&branches)),
+            vec![app.to_string()]
+        );
+        // An instance no branch read covered was planned for its PRs already.
+        assert!(dev_status_more_prs(&summary(3), &[]).is_empty());
+    }
+
+    #[test]
+    fn the_development_answer_lists_prs_branches_commits_and_builds_wrapped() {
+        let summary: Value = serde_json::from_str(DEV_SUMMARY).unwrap();
+        let details: Vec<Value> = [DEV_BRANCHES, DEV_BUILDS]
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let out = dev_status_answer(&summary, &details);
+        let prs = out["prs"].as_array().unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0]["number"], 15688);
+        assert_eq!(prs[0]["status"], "OPEN");
+        assert_eq!(prs[0]["url"], "https://github.com/acme/app/pull/15688");
+        assert!(unwrapped(&prs[0]["title"]).contains("ENG-1 Retry the upload"));
+        assert!(unwrapped(&prs[0]["repo"]).contains("acme/app"));
+        assert!(unwrapped(&prs[0]["source_branch"]).contains("eng-1-retry"));
+        assert_eq!(
+            prs[0]["author"],
+            Value::Null,
+            "an anonymised author is no one"
+        );
+        assert!(unwrapped(&prs[1]["author"]).contains("Ada Example"));
+        assert_eq!(
+            (prs[1]["reviewers"].clone(), prs[1]["approvals"].clone()),
+            (json!(2), json!(1))
+        );
+        let branches = out["branches"].as_array().unwrap();
+        assert_eq!(branches.len(), 1);
+        assert!(unwrapped(&branches[0]["name"]).contains("eng-1-retry"));
+        assert_eq!(
+            branches[0]["url"],
+            "https://github.com/acme/app/tree/eng-1-retry"
+        );
+        assert_eq!(
+            out["commits"],
+            json!({ "count": 3, "latest": "2026-11-12T13:32:28.000+0000" })
+        );
+        let builds = out["builds"].as_array().unwrap();
+        assert_eq!(builds.len(), 3);
+        assert_eq!(builds[0]["state"], "successful", "newest first");
+        assert_eq!(builds[0]["pipeline"], "17957");
+        assert_eq!(builds[2]["state"], "failed");
+        assert!(unwrapped(&builds[0]["branch"]).contains("eng-1-retry"));
+        assert!(unwrapped(&builds[0]["repo"]).contains("acme/app"));
+        // The same PR from two instances' reads is listed once.
+        let twice = dev_status_answer(&summary, &[details[0].clone(), details[0].clone()]);
+        assert_eq!(twice["prs"].as_array().unwrap().len(), 2);
+        // An issue with nothing says so, and no commits when the summary hasn't them.
+        let none = dev_status_answer(&Value::Null, &[]);
+        assert_eq!(
+            none,
+            json!({ "prs": [], "branches": [], "commits": null, "builds": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_status_reads_the_summary_then_the_details_it_names() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let body = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "id": "82498", "key": "ENG-1" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/dev-status/latest/issue/summary"))
+            .and(query_param("issueId", "82498"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body(DEV_SUMMARY)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/dev-status/latest/issue/detail"))
+            .and(query_param("dataType", "branch"))
+            .and(query_param(
+                "applicationType",
+                "oAuth-com.github.integration.production",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body(DEV_BRANCHES)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // A site whose builds can't be read still answers its PRs.
+        Mock::given(method("GET"))
+            .and(path("/rest/dev-status/latest/issue/detail"))
+            .and(query_param("dataType", "build"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraDevStatusTool::new(clients, "acme".into(), Arc::default());
+        // By key, it looks the id up once; with the id, not at all.
+        for input in [
+            json!({ "issue_key": "ENG-1" }),
+            json!({ "issue_key": "ENG-1", "issue_id": "82498" }),
+        ] {
+            let r = tool.execute(input).await.unwrap();
+            assert!(r.success, "{:?}", r.error);
+            assert_eq!(r.output["issue_id"], "82498");
+            assert_eq!(r.output["prs"].as_array().unwrap().len(), 2);
+            assert_eq!(r.output["builds"], json!([]));
+        }
+        for bad in [
+            json!({ "issue_key": "ENG-1/../x" }),
+            json!({ "issue_key": "ENG-1", "issue_id": "1&x=2" }),
+            json!({}),
+        ] {
+            assert!(!tool.execute(bad.clone()).await.unwrap().success, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_links_come_with_their_words_wrapped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-1/remotelink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 10000, "relationship": "mentioned in",
+                  "application": { "type": "com.atlassian.confluence", "name": "Confluence" },
+                  "object": { "url": "https://acme.atlassian.net/wiki/x/AbC", "title": "Upload retries",
+                              "status": { "resolved": false } } },
+                { "id": 10001, "object": { "url": "https://www.figma.com/file/abc", "title": "Retry screen" } },
+                { "id": 10002, "object": { "url": "javascript:alert(1)", "title": "Not a page" } }
+            ])))
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraListRemoteLinksTool::new(clients, "acme".into(), Arc::default());
+        let r = tool.execute(json!({ "issue_key": "ENG-1" })).await.unwrap();
+        assert!(r.success, "{:?}", r.error);
+        let links = r.output["links"].as_array().unwrap();
+        assert_eq!(r.output["count"], 3);
+        assert_eq!(links[0]["url"], "https://acme.atlassian.net/wiki/x/AbC");
+        assert!(unwrapped(&links[0]["title"]).contains("Upload retries"));
+        assert!(unwrapped(&links[0]["app"]).contains("Confluence"));
+        assert!(unwrapped(&links[0]["relationship"]).contains("mentioned in"));
+        assert_eq!(links[1]["app"], Value::Null);
+        assert!(
+            unwrapped(&links[2]["url"]).contains("javascript:alert(1)"),
+            "an address that isn't https is someone's words"
+        );
+        let bad = tool
+            .execute(json!({ "issue_key": "ENG-1?x" }))
+            .await
+            .unwrap();
+        assert!(!bad.success);
     }
 
     #[test]

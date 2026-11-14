@@ -1535,6 +1535,7 @@ impl Desk {
                     None,
                     crate::board_sync::priorities(s),
                 ),
+                dev: None,
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -2470,6 +2471,7 @@ impl Desk {
             // Its body is Desk's own: never read again for an old shape.
             html_read: crate::board_sync::HTML_READ,
             details: Default::default(),
+            dev: None,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

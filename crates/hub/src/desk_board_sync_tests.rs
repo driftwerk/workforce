@@ -59,15 +59,19 @@ pub(crate) struct Jira {
     /// What `jira.get_issue` adds for an issue when its changelog is asked
     /// for (`changelog`, `created`, `reporter`).
     pub history: BTreeMap<String, Value>,
+    /// What `jira.dev_status` and `jira.list_remote_links` answer, when
+    /// registered: a failure while unset.
+    pub dev_answer: Option<Value>,
+    pub links_answer: Option<Value>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Jira>>;
 
 pub(crate) const JIRA_STATUSES: [&str; 4] = ["To Do", "In Progress", "In Review", "Done"];
 
-struct FakeJiraTool {
-    name: &'static str,
-    jira: Shared,
+pub(crate) struct FakeJiraTool {
+    pub name: &'static str,
+    pub jira: Shared,
 }
 
 fn wrapped(s: &str, source: &str) -> Value {
@@ -279,6 +283,16 @@ impl Tool for FakeJiraTool {
                 };
                 let range = workforce_skills::adapters::file_read::range_of(&input).unwrap();
                 workforce_skills::adapters::file_read::chunk(bytes, mime, range)
+            }
+            "jira.dev_status" | "jira.list_remote_links" => {
+                let answer = match self.name {
+                    "jira.dev_status" => j.dev_answer.clone(),
+                    _ => j.links_answer.clone(),
+                };
+                match answer {
+                    Some(a) => a,
+                    None => return Ok(ToolResult::failure("Jira answered 500", 0)),
+                }
             }
             other => json!({ "unexpected": other }),
         };
