@@ -179,7 +179,23 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
             matches!(d.decide(s.id, p.id, Decision::Deny, you()), Err(DeskError::Invalid(_))),
             "Codex didn't offer it"
         );
-        d.decide(s.id, p.id, Decision::Cancel, you()).unwrap();
+        // Unbound, its boss decides it: a no, where Codex offers only to
+        // cancel, cancels it.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        d.decide(
+            s.id,
+            p.id,
+            Decision::Deny,
+            Some(By::manager("crew", "Crew", "it deletes a file the task needs")),
+        )
+        .unwrap();
         let answer = next_sent(&mut ws, |v| v.get("result").is_some()).await;
         assert_eq!(answer, json!({"id": 0, "result": {"decision": "cancel"}}));
         assert!(d.view(s.id).unwrap().pending.is_none());
@@ -189,6 +205,34 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
         );
         say(&mut ws, json!({"method": "serverRequest/resolved",
             "params": {"threadId": "t1", "requestId": 0}})).await;
+
+        // What Desk didn't see whole is the person's to allow: a command it
+        // only has Codex's reading of, and one too long to show.
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let mut blind = ask(10, None);
+        blind["params"].as_object_mut().unwrap().remove("command");
+        let mut long = ask(11, None);
+        long["params"]["command"] = json!("x".repeat(9000));
+        for (n, request) in [(10, blind), (11, long)] {
+            say(&mut ws, request).await;
+            until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+            let p = d.view(s.id).unwrap().pending.unwrap();
+            assert!(
+                matches!(
+                    d.decide(s.id, p.id, Decision::Allow, Some(By::manager("crew", "Crew", "fine"))),
+                    Err(DeskError::Invalid(m)) if m.contains("didn't see all")
+                ),
+                "request {n}"
+            );
+            d.decide(s.id, p.id, Decision::Cancel, you()).unwrap();
+            next_sent(&mut ws, |v| v["id"] == n).await;
+            say(&mut ws, json!({"method": "serverRequest/resolved",
+                "params": {"threadId": "t1", "requestId": n}})).await;
+            until(|| d.view(s.id).unwrap().pending.is_none()).await;
+        }
 
         // Answered in the terminal: it goes from Desk too.
         say(&mut ws, ask(1, None)).await;
@@ -386,6 +430,73 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let v = d.view(s.id).unwrap();
         assert_eq!((v.state, v.pending), (SessionState::Working, None));
+
+        // Its boss answers its questions: every one, by its id, in the
+        // person's place.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        d.set_dialog_answerers(std::collections::HashMap::from([(s.id, chrono::Duration::zero())]));
+        say(&mut ws, json!({"id": 6, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "t1", "turnId": "u2", "itemId": "q-3", "isBlocking": true,
+            "questions": [
+                {"id": "where", "header": "Target", "question": "Deploy main or the release branch?",
+                 "isOther": false, "isSecret": false, "options": [
+                    {"label": "main", "description": "What is on main now."},
+                    {"label": "release", "description": "The release branch."}]},
+                {"id": "note", "header": "Note", "question": "What should the release note say?",
+                 "isOther": true, "isSecret": false, "options": null}]}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        let p = d.view(s.id).unwrap().pending.unwrap();
+        assert_eq!(p.request.as_ref().unwrap().input["questions"][1]["id"], "note");
+        let boss = |said: &str| Some(By::manager("crew", "Crew", said));
+        assert!(
+            matches!(d.decide(s.id, p.id, Decision::Deny, boss(r#"{"where": "staging"}"#)), Err(DeskError::Invalid(_))),
+            "not one of its options, and the note unanswered"
+        );
+        assert!(d.view(s.id).unwrap().pending.is_some_and(|q| q.id == p.id && q.answerable));
+        d.decide(
+            s.id,
+            p.id,
+            Decision::Deny,
+            boss(r#"{"where": "Release", "note": "Fixes the invite emails."}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            next_sent(&mut ws, |v| v.get("result").is_some()).await,
+            json!({"id": 6, "result": {"answers": {
+                "where": {"answers": ["release"]},
+                "note": {"answers": ["Fixes the invite emails."]}}}})
+        );
+        assert!(d.view(s.id).unwrap().pending.is_none(), "answered");
+        say(&mut ws, json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 6}})).await;
+
+        // A secret is the person's to type, always.
+        say(&mut ws, json!({"id": 7, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "t1", "turnId": "u2", "itemId": "q-4", "isBlocking": true,
+            "questions": [{"id": "key", "header": "Key", "question": "Paste the API key",
+                "isOther": true, "isSecret": true, "options": null}]}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.detail == "Paste the API key")).await;
+        let secret = d.view(s.id).unwrap().pending.unwrap();
+        assert!(!secret.answerable && secret.request.is_none());
+        assert!(d.decide(s.id, secret.id, Decision::Deny, boss(r#"{"key": "sk-x"}"#)).is_err());
+
+        // The person writing to it takes a held question back: its terminal asks.
+        say(&mut ws, json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 7}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_none()).await;
+        say(&mut ws, json!({"id": 8, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "t1", "turnId": "u2", "itemId": "q-5", "isBlocking": true,
+            "questions": [{"id": "go", "header": "Go", "question": "Go on?", "isOther": true}]}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        let held = d.view(s.id).unwrap().pending.unwrap();
+        d.person_typing(s.id).unwrap();
+        assert!(d.view(s.id).unwrap().pending.is_some_and(|q| q.id == held.id && !q.answerable));
+        assert!(d.decide(s.id, held.id, Decision::Deny, boss(r#"{"go": "yes"}"#)).is_err());
     })
     .await;
 }

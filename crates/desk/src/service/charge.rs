@@ -353,10 +353,19 @@ impl Desk {
         let held = {
             let mut st = self.0.state.lock();
             st.charges.driven.insert(id, Utc::now());
+            // Codex's question held for its boss is theirs now, in front or
+            // waiting behind another ask.
+            if let Some((_, q)) = st.live.get_mut(&id).and_then(|l| l.codex_question.as_mut()) {
+                q.answerable = false;
+            }
             st.live.get(&id).and_then(|l| {
                 l.pending
                     .as_ref()
-                    .filter(|p| p.answerable && l.holder().is_some_and(|h| h.question))
+                    .filter(|p| {
+                        p.answerable
+                            && (l.holder().is_some_and(|h| h.question)
+                                || l.codex_question.as_ref().is_some_and(|(_, q)| q.id == p.id))
+                    })
                     .map(|p| p.id)
             })
         };
@@ -394,6 +403,10 @@ impl Desk {
                 return;
             };
             p.answerable = false;
+            // Codex's question, kept for when what it asks in front ends.
+            if let Some((_, q)) = l.codex_question.as_mut().filter(|(_, q)| q.id == pending) {
+                q.answerable = false;
+            }
             l.answer.take()
         };
         if let Some(a) = answer {
