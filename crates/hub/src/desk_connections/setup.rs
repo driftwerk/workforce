@@ -587,7 +587,7 @@ impl Setup {
                         "{said} It's kept: turn it on for {} in Connections.",
                         self.whose
                     )),
-                    action: Some("retry"),
+                    action: Some("open_connections"),
                     ..now(NowKind::Failed, format!("{service} isn't on yet"))
                 };
             }
@@ -1068,7 +1068,8 @@ impl Setups {
                 && s.ended.is_none()
         }) {
             s.sync(&self.connections);
-            if s.connected.as_ref().is_some_and(|c| c.on_for.is_some()) {
+            // Kept already, on or not: a new setup would keep it twice.
+            if s.connected.is_some() {
                 continue;
             }
             let failed = s.steps.iter().any(|x| x.state == StepState::Failed);
