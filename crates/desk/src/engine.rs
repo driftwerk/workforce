@@ -703,30 +703,12 @@ fn devin_login_var(name: &str) -> bool {
         || devin_setting(name)
 }
 
-/// A `DEVIN_…` setting of the person's: none naming a secret of any kind,
-/// nor where Devin's API or servers are, which would point its sign-in
-/// elsewhere. The words are matched anywhere in the name, so a setting
-/// that merely contains one (`DEVIN_PATH`, for `PAT`) is left out too.
+/// A `DEVIN_…` setting of the person's that Devin's sign-in sees: only
+/// those its sessions keep ([`crate::devin::DEVIN_KEPT`]), so a sign-in
+/// is checked where its sessions run, and no credential or address of
+/// the person's outranks Devin's own login.
 fn devin_setting(name: &str) -> bool {
-    const SECRET: &[&str] = &[
-        "KEY",
-        "TOKEN",
-        "SECRET",
-        "CREDENTIAL",
-        "PASSWORD",
-        "AUTH",
-        "PAT",
-        "COOKIE",
-        "JWT",
-        "BEARER",
-    ];
-    const WHERE: &[&str] = &[
-        "URL", "URI", "HOST", "ENDPOINT", "BASE", "SERVER", "DOMAIN", "ORIGIN", "GATEWAY", "PROXY",
-    ];
-    let upper = name.to_ascii_uppercase();
-    upper.starts_with("DEVIN_")
-        && !upper.starts_with("DEVIN_API_")
-        && !SECRET.iter().chain(WHERE).any(|w| upper.contains(w))
+    crate::devin::DEVIN_KEPT.contains(&name.to_ascii_uppercase().as_str())
 }
 
 /// Copilot CLI signs in with a GitHub token from its environment; with
@@ -1027,6 +1009,10 @@ mod tests {
             "DEVIN_JWT",
             "DEVIN_BEARER",
             "DEVIN_ORIGIN_X",
+            "DEVIN_DATA_DIR",
+            "DEVIN_CONFIG_DIR",
+            "DEVIN_INSECURE",
+            "DEVIN_MODEL",
         ]
         .iter()
         .map(|k| (k.to_string(), "x".to_string()))
@@ -1037,7 +1023,7 @@ mod tests {
             [
                 "ALL_PROXY",
                 "BROWSER",
-                "DEVIN_THEME",
+                "DEVIN_MODEL",
                 "DISPLAY",
                 "HOME",
                 "HTTPS_PROXY",
