@@ -186,18 +186,25 @@ pub fn devin_said(screen: &str) -> DevinSaid {
 /// [`DEVIN_PAGES`], carrying the login's own `state` and PKCE
 /// `code_challenge` (a page cut short, or one without them, is none), and
 /// sending the browser on to nowhere but this computer
-/// ([`returns_here_only`]).
+/// ([`sends_away`] finds nothing).
 fn devin_page(word: &str) -> Option<url::Url> {
     let page = crate::engine_accounts::page_on(word, DEVIN_PAGES)?;
     let carries = |key: &str| page.query_pairs().any(|(k, v)| k == key && !v.is_empty());
     if !(carries("state") && carries("code_challenge")) {
         return None;
     }
-    if !returns_here_only(&page) {
-        // Without its query: the login's own state and challenge.
-        let mut shown = page.clone();
-        shown.set_query(None);
-        tracing::warn!(page = %shown, "Devin's sign-in page would send the browser on to somewhere other than this computer: not opened");
+    if let Some(name) = sends_away(&page) {
+        // By its shape: the query is the login's own state and challenge.
+        let shown: String = format!(
+            "{}://{}{}",
+            page.scheme(),
+            page.host_str().unwrap_or(""),
+            page.path()
+        )
+        .chars()
+        .take(200)
+        .collect();
+        tracing::warn!(page = %shown, sent_away_by = %name, "Devin's sign-in page would send the browser on to somewhere other than this computer: not opened");
         return None;
     }
     Some(page)
@@ -207,24 +214,45 @@ fn devin_page(word: &str) -> Option<url::Url> {
 /// result to.
 const APP_SCHEMES: &[&str] = &["windsurf", "devin", "codeium"];
 
-/// Whether every value in `page`'s query (split on `&` and `;`, as some
-/// servers split it) sends the browser on to nowhere but this computer. A
-/// value with a scheme, or starting with two of `/` and `\` (a host by the
-/// page's own scheme), is allowed only as `http(s)://` on `127.0.0.1`,
-/// `localhost` or `[::1]`, or as one of the [`APP_SCHEMES`]; every other
-/// scheme (`javascript:`, `data:`, `file:`, `blob:`, …) is refused. A value
-/// without one (a path, a word, Windsurf's `chisel-show-auth-token`) is
-/// allowed: the real shapes are still to be seen. Desk's machines check
-/// the same (`desk-machine`'s `returns_here_only`).
+/// Whether `page` sends the browser on to nowhere but this computer
+/// ([`sends_away`] finds nothing).
+#[cfg(test)]
 fn returns_here_only(page: &url::Url) -> bool {
-    page.query()
-        .unwrap_or("")
-        .split(['&', ';'])
-        .flat_map(|part| url::form_urlencoded::parse(part.as_bytes()))
-        .all(|(_, v)| returns_here(&v))
+    sends_away(page).is_none()
 }
 
-/// One query value, read as a browser reads it.
+/// The first of `page`'s query parameters, split at `&` and at `;` (as
+/// some servers split it), whose name or value could send the browser
+/// somewhere but this computer, by its name (`?` when that is no plain
+/// name); none when no parameter does.
+///
+/// Every name and value is checked, whatever it is called: one with a
+/// scheme is allowed only as `http(s)://` on `127.0.0.1`, `localhost` or
+/// `[::1]`, or as one of [`APP_SCHEMES`]; one starting with two of `/` and
+/// `\` (a host by the page's own scheme) is refused, and so is any other
+/// scheme (`javascript:`, `data:`, `file:`, `blob:`, …). One that isn't a
+/// URL (a path, a word, Windsurf's `chisel-show-auth-token`) is allowed:
+/// the real shapes are still to be seen. Desk's machines check the same
+/// (`desk-machine`'s `sends_away`).
+fn sends_away(page: &url::Url) -> Option<String> {
+    page.query()?
+        .split(['&', ';'])
+        .flat_map(|piece| url::form_urlencoded::parse(piece.as_bytes()))
+        .find(|(name, value)| !returns_here(name) || !returns_here(value))
+        .map(|(name, _)| {
+            let plain = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-.[]".contains(c));
+            match plain {
+                true => name.into_owned(),
+                false => "?".to_string(),
+            }
+        })
+}
+
+/// One query name or value, read as a browser reads it.
 fn returns_here(value: &str) -> bool {
     // Browsers drop leading and trailing spaces and controls, and tabs and
     // newlines anywhere, and read `\` as `/`.
@@ -830,6 +858,7 @@ mod tests {
             "&redirect_uri=DEVIN%3A%2F%2Fauth%2Fcallback",
             "&redirect_uri=codeium%3A%2F%2Fauth",
             "&prompt=select_account&code_challenge_method=S256",
+            "&when=12%3A30;page=2",
         ] {
             let page = devin(here);
             assert_eq!(
@@ -856,17 +885,32 @@ mod tests {
             "&next=file%3A%2F%2F%2Fetc%2Fpasswd",
             "&next=blob%3Ahttps%3A%2F%2Flocalhost%2Fx",
             "&Redirect_URI=https%3A%2F%2Fevil.example%2Fcb",
-            // Any parameter, not only those named for it.
-            "&continue=https%3A%2F%2Fevil.example%2F",
-            "&goto=%2F%2Fevil",
-            // Split on `;` as some servers split it.
-            "&x=1;next=https%3A%2F%2Fevil.example",
+            // Whatever the parameter is called, and however it is split.
+            "&returnTo=https%3A%2F%2Fevil.example",
+            "&redirectUrl=https%3A%2F%2Fevil.example",
+            "&continue=%2F%2Fevil",
+            "&redirect_uri%5B%5D=https%3A%2F%2Fevil.example",
+            "&redirect_uri[]=https%3A%2F%2Fevil.example",
+            "&x=1;redirect_uri=https%3A%2F%2Fevil.example",
+            "&https%3A%2F%2Fevil.example",
+            "&next=vscode%3A%2F%2Fx",
             "&redirect_uri=http%3A%2F%2Flocalhost%3A4321%2Fcallback&next=https%3A%2F%2Fevil.example",
         ] {
             assert_eq!(devin_said(&devin_screen(&devin(away))).url, None, "{away}");
         }
         let windsurf = "https://windsurf.com/windsurf/signin?state=s&code_challenge=c&redirect_uri=https%3A%2F%2Fevil.example%2Fcb";
         assert_eq!(devin_said(&devin_screen(windsurf)).url, None);
+        // Which parameter sent it away, by a plain name only.
+        let named = url::Url::parse(&devin("&returnTo=https%3A%2F%2Fevil.example")).unwrap();
+        assert_eq!(sends_away(&named).as_deref(), Some("returnTo"));
+        let bare = url::Url::parse(&devin("&https%3A%2F%2Fevil.example%2Fsecret")).unwrap();
+        assert_eq!(sends_away(&bare).as_deref(), Some("?"));
+        // The page Devin 3000.12.57 prints for a pasted code: no redirect_uri.
+        let pasted = "https://app.devin.ai/auth/cli/continue?state=Zx8q3V1kQ2&prompt=select_account&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1";
+        assert_eq!(
+            devin_said(&devin_screen(pasted)).url.as_deref(),
+            Some(pasted)
+        );
         // Both pages as the binary builds them still pass.
         assert!(returns_here_only(&url::Url::parse(DEVIN_PAGE).unwrap()));
         assert!(returns_here_only(

@@ -741,7 +741,9 @@ pub fn patch_paths(patch: &str) -> Option<Vec<String>> {
             .find_map(|m| line.strip_prefix(m).map(|p| (*m, p)))
         {
             let p = p.trim().to_string();
-            if p.is_empty() || (mark == DELETE && names_a_folder(&p)) {
+            // A path with what shows as nothing in it: Devin may read it
+            // without them (`/etc/x`), Desk with (a file in the folder).
+            if p.is_empty() || p.contains(UNSEEN) || (mark == DELETE && names_a_folder(&p)) {
                 return None;
             }
             if !paths.contains(&p) {
@@ -1517,6 +1519,13 @@ mod tests {
             assert_eq!(patch_paths(&p).unwrap(), ["/x"], "{unseen:?}");
             let p = format!("{unseen}*** Begin Patch\n*** Update File: a\n {unseen} *** Delete File: /etc/x\n*** End Patch");
             assert_eq!(patch_paths(&p).unwrap(), ["a", "/etc/x"], "{unseen:?}");
+        }
+        // In a path, they make it one Desk can't place.
+        for unseen in ['\u{feff}', '\u{200b}', '\u{2060}'] {
+            for path in [format!("{unseen}/etc/x"), format!("src/{unseen}a.rs")] {
+                let p = format!("*** Begin Patch\n*** Update File: {path}\n*** End Patch");
+                assert_eq!(patch_paths(&p), None, "{path:?}");
+            }
         }
         // A unified header behind one is still one.
         assert_eq!(patch_paths("\u{feff}--- a/x\n+++ b/x\n"), None);
