@@ -69,7 +69,9 @@ mod handoff;
 #[cfg(test)]
 mod handoff_tests;
 mod knows;
+mod knows_sync;
 pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
+pub use knows_sync::Gather as KnowsGather;
 mod lifecycle;
 mod line;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
