@@ -3664,7 +3664,7 @@ mod tests {
         );
         assert_eq!(
             listed(ProviderKind::Codex).await,
-            ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
+            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"]
         );
         // The live catalogue comes first once read (another test may have
         // had it read); every built-in model stays listed either way.
