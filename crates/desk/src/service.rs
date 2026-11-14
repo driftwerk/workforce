@@ -3829,6 +3829,22 @@ impl Desk {
                 return self.view_after(seen, id);
             }
             let asked = &live.codex_asks[at];
+            // A boss allows only what Desk saw whole: a request whose
+            // command or changes it didn't see, or saw only in part, is the
+            // person's to allow.
+            let seen_whole = asked
+                .pending
+                .request
+                .as_ref()
+                .is_some_and(|r| r.input.get("clipped").and_then(Value::as_bool) != Some(true));
+            if by.party.kind == crew::PartyKind::Manager
+                && matches!(decision, Decision::Allow | Decision::AllowForSession)
+                && !seen_whole
+            {
+                return Err(DeskError::Invalid(
+                    "Desk didn't see all of what it runs, so it's the person's to allow".into(),
+                ));
+            }
             // A boss's no, where Codex offers only to cancel what it asks:
             // its turn stops there, and the boss tells it why on its line.
             let offered = &asked.pending.choices;
@@ -3888,9 +3904,18 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        // Only a boss that may answer Codex at all says its answers: an
+        // unbound one, or the one that runs the session.
+        let charged = |b: &By| {
+            b.party.kind == crew::PartyKind::Manager
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
+        };
         let said = by
             .as_ref()
-            .filter(|b| decision == Decision::Deny && b.party.kind == crew::PartyKind::Manager)
+            .filter(|b| decision == Decision::Deny && charged(b))
             .and_then(|b| b.reason.clone());
         let seen = {
             let mut guard = self.0.state.lock();
@@ -6325,9 +6350,33 @@ impl Desk {
                     .live
                     .get_mut(&id)
                     .and_then(|l| l.codex_sent.remove(&request.to_string()));
+                let mut why_not = None;
                 if let (Some(sent), Ok(view)) = (sent, self.view(id)) {
                     let note = match event {
                         CodexEvent::Answered(_) => {
+                            // A boss's no reaches Codex without words: why,
+                            // and what to do instead, go on its line once
+                            // Codex has the no, never when the terminal
+                            // answered first.
+                            let manager = sent.by.party.kind == crew::PartyKind::Manager;
+                            if manager && matches!(sent.decision, Decision::Deny | Decision::Cancel)
+                            {
+                                if let Some(why) = sent.by.reason.as_deref() {
+                                    let why = why.trim_end_matches(" (unbound: no limits)");
+                                    let what = match sent.pending.detail.trim() {
+                                        "" => sent.pending.tool.clone(),
+                                        d => format!(
+                                            "{} `{}`",
+                                            sent.pending.tool,
+                                            crew::clip(d, 160)
+                                        ),
+                                    };
+                                    why_not = Some((
+                                        sent.by.clone(),
+                                        format!("I said no to {what}: {why}"),
+                                    ));
+                                }
+                            }
                             decided_note(&view, &sent.pending, sent.decision, sent.by)
                         }
                         _ => {
@@ -6345,6 +6394,21 @@ impl Desk {
                     };
                     if let Some(note) = note {
                         self.note(note);
+                    }
+                }
+                if let Some((by, text)) = why_not {
+                    let told = self
+                        .line_send(
+                            crate::LineSender::Overseer(by),
+                            crate::line::Send::Tell {
+                                to: crate::line::Target::Session(id),
+                                text,
+                                when: crate::line::When::Queue,
+                            },
+                        )
+                        .await;
+                    if let Err(e) = told {
+                        tracing::warn!(%id, error = ?e, "telling Codex why its boss said no failed");
                     }
                 }
                 continue;

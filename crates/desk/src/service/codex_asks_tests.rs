@@ -206,6 +206,34 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
         say(&mut ws, json!({"method": "serverRequest/resolved",
             "params": {"threadId": "t1", "requestId": 0}})).await;
 
+        // What Desk didn't see whole is the person's to allow: a command it
+        // only has Codex's reading of, and one too long to show.
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let mut blind = ask(10, None);
+        blind["params"].as_object_mut().unwrap().remove("command");
+        let mut long = ask(11, None);
+        long["params"]["command"] = json!("x".repeat(9000));
+        for (n, request) in [(10, blind), (11, long)] {
+            say(&mut ws, request).await;
+            until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+            let p = d.view(s.id).unwrap().pending.unwrap();
+            assert!(
+                matches!(
+                    d.decide(s.id, p.id, Decision::Allow, Some(By::manager("crew", "Crew", "fine"))),
+                    Err(DeskError::Invalid(m)) if m.contains("didn't see all")
+                ),
+                "request {n}"
+            );
+            d.decide(s.id, p.id, Decision::Cancel, you()).unwrap();
+            next_sent(&mut ws, |v| v["id"] == n).await;
+            say(&mut ws, json!({"method": "serverRequest/resolved",
+                "params": {"threadId": "t1", "requestId": n}})).await;
+            until(|| d.view(s.id).unwrap().pending.is_none()).await;
+        }
+
         // Answered in the terminal: it goes from Desk too.
         say(&mut ws, ask(1, None)).await;
         until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
@@ -405,6 +433,14 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
 
         // Its boss answers its questions: every one, by its id, in the
         // person's place.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
         d.set_dialog_answerers(std::collections::HashMap::from([(s.id, chrono::Duration::zero())]));
         say(&mut ws, json!({"id": 6, "method": "item/tool/requestUserInput", "params": {
             "threadId": "t1", "turnId": "u2", "itemId": "q-3", "isBlocking": true,

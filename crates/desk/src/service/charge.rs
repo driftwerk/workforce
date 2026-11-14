@@ -353,6 +353,11 @@ impl Desk {
         let held = {
             let mut st = self.0.state.lock();
             st.charges.driven.insert(id, Utc::now());
+            // Codex's question held for its boss is theirs now, in front or
+            // waiting behind another ask.
+            if let Some((_, q)) = st.live.get_mut(&id).and_then(|l| l.codex_question.as_mut()) {
+                q.answerable = false;
+            }
             st.live.get(&id).and_then(|l| {
                 l.pending
                     .as_ref()

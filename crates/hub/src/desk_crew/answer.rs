@@ -412,10 +412,16 @@ impl CrewHub {
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&questions.to_string(), "its questions"),
         );
-        // Answered before Desk gives up holding it, with a margin.
-        let deadline = p.since
-            + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
-            - chrono::Duration::seconds(5);
+        // Answered before Desk gives up holding it, with a margin. Codex
+        // holds its question until it is answered: the boss's two tries.
+        let deadline = match codex {
+            true => chrono::Utc::now() + chrono::Duration::from_std(WITHIN * 2).unwrap_or_default(),
+            false => {
+                p.since
+                    + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
+                    - chrono::Duration::seconds(5)
+            }
+        };
         let mut failed = String::new();
         let mut replied = None;
         for _ in 0..2 {

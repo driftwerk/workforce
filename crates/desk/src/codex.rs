@@ -606,33 +606,41 @@ pub struct Changed {
     pub diffs: HashMap<String, Vec<Value>>,
 }
 
-/// How much of one file's diff a request carries, and of all of them.
+/// How much of one file's diff a request carries, and of all of them; how
+/// many files, and how long a command. Past any of them the request says
+/// it is `clipped`: not seen whole, so only the person allows it.
 const DIFF_MAX: usize = 4000;
 const DIFFS_MAX: usize = 16000;
+const PATHS_MAX: usize = 100;
+const COMMAND_MAX: usize = 8000;
 
-/// What a command request runs, whole: the command and where, the kind of
-/// action and its environment, and what it asks of its sandbox (network,
-/// a standing rule); never Codex's own account of it (`reason`, its parsed
-/// `commandActions`), nor its bookkeeping.
+/// What a command request runs, whole: the command (where is the request's
+/// `cwd`), the kind of action, its environment, and where on the network
+/// it goes. Only these: never Codex's own account of it (`reason`, its
+/// parsed `commandActions`), nor what it proposes for later (standing
+/// rules Desk never sends), nor anything a later Codex adds.
 fn what_runs(params: &Value) -> Value {
-    let mut v = params.clone();
-    if let Some(o) = v.as_object_mut() {
-        for k in [
-            "threadId",
-            "turnId",
-            "itemId",
-            "startedAtMs",
-            "approvalId",
-            "reason",
-            "commandActions",
-            "availableDecisions",
-            "cwd",
-        ] {
-            o.remove(k);
+    let mut out = serde_json::Map::new();
+    for k in ["command", "kind", "environmentId", "networkApprovalContext"] {
+        if let Some(v) = params.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.to_string(), v.clone());
         }
-        o.retain(|_, v| !v.is_null());
     }
-    v
+    if let Some(Value::String(c)) = out.get("command") {
+        if c.chars().count() > COMMAND_MAX {
+            let cut = crate::crew::clip(c, COMMAND_MAX);
+            out.insert("command".into(), Value::String(cut));
+            out.insert("clipped".into(), Value::Bool(true));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Whether a change deletes its file: its old contents aren't shown.
+fn deletes(change: &Value) -> bool {
+    let kind = change.get("kind");
+    kind.and_then(Value::as_str) == Some("delete")
+        || kind.and_then(|k| k.get("type")).and_then(Value::as_str) == Some("delete")
 }
 
 /// The approval a server request is, when it is one Desk answers: a
@@ -673,21 +681,43 @@ pub fn ask_of(
             let item = params.get("itemId").and_then(Value::as_str)?;
             // A grant of a folder for the rest of the session rides along.
             let mut left = DIFFS_MAX;
-            let changes: Vec<Value> = changed
-                .diffs
-                .get(item)
+            let mut clipped = false;
+            let known = changed.diffs.get(item);
+            let changes: Vec<Value> = known
                 .into_iter()
                 .flatten()
+                .take(PATHS_MAX)
                 .map(|c| {
+                    if deletes(c) {
+                        return json!({"path": c.get("path"), "kind": c.get("kind")});
+                    }
                     let diff = c.get("diff").and_then(Value::as_str).unwrap_or_default();
-                    let shown = crate::crew::clip(diff, DIFF_MAX.min(left));
-                    left = left.saturating_sub(shown.len());
-                    json!({"path": c.get("path"), "kind": c.get("kind"), "diff": shown})
+                    let room = DIFF_MAX.min(left);
+                    let cut = diff.chars().count() > room;
+                    let shown = match cut {
+                        true => crate::crew::clip(diff, room),
+                        false => diff.to_string(),
+                    };
+                    left = left.saturating_sub(shown.chars().count());
+                    clipped |= cut;
+                    let mut v =
+                        json!({"path": c.get("path"), "kind": c.get("kind"), "diff": shown});
+                    if cut {
+                        v["clipped"] = Value::Bool(true);
+                    }
+                    v
                 })
                 .collect();
-            let input = files.get(item).map(
-                |f| json!({ "paths": f, "grantRoot": params.get("grantRoot"), "changes": changes }),
-            );
+            let input = files.get(item).map(|f| {
+                clipped |= f.len() > PATHS_MAX || known.is_some_and(|k| k.len() > PATHS_MAX);
+                let paths: Vec<&String> = f.iter().take(PATHS_MAX).collect();
+                let mut v =
+                    json!({ "paths": paths, "grantRoot": params.get("grantRoot"), "changes": changes });
+                if clipped {
+                    v["clipped"] = Value::Bool(true);
+                }
+                v
+            });
             let named = files
                 .get(item)
                 .map(|f| {
@@ -1869,7 +1899,7 @@ pub(crate) mod tests {
                 whole: Some(crate::model::Request {
                     tool: "Bash".into(),
                     input: json!({"command": "/bin/zsh -lc 'rm victim.txt'", "kind": "command",
-                        "environmentId": "local", "proposedExecpolicyAmendment": ["rm", "victim.txt"]}),
+                        "environmentId": "local"}),
                     cwd: Some("/Users/k/repo".into()),
                     read_only: false,
                 }),
@@ -1910,6 +1940,60 @@ pub(crate) mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn a_request_desk_cannot_show_whole_says_so_and_a_delete_shows_no_contents() {
+        let mut long = escalated();
+        long["command"] = json!("x".repeat(9000));
+        let Some(CodexEvent::Asks(ask)) = ask_of(
+            "item/commandExecution/requestApproval",
+            &json!(0),
+            &long,
+            &Changed::default(),
+            None,
+        )
+        .map(|s| s.event) else {
+            panic!("an ask")
+        };
+        let input = &ask.whole.unwrap().input;
+        assert_eq!(input["clipped"], true);
+        assert!(
+            input.get("proposedExecpolicyAmendment").is_none(),
+            "never sent: not what runs"
+        );
+        let mut changed = Changed::default();
+        changed.files.insert("fc".into(), vec!["/r/.env".into()]);
+        changed.diffs.insert(
+            "fc".into(),
+            vec![json!({"path": "/r/.env", "kind": {"type": "delete"}, "diff": "-SECRET=1"})],
+        );
+        let params = json!({"threadId": "t1", "turnId": "u1", "itemId": "fc", "startedAtMs": 1});
+        let Some(CodexEvent::Asks(ask)) = ask_of(
+            "item/fileChange/requestApproval",
+            &json!(1),
+            &params,
+            &changed,
+            None,
+        )
+        .map(|s| s.event) else {
+            panic!("an ask")
+        };
+        let input = &ask.whole.unwrap().input;
+        assert!(!input.to_string().contains("SECRET"), "{input}");
+        assert!(input.get("clipped").is_none());
+        // Its item never seen: nothing whole to decide on.
+        let Some(CodexEvent::Asks(ask)) = ask_of(
+            "item/fileChange/requestApproval",
+            &json!(2),
+            &params,
+            &Changed::default(),
+            None,
+        )
+        .map(|s| s.event) else {
+            panic!("an ask")
+        };
+        assert!(ask.whole.is_none());
     }
 
     #[test]
