@@ -456,9 +456,15 @@ pub struct External {
     pub clipped: bool,
     /// The version of the HTML reader its body was last read with (Jira):
     /// one held from before [`HTML_READ`](crate::board_sync::HTML_READ) is
-    /// read again, once.
+    /// read again, once; [`ADF_READ`](crate::board_sync::ADF_READ) when it
+    /// was read as Jira stores it, on open: sent back only once edited here.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub html_read: u8,
+    /// A body read as ADF: the fingerprints of the HTML-read bodies it
+    /// stands for (as a read and as a search give it), so a pull that reads
+    /// the same HTML again leaves it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_prints: Vec<String>,
     /// What its issue says of itself besides its words, as last pulled:
     /// shown beside it, never pushed.
     #[serde(default)]

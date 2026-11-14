@@ -11,6 +11,7 @@ use crate::crew::{By, Kind};
 use crate::model::DeskEvent;
 use crate::ticket_dev;
 use crate::ticket_files::{self, FileRead, FileSource, TicketFile, FILE_MAX};
+use crate::ticket_markdown::AdfFile;
 
 /// How long a ticket's issue, read whole for its files, is taken as read.
 pub const READ_FRESH: chrono::Duration = chrono::Duration::minutes(5);
@@ -111,7 +112,11 @@ impl Desk {
             .flatten()
             .map(|(_, s)| s);
         let fields = sync.as_ref().and_then(|s| s.fields.as_ref());
-        let (tool, args) = crate::board_sync::read_issue_call(e.system, &e.key, fields);
+        let (tool, mut args) = crate::board_sync::read_issue_call(e.system, &e.key, fields);
+        // Its description as Jira stores it, which says more than its HTML.
+        if e.system == System::Jira {
+            args["description_adf"] = serde_json::json!(true);
+        }
         let read = crate::board_sync::call(remote, e.system, tool, args);
         // Its development, beside it: Jira's by tools of its own, at the
         // same time; Linear's comes with the issue.
@@ -151,12 +156,32 @@ impl Desk {
         }
         // The rest of what it says comes in by the pull, as it always does;
         // here only what the view shows beside it, and when it was read.
+        let adf = match e.system {
+            // Its site, by Jira's own address of it, else the ticket's.
+            System::Jira => {
+                let own = v["self"].as_str().unwrap_or(&e.url);
+                self.adf_body(id, &v, own).await
+            }
+            System::Linear => None,
+        };
         let mut t = self.ticket_of(id).await.map_err(fail)?;
         if let Some(ext) = t.external.as_mut() {
             let priorities = sync.as_ref().map_or(&[][..], crate::board_sync::priorities);
             let mut details = crate::board_sync::details_of(&issue, Some(&ext.details), priorities);
             details.read_at = Some(now);
             ext.details = details;
+            // Held as the body is, while it isn't one edited here.
+            if let Some(adf) = adf.filter(|_| t.body == ext.seen.body) {
+                // The HTML a pull reads of it, from the same answer, whole
+                // and cut as a search cuts it: while a pull reads that, this
+                // stays.
+                ext.html_prints = crate::board_sync::html_prints(&v);
+                ext.html_read = crate::board_sync::ADF_READ;
+                ext.clipped = adf.clipped;
+                ext.flagged = ext.flagged || adf.flagged;
+                ext.seen.body = adf.body.clone();
+                t.body = adf.body;
+            }
             ext.dev = ticket_dev::merged(ext.dev.take(), work, links, now);
         }
         // A Jira issue's sub-tasks say nothing of who has each, and an
@@ -197,6 +222,45 @@ impl Desk {
             ticket: Box::new(v.clone()),
         });
         Ok(v)
+    }
+
+    /// The description `answer` (a `jira.get_issue` one) gives as Jira
+    /// stores it, as Desk markdown, its pictures found among ticket `id`'s
+    /// files and its issue links on the site of `own` (the ticket's
+    /// address) chips; none when the hub doesn't give it, it is larger than
+    /// [`ADF_MAX`], or it doesn't read as a document.
+    async fn adf_body(&self, id: Uuid, answer: &serde_json::Value, own: &str) -> Option<AdfBody> {
+        let text = answer.get("description_adf")?.as_str()?;
+        if text.len() > ADF_MAX {
+            return None;
+        }
+        let (text, flagged) = crate::board_sync::unfence(text);
+        let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+        if doc["type"] != "doc" {
+            return None;
+        }
+        let files = match self.0.store.files_of(&[id]).await {
+            Ok(mut f) => f.remove(&id).unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(ticket = %id, error = format!("{err:#}"), "a ticket's files weren't read for its description");
+                vec![]
+            }
+        };
+        let files: Vec<AdfFile<'_>> = files
+            .iter()
+            .filter(|f| f.source == FileSource::Jira)
+            .map(|f| AdfFile {
+                id: f.id,
+                name: &f.name,
+            })
+            .collect();
+        let md = crate::ticket_markdown::adf_markdown(&doc, &files, own);
+        let (body, clipped) = crate::board_sync::held_body(md);
+        Some(AdfBody {
+            body,
+            clipped,
+            flagged,
+        })
     }
 
     /// One optional part of ticket `id`'s development, read through
@@ -327,6 +391,16 @@ impl Desk {
             .await?;
         Ok(())
     }
+}
+
+/// The most of a description's ADF read: a larger one is read as its HTML.
+const ADF_MAX: usize = 2 * 1024 * 1024;
+
+/// A Jira description read as ADF, as Desk holds it.
+struct AdfBody {
+    body: String,
+    clipped: bool,
+    flagged: bool,
 }
 
 /// A file's name in a history line: on one line, defanged, quoted.

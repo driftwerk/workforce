@@ -56,6 +56,9 @@ pub(crate) struct Jira {
     pub comments: BTreeMap<String, Vec<(String, String, String, bool)>>,
     /// What `jira.list_comments` answers instead of the comments, when set.
     pub comments_answer: Option<Value>,
+    /// Each issue's description as Jira stores it (ADF), answered by
+    /// `jira.get_issue` when asked for.
+    pub adf: BTreeMap<String, Value>,
     /// What `jira.get_issue` adds for an issue when its changelog is asked
     /// for (`changelog`, `created`, `reporter`).
     pub history: BTreeMap<String, Value>,
@@ -154,7 +157,16 @@ impl Tool for FakeJiraTool {
                 json!({ "count": issues.len(), "issues": issues, "next_page_token": null, "is_last": true })
             }
             "jira.get_issue" => match j.issues.get(&key) {
-                Some(i) => issue_json(i, true),
+                Some(i) => {
+                    let mut v = issue_json(i, true);
+                    if let Some(doc) = j.adf.get(&key).filter(|_| input["description_adf"] == true)
+                    {
+                        v["description_adf"] =
+                            wrapped(&doc.to_string(), "jira.get_issue.description");
+                        v["self"] = json!("https://acme.example/rest/api/3/issue/1");
+                    }
+                    v
+                }
                 None => {
                     return Ok(ToolResult::failure(
                         format!("Failed to get issue {key}: 404 Not Found"),
