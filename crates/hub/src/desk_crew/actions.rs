@@ -491,7 +491,10 @@ impl Action {
 fn charge_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
-        e @ workforce_desk::DeskError::CrossesBoss => e.to_string(),
+        e
+        @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
+            e.to_string()
+        }
         workforce_desk::DeskError::NotFound => "That session isn’t there any more.".into(),
         workforce_desk::DeskError::Internal(e) => {
             tracing::warn!(error = %e, "a charge failed");
@@ -504,7 +507,10 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
 fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
-        e @ workforce_desk::DeskError::CrossesBoss => e.to_string(),
+        e
+        @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
+            e.to_string()
+        }
         workforce_desk::DeskError::NotFound => "That ticket isn’t there any more.".into(),
         workforce_desk::DeskError::Internal(e) => {
             tracing::warn!(error = %e, "a board change failed");
