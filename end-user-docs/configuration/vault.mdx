@@ -79,7 +79,7 @@ Every write of these keys is checked, whichever way it arrives (My Settings, the
 
 ## Automatic secret protection
 
-When you paste a credential into Slack, the web UI, or a tool result, Workforce automatically replaces the cleartext with a safe marker like `[[secret:8a3f…0c2e type=ANTHROPIC_KEY preview=sk‑an…wXyZ]]`. The LLM sees only the marker, never the actual secret. When a tool needs the secret value, the marker is substituted back just before the tool runs.
+When you paste a credential into Slack, the web UI, or a tool result, Workforce automatically replaces the cleartext with a safe marker like `[[secret:8a3f…0c2e type=ANTHROPIC_KEY preview=***]]`. The LLM sees only the marker, never the actual secret. When a tool needs the secret value, the marker is substituted back just before the tool runs.
 
 You can also store secrets directly with the `cmd: secret` command:
 

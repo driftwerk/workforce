@@ -28,7 +28,7 @@ const STREAM_DELTA_OVERLAP_BYTES: usize = 80;
 
 /// Sanitize agent-controlled UI text for outbound display:
 ///   1. render any `[[secret:…]]` markers as their `preview` form so
-///      a leaked marker reads as `sk-an...wXyZ` rather than the noisy
+///      a leaked marker reads as `***` rather than the noisy
 ///      bracket form;
 ///   2. defensively redact any cleartext credential pattern that
 ///      somehow reached the response (e.g. a tool-result that bypassed
