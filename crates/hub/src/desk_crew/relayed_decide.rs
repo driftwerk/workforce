@@ -309,12 +309,15 @@ impl CrewHub {
             if !ours {
                 return None;
             }
+            // Its home not heard from within FRESH: what it decided isn't
+            // taken as said now.
+            let fresh = out.homes.get(&key).is_some_and(|at| at.elapsed() < FRESH);
             out.taken.remove(&id);
-            out.waiting.remove(&id).map(|(_, tx)| tx)
+            out.waiting.remove(&id).map(|(_, tx)| (tx, fresh))
         });
         let outcome = match taken {
-            Some(tx) => {
-                let _ = tx.send(answer);
+            Some((tx, fresh)) => {
+                let _ = tx.send(if fresh { answer } else { Err(not_in_force()) });
                 "ok"
             }
             None => "refused",
