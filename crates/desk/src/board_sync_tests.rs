@@ -53,6 +53,7 @@ fn synced(state: TicketState) -> Ticket {
         html_read: 0,
         html_print: None,
         details: Default::default(),
+        dev: None,
     });
     t
 }

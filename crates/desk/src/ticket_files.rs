@@ -260,7 +260,7 @@ fn upload_file(name: Option<String>, url: String) -> RemoteFile {
     }
 }
 
-fn is_https(url: &str) -> bool {
+pub(crate) fn is_https(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
 }
 

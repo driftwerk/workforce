@@ -1542,6 +1542,7 @@ impl Desk {
                     None,
                     crate::board_sync::priorities(s),
                 ),
+                dev: None,
             }),
             created_by: by.party.clone(),
             pinned: false,
@@ -2479,6 +2480,7 @@ impl Desk {
             html_read: crate::board_sync::HTML_READ,
             html_print: None,
             details: Default::default(),
+            dev: None,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

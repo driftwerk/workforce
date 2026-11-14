@@ -63,6 +63,24 @@ const PLAIN_EVENTS: [&str; 7] = [
     "SessionEnd",
 ];
 
+/// The question tool whose start Desk may hold for its boss to answer.
+pub const DIALOG_TOOL: &str = "AskUserQuestion";
+
+/// How long its start's hook may take: past it, Claude Code goes on and its
+/// dialog opens. Desk answers well within it ([`DIALOG_HOLD`]).
+pub const DIALOG_WAIT_SECS: u64 = 60;
+
+/// How long Desk holds a question's start for its boss to answer.
+pub const DIALOG_HOLD: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// What answers a question at its start, so its dialog never opens: the
+/// call is refused with the answer as its reason, which the model reads as
+/// the person's (verified on Claude Code 2.1.325: it went on with it).
+pub fn answered_for(message: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": "deny", "permissionDecisionReason": message } })
+}
+
 fn http_hook(url: &str, timeout_secs: u64) -> Value {
     json!({ "type": "http", "url": url, "timeout": timeout_secs })
 }
@@ -106,6 +124,20 @@ pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed
             }),
             _ => http_hook(hook_url, timeout),
         };
+        // A question's start has its own entry, waiting long enough for its
+        // boss to answer it; every other call's, the catch-all (a matcher
+        // is a regular expression: verified on 2.1.325 that it leaves the
+        // question out).
+        if event == "PreToolUse" {
+            hooks.insert(
+                event.into(),
+                json!([
+                    { "matcher": format!("^(?!{DIALOG_TOOL}$).*"), "hooks": [hook] },
+                    { "matcher": DIALOG_TOOL, "hooks": [http_hook(hook_url, DIALOG_WAIT_SECS)] }
+                ]),
+            );
+            continue;
+        }
         hooks.insert(event.into(), json!([{ "matcher": "*", "hooks": [hook] }]));
     }
     for event in PLAIN_EVENTS {
@@ -245,6 +277,10 @@ pub enum Hook {
     Question {
         id: Option<String>,
         question: Question,
+        /// An `AskUserQuestion` at its start (`PreToolUse`): its whole
+        /// input, every question and its options. Its boss may answer it
+        /// there, before its dialog opens ([`answered_for`]).
+        asks: Option<Value>,
     },
     /// Auto mode refused a tool call: the call's id, when the CLI says.
     Denied {
@@ -337,6 +373,10 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "PreToolUse" | "PermissionRequest" if question.is_some() => Hook::Question {
             id: p.tool_use_id.clone(),
             question: question.unwrap_or_default(),
+            asks: (p.hook_event_name == "PreToolUse"
+                && p.tool_name.as_deref() == Some(DIALOG_TOOL))
+            .then(|| p.tool_input.clone())
+            .flatten(),
         },
         "PreToolUse" => Hook::ToolStart {
             tool: tool().0,
@@ -644,7 +684,19 @@ pub(crate) mod tests {
             s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
             3600
         );
-        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
+        // Every call but a question's start by the catch-all; that one by
+        // its own entry, waiting for its boss.
+        assert_eq!(
+            s["hooks"]["PreToolUse"][0]["matcher"],
+            "^(?!AskUserQuestion$).*"
+        );
+        assert_eq!(
+            (
+                s["hooks"]["PreToolUse"][1]["matcher"].as_str(),
+                s["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"].as_u64()
+            ),
+            (Some("AskUserQuestion"), Some(DIALOG_WAIT_SECS))
+        );
         let compact = &s["hooks"]["PreCompact"][0]["hooks"][0];
         assert_eq!(
             (compact["type"].as_str(), compact["timeout"].as_u64()),
@@ -777,7 +829,10 @@ pub(crate) mod tests {
             };
             assert_eq!(s["hooks"][e][0]["hooks"][0]["type"], kind, "{e}");
         }
-        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
+        assert_eq!(
+            s["hooks"]["PreToolUse"][0]["matcher"],
+            "^(?!AskUserQuestion$).*"
+        );
         assert_eq!(
             hook_settings("http://h", 60),
             hook_settings_for("http://h", 60, false)
@@ -1020,7 +1075,7 @@ pub(crate) mod tests {
     fn a_question_or_a_plan_waits_on_the_person() {
         let pre = json!({"session_id": "s1", "permission_mode": "auto", "hook_event_name": "PreToolUse",
             "tool_name": "AskUserQuestion", "tool_input": two_questions(), "tool_use_id": "toolu_q1"});
-        let Hook::Question { id, question } = parse_hook(pre.to_string().as_bytes()).unwrap()
+        let Hook::Question { id, question, .. } = parse_hook(pre.to_string().as_bytes()).unwrap()
         else {
             panic!("not a question")
         };

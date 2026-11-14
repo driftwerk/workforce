@@ -9,11 +9,16 @@ use crate::board::{System, Ticket};
 use crate::board_sync::{Remote, RemoteError};
 use crate::crew::{By, Kind};
 use crate::model::DeskEvent;
+use crate::ticket_dev;
 use crate::ticket_files::{self, FileRead, FileSource, TicketFile, FILE_MAX};
 use crate::ticket_markdown::AdfFile;
 
 /// How long a ticket's issue, read whole for its files, is taken as read.
 pub const READ_FRESH: chrono::Duration = chrono::Duration::minutes(5);
+
+/// The longest one optional part of a ticket's development is waited for
+/// when it opens: a slow dev-status never holds the ticket up.
+const DEV_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The most pages of an issue's children one read of it takes.
 const CHILD_READS: usize = 3;
@@ -78,8 +83,11 @@ impl Desk {
     }
 
     /// Reads ticket `id`'s issue whole, through `remote`, and keeps what it
-    /// says of its files and itself: what opening a synced ticket does when
-    /// its issue wasn't read in the last [`READ_FRESH`] (or `force`).
+    /// says of its files and itself, and its development (PRs, branches,
+    /// commits, links: [`ticket_dev`]): what opening a synced ticket does
+    /// when its issue wasn't read in the last [`READ_FRESH`] (or `force`).
+    /// A development tool the hub lacks, or one that fails, never fails the
+    /// read: that part is left as it was.
     pub async fn read_ticket_issue(
         &self,
         id: Uuid,
@@ -109,7 +117,29 @@ impl Desk {
         if e.system == System::Jira {
             args["description_adf"] = serde_json::json!(true);
         }
-        let v = crate::board_sync::call(remote, e.system, tool, args).await?;
+        let read = crate::board_sync::call(remote, e.system, tool, args);
+        // Its development, beside it: Jira's by tools of its own, at the
+        // same time; Linear's comes with the issue.
+        let (v, work, links) = match e.system {
+            System::Jira => {
+                let (v, work, links) = futures::join!(
+                    read,
+                    self.read_dev_part(id, remote, &e, ticket_dev::dev_status_call(&e)),
+                    self.read_dev_part(id, remote, &e, ticket_dev::remote_links_call(&e)),
+                );
+                (
+                    v?,
+                    work.as_ref().and_then(ticket_dev::jira_work),
+                    links.as_ref().and_then(ticket_dev::jira_links),
+                )
+            }
+            System::Linear => {
+                let v = read.await?;
+                let dev = ticket_dev::linear_dev(v.get("issue").unwrap_or(&v));
+                let (work, links) = dev.map_or((None, None), |(w, l)| (Some(w), Some(l)));
+                (v, work, links)
+            }
+        };
         let issue = match e.system {
             System::Jira => crate::board_sync::jira_issue(&v, ""),
             System::Linear => crate::board_sync::linear_issue(v.get("issue").unwrap_or(&v)),
@@ -147,6 +177,7 @@ impl Desk {
                 ext.seen.body = adf.body.clone();
                 t.body = adf.body;
             }
+            ext.dev = ticket_dev::merged(ext.dev.take(), work, links, now);
         }
         // A Jira issue's sub-tasks say nothing of who has each, and an
         // epic's children aren't on it: one search over its children says.
@@ -221,6 +252,36 @@ impl Desk {
             clipped,
             flagged,
         })
+    }
+
+    /// One optional part of ticket `id`'s development, read through
+    /// `remote` by `call`: its answer, or `None` (logged) when the hub
+    /// doesn't offer the tool, it failed, or it took over [`DEV_READ_WAIT`],
+    /// so that part is left as it was and the ticket still reads. Quiet: an
+    /// approval is never asked for it.
+    async fn read_dev_part(
+        &self,
+        id: Uuid,
+        remote: &dyn Remote,
+        e: &crate::board::External,
+        (tool, args): (&'static str, serde_json::Value),
+    ) -> Option<serde_json::Value> {
+        let read = crate::board_sync::call_quiet(remote, e.system, tool, args);
+        let Ok(answer) = tokio::time::timeout(DEV_READ_WAIT, read).await else {
+            tracing::warn!(ticket = %id, tool, "a ticket's development took too long to read");
+            return None;
+        };
+        match answer {
+            Ok(v) => Some(v),
+            Err(RemoteError::Missing(_) | RemoteError::NotAllowed(_)) => {
+                tracing::debug!(ticket = %id, tool, "the hub doesn't offer a ticket's development tool");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(ticket = %id, tool, error = %err, "a ticket's development wasn't read");
+                None
+            }
+        }
     }
 
     /// Whether `t` takes files dropped on it: a ticket of the person's own,

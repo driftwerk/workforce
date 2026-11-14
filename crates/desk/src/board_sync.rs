@@ -1809,7 +1809,7 @@ fn count_of(v: &Value) -> Option<u32> {
 }
 
 /// Someone else's short words (a name, a component), on one line.
-fn short(v: &Value, max: usize) -> Option<String> {
+pub(crate) fn short(v: &Value, max: usize) -> Option<String> {
     let s = unfence(v.as_str()?).0;
     let s = crate::crew::one_line(s.trim(), max);
     (!s.is_empty()).then_some(s)
@@ -1841,7 +1841,7 @@ fn linear_ref(v: &Value) -> Option<IssueRef> {
 }
 
 /// A Jira PR state as Desk says it.
-fn pr_state(state: &str) -> String {
+pub(crate) fn pr_state(state: &str) -> String {
     match state.to_ascii_lowercase().as_str() {
         "merged" => "merged",
         "declined" | "closed" => "declined",
@@ -1854,7 +1854,7 @@ fn pr_state(state: &str) -> String {
 }
 
 /// A pull request's number, from its address (`…/pull/248`).
-fn pr_number(url: &str) -> Option<u32> {
+pub(crate) fn pr_number(url: &str) -> Option<u32> {
     let (_, rest) = url
         .split_once("/pull/")
         .or_else(|| url.split_once("/merge_requests/"))?;
@@ -2073,48 +2073,65 @@ fn linear_words(kind: &Value, outward: bool) -> Option<String> {
     )
 }
 
+/// A Linear attachment that is a pull or merge request (the GitHub or
+/// GitLab integration's, or any whose address is one): its address and its
+/// state as Desk says it. The one test both a card's PR summary and a
+/// ticket's development go by.
+pub(crate) fn linear_pr(a: &Value) -> Option<(String, String)> {
+    let url = a["url"].as_str()?;
+    let source = a["sourceType"].as_str().unwrap_or_default();
+    let is_pr = pr_number(url).is_some()
+        && (source.starts_with("github") || source.starts_with("gitlab") || source.is_empty());
+    if !is_pr {
+        return None;
+    }
+    let m = &a["metadata"];
+    let s = m["status"]
+        .as_str()
+        .or(m["state"].as_str())
+        .unwrap_or_default();
+    let mut state = match (s.to_ascii_lowercase().as_str(), m["draft"].as_bool()) {
+        _ if m["merged"].as_bool() == Some(true) => "merged".to_string(),
+        (_, Some(true)) => "draft".to_string(),
+        ("approved" | "reviewrequested" | "review_requested" | "inreview", _) => {
+            "review".to_string()
+        }
+        (s, _) => pr_state(s),
+    };
+    // GitHub's review decision says what an open PR waits on.
+    if matches!(state.as_str(), "open" | "review") {
+        match m["reviewDecision"]
+            .as_str()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("CHANGES_REQUESTED") => state = "changes".into(),
+            Some("APPROVED" | "REVIEW_REQUIRED") => state = "review".into(),
+            _ => {}
+        }
+    }
+    Some((url.to_string(), state))
+}
+
 /// A Linear issue's pull requests, from the GitHub or GitLab attachments
 /// the integration keeps on it: how many, and the state they add up to.
 fn linear_prs(i: &Value) -> Option<PrSummary> {
-    let prs: Vec<(&Value, String)> = i["attachments"]["nodes"]
+    let prs: Vec<(String, String)> = i["attachments"]["nodes"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|a| {
-            let url = a["url"].as_str()?;
-            let source = a["sourceType"].as_str().unwrap_or_default();
-            let is_pr = pr_number(url).is_some()
-                && (source.starts_with("github")
-                    || source.starts_with("gitlab")
-                    || source.is_empty());
-            is_pr.then(|| (a, url.to_string()))
-        })
+        .filter_map(linear_pr)
         .collect();
     if prs.is_empty() {
         return None;
     }
-    let state_of = |a: &Value| {
-        let m = &a["metadata"];
-        let s = m["status"]
-            .as_str()
-            .or(m["state"].as_str())
-            .unwrap_or_default();
-        match (s.to_ascii_lowercase().as_str(), m["draft"].as_bool()) {
-            (_, Some(true)) => "draft".to_string(),
-            ("approved" | "reviewrequested" | "review_requested" | "inreview", _) => {
-                "review".to_string()
-            }
-            (s, _) => pr_state(s),
-        }
-    };
-    let states: Vec<String> = prs.iter().map(|(a, _)| state_of(a)).collect();
     // Open work comes first: one PR still open makes the issue's open.
     let state = ["changes", "review", "open", "draft", "merged", "declined"]
         .into_iter()
-        .find(|s| states.iter().any(|x| x == s))
+        .find(|s| prs.iter().any(|(_, x)| x == s))
         .unwrap_or("open")
         .to_string();
-    let one = (prs.len() == 1).then(|| prs[0].1.clone());
+    let one = (prs.len() == 1).then(|| prs[0].0.clone());
     Some(PrSummary {
         count: prs.len() as u32,
         state,

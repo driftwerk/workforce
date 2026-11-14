@@ -463,6 +463,11 @@ pub struct External {
     /// shown beside it, never pushed.
     #[serde(default)]
     pub details: Details,
+    /// Its development there (PRs, branches, commits) and its web links,
+    /// read when the ticket is opened, with its issue: absent until read, or
+    /// on a hub without the tools. Never pushed, and the pull leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<Dev>,
 }
 
 /// What a synced ticket's issue says of itself: its priority, labels,
@@ -673,6 +678,91 @@ pub struct PrSummary {
     pub number: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// A ticket's issue's development, read when the ticket is opened: its
+/// pull requests, branches, commits and web links, and when they were read.
+/// Each part is the last that was read of it: a part a hub couldn't read is
+/// left as it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dev {
+    #[serde(default)]
+    pub prs: Vec<DevPr>,
+    #[serde(default)]
+    pub branches: Vec<DevBranch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<Commits>,
+    #[serde(default)]
+    pub links: Vec<RemoteLink>,
+    pub read_at: DateTime<Utc>,
+}
+
+/// A pull request on a ticket's issue. `state`: `open`, `review`,
+/// `changes`, `merged`, `declined` or `draft`. `checks` only when the
+/// remote says how they went, never guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevPr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u32>,
+    /// Always https.
+    pub url: String,
+    pub title: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Checks>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<DateTime<Utc>>,
+}
+
+/// How a PR's checks went: how many passed of how many, and overall
+/// (`pass`, `run` while any is running, `fail` when any failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checks {
+    pub passed: u32,
+    pub total: u32,
+    pub state: String,
+}
+
+/// A branch on a ticket's issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevBranch {
+    pub name: String,
+    /// Always https.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// How many commits a ticket's issue has, and when the latest was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commits {
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<DateTime<Utc>>,
+}
+
+/// A web link on a ticket's issue (a Confluence page, a design): its
+/// title, address (always https), the app it is in (else its host), and
+/// how it relates (`words`: "mentioned in", "page").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLink {
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<String>,
 }
 
 /// A Jira site's own fields a board reads (`jira.list_fields`): the custom

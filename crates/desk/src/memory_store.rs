@@ -909,6 +909,9 @@ pub(crate) async fn forget_memory_in(
     )
     .await
     .context("forgetting sessions' accounts")?;
+    // What agents were sent of them goes too, without asking: the person
+    // asked for them to be forgotten (Sees §8.3).
+    crate::knows_store::knows_forget_sessions_in(tx, ids).await?;
     let readers: Vec<String> = ids.iter().map(|id| format!("session:{id}")).collect();
     tx.execute(
         "DELETE FROM memory_reads WHERE reader = ANY($1)",
