@@ -1313,6 +1313,115 @@ mod tests {
             Err(StatusCode::UNAUTHORIZED)
         );
     }
+    /// What an agent sees (Sees) is read and set by Desk over its paired
+    /// path, as the person: their device's token, which is no system
+    /// administrator's, reads every rule route and sets a rule for an agent
+    /// on another hub. The hub's own token, a member's device and no one
+    /// read nothing.
+    #[tokio::test]
+    async fn the_holders_paired_desk_reads_and_sets_what_an_agent_sees() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        use workforce_identity::store::IdentityStore;
+        use workforce_identity::types::{Identity, IdentityRole};
+        workforce_postgres::test_support::with_test_pool(
+            workforce_desk::store::build_pool,
+            |pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+                let local = crate::desk_board_sync::tests::local_hub(desk.clone(), dir.path());
+                let devices = &local.devices;
+                let mut holder = local.person.clone();
+                let (_, holds) = crate::remote_mcp::testing::pair_device(
+                    &local.fx,
+                    devices,
+                    &mut holder,
+                    "Desk",
+                );
+                let mut member = Identity::new("Mo", IdentityRole::Member);
+                local.fx.identities.create(&member).unwrap();
+                let (_, doesnt) = crate::remote_mcp::testing::pair_device(
+                    &local.fx,
+                    devices,
+                    &mut member,
+                    "Desk",
+                );
+                let state = Arc::clone(&local.fx.state);
+                let app = workforce_desk::knows_router(desk, Arc::new(SystemAdmins(state.clone())));
+                let send = |token: Option<String>,
+                            method: &str,
+                            uri: &str,
+                            body: Option<serde_json::Value>| {
+                    let app = app.clone();
+                    let (method, uri) = (method.to_string(), uri.to_string());
+                    async move {
+                        let mut req = Request::builder().method(method.as_str()).uri(uri.as_str());
+                        if let Some(t) = token {
+                            req = req.header("authorization", format!("Bearer {t}"));
+                        }
+                        let body = match body {
+                            Some(b) => {
+                                req = req.header("content-type", "application/json");
+                                Body::from(b.to_string())
+                            }
+                            None => Body::empty(),
+                        };
+                        let res = app.oneshot(req.body(body).unwrap()).await.unwrap();
+                        let status = res.status();
+                        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                            .await
+                            .unwrap();
+                        (
+                            status,
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                        )
+                    }
+                };
+                // Allan, on another hub: his rule is kept here.
+                let rule = "/api/desk/knows/driftwerk/allan";
+                let reads = [
+                    "/api/desk/knows".to_string(),
+                    rule.to_string(),
+                    format!("{rule}/log"),
+                    format!("{rule}/machines"),
+                ];
+                for read in &reads {
+                    let (status, body) = send(Some(holds.clone()), "GET", read, None).await;
+                    assert_eq!(status, StatusCode::OK, "{read}: {body}");
+                }
+                let (status, body) = send(
+                    Some(holds.clone()),
+                    "PUT",
+                    rule,
+                    Some(serde_json::json!({ "places": ["all"], "digest": "daily" })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let (_, body) = send(Some(holds.clone()), "GET", "/api/desk/knows", None).await;
+                assert_eq!(body["rules"][0]["agent"], "driftwerk/allan", "{body}");
+                assert_eq!(body["rules"][0]["places"][0], "all", "{body}");
+                let (_, body) = send(Some(holds), "GET", rule, None).await;
+                assert_eq!(body["rule"]["digest"], "daily", "{body}");
+                // No one else reads them, the hub's own token included.
+                for read in &reads {
+                    for (who, token) in [
+                        ("the hub's token", Some(state.auth_token.clone())),
+                        ("a member's device", Some(doesnt.clone())),
+                        ("no one", None),
+                    ] {
+                        let (status, _) = send(token, "GET", read, None).await;
+                        assert!(
+                            matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                            "{who} read {read}: {status}"
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
     #[test]
     fn only_the_hubs_own_token_itself_is_the_hub_token() {
         let with = |v: &str| {
