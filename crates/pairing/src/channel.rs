@@ -402,12 +402,8 @@ impl ChannelPairingService {
         };
         self.store.create_channel_request(&req)?;
 
-        info!(
-            platform,
-            sender_id,
-            code = code,
-            "Created channel pairing request"
-        );
+        // The code is what proves the person at the channel: never logged.
+        info!(platform, sender_id, "Created channel pairing request");
         Ok(code)
     }
 }
@@ -429,6 +425,20 @@ mod tests {
             device_token_ttl_secs: 2_592_000,
             who_can_connect: WhoCanConnect::default(),
         }
+    }
+
+    #[test]
+    fn a_channel_pairing_code_is_never_logged() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = ChannelPairingService::new(store.clone(), pairing_config());
+        let log = crate::logged(|| {
+            svc.check_sender("slack", "C1", "U1", "Test").unwrap();
+        });
+        let code = store.list_pending_channel_requests().unwrap()[0]
+            .code
+            .clone();
+        assert!(log.contains("Created channel pairing request"), "{log}");
+        assert!(!code.is_empty() && !log.contains(&code), "{code} in {log}");
     }
 
     #[test]
