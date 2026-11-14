@@ -1434,6 +1434,17 @@ mod tests {
         let s = acme(real.to_str().unwrap());
         assert_eq!(change(&s, json!(["src"])), Err(folder.into()));
         assert_eq!(change(&s, json!(["src/a.ts"])), Ok(()));
+        // Every engine's change: Claude's write too.
+        let write = |s: &SessionView, path: &str| {
+            let input = json!({ "file_path": path, "content": "x" });
+            judged(Engine::Claude, &asking("Write", input, None), s)
+        };
+        assert_eq!(write(&s, "src"), Err(folder.into()));
+        assert_eq!(write(&s, "."), Err(folder.into()));
+        assert_eq!(write(&s, real.to_str().unwrap()), Err(folder.into()));
+        assert_eq!(write(&s, "src/a.ts"), Ok(()));
+        let a = acme("/Users/sam/dev/acme-web");
+        assert_eq!(write(&a, "/Users/sam/dev"), Err(folder.into()));
     }
 
     #[test]
@@ -1537,6 +1548,9 @@ mod tests {
         ] {
             assert_eq!(edit(gate), Err(boss::SETTINGS.into()), "{gate}");
         }
-        assert_eq!(edit(".github/CODEOWNERS"), Ok(()));
+        // Who must review what is a protection too: what a boss's own asks
+        // count as running later ([`crate::boss_ask`]) is a setting.
+        assert_eq!(edit(".github/CODEOWNERS"), Err(boss::SETTINGS.into()));
+        assert_eq!(edit("docs/ci.md"), Ok(()));
     }
 }

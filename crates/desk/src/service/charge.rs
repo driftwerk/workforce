@@ -694,16 +694,15 @@ pub enum ServedCheck {
 
 impl Desk {
     /// Where a boss's answer is judged now: the hub's bounds, every agent's
-    /// settings, and the Devin config folder Devin's sessions find from
-    /// the environment Desk runs them in now. That can be other than the
-    /// hub's (a session's start may set `HOME` or `XDG_CONFIG_HOME`), and
+    /// settings, and the Devin folders Devin's sessions find
+    /// ([`Desk::devin_withheld`]), which can be other than the hub's and
     /// change after the hub's bounds were said. None before the hub says
     /// them.
     pub(crate) fn judging_bounds(&self) -> Option<charge::Bounds> {
         let mut bounds = self.0.boss_bounds.lock().clone()?;
         let settings = self.0.state.lock().charges.agent_settings.clone();
         bounds.withheld.extend(settings);
-        bounds.withheld.extend(self.devin_config_folder());
+        bounds.withheld.extend(self.devin_withheld());
         Some(bounds)
     }
 

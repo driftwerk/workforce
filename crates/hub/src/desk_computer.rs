@@ -289,26 +289,34 @@ fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
     let mut out = vec![crate::desk_folder::of(config).unwrap_or(data)];
     out.push(home.join("Library/Keychains"));
-    // The person's Devin config folder, found as Desk finds it for Devin's
-    // sessions: it runs its hooks' commands. Neither read nor written, at
-    // `~/.config/devin` as wherever `XDG_CONFIG_HOME` puts it.
-    let env: std::collections::BTreeMap<String, String> = ["HOME", "XDG_CONFIG_HOME"]
-        .into_iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect();
-    if let Some(dir) = workforce_desk::devin_person_config(&env)
+    // The person's Devin folders, found as Desk finds them for Devin's
+    // sessions: its config (it runs its hooks' commands) and its data (its
+    // sessions and sign-in). Neither read nor written, at `~/.config/devin`
+    // and `~/.local/share/devin` as wherever `XDG_CONFIG_HOME` and
+    // `XDG_DATA_HOME` put them.
+    let env: std::collections::BTreeMap<String, String> =
+        ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+            .into_iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+            .collect();
+    let config = workforce_desk::devin_person_config(&env)
         .as_deref()
         .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    for dir in [config, workforce_desk::devin_data_folder(&env)]
+        .into_iter()
+        .flatten()
     {
-        out.push(workforce_agent::tools::paths::resolve_real(dir));
+        out.push(workforce_agent::tools::paths::resolve_real(&dir));
     }
-    // And where Devin's sessions find it: their environment is the hub's
-    // with what a session's start added over it, which may set `HOME` or
-    // `XDG_CONFIG_HOME` apart from the hub's own, and change while the hub
-    // runs. Both are withheld. (A boss's bounds are said once, so Desk adds
-    // this one again each time it judges.)
-    if let Some(dir) =
-        crate::desk_driver::desk().and_then(workforce_desk::Desk::devin_config_folder)
+    // And where Devin's sessions find them: their environment is the hub's
+    // with what a session's start added over it, which may set these apart
+    // from the hub's own, and change while the hub runs. Both are withheld.
+    // (A boss's bounds are said once, so Desk adds these again each time it
+    // judges.)
+    for dir in crate::desk_driver::desk()
+        .map(workforce_desk::Desk::devin_withheld)
+        .unwrap_or_default()
     {
         if !out.contains(&dir) {
             out.push(dir);

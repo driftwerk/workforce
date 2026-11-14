@@ -282,11 +282,12 @@ async fn desks_run_folder_holding_devins_hook_tokens_is_withheld_from_every_boss
     .await;
 }
 
-/// The Devin config folder Devin's sessions find is withheld from a boss
-/// where their environment puts it, even where what a session's start
-/// added sets it apart from the hub's, and after the hub said its bounds.
+/// The Devin folders Devin's sessions find (config and data) are withheld
+/// from a boss where their environment puts them, even where what a
+/// session's start added sets them apart from the hub's, after the hub
+/// said its bounds, and for as long as a run that found others runs.
 #[tokio::test]
-async fn the_devin_config_folder_devins_sessions_find_is_withheld_from_every_boss() {
+async fn the_devin_folders_devins_sessions_find_are_withheld_from_every_boss() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let o = options(dir.path());
@@ -305,25 +306,49 @@ async fn the_devin_config_folder_devins_sessions_find_is_withheld_from_every_bos
             scratch: Vec::new(),
             home: dir.path().join("home"),
         });
-        let elsewhere = dir.path().join("elsewhere");
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let elsewhere = real.join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("devin")).unwrap();
-        d.0.state.lock().session_env = BTreeMap::from([(
-            "XDG_CONFIG_HOME".to_string(),
-            elsewhere.display().to_string(),
-        )]);
-        let folder = std::fs::canonicalize(elsewhere.join("devin")).unwrap();
-        assert_eq!(d.devin_config_folder(), Some(folder.clone()));
-        let bounds = d.judging_bounds().unwrap();
-        assert!(bounds.withheld.contains(&folder), "{:?}", bounds.withheld);
-        let home = dir.path().join("other-home");
+        d.0.state.lock().session_env = BTreeMap::from([
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                elsewhere.display().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                real.join("data").display().to_string(),
+            ),
+        ]);
+        let config = elsewhere.join("devin");
+        let data = real.join("data/devin");
+        let withheld = d.judging_bounds().unwrap().withheld;
+        assert!(withheld.contains(&config), "{withheld:?}");
+        assert!(withheld.contains(&data), "{withheld:?}");
+        // A run launched now keeps them withheld while it runs, and writes
+        // back to its own config, whatever a later start sets.
+        let id = Uuid::new_v4();
+        d.devin_launched(id, Utc::now());
+        let home = real.join("other-home");
         d.0.state.lock().session_env =
             BTreeMap::from([("HOME".to_string(), home.display().to_string())]);
-        assert!(d
-            .judging_bounds()
-            .unwrap()
-            .withheld
-            .iter()
-            .any(|w| w.ends_with("other-home/.config/devin")));
+        let withheld = d.judging_bounds().unwrap().withheld;
+        for w in [
+            config.clone(),
+            data.clone(),
+            home.join(".config/devin"),
+            home.join(".local/share/devin"),
+        ] {
+            assert!(withheld.contains(&w), "{w:?} in {withheld:?}");
+        }
+        assert_eq!(
+            d.0.state.lock().devin_runs[&id].config,
+            Some(config.join("config.json"))
+        );
+        // Once it has ended, only where sessions find them now.
+        d.0.state.lock().devin_runs.get_mut(&id).unwrap().ended = Some(Utc::now());
+        let withheld = d.judging_bounds().unwrap().withheld;
+        assert!(!withheld.contains(&config), "{withheld:?}");
+        assert!(withheld.contains(&home.join(".config/devin")));
     })
     .await;
 }

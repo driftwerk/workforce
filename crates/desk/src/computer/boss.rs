@@ -555,13 +555,34 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
             || (name == ".cargo" && next.is_some_and(|n| n.starts_with("config")))
             || (name == ".github" && matches!(next, Some("workflows" | "actions")))
             || mcp_config(name)
+            || runs_later(name, next)
     })
+}
+
+/// The agents' instructions [`crate::boss_ask::RUNS_LATER`] names: what a
+/// session's work edits in its own folder, never its settings.
+const INSTRUCTIONS: [&str; 4] = ["claude.md", "claude.local.md", "agents.md", "gemini.md"];
+
+/// Whether `name` (folded), with the one after it, is a part of a path
+/// whose contents run on their own later, as a boss's own asks count it
+/// ([`crate::boss_ask::RUNS_LATER`] and `RUNS_LATER_IN`; Windows takes
+/// `.git.` and `.git ` for `.git`): one list for both. The agents'
+/// instructions aside ([`INSTRUCTIONS`]).
+fn runs_later(name: &str, next: Option<&str>) -> bool {
+    let trim = |n: &str| n.trim_end_matches(['.', ' ']).to_string();
+    let name = trim(name);
+    (crate::boss_ask::RUNS_LATER.contains(&name.as_str()) && !INSTRUCTIONS.contains(&name.as_str()))
+        || name.contains(".gitlab-ci")
+        || next.is_some_and(|n| {
+            crate::boss_ask::RUNS_LATER_IN.contains(&(name.as_str(), trim(n).as_str()))
+        })
 }
 
 /// Whether `name` (folded) is an MCP config by any spelling an engine
 /// reads, wherever it sits: Devin's and Windsurf's `mcp_config.json`, and
-/// `mcp.json`, each as JSON or JSONC. Its servers are commands it runs.
+/// `mcp.json` (`.mcp.json` too), each as JSON or JSONC. Its servers are commands it runs.
 fn mcp_config(name: &str) -> bool {
+    let name = name.strip_prefix('.').unwrap_or(name);
     ["mcp_config.", "mcp."]
         .iter()
         .filter_map(|p| name.strip_prefix(p))
@@ -4478,6 +4499,8 @@ pub(crate) mod tests {
             "/Users/sam/dev/acme-web/\u{ff4d}\u{ff43}\u{ff50}.json",
             "/Users/sam/.codeium/windsurf/mcp_config.json",
             "/Users/sam/dev/acme-web/.cursor/mcp.json",
+            "/Users/sam/dev/acme-web/.mcp.jsonc",
+            "/Users/sam/dev/acme-web/.MCP.json",
         ] {
             assert!(settings(Path::new(p), home, &w), "{p}");
         }
@@ -4490,6 +4513,62 @@ pub(crate) mod tests {
             "/Users/sam/dev/acme-web/src/mcp.rs",
         ] {
             assert!(!settings(Path::new(p), home, &w), "{p}");
+        }
+    }
+
+    /// Everything a boss's own asks count as running on its own later is a
+    /// setting no boss changes for a session: one list for both. The
+    /// agents' instructions aside, which a session's work edits.
+    #[test]
+    fn what_runs_later_is_a_setting() {
+        let home = Path::new("/Users/sam");
+        let w = [PathBuf::from("/Users/sam/Library/Application Support/Desk")];
+        let repo = Path::new("/Users/sam/dev/acme-web");
+        for name in crate::boss_ask::RUNS_LATER {
+            let p = repo.join(name).join("x");
+            assert_eq!(
+                settings(&p, home, &w),
+                !INSTRUCTIONS.contains(name),
+                "{}",
+                p.display()
+            );
+            assert_eq!(
+                settings(&repo.join(name), home, &w),
+                !INSTRUCTIONS.contains(name),
+                "{name}"
+            );
+        }
+        for (dir, file) in crate::boss_ask::RUNS_LATER_IN {
+            let p = repo.join(dir).join(file);
+            assert!(settings(&p, home, &w), "{}", p.display());
+        }
+        for p in [
+            ".windsurf/rules/x.md",
+            ".windsurfrules",
+            ".cursor/hooks.json",
+            ".gemini/settings.json",
+            ".pre-commit-config.yaml",
+            "lefthook.yml",
+            "mise.toml",
+            ".tool-versions",
+            ".idea/workspace.xml",
+            ".zed/settings.json",
+            ".gitlab-ci.yml",
+            "ci/.gitlab-ci-deploy.yml",
+            ".drone.yml",
+            "Jenkinsfile",
+            "azure-pipelines.yml",
+            ".GIT./hooks/pre-push",
+        ] {
+            assert!(settings(&repo.join(p), home, &w), "{p}");
+        }
+        for p in [
+            "CLAUDE.md",
+            "docs/AGENTS.md",
+            "src/config.rs",
+            ".vscode-test/x",
+        ] {
+            assert!(!settings(&repo.join(p), home, &w), "{p}");
         }
     }
 }

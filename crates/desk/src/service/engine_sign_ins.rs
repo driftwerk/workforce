@@ -232,8 +232,11 @@ fn returns_here_only(page: &url::Url) -> bool {
 /// `\` (a host by the page's own scheme) is refused, and so is any other
 /// scheme (`javascript:`, `data:`, `file:`, `blob:`, …). One that isn't a
 /// URL (a path, a word, Windsurf's `chisel-show-auth-token`) is allowed:
-/// the real shapes are still to be seen. Desk's machines check the same
-/// (`desk-machine`'s `sends_away`).
+/// the real shapes are still to be seen. One still holding a `%` once
+/// decoded (encoded twice, `%253A%252F%252F`) is refused: a reader that
+/// decodes again could find a scheme in it. Desk's machines check the same
+/// before opening a page: the workforce-desk repository's
+/// `crates/desk-machine/src/callback.rs` (`sign_in_page`).
 fn sends_away(page: &url::Url) -> Option<String> {
     page.query()?
         .split(['&', ';'])
@@ -261,6 +264,9 @@ fn returns_here(value: &str) -> bool {
         .chars()
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
+    if value.contains('%') {
+        return false;
+    }
     if value.starts_with(['/', '\\']) && value[1..].starts_with(['/', '\\']) {
         return false;
     }
@@ -894,6 +900,11 @@ mod tests {
             "&x=1;redirect_uri=https%3A%2F%2Fevil.example",
             "&https%3A%2F%2Fevil.example",
             "&next=vscode%3A%2F%2Fx",
+            // Encoded twice: a reader decoding again finds a scheme.
+            "&redirect_uri=https%253A%252F%252Fevil.example",
+            "&redirect_uri=%252F%252Fevil",
+            "&https%253A%252F%252Fevil.example=1",
+            "&x=100%25",
             "&redirect_uri=http%3A%2F%2Flocalhost%3A4321%2Fcallback&next=https%3A%2F%2Fevil.example",
         ] {
             assert_eq!(devin_said(&devin_screen(&devin(away))).url, None, "{away}");
