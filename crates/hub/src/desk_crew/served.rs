@@ -576,6 +576,24 @@ impl CrewHub {
             && self.overseer_for(&served_oversight(g).scope).is_none()
     }
 
+    /// Whether `boss` is the boss relayed from the home served for `g` here
+    /// now, at Act fully as far as its home goes: the grant's own boss, no
+    /// local overseer of the group, and the home said lately that Act
+    /// fully is in force for it there ([`super::relayed_decide`]).
+    pub(super) fn serves_relayed(&self, g: &Grant, boss: &BossRef) -> bool {
+        matches!(boss, BossRef::Local { .. })
+            && g.boss.as_ref() == Some(boss)
+            && self.overseer_for(&served_oversight(g).scope).is_none()
+            && self.home_holds_full(&boss.party_id(), &g.group)
+    }
+
+    /// Whether `boss` is served for `g` here and may act fully on it: a
+    /// remote boss ([`Self::serves_remote`]), or one relayed from the home
+    /// while its home holds it ([`Self::serves_relayed`]).
+    fn serves_fully(&self, g: &Grant, boss: &BossRef) -> bool {
+        self.serves_remote(g, boss) || self.serves_relayed(g, boss)
+    }
+
     /// The requests `boss`, the remote boss of `group`, owes an answer to
     /// and hasn't been given yet, as `event` frames: in each of the grant's
     /// sessions it runs and has the wheel of, at a level that does more
@@ -694,8 +712,9 @@ impl CrewHub {
     /// for any served boss: the rest is asked, and decided.
     ///
     /// A boss relayed from the home (the home's own boss of a machine's
-    /// sessions) is never unbound here: its decisions have no way back to
-    /// its hub yet.
+    /// sessions) is judged the same, and only while its home said lately
+    /// that Act fully is in force for it there: its decisions go back by
+    /// the relay ([`super::relayed_decide`]).
     pub(crate) fn served_full(&self, boss: &str) -> Option<workforce_desk::charge::FullGrant> {
         if !grant::is_served(boss) {
             return None;
@@ -709,7 +728,7 @@ impl CrewHub {
                 continue;
             }
             let o = served_oversight(&g);
-            if !self.serves_remote(&g, b)
+            if !self.serves_fully(&g, b)
                 || !sees::shows(g.sees, Part::Question)
                 || !sees::shows(g.sees, Part::Reply)
                 || !self.unbound_given(boss, &o)
@@ -726,7 +745,8 @@ impl CrewHub {
         })
     }
 
-    /// The live grant here that serves `boss` (`<hub>/<agent>`) and holds
+    /// The live grant here that serves `boss` (`<hub>/<agent>`, or
+    /// `home/<agent>` while its home holds it at Act fully) and holds
     /// session `id`: what a decision of its on `id` is judged by.
     pub(crate) fn served_grant_of(&self, boss: &str, id: Uuid) -> Option<Grant> {
         self.desk
@@ -737,7 +757,7 @@ impl CrewHub {
             .find(|g| {
                 g.boss
                     .as_ref()
-                    .is_some_and(|b| b.party_id() == boss && self.serves_remote(g, b))
+                    .is_some_and(|b| b.party_id() == boss && self.serves_fully(g, b))
                     && self.in_grant(g, id)
             })
     }

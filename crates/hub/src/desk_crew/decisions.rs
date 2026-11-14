@@ -354,14 +354,12 @@ impl CrewHub {
             } => format!("Sent {} a message.", self.name_of_session(*s)),
             _ => said_short(said).to_string(),
         };
-        // A boss on another hub is named with its hub, in the lines the
-        // person reads.
-        let (what, brief) = match boss.split_once('/') {
-            Some((hub, agent)) => (
-                format!("{what} (by {agent} on {hub})"),
-                format!("{} (by {agent} on {hub})", brief.trim_end_matches('.')),
-            ),
-            None => (what, brief),
+        // A boss on another hub is named with its hub, and the home's own
+        // as at home, in the lines the person reads.
+        let what = super::remote_decide::named(&boss, what);
+        let brief = match boss.contains('/') {
+            true => super::remote_decide::named(&boss, brief.trim_end_matches('.').to_string()),
+            false => brief,
         };
         // One made by a preference says so (its why already cites it).
         let how = match by.preference {
