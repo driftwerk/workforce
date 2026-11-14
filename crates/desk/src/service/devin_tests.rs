@@ -376,9 +376,8 @@ async fn a_devin_session_started_again_at_once_keeps_its_new_runs_files() {
             .unwrap();
         assert!(set.not_started.is_none(), "{:?}", set.not_started);
         assert_eq!(
-            set.confirmed,
-            Some(crate::mode::Mode::AcceptEdits),
-            "Devin said the mode it runs in"
+            set.confirmed, None,
+            "Devin's mode is never waited on until a real capture says it is sent"
         );
         its_next_hook_lands(&d, s.id, "the new run's Stop landed").await;
         let args = last_args(dir.path());
@@ -437,6 +436,33 @@ async fn a_resume_devin_refuses_leaves_none_of_its_files() {
             starts,
             "Devin never ran"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_devin_resume_that_fails_while_its_run_ends_keeps_what_the_end_said() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _cancel) = devin_desk(pool, dir.path(), |_| {}).await;
+        let s = devin_session(&d, dir.path()).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+        // A resume Devin refuses, made while the run before is still ending.
+        d.change(s.id, |r, _| r.cli_session_id = Some("-x".into()));
+        std::fs::write(dir.path().join("list.json"), r#"[{"id":"-x"}]"#).unwrap();
+        d.0.state.lock().devin_end_delay = Some(Duration::from_millis(600));
+        d.stop(s.id, None).unwrap();
+        until("its process went", || {
+            !d.0.state.lock().live.contains_key(&s.id)
+        })
+        .await;
+        let refused = d.resume(s.id, None, None).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("wouldn't pass on"),
+            "{refused}"
+        );
+        // Read after the end, never before it: its `Stopped` stays.
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
     })
     .await;
 }
@@ -516,6 +542,12 @@ async fn a_devin_session_the_holder_kept_keeps_its_files_when_the_hub_starts_aga
         let (second, _cancel) =
             devin_desk(pool, dir.path(), move |o| o.holder = Some(holder)).await;
         assert!(second.view(s.id).unwrap().live, "taken back");
+        // Its shell may have moved before the restart: where a relative
+        // path lands is unknown until Devin says.
+        assert!(
+            second.0.state.lock().live[&s.id].moved,
+            "taken back unmoved"
+        );
         for f in [&files.config, &files.base, &files.hook] {
             assert!(f.exists(), "{} ended under it", f.display());
         }

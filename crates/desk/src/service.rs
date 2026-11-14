@@ -1993,7 +1993,9 @@ impl Desk {
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),
-                    moved: false,
+                    // Devin's shell stays from call to call: it may have
+                    // moved before the hub restarted, unseen.
+                    moved: record.engine == Engine::Devin,
                     codex_sent: HashMap::new(),
                     held: None,
                     open_question: None,
@@ -3383,13 +3385,18 @@ impl Desk {
         prompt: Option<String>,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        let r = self.load(id).await?;
-        // A Devin session's run before ends whole first ([`Self::on_exit`]).
-        let lock = (r.engine == Engine::Devin).then(|| self.devin_lock(id));
+        // A Devin session's run before ends whole first ([`Self::on_exit`]),
+        // and it is read after: what that end said is never saved over.
+        let engine = match self.engine_of(id) {
+            Some(e) => e,
+            None => self.load(id).await?.engine,
+        };
+        let lock = (engine == Engine::Devin).then(|| self.devin_lock(id));
         let _ending = match &lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        let r = self.load(id).await?;
         if self.0.state.lock().live.contains_key(&id) {
             return Err(DeskError::Conflict("session is already running".into()));
         }
@@ -5342,8 +5349,13 @@ impl Desk {
         }
         if let Hook::ToolStart { call, .. } = &hook {
             // What Devin types into a command already running could move
-            // its shell anywhere, unseen.
-            let typed = call.tool == format!("{}write_to_process", devin::UNKNOWN);
+            // its shell anywhere, unseen; and a command it runs with what
+            // Desk can't read (its own folder among it) is read as moving.
+            let typed = [
+                format!("{}write_to_process", devin::UNKNOWN),
+                format!("{}exec", devin::UNKNOWN),
+            ]
+            .contains(&call.tool);
             // A move is read as the boss reads the command, however it is
             // quoted or escaped.
             let cd = typed
