@@ -986,11 +986,7 @@ impl Desk {
     /// What a session started for ticket `id` on `machine` is told: what
     /// [`Self::assign_ticket`] gives a new session here, and that its board
     /// is not on `machine`.
-    pub async fn ticket_start_text(
-        &self,
-        id: Uuid,
-        machine: &str,
-    ) -> Result<StartText, DeskError> {
+    pub async fn ticket_start_text(&self, id: Uuid, machine: &str) -> Result<StartText, DeskError> {
         let t = self.ticket_of(id).await?;
         let b = self.board_of(t.board).await?;
         let key = t.key(&b).unwrap_or_else(|| "a ticket".into());

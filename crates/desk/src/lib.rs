@@ -139,8 +139,8 @@ pub use service::{
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
-    AssignTo, BoardPatch, ChargedTo, Move, MachineSessionFor, NewBoard, NewSessionFor, NewTicket, StartText, TicketPatch,
-    TicketQuery, TicketView,
+    AssignTo, BoardPatch, ChargedTo, MachineSessionFor, Move, NewBoard, NewSessionFor, NewTicket,
+    StartText, TicketPatch, TicketQuery, TicketView,
 };
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
