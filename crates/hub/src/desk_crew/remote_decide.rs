@@ -146,7 +146,8 @@ impl CrewHub {
             // session as a deny's reason, and Activity.
             (Some(t), _) => Ok(t.chars().take(MAX_ANSWER).collect()),
             (None, Some(e)) => Err(Failed {
-                why: workforce_desk::crew::one_line(e, 160),
+                // Its control characters gone first: what it says is shown.
+                why: workforce_desk::crew::one_line(&workforce_core::desk::one_line(e, 1_000), 160),
                 code: frame["code"].as_str().and_then(Code::parse),
             }),
             (None, None) => Err("its hub's answer couldn't be read".to_string().into()),

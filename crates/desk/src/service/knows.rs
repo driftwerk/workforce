@@ -63,6 +63,12 @@ pub struct RuleChanged {
 }
 
 impl Desk {
+    /// Whether this is a machine's engine, not the person's own computer:
+    /// its pushes leave the agent's digest to the Mac's (Sees K7).
+    pub fn knows_on_machine(&self) -> bool {
+        self.0.opts.bosses.machine
+    }
+
     /// The work as a rule reads it now: the sidebar, each board and the
     /// sessions its tickets are assigned to, each grid's panes, and who
     /// runs which session.

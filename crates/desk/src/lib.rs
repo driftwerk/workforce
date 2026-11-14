@@ -35,6 +35,11 @@ mod crew_store;
 mod cwd;
 pub mod decision;
 pub mod decision_store;
+// Devin's engine, its pieces before its sessions start (H2 wires them).
+#[allow(dead_code)]
+mod devin;
+#[allow(dead_code)]
+mod devin_config;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;
@@ -101,6 +106,7 @@ pub mod ticket_markdown;
 mod token_pipe;
 mod transcript;
 pub mod update;
+pub mod update_brief;
 pub mod update_store;
 pub mod usage;
 mod vt;

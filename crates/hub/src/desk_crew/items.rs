@@ -56,12 +56,18 @@ pub const OPEN: &str = "crew.open_items";
 pub const PROMISE: &str = "crew.promise";
 pub const ORDER: &str = "crew.order";
 
-pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message, one line (question, at most 15 words), with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Never retell a session's plan: the full text (text) and what it holds up (holding_up) sit behind \"more\". Give your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"); also its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). For what only the person can physically do (rotate their credentials), use kind todo: one line, no answers. At Act fully, decide and act instead of asking; ask with answers only when you truly can't decide, saying why (cant_decide). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
+pub const ASK_DESCRIPTION: &str = "Ask the person something, or ask them to confirm a decision you took (kind: confirm): it goes to them at once as a needs-you message, one line (question, at most 15 words), with its answers as buttons, and stays open until they answer, it no longer applies, or you close it (crew.close_item). Never retell a session's plan: the full text (text) and what it holds up (holding_up) sit behind \"more\". Give your recommendation, the answers to offer (options) and, when an answer would settle a kind of case from then on, that case (generalizes, e.g. \"When a session wants to merge with CI red\"); also its points when there are several (items), which option you recommend (recommended) and what carries on meanwhile (not_blocking). For what only the person can physically do (rotate their credentials), use kind todo: one line, no answers. At Act fully you handle nearly everything yourself (about 99 in 100), by the person's own instructions (their orders and preferences, both ways); touching production or staging is no reason by itself to ask. An ask with answer buttons there is rare: only when their instructions don't cover it and you truly can't decide, or only the person can act, saying why (cant_decide); then the buttons alone, with no recommendation text (mark the one you would pick with recommended, if any). Asking the same thing again updates it: nothing is said twice. For a question a session asked you, use crew.escalate instead.";
 /// What `crew.ask` says at Act fully to an ask that gave no reason it
 /// couldn't decide.
-const ACT_FULLY_ASK: &str = "At Act fully you decide and act yourself: do it, and the person reads what you did in your update. For what only the person can physically do (rotate their own credentials, sign in), use kind todo: one line, no answers. Ask with answers only when you truly can't decide, and say why (cant_decide).";
+const ACT_FULLY_ASK: &str = "At Act fully you decide and act yourself, by the person's own instructions (below, in their words, when they gave any): do it, and the person reads what you did in your update. Touching production or staging is no reason by itself to ask: their orders say whether to do it or refuse it. For what only the person can physically do (their credentials, a payment, sign in), use kind todo: one line, no answers. Answer buttons are fine but rare (you handle about 99 in 100 yourself): only when their instructions don't cover it and you truly can't decide, or only the person can act, saying why (cant_decide); then no recommendation text beside them.";
+/// What `crew.ask` says at Act fully to the first ask of a matter while the
+/// person has standing orders or preferences: check it against them.
+const CHECK_ORDERS: &str = "Not asked yet: check this against the person's own instructions below, in their words. Where they cover it, act on them (refuse what they forbid, with what to do instead; do what they want done, and have the session check nothing broke) and say \"✓ did X — why\" in your update. Ask again, the same, only if they truly don't cover it (a destructive or irreversible step outside them, or something only the person can physically do), saying in cant_decide why they don't.";
+/// How long an ask of a matter checked against the person's instructions
+/// may be asked again without being checked anew.
+const CHECKED_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
-pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself.";
+pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself. A why is never said to the person. For a promise or one of their orders that ended in a real result they would want, say what was done in done (at most 12 words, e.g. \"Cufflink migration: 18 of 20 tables moved\"): it reaches them once as \"✓ <done>\". One that simply ended (its time or condition passed, the person came back or checked in, the morning came) or duplicated another item takes why only: nothing is said of it.";
 pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
 pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, your promises, their orders, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
@@ -84,7 +90,7 @@ pub fn schema(name: &str) -> Value {
         ASK => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "What you ask, in full, readable cold" },
             "kind": { "type": "string", "enum": ["ask", "confirm", "todo"], "description": "ask (default), confirm a decision you took, or todo: what only the person can physically do (one line, no answers; they mark it Done)" },
-            "cant_decide": { "type": "string", "description": "At Act fully: why you can't decide this yourself. Without it, at Act fully you decide and act instead of asking" },
+            "cant_decide": { "type": "string", "description": "At Act fully: why the person's own instructions (their orders, preferences, the session's instructions) don't cover this and you can't decide it yourself. Touching production or staging is no reason by itself. Without it, at Act fully you decide and act instead of asking" },
             "session_id": { "type": "string", "description": "The session it is about, if one (from crew.overview)" },
             "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
             "recommendation": { "type": "string" },
@@ -109,7 +115,8 @@ pub fn schema(name: &str) -> Value {
         CLOSE => json!({ "type": "object", "properties": {
             "item_id": { "type": "string" },
             "answer": { "type": "string", "description": "The person's answer, in their words" },
-            "why": { "type": "string", "description": "Why it is settled without their answer" }
+            "why": { "type": "string", "description": "Why it is settled without their answer; never said to the person" },
+            "done": { "type": "string", "description": "A promise or order that ended in a real result: what was done, at most 12 words, said once as \"✓ <done>\". Leave it out when it simply ended or was a duplicate" }
         }, "required": ["item_id"] }),
         _ => json!({ "type": "object", "properties": {} }),
     }
@@ -151,25 +158,35 @@ fn line_closed(asked: Option<Asked>, session: &str) -> Option<(ClosedBy, String)
     }
 }
 
-/// What a promise or order the boss kept says, once, at `tz`: when it was
-/// asked, what it was and what showed it done. None for anything else.
-pub(super) fn kept_line(closed: &OpenItem, tz: chrono_tz::Tz) -> Option<String> {
-    let why = closed.closed_why.as_deref()?;
-    let why = why.strip_prefix("Done: ").unwrap_or(why);
-    if closed.closed_by != Some(ClosedBy::Boss) || closed.done_when.as_deref() == Some(REPLIED) {
+/// How the boss's close of a promise or order with a real result starts
+/// its why; any other close of one says nothing to the person.
+pub(super) const DONE_PREFIX: &str = "Done: ";
+/// The most words a kept line says.
+pub(super) const KEPT_WORDS: usize = 12;
+
+/// What a promise or order the boss kept says, once: "✓ <what was done>",
+/// at most [`KEPT_WORDS`] words. Only one that ended in a result (its
+/// session's account showed it done, or the boss closed it with `done`):
+/// one that simply ended (its time or condition passed, the person came
+/// back) or was a duplicate says nothing, and the person's own words are
+/// never said back to them. None for anything else.
+pub(super) fn kept_line(closed: &OpenItem) -> Option<String> {
+    if closed.closed_by != Some(ClosedBy::Boss)
+        || closed.done_when.as_deref() == Some(REPLIED)
+        || !matches!(closed.kind, OpenKind::Order | OpenKind::Promise)
+    {
         return None;
     }
-    let at = closed.opened_at.with_timezone(&tz).format("%H:%M");
-    let what = match closed.kind {
-        OpenKind::Order => format!("The change you asked for at {at}"),
-        OpenKind::Promise => format!("What I promised at {at}"),
-        _ => return None,
-    };
-    Some(format!(
-        "{what} (“{}”) is {}: {why}",
-        crew::one_line(&closed.text, 200),
-        closed.done_when.as_deref().unwrap_or("done"),
-    ))
+    let what = closed.closed_why.as_deref()?.strip_prefix(DONE_PREFIX)?;
+    let what = crew::words(what.trim(), KEPT_WORDS);
+    (!what.is_empty()).then(|| format!("✓ {what}"))
+}
+
+/// Whether an order keyed `key` is the person's own message (kept from
+/// their DM turn), not the boss's record of it (`crew.order`, keyed by its
+/// words).
+fn persons_order(key: &str) -> bool {
+    key.starts_with("order:") && !key.starts_with("order:text:")
 }
 
 /// What is said of `due` (one boss's items due to be said again, oldest
@@ -254,14 +271,45 @@ impl CrewHub {
                 .map(str::to_string)
         };
         let cant_decide = some_of("cant_decide");
-        // At Act fully the boss decides and acts; it asks only what it
-        // truly can't decide, and says why.
-        if kind != OpenKind::Todo && cant_decide.is_none() {
-            let full = self.overseer_named(boss).is_some_and(|(_, o)| {
-                self.level_now(boss, &o).0 == workforce_common::oversight::Level::Full
+        // At Act fully the boss decides and acts by the person's own
+        // instructions; it asks only what they don't cover and it truly
+        // can't decide, and says why. Before its first ask of a matter it
+        // is given those instructions, in their words, to check against.
+        let mut at_full = false;
+        if kind != OpenKind::Todo {
+            let full = self.overseer_named(boss).filter(|(_, o)| {
+                self.level_now(boss, o).0 == workforce_common::oversight::Level::Full
             });
-            if full {
-                return Err(ACT_FULLY_ASK.into());
+            at_full = full.is_some();
+            if let Some((_, o)) = full {
+                let about: Option<Uuid> = input["session_id"].as_str().and_then(|s| s.parse().ok());
+                let standing = self.standing_words(boss, &o, about).await;
+                let words = |lead: &str| match standing.is_empty() {
+                    true => lead.to_string(),
+                    false => format!("{lead}\n\n{standing}"),
+                };
+                if cant_decide.is_none() {
+                    return Err(words(ACT_FULLY_ASK));
+                }
+                // Its one line is one line: a long one is asked again,
+                // shorter, before it is checked against their orders.
+                if let Some(q) = some_of("question") {
+                    if crew::word_count(&q) > open_item::QUESTION_WORDS || q.contains('\n') {
+                        return Err(format!(
+                            "question is one line of at most {} words; put the rest in text.",
+                            open_item::QUESTION_WORDS
+                        ));
+                    }
+                }
+                // A matter is its session, or its words when about none:
+                // reworded, it is not checked twice.
+                let matter = match about {
+                    Some(s) => format!("{boss}\u{1f}{s}"),
+                    None => format!("{boss}\u{1f}{}", open_item::normalised(text)),
+                };
+                if !standing.is_empty() && self.first_ask_at_full(&matter) {
+                    return Err(words(CHECK_ORDERS));
+                }
             }
         }
         // Its one line is one line: a long one is asked again, shorter.
@@ -309,7 +357,10 @@ impl CrewHub {
         }
         let mut new = NewItem::ask(boss, kind, session, text).generalizing(some("generalizes"));
         new.holding_up = some("holding_up");
-        new.recommendation = some("recommendation");
+        // At Act fully an ask is rare and its buttons stand alone: no
+        // recommendation essay beside them (the one it would pick can be
+        // marked recommended).
+        new.recommendation = some("recommendation").filter(|_| !at_full);
         let list = |k: &str| -> Vec<String> {
             input[k]
                 .as_array()
@@ -455,16 +506,81 @@ impl CrewHub {
                 o
             }
         };
-        let opened = self
-            .desk
-            .store()
-            .item_open(&new)
-            .await
-            .map_err(Self::item_err)?;
-        Ok(json!(format!(
-            "Kept as item {}: it is tracked until it is done, and in every turn of yours till then.",
-            opened.item().id
-        )))
+        let opened = match new.kind {
+            OpenKind::Order => self.order_open(new).await,
+            _ => self.desk.store().item_open(&new).await,
+        }
+        .map_err(Self::item_err)?;
+        Ok(json!(match opened {
+            Opened::New(i) => format!(
+                "Kept as item {}: it is tracked until it is done, and in every turn of yours till then.",
+                i.id
+            ),
+            Opened::Again(i) => format!(
+                "That is already kept as item {} (“{}”): it is one item, its sessions joined.",
+                i.id,
+                crew::one_line(&i.text, 120)
+            ),
+        }))
+    }
+
+    /// Keeps the person's order `new`: the same words as an open order of
+    /// the same boss opened within [`open_item::SAME_ORDER_WITHIN`], about
+    /// the same sessions or none, are that order, its sessions joined, so
+    /// the same order said twice is never two items. The person's own
+    /// words outrank the boss's record of them: an order from their
+    /// message takes the place of one the boss recorded (closed, said of
+    /// nowhere), never the other way.
+    async fn order_open(&self, mut new: NewItem) -> eyre::Result<Opened> {
+        let now = Utc::now();
+        let meet = |a: &[Uuid], b: &[Uuid]| {
+            a.is_empty() || b.is_empty() || a.iter().any(|s| b.contains(s))
+        };
+        let open = match self.desk.store().items_not_closed(Some(&new.boss)).await {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::info!(error = %e, "the open orders couldn't be read to merge one");
+                Vec::new()
+            }
+        };
+        let was = open.into_iter().find(|i| {
+            i.kind == OpenKind::Order
+                && i.dedupe_key != new.dedupe_key
+                && now - i.opened_at <= open_item::SAME_ORDER_WITHIN
+                && meet(&i.sessions, &new.sessions)
+                && open_item::same_order(&i.text, &new.text)
+        });
+        match was {
+            Some(was) if persons_order(&new.dedupe_key) && !persons_order(&was.dedupe_key) => {
+                for s in was.sessions {
+                    if !new.sessions.contains(&s) {
+                        new.sessions.push(s);
+                    }
+                }
+                new.done_when = new.done_when.or(was.done_when);
+                // Kept first: a failure never loses the order.
+                let opened = self.desk.store().item_open(&new).await?;
+                if let Err(e) = self
+                    .desk
+                    .store()
+                    .item_close(
+                        was.id,
+                        ClosedBy::Boss,
+                        "The person's own order took its place.",
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "the boss's record of an order wasn't closed");
+                }
+                return Ok(opened);
+            }
+            Some(was) => {
+                new.dedupe_key = was.dedupe_key;
+                new.text = was.text;
+            }
+            None => {}
+        }
+        self.desk.store().item_open(&new).await
     }
 
     /// After `action` was done by `by` (left in `done`): a status question
@@ -570,7 +686,7 @@ impl CrewHub {
                 .map(|m| m.id.clone())
         });
         let new = NewItem::order(boss, text.trim(), sessions, message.as_deref());
-        if let Err(e) = self.desk.store().item_open(&new).await {
+        if let Err(e) = self.order_open(new).await {
             tracing::warn!(error = %format!("{e:#}"), "keeping the person's order failed");
         }
     }
@@ -677,6 +793,37 @@ impl CrewHub {
             return Ok(json!("That was already settled."));
         }
         let text = |k: &str| input[k].as_str().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(done) = text("done") {
+            if !matches!(item.kind, OpenKind::Promise | OpenKind::Order) {
+                return Err(
+                    "done is for a promise or an order; close this with answer or why.".into(),
+                );
+            }
+            if item.kind == OpenKind::Promise && item.done_when.as_deref() == Some(REPLIED) {
+                return Err("This promise is kept by the session's reply, said as it comes: close it with why.".into());
+            }
+            if crew::word_count(done) > KEPT_WORDS || done.contains('\n') {
+                return Err(format!(
+                    "done is one line of at most {KEPT_WORDS} words: what was done, not the order again."
+                ));
+            }
+            let closed = self
+                .desk
+                .store()
+                .item_close(id, ClosedBy::Boss, &format!("{DONE_PREFIX}{done}"))
+                .await
+                .map_err(Self::item_err)?;
+            // With the composer on it goes in the next update; off, now.
+            let composed = self
+                .overseer_named(boss)
+                .is_some_and(|(_, o)| o.updates.enabled);
+            if let (Some(closed), false) = (closed, composed) {
+                if let Some(text) = kept_line(&closed) {
+                    self.say(boss, text).await;
+                }
+            }
+            return Ok(json!(format!("Closed: the person reads “✓ {done}” once.")));
+        }
         match (text("answer"), text("why")) {
             // A session's question: the person's answer goes on to it, as
             // theirs, and that closes the item.
@@ -709,7 +856,7 @@ impl CrewHub {
                     .map_err(Self::item_err)?;
                 Ok(json!("Closed."))
             }
-            (None, None) => Err("Say the person's answer, or why it is settled without it.".into()),
+            (None, None) => Err("Say the person's answer, why it is settled without it, or (a promise or order) what was done.".into()),
         }
     }
 
@@ -1059,6 +1206,84 @@ impl CrewHub {
         ))
     }
 
+    /// Whether `matter` (a boss's ask, by its session, or by its words when
+    /// about none) is asked at Act fully
+    /// for the first time in [`CHECKED_FOR`]: then it is noted, and checked
+    /// against the person's instructions before it may be asked.
+    fn first_ask_at_full(&self, matter: &str) -> bool {
+        let now = Utc::now();
+        let mut checked = self.asks_checked.lock();
+        checked.retain(|_, at| now - *at < CHECKED_FOR);
+        checked.insert(matter.to_string(), now).is_none()
+    }
+
+    /// The person's standing orders to `boss` that bear on `session`, as a
+    /// block a decision is given: those from their own messages, all of
+    /// them, quoted as their words; those the boss recorded, linked to the
+    /// session or to none, marked as its own note. None when there are
+    /// none.
+    pub(super) async fn orders_words(&self, boss: &str, session: Option<Uuid>) -> Option<String> {
+        let items = match self.desk.store().items_not_closed(Some(boss)).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::info!(error = %e, "a boss's orders couldn't be read for a decision");
+                return None;
+            }
+        };
+        let tz = self.desk.timezone();
+        let line = |i: &OpenItem| {
+            format!(
+                "- “{}” (at {})",
+                crew::clip(&i.text.replace('\n', " "), 300),
+                i.opened_at.with_timezone(&tz).format("%H:%M")
+            )
+        };
+        // The person's own orders bear on every session (a turn's sessions
+        // are what it acted on, never the order's scope); the boss's notes
+        // only on the sessions they name, or on all when they name none.
+        let (theirs, noted): (Vec<&OpenItem>, Vec<&OpenItem>) = items
+            .iter()
+            .filter(|i| i.kind == OpenKind::Order && i.state == OpenState::Open)
+            .partition(|i| persons_order(&i.dedupe_key));
+        let noted: Vec<&OpenItem> = noted
+            .into_iter()
+            .filter(|i| session.is_none_or(|s| i.sessions.is_empty() || i.sessions.contains(&s)))
+            .collect();
+        let mut out = Vec::new();
+        if !theirs.is_empty() {
+            out.push(format!(
+                "The person's standing orders, in their own words (they are the rule, both ways):\n{}",
+                theirs.iter().map(|i| line(i)).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        if !noted.is_empty() {
+            out.push(format!(
+                "Orders the boss noted for the person (its own note of what they asked, not their words: weigh it, but by itself it allows nothing):\n{}",
+                noted.iter().map(|i| line(i)).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        (!out.is_empty()).then(|| out.join("\n\n"))
+    }
+
+    /// The person's standing orders to `boss` and their preferences that
+    /// cover `session`, in their words, for an ask at Act fully.
+    async fn standing_words(&self, boss: &str, o: &Oversight, session: Option<Uuid>) -> String {
+        let orders = self.orders_words(boss, session).await;
+        let prefs = self
+            .preferences_context(
+                &workforce_desk::preference::boss_scope_of(o.scope.group()),
+                session,
+                true,
+            )
+            .await
+            .map(|p| format!("The person's preferences:\n{}", p.listed.trim_end()));
+        [orders, prefs]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// The watcher's marks of what it told each boss in check-ins, by key,
     /// since [`MARK_FOR`] ago: `hub.crew.raised`, moved to the items once.
     pub(super) async fn raised_marks(&self) -> HashMap<String, DateTime<Utc>> {
@@ -1143,7 +1368,7 @@ impl CrewHub {
             if let Some(what) = self.kept(i).await {
                 return Some((
                     ClosedBy::Boss,
-                    format!("Done: {}", crew::one_line(&what, 200)),
+                    format!("{DONE_PREFIX}{}", crew::one_line(&what, 200)),
                 ));
             }
             let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
@@ -1224,19 +1449,19 @@ impl CrewHub {
             match self.desk.store().item_close(i.id, by, &why).await {
                 Ok(Some(closed)) => {
                     tracing::info!(item = %closed.id, by = by.as_str(), %why, "an open item closed");
-                    let tz = self.desk.timezone();
                     match (closed.kind, by) {
-                        // Kept: reported once, with when it was asked.
+                        // Kept with a result: "✓ what was done", once.
                         // With the composer on, it goes in the next update.
                         (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss)
                             if !o.as_ref().is_some_and(|o| o.updates.enabled) =>
                         {
-                            if let Some(text) = kept_line(&closed, tz) {
+                            if let Some(text) = kept_line(&closed) {
                                 self.say(&closed.boss, text).await;
                             }
                         }
-                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Boss) => {}
-                        (OpenKind::Promise | OpenKind::Order, ClosedBy::Lapsed) => {
+                        // A promise of the boss's own it couldn't keep is
+                        // news, said once in its own words.
+                        (OpenKind::Promise, ClosedBy::Lapsed) => {
                             self.say(
                                 &closed.boss,
                                 format!(
@@ -1246,6 +1471,10 @@ impl CrewHub {
                             )
                             .await;
                         }
+                        // The person's order that simply ended (its sessions
+                        // ended, nothing changed for days): nothing is said,
+                        // and their own words are never said back to them.
+                        (OpenKind::Promise | OpenKind::Order, _) => {}
                         // A session's question shows its own end where it is.
                         _ if closed.said()
                             && closed.line_message.is_none()
@@ -1556,6 +1785,94 @@ mod tests {
         assert!(!said[1].1.contains("more"));
         assert!(said[1].1.starts_with("Still waiting on you: Q1? · 3 h"));
         assert_eq!(restatements(&due[..2], now).len(), 2);
+    }
+
+    /// The boss's order closed as `why`, by `by`.
+    fn closed_order(text: &str, done_when: Option<&str>, by: ClosedBy, why: &str) -> OpenItem {
+        let now = Utc::now();
+        OpenItem {
+            id: Uuid::new_v4(),
+            boss: "desk".into(),
+            owner: "you".into(),
+            kind: OpenKind::Order,
+            session: None,
+            line_message: None,
+            text: text.into(),
+            holding_up: None,
+            recommendation: None,
+            options: vec![],
+            generalizes: None,
+            done_when: done_when.map(str::to_string),
+            dedupe_key: "order:m1".into(),
+            opened_at: now - chrono::Duration::hours(10),
+            last_said_at: None,
+            said_count: 1,
+            raised_at: None,
+            sessions: vec![],
+            prefer_scope: None,
+            changed_at: now,
+            state: OpenState::Closed,
+            closed_at: Some(now),
+            closed_by: Some(by),
+            closed_why: Some(why.into()),
+            layout: Default::default(),
+            cant_decide: None,
+        }
+    }
+
+    /// As on 11/14: an order closed as a duplicate, or because the person
+    /// came back, says nothing; one kept with a result says "✓ what was
+    /// done" in at most 12 words, never the person's words back.
+    #[test]
+    fn only_an_order_kept_with_a_result_is_said_and_in_one_short_line() {
+        let order = "don't start on any new work except keeping the cufflink migration going";
+        for why in [
+            "Duplicate of the no-new-work order; they checked in on the morning of 14 Nov.",
+            "The person is back in the morning and has had the overnight report",
+        ] {
+            let i = closed_order(
+                order,
+                Some("The person is back in the morning"),
+                ClosedBy::Boss,
+                why,
+            );
+            assert_eq!(kept_line(&i), None, "{why}");
+        }
+        let lapsed = closed_order(order, None, ClosedBy::Lapsed, "nothing changed for 3 days");
+        assert_eq!(kept_line(&lapsed), None);
+
+        let kept = closed_order(
+            order,
+            Some("merged"),
+            ClosedBy::Boss,
+            "Done: Merged #622 after CI went green",
+        );
+        assert_eq!(
+            kept_line(&kept).as_deref(),
+            Some("✓ Merged #622 after CI went green")
+        );
+        let long = closed_order(
+            order,
+            Some("merged"),
+            ClosedBy::Boss,
+            "Done: Moved eighteen of the twenty cufflink tables to the new cluster overnight and checked every row count",
+        );
+        let line = kept_line(&long).unwrap();
+        assert!(line.starts_with("✓ Moved eighteen"), "{line}");
+        assert!(crew::word_count(&line) <= KEPT_WORDS + 1, "{line}");
+        for line in [kept_line(&kept).unwrap(), line] {
+            assert!(
+                !line.contains("cufflink migration going"),
+                "never the order back: {line}"
+            );
+            assert!(
+                !line.contains("The change you asked for") && !line.contains(" is "),
+                "{line}"
+            );
+        }
+        // A promise to report a session's reply is said by that reply.
+        let replied = closed_order(order, Some(REPLIED), ClosedBy::Boss, "Done: it replied");
+        assert_eq!(kept_line(&replied), None);
     }
 
     #[test]

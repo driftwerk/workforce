@@ -287,6 +287,26 @@ mod tests {
         for c in Code::ALL {
             assert_eq!(Code::parse(c.as_str()), Some(c));
         }
+        // Every variant is in `ALL`, and goes down the wire as its own word.
+        for c in Code::ALL {
+            let wire = match c {
+                Code::TooLong => "too_long",
+                Code::NotADecision => "not_a_decision",
+                Code::Paced => "paced",
+                Code::Budget => "budget",
+                Code::Link => "link",
+                Code::Gone => "gone",
+                Code::ModelFailed => "model_failed",
+                Code::Timeout => "timeout",
+            };
+            let v = answered(Uuid::nil(), Uuid::nil(), Err(Refused::new(c, "x")));
+            assert_eq!(v["code"], wire);
+        }
+        assert_eq!(
+            Code::ALL.len(),
+            8,
+            "a new code is in ALL, and in the match above"
+        );
         assert_eq!(Code::parse("its hub decides no more for it just now"), None);
         assert_eq!(Code::parse(""), None);
         let not_again: Vec<Code> = Code::ALL.into_iter().filter(|c| !c.again()).collect();

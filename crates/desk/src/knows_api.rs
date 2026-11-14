@@ -25,7 +25,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::api::Authorize;
 use crate::knows::{agent_key_ok, Digest, Rule};
@@ -212,12 +212,52 @@ async fn log(
     }
 }
 
+/// `GET /api/desk/knows/{hub}/{agent}/machines`: what each machine's engine
+/// is to share with the agent of its own sessions (Sees K7), for Desk's
+/// native side to hand each machine: `{everything, transcripts, machines:
+/// {<machine>: ["session:<id>"…]}}`. A machine not named shares only the
+/// agent's own work there, or everything when `everything`.
+async fn machines(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path((hub, agent)): Path<(String, String)>,
+) -> Response {
+    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
+        return error(status, "not allowed");
+    }
+    let Some(agent) = agent_of(&hub, &agent) else {
+        return not_an_agent();
+    };
+    let rule = match s.desk.store().knows_rule(&agent).await {
+        Ok(k) => k.map(|k| k.rule).unwrap_or_default(),
+        Err(e) => return failed(DeskError::Internal(e)),
+    };
+    let world = match s.desk.knows_world().await {
+        Ok(w) => w,
+        Err(e) => return failed(e),
+    };
+    let share = crate::knows::machine_share(&rule, &world);
+    let machines: serde_json::Map<String, Value> = share
+        .machines
+        .keys()
+        .map(|m| (m.clone(), json!(share.places_for(m))))
+        .collect();
+    Json(json!({
+        "everything": share.everything,
+        "transcripts": rule.transcripts,
+        "machines": machines,
+    }))
+    .into_response()
+}
+
 pub(crate) fn knows_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/knows", get(rules))
         .route("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
         .route("/api/desk/knows/{hub}/{agent}/held", post(held))
         .route("/api/desk/knows/{hub}/{agent}/log", get(log))
+        .route("/api/desk/knows/{hub}/{agent}/machines", get(machines))
         .with_state(Arc::new(KnowsApi { desk, auth }))
 }
 
@@ -288,6 +328,37 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn each_machine_is_told_what_of_its_own_a_rule_covers() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let app = knows_router(d.clone(), Arc::new(Bearer));
+            let uri = "/api/desk/knows/driftwerk/allan";
+            let s = uuid::Uuid::from_u128(9);
+            let (status, body) = send(&app, "GET", &format!("{uri}/machines"), None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, json!({ "everything": false, "transcripts": false, "machines": {} }));
+            send(
+                &app,
+                "PUT",
+                uri,
+                Some(json!({ "places": [format!("session:devbox/{s}")], "transcripts": true })),
+            )
+            .await;
+            let (_, body) = send(&app, "GET", &format!("{uri}/machines"), None).await;
+            assert_eq!(
+                body,
+                json!({ "everything": false, "transcripts": true, "machines": { "devbox": [format!("session:{s}")] } })
+            );
+            send(&app, "PUT", uri, Some(json!({ "places": ["all"] }))).await;
+            let (_, body) = send(&app, "GET", &format!("{uri}/machines"), None).await;
+            assert_eq!(body["everything"], true);
+            assert_eq!(body["machines"], json!({}));
+        })
+        .await;
     }
 
     #[tokio::test]
