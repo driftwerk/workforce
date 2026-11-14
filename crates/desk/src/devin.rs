@@ -52,13 +52,21 @@ pub struct DevinSpawn<'a> {
 }
 
 /// `devin --config <file> [--permission-mode m] [-r id] [--model m] -- <prompt>`.
-pub fn spawn(s: &DevinSpawn<'_>) -> Spawn {
+/// A session id or model that could read as an option, or as anything but
+/// a name, is refused.
+pub fn spawn(s: &DevinSpawn<'_>) -> Result<Spawn> {
     let mut args = vec!["--config".to_string(), s.config.display().to_string()];
     args.extend(s.mode.and_then(Mode::devin_args).unwrap_or_default());
     if let Launch::Resume { session_id } = s.launch {
+        if !is_name(session_id, "-_") {
+            eyre::bail!("a Devin session id Desk wouldn't pass on");
+        }
         args.extend(["-r".to_string(), session_id.to_string()]);
     }
     if let Some(m) = s.model {
+        if !is_name(m, "-_.:/") {
+            eyre::bail!("a Devin model name Desk wouldn't pass on");
+        }
         args.extend(["--model".to_string(), m.to_string()]);
     }
     // A bare word is a path for Devin to open: its prompt follows `--`,
@@ -68,47 +76,52 @@ pub fn spawn(s: &DevinSpawn<'_>) -> Spawn {
     }
     let mut env = s.env.clone();
     scrub_env(&mut env);
-    Spawn {
+    Ok(Spawn {
         program: s.program.to_path_buf(),
         args,
         cwd: s.cwd.to_path_buf(),
         env,
-    }
+    })
+}
+
+/// Whether `s` is a plain name: letters, digits and `extra`, not starting
+/// with `-`, at most 200 long.
+fn is_name(s: &str, extra: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
 }
 
 /// Takes out of a Devin session's environment what would outrank the
-/// person's own sign-in (an API key Devin reads from it), and what Desk
-/// gives Claude Code only: Devin reads the person's Claude setup, and must
-/// not pick up Desk's plugin from it.
+/// person's own sign-in or point Devin elsewhere (every `DEVIN_`,
+/// `WINDSURF_` and `CODEIUM_` setting but [`DEVIN_KEPT`]), what Desk gives
+/// Claude Code only (Devin reads the person's Claude setup, and must not
+/// pick up Desk's plugin or sign-in from it), and Desk's own tokens.
 pub fn scrub_env(env: &mut BTreeMap<String, String>) {
-    env.retain(|k, _| !outranks_sign_in(k));
-    for k in OWN_TO_CLAUDE {
-        env.remove(k);
-    }
+    env.retain(|k, _| {
+        let n = k.to_ascii_uppercase();
+        let vendor = ["DEVIN_", "WINDSURF_", "CODEIUM_"]
+            .iter()
+            .any(|p| n.starts_with(p));
+        (!vendor || DEVIN_KEPT.contains(&n.as_str())) && !NOT_FOR_DEVIN.contains(&n.as_str())
+    });
 }
 
-/// What Desk sets for Claude Code sessions alone.
-const OWN_TO_CLAUDE: [&str; 2] = ["CLAUDE_CODE_PLUGIN_DIRS", claude::USAGE_URL];
+/// The `DEVIN_` settings a session keeps: the person's choices, no
+/// credential or address among them.
+const DEVIN_KEPT: [&str; 2] = ["DEVIN_MODEL", "DEVIN_PERMISSION_MODE"];
 
-/// A credential Devin (or Windsurf, whose key it takes) could read from its
-/// environment: `WINDSURF_API_KEY`, a `DEVIN_…_TOKEN`.
-fn outranks_sign_in(name: &str) -> bool {
-    let n = name.to_ascii_uppercase();
-    ["DEVIN_", "WINDSURF_", "CODEIUM_"]
-        .iter()
-        .any(|p| n.starts_with(p))
-        && [
-            "KEY",
-            "TOKEN",
-            "SECRET",
-            "AUTH",
-            "CREDENTIAL",
-            "PASSWORD",
-            "COOKIE",
-        ]
-        .iter()
-        .any(|w| n.contains(w))
-}
+/// What Desk sets for Claude Code sessions alone, and its own tokens.
+const NOT_FOR_DEVIN: [&str; 6] = [
+    "CLAUDE_CODE_PLUGIN_DIRS",
+    claude::USAGE_URL,
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "DESK_HOOK_TOKEN",
+    "DESK_HOOK_URL",
+    "DESK_LINE_TOKEN",
+];
 
 /// A session's files in the hub's private run folder: each only this user
 /// can read, written when it starts, removed when it ends.
@@ -146,15 +159,27 @@ impl SessionFiles {
         person: &Person,
     ) -> Result<()> {
         crate::token_pipe::private_run_dir(run_dir)?;
-        devin_config::write_private(&self.hook, curl_config(hook_url)?.as_bytes())?;
-        let hooks = hooks(&self.hook, approval_timeout_secs, fail_closed);
-        let config = devin_config::session_config(person, &hooks);
-        devin_config::write_private(&self.config, serde_json::to_vec_pretty(&config)?.as_slice())?;
-        match person {
-            Person::Read(v) => devin_config::write_private(&self.base, v.to_string().as_bytes())?,
-            Person::Unreadable(_) => remove(&self.base),
+        let wrote = (|| -> Result<()> {
+            devin_config::write_private(&self.hook, curl_config(hook_url)?.as_bytes())?;
+            let hooks = hooks(&self.hook, approval_timeout_secs, fail_closed)?;
+            let config = devin_config::session_config(person, &hooks);
+            devin_config::write_private(
+                &self.config,
+                serde_json::to_vec_pretty(&config)?.as_slice(),
+            )?;
+            match person.base() {
+                Some(base) => devin_config::write_private(&self.base, base.to_string().as_bytes())?,
+                None => remove(&self.base),
+            }
+            Ok(())
+        })();
+        if wrote.is_err() {
+            // Half a session's files are none: the token goes with them.
+            for f in [&self.hook, &self.config, &self.base] {
+                remove(f);
+            }
         }
-        Ok(())
+        wrote
     }
 
     /// What Devin saved to the session's config is written back to the
@@ -206,16 +231,19 @@ pub fn sessions_with_files(run_dir: &Path) -> Vec<Uuid> {
 }
 
 /// The curl config a session's hooks post with. curl reads it with `-K`,
-/// so the token in its URL is never on a command line.
+/// so the token in its URL is never on a command line. It goes to the hub
+/// straight, never through a proxy the environment names, and by plain
+/// HTTP only (the hub's own address), so no redirect takes it elsewhere.
 pub fn curl_config(hook_url: &str) -> Result<String> {
-    if hook_url
-        .chars()
-        .any(|c| c == '"' || c == '\\' || c.is_control())
+    if !hook_url.starts_with("http://")
+        || hook_url
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
     {
         eyre::bail!("a hook URL Desk wouldn't write");
     }
     Ok(format!(
-        "url = \"{hook_url}\"\nheader = \"Content-Type: application/json\"\n"
+        "url = \"{hook_url}\"\nheader = \"Content-Type: application/json\"\nnoproxy = \"*\"\nproto = \"=http\"\n"
     ))
 }
 
@@ -229,18 +257,29 @@ const PLAIN_SECS: u64 = 10;
 /// What one hook runs: a `curl` of the session's hook URL (from its
 /// `.hook` file) with the payload on stdin, Desk's answer on stdout. With
 /// `fail_closed` (a boss on another hub runs it), Desk not answering
-/// refuses the call: exit 2, its reason on stderr.
-pub fn hook_command(hook_file: &Path, event: &str, timeout: u64, fail_closed: bool) -> String {
-    let file = shlex::try_quote(&hook_file.display().to_string())
-        .map(|q| q.into_owned())
-        .unwrap_or_else(|_| "/dev/null".into());
-    let post = format!(
-        "curl -sf --max-time {timeout} -K {file} -H '{EVENT_HEADER}: {event}' --data-binary @-"
-    );
-    match fail_closed {
-        true => format!("{post} || {{ echo '{}' >&2; exit 2; }}", claude::UNREACHED),
+/// refuses the call: exit 2, its reason on stderr. `-q` first: curl reads
+/// no `~/.curlrc` of the person's.
+pub fn hook_command(
+    hook_file: &Path,
+    event: &str,
+    timeout: u64,
+    fail_closed: bool,
+) -> Result<String> {
+    let quote = |s: &str| -> Result<String> {
+        shlex::try_quote(s)
+            .map(|q| q.into_owned())
+            .map_err(|_| eyre::eyre!("a hook Desk couldn't quote"))
+    };
+    let file = quote(&hook_file.display().to_string())?;
+    let header = quote(&format!("{EVENT_HEADER}: {event}"))?;
+    let post = format!("curl -q -sf --max-time {timeout} -K {file} -H {header} --data-binary @-");
+    Ok(match fail_closed {
+        true => format!(
+            "{post} || {{ echo {} >&2; exit 2; }}",
+            quote(claude::UNREACHED)?
+        ),
         false => post,
-    }
+    })
 }
 
 /// The hooks Desk appends to a session's config, event by event.
@@ -254,17 +293,17 @@ pub fn hooks(
     hook_file: &Path,
     approval_timeout_secs: u64,
     fail_closed: bool,
-) -> Map<String, Value> {
-    let entry = |event: &str, timeout: u64, fail_closed: bool| {
+) -> Result<Map<String, Value>> {
+    let entry = |event: &str, timeout: u64, fail_closed: bool| -> Result<Value> {
         let mut hook = json!({
             "type": "command",
-            "command": hook_command(hook_file, event, timeout, fail_closed),
+            "command": hook_command(hook_file, event, timeout, fail_closed)?,
             "timeout": timeout + 5,
         });
         if fail_closed {
             hook["fail_closed"] = Value::Bool(true);
         }
-        json!([{ "hooks": [hook] }])
+        Ok(json!([{ "hooks": [hook] }]))
     };
     let mut m = Map::new();
     for (event, timeout, closed) in [
@@ -278,9 +317,9 @@ pub fn hooks(
         // Answered at once, never holding the compaction up.
         ("PreCompact", 5, false),
     ] {
-        m.insert(event.into(), entry(event, timeout, closed));
+        m.insert(event.into(), entry(event, timeout, closed)?);
     }
-    m
+    Ok(m)
 }
 
 /// Reads one of Devin's hooks: its payload put in Claude Code's terms
@@ -343,143 +382,268 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
         return;
     };
     let raw = p.get("tool_input").cloned().unwrap_or(Value::Null);
-    let Some((tool, mut input)) = tool_of(&name, &raw) else {
+    let Some(read) = tool_of(&name, &raw) else {
         return;
     };
+    let mut input = read.input;
     input.insert(RAW.into(), json!({ "tool": name, "input": raw }));
-    p.insert("tool_name".into(), Value::String(tool.into()));
+    p.insert("tool_name".into(), Value::String(read.tool.into()));
     p.insert("tool_input".into(), Value::Object(input));
+    // Where a command runs, when it says: what its paths are read against.
+    if let Some(cwd) = read.cwd {
+        p.insert("cwd".into(), Value::String(cwd));
+    }
 }
 
-/// The first of `keys` `input` has as text.
-fn text_of<'a>(input: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|k| input.get(*k).and_then(Value::as_str))
+/// A field Desk reads of a tool's input: its name in Claude Code's terms,
+/// the names Devin may give it, and whether the tool can't run without it.
+type Field<'a> = (&'a str, &'a [&'a str], bool);
+
+/// One of Devin's calls in Claude Code's terms.
+struct Read {
+    tool: &'static str,
+    input: Map<String, Value>,
+    /// Where it runs, when its input says (an absolute path).
+    cwd: Option<String>,
+}
+
+/// The one text `input` has under any of `keys`. `Err`: it has one that
+/// isn't text, or two that differ, which Desk can't tell which Devin uses.
+fn text_of<'a>(input: &'a Map<String, Value>, keys: &[&str]) -> Result<Option<&'a str>, ()> {
+    let mut found: Option<&str> = None;
+    for k in keys {
+        match input.get(*k) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => match found {
+                Some(f) if f != s => return Err(()),
+                _ => found = Some(s),
+            },
+            Some(_) => return Err(()),
+        }
+    }
+    Ok(found)
 }
 
 /// What Claude Code calls Devin's tool `name`, and the input fields Desk
 /// reads, from Devin's `input`. Its documented names (docs.devin.ai,
 /// lifecycle hooks); its input fields only `exec`'s (`command`,
 /// `shell_id`) are documented, so each field is looked for under the
-/// names it is likely to have. None: a tool Desk doesn't know, which keeps
-/// its own name (an MCP server's `mcp__s__t` among them).
-fn tool_of(name: &str, input: &Value) -> Option<(&'static str, Map<String, Value>)> {
-    let mut out = Map::new();
-    let mut put = |k: &str, v: Option<&str>| {
-        if let Some(v) = v {
-            out.insert(k.into(), Value::String(v.into()));
-        }
-    };
+/// names it is likely to have.
+///
+/// None (the call keeps Devin's name, which Desk judges as a tool it
+/// doesn't know, never as a safe one): a tool Desk doesn't know (an MCP
+/// server's `mcp__s__t` among them); an input that isn't an object, lacks
+/// what the tool can't run without, has a field Desk doesn't know (it
+/// could name what Desk doesn't read), or says one field two ways; a tool
+/// whose effect Desk can't read from its input (`write_to_process` types
+/// into a command already running; a subagent runs tools of its own).
+fn tool_of(name: &str, input: &Value) -> Option<Read> {
+    let input = input.as_object()?;
     const PATH: [&str; 4] = ["file_path", "path", "file", "filename"];
-    let tool = match name {
+    // Each tool's fields: what Desk reads, and what it may carry beside.
+    let (tool, fields, known): (&'static str, &[Field], &[&str]) = match name {
+        "exec" => (
+            "Bash",
+            &[("command", &["command", "cmd"], true)],
+            &[
+                "shell_id",
+                "timeout",
+                "timeout_ms",
+                "description",
+                "run_in_background",
+                "background",
+                "cwd",
+                "workdir",
+            ],
+        ),
+        "edit" => (
+            "Edit",
+            &[
+                ("file_path", &PATH, true),
+                ("old_string", &["old_string", "old_str"], false),
+                ("new_string", &["new_string", "new_str"], false),
+            ],
+            &["replace_all", "expected_replacements"],
+        ),
+        "write" => (
+            "Write",
+            &[("file_path", &PATH, true)],
+            &["content", "contents", "text"],
+        ),
+        "apply_patch" => (
+            "Edit",
+            &[("patch", &["patch", "input", "diff", "content"], true)],
+            &[],
+        ),
+        "notebook_edit" => (
+            "NotebookEdit",
+            &[(
+                "notebook_path",
+                &["notebook_path", "path", "file_path"],
+                true,
+            )],
+            &[
+                "cell_id",
+                "cell_number",
+                "new_source",
+                "cell_type",
+                "edit_mode",
+            ],
+        ),
+        "read" => (
+            "Read",
+            &[("file_path", &PATH, true)],
+            &["offset", "limit", "start_line", "end_line", "pages"],
+        ),
+        "notebook_read" => (
+            "NotebookRead",
+            &[(
+                "notebook_path",
+                &["notebook_path", "path", "file_path"],
+                true,
+            )],
+            &[],
+        ),
+        "grep" | "glob" => (
+            if name == "grep" { "Grep" } else { "Glob" },
+            &[
+                ("pattern", &["pattern", "query", "regex"], true),
+                ("path", &["path", "dir", "directory"], false),
+                ("glob", &["glob", "include"], false),
+            ],
+            &[
+                "output_mode",
+                "case_insensitive",
+                "-i",
+                "-n",
+                "-A",
+                "-B",
+                "-C",
+                "context",
+                "head_limit",
+                "limit",
+                "type",
+                "multiline",
+            ],
+        ),
+        "webfetch" => (
+            "WebFetch",
+            &[("url", &["url"], true)],
+            &["prompt", "format", "timeout"],
+        ),
+        "todo_write" => ("TodoWrite", &[], &["todos"]),
+        "skill" => ("Skill", &[], &["skill", "name", "args"]),
+        "ask_user_question" => {
+            let q = questions_of(input)?;
+            let mut out = Map::new();
+            out.insert("questions".into(), q);
+            return Some(Read {
+                tool: claude::DIALOG_TOOL,
+                input: out,
+                cwd: None,
+            });
+        }
+        "exit_plan_mode" => (
+            claude::PLAN_TOOL,
+            &[("plan", &["plan", "content", "text"], false)],
+            &[],
+        ),
+        _ => return None,
+    };
+    let all: Vec<&str> = fields
+        .iter()
+        .flat_map(|(_, keys, _)| keys.iter().copied())
+        .chain(known.iter().copied())
+        .collect();
+    if input.keys().any(|k| !all.contains(&k.as_str())) {
+        return None;
+    }
+    let mut out = Map::new();
+    for (field, keys, required) in fields {
+        match text_of(input, keys).ok()? {
+            Some(v) => {
+                out.insert((*field).into(), Value::String(v.into()));
+            }
+            None if *required => return None,
+            None => {}
+        }
+    }
+    let mut cwd = None;
+    match name {
         "exec" => {
-            put("command", text_of(input, &["command", "cmd"]));
-            "Bash"
+            if let Some(dir) = text_of(input, &["cwd", "workdir"]).ok()? {
+                // Relative to what Desk can't be sure: none.
+                if !Path::new(dir).is_absolute() {
+                    return None;
+                }
+                cwd = Some(dir.to_string());
+            }
         }
-        // What it types into a running command runs there too.
-        "write_to_process" => {
-            put(
-                "command",
-                text_of(input, &["input", "text", "data", "command"]),
-            );
-            "Bash"
-        }
-        "edit" => {
-            put("file_path", text_of(input, &PATH));
-            put("old_string", text_of(input, &["old_string", "old_str"]));
-            put("new_string", text_of(input, &["new_string", "new_str"]));
-            "Edit"
-        }
-        "write" => {
-            put("file_path", text_of(input, &PATH));
-            "Write"
+        // A search without a place searches where the session runs.
+        "grep" | "glob" if !out.contains_key("path") => {
+            out.insert("path".into(), Value::String(".".into()));
         }
         // Every file the patch touches, as Codex's changes name them.
         "apply_patch" => {
-            let patch = text_of(input, &["patch", "input", "diff", "content"]);
-            put("patch", patch);
-            let paths = patch.map(patch_paths).unwrap_or_default();
+            let paths = patch_paths(out["patch"].as_str()?)?;
             out.insert("paths".into(), json!(paths));
-            "Edit"
         }
-        "notebook_edit" => {
-            put(
-                "notebook_path",
-                text_of(input, &["notebook_path", "path", "file_path"]),
-            );
-            "NotebookEdit"
-        }
-        "read" | "notebook_read" => {
-            put("file_path", text_of(input, &PATH));
-            if name == "notebook_read" {
-                "NotebookRead"
-            } else {
-                "Read"
-            }
-        }
-        "grep" | "glob" => {
-            put("pattern", text_of(input, &["pattern", "query", "regex"]));
-            put("path", text_of(input, &["path", "dir", "directory"]));
-            put("glob", text_of(input, &["glob", "include"]));
-            if name == "grep" {
-                "Grep"
-            } else {
-                "Glob"
-            }
-        }
-        "webfetch" => {
-            put("url", text_of(input, &["url"]));
-            "WebFetch"
-        }
-        "todo_write" => "TodoWrite",
-        "run_subagent" | "read_subagent" => "Task",
-        "skill" => "Skill",
-        "ask_user_question" => {
-            if let Some(q) = questions_of(input) {
-                out.insert("questions".into(), q);
-            }
-            claude::DIALOG_TOOL
-        }
-        "exit_plan_mode" => {
-            put("plan", text_of(input, &["plan", "content", "text"]));
-            claude::PLAN_TOOL
-        }
-        _ => return None,
-    };
-    Some((tool, out))
+        _ => {}
+    }
+    Some(Read {
+        tool,
+        input: out,
+        cwd,
+    })
 }
 
 /// The files a patch in `*** Begin Patch` form names: each it adds,
-/// updates, deletes or moves to.
-pub fn patch_paths(patch: &str) -> Vec<String> {
+/// updates, deletes or moves to. None: it names none, or has a line Desk
+/// can't be sure of (a `***` line it doesn't know, a unified diff's file
+/// header), which could touch a file Desk didn't read.
+pub fn patch_paths(patch: &str) -> Option<Vec<String>> {
     const MARKS: [&str; 4] = [
         "*** Add File:",
         "*** Update File:",
         "*** Delete File:",
         "*** Move to:",
     ];
+    const PLAIN: [&str; 3] = ["*** Begin Patch", "*** End Patch", "*** End of File"];
     let mut paths: Vec<String> = Vec::new();
     for line in patch.lines() {
-        let line = line.trim_end();
+        let line = line.trim();
         if let Some(p) = MARKS.iter().find_map(|m| line.strip_prefix(m)) {
             let p = p.trim().to_string();
-            if !p.is_empty() && !paths.contains(&p) {
+            if p.is_empty() {
+                return None;
+            }
+            if !paths.contains(&p) {
                 paths.push(p);
             }
+        } else if (line.starts_with("***") && !PLAIN.contains(&line))
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+        {
+            return None;
         }
     }
-    paths
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// `ask_user_question`'s questions as Claude Code's `AskUserQuestion` has
 /// them (`question`, `header`, `options[].label`, `multiSelect`): its own
 /// shape isn't documented, so a lone question, options as plain words and
 /// the like are read too.
-fn questions_of(input: &Value) -> Option<Value> {
+/// The first of `keys` `v` has as text.
+fn text_in<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str))
+}
+
+fn questions_of(input: &Map<String, Value>) -> Option<Value> {
     let one = |q: &Value| -> Option<Value> {
         let text = match q {
             Value::String(s) => Some(s.as_str()),
-            q => text_of(q, &["question", "text", "prompt", "title"]),
+            q => text_in(q, &["question", "text", "prompt", "title"]),
         }?;
         let options: Vec<Value> = q
             .get("options")
@@ -489,9 +653,9 @@ fn questions_of(input: &Value) -> Option<Value> {
             .flatten()
             .filter_map(|o| match o {
                 Value::String(s) => Some(json!({ "label": s })),
-                o => text_of(o, &["label", "text", "value", "title"]).map(|l| {
+                o => text_in(o, &["label", "text", "value", "title"]).map(|l| {
                     let mut opt = json!({ "label": l });
-                    if let Some(d) = text_of(o, &["description"]) {
+                    if let Some(d) = text_in(o, &["description"]) {
                         opt["description"] = json!(d);
                     }
                     opt
@@ -499,7 +663,7 @@ fn questions_of(input: &Value) -> Option<Value> {
             })
             .collect();
         let mut out = json!({ "question": text, "options": options });
-        if let Some(h) = text_of(q, &["header"]) {
+        if let Some(h) = text_in(q, &["header"]) {
             out["header"] = json!(h);
         }
         let multi = ["multiSelect", "multi_select", "multiple", "allow_multiple"]
@@ -510,17 +674,25 @@ fn questions_of(input: &Value) -> Option<Value> {
     };
     let questions: Vec<Value> = match input.get("questions").and_then(Value::as_array) {
         Some(qs) => qs.iter().filter_map(one).collect(),
-        None => one(input).into_iter().collect(),
+        None => one(&Value::Object(input.clone())).into_iter().collect(),
     };
     (!questions.is_empty()).then_some(Value::Array(questions))
 }
 
 /// Desk's answer to a hook, made in Claude Code's terms, in Devin's: an
-/// allow approves, a deny blocks with its reason, an ask or no decision is
-/// none (its terminal asks), and words for the model beside a result stay
-/// as they are (Devin reads `additionalContext` there).
-pub fn answer(claude_said: Value) -> Value {
+/// allow approves, a deny blocks with its reason, and words for the model
+/// beside a result stay as they are (Devin reads `additionalContext`
+/// there). No answer is none: Devin goes on as it would without Desk. An
+/// ask (or a decision Desk doesn't make) is none too, its terminal asking,
+/// except with `closed` (a session whose boss is on another hub, where
+/// nobody is at its terminal, and Devin's own mode could run the call
+/// unasked): there it blocks.
+pub fn answer(claude_said: Value, closed: bool) -> Value {
     let none = || json!({});
+    let undecided = || match closed {
+        true => json!({ "decision": "block", "reason": UNJUDGED }),
+        false => json!({}),
+    };
     let Some(out) = claude_said.get("hookSpecificOutput") else {
         return none();
     };
@@ -531,7 +703,7 @@ pub fn answer(claude_said: Value) -> Value {
         return match d.get("behavior").and_then(Value::as_str) {
             Some("allow") => json!({ "decision": "approve" }),
             Some("deny") => block(d.get("message").and_then(Value::as_str)),
-            _ => none(),
+            _ => undecided(),
         };
     }
     // A call's start's (`PreToolUse`).
@@ -539,7 +711,7 @@ pub fn answer(claude_said: Value) -> Value {
         return match d {
             "allow" => json!({ "decision": "approve" }),
             "deny" => block(text("permissionDecisionReason")),
-            _ => none(),
+            _ => undecided(),
         };
     }
     if let Some(words) = text("additionalContext") {
@@ -552,6 +724,10 @@ pub fn answer(claude_said: Value) -> Value {
     }
     none()
 }
+
+/// Why a call nobody could judge was refused.
+pub const UNJUDGED: &str =
+    "Refused: Desk couldn't judge this call, and nobody is at this session's terminal to.";
 
 #[cfg(test)]
 mod tests {
@@ -574,6 +750,11 @@ mod tests {
             ("DEVIN_API_TOKEN".to_string(), "t".to_string()),
             ("DEVIN_MODEL".to_string(), "swe-1-6".to_string()),
             ("CLAUDE_CODE_PLUGIN_DIRS".to_string(), "/p".to_string()),
+            ("DEVIN_API_BASE_URL".to_string(), "http://evil".to_string()),
+            ("codeium_portal".to_string(), "x".to_string()),
+            ("DESK_LINE_TOKEN".to_string(), "x".to_string()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "x".to_string()),
+            ("DEVIN_PERMISSION_MODE".to_string(), "normal".to_string()),
             ("COLORFGBG".to_string(), "0;15".to_string()),
         ]);
         spawn(&DevinSpawn {
@@ -586,6 +767,7 @@ mod tests {
             config: Path::new("/run/0.devin.json"),
             env: &env,
         })
+        .unwrap()
     }
 
     #[test]
@@ -636,12 +818,53 @@ mod tests {
             "WINDSURF_API_KEY",
             "DEVIN_API_TOKEN",
             "CLAUDE_CODE_PLUGIN_DIRS",
+            "DEVIN_API_BASE_URL",
+            "codeium_portal",
+            "DESK_LINE_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
         ] {
             assert!(!s.env.contains_key(gone), "{gone}");
         }
-        for kept in ["HOME", "DEVIN_MODEL", "COLORFGBG"] {
+        for kept in ["HOME", "DEVIN_MODEL", "DEVIN_PERMISSION_MODE", "COLORFGBG"] {
             assert!(s.env.contains_key(kept), "{kept}");
         }
+    }
+
+    #[test]
+    fn a_session_id_or_model_that_could_read_as_an_option_is_refused() {
+        let at = |launch: Launch<'_>, model: Option<&str>| {
+            spawn(&DevinSpawn {
+                program: Path::new("/bin/devin"),
+                cwd: Path::new("/repo"),
+                launch,
+                prompt: None,
+                mode: None,
+                model,
+                config: Path::new("/run/0.devin.json"),
+                env: &BTreeMap::new(),
+            })
+        };
+        for id in ["--config=/tmp/x", "-x", "", "a b", "ses;rm", "a\nb"] {
+            assert!(
+                at(Launch::Resume { session_id: id }, None).is_err(),
+                "{id:?}"
+            );
+        }
+        for m in ["--dangerous", "a b", ""] {
+            assert!(at(Launch::New, Some(m)).is_err(), "{m:?}");
+        }
+        let s = at(
+            Launch::Resume {
+                session_id: "ses_01-AB",
+            },
+            Some("claude-opus-4.8"),
+        )
+        .unwrap();
+        assert!(s.args.windows(2).any(|w| w == ["-r", "ses_01-AB"]));
+        assert!(s
+            .args
+            .windows(2)
+            .any(|w| w == ["--model", "claude-opus-4.8"]));
     }
 
     #[test]
@@ -659,8 +882,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, f) = files();
         let run = f.config.parent().unwrap().to_path_buf();
-        let person = Person::Read(json!({"agent": {"model": "swe-1-6-fast"},
-            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}}));
+        let person = Person::Read {
+            config: json!({"agent": {"model": "swe-1-6-fast"},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}}),
+            real: None,
+        };
         f.write(&run, URL, 3600, false, &person).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&run), 0o700);
@@ -697,7 +923,8 @@ mod tests {
             model: None,
             config: &f.config,
             env: &BTreeMap::new(),
-        });
+        })
+        .unwrap();
         assert!(!s.args.iter().any(|a| a.contains(token)));
         assert_eq!(sessions_with_files(&run), vec![Uuid::nil()]);
         // Ended: written back (nothing saved here), every file gone.
@@ -712,11 +939,16 @@ mod tests {
             .unwrap();
         assert!(!f.base.exists());
         assert!(curl_config("http://h/\"\nurl = \"http://evil").is_err());
+        assert!(curl_config("https://h/hook").is_err());
+        assert!(curl_config("file:///etc/passwd").is_err());
+        // Straight to the hub: no proxy, no other protocol.
+        assert!(hook_text.contains("noproxy = \"*\"\n"));
+        assert!(hook_text.contains("proto = \"=http\"\n"));
     }
 
     #[test]
     fn every_hook_posts_through_the_curl_file_and_waits_as_long_as_its_event_may() {
-        let hooks = hooks(Path::new("/run dir/0.hook"), 3600, false);
+        let hooks = hooks(Path::new("/run dir/0.hook"), 3600, false).unwrap();
         let events: Vec<&str> = hooks.keys().map(String::as_str).collect();
         for e in [
             "SessionStart",
@@ -735,7 +967,10 @@ mod tests {
             let h = &groups[0]["hooks"][0];
             assert_eq!(h["type"], "command");
             let c = h["command"].as_str().unwrap();
-            assert!(c.starts_with("curl -sf --max-time "), "{c}");
+            assert!(
+                c.starts_with("curl -q -sf --max-time "),
+                "no ~/.curlrc: {c}"
+            );
             assert!(c.contains("-K '/run dir/0.hook'"), "{c}");
             assert!(c.contains(&format!("{EVENT_HEADER}: {e}")), "{c}");
             assert!(h.get("fail_closed").is_none());
@@ -744,7 +979,7 @@ mod tests {
         assert_eq!(timeout("PermissionRequest"), 3605);
         assert_eq!(timeout("PreToolUse"), claude::DIALOG_WAIT_SECS + 5);
         assert_eq!(timeout("Stop"), 15);
-        let closed = super::hooks(Path::new("/r/0.hook"), 60, true);
+        let closed = super::hooks(Path::new("/r/0.hook"), 60, true).unwrap();
         let pre = &closed["PreToolUse"][0]["hooks"][0];
         assert_eq!(pre["fail_closed"], true);
         assert!(pre["command"].as_str().unwrap().ends_with("exit 2; }"));
@@ -761,7 +996,7 @@ mod tests {
         let hook_file = dir.path().join("0.hook");
         let run = |url: &str| {
             std::fs::write(&hook_file, curl_config(url).unwrap()).unwrap();
-            let c = hook_command(&hook_file, "PreToolUse", 3, true);
+            let c = hook_command(&hook_file, "PreToolUse", 3, true).unwrap();
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&c)
@@ -828,13 +1063,6 @@ mod tests {
                 "Bash",
                 "command",
                 "cargo test",
-            ),
-            (
-                "write_to_process",
-                json!({"shell_id": "1", "input": "y\n"}),
-                "Bash",
-                "command",
-                "y\n",
             ),
             (
                 "edit",
@@ -909,19 +1137,61 @@ mod tests {
                 "{devin} kept"
             );
         }
-        for (devin, claude) in [
-            ("todo_write", "TodoWrite"),
-            ("run_subagent", "Task"),
-            ("read_subagent", "Task"),
-            ("skill", "Skill"),
-        ] {
+        for (devin, claude) in [("todo_write", "TodoWrite"), ("skill", "Skill")] {
             assert_eq!(start(devin, json!({})).0, claude);
         }
-        // Unknown to Desk: its own name, its input untouched.
-        for devin in ["request_scope", "mcp__github__create_issue", "kill_shell"] {
+        // A search without a place searches where the session runs.
+        assert_eq!(start("grep", json!({"pattern": "x"})).1["path"], ".");
+        // Unknown to Desk, or what it can't read the effect of: its own
+        // name, its input untouched.
+        for devin in [
+            "request_scope",
+            "mcp__github__create_issue",
+            "kill_shell",
+            "write_to_process",
+            "run_subagent",
+            "read_subagent",
+        ] {
             let (tool, input) = start(devin, json!({"a": 1}));
             assert_eq!((tool.as_str(), input), (devin, json!({"a": 1})));
         }
+        // An input Desk can't be sure it reads whole: Devin's own name.
+        for (devin, input) in [
+            // What it can't run without, missing.
+            ("read", json!({})),
+            ("read", json!({"offset": 1})),
+            ("exec", json!({"shell_id": "1"})),
+            ("edit", json!({"old_str": "a"})),
+            ("write", json!({"content": "x"})),
+            ("grep", json!({"path": "src"})),
+            ("webfetch", json!({})),
+            ("apply_patch", json!({})),
+            // Not an object, or not text.
+            ("read", json!("/etc/hosts")),
+            ("read", json!(null)),
+            ("read", json!({"file_path": ["/etc/hosts"]})),
+            // A field Desk doesn't read.
+            ("read", json!({"file_path": "a", "also": "/etc/shadow"})),
+            ("exec", json!({"command": "ls", "env": {"X": "1"}})),
+            // One field said two ways.
+            ("read", json!({"file_path": "a", "path": "/etc/shadow"})),
+            ("exec", json!({"command": "ls", "cmd": "rm -rf /"})),
+            // Run where Desk can't be sure.
+            ("exec", json!({"command": "ls", "cwd": "../elsewhere"})),
+        ] {
+            assert_eq!(start(devin, input.clone()).0, devin, "{input}");
+        }
+        // Said the same way twice is one.
+        assert_eq!(
+            start("read", json!({"file_path": "a", "path": "a"})).1["file_path"],
+            "a"
+        );
+        // Where its command runs, when it says, is the call's own.
+        let mut p = json!({"hook_event_name": "PreToolUse", "cwd": "/repo", "tool_name": "exec",
+            "tool_input": {"command": "rm -rf build", "workdir": "/elsewhere"}});
+        normalize(&mut p, None);
+        assert_eq!(p["tool_name"], "Bash");
+        assert_eq!(p["cwd"], "/elsewhere");
         // And it reads on as Claude Code's do.
         assert_eq!(
             parsed(json!({"hook_event_name": "PreToolUse", "tool_name": "exec",
@@ -944,18 +1214,33 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n*** Add File: src/new.rs\n+x\n\
                      *** Delete File: old.rs\n*** Update File: src/c.rs\n*** Move to: src/d.rs\n*** Update File: src/a.rs\n*** End Patch\n";
         assert_eq!(
-            patch_paths(patch),
+            patch_paths(patch).unwrap(),
             ["src/a.rs", "src/new.rs", "old.rs", "src/c.rs", "src/d.rs"]
         );
+        // Marks indented are marks still.
+        assert_eq!(
+            patch_paths("*** Begin Patch\n  *** Update File: src/e.rs\n*** End Patch").unwrap(),
+            ["src/e.rs"]
+        );
+        // A line Desk can't be sure of, or no file: none.
+        for p in [
+            "*** Begin Patch\n*** Update File: a\n*** Copy File: /etc/x\n*** End Patch",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@\n-a\n+b\n",
+            "*** Begin Patch\n*** Update File: a\n+++ /etc/x\n*** End Patch",
+            "*** Begin Patch\n*** Add File:\n*** End Patch",
+            "*** Begin Patch\n*** End Patch",
+        ] {
+            assert_eq!(patch_paths(p), None, "{p}");
+        }
         let mut p = json!({"hook_event_name": "PermissionRequest", "tool_name": "apply_patch",
             "tool_input": {"patch": patch}});
         normalize(&mut p, None);
         assert_eq!(p["tool_name"], "Edit");
         assert_eq!(p["tool_input"]["paths"].as_array().unwrap().len(), 5);
-        // None named: none, which a boss can't judge.
-        let mut p = json!({"tool_name": "apply_patch", "tool_input": {}});
+        // None named: Devin's own name, which a boss can't judge.
+        let mut p = json!({"tool_name": "apply_patch", "tool_input": {"patch": "x"}});
         normalize(&mut p, None);
-        assert_eq!(p["tool_input"]["paths"], json!([]));
+        assert_eq!(p["tool_name"], "apply_patch");
     }
 
     #[test]
@@ -1096,7 +1381,20 @@ mod tests {
             (json!({}), none.clone()),
             (json!({"anything": 1}), none.clone()),
         ] {
-            assert_eq!(answer(made.clone()), devin, "{made}");
+            assert_eq!(answer(made.clone(), false), devin, "{made}");
         }
+        // Nobody at its terminal: an ask blocks; a decision stands, and no
+        // answer is still none.
+        let refused = json!({"decision": "block", "reason": UNJUDGED});
+        assert_eq!(answer(claude::ask_call("asked"), true), refused);
+        assert_eq!(
+            answer(
+                json!({"hookSpecificOutput": {"decision": {"behavior": "ask"}}}),
+                true
+            ),
+            refused
+        );
+        assert_eq!(answer(claude::allow(), true), approve);
+        assert_eq!(answer(json!({}), true), none);
     }
 }
