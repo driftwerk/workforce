@@ -4806,8 +4806,18 @@ impl Desk {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
         // Checked again on every start and resume, whatever the record was
-        // read from: only a model's name reaches its CLI's command line.
-        let model = session_model(r.engine, r.model.as_deref())?;
+        // read from: only a model's name reaches its CLI's command line. One
+        // kept that isn't (a row edited, a rule since narrowed) never strands
+        // the session: it runs on its engine's default, said so, and its
+        // record says it.
+        let model = match session_model(r.engine, r.model.as_deref()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(session = %r.id, error = %e, "a session's kept model isn't one Desk passes on: it runs on its engine's default");
+                self.change(r.id, |r, _| r.model = None);
+                None
+            }
+        };
         let model = model.as_deref();
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Read only now; it reaches the CLI on a descriptor, never in an

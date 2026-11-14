@@ -151,7 +151,8 @@ async fn a_name_that_isnt_a_models_is_refused_and_nothing_starts() {
 }
 
 /// A record whose model was changed where Desk didn't check it (its row,
-/// edited) is refused at its resume: nothing in it reaches the CLI.
+/// edited) resumes on its engine's default: nothing of it reaches the CLI,
+/// and its record no longer says it.
 #[tokio::test]
 async fn a_kept_model_is_checked_again_at_every_start() {
     with_test_pool(build_pool, |pool| async move {
@@ -167,10 +168,13 @@ async fn a_kept_model_is_checked_again_at_every_start() {
         };
         store.put(&was).await.unwrap();
         let d = logging_desk(pool, dir.path()).await;
-        let refused = d.resume(was.id, None, None).await;
-        assert!(matches!(refused, Err(DeskError::Invalid(_))), "{refused:?}");
-        assert!(starts(dir.path()).is_empty(), "nothing was run");
-        assert!(!d.view(was.id).unwrap().live);
+        let back = d.resume(was.id, None, None).await.unwrap();
+        assert_eq!(back.model, None);
+        let ran = until_started(dir.path(), 1).await;
+        assert!(!ran[0].contains("--model"), "{ran:?}");
+        assert!(!ran[0].contains("dangerously"), "{ran:?}");
+        d.persisted().await;
+        assert_eq!(store.get(was.id).await.unwrap().unwrap().model, None);
     })
     .await;
 }
