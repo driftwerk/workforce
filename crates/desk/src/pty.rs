@@ -108,6 +108,11 @@ impl Core {
 pub(crate) struct Screen {
     core: Mutex<Core>,
     tx: broadcast::Sender<Frame>,
+    /// Output is dropped unread, never parsed or sent on: a terminal that
+    /// may be echoing a secret typed into it ([`Pty::blind`]).
+    blind: std::sync::atomic::AtomicBool,
+    /// The hub's own child has been waited for: its pid may be another's.
+    reaped: std::sync::atomic::AtomicBool,
 }
 
 impl Screen {
@@ -127,12 +132,17 @@ impl Screen {
                 exited: false,
             }),
             tx: broadcast::channel(1024).0,
+            blind: Default::default(),
+            reaped: Default::default(),
         })
     }
 
     /// Takes in output. Returns the replies the hub owes the program's
     /// queries when no viewer is active to answer them.
     pub(crate) fn push(&self, chunk: &[u8]) -> Option<Vec<u8>> {
+        if self.blind.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         let mut core = self.core.lock();
         let replies = core.term.feed(chunk);
         let _ = self.tx.send(Frame::Bytes(Bytes::copy_from_slice(chunk)));
@@ -364,6 +374,21 @@ impl Pty {
         self.io.kill();
     }
 
+    /// From now on its output is dropped unread: nothing it draws reaches
+    /// the screen, its history or a viewer. For a terminal a secret is
+    /// about to be typed into, which it may echo.
+    pub fn blind(&self) {
+        self.screen
+            .blind
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the hub's own child was waited for, so its pid is no longer
+    /// its own to signal.
+    pub fn reaped(&self) -> bool {
+        self.screen.reaped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The screen as plain text: the history and screen, or the alternate
     /// screen while a program has it.
     pub fn text(&self) -> String {
@@ -564,6 +589,9 @@ impl Local {
                     .wait()
                     .ok()
                     .map(|s: portable_pty::ExitStatus| s.exit_code());
+                ended
+                    .reaped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 // The child can be reaped before the reader has taken its
                 // last output; announcing the end first would cut that
                 // output off for anyone who stops listening at the end. A

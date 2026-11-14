@@ -581,7 +581,9 @@ const DEVIN_TOKEN: &str = "devin-pasted-Qm9vbXNoYWthbGFrYQ-7f3a9c";
 /// reached it). `auth login` draws its page and waits for the test to
 /// approve or refuse it; with `--force-manual-token-flow`, it reads the
 /// token (the terminal echoes it), draws it again itself, and signs in
-/// only by [`DEVIN_TOKEN`].
+/// only by [`DEVIN_TOKEN`], ignoring a hang-up meanwhile, as does the
+/// child it starts (both pids in `login-pids`). Its environment is kept in
+/// `login-env`.
 fn devin(dir: &Path) -> PathBuf {
     let path = dir.join("devin");
     let d = dir.display();
@@ -593,9 +595,10 @@ fn devin(dir: &Path) -> PathBuf {
              'auth status') if [ -n \"$WINDSURF_API_KEY\" ]; then echo 'Logged in with provided API key.'\n\
                elif [ -e '{d}/devin-in' ]; then echo 'Logged in as kim@example.com (via browser)'; echo '  Credentials path: {d}/credentials.toml'\n\
                else echo 'Not logged in.'; echo '  Credentials path: {d}/credentials.toml'; fi ;;\n\
-             'auth login') page='{DEVIN_PAGE}'\n\
+             'auth login') page='{DEVIN_PAGE}'; env > '{d}/login-env'\n\
                [ -e '{d}/devin-host' ] && page=$(echo \"$page\" | sed \"s/app.devin.ai/$(cat '{d}/devin-host')/\")\n\
                if [ \"$3\" = '--force-manual-token-flow' ]; then\n\
+                 trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & echo \"$$ $!\" > '{d}/login-pids'\n\
                  echo 'Open this page on any computer and sign in:'\n\
                  echo \"   $page\"\n\
                  printf 'Paste the token shown on the page: '\n\
@@ -674,9 +677,10 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
             .with_writer(log.clone())
             .finish(),
     );
-    // With one subscriber alive in the process, tracing asks whichever
-    // thread looks next (another test's, listening to nothing) whether to
-    // log; with two it asks both, so this one hears its callsites.
+    // Under `cargo test` other tests' threads share these callsites. A
+    // second live subscriber keeps tracing from caching "off" for them on
+    // a thread that listens to nothing; what is caught is still only what
+    // this thread logs (its own desk's tasks run here).
     let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     tracing::callsite::rebuild_interest_cache();
     with_test_pool(build_pool, |pool| async move {
@@ -728,8 +732,15 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
         )
         .await;
         assert_eq!(code, 204, "{body}");
+        // The terminal echoes it at once, and the CLI draws it: neither is
+        // ever on the screen, from the moment it was typed.
+        for _ in 0..8 {
+            let screen = d.engine_sign_in_screen(id).expect("the CLI still runs");
+            assert!(leaked(&screen, DEVIN_TOKEN).is_empty(), "{screen}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
-        // The terminal and the CLI drew it, and it is wiped within a look.
+        // Nor later.
         tokio::time::sleep(Duration::from_millis(700)).await;
         let screen = d.engine_sign_in_screen(id).expect("the CLI still runs");
         assert!(leaked(&screen, DEVIN_TOKEN).is_empty(), "{screen}");
@@ -742,6 +753,10 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
             None,
             "nothing of its screen is kept"
         );
+        let login_env = std::fs::read_to_string(dir.path().join("login-env")).unwrap();
+        for key in ["WINDSURF_API_KEY", "ANTHROPIC_API_KEY"] {
+            assert!(!login_env.contains(key), "{key} reached the login");
+        }
         let who = until(|| match devin_signed_in(&d) {
             crate::engine::SignIn::In { who, .. } => Some(who),
             _ => None,
@@ -802,6 +817,30 @@ async fn devin_signs_in_by_a_pasted_token_kept_and_said_nowhere() {
         })
         .await;
         assert_eq!(failed, super::engine_sign_ins::DEVIN_TOKEN_FAILED);
+
+        // Given up on while it waits for a token, it and what it started
+        // end, even ignoring the hang-up.
+        std::fs::remove_file(dir.path().join("login-pids")).unwrap();
+        let given_up = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        until(|| {
+            matches!(
+                d.engine_sign_in(given_up.id).unwrap().state,
+                EngineSignInState::Paste { .. }
+            )
+            .then_some(())
+        })
+        .await;
+        let pids: Vec<libc::pid_t> =
+            until(|| std::fs::read_to_string(dir.path().join("login-pids")).ok())
+                .await
+                .split_whitespace()
+                .map(|p| p.parse().unwrap())
+                .collect();
+        assert_eq!(pids.len(), 2);
+        d.cancel_engine_sign_in(given_up.id).unwrap();
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+        until(|| pids.iter().all(|&p| !alive(p)).then_some(())).await;
     })
     .await;
 }

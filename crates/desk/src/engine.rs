@@ -614,12 +614,10 @@ pub fn devin_status_sign_in(status: &str) -> SignIn {
     {
         return SignIn::Out;
     }
-    let Some(said) = lines.iter().find(|l| {
-        (l.starts_with("logged in") || l.starts_with("signed in"))
-            || ((l.contains(" logged in") || l.contains(" signed in"))
-                && !l.contains("not logged in")
-                && !l.contains("not signed in"))
-    }) else {
+    let Some(said) = lines
+        .iter()
+        .find(|l| l.starts_with("logged in") || l.starts_with("signed in"))
+    else {
         return SignIn::Unknown;
     };
     SignIn::In {
@@ -664,25 +662,37 @@ fn email_like(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
 }
 
-/// The person's environment as a Devin of theirs runs in it, without the
-/// keys that would sign Devin in ahead of its own login: Desk never signs
-/// Devin in by a key in its environment.
-pub fn without_devin_keys(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+/// The environment Devin's login and `auth status` run in: only what
+/// finds the person's own Devin, its files and the network (home, path,
+/// user, shell, temp, `XDG_*`, locale, terminal, proxies, CA files). No key
+/// or token of any kind reaches it, so Devin signs in by its own login and
+/// never by one ahead of it.
+pub fn devin_login_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
-        .filter(|(k, _)| !devin_key_name(k))
+        .filter(|(k, _)| devin_login_var(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
 
-/// `WINDSURF_API_KEY`, and any `DEVIN_…` variable that names a key, token
-/// or secret.
-fn devin_key_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper == "WINDSURF_API_KEY"
-        || (upper.starts_with("DEVIN_")
-            && ["KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD"]
-                .iter()
-                .any(|w| upper.contains(w)))
+/// Whether `name` is one [`devin_login_env`] keeps.
+fn devin_login_var(name: &str) -> bool {
+    const KEPT: &[&str] = &[
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ];
+    const PROXIES: &[&str] = &["http_proxy", "https_proxy", "no_proxy"];
+    KEPT.contains(&name)
+        || PROXIES.iter().any(|p| name.eq_ignore_ascii_case(p))
+        || name.starts_with("XDG_")
+        || name.starts_with("LC_")
 }
 
 /// Copilot CLI signs in with a GitHub token from its environment; with
@@ -929,6 +939,7 @@ mod tests {
             "error: unrecognized subcommand 'status'\n",
             "Failed to load credentials: invalid TOML\n",
             "  Credentials path: /home/kim/.local/share/devin/credentials.toml\n",
+            "Warning: you are logged in as kim@example.com elsewhere\n",
         ] {
             assert_eq!(devin_status_sign_in(garbage), SignIn::Unknown, "{garbage}");
         }
@@ -959,12 +970,29 @@ mod tests {
             "DEVIN_API_KEY",
             "DEVIN_SESSION_TOKEN",
             "DEVIN_THEME",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "XDG_DATA_HOME",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "no_proxy",
+            "PATH",
         ]
         .iter()
         .map(|k| (k.to_string(), "x".to_string()))
         .collect();
-        let kept: Vec<String> = without_devin_keys(&env).into_keys().collect();
-        assert_eq!(kept, ["DEVIN_THEME", "HOME"]);
+        let kept: Vec<String> = devin_login_env(&env).into_keys().collect();
+        assert_eq!(
+            kept,
+            [
+                "HOME",
+                "HTTPS_PROXY",
+                "LC_ALL",
+                "PATH",
+                "XDG_DATA_HOME",
+                "no_proxy"
+            ]
+        );
     }
 
     #[test]

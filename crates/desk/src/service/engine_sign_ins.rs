@@ -9,8 +9,8 @@
 //!   On a computer with no browser (`--force-manual-token-flow`) the page
 //!   gives a token, which the person pastes into Desk and Desk types into
 //!   the CLI. That token is kept nowhere: not in a log, an event, this
-//!   sign-in's view, or the screen, which is never read and is wiped
-//!   while the CLI waits for it.
+//!   sign-in's view, or the screen, which is blinded (its output dropped
+//!   unread) before Desk can be given a token, and wiped besides.
 //!
 //! The CLI keeps the sign-in where its sessions read it. Nothing it signs
 //! in with passes through Desk but a pasted token, on its way to the CLI.
@@ -159,8 +159,8 @@ pub fn devin_said(screen: &str) -> DevinSaid {
     for line in screen.lines() {
         let lower = line.to_lowercase();
         for word in screen_words(line) {
-            if crate::engine_accounts::page_on(word, DEVIN_PAGES).is_some() {
-                said.url = Some(word.to_string());
+            if let Some(page) = devin_page(word) {
+                said.url = Some(page.as_str().to_string());
             }
         }
         // Only its falling back from the browser: a hint that a manual
@@ -182,15 +182,24 @@ pub fn devin_said(screen: &str) -> DevinSaid {
     said
 }
 
+/// `word` as Devin's login page, read as a browser reads it: on
+/// [`DEVIN_PAGES`], and carrying the login's own `state` and PKCE
+/// `code_challenge` (a page cut short, or one without them, is none).
+fn devin_page(word: &str) -> Option<url::Url> {
+    let page = crate::engine_accounts::page_on(word, DEVIN_PAGES)?;
+    let carries = |key: &str| page.query_pairs().any(|(k, v)| k == key && !v.is_empty());
+    (carries("state") && carries("code_challenge")).then_some(page)
+}
+
 /// The words of a screen line a page or code may be.
 fn screen_words(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| c.is_whitespace() || c == '│' || c == '"' || c == '\'')
         .map(|w| w.trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | ',' | '.')))
 }
 
-/// Whether `url` is Codex's device page, read as a browser reads it.
-fn device_host(url: &str) -> bool {
-    crate::engine_accounts::page_on(url, DEVICE_PAGES).is_some()
+/// `url` as Codex's device page, read as a browser reads it.
+fn device_page(url: &str) -> Option<url::Url> {
+    crate::engine_accounts::page_on(url, DEVICE_PAGES)
 }
 
 /// A one-time code as Codex prints it: groups of capitals and digits
@@ -213,8 +222,8 @@ pub fn device_said(screen: &str) -> DeviceSaid {
     for line in screen.lines() {
         let lower = line.to_lowercase();
         for word in screen_words(line) {
-            if said.url.is_none() && device_host(word) {
-                said.url = Some(word.to_string());
+            if said.url.is_none() {
+                said.url = device_page(word).map(|p| p.as_str().to_string());
             }
             if after_code_line && said.code.is_none() && device_code(word) {
                 said.code = Some(word.to_string());
@@ -258,7 +267,7 @@ impl Desk {
         let env = self.with_added(&self.0.state.lock().session_env.clone());
         // Devin signs in by its own login, never a key ahead of it.
         let env = match engine {
-            Engine::Devin => crate::engine::without_devin_keys(&env),
+            Engine::Devin => crate::engine::devin_login_env(&env),
             _ => env,
         };
         let spec = Spawn {
@@ -303,7 +312,9 @@ impl Desk {
             );
             ended
         };
-        ended.iter().for_each(|p| p.kill());
+        ended.into_iter().for_each(|p| {
+            tokio::spawn(end_cli(p));
+        });
         tokio::spawn(self.clone().follow_engine_sign_in(view.id, exit));
         Ok(view)
     }
@@ -324,8 +335,11 @@ impl Desk {
     /// ending. The token is kept nowhere, and said nowhere.
     pub fn engine_sign_in_token(&self, id: Uuid, token: &str) -> Result<(), DeskError> {
         let token = token.trim();
-        // A control character would be keys of its own in the CLI.
-        if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_control) {
+        // Printable ASCII alone: a control character, a space or an escape
+        // would be keys of their own in the CLI. 4 KiB is far past any
+        // token; a terminal's line holds less still in canonical mode
+        // (macOS's MAX_CANON is 1024), which the CLI's own read decides.
+        if token.is_empty() || token.len() > 4096 || !token.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(DeskError::Invalid(
                 "paste the token the sign-in page gives you".into(),
             ));
@@ -346,12 +360,10 @@ impl Desk {
             run.typed = true;
             pty
         };
-        let mut keys = Vec::with_capacity(token.len() + 1);
-        keys.extend_from_slice(token.as_bytes());
-        keys.push(b'\r');
-        let typed = pty.write(&keys);
-        keys.fill(0);
-        typed.map_err(|_| DeskError::Conflict("that sign-in has ended".into()))
+        // The bytes pass through the terminal's writer queue on their way
+        // and are freed there, not zeroed; nothing keeps or logs them.
+        pty.write(format!("{token}\r").as_bytes())
+            .map_err(|_| DeskError::Conflict("that sign-in has ended".into()))
     }
 
     /// Ends an engine sign-in the person gave up on.
@@ -359,7 +371,7 @@ impl Desk {
         let run = self.0.state.lock().engine_sign_ins.remove(&id);
         let run = run.ok_or_else(|| DeskError::Conflict("that sign-in has ended".into()))?;
         if let Some(pty) = run.pty {
-            pty.kill();
+            tokio::spawn(end_cli(pty));
         }
         Ok(())
     }
@@ -382,8 +394,8 @@ impl Desk {
     }
 
     /// Where sign-in `id` is now, from what its CLI draws. A Devin waiting
-    /// for a token has its screen wiped instead of read, so a token it
-    /// echoes stays on it no longer than one look.
+    /// for a token is blind from the moment it is, so a token it echoes
+    /// never reaches its screen; the screen is wiped at every look besides.
     fn engine_sign_in_looked(&self, id: Uuid, engine: Engine, pty: &Pty) {
         let (state, manual) = {
             let st = self.0.state.lock();
@@ -401,7 +413,13 @@ impl Desk {
                 let said = devin_said(&pty.text());
                 if let Some(url) = said.url {
                     let next = match manual || said.manual {
-                        true => EngineSignInState::Paste { url },
+                        true => {
+                            // Before Desk can be given a token: whatever the
+                            // terminal shows from now on is never taken in.
+                            pty.blind();
+                            wipe(pty);
+                            EngineSignInState::Paste { url }
+                        }
                         false => EngineSignInState::Page { url },
                     };
                     if next != state {
@@ -504,13 +522,12 @@ impl Desk {
                 }
                 _ = tokio::time::sleep(SIGN_IN_EVERY) => {}
                 _ = self.0.cancel.cancelled() => {
-                    pty.kill();
+                    end_cli(pty).await;
                     return;
                 }
             }
             if started.elapsed() > SIGN_IN_FOR {
-                pty.kill();
-                wipe(&pty);
+                end_cli(Arc::clone(&pty)).await;
                 break EngineSignInState::Failed {
                     why: match engine {
                         Engine::Devin => DEVIN_FAILED,
@@ -551,6 +568,34 @@ impl Desk {
             }
         });
     }
+}
+
+/// How long a CLI told to hang up has before it is killed.
+const HANG_UP_FOR: Duration = Duration::from_secs(1);
+
+/// Ends a sign-in's CLI and everything it started: its screen is wiped and
+/// blinded, its process group (it leads its own session) is told to hang
+/// up, and killed if it is still there a second later. A CLI already waited
+/// for is never signalled: its pid may be another process's by now.
+async fn end_cli(pty: Arc<Pty>) {
+    pty.blind();
+    wipe(&pty);
+    let Some(pid) = pty.pid().and_then(|p| libc::pid_t::try_from(p).ok()) else {
+        pty.kill();
+        return;
+    };
+    let signal = |sig| {
+        if !pty.reaped() {
+            // SAFETY: killpg only sends a signal; the group is the child's own.
+            unsafe { libc::killpg(pid, sig) };
+        }
+    };
+    signal(libc::SIGHUP);
+    let until = tokio::time::Instant::now() + HANG_UP_FOR;
+    while !pty.reaped() && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    signal(libc::SIGKILL);
 }
 
 /// Wipes a sign-in's screen and the history behind it.
@@ -643,6 +688,9 @@ mod tests {
             "app.devin.ai.evil.example",
             "evil.example\\@app.devin.ai",
             "app.devin.ai:8443",
+            "app.devin.ai.",
+            "\u{430}pp.devin.ai",
+            "xn--pp-8cd.devin.ai",
             "app.beta.devin.ai",
             "app.devinenterprise.com",
             "devin.ai",
@@ -664,6 +712,22 @@ mod tests {
         ] {
             assert_eq!(devin_said(&devin_screen(other)).url, None, "{other}");
         }
+        // A login of someone's at another host, by way of a user name.
+        let at = DEVIN_PAGE.replace("app.devin.ai", "app.devin.ai@evil.example");
+        assert_eq!(devin_said(&devin_screen(&at)).url, None);
+        // The host as a browser reads it, and the page as it would open it.
+        let upper = DEVIN_PAGE.replace("app.devin.ai", "APP.Devin.AI");
+        assert_eq!(
+            devin_said(&devin_screen(&upper)).url.as_deref(),
+            Some(DEVIN_PAGE)
+        );
+        // Cut short, or without its own state and challenge, it is no login.
+        let cut = &DEVIN_PAGE[..DEVIN_PAGE.find("&code_challenge=").unwrap()];
+        assert_eq!(devin_said(&devin_screen(cut)).url, None, "{cut}");
+        let no_state = DEVIN_PAGE.replace("state=", "stat=");
+        assert_eq!(devin_said(&devin_screen(&no_state)).url, None);
+        let empty = DEVIN_PAGE.replace("code_challenge=Q1w2", "code_challenge=&x=Q1w2");
+        assert_eq!(devin_said(&devin_screen(&empty)).url, None);
         // Codex's device page is never taken for Devin's, nor Devin's for Codex's.
         assert_eq!(device_said(&devin_screen(DEVIN_PAGE)).url, None);
     }
